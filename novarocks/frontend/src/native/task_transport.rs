@@ -59,6 +59,8 @@ use novarocks_execution::task_execution::{
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
+use novarocks_proto_codec::task_execution::domain as codec_domain;
+use novarocks_proto_codec::task_execution::domain::{stored_credential, stored_message};
 use novarocks_proto_codec::task_execution::operation as codec;
 use novarocks_proto_codec::task_execution::operation::{
     ReceiptHeader, StatusStreamEvent, decode_receipt_batch, decode_status_event,
@@ -106,130 +108,110 @@ pub(crate) struct EstablishWireContent {
     pub(crate) native_compatibility_id: Option<proto::NativeCompatibilityId>,
 }
 
-/// The typed wire content one intent's encoder needs handed back to it.
+/// Encodes one intent, projecting its own payloads back to the wire.
 ///
-/// The protocol keeps codec-owned content behind a fingerprint, so a neutral
-/// intent knows a payload's size and identity but not its bytes. Four
-/// operation kinds therefore cannot be encoded from the intent alone, and the
-/// owner that minted the intent — which still holds the typed content it built
-/// the request from — supplies it here. Everything else is [`Self::Neutral`]:
-/// the central codec encodes it whole.
-pub(crate) enum OperationWireContent {
-    Neutral,
-    CreateTask {
-        fragment: Arc<WireFragmentPlan>,
-        initial_domains: Vec<proto::TaskDomainUpdate>,
-    },
-    UpdateTask {
-        domains: Vec<proto::TaskDomainUpdate>,
-    },
-    EstablishQueryContext(Box<EstablishWireContent>),
-    AdvanceQueryContextDomain {
-        domain: proto::QueryContextDomainUpdate,
-    },
-}
-
-impl fmt::Debug for OperationWireContent {
-    /// Renders only the variant: an establish transitively holds confidential
-    /// credential material, so nothing but the shape may be printed.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Neutral => "OperationWireContent::Neutral",
-            Self::CreateTask { .. } => "OperationWireContent::CreateTask",
-            Self::UpdateTask { .. } => "OperationWireContent::UpdateTask",
-            Self::EstablishQueryContext(_) => "OperationWireContent::EstablishQueryContext",
-            Self::AdvanceQueryContextDomain { .. } => {
-                "OperationWireContent::AdvanceQueryContextDomain"
-            }
-        })
-    }
-}
-
-/// The wire half of one attempt, as the sink needs it.
-///
-/// This seam exists for one recorded reason: the central codec exposes the
-/// encode half of every acknowledgement but no neutral decoder for an
-/// acknowledgement body, and it cannot re-encode content the neutral intent
-/// only fingerprints. Naming both gaps in one place is what keeps a second
-/// wire decoder from growing inside the frontend. Removing it needs
-/// `decode_create_task_ack`, `decode_update_task_ack` and
-/// `decode_query_context_ack` in `novarocks-proto-codec`, plus a typed content
-/// handle reachable from an intent.
-pub(crate) trait TaskOperationWire: fmt::Debug + Send + Sync {
-    /// The typed content this intent's encoder needs, if any.
-    fn content_for(&self, intent: &OperationIntent) -> Result<OperationWireContent, String>;
-}
-
-/// Encodes one intent with the content its kind requires.
+/// Nothing is handed in from outside: an intent carries its payloads behind a
+/// fingerprint, and the codec that produced them is the only thing that can
+/// recover them. The two attempt-level facts an establish needs -- the query
+/// options and the compatibility identity -- come from the sink, because they
+/// belong to the attempt rather than to any one operation and the neutral
+/// request deliberately does not name a generated type.
 fn encode_operation(
     intent: &OperationIntent,
-    content: OperationWireContent,
+    attempt: &AttemptWireFacts,
 ) -> Result<proto::TaskOperation, String> {
-    match (intent, content) {
-        (
-            OperationIntent::CreateTask(request),
-            OperationWireContent::CreateTask {
-                fragment,
-                initial_domains,
-            },
-        ) => Ok(encode_create_task(request, &fragment, initial_domains)),
-        (OperationIntent::UpdateTask(request), OperationWireContent::UpdateTask { domains }) => {
+    match intent {
+        OperationIntent::CreateTask(request) => {
+            let fragment = wire_fragment_plan(request.descriptor().plan())?;
+            let domains = encode_task_domains(request.initial_domains())?;
+            Ok(encode_create_task(request, fragment, domains))
+        }
+        OperationIntent::UpdateTask(request) => {
+            let domains = encode_task_domains(request.domains())?;
             Ok(encode_update_task(request, domains))
         }
-        (OperationIntent::UpdateQueryContext(request), content) => {
-            encode_query_context_operation(request, content)
+        OperationIntent::UpdateQueryContext(request) => {
+            encode_query_context_operation(request, attempt)
         }
-        (OperationIntent::CancelTask(request), OperationWireContent::Neutral) => {
-            Ok(encode_cancel_task(*request))
-        }
-        (OperationIntent::AbortQueryContext(request), OperationWireContent::Neutral) => {
-            Ok(encode_abort_query_context(*request))
-        }
-        (OperationIntent::ReleaseQueryContext(request), OperationWireContent::Neutral) => {
-            Ok(encode_release_query_context(*request))
-        }
+        OperationIntent::CancelTask(request) => Ok(encode_cancel_task(*request)),
+        OperationIntent::AbortQueryContext(request) => Ok(encode_abort_query_context(*request)),
+        OperationIntent::ReleaseQueryContext(request) => Ok(encode_release_query_context(*request)),
         // Both reads are their own RPC with their own response shape, so they
         // have no batch receipt to be answered by and can never be encoded as
         // a batch item.
-        (OperationIntent::FetchTaskDynamicFilters(_) | OperationIntent::GetFinalTaskInfo(_), _) => {
+        OperationIntent::FetchTaskDynamicFilters(_) | OperationIntent::GetFinalTaskInfo(_) => {
             Err(format!(
                 "{} is a separate RPC and has no operation-batch encoding",
                 intent.kind()
             ))
         }
-        (intent, content) => Err(format!(
-            "{content:?} does not carry the wire content {} requires",
-            intent.kind()
-        )),
     }
+}
+
+/// The two attempt-level facts an establish carries that no intent names.
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptWireFacts {
+    pub(crate) query_options: proto::QueryOptions,
+    pub(crate) native_compatibility_id: Option<proto::NativeCompatibilityId>,
+}
+
+fn wire_fragment_plan(
+    plan: &Arc<dyn novarocks_execution::task_execution::descriptor::PhysicalFragmentPlan>,
+) -> Result<&WireFragmentPlan, String> {
+    plan.stored_representation()
+        .and_then(|stored| stored.downcast_ref::<WireFragmentPlan>())
+        .ok_or_else(|| "task descriptor plan is not a codec-produced fragment plan".to_owned())
+}
+
+fn encode_task_domains(
+    domains: &[novarocks_execution::task_execution::operation::TaskDomainUpdate],
+) -> Result<Vec<proto::TaskDomainUpdate>, String> {
+    domains
+        .iter()
+        .map(|domain| {
+            codec_domain::encode_neutral_task_domain(domain, FieldPath::root("initial_domains"))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
 }
 
 fn encode_query_context_operation(
     request: &UpdateQueryContext,
-    content: OperationWireContent,
+    attempt: &AttemptWireFacts,
 ) -> Result<proto::TaskOperation, String> {
-    match (request, content) {
-        (
-            UpdateQueryContext::Establish(establish),
-            OperationWireContent::EstablishQueryContext(content),
-        ) => Ok(encode_establish_query_context(
-            establish,
-            content.catalog_set,
-            content.initial_runtime_filter,
-            content.initial_credential,
-            content.query_options,
-            content.native_compatibility_id,
-        )),
-        (
-            UpdateQueryContext::AdvanceDomain(advance),
-            OperationWireContent::AdvanceQueryContextDomain { domain },
-        ) => Ok(encode_advance_query_context_domain(advance, domain)),
-        (UpdateQueryContext::RenewLease(renew), OperationWireContent::Neutral) => {
-            Ok(encode_renew_lease(renew))
+    match request {
+        UpdateQueryContext::Establish(establish) => {
+            let catalog_set = stored_message::<CatalogSet>(establish.catalog_binding().as_ref())
+                .ok_or("establish catalog binding is not a codec-produced catalog set")?;
+            let filter = stored_message::<proto::RuntimeFilterContribution>(
+                establish.initial_runtime_filter().as_ref(),
+            )
+            .ok_or("establish runtime filter is not a codec-produced contribution")?;
+            let credential = stored_credential(establish.initial_credential().material().as_ref())
+                .ok_or("establish credential is not codec-produced material")?;
+            Ok(encode_establish_query_context(
+                establish,
+                catalog_set.clone(),
+                filter.clone(),
+                proto::QueryContextCredentialDomain {
+                    lease_id: establish.initial_credential().lease_id().get(),
+                    epoch: establish.initial_credential().epoch().get(),
+                    descriptors: credential.descriptors().to_vec(),
+                    envelopes: credential.envelopes().to_vec(),
+                },
+                attempt.query_options.clone(),
+                attempt.native_compatibility_id.clone(),
+            ))
         }
-        (_, content) => Err(format!(
-            "{content:?} does not carry the wire content this query context command requires"
-        )),
+        UpdateQueryContext::AdvanceDomain(advance) => {
+            let domain = codec_domain::encode_neutral_query_context_domain(
+                advance.domain(),
+                FieldPath::root("advance_domain"),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(encode_advance_query_context_domain(advance, domain))
+        }
+        UpdateQueryContext::RenewLease(renew) => Ok(encode_renew_lease(renew)),
     }
 }
 
@@ -564,7 +546,7 @@ fn freeze_targets(
 pub(crate) struct NativeTaskOperationSink {
     targets: BTreeMap<BackendProcessId, TaskBackendTarget>,
     transport: TransportBudget,
-    wire: Arc<dyn TaskOperationWire>,
+    attempt: AttemptWireFacts,
     acks: TaskAckIntakeHandle,
     data_runtime: FrontendDataRuntime,
 }
@@ -582,14 +564,14 @@ impl NativeTaskOperationSink {
     pub(crate) fn new(
         backends: &[(BackendProcessId, RuntimeEndpoint)],
         transport: TransportBudget,
-        wire: Arc<dyn TaskOperationWire>,
+        attempt: AttemptWireFacts,
         acks: TaskAckIntakeHandle,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, String> {
         Ok(Self {
             targets: freeze_targets(backends, &data_runtime)?,
             transport,
-            wire,
+            attempt,
             acks,
             data_runtime,
         })
@@ -662,10 +644,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
         let mut operations = Vec::with_capacity(batch.operations().len());
         let mut sent = Vec::with_capacity(batch.operations().len());
         for intent in batch.operations() {
-            let encoded = self
-                .wire
-                .content_for(intent)
-                .and_then(|content| encode_operation(intent, content));
+            let encoded = encode_operation(intent, &self.attempt);
             match encoded {
                 Ok(operation) => {
                     operations.push(operation);
@@ -735,7 +714,6 @@ impl TaskOperationSink for NativeTaskOperationSink {
         let client = target.client.clone();
         let endpoint = target.endpoint.clone();
         let acks = self.acks.clone();
-        let wire = Arc::clone(&self.wire);
         let data_runtime = self.data_runtime.clone();
         // A submission never blocks on a round trip: the batch leaves on the
         // role's runtime and its receipts come back through the intake, which
@@ -746,7 +724,6 @@ impl TaskOperationSink for NativeTaskOperationSink {
                     client,
                     endpoint,
                     data_runtime,
-                    wire,
                     acks,
                 },
                 request,
@@ -763,7 +740,6 @@ struct ApplySend {
     client: Client,
     endpoint: NativeEndpoint,
     data_runtime: FrontendDataRuntime,
-    wire: Arc<dyn TaskOperationWire>,
     acks: TaskAckIntakeHandle,
 }
 
@@ -1557,12 +1533,11 @@ mod tests {
     }
 
     /// A seam double for operations that need no retained typed content.
-    #[derive(Debug)]
-    struct NeutralWire;
-
-    impl TaskOperationWire for NeutralWire {
-        fn content_for(&self, _intent: &OperationIntent) -> Result<OperationWireContent, String> {
-            Ok(OperationWireContent::Neutral)
+    /// The attempt-level wire facts every test sink carries.
+    fn test_attempt_facts() -> AttemptWireFacts {
+        AttemptWireFacts {
+            query_options: proto::QueryOptions::default(),
+            native_compatibility_id: None,
         }
     }
 
@@ -1942,7 +1917,7 @@ mod tests {
         let sink = NativeTaskOperationSink::new(
             &[(backend, loopback.endpoint.clone())],
             TransportBudget::DEFAULT,
-            Arc::new(NeutralWire),
+            test_attempt_facts(),
             acks.handle(),
             data_runtime,
         )

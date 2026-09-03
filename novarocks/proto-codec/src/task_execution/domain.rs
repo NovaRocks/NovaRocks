@@ -177,6 +177,10 @@ const SHARED_FILTER_DOMAIN_TAG: &[u8] = b"novarocks.task_execution.shared_dynami
 /// owners have to agree on.
 pub struct WireCredential {
     pairs: Vec<VendedCredentialLease>,
+    /// The received bytes of both halves, retained so a rotation re-encodes to
+    /// exactly what arrived rather than to whatever a re-encode of the decoded
+    /// value would produce.
+    descriptors: Vec<novarocks::CredentialLeaseDescriptor>,
     envelopes: Vec<novarocks::CredentialLeaseSecretEnvelope>,
     encoded_len: usize,
 }
@@ -245,6 +249,7 @@ impl WireCredential {
         }
         Ok(Self {
             pairs,
+            descriptors: descriptors.to_vec(),
             envelopes: envelopes.to_vec(),
             encoded_len: envelopes.iter().map(Message::encoded_len).sum(),
         })
@@ -266,6 +271,10 @@ impl WireCredential {
     }
 
     /// The envelopes, for the backend's credential slot owner.
+    pub fn descriptors(&self) -> &[novarocks::CredentialLeaseDescriptor] {
+        &self.descriptors
+    }
+
     pub fn envelopes(&self) -> &[novarocks::CredentialLeaseSecretEnvelope] {
         &self.envelopes
     }
@@ -510,6 +519,71 @@ pub fn encode_task_domain(value: &DecodedTaskDomain) -> novarocks::TaskDomainUpd
     novarocks::TaskDomainUpdate {
         domain: Some(domain),
     }
+}
+
+/// Encodes one query-context domain change the owner holds neutrally.
+///
+/// The credential arm is the reason this cannot be shared with its task-scoped
+/// sibling: its payload is a secret, so it is recovered through the
+/// confidential projection rather than the ordinary one, and the whole lease
+/// table travels with every rotation.
+pub fn encode_neutral_query_context_domain(
+    value: &QueryContextDomainUpdate,
+    path: FieldPath,
+) -> Result<novarocks::QueryContextDomainUpdate, ProtocolError> {
+    let domain = match value {
+        QueryContextDomainUpdate::CatalogBinding { version, payload } => {
+            let catalog_set =
+                stored_message::<novarocks_proto_models::catalog::CatalogSet>(payload.as_ref())
+                    .ok_or_else(|| {
+                        invalid(
+                            path.field("catalog_binding"),
+                            "catalog binding payload is not a codec-produced catalog set",
+                        )
+                    })?;
+            novarocks::query_context_domain_update::Domain::CatalogBinding(
+                novarocks::QueryContextCatalogDomain {
+                    version: version.get(),
+                    catalog_set: Some(catalog_set.clone()),
+                },
+            )
+        }
+        QueryContextDomainUpdate::SharedDynamicFilter { version, payload } => {
+            let contribution =
+                stored_message::<novarocks::RuntimeFilterContribution>(payload.as_ref())
+                    .ok_or_else(|| {
+                        invalid(
+                            path.field("shared_dynamic_filter"),
+                            "shared filter payload is not a codec-produced contribution",
+                        )
+                    })?;
+            novarocks::query_context_domain_update::Domain::SharedDynamicFilter(
+                novarocks::QueryContextSharedDynamicFilterDomain {
+                    version: version.get(),
+                    contribution: Some(contribution.clone()),
+                },
+            )
+        }
+        QueryContextDomainUpdate::Credential(update) => {
+            let material = stored_credential(update.material().as_ref()).ok_or_else(|| {
+                invalid(
+                    path.field("credential"),
+                    "credential payload is not codec-produced material",
+                )
+            })?;
+            novarocks::query_context_domain_update::Domain::Credential(
+                novarocks::QueryContextCredentialDomain {
+                    lease_id: update.lease_id().get(),
+                    epoch: update.epoch().get(),
+                    descriptors: material.descriptors().to_vec(),
+                    envelopes: material.envelopes().to_vec(),
+                },
+            )
+        }
+    };
+    Ok(novarocks::QueryContextDomainUpdate {
+        domain: Some(domain),
+    })
 }
 
 /// Encodes one task-scoped domain change the owner holds neutrally.
