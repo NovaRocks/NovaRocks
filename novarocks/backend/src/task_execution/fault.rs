@@ -74,6 +74,36 @@ pub(super) fn lease_renewal_ack_dropped(
     )
 }
 
+/// Refuses every lease renewal of this attempt for as long as the fault stays
+/// armed, so the lease genuinely expires.
+///
+/// This is the failure path a single dropped acknowledgement cannot reach: the
+/// frontend resends a lost renewal and the lease survives, which is exactly
+/// what `lease-renewal-ack-drop` asserts. Letting the lease run out instead is
+/// what makes the backend stand its tasks down, and the arming is therefore
+/// matched without being consumed -- consuming it would let the second renewal
+/// through and keep the lease alive.
+pub(super) fn lease_renewal_stopped(context: QueryContextRef) -> Result<bool, tonic::Status> {
+    let Some(scope) = match_persistent(
+        QueryLifecycleFaultKind::LeaseRenewalStop,
+        context.query_execution_id(),
+        context.backend_process_id(),
+    )?
+    else {
+        return Ok(false);
+    };
+    let execution = context.query_execution_id();
+    eprintln!(
+        "NOVAROCKS_TASK_LEASE_RENEWAL_STOPPED execution_id={}:{}:{} backend_index={} token={}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        scope.backend_index,
+        scope.token,
+    );
+    Ok(true)
+}
+
 /// Drops the acknowledgement of one admitted `CreateTask`.
 ///
 /// It claims only on an accepted create, so a converging duplicate or a
@@ -201,6 +231,42 @@ fn drop_context_ack(
         scope.token,
     );
     Err(tonic::Status::deadline_exceeded(detail))
+}
+
+#[cfg(debug_assertions)]
+fn match_persistent(
+    kind: QueryLifecycleFaultKind,
+    execution_id: QueryExecutionId,
+    process_id: BackendProcessId,
+) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, tonic::Status> {
+    let Some(root) = novarocks_failpoint::configured_root() else {
+        return Ok(None);
+    };
+    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
+        .map_err(|_| tonic::Status::failed_precondition("lifecycle fault backend index is unset"))?
+        .parse::<usize>()
+        .map_err(|error| {
+            tonic::Status::failed_precondition(format!(
+                "invalid lifecycle fault backend index: {error}"
+            ))
+        })?;
+    novarocks_failpoint::match_persistent_fault(
+        &root,
+        kind,
+        execution_id,
+        backend_index,
+        process_id,
+    )
+    .map_err(tonic::Status::failed_precondition)
+}
+
+#[cfg(not(debug_assertions))]
+fn match_persistent(
+    _kind: QueryLifecycleFaultKind,
+    _execution_id: QueryExecutionId,
+    _process_id: BackendProcessId,
+) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, tonic::Status> {
+    Ok(None)
 }
 
 #[cfg(debug_assertions)]

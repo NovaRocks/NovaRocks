@@ -80,6 +80,12 @@ pub enum QueryLifecycleFaultKind {
     /// counterpart in the retired lifecycle: the query execution lease is a
     /// domain the task protocol introduced.
     LeaseRenewalAckDrop,
+    /// Stops answering lease renewals for the rest of the attempt, rather
+    /// than dropping one acknowledgement. The lease then genuinely expires and
+    /// the backend must stand its tasks down -- the failure path the retired
+    /// protocol's heartbeat-loss case asserted, which a single dropped
+    /// acknowledgement cannot reach because the frontend simply resends it.
+    LeaseRenewalStop,
     StageConflictAfterApply,
     StartDigestCorrupt,
     ObservationForeignParticipant,
@@ -94,7 +100,7 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
         Self::InitAckDrop,
         Self::StageAckDrop,
         Self::StartAckDrop,
@@ -123,6 +129,7 @@ impl QueryLifecycleFaultKind {
         Self::CreateTaskAckDrop,
         Self::TaskStatusSubscriptionDrop,
         Self::LeaseRenewalAckDrop,
+        Self::LeaseRenewalStop,
         Self::StageConflictAfterApply,
         Self::StartDigestCorrupt,
         Self::ObservationForeignParticipant,
@@ -163,6 +170,7 @@ impl QueryLifecycleFaultKind {
             Self::CreateTaskAckDrop => "create-task-ack-drop",
             Self::TaskStatusSubscriptionDrop => "task-status-subscription-drop",
             Self::LeaseRenewalAckDrop => "lease-renewal-ack-drop",
+            Self::LeaseRenewalStop => "lease-renewal-stop",
             Self::StageConflictAfterApply => "stage-conflict-after-apply",
             Self::StartDigestCorrupt => "start-digest-corrupt",
             Self::ObservationForeignParticipant => "observation-foreign-participant",
@@ -190,7 +198,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 24] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 25] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -213,6 +221,7 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 24] = [
     QueryLifecycleFaultKind::CreateTaskAckDrop,
     QueryLifecycleFaultKind::TaskStatusSubscriptionDrop,
     QueryLifecycleFaultKind::LeaseRenewalAckDrop,
+    QueryLifecycleFaultKind::LeaseRenewalStop,
     QueryLifecycleFaultKind::StageConflictAfterApply,
     QueryLifecycleFaultKind::StartDigestCorrupt,
     QueryLifecycleFaultKind::ObservationForeignParticipant,
@@ -424,6 +433,36 @@ mod typed {
         let trigger = trigger_path(root, backend_index, kind);
         publish_new(&trigger, serialize_scope(&scope).as_bytes())?;
         fs::remove_file(&arm).map_err(|error| format!("consume {}: {error}", arm.display()))?;
+        Ok(Some(scope))
+    }
+
+    /// Matches an armed fault without consuming it.
+    ///
+    /// A one-shot claim answers "perturb this one operation". Some faults have
+    /// to answer "keep perturbing every one of these until the attempt ends" --
+    /// a lease that genuinely expires needs every renewal refused, not one.
+    /// Consuming the trigger would make the second renewal succeed and the
+    /// lease survive, which is the opposite of what such a case asserts.
+    pub fn match_persistent_fault(
+        root: &Path,
+        kind: QueryLifecycleFaultKind,
+        execution_id: QueryExecutionId,
+        backend_index: usize,
+        process_id: BackendProcessId,
+    ) -> Result<Option<QueryLifecycleFaultScope>, String> {
+        let trigger = trigger_path(root, backend_index, kind);
+        let contents = match fs::read_to_string(&trigger) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read {}: {error}", trigger.display())),
+        };
+        let scope = parse_scope(&contents)?;
+        if scope.execution_id != execution_id
+            || scope.backend_index != backend_index
+            || scope.process_id != process_id
+        {
+            return Ok(None);
+        }
         Ok(Some(scope))
     }
 
@@ -664,14 +703,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 34);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 35);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 24);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 25);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)

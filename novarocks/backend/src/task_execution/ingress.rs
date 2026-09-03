@@ -136,6 +136,17 @@ impl RegistryTaskExecutionIngress {
                         "decoded query context command has no neutral projection",
                     ));
                 };
+                // Checked before the renewal is applied, not after: this
+                // fault has to prevent the extension itself so the lease can
+                // run out. Dropping the answer afterwards is the other fault,
+                // and the frontend survives that one by resending.
+                if matches!(&neutral, UpdateQueryContext::RenewLease(_))
+                    && fault::lease_renewal_stopped(context)?
+                {
+                    return Err(tonic::Status::deadline_exceeded(
+                        "runner-owned lease renewal refused so the lease expires",
+                    ));
+                }
                 let receipt = self.registry.update_query_context(&neutral);
                 match &neutral {
                     UpdateQueryContext::Establish(_) => {
