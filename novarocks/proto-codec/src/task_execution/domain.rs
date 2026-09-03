@@ -512,6 +512,65 @@ pub fn encode_task_domain(value: &DecodedTaskDomain) -> novarocks::TaskDomainUpd
     }
 }
 
+/// Encodes one task-scoped domain change the owner holds neutrally.
+///
+/// The neutral update carries its payload behind a fingerprint, so this
+/// projects it back to the message it was built from. A payload this codec did
+/// not produce, or one holding a different message than its domain implies, is
+/// refused: encoding it as an empty or default body would put a request on the
+/// wire that says something the owner never decided.
+pub fn encode_neutral_task_domain(
+    value: &TaskDomainUpdate,
+    path: FieldPath,
+) -> Result<novarocks::TaskDomainUpdate, ProtocolError> {
+    let domain = match value {
+        TaskDomainUpdate::SplitAssignment(intent) => {
+            let assignment = stored_message::<
+                novarocks_proto_models::connector_read::SplitAssignment,
+            >(intent.payload().as_ref())
+            .ok_or_else(|| {
+                invalid(
+                    path.field("split_assignment"),
+                    "split assignment payload is not a codec-produced assignment",
+                )
+            })?;
+            novarocks::task_domain_update::Domain::SplitAssignment(
+                novarocks::TaskSplitAssignmentDomain {
+                    assignment: Some(assignment.clone()),
+                },
+            )
+        }
+        TaskDomainUpdate::TaskDynamicFilter { version, payload } => {
+            let envelope = stored_message::<novarocks_proto_models::filter::RuntimeFilterEnvelope>(
+                payload.as_ref(),
+            )
+            .ok_or_else(|| {
+                invalid(
+                    path.field("dynamic_filter"),
+                    "dynamic filter payload is not a codec-produced runtime filter envelope",
+                )
+            })?;
+            novarocks::task_domain_update::Domain::DynamicFilter(
+                novarocks::TaskDynamicFilterDomain {
+                    version: version.get(),
+                    envelope: Some(envelope.clone()),
+                },
+            )
+        }
+        TaskDomainUpdate::OpenExchangeEdges { version, edges } => {
+            novarocks::task_domain_update::Domain::OpenExchangeEdges(
+                novarocks::OpenExchangeEdgesDomain {
+                    version: version.get(),
+                    edge_ids: edges.iter().map(|edge| edge.get()).collect(),
+                },
+            )
+        }
+    };
+    Ok(novarocks::TaskDomainUpdate {
+        domain: Some(domain),
+    })
+}
+
 /// One decoded query-context domain change, with its typed content retained.
 pub enum DecodedQueryContextDomain {
     CatalogBinding {

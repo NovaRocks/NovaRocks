@@ -1545,6 +1545,37 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn a_neutral_task_domain_encodes_back_to_what_it_was_decoded_from() {
+        use super::domain::{decode_task_domain, encode_neutral_task_domain};
+
+        // The frontend holds its domains neutrally, behind a fingerprint. If
+        // the encode direction could not project them back, the only way to
+        // put one on the wire would be to rebuild it from the neutral fields
+        // -- and the split payload has no neutral form at all, so that would
+        // silently ship an empty assignment.
+        let wire = novarocks::TaskDomainUpdate {
+            domain: Some(novarocks::task_domain_update::Domain::SplitAssignment(
+                novarocks::TaskSplitAssignmentDomain {
+                    assignment: Some(novarocks_proto_models::connector_read::SplitAssignment {
+                        plan_node_id: 7,
+                        // The terminal marker with no splits: the case a task
+                        // that received nothing still has to hear, and the one
+                        // whose payload has no neutral form to rebuild from.
+                        no_more_splits: true,
+                        splits: Vec::new(),
+                    }),
+                },
+            )),
+        };
+        let decoded =
+            decode_task_domain(&wire, FieldPath::root("domain")).expect("a legal assignment");
+        let reencoded =
+            encode_neutral_task_domain(&decoded.as_neutral(), FieldPath::root("domain"))
+                .expect("a decoded domain re-encodes");
+        assert_eq!(reencoded, wire, "the round trip changed the request");
+    }
+
+    #[test]
     fn every_accepted_domain_receipt_survives_a_round_trip() {
         use super::operation::{
             decode_query_context_domain_receipt, decode_task_domain_receipt,
