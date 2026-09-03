@@ -607,9 +607,30 @@ impl NativeTaskExecutionHost {
         // Queue state classifies duplicates before any provider payload is
         // decoded, so a retransmission at or below the watermark never
         // recovers provider data.
-        let preflight = queue
-            .preflight_sequences(node, &sequences)
-            .map_err(split_queue_rejection)?;
+        // A delivery that lands after this plan node stopped taking input is
+        // moot, not illegal. The queue closes when the consumer needs nothing
+        // more, which is ordinary early termination: a LIMIT that already has
+        // its rows, an exchange whose downstream went away. The frontend
+        // cannot know that happened, so it has done nothing wrong by still
+        // delivering, and the splits are genuinely unneeded -- refusing them
+        // fails a query that had already read everything it asked for.
+        //
+        // The answer is the node's measured depth, not an absent one: the
+        // frontend refuses a receipt with no depth, correctly, because an
+        // unreported depth is not zero. A closed queue can still be measured,
+        // so this reports what it actually holds rather than defaulting.
+        //
+        // The case that stays a refusal is the frontend contradicting itself,
+        // sending more splits to a node it already sealed. The queue reports
+        // that separately as AfterNoMoreSplits under the Protocol category,
+        // so respecting its own distinction is all this needs.
+        let preflight = match queue.preflight_sequences(node, &sequences) {
+            Ok(preflight) => preflight,
+            Err(error) if error.kind() == SplitQueueErrorKind::Closed => {
+                return Ok(queue.stats().queued_splits as u64);
+            }
+            Err(error) => return Err(split_queue_rejection(error)),
+        };
         let new_splits: Vec<_> = assignment
             .splits()
             .iter()
@@ -635,9 +656,13 @@ impl NativeTaskExecutionHost {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| protocol(format!("split payload is not decodable: {error}")))?
         };
-        let outcome = queue
-            .offer_splits(node, received, assignment.no_more_splits())
-            .map_err(split_queue_rejection)?;
+        let outcome = match queue.offer_splits(node, received, assignment.no_more_splits()) {
+            Ok(outcome) => outcome,
+            Err(error) if error.kind() == SplitQueueErrorKind::Closed => {
+                return Ok(queue.stats().queued_splits as u64);
+            }
+            Err(error) => return Err(split_queue_rejection(error)),
+        };
         // Acceptance evidence for distributed runs: it proves a real remote
         // assignment reached this task, which a single-process smoke cannot
         // show. The retired fragment service emitted this from its own
@@ -1329,6 +1354,9 @@ fn split_queue_rejection(error: SplitQueueError) -> HostRejection {
         | SplitQueueErrorKind::SequenceConflict
         | SplitQueueErrorKind::AfterNoMoreSplits => TaskFailureCategory::Protocol,
     };
+    if error.kind() == SplitQueueErrorKind::Closed {
+        return HostRejection::from_closed_queue(category, error.to_string());
+    }
     HostRejection::new(category, error.to_string())
 }
 

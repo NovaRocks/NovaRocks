@@ -47,32 +47,52 @@ use super::status::TaskStatusReporter;
 /// task's status can never be widened into free-form text or a different
 /// category on the way.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostRejection(TaskFailure);
+pub struct HostRejection {
+    failure: TaskFailure,
+    /// This rejection is "the plan node stopped taking input", which a caller
+    /// holding a replay may treat as moot rather than illegal. It is a
+    /// separate flag rather than a category because the category is what
+    /// reaches a task's status, and this distinction must not widen that
+    /// vocabulary.
+    closed_queue: bool,
+}
 
 impl HostRejection {
     pub fn new(category: TaskFailureCategory, detail: impl AsRef<str>) -> Self {
-        Self(TaskFailure::new(
-            category,
-            SafeDetail::truncating(detail.as_ref()),
-        ))
+        Self {
+            failure: TaskFailure::new(category, SafeDetail::truncating(detail.as_ref())),
+            closed_queue: false,
+        }
+    }
+
+    /// The same rejection, marked as caused by a closed plan-node queue.
+    pub fn from_closed_queue(category: TaskFailureCategory, detail: impl AsRef<str>) -> Self {
+        Self {
+            closed_queue: true,
+            ..Self::new(category, detail)
+        }
+    }
+
+    pub const fn is_closed_queue(&self) -> bool {
+        self.closed_queue
     }
 
     pub const fn failure(&self) -> &TaskFailure {
-        &self.0
+        &self.failure
     }
 
     pub const fn category(&self) -> TaskFailureCategory {
-        self.0.category()
+        self.failure.category()
     }
 
     pub const fn detail(&self) -> &SafeDetail {
-        self.0.detail()
+        self.failure.detail()
     }
 }
 
 impl fmt::Display for HostRejection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        self.failure.fmt(formatter)
     }
 }
 

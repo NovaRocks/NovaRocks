@@ -211,10 +211,25 @@ pub(super) fn apply_planned(
     let mut queued = Vec::with_capacity(updates.len());
     for (update, progression) in updates.iter().zip(plan) {
         if reaches_execution(update, *progression) {
-            queued.push(
-                host.apply_task_domain(descriptor, update)
-                    .map_err(rejection_from_host)?,
-            );
+            match host.apply_task_domain(descriptor, update) {
+                Ok(depth) => queued.push(depth),
+                Err(rejection) => {
+                    // The only place this reason exists. The frontend's
+                    // acknowledgement carries the outcome but not the detail,
+                    // so a refused domain update reaches the client as a bare
+                    // "answered with InvalidStateOrRequest" and an operator
+                    // has nothing to act on.
+                    tracing::warn!(
+                        task = %descriptor.identity(),
+                        kind = ?update.kind(),
+                        progression = ?progression,
+                        category = ?rejection.category(),
+                        detail = %rejection.detail(),
+                        "task domain update refused by the execution host"
+                    );
+                    return Err(rejection_from_host(rejection));
+                }
+            }
         } else {
             // Nothing reached a queue, so nothing was measured. The receipt
             // reports the retained token without a depth rather than the depth
