@@ -41,9 +41,11 @@
 //! steps.
 
 mod clock;
+mod context_host;
 mod credential_slot;
 mod domains;
 mod entry;
+mod execution_host;
 mod host;
 pub(crate) mod ingress;
 mod observation;
@@ -56,7 +58,12 @@ mod status;
 mod tests;
 
 pub use clock::{BackendMonotonicClock, ManualClock, ProcessMonotonicClock};
+pub use context_host::NativeQueryContextHost;
 pub use credential_slot::QueryContextCredentialSlot;
+pub use execution_host::{
+    InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, TaskInboundCapabilities,
+    TaskQueryContextFacts,
+};
 pub use host::{
     HostRejection, QueryContextHost, RunnableTask, SharedFactsRequest, TaskDynamicFilterRead,
     TaskExecutionHost,
