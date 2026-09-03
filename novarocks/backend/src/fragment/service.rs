@@ -1185,11 +1185,7 @@ fn consume_terminal_fact(
 }
 
 fn profiler_for_native_fragment(root_plan_node_id: i32) -> Profiler {
-    let profiler = Profiler::new(format!(
-        "execute_fragment_native (plan_node_id={root_plan_node_id})"
-    ));
-    profiler.set_metadata(i64::from(root_plan_node_id));
-    profiler
+    novarocks_execution::runtime::profile::fragment_root_profiler(root_plan_node_id)
 }
 
 #[cfg(test)]

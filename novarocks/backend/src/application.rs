@@ -39,14 +39,22 @@ use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
 use crate::rpc::task_execution::TaskExecutionIngress;
 use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
 use crate::task_execution::{
-    HostRejection, QueryContextHost, RegistryTaskExecutionIngress, RunnableTask,
-    SharedFactsRequest, TaskExecutionHost, TaskExecutionRegistry, TaskExecutionRegistryConfig,
+    RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
+};
+// Only the refusing hosts below name these, and they exist for one test.
+#[cfg(test)]
+use crate::task_execution::{
+    HostRejection, QueryContextHost, RunnableTask, SharedFactsRequest, TaskExecutionHost,
     TaskStatusReporter,
 };
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
+#[cfg(test)]
 use novarocks_execution::task_execution::descriptor::TaskDescriptor;
+#[cfg(test)]
 use novarocks_execution::task_execution::identity::QueryContextRef;
+#[cfg(test)]
 use novarocks_execution::task_execution::operation::{QueryContextDomainUpdate, TaskDomainUpdate};
+#[cfg(test)]
 use novarocks_execution::task_execution::status::TaskFailureCategory;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 
@@ -305,6 +313,7 @@ struct BackendApplicationServices {
 }
 
 /// What the two unrouted hosts below report.
+#[cfg(test)]
 const UNROUTED_DETAIL: &str = "the native task protocol has no execution binding in this process";
 
 /// The query-context half of the execution binding the task protocol owner

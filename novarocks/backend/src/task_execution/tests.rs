@@ -209,6 +209,15 @@ impl HostLedger {
 struct HostGate {
     open: Mutex<bool>,
     changed: Condvar,
+    /// How many host calls have reached this gate.
+    ///
+    /// This is the only honest rendezvous for "the owner is inside its
+    /// creation transaction". Counting in-flight operations is not: that
+    /// becomes true when an operation enters its scope, which is *before* the
+    /// identity is elected, so a test waiting on it can race ahead and become
+    /// the creation owner itself -- and then block on a gate only it could
+    /// open.
+    entered: AtomicUsize,
 }
 
 impl HostGate {
@@ -216,11 +225,17 @@ impl HostGate {
         Self {
             open: Mutex::new(true),
             changed: Condvar::new(),
+            entered: AtomicUsize::new(0),
         }
+    }
+
+    fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
     }
 
     fn wait(&self) {
         let mut open = self.open.lock().expect("host gate");
+        self.entered.fetch_add(1, Ordering::SeqCst);
         while !*open {
             open = self.changed.wait(open).expect("host gate");
         }
@@ -732,7 +747,7 @@ fn a_conflicting_descriptor_fails_closed() {
 #[test]
 fn a_conflicting_descriptor_does_not_preempt_a_creation_in_progress() {
     let fixture = Fixture::new();
-    let context = fixture.establish(1);
+    fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
 
     // Hold the creation owner inside its transaction, before its receiver is
@@ -746,7 +761,7 @@ fn a_conflicting_descriptor_does_not_preempt_a_creation_in_progress() {
     // thread into a run that never ends, which is worse than a failure: it
     // takes the whole suite with it and says nothing about why.
     let rendezvous = std::time::Instant::now();
-    while fixture.registry.in_flight_operations(context) == 0 {
+    while fixture.task_host.install_gate.entered() == 0 {
         assert!(
             rendezvous.elapsed() < std::time::Duration::from_secs(30),
             "the creation owner never reached its install gate"

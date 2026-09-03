@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use novarocks_execution::connector::{
@@ -54,12 +54,14 @@ use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkK
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeEdgeGates, ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort,
-    FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
+    FragmentEvent, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
 };
 use novarocks_execution::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, FragmentTerminalFact,
     RunningFragmentHandle, prepare_fragment,
 };
+use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
+use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_execution::task_execution::descriptor::{
     ExchangeSource, IngressRejection, TaskDescriptor,
@@ -77,6 +79,7 @@ use novarocks_spi::connector::{
     CatalogHandle, ConnectorStorageResolver, read_stack::ConnectorSession,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
+use tracing::debug;
 
 use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
 use crate::fragment::decode::plan::context::{
@@ -312,6 +315,123 @@ struct TaskRuntime {
     read_context: Arc<TypedReadAttemptContext>,
     delivery_expire: Duration,
     query_expire: Duration,
+    /// This task's metrics owner, retained so `submit_runnable` can hand it
+    /// the status reporter that only exists once the task is runnable.
+    operator_statistics: Arc<TaskOperatorStatisticsSink>,
+}
+
+/// Delivers one fragment's events to every owner that has a claim on them.
+///
+/// A task's events answer to two owners at once: the query context folds
+/// runtime-filter evidence under the installed consumer identity, and the task
+/// itself owns its metrics. Neither may see the other's facts, and neither may
+/// be the one that decides the other's delivery, so the fragment is handed a
+/// fan-out rather than a sink that quietly does both jobs.
+struct CompositeFragmentEventSink {
+    sinks: Vec<Arc<dyn FragmentEventSink>>,
+}
+
+impl CompositeFragmentEventSink {
+    fn new(sinks: Vec<Arc<dyn FragmentEventSink>>) -> Self {
+        Self { sinks }
+    }
+}
+
+impl FragmentEventSink for CompositeFragmentEventSink {
+    fn record(&self, event: FragmentEvent) {
+        for sink in &self.sinks {
+            sink.record(event.clone());
+        }
+    }
+}
+
+/// The task's own metrics owner: it turns this fragment's profile into the
+/// operator statistics its final info carries.
+///
+/// The reporter is bound late because it does not exist yet when the fragment
+/// is prepared: the creation transaction mints it only for `submit_runnable`,
+/// the last install step. Until then this sink has nothing to report onto and
+/// says so by dropping the event, rather than buffering statistics for a task
+/// that may never become runnable.
+struct TaskOperatorStatisticsSink {
+    fragment_instance_id: UniqueId,
+    /// `None` when the query did not ask for a profile. Without one there is
+    /// no counter to read, which is a different statement from an operator
+    /// that ran and counted nothing.
+    profiler: Option<Profiler>,
+    reporter: OnceLock<TaskStatusReporter>,
+}
+
+impl TaskOperatorStatisticsSink {
+    fn new(fragment_instance_id: UniqueId, profiler: Option<Profiler>) -> Self {
+        Self {
+            fragment_instance_id,
+            profiler,
+            reporter: OnceLock::new(),
+        }
+    }
+
+    /// Binds the status reporter this task's statistics are recorded onto.
+    fn bind(&self, reporter: TaskStatusReporter) {
+        // Set once: a second reporter would address a second task, and this
+        // sink belongs to exactly one.
+        let _ = self.reporter.set(reporter);
+    }
+
+    /// Records the operator statistics one profile tree attributes.
+    ///
+    /// The reporter owns the entry bound and its truncation marker, so the
+    /// whole attributed list is handed over rather than pre-trimmed here.
+    fn record_profile(&self, profile: &RuntimeProfileTree) {
+        let Some(reporter) = self.reporter.get() else {
+            return;
+        };
+        let projection = project_operator_statistics(profile);
+        if projection.unattributed_operators() > 0 {
+            // Named, not folded: these operators belong to no plan node, so
+            // there is no honest node to report them under.
+            debug!(
+                "fragment {} profile carries {} operator(s) with no plan node; they are not \
+                 reported as operator statistics",
+                self.fragment_instance_id,
+                projection.unattributed_operators()
+            );
+        }
+        reporter.record_operator_statistics(projection.into_statistics());
+    }
+
+    /// Records from the profiler this sink holds, if the query asked for one.
+    fn record_current(&self) {
+        if let Some(profiler) = self.profiler.as_ref() {
+            self.record_profile(&profiler.to_native_tree());
+        }
+    }
+}
+
+impl FragmentEventSink for TaskOperatorStatisticsSink {
+    fn record(&self, event: FragmentEvent) {
+        match event {
+            // A snapshot carries its own tree, so it is reported as given
+            // rather than re-read from this sink's profiler: the two are not
+            // required to be the same profile.
+            FragmentEvent::ProfileSnapshot(snapshot) => {
+                debug_assert_eq!(snapshot.fragment_instance_id(), self.fragment_instance_id);
+                self.record_profile(snapshot.profile());
+            }
+            // Progress is the sampling tick. It carries whole-fragment totals,
+            // which say nothing per operator, so the tick is used only as the
+            // moment to read the operators' own counters.
+            FragmentEvent::Progress(progress) => {
+                debug_assert_eq!(progress.fragment_instance_id(), self.fragment_instance_id);
+                self.record_current();
+            }
+            // Runtime-filter evidence answers to the query context's filter
+            // participant. Folding it here would put two unrelated facts
+            // behind one identity.
+            FragmentEvent::RuntimeFilterRowEffect(_)
+            | FragmentEvent::RuntimeFilterScanUnitOutcome(_) => {}
+        }
+    }
 }
 
 const CAPABILITY_LOCK: &str = "task inbound capability lock";
@@ -549,6 +669,13 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         }
         let expects_bindings = request.has_runtime_filter_bindings();
         let (delivery_expire, query_expire) = request.query_expire_durations();
+        // Profiling is the query's decision, exactly as it is on the
+        // fragment-based path. Without it there is no per-operator counter to
+        // read, and this task's final info reports no operator statistics
+        // rather than reporting zeroes it never measured.
+        let profiler = request
+            .enable_profile()
+            .then(|| fragment_root_profiler(request.root_plan_node_id()));
         let submission = request.into_submission();
         // Same reasoning for parallelism: preparing at the plan's value would
         // run the task at a degree the frontend never agreed to.
@@ -567,6 +694,20 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 ))
             })?;
 
+        // Installed before preparation because preparation may already create
+        // workers that retain the sink; binding its reporter comes later,
+        // because the reporter is minted only for `submit_runnable`.
+        let operator_statistics = Arc::new(TaskOperatorStatisticsSink::new(
+            kernel_key,
+            profiler.clone(),
+        ));
+        let event_sink: Arc<dyn FragmentEventSink> =
+            Arc::new(CompositeFragmentEventSink::new(vec![
+                self.context_facts
+                    .runtime_filter_event_sink(execution, kernel_key),
+                Arc::clone(&operator_statistics) as Arc<dyn FragmentEventSink>,
+            ]));
+
         let runtime_filter =
             self.context_facts
                 .runtime_filter_session(execution, kernel_key, expects_bindings)?;
@@ -584,12 +725,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             })?;
         let context = admission
             .into_prepare_context(
-                None,
+                profiler,
                 Arc::clone(&self.exchange_transmitter),
                 Arc::clone(&self.lookup_client),
                 Arc::clone(&self.result_writer),
-                self.context_facts
-                    .runtime_filter_event_sink(execution, kernel_key),
+                event_sink,
             )
             .with_fragment_commit_port(Arc::clone(&self.commit_port))
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
@@ -618,6 +758,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 read_context,
                 delivery_expire,
                 query_expire,
+                operator_statistics,
             }),
         );
         lease.retain();
@@ -697,12 +838,17 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // can block on an empty queue.
         runtime.read_context.publish();
 
+        // The metrics owner can only report onto a task that has a reporter,
+        // and this is the first moment one exists.
+        runtime.operator_statistics.bind(reporter.clone());
+
         let task = Arc::new(NativeRunnableTask::new(identity, kernel_key));
         let worker = Arc::clone(&task);
         let queries = self.queries.clone();
         let split_queues = Arc::clone(&self.split_queues);
         let attempt = runtime.attempt;
         let sink_kind = runtime.sink_kind;
+        let operator_statistics = Arc::clone(&runtime.operator_statistics);
         std::thread::Builder::new()
             .name(format!(
                 "native-task-{:x}-{:x}",
@@ -727,6 +873,16 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 // task would run to completion after being told to stop.
                 worker.attach(Arc::new(running.clone()));
                 let fact = running.join();
+                // The sampling tick stops firing the moment the drivers
+                // finish, so the last event-driven snapshot predates the rows
+                // the operators counted on their way out. The terminal fact
+                // carries the profile as frozen at the end, and recording it
+                // here — before the terminal state is published — is what puts
+                // final numbers in a final info rather than stale ones. A task
+                // that was asked for no profile has nothing to read here.
+                if let Some(profile) = fact.profile() {
+                    operator_statistics.record_profile(profile);
+                }
                 report_terminal(&reporter, sink_kind, &fact, worker.stand_down());
                 worker.finish();
                 split_queues.close_attempt(attempt);
@@ -1058,8 +1214,9 @@ fn resource_exhausted(detail: impl AsRef<str>) -> HostRejection {
 #[cfg(test)]
 mod tests {
     use super::{
-        FragmentStandDown, InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost,
-        StandDown, TaskInboundCapabilities, TaskQueryContextFacts, report_terminal,
+        CompositeFragmentEventSink, FragmentStandDown, InboundFrameAdmission, NativeRunnableTask,
+        NativeTaskExecutionHost, StandDown, TaskInboundCapabilities, TaskOperatorStatisticsSink,
+        TaskQueryContextFacts, report_terminal,
     };
 
     use std::num::{NonZeroU32, NonZeroUsize};
@@ -1073,12 +1230,14 @@ mod tests {
         ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
     use novarocks_execution::runtime::fragment::io::{
-        FragmentEventSink, NoopFragmentEventSink, UnavailableExchangeReceiverPort,
+        FragmentEvent, FragmentEventSink, FragmentProgress, NoopFragmentEventSink,
+        UnavailableExchangeReceiverPort,
     };
     use novarocks_execution::runtime::fragment::{
         FragmentCancelReason, FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
         FragmentTerminalFact,
     };
+    use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
     use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
     use novarocks_execution::task_execution::descriptor::{
         ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource, ExchangeTopology,
@@ -1090,7 +1249,9 @@ mod tests {
     };
     use novarocks_execution::task_execution::identity::TaskIdentity;
     use novarocks_execution::task_execution::operation::TaskDomainUpdate;
-    use novarocks_execution::task_execution::status::{AbortCause, CancelReason, TaskState};
+    use novarocks_execution::task_execution::status::{
+        AbortCause, CancelReason, TaskOutputFacts, TaskState,
+    };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
     use novarocks_proto_models::{
@@ -1139,6 +1300,15 @@ mod tests {
         kernel_key: UniqueId,
         pipeline_dop: i32,
     ) -> Arc<dyn PhysicalFragmentPlan> {
+        wire_plan_with_profile(query, kernel_key, pipeline_dop, false)
+    }
+
+    fn wire_plan_with_profile(
+        query: QueryId,
+        kernel_key: UniqueId,
+        pipeline_dop: i32,
+        enable_profile: bool,
+    ) -> Arc<dyn PhysicalFragmentPlan> {
         let wire = WireFragmentPlan::parse(
             proto::TaskFragmentPlan {
                 plan: Some(plan::PlanFragment {
@@ -1177,6 +1347,7 @@ mod tests {
                     backend_num: 3,
                     query_options: Some(proto::QueryOptions {
                         pipeline_dop,
+                        enable_profile,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -2207,6 +2378,180 @@ mod tests {
         );
 
         await_terminal(&owner);
+        host.remove_receiver(&descriptor);
+    }
+
+    // -------------------------------------------------- operator statistics
+
+    /// Records every event it is handed, so a fan-out can be observed.
+    #[derive(Default)]
+    struct CountingEventSink {
+        seen: AtomicUsize,
+    }
+
+    impl FragmentEventSink for CountingEventSink {
+        fn record(&self, _event: FragmentEvent) {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Catches a composition that hands a task's events to one owner only.
+    /// The query context folds runtime-filter evidence and the task owns its
+    /// metrics; whichever sink were dropped would lose its facts silently,
+    /// because a fragment reports through exactly one sink handle.
+    #[test]
+    fn a_composed_event_sink_delivers_each_event_to_every_owner() {
+        let filters = Arc::new(CountingEventSink::default());
+        let metrics = Arc::new(CountingEventSink::default());
+        let composite = CompositeFragmentEventSink::new(vec![
+            Arc::clone(&filters) as Arc<dyn FragmentEventSink>,
+            Arc::clone(&metrics) as Arc<dyn FragmentEventSink>,
+        ]);
+
+        composite.record(FragmentEvent::Progress(FragmentProgress::new(
+            UniqueId::new(1, 2),
+            0,
+            0,
+            0,
+        )));
+
+        assert_eq!(filters.seen.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.seen.load(Ordering::SeqCst), 1);
+    }
+
+    /// Catches a metrics sink that reports onto a task that has no reporter
+    /// yet. Preparation can already create workers that hold the sink, and the
+    /// reporter is minted only when the task becomes runnable.
+    #[test]
+    fn a_metrics_sink_without_a_reporter_records_nothing_rather_than_panicking() {
+        let kernel_key = UniqueId::new(11, 12);
+        let profiler = RuntimeProfile::new("execute_fragment_native (plan_node_id=10)");
+        let sink = TaskOperatorStatisticsSink::new(kernel_key, Some(profiler));
+
+        sink.record(FragmentEvent::Progress(FragmentProgress::new(
+            kernel_key, 0, 0, 0,
+        )));
+    }
+
+    /// Catches a metrics sink that reports statistics for a query that asked
+    /// for no profile. Without a profiler there is no counter to read, and a
+    /// list of zeroes would claim measurements nothing took.
+    #[test]
+    fn a_metrics_sink_without_a_profiler_reports_no_statistics() {
+        let task = identity(40, 1, 1);
+        let kernel_key = UniqueId::new(13, 14);
+        let (owner, reporter) = reporter_for(task);
+        let sink = TaskOperatorStatisticsSink::new(kernel_key, None);
+        sink.bind(reporter.clone());
+
+        sink.record(FragmentEvent::Progress(FragmentProgress::new(
+            kernel_key, 0, 0, 0,
+        )));
+        reporter.running();
+        reporter.finished(TaskOutputFacts::new(true));
+
+        let final_info = owner.final_info().expect("a terminal task has final info");
+        assert!(final_info.operator_statistics().is_empty());
+        assert!(!final_info.operator_statistics_truncated());
+    }
+
+    /// Catches a progress tick that reports whole-fragment totals as if they
+    /// were one operator's, instead of reading the operators' own counters.
+    #[test]
+    fn a_progress_tick_reports_the_operators_counters_not_the_fragment_totals() {
+        let task = identity(41, 1, 1);
+        let kernel_key = UniqueId::new(15, 16);
+        let (owner, reporter) = reporter_for(task);
+        let profiler = RuntimeProfile::new("execute_fragment_native (plan_node_id=10)");
+        let common = profiler
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)")
+            .child("ValuesSource (id=10)")
+            .child("CommonMetrics");
+        common.counter_set("PushRowNum", ProfileUnit::Unit, 0);
+        common.counter_set("PullRowNum", ProfileUnit::Unit, 7);
+        let sink = TaskOperatorStatisticsSink::new(kernel_key, Some(profiler));
+        sink.bind(reporter.clone());
+
+        // The tick carries zeroes for the whole fragment; the operator counted
+        // seven rows. The recorded statistics must be the operator's.
+        sink.record(FragmentEvent::Progress(FragmentProgress::new(
+            kernel_key, 0, 0, 0,
+        )));
+        reporter.running();
+        reporter.finished(TaskOutputFacts::new(true));
+
+        let final_info = owner.final_info().expect("a terminal task has final info");
+        let entries = final_info.operator_statistics();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].plan_node_id(), 10);
+        assert_eq!(entries[0].operator().as_str(), "ValuesSource");
+        assert_eq!(entries[0].output_rows(), Some(7));
+    }
+
+    /// Catches the whole production wiring: a profiled task must carry its
+    /// operators' facts in the final info the frontend reads, keyed by the
+    /// plan node the plan named. Before this producer existed the field was
+    /// always empty, so an `EXPLAIN ANALYZE` over the task protocol had
+    /// nothing to render.
+    #[test]
+    fn a_profiled_task_reports_its_operator_statistics_in_its_final_info() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let task = identity(42, 1, 1);
+        let kernel_key = UniqueId::new(271, 272);
+        let descriptor = descriptor_with(
+            task,
+            kernel_key,
+            1,
+            ExchangeTopology::default(),
+            wire_plan_with_profile(task.query_execution_id().query_id(), kernel_key, 1, true),
+        );
+        let (owner, reporter) = reporter_for(task);
+
+        host.install_receiver(&descriptor).expect("prepares");
+        let _runnable = host
+            .submit_runnable(&descriptor, reporter)
+            .expect("a prepared fragment starts");
+        assert_eq!(await_terminal(&owner), TaskState::Finished);
+
+        let final_info = owner.final_info().expect("a terminal task has final info");
+        let entries = final_info.operator_statistics();
+        // The fixture plan is one VALUES node feeding a NOOP sink. The VALUES
+        // operator names plan node 10; the NOOP sink names no plan node at all
+        // and is therefore refused rather than attributed to node 10.
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected only the plan-node-bearing operator, got {entries:?}"
+        );
+        assert_eq!(entries[0].plan_node_id(), 10);
+        assert_eq!(entries[0].operator().as_str(), "ValuesSource");
+        assert!(!final_info.operator_statistics_truncated());
+
+        host.remove_receiver(&descriptor);
+    }
+
+    /// Catches a wiring that profiles every task regardless of what the query
+    /// asked for. Profiling is the query's decision, and a task that was not
+    /// asked to measure must report nothing rather than zeroes.
+    #[test]
+    fn an_unprofiled_task_reports_no_operator_statistics() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let task = identity(43, 1, 1);
+        let descriptor = consistent_descriptor(task, UniqueId::new(281, 282));
+        let (owner, reporter) = reporter_for(task);
+
+        host.install_receiver(&descriptor).expect("prepares");
+        let _runnable = host
+            .submit_runnable(&descriptor, reporter)
+            .expect("a prepared fragment starts");
+        assert_eq!(await_terminal(&owner), TaskState::Finished);
+
+        let final_info = owner.final_info().expect("a terminal task has final info");
+        assert!(final_info.operator_statistics().is_empty());
+
         host.remove_receiver(&descriptor);
     }
 }

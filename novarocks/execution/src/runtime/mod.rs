@@ -10,6 +10,7 @@ pub mod fragment;
 pub mod io;
 pub mod mem_tracker;
 pub mod observable;
+pub mod operator_statistics;
 pub mod profile;
 pub mod query_options;
 pub mod runtime_state;

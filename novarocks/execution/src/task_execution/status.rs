@@ -905,6 +905,23 @@ impl OperatorStatistics {
         self
     }
 
+    /// Records only the rows that entered the operator.
+    ///
+    /// The two row counts are separate options because a profile can carry one
+    /// counter and not the other. Forcing a producer through `with_rows` would
+    /// make it invent the missing half as zero, which claims the operator
+    /// observed no rows rather than that it reported none.
+    pub const fn with_input_rows(mut self, input: u64) -> Self {
+        self.input_rows = Some(input);
+        self
+    }
+
+    /// Records only the rows that left the operator.
+    pub const fn with_output_rows(mut self, output: u64) -> Self {
+        self.output_rows = Some(output);
+        self
+    }
+
     pub const fn with_wall_time(mut self, value: Duration) -> Self {
         self.wall_time = Some(value);
         self

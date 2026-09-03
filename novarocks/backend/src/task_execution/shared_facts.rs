@@ -31,7 +31,7 @@
 //! Nothing else in the backend may name a wire type to get at a payload.
 
 use novarocks_execution::task_execution::descriptor::PhysicalFragmentPlan;
-use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_execution::task_execution::domain::CodecOwnedContent;
 use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::operation::CredentialUpdate;
 use novarocks_execution::task_execution::status::TaskFailureCategory;

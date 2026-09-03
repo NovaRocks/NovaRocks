@@ -82,6 +82,19 @@ pub fn merge_pipeline_profiles(profiler: &Profiler) -> Profiler {
 pub const RUNTIME_FILTER_INPUT_ROWS: &str = "RuntimeFilterInputRows";
 pub const RUNTIME_FILTER_OUTPUT_ROWS: &str = "RuntimeFilterOutputRows";
 
+/// The root profile of one fragment instance.
+///
+/// The root's name carries the fragment's own plan-node id, which is how every
+/// reader keys a tree back to the fragment that produced it. Both role-side
+/// fragment entrypoints build it here so that key has one spelling.
+pub fn fragment_root_profiler(root_plan_node_id: i32) -> Profiler {
+    let profiler = Profiler::new(format!(
+        "execute_fragment_native (plan_node_id={root_plan_node_id})"
+    ));
+    profiler.set_metadata(i64::from(root_plan_node_id));
+    profiler
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProfileUnit {
     Unit,

@@ -766,6 +766,49 @@ mod tests {
         );
     }
 
+    /// Catches a decoder that requires both row counts before reporting
+    /// either. The producing profile carries the two counters independently,
+    /// so demanding the pair would turn a counter that was measured into one
+    /// that was never reported.
+    #[test]
+    fn one_operator_row_count_survives_the_wire_without_the_other() {
+        use super::status::{decode_final_task_info, encode_final_task_info};
+        use novarocks_execution::task_execution::{FinalTaskInfo, OperatorStatistics};
+
+        let process = backend();
+        let task = identity(2, 5, process);
+        let terminal = TaskStatus::try_new(
+            task,
+            TaskStatusVersion::new(3).expect("nonzero"),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("legal");
+        let info = FinalTaskInfo::try_new(
+            task,
+            terminal,
+            vec![
+                OperatorStatistics::new(7, SafeDetail::new("SCAN").expect("fits"))
+                    .with_output_rows(11),
+            ],
+            false,
+        )
+        .expect("legal");
+
+        let decoded = decode_final_task_info(
+            task,
+            &encode_final_task_info(&info),
+            FieldPath::root("info"),
+        )
+        .expect("a half pair is legal");
+
+        let entries = decoded.operator_statistics();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].input_rows(), None);
+        assert_eq!(entries[0].output_rows(), Some(11));
+    }
+
     #[test]
     fn an_absent_state_and_the_client_only_outcomes_have_no_wire_form() {
         assert_eq!(encode_query_context_state(QueryContextState::Absent), None);

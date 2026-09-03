@@ -396,8 +396,15 @@ pub fn decode_final_task_info(
         let entry_path = path.clone().field("operator_statistics").index(index);
         let operator = decode_safe_detail(&entry.operator, entry_path.field("operator"))?;
         let mut stats = OperatorStatistics::new(entry.plan_node_id, operator);
-        if let (Some(input), Some(output)) = (entry.input_rows, entry.output_rows) {
-            stats = stats.with_rows(input, output);
+        // The two row counts are decoded independently because the wire, the
+        // domain type and the producing profile all model them independently.
+        // Requiring both would drop a counter the producer did observe and
+        // report it as never observed.
+        if let Some(input) = entry.input_rows {
+            stats = stats.with_input_rows(input);
+        }
+        if let Some(output) = entry.output_rows {
+            stats = stats.with_output_rows(output);
         }
         if let Some(millis) = entry.wall_time_millis {
             stats = stats.with_wall_time(Duration::from_millis(millis));
