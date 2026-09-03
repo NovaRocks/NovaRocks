@@ -590,6 +590,15 @@ pub struct FrontendDistributedQueryCoordinator {
     /// Validated once at startup from the timeouts the composition root froze;
     /// query admission consumes it rather than re-reading configuration.
     lifecycle_config: FrontendQueryLifecycleConfig,
+    /// Every bound the task protocol runs one attempt with, frozen at startup.
+    ///
+    /// Held rather than read per attempt so a deployment's bounds cannot change
+    /// while the process runs.
+    #[expect(
+        dead_code,
+        reason = "the cutover reads these when it assembles a round"
+    )]
+    task_execution_budgets: novarocks_execution::task_execution::TaskExecutionBudgets,
     pre_start_timeout: Duration,
     task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
     connector_split_initial_dynamic_filter_wait_cap: Duration,
@@ -661,6 +670,7 @@ impl FrontendDistributedQueryCoordinator {
         query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
         task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
         connector_split_initial_dynamic_filter_wait_cap: Duration,
+        task_execution_budgets: novarocks_execution::task_execution::TaskExecutionBudgets,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, DistributedQueryError> {
@@ -693,6 +703,7 @@ impl FrontendDistributedQueryCoordinator {
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
             data_runtime,
             lifecycle_config,
+            task_execution_budgets,
             pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
             task_update_retry_policy,
             connector_split_initial_dynamic_filter_wait_cap,
@@ -750,6 +761,8 @@ impl FrontendDistributedQueryCoordinator {
     ) -> Self {
         let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
+            task_execution_budgets:
+                novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
             report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
                 report_endpoint,
             )),
@@ -825,6 +838,8 @@ impl FrontendDistributedQueryCoordinator {
     ) -> Self {
         let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
+            task_execution_budgets:
+                novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
             report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
                 report_endpoint,
             )),

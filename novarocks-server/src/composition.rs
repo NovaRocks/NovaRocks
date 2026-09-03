@@ -43,7 +43,7 @@ use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
 use novarocks_execution::task_execution::{
-    DispatchBudget, LeaseBounds, OperationWaitCaps, TransportBudget,
+    DispatchBudget, LeaseBounds, OperationWaitCaps, TaskExecutionBudgets, TransportBudget,
 };
 use novarocks_frontend::{
     CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
@@ -569,7 +569,10 @@ pub fn compose_frontend_server_config(
             Duration::from_millis(runtime_config.query_control_task_update_retry_max_backoff_ms),
         )
         .map_err(|error| anyhow::anyhow!("construct task update retry policy: {error}"))?,
-    );
+    )
+    // Composed and validated here, then frozen: the coordinator never reads a
+    // process-global configuration per attempt.
+    .with_task_execution_budgets(compose_task_execution_budgets(config)?);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
         execution =
@@ -638,16 +641,6 @@ pub fn compose_frontend_server_config(
         native_trust: std::sync::Arc::clone(native_trust.trust()),
         native_transport: frontend_native_transport(native_trust.transport()),
     })
-}
-
-/// Every budget the native task protocol runs one attempt with.
-#[derive(Clone, Copy, Debug)]
-pub struct TaskExecutionBudgets {
-    pub dispatch: DispatchBudget,
-    pub wait_caps: OperationWaitCaps,
-    pub lease_bounds: LeaseBounds,
-    pub transport: TransportBudget,
-    pub status_subscription_error_budget: u32,
 }
 
 /// Materializes the task protocol's budgets from one validated role config.

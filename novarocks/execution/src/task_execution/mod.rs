@@ -58,12 +58,13 @@ pub use lease::{
 };
 pub use operation::{
     AbortQueryContext, AdvanceQueryContextDomain, CancelTask, CreateTask, CreateTaskReceipt,
-    CredentialUpdate, DispatchBudget, DispatchLane, EstablishQueryContext, FetchTaskDynamicFilters,
-    FrontendAction, GetFinalTaskInfo, MaxWait, MaxWaitError, OperationEnvelope, OperationKind,
-    OperationOutcome, OperationWaitCaps, PlanNodeSplitReceipt, QueryContextDomainReceipt,
-    QueryContextDomainUpdate, QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
-    RenewQueryExecutionLease, RequestError, SplitAssignmentIntent, TaskDomainReceipt,
-    TaskDomainUpdate, TransportBudget, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    CredentialUpdate, DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget, DispatchLane,
+    EstablishQueryContext, FetchTaskDynamicFilters, FrontendAction, GetFinalTaskInfo, MaxWait,
+    MaxWaitError, OperationEnvelope, OperationKind, OperationOutcome, OperationWaitCaps,
+    PlanNodeSplitReceipt, QueryContextDomainReceipt, QueryContextDomainUpdate, QueryContextReceipt,
+    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, RequestError,
+    SplitAssignmentIntent, TaskDomainReceipt, TaskDomainUpdate, TaskExecutionBudgets,
+    TransportBudget, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
 };
 pub use status::{
     AbortCause, CancelReason, DynamicFilterAdvertisement, FinalInfoDisagreement, FinalTaskInfo,

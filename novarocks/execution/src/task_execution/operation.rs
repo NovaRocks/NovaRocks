@@ -650,6 +650,44 @@ pub enum DispatchLane {
     Lifecycle,
 }
 
+/// Every budget the native task protocol runs one attempt with.
+///
+/// Grouped because they are configured together and validated together: a
+/// deployment that tightens one of them has to hand the whole set to the owner
+/// in one move, and an owner given only some of them would have to invent the
+/// rest.
+#[derive(Clone, Copy, Debug)]
+pub struct TaskExecutionBudgets {
+    pub dispatch: DispatchBudget,
+    pub wait_caps: OperationWaitCaps,
+    pub lease_bounds: crate::task_execution::lease::LeaseBounds,
+    pub transport: TransportBudget,
+    /// How many consecutive status subscription failures one attempt tolerates
+    /// before it reports the observation lost rather than retrying in silence.
+    pub status_subscription_error_budget: u32,
+}
+
+impl TaskExecutionBudgets {
+    /// The frozen contract values.
+    ///
+    /// Not invented defaults: each member's own `DEFAULT` is the number the
+    /// protocol froze, and a deployment tightens them through configuration
+    /// rather than starting from nothing.
+    pub const DEFAULT: Self = Self {
+        dispatch: DispatchBudget::DEFAULT,
+        wait_caps: OperationWaitCaps::DEFAULT,
+        lease_bounds: crate::task_execution::lease::LeaseBounds::DEFAULT,
+        transport: TransportBudget::DEFAULT,
+        status_subscription_error_budget: DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET,
+    };
+}
+
+/// How many consecutive status subscription failures one attempt tolerates.
+///
+/// Small on purpose: a subscription that keeps failing is an observation loss,
+/// and reporting that is more useful than retrying in silence.
+pub const DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET: u32 = 8;
+
 /// Payload and queue budgets of the operation transport.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct TransportBudget {

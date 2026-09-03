@@ -1692,7 +1692,7 @@ fn default_task_lease_max_ms() -> u64 {
 /// No neutral type owns this number: the protocol requires the budget to be
 /// bounded without fixing its size, so the deployment owns it.
 fn default_task_status_subscription_error_budget() -> u32 {
-    8
+    novarocks_execution::task_execution::DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET
 }
 
 fn duration_millis(value: Duration) -> u64 {
