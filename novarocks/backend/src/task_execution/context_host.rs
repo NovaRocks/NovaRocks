@@ -237,7 +237,13 @@ impl NativeQueryContextHost {
     /// scoped storage access resolves it through here, and a context that was
     /// never established or has already been released has none — there is no
     /// process-level credential to fall back to.
-    pub fn storage_resolver(
+    /// The resolver one established context installed.
+    ///
+    /// Named apart from the `TaskQueryContextFacts` method of the same shape:
+    /// that one is keyed by execution id and refuses when there is no context,
+    /// and two same-named methods keyed differently is how a caller reaches
+    /// the wrong one.
+    pub fn storage_resolver_for_context(
         &self,
         context: QueryContextRef,
     ) -> Option<Arc<dyn ConnectorStorageResolver>> {
@@ -258,6 +264,28 @@ impl NativeQueryContextHost {
     /// A running task names its query execution and nothing else, so this is
     /// how the task side of execution reaches the shared facts of the context
     /// it belongs to.
+    /// The runtime-filter participant this query installed on this backend.
+    ///
+    /// `None` covers both "no filter on this backend" and "the context is
+    /// gone"; the caller decides which of those is an error, because only it
+    /// knows whether its plan binds a filter.
+    fn participant_for_execution(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Option<Arc<RuntimeFilterParticipant>> {
+        let context = self.context_for_execution(execution)?;
+        let contexts = self
+            .contexts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let installed = contexts.get(context)?;
+        let facts = installed
+            .facts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        facts.participant.clone()
+    }
+
     pub fn context_for_execution(&self, execution: QueryExecutionId) -> Option<QueryContextRef> {
         self.contexts
             .lock()
@@ -1164,7 +1192,7 @@ mod tests {
         assert!(
             fixture
                 .host
-                .storage_resolver(context)
+                .storage_resolver_for_context(context)
                 .expect("an active context resolves storage")
                 .resolve_vended_s3(&storage_request("s3://bucket/a/file.parquet"))
                 .is_ok(),
@@ -1193,7 +1221,7 @@ mod tests {
             1
         );
         assert!(
-            fixture.host.storage_resolver(context).is_none(),
+            fixture.host.storage_resolver_for_context(context).is_none(),
             "a released context has no credential authority"
         );
 
@@ -1230,7 +1258,7 @@ mod tests {
             "the participant installed before the failing step must be closed"
         );
         assert!(
-            fixture.host.storage_resolver(context).is_none(),
+            fixture.host.storage_resolver_for_context(context).is_none(),
             "a refused establish must not leave credential material resident"
         );
     }
@@ -1292,12 +1320,83 @@ mod tests {
             1,
             "the participant installed before the cancellation must be closed exactly once"
         );
-        assert!(fixture.host.storage_resolver(context).is_none());
+        assert!(fixture.host.storage_resolver_for_context(context).is_none());
     }
 
     /// A release that arrives before its establish is called exactly once by
     /// the owner, so the establish that follows must refuse rather than install
     /// facts nothing will take back.
+    #[test]
+    fn a_task_that_binds_a_filter_is_refused_when_its_context_installed_none() {
+        use crate::task_execution::execution_host::TaskQueryContextFacts;
+
+        // Answering `None` here would let the scan run unfiltered and call the
+        // result correct. A query that installs no filter on this backend is
+        // the ordinary case and must still be answered `None`, so the two are
+        // distinguished by what the task's own plan binds.
+        let fixture = Fixture::new();
+        let context = context(1);
+        fixture
+            .establish(
+                context,
+                vec![catalog_properties()],
+                no_contribution(),
+                &credential(1, SECRET_SENTINEL, live_until()),
+            )
+            .expect("an establish with no filter participant is legal");
+
+        let execution = context.query_execution_id();
+        let finst = novarocks_types::UniqueId::new(4, 5);
+        assert!(
+            fixture
+                .host
+                .runtime_filter_session(execution, finst, false)
+                .expect("a task that binds none is answered")
+                .is_none()
+        );
+        match fixture.host.runtime_filter_session(execution, finst, true) {
+            Err(refusal) => assert_eq!(refusal.category(), TaskFailureCategory::Protocol),
+            Ok(_) => panic!("a task that binds a filter has nothing to bind to"),
+        }
+    }
+
+    #[test]
+    fn storage_credentials_are_refused_rather_than_defaulted() {
+        use crate::task_execution::execution_host::TaskQueryContextFacts;
+
+        // There is no process-level credential a scan could legitimately fall
+        // back to, so an unestablished or released context must fail the
+        // task's preparation instead of deferring the failure to read time,
+        // where it would surface as an object-store error with no context.
+        let fixture = Fixture::new();
+        let context = context(1);
+        let execution = context.query_execution_id();
+
+        match TaskQueryContextFacts::storage_resolver(fixture.host.as_ref(), execution) {
+            Err(refusal) => assert_eq!(refusal.category(), TaskFailureCategory::Protocol),
+            Ok(_) => panic!("an unestablished context holds no credentials"),
+        }
+
+        fixture
+            .establish(
+                context,
+                vec![catalog_properties()],
+                no_contribution(),
+                &credential(1, SECRET_SENTINEL, live_until()),
+            )
+            .expect("establish");
+        assert!(TaskQueryContextFacts::storage_resolver(fixture.host.as_ref(), execution).is_ok());
+
+        fixture.host.release(context);
+        match TaskQueryContextFacts::storage_resolver(fixture.host.as_ref(), execution) {
+            Err(refusal) => {
+                assert_eq!(refusal.category(), TaskFailureCategory::Protocol);
+                assert!(!refusal.detail().as_str().contains(SECRET_SENTINEL));
+            }
+            Ok(_) => panic!("a released context holds no credentials either"),
+        }
+    }
+
     #[test]
     fn an_unreadable_establish_after_a_release_leaves_no_marker_behind() {
         // A released marker is consumed only by the materialize that answers
@@ -1366,7 +1465,7 @@ mod tests {
             0,
             "no provider may be bound for a context that was already released"
         );
-        assert!(fixture.host.storage_resolver(context).is_none());
+        assert!(fixture.host.storage_resolver_for_context(context).is_none());
     }
 
     /// The empty contribution is how a query with no runtime filter establishes.
@@ -1440,7 +1539,7 @@ mod tests {
             "no provider may be bound for a request that cannot be projected"
         );
         assert_eq!(fixture.query_leases(), 0);
-        assert!(fixture.host.storage_resolver(context).is_none());
+        assert!(fixture.host.storage_resolver_for_context(context).is_none());
     }
 
     /// A second establish must not silently replace the first context's facts.
@@ -1476,7 +1575,7 @@ mod tests {
             "the refused establish must not have built a second participant"
         );
         // The first context is untouched.
-        assert!(fixture.host.storage_resolver(context).is_some());
+        assert!(fixture.host.storage_resolver_for_context(context).is_some());
     }
 
     /// A rotation replaces only the credential slot.
@@ -1520,7 +1619,7 @@ mod tests {
         assert!(
             fixture
                 .host
-                .storage_resolver(context)
+                .storage_resolver_for_context(context)
                 .expect("still active")
                 .resolve_vended_s3(&storage_request("s3://bucket/a/file.parquet"))
                 .is_ok()
@@ -1554,7 +1653,7 @@ mod tests {
         assert!(
             fixture
                 .host
-                .storage_resolver(context)
+                .storage_resolver_for_context(context)
                 .expect("still active")
                 .resolve_vended_s3(&storage_request("s3://bucket/a/file.parquet"))
                 .is_ok(),
@@ -1713,7 +1812,12 @@ mod tests {
                 .is_err(),
             "a released context must not accept a rotation"
         );
-        assert!(fixture.host.storage_resolver(released).is_none());
+        assert!(
+            fixture
+                .host
+                .storage_resolver_for_context(released)
+                .is_none()
+        );
     }
 
     /// A close that does not complete must still leave the context releasable.
@@ -1745,7 +1849,7 @@ mod tests {
             0,
             "a failed close must not hold the catalog leases open"
         );
-        assert!(fixture.host.storage_resolver(context).is_none());
+        assert!(fixture.host.storage_resolver_for_context(context).is_none());
 
         fixture.host.release(context);
         assert_eq!(
@@ -1792,5 +1896,202 @@ mod tests {
         let update = credential(3, SECRET_SENTINEL, live_until());
         let rendered = format!("{update:?}");
         assert!(!rendered.contains(SECRET_SENTINEL), "{rendered}");
+    }
+}
+
+/// The query-scoped facts one task's preparation needs.
+///
+/// The execution side only ever holds a `&TaskDescriptor`, and a `TaskIdentity`
+/// carries no frontend process id, so it structurally cannot name a
+/// `QueryContextRef`. This maps the execution id it does have onto the context
+/// that installed the facts, and refuses when there is none: an unestablished
+/// or released context has no runtime filter, no catalog lease, and no
+/// storage credential, and there is no process-level substitute for any of
+/// them that a task could legitimately fall back to.
+use novarocks_execution::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
+use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
+use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_proto_codec::task_execution::domain::stored_message;
+use novarocks_proto_models::filter;
+use novarocks_types::UniqueId;
+
+use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
+use crate::task_execution::execution_host::TaskQueryContextFacts;
+use novarocks_spi::connector::CatalogHandle;
+
+impl TaskQueryContextFacts for NativeQueryContextHost {
+    fn runtime_filter_session(
+        &self,
+        execution: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        expects_bindings: bool,
+    ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
+        let Some(participant) = self.participant_for_execution(execution) else {
+            // A query that installs no filter on this backend is the ordinary
+            // case; a task whose plan binds one and finds none is not, because
+            // it would otherwise read unfiltered and call that success.
+            return if expects_bindings {
+                Err(protocol(&format!(
+                    "task of {execution:?} binds a runtime filter but its query context installed \
+                     none on this backend"
+                )))
+            } else {
+                Ok(None)
+            };
+        };
+        participant
+            .session_for_fragment(execution, fragment_instance_id, expects_bindings)
+            .map_err(|error| protocol(&format!("runtime filter session refused: {error}")))
+    }
+
+    fn runtime_filter_event_sink(
+        &self,
+        execution: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+    ) -> Arc<dyn FragmentEventSink> {
+        Arc::new(ContextRuntimeFilterEventSink {
+            participant: self.participant_for_execution(execution),
+            fragment_instance_id,
+        })
+    }
+
+    fn deliver_task_dynamic_filter(
+        &self,
+        execution: QueryExecutionId,
+        _fragment_instance_id: UniqueId,
+        version: DomainVersion,
+        payload: &Arc<dyn CodecOwnedContent>,
+    ) -> Result<(), HostRejection> {
+        let envelope = stored_message::<filter::RuntimeFilterEnvelope>(payload.as_ref())
+            .ok_or_else(|| {
+                internal(&format!(
+                    "task dynamic filter version {} is not a codec-produced runtime filter \
+                     envelope",
+                    version.get()
+                ))
+            })?
+            .clone();
+        let participant = self.participant_for_execution(execution).ok_or_else(|| {
+            protocol(&format!(
+                "task dynamic filter for {execution:?} has no installed participant to accept it"
+            ))
+        })?;
+        // The one decoder that turns a wire envelope into a backend one lives
+        // in the runtime-filter transport. Reusing it is what keeps this from
+        // becoming a second authority over the same wire shape.
+        let response = crate::runtime_filter::rpc::handle_runtime_filter_envelope(
+            participant as Arc<dyn crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress>,
+            envelope,
+        )
+        .map_err(|status| protocol(&format!("task dynamic filter was refused: {status}")))?;
+        // A duplicate is a legal answer to a replayed push; only a rejection
+        // or an unknown status means the filter did not land.
+        let accepted = matches!(
+            filter::RuntimeFilterAcceptStatus::try_from(response.accept_status),
+            Ok(filter::RuntimeFilterAcceptStatus::Accepted
+                | filter::RuntimeFilterAcceptStatus::Duplicate)
+        );
+        if !accepted {
+            return Err(protocol(&format!(
+                "task dynamic filter version {} was not accepted: {}",
+                version.get(),
+                response.rejection_reason
+            )));
+        }
+        Ok(())
+    }
+
+    fn catalog_read_execution(
+        &self,
+        execution: QueryExecutionId,
+        handle: &CatalogHandle,
+    ) -> Result<ConnectorExecutionReadBinding, String> {
+        let runtime = self
+            .catalog_manager
+            .resolve_for_query(execution, handle)
+            .ok_or_else(|| missing_catalog_lease(handle))?;
+        runtime
+            .read()
+            .cloned()
+            .ok_or_else(|| missing_catalog_capability(handle, "read"))
+    }
+
+    fn catalog_write_execution(
+        &self,
+        execution: QueryExecutionId,
+        handle: &CatalogHandle,
+    ) -> Result<ConnectorExecutionWriteBinding, String> {
+        let runtime = self
+            .catalog_manager
+            .resolve_for_query(execution, handle)
+            .ok_or_else(|| missing_catalog_lease(handle))?;
+        runtime
+            .write()
+            .cloned()
+            .ok_or_else(|| missing_catalog_capability(handle, "write"))
+    }
+
+    fn storage_resolver(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Result<Arc<dyn ConnectorStorageResolver>, HostRejection> {
+        // Deliberately a refusal, not a permissive default: a scan that
+        // reached read time with no vended credential would fail there anyway,
+        // and failing here says which context is missing.
+        self.context_for_execution(execution)
+            .and_then(|context| self.storage_resolver_for_context(context))
+            .ok_or_else(|| {
+                protocol(&format!(
+                    "no established query context on this backend holds storage credentials for \
+                     {execution:?}"
+                ))
+            })
+    }
+}
+
+fn missing_catalog_lease(handle: &CatalogHandle) -> String {
+    format!(
+        "no query-leased catalog runtime exists for {}@{}",
+        handle.catalog_name().as_str(),
+        handle.version().short_hex()
+    )
+}
+
+fn missing_catalog_capability(handle: &CatalogHandle, capability: &str) -> String {
+    format!(
+        "catalog runtime for {}@{} has no typed {capability} capability",
+        handle.catalog_name().as_str(),
+        handle.version().short_hex()
+    )
+}
+
+/// Folds a running fragment's runtime-filter evidence into the participant
+/// that owns the installed consumer identity.
+///
+/// Progress and profile events are dropped here: they belong to the task's own
+/// metrics owner, which is a different sink. Silently folding them into the
+/// filter participant would put two unrelated facts behind one identity.
+struct ContextRuntimeFilterEventSink {
+    /// Resolved once, when the fragment is installed: the context has
+    /// materialized by then, and a query with no filter on this backend has
+    /// nothing to fold into.
+    participant: Option<Arc<RuntimeFilterParticipant>>,
+    fragment_instance_id: UniqueId,
+}
+
+impl FragmentEventSink for ContextRuntimeFilterEventSink {
+    fn record(&self, event: FragmentEvent) {
+        let Some(participant) = self.participant.as_ref() else {
+            return;
+        };
+        match event {
+            FragmentEvent::RuntimeFilterRowEffect(effect) => {
+                participant.record_row_effect(self.fragment_instance_id, effect);
+            }
+            FragmentEvent::RuntimeFilterScanUnitOutcome(outcome) => {
+                participant.record_scan_unit_outcome(self.fragment_instance_id, outcome);
+            }
+            FragmentEvent::Progress(_) | FragmentEvent::ProfileSnapshot(_) => {}
+        }
     }
 }

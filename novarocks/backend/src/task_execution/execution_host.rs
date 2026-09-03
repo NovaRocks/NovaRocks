@@ -109,6 +109,7 @@ pub trait TaskQueryContextFacts: Send + Sync {
     fn runtime_filter_session(
         &self,
         execution: QueryExecutionId,
+        fragment_instance_id: UniqueId,
         expects_bindings: bool,
     ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection>;
 
@@ -365,6 +366,7 @@ impl NativeTaskExecutionHost {
     fn typed_scan_runtime(
         &self,
         execution: QueryExecutionId,
+        fragment_instance_id: UniqueId,
         read_context: Arc<TypedReadAttemptContext>,
         splits: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
     ) -> Result<TypedScanRuntime, HostRejection> {
@@ -390,7 +392,7 @@ impl NativeTaskExecutionHost {
             // before the task is installed, and a scan that binds a filter
             // must see the same session the fragment was prepared with.
             facts
-                .runtime_filter_session(execution, true)
+                .runtime_filter_session(execution, fragment_instance_id, true)
                 .map_err(|error| format!("resolve task runtime-filter session: {error}"))
         });
         let facts = Arc::clone(&self.context_facts);
@@ -514,8 +516,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // to close it again. The lease does that structurally.
         let mut lease = SplitQueueLease::held(&self.split_queues, attempt);
         let read_context = Arc::new(TypedReadAttemptContext::new());
-        let typed_runtime =
-            self.typed_scan_runtime(execution, Arc::clone(&read_context), Arc::clone(&splits))?;
+        let typed_runtime = self.typed_scan_runtime(
+            execution,
+            kernel_key,
+            Arc::clone(&read_context),
+            Arc::clone(&splits),
+        )?;
 
         let request = NativeFragmentRequest::try_decode_with_runtime(
             execution,
@@ -557,9 +563,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 ))
             })?;
 
-        let runtime_filter = self
-            .context_facts
-            .runtime_filter_session(execution, expects_bindings)?;
+        let runtime_filter =
+            self.context_facts
+                .runtime_filter_session(execution, kernel_key, expects_bindings)?;
         let admission = self
             .queries
             .prepare_admission_execution(
@@ -1275,6 +1281,7 @@ mod tests {
         fn runtime_filter_session(
             &self,
             _execution: QueryExecutionId,
+            _fragment_instance_id: UniqueId,
             _expects_bindings: bool,
         ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
             self.filter_sessions_requested
