@@ -682,14 +682,26 @@ fn compose_backend_application_services(
             )
         })?,
     );
+    // One catalog manager per process, composed here rather than inside the
+    // lifecycle registry: a catalog lease belongs to the process, and two
+    // managers would be two authorities over the same leases.
+    let catalog_manager = Arc::new(
+        crate::connector::catalog_manager::CatalogManager::try_new(catalog_manager_config)
+            .map_err(|error| {
+                BackendApplicationError::new(
+                    BackendApplicationErrorKind::Configuration,
+                    format!("compose backend catalog manager: {error}"),
+                )
+            })?,
+    );
     let query_lifecycle_registry =
         QueryLifecycleRegistry::new_with_runtime_and_execution_role_binding_factories(
             data_runtime.clone(),
             local_runtime,
             query_lifecycle_config,
             native_compatibility_id,
-            execution_role_binding_factories,
-            catalog_manager_config,
+            Arc::clone(&execution_role_binding_factories),
+            Arc::clone(&catalog_manager),
         );
     let native_fragment_service = Arc::new(
         NativeFragmentService::new_with_controls(

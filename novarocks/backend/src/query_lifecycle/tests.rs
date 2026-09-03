@@ -714,7 +714,12 @@ fn registry_with_blocking_catalog_materializer(
         registry_config(8),
         novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         Arc::new(factories),
-        crate::connector::catalog_manager::CatalogManagerConfig::default(),
+        std::sync::Arc::new(
+            crate::connector::catalog_manager::CatalogManager::try_new(
+                crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            )
+            .expect("the default catalog manager configuration is valid"),
+        ),
     )
 }
 

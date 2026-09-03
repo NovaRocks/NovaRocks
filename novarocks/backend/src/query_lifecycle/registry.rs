@@ -253,6 +253,24 @@ fn observation_participant_ref(participant: &ParticipantAttemptRef) -> Participa
     participant.clone()
 }
 
+/// One catalog manager for a registry built without an injected one.
+///
+/// Only the test constructors reach this. Production composes the manager
+/// once and shares it, because it is a process resource that outlives any one
+/// lifecycle stack.
+fn default_catalog_manager() -> Arc<
+    crate::connector::catalog_manager::CatalogManager<
+        crate::connector::ConnectorExecutionRoleBinding,
+    >,
+> {
+    Arc::new(
+        crate::connector::catalog_manager::CatalogManager::try_new(
+            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+        )
+        .expect("the default catalog manager configuration is valid"),
+    )
+}
+
 fn empty_execution_role_binding_factories()
 -> Arc<crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet> {
     Arc::new(
@@ -1428,7 +1446,7 @@ impl QueryLifecycleRegistry {
             terminal_fallback,
             NativeCompatibilityId::new([0x71; 32]),
             empty_execution_role_binding_factories(),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            default_catalog_manager(),
         )
     }
 
@@ -1457,7 +1475,7 @@ impl QueryLifecycleRegistry {
             runtime_filter_factory,
             NativeCompatibilityId::new([0x71; 32]),
             empty_execution_role_binding_factories(),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            default_catalog_manager(),
         )
     }
 
@@ -1478,7 +1496,7 @@ impl QueryLifecycleRegistry {
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
             NativeCompatibilityId::new([0x71; 32]),
             empty_execution_role_binding_factories(),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            default_catalog_manager(),
         )
     }
 
@@ -1494,7 +1512,7 @@ impl QueryLifecycleRegistry {
             config,
             native_compatibility_id,
             empty_execution_role_binding_factories(),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            default_catalog_manager(),
         )
     }
 
@@ -1506,7 +1524,11 @@ impl QueryLifecycleRegistry {
         execution_role_binding_factories: Arc<
             crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet,
         >,
-        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+        catalog_manager: Arc<
+            crate::connector::catalog_manager::CatalogManager<
+                crate::connector::ConnectorExecutionRoleBinding,
+            >,
+        >,
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
             runtime.clone(),
@@ -1518,7 +1540,7 @@ impl QueryLifecycleRegistry {
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
             native_compatibility_id,
             execution_role_binding_factories,
-            catalog_manager_config,
+            catalog_manager,
         )
     }
 
@@ -1538,7 +1560,11 @@ impl QueryLifecycleRegistry {
         execution_role_binding_factories: Arc<
             crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet,
         >,
-        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+        catalog_manager: Arc<
+            crate::connector::catalog_manager::CatalogManager<
+                crate::connector::ConnectorExecutionRoleBinding,
+            >,
+        >,
     ) -> Arc<Self> {
         Self::new_with_backend_identity_and_runtime_filter_factory(
             runtime.clone(),
@@ -1551,7 +1577,7 @@ impl QueryLifecycleRegistry {
             Arc::new(BackendRuntimeFilterParticipantFactory::new(runtime)),
             native_compatibility_id,
             execution_role_binding_factories,
-            catalog_manager_config,
+            catalog_manager,
         )
     }
 
@@ -1572,7 +1598,11 @@ impl QueryLifecycleRegistry {
         execution_role_binding_factories: Arc<
             crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet,
         >,
-        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+        catalog_manager: Arc<
+            crate::connector::catalog_manager::CatalogManager<
+                crate::connector::ConnectorExecutionRoleBinding,
+            >,
+        >,
     ) -> Arc<Self> {
         assert!(config.max_active_entries > 0);
         assert!(config.tombstone_capacity > 0);
@@ -1599,10 +1629,7 @@ impl QueryLifecycleRegistry {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
             catalog_install_runtime,
-            catalog_manager: Arc::new(
-                crate::connector::catalog_manager::CatalogManager::try_new(catalog_manager_config)
-                    .expect("backend catalog manager configuration was validated at startup"),
-            ),
+            catalog_manager,
             execution_role_binding_factories,
             runtime_filter_factory,
             config,
