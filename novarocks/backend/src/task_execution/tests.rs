@@ -33,7 +33,7 @@ use novarocks_execution::task_execution::descriptor::{
 };
 use novarocks_execution::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
-    DomainVersion, PlanNodeId, SplitSequence,
+    DomainProgression, DomainVersion, PlanNodeId, SplitSequence,
 };
 use novarocks_execution::task_execution::identity::{
     QueryContextRef, TaskIdentity, TaskOperationId,
@@ -1729,6 +1729,85 @@ fn a_split_receipt_reports_the_queue_depth_the_offer_left_behind() {
         nodes.first().expect("one plan node").queued_splits(),
         Some(7),
         "the depth the execution side measured must reach the sender"
+    );
+}
+
+#[test]
+fn a_replayed_split_assignment_is_answered_as_a_duplicate_that_still_reports_its_queue_depth() {
+    // What this catches: the receiver classifying a retransmitted split batch
+    // as already covered and then answering with no queue depth, because
+    // nothing new was enqueued. The sender refuses a delivery acknowledgement
+    // that carries no depth -- an unreported depth is not a depth of zero --
+    // so that answer fails the very replay ADR-0123 exists for. The
+    // consequence is that a dropped acknowledgement on a sealed split batch
+    // strands every scan behind it: the batch is never re-delivered, the
+    // deliverer stops before the tasks it had left, and their scans wait for
+    // a terminal marker that never arrives.
+    //
+    // A duplicate is therefore not "nothing happened". It still reaches the
+    // plan node's own queue, which is where ADR-0123 puts duplicate
+    // recognition and the only thing that can measure how full that queue is
+    // now.
+    let fixture = Fixture::new();
+    fixture.establish(1);
+    let identity = fixture.identity(1, 1, 1);
+    fixture.create(identity, 5);
+    fixture.task_host.queued_splits.store(4, Ordering::SeqCst);
+
+    // One sealed, nonempty batch: exactly the shape whose acknowledgement the
+    // fault injection drops.
+    let request = UpdateTask::try_new(
+        TaskOperationId::new_v7(),
+        identity,
+        vec![split_update(3, 1, 3, true, 21)],
+    )
+    .expect("a legal update");
+    let accepted = fixture.registry.update_task(&request);
+    assert_eq!(accepted.outcome(), OperationOutcome::Accepted);
+    assert_eq!(HostLedger::get(&fixture.ledger.task_domains_applied), 1);
+
+    // The identical immutable request, resent because its acknowledgement was
+    // lost. The task's watermark already covers it.
+    let replayed = fixture.registry.update_task(&request);
+    assert_eq!(
+        replayed.outcome(),
+        OperationOutcome::Idempotent,
+        "a replay of an accepted batch is a duplicate, not new work"
+    );
+    assert_eq!(
+        HostLedger::get(&fixture.ledger.task_domains_applied),
+        2,
+        "the replay must still reach the queue that recognises duplicates and \
+         measures its own depth"
+    );
+    let receipt = replayed
+        .acknowledgement()
+        .expect("a duplicate update carries its retained receipt");
+    let novarocks_execution::task_execution::operation::TaskDomainReceipt::SplitAssignment {
+        nodes,
+        progression,
+    } = receipt
+        .domains()
+        .first()
+        .expect("the update carried one domain")
+    else {
+        panic!("a split update produces a split receipt");
+    };
+    assert_eq!(*progression, DomainProgression::Idempotent);
+    let node = nodes.first().expect("one plan node");
+    assert!(
+        node.watermark().no_more_splits(),
+        "the retained watermark still confirms the seal the request asked for"
+    );
+    assert_eq!(
+        node.watermark().accepted_through(),
+        Some(SplitSequence::new(3).expect("nonzero sequence")),
+        "the retained watermark still covers the request's own range"
+    );
+    assert_eq!(
+        node.queued_splits(),
+        Some(4),
+        "a duplicate acknowledgement the sender can act on has to carry a depth"
     );
 }
 

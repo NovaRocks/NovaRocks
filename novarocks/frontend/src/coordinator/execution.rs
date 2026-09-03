@@ -1879,6 +1879,25 @@ impl FrontendDistributedQueryCoordinator {
                     detail,
                 ));
             }
+            // A deliverer that failed will never feed the scans it had left,
+            // so the round cannot reach its own exit and would otherwise run
+            // out the statement deadline reporting the wait instead of the
+            // cause. Read every turn, and only a failure ends the attempt:
+            // a worker that stopped because every source went terminal is the
+            // normal case and says nothing about the query.
+            let delivery_failure = split_assignment
+                .as_mut()
+                .and_then(SplitAssignmentRoundGuard::failure)
+                .map(|error| format!("split assignment stopped delivering: {error}"));
+            if let Some(detail) = delivery_failure {
+                break Err(self.fail_task_round(
+                    query_id,
+                    &mut round,
+                    &split_delivery,
+                    classification,
+                    detail,
+                ));
+            }
 
             if !observed_result_eof && task_is_created(&round, root_task) {
                 let wait = max_root_result_wait(now, statement_deadline);

@@ -210,19 +210,46 @@ pub(super) fn apply_planned(
 ) -> Result<Vec<Option<u64>>, DomainRejection> {
     let mut queued = Vec::with_capacity(updates.len());
     for (update, progression) in updates.iter().zip(plan) {
-        if matches!(progression, DomainProgression::Apply) {
+        if reaches_execution(update, *progression) {
             queued.push(
                 host.apply_task_domain(descriptor, update)
                     .map_err(rejection_from_host)?,
             );
         } else {
-            // Nothing was applied, so nothing was measured. The receipt
-            // reports the retained watermark without a depth rather than the
-            // depth of an offer that never landed.
+            // Nothing reached a queue, so nothing was measured. The receipt
+            // reports the retained token without a depth rather than the depth
+            // of an offer that never landed.
             queued.push(None);
         }
     }
     Ok(queued)
+}
+
+/// Whether one classified update still has to reach the execution side.
+///
+/// A strictly newer token always does. A split assignment the watermark
+/// already covers does as well, and that is not a second application:
+/// ADR-0123 puts duplicate recognition in the plan node's own queue, whose
+/// preflight drops every sequence at or below its watermark before a provider
+/// payload is decoded and whose terminal marker only transitions once. Routing
+/// the replay there is the only thing that makes the retransmission the retry
+/// rule depends on observable at the receiver, and the only thing that can
+/// measure the queue depth the sender reads as backpressure. Withholding that
+/// depth is not a smaller answer: the sender refuses a duplicate
+/// acknowledgement that carries none, which strands every scan queued behind
+/// the sealed batch.
+///
+/// The other two domains have no queue and are not replay-safe down there:
+/// opening an exchange edge and installing a filter payload are applications,
+/// so only a strictly newer token reaches them.
+const fn reaches_execution(update: &TaskDomainUpdate, progression: DomainProgression) -> bool {
+    match progression {
+        DomainProgression::Apply => true,
+        DomainProgression::Idempotent => {
+            matches!(update, TaskDomainUpdate::SplitAssignment(_))
+        }
+        DomainProgression::Older | DomainProgression::Conflict(_) => false,
+    }
 }
 
 fn rejection_from_host(rejection: HostRejection) -> DomainRejection {
