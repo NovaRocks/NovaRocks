@@ -310,7 +310,18 @@ impl OperationOutcome {
             Self::RetryableObservationLoss => FrontendAction::ResubscribeObservation,
             Self::OperationTimedOut => FrontendAction::FailOperationClosed,
             Self::ReleaseNotReady => FrontendAction::RetryAfterProgress,
-            Self::ContextTerminalReceipt | Self::Gone => FrontendAction::StopSendingAndReconcile,
+            // A task that already terminated is not a reason to fail the
+            // attempt. The sender could not have known -- it holds a status
+            // older than the terminal by construction -- and the operation has
+            // nothing left to do. What it must do is stop sending to that task
+            // and reconcile against the status stream, which is where the
+            // task's own terminal says why it ended. Failing here would make
+            // this rejection a second authority on that question, and it would
+            // fail queries whose work is already complete: a delivery landing
+            // just after an early-terminating scan finished.
+            Self::ContextTerminalReceipt | Self::Gone | Self::TerminalRejected => {
+                FrontendAction::StopSendingAndReconcile
+            }
             Self::NormalDestinationCanceled => FrontendAction::Settled,
             Self::IdentityMismatch
             | Self::CreateConflict
@@ -320,7 +331,6 @@ impl OperationOutcome {
             | Self::LeaseExpired
             | Self::DestinationFailure
             | Self::InvalidStateOrRequest
-            | Self::TerminalRejected
             | Self::ResourceExhausted => FrontendAction::FailAttempt,
         }
     }
@@ -1579,6 +1589,13 @@ mod tests {
             FrontendAction::Settled,
             "a normal downstream departure is not a producer failure"
         );
+        assert_eq!(
+            OperationOutcome::TerminalRejected.frontend_action(),
+            FrontendAction::StopSendingAndReconcile,
+            "a task that already terminated is reconciled against its own status, \
+             not treated as this operation's failure: the sender held an older \
+             status by construction and the operation has nothing left to do"
+        );
         for fatal in [
             OperationOutcome::IdentityMismatch,
             OperationOutcome::CreateConflict,
@@ -1588,7 +1605,6 @@ mod tests {
             OperationOutcome::LeaseExpired,
             OperationOutcome::DestinationFailure,
             OperationOutcome::InvalidStateOrRequest,
-            OperationOutcome::TerminalRejected,
             OperationOutcome::ResourceExhausted,
         ] {
             assert_eq!(
