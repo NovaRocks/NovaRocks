@@ -1375,6 +1375,20 @@ impl ValidatedNativeSubmission {
         self.execution_id
     }
 
+    /// Packages this instance's plan and its own parameters for the task
+    /// protocol.
+    ///
+    /// The two travel together because the backend proves them against each
+    /// other: a descriptor whose plan names a different instance than the
+    /// descriptor does is refused at decode. Handing them over separately
+    /// would let a caller pair a plan with the wrong instance's parameters.
+    pub fn into_task_fragment_plan(self) -> novarocks_proto_models::novarocks::TaskFragmentPlan {
+        novarocks_proto_models::novarocks::TaskFragmentPlan {
+            plan: Some(self.plan),
+            instance_params: Some(self.instance_params),
+        }
+    }
+
     fn into_stage_fragment(self) -> Result<(usize, StageFragment), DistributedQueryError> {
         let fragment = StageFragment::new(self.plan, self.instance_params)
             .map_err(|error| contract_error(error.to_string()))?;
