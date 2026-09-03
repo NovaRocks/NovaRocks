@@ -548,7 +548,9 @@ pub(crate) mod tests {
             .into(),
         ]);
         let creation = ViewCreation::builder()
-            .location("s3://bucket/warehouse/default.db/event_agg".to_string())
+            .location(Some(
+                "s3://bucket/warehouse/default.db/event_agg".to_string(),
+            ))
             .name("view".to_string())
             .schema(Schema::builder().build().unwrap())
             .default_namespace(NamespaceIdent::from_vec(vec!["default".to_string()]).unwrap())

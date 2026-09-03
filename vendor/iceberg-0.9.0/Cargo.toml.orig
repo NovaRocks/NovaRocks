@@ -46,7 +46,6 @@ arrow-select = { workspace = true }
 arrow-string = { workspace = true }
 as-any = { workspace = true }
 async-trait = { workspace = true }
-backon = { workspace = true }
 base64 = { workspace = true }
 bimap = { workspace = true }
 bytes = { workspace = true }

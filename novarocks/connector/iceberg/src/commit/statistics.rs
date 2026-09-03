@@ -82,7 +82,7 @@ pub async fn commit_statistics_file(
         }
         let tx = Transaction::new(&table);
         let action = tx.update_statistics().set_statistics(stats_file.clone());
-        let tx = action.apply(tx).map_err(|e| {
+        let tx = action.apply(tx).await.map_err(|e| {
             StatisticsRegistrationFailure::Commit(format!(
                 "iceberg update_statistics apply failed: {e}"
             ))

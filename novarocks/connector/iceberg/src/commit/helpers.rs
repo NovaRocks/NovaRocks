@@ -34,13 +34,6 @@ use std::sync::Arc;
 /// Submit one already-staged `ActionCommit` as a single self-assembled
 /// `TableCommit`, optionally carrying additional caller-supplied requirements.
 ///
-/// Write actions must not be handed to `Transaction::commit`. `do_commit`
-/// reloads the table first and, whenever the metadata moved, re-runs every
-/// action against the refreshed base — which recomputes each requirement from
-/// the *new* observed value and then retries with backoff. A requirement
-/// produced that way is always self-consistent, so it can never reject a
-/// stale writer.
-///
 /// Submitting the frozen updates and requirements straight to
 /// `Catalog::update_table` keeps the requirements that were computed against
 /// the base state the action actually observed. That is what makes an extra
@@ -105,12 +98,6 @@ impl OccSubmitError {
 }
 
 /// Submit one write action with target-ref OCC, re-staging on conflicts.
-///
-/// This deliberately replaces `Transaction::commit` for distributed DML.
-/// `do_commit` reloads the table, re-applies every action against the
-/// refreshed base and retries with backoff, which means each requirement is
-/// recomputed from the value it is about to assert — self-consistent by
-/// construction, and therefore incapable of rejecting a stale writer.
 ///
 /// Each retry re-stages the action against the freshly loaded base, rebuilding
 /// its target-ref requirements. Unknown submission outcomes never enter this

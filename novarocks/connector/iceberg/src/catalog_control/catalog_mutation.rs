@@ -44,7 +44,7 @@ use crate::iceberg::spec::{
     SnapshotRetention, StructType, Summary, Transform, Type, UnboundPartitionField,
     UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
-use crate::iceberg::transaction::Transaction;
+use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
 use crate::iceberg::{
     NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
 };
@@ -1917,32 +1917,16 @@ fn execute_bootstrap(
                     "empty-table bootstrap target gained a snapshot",
                 ));
             }
-            // Build the action through the vendored transaction, then stage and
-            // dispatch it here. Constructing a `Transaction` is harmless; what
-            // this avoids is its `commit`, which retries on
-            // `Error::retryable()` -- a predicate that includes a lost response.
-            // The bootstrap snapshot could therefore be sent twice with no way
-            // to tell, and the three-state classification below would be
-            // reasoning about the wrong request.
-            let action = std::sync::Arc::new(
-                Transaction::new(&current)
-                    .fast_append()
-                    .set_snapshot_properties(snapshot_properties.into_iter().collect())
-                    .set_commit_uuid(uuid::Uuid::new_v4()),
-            );
-            let staged =
-                crate::iceberg::transaction::TransactionAction::commit(action, &current).await?;
-            let base = current.clone();
-            crate::commit::helpers::submit_action_commit(
-                catalog.as_ref(),
-                current.identifier().clone(),
-                staged,
-                Vec::new(),
-            )
-            .await
-            // An empty-table bootstrap always stages a snapshot, so a proven
-            // no-op means nothing was sent; report the base the caller loaded.
-            .map(|table| table.unwrap_or(base))
+            // Eagerly stage through the vendored transaction, but keep the
+            // provider-owned single-dispatch frontier below.
+            let transaction = Transaction::new(&current);
+            let transaction = transaction
+                .fast_append()
+                .set_snapshot_properties(snapshot_properties.into_iter().collect())
+                .set_commit_uuid(uuid::Uuid::new_v4())
+                .apply(transaction)
+                .await?;
+            catalog.update_table(transaction.into_table_commit()).await
         });
     let committed = match committed {
         Ok(Ok(table)) => table,

@@ -82,29 +82,24 @@ impl TransactionAction for UpgradeFormatVersionAction {
 
 #[cfg(test)]
 mod tests {
-    use as_any::Downcast;
-
     use crate::spec::FormatVersion;
     use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
-    use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 
-    #[test]
-    fn test_upgrade_format_version() {
+    #[tokio::test]
+    async fn test_upgrade_format_version() {
         let table = crate::transaction::tests::make_v1_table();
         let tx = Transaction::new(&table);
         let tx = tx
             .upgrade_table_version()
             .set_format_version(FormatVersion::V2)
             .apply(tx)
+            .await
             .unwrap();
 
-        assert_eq!(tx.actions.len(), 1);
-
-        let action = (*tx.actions[0])
-            .downcast_ref::<UpgradeFormatVersionAction>()
-            .unwrap();
-
-        assert_eq!(action.format_version, Some(FormatVersion::V2));
+        assert_eq!(
+            tx.staged_table().metadata().format_version(),
+            FormatVersion::V2
+        );
     }
 }
