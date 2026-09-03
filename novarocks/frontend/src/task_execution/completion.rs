@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_execution::task_execution::{
     FinalTaskInfo, ResultPacketVerdict, RootResultStream, TaskIdentity, TaskState, TaskStatus,
-    WriteCompletionFacts, verify_final_info,
+    verify_final_info,
 };
 
 use super::error::TaskExecutionError;
@@ -141,8 +141,15 @@ impl ReadCompletionTracker {
     }
 }
 
-/// What the frontend may tell a client about a write, and why not when it may
-/// not.
+/// Whether this attempt's declared writers all reached their terminal, and
+/// why not when they did not.
+///
+/// This is the task-terminal half of a write's completion and nothing more.
+/// Whether a complete prepared write set arrived is the write commit
+/// barrier's fact, and whether the external commit succeeded is
+/// `finish_write_session`'s. Each of those has exactly one owner, and this
+/// type deliberately cannot answer either: a second answer to a question that
+/// admits one is how a partial write comes to report success.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum WriteVerdict {
     /// Every fact holds.
@@ -162,10 +169,6 @@ pub enum WriteVerdict {
     /// declared set is not the real one and "every writer finished" cannot be
     /// decided from it.
     UndeclaredWriter(TaskIdentity),
-    /// No complete prepared write set was received.
-    PreparedWriteSetIncomplete,
-    /// The frontend's external commit has not succeeded.
-    ExternalCommitNotSucceeded,
 }
 
 impl WriteVerdict {
@@ -188,8 +191,6 @@ pub struct WriteCompletionTracker {
     states: BTreeMap<TaskIdentity, TaskState>,
     canceled_writers: BTreeSet<TaskIdentity>,
     undeclared_writers: BTreeSet<TaskIdentity>,
-    prepared_write_set_complete: bool,
-    external_commit_succeeded: bool,
 }
 
 impl WriteCompletionTracker {
@@ -214,8 +215,6 @@ impl WriteCompletionTracker {
             states: BTreeMap::new(),
             canceled_writers: BTreeSet::new(),
             undeclared_writers: BTreeSet::new(),
-            prepared_write_set_complete: false,
-            external_commit_succeeded: false,
         })
     }
 
@@ -247,19 +246,6 @@ impl WriteCompletionTracker {
         }
     }
 
-    /// Records the complete prepared write set.
-    ///
-    /// The caller must already have observed the root result stream's end:
-    /// a prefix is not most of a write, it is no write at all.
-    pub const fn note_prepared_write_set_complete(&mut self) {
-        self.prepared_write_set_complete = true;
-    }
-
-    /// Records that the frontend's external commit succeeded.
-    pub const fn note_external_commit_succeeded(&mut self) {
-        self.external_commit_succeeded = true;
-    }
-
     /// The task-terminal half of the commit gate.
     ///
     /// The write commit barrier keeps "the prepared write set is complete" and
@@ -288,52 +274,6 @@ impl WriteCompletionTracker {
             }
         }
         WriteVerdict::Complete
-    }
-
-    /// Whether the external commit may be attempted.
-    pub fn commit_gate(&self, attempt_failed: bool) -> WriteVerdict {
-        let execution = self.execution_verdict(attempt_failed);
-        if !execution.is_complete() {
-            return execution;
-        }
-        if !self.prepared_write_set_complete {
-            return WriteVerdict::PreparedWriteSetIncomplete;
-        }
-        WriteVerdict::Complete
-    }
-
-    /// The neutral facts this tracker holds.
-    pub fn facts(&self, attempt_failed: bool) -> WriteCompletionFacts {
-        let execution = self.execution_verdict(attempt_failed);
-        WriteCompletionFacts::new(
-            execution.is_complete(),
-            matches!(
-                self.states.get(&self.root_finish),
-                Some(TaskState::Finished)
-            ),
-            self.prepared_write_set_complete,
-            self.external_commit_succeeded,
-            !self.canceled_writers.is_empty(),
-        )
-    }
-
-    /// Whether the write may be reported to the client as successful.
-    ///
-    /// The verdict and the neutral predicate must agree; disagreeing would
-    /// mean two answers to the question this protocol allows one answer to, so
-    /// the conservative side wins.
-    pub fn client_visible_completion(&self, attempt_failed: bool) -> WriteVerdict {
-        let gate = self.commit_gate(attempt_failed);
-        if !gate.is_complete() {
-            return gate;
-        }
-        if !self.external_commit_succeeded {
-            return WriteVerdict::ExternalCommitNotSucceeded;
-        }
-        if self.facts(attempt_failed).client_visible_completion() {
-            return WriteVerdict::Complete;
-        }
-        WriteVerdict::ExternalCommitNotSucceeded
     }
 }
 
@@ -507,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_needs_every_writer_the_root_the_set_and_the_commit() {
+    fn a_write_needs_every_declared_writer_and_the_root_finish_task() {
         let backend = BackendProcessId::new_v7();
         let writer_one = identity(2, 1, backend);
         let writer_two = identity(2, 2, backend);
@@ -546,22 +486,13 @@ mod tests {
         tracker.observe_status(&status(root, 4, TaskState::Finished));
         assert!(tracker.execution_verdict(false).is_complete());
 
-        // Execution succeeding does not stand in for the data plane closing.
-        assert_eq!(
-            tracker.commit_gate(false),
-            WriteVerdict::PreparedWriteSetIncomplete
-        );
-        tracker.note_prepared_write_set_complete();
-        assert!(tracker.commit_gate(false).is_complete());
-
-        // And the commit gate does not stand in for the commit.
-        assert_eq!(
-            tracker.client_visible_completion(false),
-            WriteVerdict::ExternalCommitNotSucceeded
-        );
-        tracker.note_external_commit_succeeded();
-        assert!(tracker.client_visible_completion(false).is_complete());
-        assert!(tracker.facts(false).client_visible_completion());
+        // What this verdict does NOT say is deliberately not askable here.
+        // "A complete prepared write set arrived" belongs to the write commit
+        // barrier and "the external commit succeeded" to finish_write_session;
+        // both directions of the first are asserted over there, in
+        // write_barrier's a_successful_execution_does_not_stand_in_for_a_
+        // complete_set and its converse. A second answer here is what this
+        // type was trimmed to make unrepresentable.
     }
 
     #[test]
@@ -577,18 +508,10 @@ mod tests {
         // written.
         tracker.observe_status(&status(writer, 2, TaskState::Canceled));
         tracker.observe_status(&status(root, 3, TaskState::Finished));
-        tracker.note_prepared_write_set_complete();
-        tracker.note_external_commit_succeeded();
-
         assert_eq!(
             tracker.execution_verdict(false),
             WriteVerdict::WriterCanceled(writer)
         );
-        assert_eq!(
-            tracker.client_visible_completion(false),
-            WriteVerdict::WriterCanceled(writer)
-        );
-        assert!(!tracker.facts(false).client_visible_completion());
     }
 
     #[test]
@@ -602,9 +525,7 @@ mod tests {
 
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         tracker.observe_status(&status(root, 2, TaskState::Finished));
-        tracker.note_prepared_write_set_complete();
-        tracker.note_external_commit_succeeded();
-        assert!(tracker.client_visible_completion(false).is_complete());
+        assert!(tracker.execution_verdict(false).is_complete());
 
         // A status carrying writer facts from a task the caller did not
         // declare: "every writer finished" cannot be decided from a set that
@@ -613,7 +534,7 @@ mod tests {
             status(undeclared, 2, TaskState::Running).with_writer(TaskWriterFacts::empty());
         tracker.observe_status(&interloper);
         assert_eq!(
-            tracker.client_visible_completion(false),
+            tracker.execution_verdict(false),
             WriteVerdict::UndeclaredWriter(undeclared)
         );
     }
@@ -628,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn a_latched_failure_refuses_a_write_at_every_gate() {
+    fn a_latched_failure_refuses_a_write_whose_tasks_all_finished() {
         let backend = BackendProcessId::new_v7();
         let writer = identity(2, 1, backend);
         let root = identity(1, 3, backend);
@@ -636,16 +557,11 @@ mod tests {
             WriteCompletionTracker::try_new(root, [writer]).expect("a declared writer set");
         tracker.observe_status(&status(writer, 2, TaskState::Finished));
         tracker.observe_status(&status(root, 2, TaskState::Finished));
-        tracker.note_prepared_write_set_complete();
-        tracker.note_external_commit_succeeded();
-
+        // Every task reached FINISHED, so only the latch stands between this
+        // write and a success report. A verdict that read the terminals alone
+        // would call it complete.
+        assert!(tracker.execution_verdict(false).is_complete());
         assert_eq!(tracker.execution_verdict(true), WriteVerdict::AttemptFailed);
-        assert_eq!(tracker.commit_gate(true), WriteVerdict::AttemptFailed);
-        assert_eq!(
-            tracker.client_visible_completion(true),
-            WriteVerdict::AttemptFailed
-        );
-        assert!(!tracker.facts(true).client_visible_completion());
     }
 
     #[test]

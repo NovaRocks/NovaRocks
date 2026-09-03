@@ -2039,7 +2039,6 @@ impl FrontendDistributedQueryCoordinator {
                             )
                         },
                     )?);
-                    tracker.note_prepared_write_set_complete();
                 }
                 observe_write_statuses(&round, tracker);
                 // The execution half only. The barrier keeps "the prepared

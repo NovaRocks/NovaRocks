@@ -86,11 +86,6 @@ impl<T> OperationReceipt<T> {
         Self::rejected(operation_id, outcome, detail)
     }
 
-    pub fn with_detail(mut self, detail: impl AsRef<str>) -> Self {
-        self.detail = Some(SafeDetail::truncating(detail.as_ref()));
-        self
-    }
-
     pub const fn operation_id(&self) -> TaskOperationId {
         self.operation_id
     }
