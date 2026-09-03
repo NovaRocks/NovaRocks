@@ -51,7 +51,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use novarocks_execution::task_execution::identity::TaskOperationId;
-use novarocks_execution::task_execution::operation::{OperationOutcome, TransportBudget};
+use novarocks_execution::task_execution::operation::{
+    OperationOutcome, TransportBudget, UpdateQueryContext,
+};
 use novarocks_execution::task_execution::status::{SafeDetail, TaskFailureCategory};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::task_execution::operation::{
@@ -64,6 +66,7 @@ use novarocks_proto_codec::task_execution::status::{encode_final_task_info, enco
 use novarocks_proto_models::novarocks as proto;
 use tokio_stream::Stream;
 
+use super::fault;
 use super::host::HostRejection;
 use super::observation::{TaskStatusEvent, TaskStatusSource};
 use super::receipt::OperationReceipt;
@@ -94,6 +97,9 @@ impl RegistryTaskExecutionIngress {
         match operation {
             DecodedOperation::CreateTask(request) => {
                 let receipt = self.registry.create_task(request.request());
+                // Claimed after the owner applied it: the task is admitted and
+                // running, and only this answer is lost.
+                fault::create_task_ack_dropped(request.request().identity(), receipt.outcome())?;
                 encode_item(&receipt, |ack| {
                     encode_create_task_ack(ack).map(ReceiptAck::CreateTask)
                 })
@@ -112,6 +118,15 @@ impl RegistryTaskExecutionIngress {
                     ));
                 };
                 let receipt = self.registry.update_query_context(&neutral);
+                match &neutral {
+                    UpdateQueryContext::Establish(_) => {
+                        fault::establish_context_ack_dropped(context, receipt.outcome())?;
+                    }
+                    UpdateQueryContext::RenewLease(_) => {
+                        fault::lease_renewal_ack_dropped(context, receipt.outcome())?;
+                    }
+                    UpdateQueryContext::AdvanceDomain(_) => {}
+                }
                 // Read after the operation: an establish that lost the latch
                 // to an abort reports the cause that abort installed.
                 let cause = self.registry.termination_cause(context);
@@ -225,6 +240,16 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         // The catch-up frames are taken before the stream exists, so a cursor
         // that is behind cannot miss a version published between the two.
         let catch_up = source.subscribe(&cursors);
+        if fault::task_status_subscription_dropped(context)? {
+            // The subscription was established and is then torn down from the
+            // stream body, which is what a lost stream looks like. Cursors are
+            // read-only, so the resubscription loses no frame.
+            return Ok(Box::pin(tokio_stream::once(Err(
+                tonic::Status::unavailable(
+                    "runner-owned task status stream dropped after the subscription was established",
+                ),
+            ))));
+        }
         Ok(Box::pin(TaskStatusSubscription::new(source, catch_up)))
     }
 

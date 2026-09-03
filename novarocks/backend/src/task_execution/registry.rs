@@ -86,6 +86,7 @@ use super::entry::{
     estimate_retained_bytes,
 };
 use super::host::{QueryContextHost, RunnableTask, SharedFactsRequest, TaskExecutionHost};
+use super::marker;
 use super::observation::TaskStatusSource;
 use super::receipt::{
     CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome, FinalTaskInfoOutcome,
@@ -408,6 +409,16 @@ impl TaskExecutionRegistry {
 
     /// Creates one task, atomically or not at all.
     pub fn create_task(&self, request: &CreateTask) -> CreateTaskOutcome {
+        let receipt = self.admit_create_task(request);
+        // Read off the receipt this call is about to return, so the evidence
+        // names the same verdict the frontend is given. Re-deriving it from
+        // registry state here could disagree with that answer, because the
+        // lock is released by now.
+        marker::create_task(request.identity(), &receipt);
+        receipt
+    }
+
+    fn admit_create_task(&self, request: &CreateTask) -> CreateTaskOutcome {
         let envelope = request.envelope();
         let operation = envelope.operation_id();
         let identity = request.identity();
@@ -866,11 +877,22 @@ impl TaskExecutionRegistry {
 
     pub fn update_query_context(&self, request: &UpdateQueryContext) -> QueryContextOutcome {
         match request {
-            UpdateQueryContext::Establish(establish) => self.establish_query_context(establish),
+            UpdateQueryContext::Establish(establish) => {
+                let receipt = self.establish_query_context(establish);
+                // Emitted on the receipt, not inside the handler: the
+                // establish decision has several exit paths and the receipt is
+                // the one place all of them agree on.
+                marker::establish_query_context(establish.context(), &receipt);
+                receipt
+            }
             UpdateQueryContext::AdvanceDomain(advance) => {
                 self.advance_query_context_domain(advance)
             }
-            UpdateQueryContext::RenewLease(renew) => self.renew_query_execution_lease(renew),
+            UpdateQueryContext::RenewLease(renew) => {
+                let receipt = self.renew_query_execution_lease(renew);
+                marker::renew_query_execution_lease(renew.context(), renew.sequence(), &receipt);
+                receipt
+            }
         }
     }
 
@@ -1402,6 +1424,15 @@ impl TaskExecutionRegistry {
     // ------------------------------------------------- release query context
 
     pub fn release_query_context(
+        &self,
+        request: &ReleaseQueryContext,
+    ) -> ReleaseQueryContextOutcome {
+        let receipt = self.apply_release_query_context(request);
+        marker::release_query_context(request.context(), &receipt);
+        receipt
+    }
+
+    fn apply_release_query_context(
         &self,
         request: &ReleaseQueryContext,
     ) -> ReleaseQueryContextOutcome {

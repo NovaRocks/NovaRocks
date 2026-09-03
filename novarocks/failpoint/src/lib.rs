@@ -62,6 +62,24 @@ pub enum QueryLifecycleFaultKind {
     RuntimeFilterFeedbackContractDigestCorrupt,
     RuntimeFilterFeedbackUnavailable,
     TaskUpdateTerminalAckDrop,
+    /// Drops the acknowledgement of one `EstablishQueryContext` after the
+    /// backend has installed the context. The context exists and the frontend
+    /// does not know it, which is the unknown-outcome case the protocol's
+    /// idempotent replay exists to survive.
+    EstablishContextAckDrop,
+    /// Drops the acknowledgement of one `CreateTask` after the task is
+    /// admitted and running. It is the successor of both `StageAckDrop` and
+    /// `StartAckDrop`, because `CreateTask` is the protocol's single admission
+    /// point rather than two phases.
+    CreateTaskAckDrop,
+    /// Drops one `SubscribeTaskStatus` stream after the subscription is
+    /// established. Cursors are unconsumed, so the observation is recovered by
+    /// resubscribing rather than by re-running anything.
+    TaskStatusSubscriptionDrop,
+    /// Drops the acknowledgement of one applied lease renewal. It has no
+    /// counterpart in the retired lifecycle: the query execution lease is a
+    /// domain the task protocol introduced.
+    LeaseRenewalAckDrop,
     StageConflictAfterApply,
     StartDigestCorrupt,
     ObservationForeignParticipant,
@@ -76,7 +94,7 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 34] = [
         Self::InitAckDrop,
         Self::StageAckDrop,
         Self::StartAckDrop,
@@ -101,6 +119,10 @@ impl QueryLifecycleFaultKind {
         Self::RuntimeFilterFeedbackContractDigestCorrupt,
         Self::RuntimeFilterFeedbackUnavailable,
         Self::TaskUpdateTerminalAckDrop,
+        Self::EstablishContextAckDrop,
+        Self::CreateTaskAckDrop,
+        Self::TaskStatusSubscriptionDrop,
+        Self::LeaseRenewalAckDrop,
         Self::StageConflictAfterApply,
         Self::StartDigestCorrupt,
         Self::ObservationForeignParticipant,
@@ -137,6 +159,10 @@ impl QueryLifecycleFaultKind {
             }
             Self::RuntimeFilterFeedbackUnavailable => "runtime-filter-feedback-unavailable",
             Self::TaskUpdateTerminalAckDrop => "task-update-terminal-ack-drop",
+            Self::EstablishContextAckDrop => "establish-context-ack-drop",
+            Self::CreateTaskAckDrop => "create-task-ack-drop",
+            Self::TaskStatusSubscriptionDrop => "task-status-subscription-drop",
+            Self::LeaseRenewalAckDrop => "lease-renewal-ack-drop",
             Self::StageConflictAfterApply => "stage-conflict-after-apply",
             Self::StartDigestCorrupt => "start-digest-corrupt",
             Self::ObservationForeignParticipant => "observation-foreign-participant",
@@ -164,7 +190,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 20] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 24] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -179,6 +205,14 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 20] = [
     QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
     QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
+    // The task protocol's four core-operation faults. Each drops an
+    // acknowledgement the backend already earned; none of them skips the
+    // operation, because a fault that never applied anything would exercise
+    // no replay path at all.
+    QueryLifecycleFaultKind::EstablishContextAckDrop,
+    QueryLifecycleFaultKind::CreateTaskAckDrop,
+    QueryLifecycleFaultKind::TaskStatusSubscriptionDrop,
+    QueryLifecycleFaultKind::LeaseRenewalAckDrop,
     QueryLifecycleFaultKind::StageConflictAfterApply,
     QueryLifecycleFaultKind::StartDigestCorrupt,
     QueryLifecycleFaultKind::ObservationForeignParticipant,
@@ -630,14 +664,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 30);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 34);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 20);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 24);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)
@@ -649,6 +683,22 @@ mod tests {
         assert_eq!(
             parse_runner_rfo_kind("task-update-terminal-ack-drop"),
             Some(QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("establish-context-ack-drop"),
+            Some(QueryLifecycleFaultKind::EstablishContextAckDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("create-task-ack-drop"),
+            Some(QueryLifecycleFaultKind::CreateTaskAckDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("task-status-subscription-drop"),
+            Some(QueryLifecycleFaultKind::TaskStatusSubscriptionDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("lease-renewal-ack-drop"),
+            Some(QueryLifecycleFaultKind::LeaseRenewalAckDrop)
         );
         assert_eq!(
             parse_runner_rfo_kind("connector-write-writer-failure"),
