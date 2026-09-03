@@ -644,7 +644,7 @@ fn plan_query_for_ctas_source(
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
-        novarocks_sql::compiler::builtin_sql_function_catalog(),
+        state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(

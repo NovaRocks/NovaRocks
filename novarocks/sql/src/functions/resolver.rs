@@ -38,19 +38,12 @@
 //!    merge repeated `Any(name)` bindings through `wider_type`.
 
 use arrow::datatypes::DataType;
+use novarocks_functions::{FunctionResolutionError, ResolvedFunctionSignature};
 
 use super::registry;
 use super::signature::{BindMode, Bindings, Signature, TypeSpec, anchor_matches, realize, unify};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ResolvedScalarFunction {
-    pub(crate) return_type: DataType,
-    /// Instantiated target type for each argument position.
-    pub(crate) argument_types: Vec<DataType>,
-    /// When true, callers must bind each argument to `argument_types` before
-    /// continuing with the resolved function.
-    pub(crate) enforce_argument_binding: bool,
-}
+pub(crate) type ResolvedScalarFunction = ResolvedFunctionSignature;
 
 /// Why a function call could not be resolved against the registry.
 ///
@@ -58,40 +51,7 @@ pub(crate) struct ResolvedScalarFunction {
 /// hand-written `infer_*` fallback. A caller that supports argument binding
 /// must inspect `NoMatchingSignature::binding_enforced` before taking a
 /// fallback path, so an opt-in signature policy cannot be bypassed.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum ResolveError {
-    /// The function name is not registered. The caller should fall back to
-    /// the legacy path — Step A only covers a subset of all known SQL
-    /// functions.
-    UnknownFunction,
-    /// The function name is registered but no signature matches the given
-    /// argument types. A legacy fallback remains available for candidates
-    /// without enforced binding; callers must inspect `binding_enforced`
-    /// before using that fallback for an opt-in candidate.
-    NoMatchingSignature {
-        /// All registered signatures for this name, for diagnostic output.
-        candidates: usize,
-        /// Whether at least one candidate requires argument binding. Callers
-        /// must check this before applying a legacy fallback.
-        binding_enforced: bool,
-    },
-    /// The signature matched but its return type referenced an unbound
-    /// type variable — a registry bug, not a user error. Bubble up.
-    BadSignature(String),
-}
-
-impl std::fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ResolveError::UnknownFunction => write!(f, "function not registered"),
-            ResolveError::NoMatchingSignature { candidates, .. } => write!(
-                f,
-                "no matching signature among {candidates} registered candidates"
-            ),
-            ResolveError::BadSignature(msg) => write!(f, "bad signature: {msg}"),
-        }
-    }
-}
+pub(crate) type ResolveError = FunctionResolutionError;
 
 /// Resolve a scalar function call to its instantiated signature.
 ///

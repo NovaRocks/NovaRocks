@@ -45,6 +45,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 /// only the leaf ports it uses rather than a reference back to this kernel.
 #[derive(Clone)]
 pub struct QueryPreparationKernel {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -107,6 +108,7 @@ impl SystemTableQueryKernel {
 impl QueryPreparationKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -117,6 +119,7 @@ impl QueryPreparationKernel {
         exchange_port: u16,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -126,6 +129,10 @@ impl QueryPreparationKernel {
             backend_topology,
             exchange_port,
         }
+    }
+
+    pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
+        &self.functions
     }
 
     /// The typed connector controls this statement may resolve, frozen with
@@ -173,6 +180,7 @@ impl QueryPreparationKernel {
 /// it is not a separate recovery context or scheduler.
 #[derive(Clone)]
 pub struct DmlExecutionKernel {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -186,6 +194,7 @@ pub struct DmlExecutionKernel {
 
 impl DmlExecutionKernel {
     pub fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -195,6 +204,7 @@ impl DmlExecutionKernel {
         query_execution: QueryExecutionService,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -204,6 +214,10 @@ impl DmlExecutionKernel {
             query_execution,
             lake_publication_runtime_policy: None,
         }
+    }
+
+    pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
+        &self.functions
     }
 
     /// The typed connector controls this statement may resolve.

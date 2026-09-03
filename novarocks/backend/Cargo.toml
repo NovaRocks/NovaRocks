@@ -9,6 +9,7 @@ doctest = false
 
 [dependencies]
 novarocks-execution = { path = "../execution" }
+novarocks-functions = { path = "../functions" }
 novarocks-connector-binding = { path = "../connector-binding" }
 novarocks-failpoint = { path = "../failpoint" }
 novarocks-native-trust = { path = "../native-trust" }
@@ -43,3 +44,4 @@ protoc-bin-vendored = "3"
 tonic-build = "0.12"
 
 [dev-dependencies]
+novarocks-sql = { path = "../sql" }

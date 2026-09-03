@@ -16,32 +16,13 @@
 # under the License.
 
 [package]
-name = "novarocks-sql"
+name = "novarocks-functions"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
 doctest = false
 
-[features]
-test-support = []
-
 [dependencies]
-arrow = { version = "58.2.0", features = ["prettyprint", "ipc", "ipc_compression"] }
-base64 = "0.22"
-bytes = "1"
-chrono = "0.4"
-hex = "0.4"
-novarocks-parser = { path = "../parser" }
-novarocks-functions = { path = "../functions" }
-novarocks-spi = { path = "../spi" }
-novarocks-types = { path = "../types" }
-novarocks-user-error = { path = "../user-error" }
-md-5 = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+arrow-schema = "58.2.0"
 sha2 = "0.10"
-tracing = "0.1"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
-
-[dev-dependencies]

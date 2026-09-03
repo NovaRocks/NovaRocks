@@ -87,6 +87,8 @@ pub struct BackendServerConfig {
     pub native_trust: Arc<NativeTrust>,
     /// Server-resolved compatibility identity frozen before role composition.
     pub native_compatibility_id: NativeCompatibilityId,
+    /// Process-wide immutable engine function catalog composed by Server.
+    pub function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     pub native_transport: BackendNativeTransport,
     /// Exact FE native ingress used exclusively for authenticated membership announce.
     pub frontend_endpoint: NativeEndpoint,
@@ -674,15 +676,22 @@ impl Drop for QueryLifecycleSweepTask {
 fn compose_backend_application_services(
     data_runtime: BackendDataRuntime,
     execution_runtime_config: ExecutionRuntimeConfig,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     query_lifecycle_config: QueryLifecycleRegistryConfig,
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
-    let execution_runtime = Arc::new(ExecutionRuntime::new(execution_runtime_config).map_err(
-        |error| BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error),
-    )?);
+    let execution_runtime = Arc::new(
+        ExecutionRuntime::new_with_function_catalog(
+            execution_runtime_config,
+            Arc::clone(&function_catalog),
+        )
+        .map_err(|error| {
+            BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+        })?,
+    );
     let controls = Arc::new(FragmentControlRegistry::default());
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
@@ -893,6 +902,7 @@ impl BackendApplicationHost {
             advertise_endpoint,
             native_trust,
             native_compatibility_id,
+            function_catalog,
             native_transport,
             frontend_endpoint,
             announce_interval,
@@ -917,6 +927,7 @@ impl BackendApplicationHost {
         let services = compose_backend_application_services(
             data_runtime,
             execution_runtime_config,
+            function_catalog,
             query_lifecycle_config,
             native_compatibility_id,
             write_commit_evidence_limits,
@@ -1410,6 +1421,10 @@ mod tests {
             },
             native_trust: crate::rpc::runtime::test_backend_native_trust(),
             native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            function_catalog: Arc::new(
+                novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                    .expect("builtin function catalog"),
+            ),
             native_transport: crate::rpc::runtime::BackendNativeTransport::Plaintext,
             frontend_endpoint: NativeEndpoint::from_host_port("127.0.0.1", unused_port())
                 .expect("valid frontend endpoint"),
@@ -1572,6 +1587,10 @@ mod tests {
         let services = compose_backend_application_services(
             test_data_runtime(),
             execution_runtime_config(),
+            Arc::new(
+                novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                    .expect("builtin function catalog"),
+            ),
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             WriteCommitEvidenceLimits::default(),

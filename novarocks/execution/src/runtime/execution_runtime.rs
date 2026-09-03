@@ -129,6 +129,7 @@ impl ExecutionRuntimeConfig {
 #[derive(Clone)]
 pub struct ExecutionRuntime {
     config: ExecutionRuntimeConfig,
+    function_catalog: Option<Arc<novarocks_functions::EngineFunctionCatalog>>,
     services: Arc<ExecutionServices>,
     mem_root: Arc<MemTracker>,
     exchange_registry: Arc<ExecutionExchangeRegistry>,
@@ -139,6 +140,20 @@ pub struct ExecutionRuntime {
 
 impl ExecutionRuntime {
     pub fn new(config: ExecutionRuntimeConfig) -> Result<Self, ExecutionRuntimeConfigError> {
+        Self::new_inner(config, None)
+    }
+
+    pub fn new_with_function_catalog(
+        config: ExecutionRuntimeConfig,
+        function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    ) -> Result<Self, ExecutionRuntimeConfigError> {
+        Self::new_inner(config, Some(function_catalog))
+    }
+
+    fn new_inner(
+        config: ExecutionRuntimeConfig,
+        function_catalog: Option<Arc<novarocks_functions::EngineFunctionCatalog>>,
+    ) -> Result<Self, ExecutionRuntimeConfigError> {
         config.validate()?;
         let services =
             ExecutionServices::new(&config).map_err(ExecutionRuntimeConfigError::runtime)?;
@@ -154,6 +169,7 @@ impl ExecutionRuntime {
         ));
         Ok(Self {
             config,
+            function_catalog,
             services: Arc::new(services),
             mem_root: MemTracker::new_root("execution"),
             exchange_registry: Arc::new(ExecutionExchangeRegistry::default()),
@@ -165,6 +181,10 @@ impl ExecutionRuntime {
 
     pub const fn config(&self) -> &ExecutionRuntimeConfig {
         &self.config
+    }
+
+    pub fn function_catalog(&self) -> Option<&Arc<novarocks_functions::EngineFunctionCatalog>> {
+        self.function_catalog.as_ref()
     }
 
     pub fn services(&self) -> &ExecutionServices {

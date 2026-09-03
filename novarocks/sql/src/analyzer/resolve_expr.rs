@@ -3859,6 +3859,9 @@ fn bind_scalar_function_call_with_catalog(
             ..
         }) => Err(no_matching_signature(name, &arg_types)),
         Err(crate::functions::ResolveError::BadSignature(message)) => Err(message),
+        Err(crate::functions::ResolveError::HiddenFunction) => {
+            Err(format!("function `{name}` is not available to user SQL"))
+        }
         Err(crate::functions::ResolveError::UnknownFunction) => {
             validate_scalar_function_call_typed(name, &args)?;
             Ok(BoundScalarCall {

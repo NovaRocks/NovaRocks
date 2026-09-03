@@ -30,7 +30,10 @@ use std::time::Instant;
 
 use crate::analyze_error::AnalyzeError;
 pub use crate::explain::ExplainLevel;
-pub use crate::functions::builtin_sql_function_catalog;
+pub use crate::functions::{
+    build_builtin_engine_function_catalog, builtin_engine_function_catalog,
+    builtin_sql_function_catalog, contribute_builtin_functions,
+};
 pub use crate::optimizer::options::SessionOptimizerSettings;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
@@ -191,21 +194,16 @@ impl SqlImvPlanningInput {
 /// The function implementation and its execution kernels are explicitly out
 /// of scope for this compiler-facing contract.
 pub trait SqlFunctionCatalog: Send + Sync {
-    #[expect(
-        private_interfaces,
-        reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
-    )]
     fn resolve_scalar_signature(
         &self,
         name: &str,
         arg_types: &[arrow::datatypes::DataType],
-    ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError>;
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionSignature,
+        novarocks_functions::FunctionResolutionError,
+    >;
 
-    #[expect(
-        private_interfaces,
-        reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
-    )]
-    fn volatility(&self, name: &str) -> crate::functions::FunctionVolatility;
+    fn volatility(&self, name: &str) -> novarocks_functions::FunctionVolatility;
 }
 
 pub use crate::common::expr::{BinOp, LiteralValue, UnOp};

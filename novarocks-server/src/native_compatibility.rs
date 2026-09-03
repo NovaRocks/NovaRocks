@@ -46,9 +46,11 @@ pub fn native_carrier_declarations() -> anyhow::Result<Vec<NativeCarrierDeclarat
 
 /// Resolves the immutable compatibility material for this binary before role
 /// application composition opens listeners or runtime services.
-pub fn resolve_native_compatibility_material() -> anyhow::Result<NativeCompatibilityMaterial> {
+pub fn resolve_native_compatibility_material(
+    function_catalog_digest: [u8; 32],
+) -> anyhow::Result<NativeCompatibilityMaterial> {
     let declarations = native_carrier_declarations()?;
-    derive_repository_native_compatibility_material(declarations)
+    derive_repository_native_compatibility_material(declarations, function_catalog_digest)
         .with_context(|| "derive native compatibility material")
 }
 
@@ -112,7 +114,8 @@ mod tests {
 
     #[test]
     fn repository_material_is_nonempty_and_uses_the_server_manifest() {
-        let material = resolve_native_compatibility_material().expect("compatibility material");
+        let material = resolve_native_compatibility_material([0x31; 32])
+            .expect("compatibility material");
 
         assert_eq!(material.carriers(), native_carrier_declarations().unwrap());
         assert_eq!(material.id().to_string().len(), 64);

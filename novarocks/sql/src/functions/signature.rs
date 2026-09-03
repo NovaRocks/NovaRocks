@@ -144,6 +144,63 @@ impl Signature {
         self.argument_binding = ArgumentBindingPolicy::CoerceAndEnforce;
         self
     }
+
+    pub(crate) fn canonical(&self) -> String {
+        let mut value = String::from("(");
+        for (index, argument) in self.args.iter().enumerate() {
+            if index > 0 {
+                value.push(',');
+            }
+            argument.write_canonical(&mut value);
+        }
+        if self.variadic {
+            value.push_str("...");
+        }
+        value.push_str(")->");
+        self.ret.write_canonical(&mut value);
+        value.push_str(if self.widening { ";widen" } else { ";strict" });
+        value.push_str(match self.argument_binding {
+            ArgumentBindingPolicy::Legacy => ";legacy",
+            ArgumentBindingPolicy::CoerceAndEnforce => ";coerce",
+        });
+        value
+    }
+}
+
+impl TypeSpec {
+    fn write_canonical(&self, output: &mut String) {
+        match self {
+            Self::Boolean => output.push_str("bool"),
+            Self::Int8 => output.push_str("i8"),
+            Self::Int16 => output.push_str("i16"),
+            Self::Int32 => output.push_str("i32"),
+            Self::Int64 => output.push_str("i64"),
+            Self::Float32 => output.push_str("f32"),
+            Self::Float64 => output.push_str("f64"),
+            Self::Utf8 => output.push_str("utf8"),
+            Self::Binary => output.push_str("binary"),
+            Self::Date => output.push_str("date"),
+            Self::Datetime => output.push_str("datetime"),
+            Self::AnyDecimal128 => output.push_str("decimal128"),
+            Self::List(item) => {
+                output.push_str("list<");
+                item.write_canonical(output);
+                output.push('>');
+            }
+            Self::Map(key, value) => {
+                output.push_str("map<");
+                key.write_canonical(output);
+                output.push(',');
+                value.write_canonical(output);
+                output.push('>');
+            }
+            Self::Any(name) => {
+                output.push_str("any<");
+                output.push_str(name);
+                output.push('>');
+            }
+        }
+    }
 }
 
 /// Check whether a concrete `DataType` matches a `TypeSpec` *anchor*

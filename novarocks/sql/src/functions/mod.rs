@@ -42,7 +42,14 @@ pub(crate) mod registry;
 pub(crate) mod resolver;
 pub(crate) mod signature;
 
+use std::sync::{Arc, LazyLock};
+
 use arrow::datatypes::DataType;
+use novarocks_functions::{
+    EngineFunctionCatalog, EngineFunctionCatalogBuilder, FunctionCatalogError,
+    FunctionDefinition, FunctionKind, FunctionResolutionError, FunctionSignatureResolver,
+    FunctionVisibility, ResolvedFunctionSignature,
+};
 
 #[cfg(test)]
 pub(crate) use resolver::resolve_scalar_function;
@@ -56,40 +63,92 @@ pub(crate) use resolver::{
 /// intentionally carried by the immutable function catalog so that analysis,
 /// lambda validation, CSE, predicate derivation, and aggregate pushdown make
 /// the same decision.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
-pub(crate) enum FunctionVolatility {
-    #[default]
-    Immutable,
-    Volatile,
-}
+pub(crate) use novarocks_functions::FunctionVolatility;
 
-impl FunctionVolatility {
-    pub(crate) const fn is_volatile(self) -> bool {
-        matches!(self, Self::Volatile)
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct BuiltinSqlFunctionCatalog;
-
-impl crate::compiler::SqlFunctionCatalog for BuiltinSqlFunctionCatalog {
+impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
     fn resolve_scalar_signature(
         &self,
         name: &str,
         arg_types: &[DataType],
     ) -> Result<ResolvedScalarFunction, ResolveError> {
-        resolve_scalar_function_signature(name, arg_types)
+        self.resolve_user(name, FunctionKind::Scalar, arg_types)
     }
 
     fn volatility(&self, name: &str) -> FunctionVolatility {
-        builtin_function_volatility(name)
+        self.definition(name, FunctionKind::Scalar)
+            .map(FunctionDefinition::volatility)
+            .unwrap_or_default()
     }
 }
 
-static BUILTIN_SQL_FUNCTION_CATALOG: BuiltinSqlFunctionCatalog = BuiltinSqlFunctionCatalog;
+struct BuiltinScalarResolver {
+    canonical_name: Box<str>,
+}
+
+impl FunctionSignatureResolver for BuiltinScalarResolver {
+    fn resolve(
+        &self,
+        argument_types: &[DataType],
+    ) -> Result<ResolvedFunctionSignature, FunctionResolutionError> {
+        resolve_scalar_function_signature(&self.canonical_name, argument_types)
+            .map(|resolved| ResolvedFunctionSignature {
+                return_type: resolved.return_type,
+                argument_types: resolved.argument_types,
+                enforce_argument_binding: resolved.enforce_argument_binding,
+            })
+            .map_err(|error| match error {
+                ResolveError::UnknownFunction => FunctionResolutionError::UnknownFunction,
+                ResolveError::HiddenFunction => FunctionResolutionError::HiddenFunction,
+                ResolveError::NoMatchingSignature {
+                    candidates,
+                    binding_enforced,
+                } => FunctionResolutionError::NoMatchingSignature {
+                    candidates,
+                    binding_enforced,
+                },
+                ResolveError::BadSignature(message) => {
+                    FunctionResolutionError::BadSignature(message)
+                }
+            })
+    }
+}
+
+pub fn contribute_builtin_functions(
+    builder: &mut EngineFunctionCatalogBuilder,
+) -> Result<(), FunctionCatalogError> {
+    for (name, signatures) in registry::builtin_scalar_declarations() {
+        let resolver = Arc::new(BuiltinScalarResolver {
+            canonical_name: name.clone().into_boxed_str(),
+        });
+        builder.register(FunctionDefinition::try_new(
+            &name,
+            FunctionKind::Scalar,
+            FunctionVisibility::Public,
+            builtin_function_volatility(&name),
+            signatures,
+            resolver,
+        )?)?;
+    }
+    Ok(())
+}
+
+pub fn build_builtin_engine_function_catalog() -> Result<EngineFunctionCatalog, FunctionCatalogError>
+{
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    contribute_builtin_functions(&mut builder)?;
+    builder.seal()
+}
+
+static BUILTIN_ENGINE_FUNCTION_CATALOG: LazyLock<EngineFunctionCatalog> = LazyLock::new(|| {
+    build_builtin_engine_function_catalog().expect("builtin engine function catalog must be valid")
+});
 
 pub fn builtin_sql_function_catalog() -> &'static dyn crate::compiler::SqlFunctionCatalog {
-    &BUILTIN_SQL_FUNCTION_CATALOG
+    &*BUILTIN_ENGINE_FUNCTION_CATALOG
+}
+
+pub fn builtin_engine_function_catalog() -> &'static EngineFunctionCatalog {
+    &BUILTIN_ENGINE_FUNCTION_CATALOG
 }
 
 /// Canonical set of volatile builtins.  Keep this list here rather than in
@@ -156,5 +215,17 @@ mod tests {
             .resolve_scalar_signature("lower", &[DataType::Utf8])
             .expect("registered function resolves through snapshot");
         assert_eq!(resolved.return_type, DataType::Utf8);
+    }
+
+    #[test]
+    fn builtin_bundle_is_canonical_and_reproducible() {
+        let first = build_builtin_engine_function_catalog().expect("first catalog");
+        let second = build_builtin_engine_function_catalog().expect("second catalog");
+        assert_eq!(first.digest(), second.digest());
+        assert!(!first.definitions().is_empty());
+        assert!(first.definitions().windows(2).all(|pair| {
+            (pair[0].canonical_name(), pair[0].kind())
+                < (pair[1].canonical_name(), pair[1].kind())
+        }));
     }
 }

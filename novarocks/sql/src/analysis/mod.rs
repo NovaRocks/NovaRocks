@@ -320,10 +320,6 @@ pub enum ExprKind {
         /// Semantics resolved by the request's immutable function catalog.
         /// The optimizer bridge preserves this value instead of reclassifying
         /// by name from ambient process state.
-        #[expect(
-            private_interfaces,
-            reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
-        )]
         volatility: crate::functions::FunctionVolatility,
     },
     /// Higher-order function lambda expression.

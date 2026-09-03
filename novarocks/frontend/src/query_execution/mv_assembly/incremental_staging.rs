@@ -351,7 +351,7 @@ fn bind_incremental_write_dataflow(
                         backend_count,
                     },
                     catalog: &catalog,
-                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
@@ -442,7 +442,7 @@ fn bind_incremental_write_dataflow(
                         backend_count,
                     },
                     catalog: &catalog,
-                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),

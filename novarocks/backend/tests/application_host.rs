@@ -47,6 +47,10 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         },
         native_trust: test_native_trust(),
         native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        function_catalog: std::sync::Arc::new(
+            novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin function catalog"),
+        ),
         native_transport: BackendNativeTransport::Plaintext,
         frontend_endpoint: novarocks_types::NativeEndpoint::from_host_port(
             "127.0.0.1",

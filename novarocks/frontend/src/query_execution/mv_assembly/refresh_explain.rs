@@ -132,7 +132,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
             optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings::default(),
             environment: novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
             catalog: &catalog,
-            functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+            functions: ports.function_catalog().as_ref(),
             constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
             control: novarocks_sql::compiler::SqlCompileControl::new(
                 Some(connector_context.deadline()),

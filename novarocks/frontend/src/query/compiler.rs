@@ -57,7 +57,6 @@ use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
     ExplainLevel, SqlAnalyzeRequest, SqlCompileControl, SqlCompileError, SqlCompileIntent,
     SqlCompiler, SqlOptimizeRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-    builtin_sql_function_catalog,
 };
 
 /// Preserves SQL analyze-domain facts until the session still has the original
@@ -128,6 +127,7 @@ fn reject_quarantined_mv_targets(
 
 #[derive(Clone)]
 pub(crate) struct FrontendQueryCompiler {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     query: QueryPreparationKernel,
     view: ViewExecutionKernel,
     system_tables: SystemTableQueryKernel,
@@ -320,6 +320,7 @@ impl PreReadyRetryBoundary for FrontendDistributedRoundFactory {
 
 impl FrontendQueryCompiler {
     pub(crate) fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         query: QueryPreparationKernel,
         view: ViewExecutionKernel,
         system_tables: SystemTableQueryKernel,
@@ -327,6 +328,7 @@ impl FrontendQueryCompiler {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
+            functions,
             query,
             view,
             system_tables,
@@ -574,7 +576,7 @@ impl FrontendQueryCompiler {
 
     #[allow(clippy::too_many_arguments)]
     fn analyze_request<'a>(
-        &self,
+        &'a self,
         query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
@@ -597,7 +599,7 @@ impl FrontendQueryCompiler {
             },
             SqlPlanningEnvironment::Distributed { backend_count },
             materializer,
-            builtin_sql_function_catalog(),
+            self.functions.as_ref(),
             crate::query_execution::constant_eval::constant_evaluator(),
             mv_definitions,
             SqlCompileControl::new(

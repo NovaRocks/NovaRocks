@@ -113,6 +113,7 @@ pub(crate) trait DmlQueryExecutionKernel:
     + crate::query_execution::planning::time_travel::TimeTravelResolver
     + crate::query_execution::planning::statistics::QueryStatisticsResolver
 {
+    fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     /// The statement's typed connector control registry, supplied once when
     /// the kernel was composed.
@@ -127,6 +128,10 @@ pub(crate) trait DmlQueryExecutionKernel:
 }
 
 impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
+    fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
+        self.function_catalog().as_ref()
+    }
+
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
         self.connector_control().as_ref()
     }
@@ -156,6 +161,10 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 /// kernel that froze its catalog/statistics facts. It must not recover the
 /// legacy aggregate just to enter the generic Iceberg-write preparation path.
 impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
+    fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
+        self.function_catalog().as_ref()
+    }
+
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
         self.connector_control().as_ref()
     }
@@ -1747,7 +1756,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
-        novarocks_sql::compiler::builtin_sql_function_catalog(),
+        DmlQueryExecutionKernel::function_catalog(state),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
@@ -2101,7 +2110,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
-        novarocks_sql::compiler::builtin_sql_function_catalog(),
+        query_kernel.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         mv_definitions.as_ref(),
         novarocks_sql::compiler::SqlCompileControl::new(
@@ -2205,7 +2214,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             },
             novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
             &catalog_snapshot,
-            novarocks_sql::compiler::builtin_sql_function_catalog(),
+            query_kernel.function_catalog().as_ref(),
             crate::query_execution::constant_eval::constant_evaluator(),
             Some(&mv_definitions),
             novarocks_sql::compiler::SqlCompileControl::new(

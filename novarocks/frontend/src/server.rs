@@ -128,6 +128,7 @@ pub fn build_frontend_query_session_factory(
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
     let unified_statistics = Arc::new(crate::connector::UnifiedStatisticsResolver::default());
     let catalog_application = host.catalog_application_port();
+    let function_catalog = host.function_catalog();
     let catalog_projection = host.catalog_runtime_projection();
     let connector_control = host.connector_control_registry();
     // Constructor-supplied, exactly once: query preparation receives the
@@ -155,6 +156,7 @@ pub fn build_frontend_query_session_factory(
         core_capabilities::bind_mv_refresh_provider_activation(
             sink.as_ref(),
             core_capabilities::MvRefreshProviderActivationPorts::new(
+                Arc::clone(&function_catalog),
                 Arc::clone(&catalog_service),
                 Some(Arc::clone(&catalog_application)),
                 Arc::clone(&connector_control),
@@ -237,6 +239,7 @@ pub fn build_frontend_query_session_factory(
         && let Err(error) = core_capabilities::bind_mv_background_engine(
             sink.as_ref(),
             core_capabilities::MvBackgroundPorts::new(
+                Arc::clone(&function_catalog),
                 Arc::clone(&catalog_service),
                 Some(Arc::clone(&catalog_application)),
                 Arc::clone(&connector_control),
@@ -260,6 +263,7 @@ pub fn build_frontend_query_session_factory(
 
     let query_compiler =
         core_capabilities::query_compiler(core_capabilities::QueryCompilerPorts::new(
+            Arc::clone(&function_catalog),
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
@@ -308,6 +312,7 @@ pub fn build_frontend_query_session_factory(
     );
     let mv_command_executor =
         core_capabilities::mv_command_executor(core_capabilities::MvCommandPorts::new(
+            Arc::clone(&function_catalog),
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
@@ -322,6 +327,7 @@ pub fn build_frontend_query_session_factory(
     let maintenance_read_command_executor =
         core_capabilities::maintenance_read_command_executor(maintenance_service);
     let dml_engines = core_capabilities::dml_engines(core_capabilities::DmlEnginePorts::new(
+        function_catalog,
         Arc::clone(&catalog_service),
         Some(catalog_application),
         connector_control,

@@ -3161,11 +3161,13 @@ dependencies = [
  "novarocks-connector-binding",
  "novarocks-execution",
  "novarocks-failpoint",
+ "novarocks-functions",
  "novarocks-native-trust",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-secret",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-types",
  "novarocks-version",
  "once_cell",
@@ -3295,6 +3297,7 @@ dependencies = [
  "hex",
  "libm",
  "md-5",
+ "novarocks-functions",
  "novarocks-spi",
  "novarocks-types",
  "num-traits",
@@ -3347,6 +3350,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-fs",
+ "novarocks-functions",
  "novarocks-native-trust",
  "novarocks-parser",
  "novarocks-plan-codec",
@@ -3398,6 +3402,14 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "novarocks-functions"
+version = "0.1.0"
+dependencies = [
+ "arrow-schema",
+ "sha2",
 ]
 
 [[package]]
@@ -3486,6 +3498,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hex",
  "libc",
  "mysql",
  "novarocks-backend",
@@ -3496,9 +3509,11 @@ dependencies = [
  "novarocks-failpoint",
  "novarocks-frontend",
  "novarocks-fs",
+ "novarocks-functions",
  "novarocks-native-trust",
  "novarocks-secret",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-state-store-sqlite",
  "novarocks-test-support",
  "novarocks-types",
@@ -3538,6 +3553,7 @@ dependencies = [
  "chrono",
  "hex",
  "md-5",
+ "novarocks-functions",
  "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",
