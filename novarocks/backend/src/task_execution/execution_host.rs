@@ -991,13 +991,25 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                     // A filter domain has no queue to report.
                     .map(|()| None)
             }
-            TaskDomainUpdate::OpenExchangeEdges { version, edges } => runtime
-                .edges
-                .open(*version, edges)
-                .map(|_| None)
-                .map_err(|conflict| {
-                    protocol(format!("task {identity} edge open is illegal: {conflict}"))
-                }),
+            TaskDomainUpdate::OpenExchangeEdges { version, edges } => {
+                // The one place a gated edge starts sending. Logged because a
+                // sink whose edge never opens waits silently, and the absence
+                // of this line is the evidence that distinguishes "the
+                // frontend never decided" from "the producer never applied it".
+                tracing::debug!(
+                    task = %identity,
+                    version = ?version,
+                    edges = ?edges,
+                    "opening this task's frozen exchange edges"
+                );
+                runtime
+                    .edges
+                    .open(*version, edges)
+                    .map(|_| None)
+                    .map_err(|conflict| {
+                        protocol(format!("task {identity} edge open is illegal: {conflict}"))
+                    })
+            }
         }
     }
 }

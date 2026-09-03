@@ -31,7 +31,20 @@ fn usage() {
     );
 }
 
+/// The tracing filter this process runs with.
+///
+/// `NOVAROCKS_LOG_FILTER` takes precedence over both config keys, matching how
+/// `NOVAROCKS_LOG_DIR` already overrides the configured log directory. A
+/// deployment states its intent in config; an operator diagnosing a live
+/// process cannot always edit that config, and in a launched test cluster the
+/// configs are generated per run.
 fn resolve_log_filter(config: &NovaRocksConfig) -> String {
+    if let Ok(filter) = std::env::var("NOVAROCKS_LOG_FILTER") {
+        let filter = filter.trim();
+        if !filter.is_empty() {
+            return filter.to_owned();
+        }
+    }
     config
         .log_filter
         .clone()

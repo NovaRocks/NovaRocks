@@ -2135,7 +2135,15 @@ impl DataStreamSinkOperator {
 
 impl ProcessorOperator for DataStreamSinkOperator {
     fn finishing_is_pending(&self) -> bool {
-        self.finishing.load(Ordering::Acquire) && self.awaits_edge_permission()
+        // "Do I still owe output?", not "is my edge closed?". A flush that
+        // parked a payload on a closed edge leaves that payload owed after the
+        // edge opens, and asking only about permission latches the operator
+        // the moment the gate lifts -- with the payload still in hand and
+        // nothing left to drive another flush. The driver treats `true` as "no
+        // progress, come back", so this is a park and not a spin, and every
+        // return through `set_finishing` re-attempts the flush.
+        self.finishing.load(Ordering::Acquire)
+            && (self.awaits_edge_permission() || self.has_pending_data())
     }
 
     fn accepts_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
@@ -2236,6 +2244,33 @@ impl ProcessorOperator for DataStreamSinkOperator {
         );
 
         self.flush_pending(true, true)?;
+        // The gate state per outbound edge, and the state of the gate each
+        // destination of THIS sink resolves to. A sink that waits forever is
+        // waiting on one of these, and without both halves it cannot be told
+        // apart from a sink whose edge opened but whose data never drained.
+        debug!(
+            "DataStreamSink finishing gates: finst={} driver_id={} dest_node_id={} edges={:?} destination_gates={:?} awaits_permission={} has_pending_data={}",
+            format_uuid(
+                self.fragment_instance_id.high(),
+                self.fragment_instance_id.low()
+            ),
+            self.driver_id,
+            self.input.dest_node_id,
+            self.edge_gates
+                .as_ref()
+                .map(|gates| gates.edges().collect::<Vec<_>>()),
+            self.destinations()
+                .iter()
+                .enumerate()
+                .map(|(idx, dest)| (
+                    dest.finst_id().low(),
+                    Self::is_pseudo_destination(dest),
+                    self.destination_state_at(idx)
+                ))
+                .collect::<Vec<_>>(),
+            self.awaits_edge_permission(),
+            self.has_pending_data(),
+        );
         // One driver reports its own finish exactly once, however many times
         // the driver retries this call while waiting for its edge to open.
         let is_last_driver = if self.finish_counted.swap(true, Ordering::SeqCst) {
@@ -2258,6 +2293,14 @@ impl ProcessorOperator for DataStreamSinkOperator {
             is_last_driver
         );
         if !is_last_driver {
+            return Ok(());
+        }
+        // End of stream must not overtake data this sink still owes. The
+        // last-driver verdict is latched, so returning here keeps it for the
+        // retry that `finishing_is_pending` asks for: the receiver would
+        // otherwise see the seal before the frames it seals and report the
+        // exchange complete with rows still parked on the sender.
+        if self.awaits_edge_permission() || self.has_pending_data() {
             return Ok(());
         }
         self.send_eos()?;

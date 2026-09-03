@@ -456,14 +456,40 @@ impl QueryTaskExecution {
     /// wire request still waits for that producer's own acknowledgement.
     fn open_ready_edges(&mut self, destination: TaskIdentity) -> Result<(), TaskExecutionError> {
         for edge_id in self.edges.note_created(destination) {
-            for producer in self.edges.producers_of(edge_id) {
+            let producers = self.edges.producers_of(edge_id).to_vec();
+            tracing::debug!(
+                edge = %edge_id,
+                destination = %destination,
+                producers = producers.len(),
+                "exchange edge decided; recording the open on every producer"
+            );
+            for producer in producers {
+                // A producer this decision cannot reach never opens its edge,
+                // and its sink then waits for permission for the rest of the
+                // query. Losing that silently is what makes the resulting hang
+                // unattributable, so each miss is reported.
                 let Some(stage) = self.stages.get_mut(&producer.stage_id()) else {
+                    tracing::warn!(
+                        edge = %edge_id,
+                        producer = %producer,
+                        "edge open cannot reach a producer whose stage is absent"
+                    );
                     continue;
                 };
                 let Some(task) = stage.task_mut(producer.task_id()) else {
+                    tracing::warn!(
+                        edge = %edge_id,
+                        producer = %producer,
+                        "edge open cannot reach a producer absent from its own stage"
+                    );
                     continue;
                 };
                 task.enqueue_update(EdgeOpenTracker::open_update(edge_id))?;
+                tracing::debug!(
+                    edge = %edge_id,
+                    producer = %producer,
+                    "edge open recorded on its producer"
+                );
             }
         }
         Ok(())
