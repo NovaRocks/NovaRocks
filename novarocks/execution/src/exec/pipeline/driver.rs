@@ -498,9 +498,18 @@ impl PipelineDriver {
     /// The executor can observe a fragment abort while a driver is parked and
     /// discard that task without another `process` turn.  Cancellation must
     /// still reach source-owned resources such as connector reader groups.
-    pub(crate) fn cancel_for_fragment_abort(&mut self) {
+    pub(crate) fn cancel_for_fragment_abort(&mut self) -> DriverState {
+        // An externally aborted parked task does not receive another normal
+        // `process` turn before the executor accounts it as complete. Route it
+        // through the same PendingFinish latch as in-driver cancellation so an
+        // async owner can finish its bounded cooperative abort first.
         self.cancel_operators();
-        self.state = DriverState::Canceled;
+        if self.has_pending_finish() {
+            self.pending_finish_state = Some(DriverState::Canceled);
+            self.state = DriverState::PendingFinish;
+            return self.state.clone();
+        }
+        self.finish_with_state(DriverState::Canceled)
     }
 
     fn fail_operators(&mut self) {
@@ -538,7 +547,15 @@ impl PipelineDriver {
                 return self.state.clone();
             }
             self.pending_finish_state = None;
-            return self.finish_with_state(final_state);
+            // An output-producing async processor can finish its background
+            // work while still holding a final page for its downstream. Resume
+            // the dataflow before completing a successful driver; terminal
+            // failure/cancellation still keeps its original first-wins state.
+            if matches!(final_state, DriverState::Finished) && !self.is_finished() {
+                self.state = DriverState::Running;
+            } else {
+                return self.finish_with_state(final_state);
+            }
         }
 
         let start = Instant::now();
@@ -580,6 +597,14 @@ impl PipelineDriver {
             // If there is no buffered data, let source readiness decide first to avoid
             // blocking on a full sink when the driver has nothing to push.
             let has_buffered = self.edge_chunks.iter().any(|c| c.is_some());
+
+            // Async processors can exert real backpressure before the terminal
+            // sink. If such a processor is full while an upstream edge already
+            // owns a page, parking on the source would miss the processor's
+            // capacity wake-up and strand that page indefinitely.
+            if has_buffered && self.internal_sink_is_blocked() {
+                return self.block_or_fail(BlockedReason::OutputFull);
+            }
 
             if !has_buffered
                 && let Some(source) = self.operators.first()
@@ -649,6 +674,9 @@ impl PipelineDriver {
     }
 
     pub(crate) fn sink_observable(&self) -> Option<Arc<Observable>> {
+        if let Some(observable) = self.internal_blocked_sink_observable() {
+            return Some(observable);
+        }
         let op = self.operators.last()?;
         let proc = op.as_processor_ref()?;
         proc.sink_observable()
@@ -686,6 +714,9 @@ impl PipelineDriver {
     }
 
     pub(crate) fn sink_ready(&self) -> bool {
+        if self.internal_sink_is_blocked() {
+            return false;
+        }
         let Some(op) = self.operators.last() else {
             return true;
         };
@@ -700,6 +731,24 @@ impl PipelineDriver {
         }
         // need_input can flip to finished (e.g. when finishing drains); re-check finished.
         op.is_finished()
+    }
+
+    fn internal_sink_is_blocked(&self) -> bool {
+        self.internal_blocked_sink_observable().is_some()
+    }
+
+    fn internal_blocked_sink_observable(&self) -> Option<Arc<Observable>> {
+        let end = self.operators.len().saturating_sub(1);
+        self.operators[..end].iter().rev().find_map(|op| {
+            if op.is_finished() {
+                return None;
+            }
+            let processor = op.as_processor_ref()?;
+            if processor.need_input() {
+                return None;
+            }
+            processor.sink_observable()
+        })
     }
 
     pub(crate) fn check_is_ready(&self) -> bool {

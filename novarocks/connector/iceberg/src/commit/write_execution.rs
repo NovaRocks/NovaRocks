@@ -32,18 +32,16 @@ use novarocks_spi::connector::{
 };
 
 use crate::access_binding::IcebergReadBinding;
-use crate::resources::IcebergExecutionRuntime;
 
 /// Startup-sealed provider factory for catalog-keyed Iceberg writers.
 #[derive(Clone)]
 pub struct IcebergCatalogWriteExecutionFactory {
     binding: IcebergReadBinding,
-    runtime: IcebergExecutionRuntime,
 }
 
 impl IcebergCatalogWriteExecutionFactory {
-    pub fn new(binding: IcebergReadBinding, runtime: IcebergExecutionRuntime) -> Self {
-        Self { binding, runtime }
+    pub fn new(binding: IcebergReadBinding) -> Self {
+        Self { binding }
     }
 }
 
@@ -56,7 +54,6 @@ impl CatalogWriteExecutionBundleFactory for IcebergCatalogWriteExecutionFactory 
         // warehouse it claims, so it still runs even though the bundle it
         // carries opens no writer.
         self.binding.bind_catalog(properties)?;
-        let _ = &self.runtime;
         Ok(CatalogWriteExecutionBundle::new(Arc::new(
             IcebergRetiredCatalogWriteExecution {
                 catalog_handle: properties.handle().clone(),

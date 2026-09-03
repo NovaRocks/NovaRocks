@@ -25,6 +25,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 pub mod async_sink;
+pub(crate) mod async_writer;
 pub mod binding;
 pub mod blocked_driver_poller;
 pub mod builder;

@@ -1,0 +1,1322 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Bounded, single-owner execution for connector writers.
+//!
+//! The driver owns only this mailbox handle. The provider writer is opened and
+//! then exclusively owned by one `sink_io` task for its complete lifecycle, so
+//! no provider future is polled on a driver thread and no writer mutex exists.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use arrow::record_batch::RecordBatch;
+use futures::FutureExt;
+use novarocks_spi::connector::write_stack::{
+    ConnectorBatchWriter, ConnectorCommitFragment, ConnectorOpenWriterRequest,
+    ConnectorWriteExecution,
+};
+use tokio::sync::{Notify, mpsc};
+use tokio::task::JoinHandle;
+
+use crate::exec::pipeline::schedule::observer::Observable;
+use crate::runtime::execution_services::IoExecutor;
+use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
+use crate::runtime::runtime_state::RuntimeErrorState;
+
+/// Limits one writer's retained input. A single input page must fit both
+/// per-page limits. `need_input` reserves against the worst legal next page, so
+/// it remains an exact admission predicate even though the pipeline contract
+/// does not pass that next page to it for inspection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AsyncWriterQueueConfig {
+    pub(crate) max_batches: usize,
+    pub(crate) max_rows: usize,
+    pub(crate) max_bytes: usize,
+    pub(crate) max_batch_rows: usize,
+    pub(crate) max_batch_bytes: usize,
+    pub(crate) abort_timeout: Duration,
+}
+
+impl Default for AsyncWriterQueueConfig {
+    fn default() -> Self {
+        Self {
+            max_batches: 4,
+            max_rows: 4 * 1_048_576,
+            max_bytes: 64 * 1024 * 1024,
+            max_batch_rows: 1_048_576,
+            max_batch_bytes: 16 * 1024 * 1024,
+            abort_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+struct AppendCommand {
+    batch: RecordBatch,
+    rows: usize,
+    bytes: usize,
+    _accounting: Option<TrackedBytes>,
+}
+
+enum WriterCommand {
+    Append(AppendCommand),
+    Finish,
+}
+
+type FinishMapper<O> =
+    Box<dyn FnOnce(u64, Vec<ConnectorCommitFragment>) -> Result<O, String> + Send + 'static>;
+
+struct WriterStart<O> {
+    execution: Arc<dyn ConnectorWriteExecution>,
+    request: ConnectorOpenWriterRequest,
+    receiver: mpsc::Receiver<WriterCommand>,
+    finish_mapper: FinishMapper<O>,
+}
+
+struct WriterShared<O> {
+    observable: Arc<Observable>,
+    abort_notify: Notify,
+    queue_usage: Mutex<QueueUsage>,
+    finish_requested: AtomicBool,
+    abort_requested: AtomicBool,
+    done: AtomicBool,
+    result: Mutex<Option<O>>,
+    error: Mutex<Option<String>>,
+    queue_tracker: Mutex<Option<Arc<MemTracker>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct QueueUsage {
+    batches: usize,
+    rows: usize,
+    bytes: usize,
+}
+
+impl<O> WriterShared<O> {
+    fn new() -> Self {
+        Self {
+            observable: Arc::new(Observable::new()),
+            abort_notify: Notify::new(),
+            queue_usage: Mutex::new(QueueUsage::default()),
+            finish_requested: AtomicBool::new(false),
+            abort_requested: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            result: Mutex::new(None),
+            error: Mutex::new(None),
+            queue_tracker: Mutex::new(None),
+        }
+    }
+
+    fn wake(&self) {
+        self.observable.defer_notify().arm();
+    }
+
+    fn release_append(&self, rows: usize, bytes: usize) {
+        let mut usage = self
+            .queue_usage
+            .lock()
+            .expect("async writer queue usage lock");
+        usage.batches = usage.batches.saturating_sub(1);
+        usage.rows = usage.rows.saturating_sub(rows);
+        usage.bytes = usage.bytes.saturating_sub(bytes);
+        drop(usage);
+        self.wake();
+    }
+
+    fn clear_queue_usage(&self) {
+        *self
+            .queue_usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = QueueUsage::default();
+        self.wake();
+    }
+
+    fn set_error(&self, error: String, runtime_error: &RuntimeErrorState) {
+        let mut guard = self.error.lock().expect("async writer error lock");
+        if guard.is_none() {
+            runtime_error.set_error(error.clone());
+            *guard = Some(error);
+        }
+        self.wake();
+    }
+
+    fn set_done(&self) {
+        self.done.store(true, Ordering::Release);
+        self.wake();
+    }
+}
+
+/// Driver-side handle for one asynchronously owned connector writer.
+pub(crate) struct AsyncWriterOwner<O: Send + 'static> {
+    config: AsyncWriterQueueConfig,
+    sender: Option<mpsc::Sender<WriterCommand>>,
+    start: Option<WriterStart<O>>,
+    shared: Arc<WriterShared<O>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl<O: Send + 'static> AsyncWriterOwner<O> {
+    pub(crate) fn new(
+        execution: Arc<dyn ConnectorWriteExecution>,
+        request: ConnectorOpenWriterRequest,
+        config: AsyncWriterQueueConfig,
+        finish_mapper: FinishMapper<O>,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel(config.max_batches.max(1).saturating_add(1));
+        Self {
+            config,
+            sender: Some(sender),
+            start: Some(WriterStart {
+                execution,
+                request,
+                receiver,
+                finish_mapper,
+            }),
+            shared: Arc::new(WriterShared::new()),
+            join: None,
+        }
+    }
+
+    pub(crate) fn set_mem_tracker(&self, tracker: Arc<MemTracker>) {
+        *self
+            .shared
+            .queue_tracker
+            .lock()
+            .expect("async writer queue tracker lock") =
+            Some(MemTracker::new_child("ConnectorWriterQueue", &tracker));
+    }
+
+    pub(crate) fn bind(
+        &mut self,
+        executor: IoExecutor,
+        runtime_error: Arc<RuntimeErrorState>,
+    ) -> Result<(), String> {
+        let start = self
+            .start
+            .take()
+            .ok_or_else(|| "connector writer actor is already bound".to_string())?;
+        let shared = Arc::clone(&self.shared);
+        let config = self.config;
+        self.join = Some(executor.spawn(async move {
+            let outcome = tokio::spawn(run_writer_actor(
+                start,
+                Arc::clone(&shared),
+                config,
+                Arc::clone(&runtime_error),
+            ))
+            .await;
+            if let Err(join_error) = outcome {
+                let detail = if join_error.is_panic() {
+                    let payload = join_error.into_panic();
+                    if let Some(message) = payload.downcast_ref::<&str>() {
+                        (*message).to_string()
+                    } else if let Some(message) = payload.downcast_ref::<String>() {
+                        message.clone()
+                    } else {
+                        "unknown panic payload".to_string()
+                    }
+                } else {
+                    join_error.to_string()
+                };
+                shared.set_error(
+                    format!("connector writer actor panicked: {detail}"),
+                    &runtime_error,
+                );
+            }
+            // The nested actor future (including its receiver and in-flight
+            // command) has now been dropped even on panic. Clear logical
+            // admission counters after the matching TrackedBytes guards have
+            // released their retained Arrow memory.
+            shared.clear_queue_usage();
+            let has_result = shared
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            let has_error = shared
+                .error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            if !shared.abort_requested.load(Ordering::Acquire) && !has_result && !has_error {
+                shared.set_error(
+                    "connector writer actor exited without a terminal result".to_string(),
+                    &runtime_error,
+                );
+            }
+            // This is the actor's lifecycle join latch: all actor-owned writer,
+            // receiver, future, and queued-memory values have been dropped by
+            // this point. `JoinHandle::is_finished` closes the final scheduler
+            // race between this store and completion of the task wrapper.
+            shared.set_done();
+        }));
+        Ok(())
+    }
+
+    pub(crate) fn can_accept(&self) -> bool {
+        if self.shared.finish_requested.load(Ordering::Acquire)
+            || self.shared.abort_requested.load(Ordering::Acquire)
+            || self.shared.done.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let usage = self
+            .shared
+            .queue_usage
+            .lock()
+            .expect("async writer queue usage lock");
+        usage.batches < self.config.max_batches
+            && usage.rows.saturating_add(self.config.max_batch_rows) <= self.config.max_rows
+            && usage.bytes.saturating_add(self.config.max_batch_bytes) <= self.config.max_bytes
+    }
+
+    pub(crate) fn enqueue(&self, batch: RecordBatch, retained_bytes: usize) -> Result<(), String> {
+        let rows = batch.num_rows();
+        if rows > self.config.max_batch_rows {
+            return Err(format!(
+                "ResourceExhausted: connector writer input batch has {rows} rows, above the per-batch limit of {} rows",
+                self.config.max_batch_rows
+            ));
+        }
+        if retained_bytes > self.config.max_batch_bytes {
+            return Err(format!(
+                "ResourceExhausted: connector writer input batch retains {retained_bytes} bytes, above the per-batch limit of {} bytes",
+                self.config.max_batch_bytes
+            ));
+        }
+        {
+            let mut usage = self
+                .shared
+                .queue_usage
+                .lock()
+                .expect("async writer queue usage lock");
+            let fits = usage.batches < self.config.max_batches
+                && usage.rows.saturating_add(rows) <= self.config.max_rows
+                && usage.bytes.saturating_add(retained_bytes) <= self.config.max_bytes;
+            if !fits {
+                return Err(
+                    "connector writer queue has no reserved rows/bytes capacity".to_string()
+                );
+            }
+            usage.batches += 1;
+            usage.rows += rows;
+            usage.bytes += retained_bytes;
+        }
+        let tracker = self
+            .shared
+            .queue_tracker
+            .lock()
+            .expect("async writer queue tracker lock")
+            .clone();
+        let command = WriterCommand::Append(AppendCommand {
+            batch,
+            rows,
+            bytes: retained_bytes,
+            _accounting: tracker.map(|tracker| TrackedBytes::new(retained_bytes, tracker)),
+        });
+        let Some(sender) = self.sender.as_ref() else {
+            self.shared.release_append(rows, retained_bytes);
+            return Err("connector writer enqueue after terminal transition".to_string());
+        };
+        if let Err(error) = sender.try_send(command) {
+            self.shared.release_append(rows, retained_bytes);
+            return Err(format!("connector writer enqueue failed: {error}"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request_finish(&mut self) -> Result<(), String> {
+        if self.shared.finish_requested.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let Some(sender) = self.sender.take() else {
+            return Err("connector writer finish after terminal transition".to_string());
+        };
+        sender
+            .try_send(WriterCommand::Finish)
+            .map_err(|error| format!("connector writer finish enqueue failed: {error}"))
+    }
+
+    pub(crate) fn request_abort(&mut self) {
+        if self.shared.done.load(Ordering::Acquire) {
+            return;
+        }
+        self.sender = None;
+        self.shared.abort_requested.store(true, Ordering::Release);
+        self.shared.abort_notify.notify_one();
+        self.shared.wake();
+    }
+
+    pub(crate) fn observable(&self) -> Arc<Observable> {
+        Arc::clone(&self.shared.observable)
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.shared.done.load(Ordering::Acquire)
+            && self
+                .join
+                .as_ref()
+                .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    pub(crate) fn has_output(&self) -> bool {
+        self.shared
+            .result
+            .lock()
+            .expect("async writer result lock")
+            .is_some()
+    }
+
+    pub(crate) fn take_output(&self) -> Option<O> {
+        self.shared
+            .result
+            .lock()
+            .expect("async writer result lock")
+            .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_usage(&self) -> (usize, usize) {
+        let usage = self
+            .shared
+            .queue_usage
+            .lock()
+            .expect("async writer queue usage lock");
+        (usage.rows, usage.bytes)
+    }
+}
+
+impl<O: Send + 'static> Drop for AsyncWriterOwner<O> {
+    fn drop(&mut self) {
+        self.request_abort();
+    }
+}
+
+enum AwaitResult<T> {
+    Completed(T),
+    Aborted,
+    Panicked(String),
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+async fn await_or_abort<T>(
+    future: impl std::future::Future<Output = T>,
+    shared: &WriterShared<impl Send>,
+) -> AwaitResult<T> {
+    if shared.abort_requested.load(Ordering::Acquire) {
+        return AwaitResult::Aborted;
+    }
+    tokio::select! {
+        biased;
+        _ = shared.abort_notify.notified() => AwaitResult::Aborted,
+        result = std::panic::AssertUnwindSafe(future).catch_unwind() => match result {
+            Ok(result) => AwaitResult::Completed(result),
+            Err(payload) => AwaitResult::Panicked(panic_message(payload)),
+        },
+    }
+}
+
+async fn abort_writer(
+    writer: &mut dyn ConnectorBatchWriter,
+    timeout: Duration,
+) -> Result<(), String> {
+    let abort = std::panic::AssertUnwindSafe(writer.abort()).catch_unwind();
+    match tokio::time::timeout(timeout, abort).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(format!("abort connector writer: {error}")),
+        Ok(Err(payload)) => Err(format!(
+            "abort connector writer panicked: {}",
+            panic_message(payload)
+        )),
+        Err(_) => Err(format!(
+            "abort connector writer exceeded the bounded wait of {} ms",
+            timeout.as_millis()
+        )),
+    }
+}
+
+async fn fail_with_abort<O>(
+    writer: &mut dyn ConnectorBatchWriter,
+    primary: String,
+    shared: &WriterShared<O>,
+    config: AsyncWriterQueueConfig,
+    runtime_error: &RuntimeErrorState,
+) {
+    let error = match abort_writer(writer, config.abort_timeout).await {
+        Ok(()) => primary,
+        Err(abort_error) => format!("{primary}; {abort_error}"),
+    };
+    shared.set_error(error, runtime_error);
+}
+
+fn checked_accepted_rows(current: u64, rows: usize) -> Result<u64, String> {
+    let rows = u64::try_from(rows)
+        .map_err(|_| "connector writer accepted row count does not fit u64".to_string())?;
+    current
+        .checked_add(rows)
+        .ok_or_else(|| "connector writer accepted row count overflowed u64".to_string())
+}
+
+async fn run_writer_actor<O: Send + 'static>(
+    start: WriterStart<O>,
+    shared: Arc<WriterShared<O>>,
+    config: AsyncWriterQueueConfig,
+    runtime_error: Arc<RuntimeErrorState>,
+) {
+    let WriterStart {
+        execution,
+        request,
+        mut receiver,
+        finish_mapper,
+    } = start;
+    let mut writer = match await_or_abort(execution.open_writer(request), shared.as_ref()).await {
+        AwaitResult::Completed(Ok(writer)) => writer,
+        AwaitResult::Completed(Err(error)) => {
+            shared.set_error(format!("open connector writer: {error}"), &runtime_error);
+            return;
+        }
+        AwaitResult::Aborted => {
+            return;
+        }
+        AwaitResult::Panicked(detail) => {
+            shared.set_error(
+                format!("open connector writer panicked: {detail}"),
+                &runtime_error,
+            );
+            return;
+        }
+    };
+    let mut finish_mapper = Some(finish_mapper);
+    let mut accepted_rows = 0u64;
+
+    loop {
+        if shared.abort_requested.load(Ordering::Acquire) {
+            if let Err(error) = abort_writer(writer.as_mut(), config.abort_timeout).await {
+                shared.set_error(error, &runtime_error);
+            }
+            return;
+        }
+        let command = tokio::select! {
+            biased;
+            _ = shared.abort_notify.notified() => continue,
+            command = receiver.recv() => command,
+        };
+        let Some(command) = command else {
+            if let Err(error) = abort_writer(writer.as_mut(), config.abort_timeout).await {
+                shared.set_error(error, &runtime_error);
+            }
+            return;
+        };
+        match command {
+            WriterCommand::Append(command) => {
+                let rows = command.rows;
+                let bytes = command.bytes;
+                let outcome = await_or_abort(writer.append(command.batch), shared.as_ref()).await;
+                drop(command._accounting);
+                shared.release_append(rows, bytes);
+                match outcome {
+                    AwaitResult::Completed(Ok(())) => {
+                        accepted_rows = match checked_accepted_rows(accepted_rows, rows) {
+                            Ok(total) => total,
+                            Err(error) => {
+                                fail_with_abort(
+                                    writer.as_mut(),
+                                    error,
+                                    shared.as_ref(),
+                                    config,
+                                    &runtime_error,
+                                )
+                                .await;
+                                return;
+                            }
+                        };
+                    }
+                    AwaitResult::Completed(Err(error)) => {
+                        fail_with_abort(
+                            writer.as_mut(),
+                            format!("append connector writer batch: {error}"),
+                            shared.as_ref(),
+                            config,
+                            &runtime_error,
+                        )
+                        .await;
+                        return;
+                    }
+                    AwaitResult::Aborted => {
+                        if let Err(error) =
+                            abort_writer(writer.as_mut(), config.abort_timeout).await
+                        {
+                            shared.set_error(error, &runtime_error);
+                        }
+                        return;
+                    }
+                    AwaitResult::Panicked(detail) => {
+                        fail_with_abort(
+                            writer.as_mut(),
+                            format!("append connector writer batch panicked: {detail}"),
+                            shared.as_ref(),
+                            config,
+                            &runtime_error,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            WriterCommand::Finish => {
+                let fragments = match await_or_abort(writer.finish(), shared.as_ref()).await {
+                    AwaitResult::Completed(Ok(fragments)) => fragments,
+                    AwaitResult::Completed(Err(error)) => {
+                        fail_with_abort(
+                            writer.as_mut(),
+                            format!("finish connector writer: {error}"),
+                            shared.as_ref(),
+                            config,
+                            &runtime_error,
+                        )
+                        .await;
+                        return;
+                    }
+                    AwaitResult::Aborted => {
+                        if let Err(error) =
+                            abort_writer(writer.as_mut(), config.abort_timeout).await
+                        {
+                            shared.set_error(error, &runtime_error);
+                        }
+                        return;
+                    }
+                    AwaitResult::Panicked(detail) => {
+                        fail_with_abort(
+                            writer.as_mut(),
+                            format!("finish connector writer panicked: {detail}"),
+                            shared.as_ref(),
+                            config,
+                            &runtime_error,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let mapper = finish_mapper
+                    .take()
+                    .expect("connector writer finish mapper is consumed exactly once");
+                match mapper(accepted_rows, fragments) {
+                    Ok(output) => {
+                        *shared.result.lock().expect("async writer result lock") = Some(output);
+                    }
+                    Err(error) => {
+                        fail_with_abort(
+                            writer.as_mut(),
+                            error,
+                            shared.as_ref(),
+                            config,
+                            &runtime_error,
+                        )
+                        .await;
+                    }
+                }
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use novarocks_spi::connector::write_stack::{
+        ConnectorBatchWriter, ConnectorCommitFragment, ConnectorOpenWriterRequest,
+        ConnectorWriteExecution,
+    };
+    use novarocks_spi::connector::{CatalogHandle, ConnectorError, ConnectorErrorKind};
+
+    use super::*;
+    use crate::exec::operators::table_writer::tests::{
+        catalog_handle, request_context, target, writer_handle,
+    };
+    use crate::runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+
+    #[derive(Default)]
+    struct Calls {
+        opened: AtomicUsize,
+        appended: AtomicUsize,
+        finished: AtomicUsize,
+        aborted: AtomicUsize,
+    }
+
+    struct ControlledExecution {
+        catalog_handle: CatalogHandle,
+        calls: Arc<Calls>,
+        append_gate: Option<Arc<Notify>>,
+        fail_append: bool,
+        fail_abort: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectorWriteExecution for ControlledExecution {
+        fn catalog_handle(&self) -> &CatalogHandle {
+            &self.catalog_handle
+        }
+
+        async fn open_writer(
+            &self,
+            _request: ConnectorOpenWriterRequest,
+        ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+            self.calls.opened.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(ControlledWriter {
+                calls: Arc::clone(&self.calls),
+                append_gate: self.append_gate.clone(),
+                fail_append: self.fail_append,
+                fail_abort: self.fail_abort,
+            }))
+        }
+    }
+
+    struct ControlledWriter {
+        calls: Arc<Calls>,
+        append_gate: Option<Arc<Notify>>,
+        fail_append: bool,
+        fail_abort: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ConnectorBatchWriter for ControlledWriter {
+        async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+            if let Some(gate) = &self.append_gate {
+                gate.notified().await;
+            }
+            if self.fail_append {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "injected append failure",
+                ));
+            }
+            self.calls
+                .appended
+                .fetch_add(batch.num_rows(), Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+            self.calls.finished.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        async fn abort(&mut self) -> Result<(), ConnectorError> {
+            self.calls.aborted.fetch_add(1, Ordering::Relaxed);
+            if self.fail_abort {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "injected abort failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn runtime() -> Arc<ExecutionRuntime> {
+        Arc::new(
+            ExecutionRuntime::new(ExecutionRuntimeConfig {
+                driver_threads: 1,
+                scan_threads: 1,
+                scan_queue_capacity: 1,
+                spill_io_threads: 1,
+                spill_io_queue_capacity: 1,
+                spill_storage:
+                    crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
+                exchange_wait_ms: 120_000,
+                exchange_io_threads: 1,
+                exchange_io_max_inflight_bytes: 1024,
+                exchange_max_transmit_batched_bytes: 1024,
+                operator_buffer_chunks: 1,
+                local_exchange_buffer_mem_limit_per_driver: 1024,
+                local_exchange_max_buffered_rows: 1024,
+                connector_io_tasks_per_scan_operator: 1,
+                scan_submit_fail_max: 1,
+                scan_submit_fail_timeout_ms: 1,
+                runtime_filter_scan_wait_time_ms_override: None,
+                runtime_filter_wait_timeout_ms_override: None,
+                sink_io_worker_threads: 1,
+                sink_io_max_blocking_threads: 1,
+            })
+            .expect("test execution runtime"),
+        )
+    }
+
+    fn request() -> ConnectorOpenWriterRequest {
+        ConnectorOpenWriterRequest {
+            handle: writer_handle(),
+            target: target(0),
+            expected_schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+            physical: novarocks_spi::connector::write_stack::ConnectorWriterPhysicalContext::new(
+                [1; 16], 2, [3; 16], 0, 0,
+            ),
+            context: request_context(),
+        }
+    }
+
+    fn batch(rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..rows as i32)) as ArrayRef],
+        )
+        .expect("record batch")
+    }
+
+    fn wait_until(predicate: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if predicate() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(predicate(), "condition did not become true before timeout");
+    }
+
+    fn owner(
+        calls: Arc<Calls>,
+        append_gate: Option<Arc<Notify>>,
+        fail_append: bool,
+        fail_abort: bool,
+        config: AsyncWriterQueueConfig,
+    ) -> (
+        AsyncWriterOwner<u64>,
+        Arc<RuntimeErrorState>,
+        Arc<MemTracker>,
+        Arc<ExecutionRuntime>,
+    ) {
+        let execution = Arc::new(ControlledExecution {
+            catalog_handle: catalog_handle(),
+            calls,
+            append_gate,
+            fail_append,
+            fail_abort,
+        });
+        let error = Arc::new(RuntimeErrorState::default());
+        let tracker = MemTracker::new_root("async-writer-test");
+        let mut owner =
+            AsyncWriterOwner::new(execution, request(), config, Box::new(|rows, _| Ok(rows)));
+        owner.set_mem_tracker(Arc::clone(&tracker));
+        let runtime = runtime();
+        owner
+            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .expect("bind async writer");
+        (owner, error, tracker, runtime)
+    }
+
+    #[test]
+    fn slow_append_holds_exact_rows_bytes_and_backpressures_until_release() {
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, error, tracker, _runtime) = owner(
+            Arc::clone(&calls),
+            Some(Arc::clone(&gate)),
+            false,
+            false,
+            config,
+        );
+        let input = batch(3);
+        let bytes = crate::exec::chunk::record_batch_bytes(&input);
+        owner.enqueue(input, bytes).expect("first append");
+        assert_eq!(owner.queued_usage(), (3, bytes));
+        assert!(!owner.can_accept());
+        assert!(tracker.current() > 0);
+        assert!(owner.enqueue(batch(1), 4).is_err());
+
+        gate.notify_one();
+        wait_until(|| owner.can_accept());
+        assert_eq!(owner.queued_usage(), (0, 0));
+        assert_eq!(tracker.current(), 0);
+        owner.request_finish().expect("finish request");
+        wait_until(|| owner.has_output());
+        assert_eq!(owner.take_output(), Some(3));
+        assert_eq!(calls.finished.load(Ordering::Relaxed), 1);
+        assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn append_failure_aborts_once_and_releases_queue_memory() {
+        let calls = Arc::new(Calls::default());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (owner, error, tracker, _runtime) =
+            owner(Arc::clone(&calls), None, true, false, config);
+        let input = batch(2);
+        let bytes = crate::exec::chunk::record_batch_bytes(&input);
+        owner.enqueue(input, bytes).expect("enqueue failing append");
+        wait_until(|| owner.is_done());
+        assert_eq!(calls.aborted.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.finished.load(Ordering::Relaxed), 0);
+        assert_eq!(owner.queued_usage(), (0, 0));
+        assert_eq!(tracker.current(), 0);
+        assert!(
+            error
+                .error()
+                .expect("runtime error")
+                .contains("injected append failure")
+        );
+    }
+
+    #[test]
+    fn cancellation_interrupts_append_then_cooperatively_aborts() {
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, error, tracker, _runtime) =
+            owner(Arc::clone(&calls), Some(gate), false, false, config);
+        let input = batch(2);
+        let bytes = crate::exec::chunk::record_batch_bytes(&input);
+        owner.enqueue(input, bytes).expect("enqueue slow append");
+        owner.request_abort();
+        wait_until(|| owner.is_done());
+        assert_eq!(calls.aborted.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.appended.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.finished.load(Ordering::Relaxed), 0);
+        assert_eq!(tracker.current(), 0);
+        assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn cancellation_drops_cancel_safe_open_without_an_unreachable_writer_abort() {
+        struct OpenDropGuard(Arc<AtomicUsize>);
+
+        impl Drop for OpenDropGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        struct CancelSafeOpenExecution {
+            catalog_handle: CatalogHandle,
+            started: Arc<AtomicUsize>,
+            effects: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+            gate: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl ConnectorWriteExecution for CancelSafeOpenExecution {
+            fn catalog_handle(&self) -> &CatalogHandle {
+                &self.catalog_handle
+            }
+
+            async fn open_writer(
+                &self,
+                _request: ConnectorOpenWriterRequest,
+            ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+                let _drop_guard = OpenDropGuard(Arc::clone(&self.dropped));
+                self.started.fetch_add(1, Ordering::Relaxed);
+                self.gate.notified().await;
+                // The fixture deliberately models the SPI rule: effects may
+                // begin only after open has completed and returned a writer.
+                self.effects.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(ControlledWriter {
+                    calls: Arc::new(Calls::default()),
+                    append_gate: None,
+                    fail_append: false,
+                    fail_abort: false,
+                }))
+            }
+        }
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let effects = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let execution = Arc::new(CancelSafeOpenExecution {
+            catalog_handle: catalog_handle(),
+            started: Arc::clone(&started),
+            effects: Arc::clone(&effects),
+            dropped: Arc::clone(&dropped),
+            gate: Arc::new(Notify::new()),
+        });
+        let runtime = runtime();
+        let error = Arc::new(RuntimeErrorState::default());
+        let mut owner = AsyncWriterOwner::new(
+            execution,
+            request(),
+            AsyncWriterQueueConfig::default(),
+            Box::new(|rows, _| Ok(rows)),
+        );
+        owner
+            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .expect("bind async writer");
+        wait_until(|| started.load(Ordering::Relaxed) == 1);
+
+        owner.request_abort();
+        wait_until(|| owner.is_done());
+
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(effects.load(Ordering::Relaxed), 0);
+        assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn append_panic_aborts_exactly_once_and_is_not_a_clean_empty_finish() {
+        struct PanickingExecution(CatalogHandle, Arc<Calls>);
+
+        #[async_trait::async_trait]
+        impl ConnectorWriteExecution for PanickingExecution {
+            fn catalog_handle(&self) -> &CatalogHandle {
+                &self.0
+            }
+
+            async fn open_writer(
+                &self,
+                _request: ConnectorOpenWriterRequest,
+            ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+                Ok(Box::new(PanickingWriter(Arc::clone(&self.1))))
+            }
+        }
+
+        struct PanickingWriter(Arc<Calls>);
+
+        #[async_trait::async_trait]
+        impl ConnectorBatchWriter for PanickingWriter {
+            async fn append(&mut self, _batch: RecordBatch) -> Result<(), ConnectorError> {
+                panic!("injected provider panic")
+            }
+
+            async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+                Ok(Vec::new())
+            }
+
+            async fn abort(&mut self) -> Result<(), ConnectorError> {
+                self.0.aborted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let runtime = runtime();
+        let error = Arc::new(RuntimeErrorState::default());
+        let tracker = MemTracker::new_root("panicking-writer-test");
+        let calls = Arc::new(Calls::default());
+        let mut owner = AsyncWriterOwner::new(
+            Arc::new(PanickingExecution(catalog_handle(), Arc::clone(&calls))),
+            request(),
+            AsyncWriterQueueConfig::default(),
+            Box::new(|rows, _| Ok(rows)),
+        );
+        owner.set_mem_tracker(Arc::clone(&tracker));
+        owner
+            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .expect("bind async writer");
+        let input = batch(2);
+        let bytes = crate::exec::chunk::record_batch_bytes(&input);
+        owner.enqueue(input, bytes).expect("enqueue panic batch");
+
+        wait_until(|| owner.is_done());
+        assert!(!owner.has_output());
+        assert_eq!(calls.aborted.load(Ordering::Relaxed), 1);
+        assert_eq!(owner.queued_usage(), (0, 0));
+        assert_eq!(tracker.current(), 0);
+        assert!(
+            error
+                .error()
+                .expect("actor panic must be recorded")
+                .contains("append connector writer batch panicked: injected provider panic")
+        );
+    }
+
+    #[test]
+    fn finish_panic_cooperatively_aborts_exactly_once_and_fails() {
+        struct PanickingFinishExecution {
+            catalog_handle: CatalogHandle,
+            calls: Arc<Calls>,
+        }
+
+        #[async_trait::async_trait]
+        impl ConnectorWriteExecution for PanickingFinishExecution {
+            fn catalog_handle(&self) -> &CatalogHandle {
+                &self.catalog_handle
+            }
+
+            async fn open_writer(
+                &self,
+                _request: ConnectorOpenWriterRequest,
+            ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+                Ok(Box::new(PanickingFinishWriter(Arc::clone(&self.calls))))
+            }
+        }
+
+        struct PanickingFinishWriter(Arc<Calls>);
+
+        #[async_trait::async_trait]
+        impl ConnectorBatchWriter for PanickingFinishWriter {
+            async fn append(&mut self, _batch: RecordBatch) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+
+            async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+                panic!("injected finish panic")
+            }
+
+            async fn abort(&mut self) -> Result<(), ConnectorError> {
+                self.0.aborted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let runtime = runtime();
+        let error = Arc::new(RuntimeErrorState::default());
+        let calls = Arc::new(Calls::default());
+        let mut owner = AsyncWriterOwner::new(
+            Arc::new(PanickingFinishExecution {
+                catalog_handle: catalog_handle(),
+                calls: Arc::clone(&calls),
+            }),
+            request(),
+            AsyncWriterQueueConfig::default(),
+            Box::new(|rows, _| Ok(rows)),
+        );
+        owner
+            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .expect("bind async writer");
+        owner.request_finish().expect("request finish");
+
+        wait_until(|| owner.is_done());
+        assert!(!owner.has_output());
+        assert_eq!(calls.aborted.load(Ordering::Relaxed), 1);
+        assert!(
+            error
+                .error()
+                .expect("finish panic must be recorded")
+                .contains("finish connector writer panicked: injected finish panic")
+        );
+    }
+
+    #[test]
+    fn abort_panic_is_an_explicit_terminal_failure() {
+        struct PanickingAbortExecution {
+            catalog_handle: CatalogHandle,
+            opened: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl ConnectorWriteExecution for PanickingAbortExecution {
+            fn catalog_handle(&self) -> &CatalogHandle {
+                &self.catalog_handle
+            }
+
+            async fn open_writer(
+                &self,
+                _request: ConnectorOpenWriterRequest,
+            ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+                self.opened.store(true, Ordering::Release);
+                Ok(Box::new(PanickingAbortWriter))
+            }
+        }
+
+        struct PanickingAbortWriter;
+
+        #[async_trait::async_trait]
+        impl ConnectorBatchWriter for PanickingAbortWriter {
+            async fn append(&mut self, _batch: RecordBatch) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+
+            async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+                Ok(Vec::new())
+            }
+
+            async fn abort(&mut self) -> Result<(), ConnectorError> {
+                panic!("injected abort panic")
+            }
+        }
+
+        let runtime = runtime();
+        let error = Arc::new(RuntimeErrorState::default());
+        let opened = Arc::new(AtomicBool::new(false));
+        let mut owner = AsyncWriterOwner::new(
+            Arc::new(PanickingAbortExecution {
+                catalog_handle: catalog_handle(),
+                opened: Arc::clone(&opened),
+            }),
+            request(),
+            AsyncWriterQueueConfig::default(),
+            Box::new(|rows, _| Ok(rows)),
+        );
+        owner
+            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .expect("bind async writer");
+        wait_until(|| opened.load(Ordering::Acquire));
+        owner.request_abort();
+
+        wait_until(|| owner.is_done());
+        assert!(
+            error
+                .error()
+                .expect("abort panic must be recorded")
+                .contains("abort connector writer panicked: injected abort panic")
+        );
+    }
+
+    #[test]
+    fn accepted_row_count_overflow_is_rejected_instead_of_saturated() {
+        assert_eq!(checked_accepted_rows(41, 1).expect("normal count"), 42);
+        assert_eq!(
+            checked_accepted_rows(u64::MAX, 1).expect_err("overflow"),
+            "connector writer accepted row count overflowed u64"
+        );
+    }
+
+    #[test]
+    fn abort_failure_is_observable_and_finish_is_never_invoked() {
+        let calls = Arc::new(Calls::default());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, error, _tracker, _runtime) =
+            owner(Arc::clone(&calls), None, false, true, config);
+        wait_until(|| calls.opened.load(Ordering::Relaxed) == 1);
+        owner.request_abort();
+        wait_until(|| owner.is_done());
+        assert_eq!(calls.aborted.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.finished.load(Ordering::Relaxed), 0);
+        assert!(
+            error
+                .error()
+                .expect("abort failure")
+                .contains("injected abort failure")
+        );
+    }
+
+    #[test]
+    fn abort_wait_is_bounded_and_timeout_is_an_explicit_failure() {
+        struct HangingAbortExecution(CatalogHandle, Arc<AtomicBool>);
+
+        #[async_trait::async_trait]
+        impl ConnectorWriteExecution for HangingAbortExecution {
+            fn catalog_handle(&self) -> &CatalogHandle {
+                &self.0
+            }
+
+            async fn open_writer(
+                &self,
+                _request: ConnectorOpenWriterRequest,
+            ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+                self.1.store(true, Ordering::Release);
+                Ok(Box::new(HangingAbortWriter))
+            }
+        }
+
+        struct HangingAbortWriter;
+
+        #[async_trait::async_trait]
+        impl ConnectorBatchWriter for HangingAbortWriter {
+            async fn append(&mut self, _batch: RecordBatch) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+
+            async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+                Ok(Vec::new())
+            }
+
+            async fn abort(&mut self) -> Result<(), ConnectorError> {
+                std::future::pending().await
+            }
+        }
+
+        let runtime = runtime();
+        let error = Arc::new(RuntimeErrorState::default());
+        let opened = Arc::new(AtomicBool::new(false));
+        let mut owner = AsyncWriterOwner::new(
+            Arc::new(HangingAbortExecution(catalog_handle(), Arc::clone(&opened))),
+            request(),
+            AsyncWriterQueueConfig {
+                abort_timeout: Duration::from_millis(20),
+                ..AsyncWriterQueueConfig::default()
+            },
+            Box::new(|rows, _| Ok(rows)),
+        );
+        owner
+            .bind(runtime.services().sink_io().clone(), Arc::clone(&error))
+            .expect("bind async writer");
+        wait_until(|| opened.load(Ordering::Acquire));
+        let started = Instant::now();
+        owner.request_abort();
+        wait_until(|| owner.is_done());
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            error
+                .error()
+                .expect("abort timeout must fail the writer")
+                .contains("exceeded the bounded wait of 20 ms")
+        );
+    }
+
+    #[test]
+    fn finish_is_idempotently_requested_and_invoked_exactly_once() {
+        let calls = Arc::new(Calls::default());
+        let (mut owner, error, _tracker, _runtime) = owner(
+            Arc::clone(&calls),
+            None,
+            false,
+            false,
+            AsyncWriterQueueConfig::default(),
+        );
+        owner.request_finish().expect("first finish request");
+        owner.request_finish().expect("second finish request");
+        wait_until(|| owner.has_output());
+        assert_eq!(owner.take_output(), Some(0));
+        assert_eq!(calls.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.aborted.load(Ordering::Relaxed), 0);
+        assert!(error.error().is_none());
+    }
+}

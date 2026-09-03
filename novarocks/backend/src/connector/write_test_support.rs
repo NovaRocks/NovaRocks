@@ -169,8 +169,9 @@ struct RecordingWriter {
     terminals: Arc<Mutex<WriterTerminals>>,
 }
 
+#[async_trait::async_trait]
 impl ConnectorBatchWriter for RecordingWriter {
-    fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         self.terminals
             .lock()
             .expect("writer terminals")
@@ -178,23 +179,24 @@ impl ConnectorBatchWriter for RecordingWriter {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+    async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
         self.terminals.lock().expect("writer terminals").finished += 1;
         Ok(Vec::new())
     }
 
-    fn abort(&mut self) -> Result<(), ConnectorError> {
+    async fn abort(&mut self) -> Result<(), ConnectorError> {
         self.terminals.lock().expect("writer terminals").aborted += 1;
         Ok(())
     }
 }
 
+#[async_trait::async_trait]
 impl ConnectorWriteExecution for RecordingWriteExecution {
     fn catalog_handle(&self) -> &CatalogHandle {
         &self.catalog_handle
     }
 
-    fn open_writer(
+    async fn open_writer(
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {

@@ -389,7 +389,12 @@ impl EventScheduler {
         if task.should_abort_immediately() {
             task.set_in_blocked(false);
             task.set_need_check_reschedule(false);
-            task.finish_due_to_abort();
+            if let Some(task) = task.finish_due_to_abort() {
+                // The global executor will move a still-pending abort to the
+                // PendingFinish poller; enqueueing here keeps this scheduler
+                // free of ownership over the executor's async-finalization set.
+                self.enqueue_ready(task);
+            }
             return;
         }
 

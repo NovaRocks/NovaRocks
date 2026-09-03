@@ -475,11 +475,16 @@ const fn uuid_bytes(high: i64, low: i64) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use arrow::datatypes::DataType;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
+    use novarocks_execution::runtime::execution_runtime::{
+        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+    };
+    use novarocks_execution::runtime::runtime_state::RuntimeState;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::connector_write as write_dto;
     use novarocks_proto_models::plan;
@@ -514,6 +519,46 @@ mod tests {
 
     fn recording_execution() -> Arc<RecordingWriteExecution> {
         Arc::new(RecordingWriteExecution::new())
+    }
+
+    fn writer_runtime_state() -> RuntimeState {
+        let runtime = Arc::new(
+            ExecutionRuntime::new(ExecutionRuntimeConfig {
+                driver_threads: 1,
+                scan_threads: 1,
+                scan_queue_capacity: 1,
+                spill_io_threads: 1,
+                spill_io_queue_capacity: 1,
+                spill_storage: ExecutionSpillStorageConfig::default(),
+                exchange_wait_ms: 120_000,
+                exchange_io_threads: 1,
+                exchange_io_max_inflight_bytes: 1024,
+                exchange_max_transmit_batched_bytes: 1024,
+                operator_buffer_chunks: 1,
+                local_exchange_buffer_mem_limit_per_driver: 1024,
+                local_exchange_max_buffered_rows: 1024,
+                connector_io_tasks_per_scan_operator: 1,
+                scan_submit_fail_max: 1,
+                scan_submit_fail_timeout_ms: 1,
+                runtime_filter_scan_wait_time_ms_override: None,
+                runtime_filter_wait_timeout_ms_override: None,
+                sink_io_worker_threads: 1,
+                sink_io_max_blocking_threads: 1,
+            })
+            .expect("writer execution runtime"),
+        );
+        RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(runtime),
+            None,
+        )
     }
 
     fn write_decode_context(execution: Arc<RecordingWriteExecution>) -> NativePlanDecodeContext {
@@ -631,8 +676,18 @@ mod tests {
         };
         let factory = novarocks_execution::exec::operators::TableWriterOperatorFactory::new(writer);
         assert!(!factory.is_sink(), "a table writer is not a terminal sink");
+        let runtime_state = writer_runtime_state();
+        let mut operators = Vec::new();
         for driver_id in 0..4 {
-            let _operator = factory.create(4, driver_id);
+            let mut operator = factory.create(4, driver_id);
+            operator
+                .bind_runtime_state(&runtime_state)
+                .expect("bind writer actor");
+            operators.push(operator);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while execution.opened().len() != 4 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
             execution.opened(),
@@ -884,8 +939,8 @@ mod tests {
 
     // -------------------------------------------------- structural write limits
 
-    #[test]
-    fn the_backend_write_binding_can_only_open_writers_and_move_carriers() {
+    #[tokio::test]
+    async fn the_backend_write_binding_can_only_open_writers_and_move_carriers() {
         // The proof is the binding's own shape: the single member that reaches a
         // provider is `ConnectorWriteExecution`, whose only method is
         // `open_writer`. There is no commit handle, no control binding, and no
@@ -913,9 +968,10 @@ mod tests {
                 physical: ConnectorWriterPhysicalContext::new([0; 16], 1, [0; 16], 0, 0),
                 context: test_request_context(),
             })
+            .await
             .expect("open writer");
         // A finished writer only ever yields commit fragments, never a commit.
-        assert!(writer.finish().expect("finish").is_empty());
+        assert!(writer.finish().await.expect("finish").is_empty());
         assert_eq!(binding.handle_decoder().owner(), TEST_WRITE_CATALOG);
         assert_eq!(binding.fragment_encoder().owner(), TEST_WRITE_CATALOG);
     }

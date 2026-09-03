@@ -17,10 +17,12 @@
 
 //! The `TableWriter` operator: one writer per pipeline driver.
 //!
-//! `create` opens the driver's own [`ConnectorBatchWriter`] with a physical
-//! context that includes that driver's id. Nothing is shared between drivers:
-//! the append path takes no cross-driver lock, no driver counts the others, and
-//! a failing driver aborts only the writer it owns.
+//! `bind_runtime_state` starts a task-local actor which opens the driver's own
+//! [`ConnectorBatchWriter`](novarocks_spi::connector::write_stack::ConnectorBatchWriter)
+//! with a physical context that includes that driver's
+//! id. Nothing is shared between drivers: the append path takes no cross-driver
+//! lock, no driver counts the others, and a failing driver cooperatively aborts
+//! only the writer its actor owns.
 //!
 //! On a successful finish the operator emits exactly one ROW_COUNT row followed
 //! by zero or more COMMIT_FRAGMENT rows. Canonical bytes are produced by the
@@ -36,20 +38,23 @@ use arrow::record_batch::RecordBatch;
 
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::write_stack::{
-    ConnectorBatchWriter, ConnectorOpenWriterRequest, ConnectorWriteExecution,
-    ConnectorWriterHandle, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, WriteRowCountAccumulator,
-    WriteTargetOrdinal, WriterRowKind, row_count_to_wire, target_ordinal_to_wire,
+    ConnectorOpenWriterRequest, ConnectorWriteExecution, ConnectorWriterHandle,
+    MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, WriteTargetOrdinal, WriterRowKind, row_count_to_wire,
+    target_ordinal_to_wire,
 };
 
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, record_batch_bytes};
 use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentEncoder, writer_relation_chunk_schema, writer_relation_schema,
 };
 use crate::exec::node::table_writer::{
     TableWriterInputProjection, TableWriterNode, TableWriterPhysicalContextTemplate,
 };
+use crate::exec::pipeline::async_writer::{AsyncWriterOwner, AsyncWriterQueueConfig};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::schedule::observer::Observable;
+use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 
 /// The immutable per-node facts every driver copies when it opens its writer.
@@ -113,23 +118,20 @@ impl OperatorFactory for TableWriterOperatorFactory {
             physical,
             context: plan.request_context.clone(),
         };
-        let (writer, open_error) = match plan.execution.open_writer(request) {
-            Ok(writer) => (Some(writer), None),
-            Err(error) => (
-                None,
-                Some(format!("open table writer for driver {driver_id}: {error}")),
-            ),
-        };
+        let target = plan.target;
+        let fragment_encoder = Arc::clone(&plan.fragment_encoder);
+        let writer = AsyncWriterOwner::new(
+            Arc::clone(&plan.execution),
+            request,
+            AsyncWriterQueueConfig::default(),
+            Box::new(move |accepted_rows, fragments| {
+                build_output(target, fragment_encoder.as_ref(), accepted_rows, &fragments)
+            }),
+        );
         Box::new(TableWriterOperator {
             name: self.name.clone(),
-            target: plan.target,
             projection: plan.projection.clone(),
-            fragment_encoder: Arc::clone(&plan.fragment_encoder),
             writer,
-            open_error,
-            rows: WriteRowCountAccumulator::new(),
-            pending_output: None,
-            terminal: false,
             finishing: false,
             finished: false,
         })
@@ -143,91 +145,66 @@ impl OperatorFactory for TableWriterOperatorFactory {
 
 struct TableWriterOperator {
     name: String,
-    target: WriteTargetOrdinal,
     projection: TableWriterInputProjection,
-    fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
-    writer: Option<Box<dyn ConnectorBatchWriter>>,
-    open_error: Option<String>,
-    rows: WriteRowCountAccumulator,
-    pending_output: Option<Chunk>,
-    terminal: bool,
+    writer: AsyncWriterOwner<Chunk>,
     finishing: bool,
     finished: bool,
 }
 
-impl TableWriterOperator {
-    fn abort_own_writer(&mut self) {
-        if self.terminal {
-            return;
+fn build_output(
+    target: WriteTargetOrdinal,
+    fragment_encoder: &dyn ConnectorCommitFragmentEncoder,
+    accepted_rows: u64,
+    fragments: &[novarocks_spi::connector::write_stack::ConnectorCommitFragment],
+) -> Result<Chunk, String> {
+    let mut encoded = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let bytes = fragment_encoder
+            .encode(target, fragment)
+            .map_err(|error| format!("encode table writer commit fragment: {error}"))?;
+        if bytes.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
+            return Err(format!(
+                "table writer commit fragment of {} bytes exceeds the frozen single-fragment budget of {} bytes",
+                bytes.len(),
+                MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES
+            ));
         }
-        self.terminal = true;
-        self.pending_output = None;
-        if let Some(writer) = self.writer.as_mut() {
-            let _ = writer.abort();
-        }
+        encoded.push(bytes);
     }
+    let rows = encoded.len() + 1;
+    let mut kinds = Vec::with_capacity(rows);
+    let mut ordinals = Vec::with_capacity(rows);
+    let mut row_counts: Vec<Option<i64>> = Vec::with_capacity(rows);
+    let mut payloads = BinaryBuilder::new();
 
-    fn encode_fragments(&mut self) -> Result<Vec<Vec<u8>>, String> {
-        let fragments = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| "table writer is unavailable during finish".to_string())?
-            .finish()
-            .map_err(|error| format!("finish table writer: {error}"))?;
-        let mut encoded = Vec::with_capacity(fragments.len());
-        for fragment in &fragments {
-            let bytes = self
-                .fragment_encoder
-                .encode(self.target, fragment)
-                .map_err(|error| format!("encode table writer commit fragment: {error}"))?;
-            if bytes.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
-                return Err(format!(
-                    "table writer commit fragment of {} bytes exceeds the frozen single-fragment budget of {} bytes",
-                    bytes.len(),
-                    MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES
-                ));
-            }
-            encoded.push(bytes);
-        }
-        Ok(encoded)
-    }
+    // The relation's carriers are signed because these columns cross the
+    // FE/BE plan boundary; narrowing fails loudly instead of wrapping.
+    let target = target_ordinal_to_wire(target)
+        .map_err(|error| format!("table writer target ordinal: {error}"))?;
+    let accepted_rows = row_count_to_wire(accepted_rows)
+        .map_err(|error| format!("table writer row count: {error}"))?;
 
-    fn build_output(&self, fragments: &[Vec<u8>]) -> Result<Chunk, String> {
-        let rows = fragments.len() + 1;
-        let mut kinds = Vec::with_capacity(rows);
-        let mut ordinals = Vec::with_capacity(rows);
-        let mut row_counts: Vec<Option<i64>> = Vec::with_capacity(rows);
-        let mut payloads = BinaryBuilder::new();
+    kinds.push(WriterRowKind::RowCount.to_wire());
+    ordinals.push(target);
+    row_counts.push(Some(accepted_rows));
+    payloads.append_null();
 
-        // The relation's carriers are signed because these columns cross the
-        // FE/BE plan boundary; narrowing fails loudly instead of wrapping.
-        let target = target_ordinal_to_wire(self.target)
-            .map_err(|error| format!("table writer target ordinal: {error}"))?;
-        let accepted_rows = row_count_to_wire(self.rows.get())
-            .map_err(|error| format!("table writer row count: {error}"))?;
-
-        kinds.push(WriterRowKind::RowCount.to_wire());
+    for fragment in &encoded {
+        kinds.push(WriterRowKind::CommitFragment.to_wire());
         ordinals.push(target);
-        row_counts.push(Some(accepted_rows));
-        payloads.append_null();
-
-        for fragment in fragments {
-            kinds.push(WriterRowKind::CommitFragment.to_wire());
-            ordinals.push(target);
-            row_counts.push(None);
-            payloads.append_value(fragment);
-        }
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(Int8Array::from(kinds)),
-            Arc::new(Int32Array::from(ordinals)),
-            Arc::new(Int64Array::from(row_counts)),
-            Arc::new(payloads.finish()) as ArrayRef,
-        ];
-        let batch = RecordBatch::try_new(writer_relation_schema(), columns)
-            .map_err(|error| format!("build table writer output batch: {error}"))?;
-        Chunk::try_new_with_chunk_schema(batch, writer_relation_chunk_schema())
+        row_counts.push(None);
+        payloads.append_value(fragment);
     }
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int8Array::from(kinds)),
+        Arc::new(Int32Array::from(ordinals)),
+        Arc::new(Int64Array::from(row_counts)),
+        Arc::new(payloads.finish()) as ArrayRef,
+    ];
+    let batch = RecordBatch::try_new(writer_relation_schema(), columns)
+        .map_err(|error| format!("build table writer output batch: {error}"))?;
+    Chunk::try_new_with_chunk_schema(batch, writer_relation_chunk_schema())
 }
 
 impl Operator for TableWriterOperator {
@@ -235,17 +212,18 @@ impl Operator for TableWriterOperator {
         &self.name
     }
 
-    fn prepare(&mut self) -> Result<(), String> {
-        match self.open_error.take() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+    fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.writer.set_mem_tracker(tracker);
+    }
+
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        self.writer
+            .bind(state.sink_io_executor()?, state.error_state())
     }
 
     fn cancel(&mut self) {
-        self.abort_own_writer();
+        self.writer.request_abort();
         self.finishing = true;
-        self.finished = true;
     }
 
     fn on_driver_failure(&mut self) {
@@ -253,7 +231,11 @@ impl Operator for TableWriterOperator {
     }
 
     fn is_finished(&self) -> bool {
-        self.finished
+        self.finished || (self.finishing && self.writer.is_done() && !self.writer.has_output())
+    }
+
+    fn pending_finish(&self) -> bool {
+        self.finishing && !self.writer.is_done()
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -267,37 +249,25 @@ impl Operator for TableWriterOperator {
 
 impl ProcessorOperator for TableWriterOperator {
     fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending_output.is_none()
+        !self.finishing && !self.finished && self.writer.can_accept()
     }
 
     fn has_output(&self) -> bool {
-        self.pending_output.is_some()
+        self.writer.has_output()
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         if chunk.is_empty() {
             return Ok(());
         }
-        if self.terminal {
-            return Err("table writer received a batch after terminal transition".to_string());
-        }
         let batch = self.projection.project(&chunk)?;
-        let appended = u64::try_from(batch.num_rows()).map_err(|error| {
-            format!("table writer batch row count is not representable: {error}")
-        })?;
-        self.rows
-            .add(appended)
-            .map_err(|error| format!("accumulate table writer row count: {error}"))?;
-        self.writer
-            .as_mut()
-            .ok_or_else(|| "table writer is unavailable".to_string())?
-            .append(batch)
-            .map_err(|error| format!("append table writer batch: {error}"))
+        let retained_bytes = record_batch_bytes(&batch);
+        self.writer.enqueue(batch, retained_bytes)
     }
 
     fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
-        let out = self.pending_output.take();
-        if self.pending_output.is_none() && self.finishing {
+        let out = self.writer.take_output();
+        if out.is_some() && self.finishing {
             self.finished = true;
         }
         Ok(out)
@@ -307,29 +277,12 @@ impl ProcessorOperator for TableWriterOperator {
         if self.finishing {
             return Ok(());
         }
-        if self.terminal {
-            self.finishing = true;
-            self.finished = true;
-            return Ok(());
-        }
-        let fragments = match self.encode_fragments() {
-            Ok(fragments) => fragments,
-            Err(error) => {
-                self.abort_own_writer();
-                return Err(error);
-            }
-        };
-        self.terminal = true;
-        let output = match self.build_output(&fragments) {
-            Ok(output) => output,
-            Err(error) => {
-                self.pending_output = None;
-                return Err(error);
-            }
-        };
-        self.pending_output = Some(output);
         self.finishing = true;
-        Ok(())
+        self.writer.request_finish()
+    }
+
+    fn sink_observable(&self) -> Option<Arc<Observable>> {
+        Some(self.writer.observable())
     }
 }
 
@@ -396,13 +349,13 @@ impl<'chunk> TableWriteRelationColumns<'chunk> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_spi::connector::write_stack::{
-        ConnectorCommitFragment, ProviderWriteRuntime, WriteRuntimeAdapter,
+        ConnectorBatchWriter, ConnectorCommitFragment, ProviderWriteRuntime, WriteRuntimeAdapter,
     };
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorError,
@@ -411,12 +364,195 @@ pub(crate) mod tests {
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
     use novarocks_types::SlotId;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::ExecNode;
     use crate::exec::node::values::ValuesNode;
+    use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
+    use crate::exec::pipeline::fragment_context::FragmentContext;
+    use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
+    use crate::runtime::mem_tracker::MemTracker;
+
+    fn poll_until<F: Fn() -> bool>(pred: F, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pred()
+    }
+
+    fn test_runtime_state() -> RuntimeState {
+        test_runtime_state_with_mem(None)
+    }
+
+    fn test_runtime_state_with_mem(mem_tracker: Option<Arc<MemTracker>>) -> RuntimeState {
+        let runtime = Arc::new(
+            crate::runtime::ExecutionRuntime::new(crate::runtime::ExecutionRuntimeConfig {
+                driver_threads: 1,
+                scan_threads: 1,
+                scan_queue_capacity: 8,
+                spill_io_threads: 1,
+                spill_io_queue_capacity: 8,
+                spill_storage:
+                    crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
+                exchange_wait_ms: 120_000,
+                exchange_io_threads: 1,
+                exchange_io_max_inflight_bytes: 1024,
+                exchange_max_transmit_batched_bytes: 1024,
+                operator_buffer_chunks: 1,
+                local_exchange_buffer_mem_limit_per_driver: 1024,
+                local_exchange_max_buffered_rows: 1024,
+                connector_io_tasks_per_scan_operator: 1,
+                scan_submit_fail_max: 1,
+                scan_submit_fail_timeout_ms: 1,
+                runtime_filter_scan_wait_time_ms_override: None,
+                runtime_filter_wait_timeout_ms_override: None,
+                sink_io_worker_threads: 1,
+                sink_io_max_blocking_threads: 1,
+            })
+            .expect("test execution runtime"),
+        );
+        RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            mem_tracker,
+            None,
+            None,
+            Some(runtime),
+            None,
+        )
+    }
+
+    fn bind(operator: &mut Box<dyn Operator>, state: &RuntimeState) {
+        operator.prepare().expect("prepare");
+        operator
+            .bind_runtime_state(state)
+            .expect("bind writer actor");
+    }
+
+    fn wait_for_output(
+        operator: &mut Box<dyn Operator>,
+        state: &RuntimeState,
+    ) -> Result<Vec<Chunk>, String> {
+        let ready = poll_until(
+            || {
+                state.error().is_some()
+                    || operator.as_processor_ref().expect("processor").has_output()
+            },
+            Duration::from_secs(5),
+        );
+        if !ready {
+            return Err("timed out waiting for table writer output".to_string());
+        }
+        if let Some(error) = state.error() {
+            return Err(error);
+        }
+        Ok(drain(operator, state))
+    }
+
+    struct OneChunkSource {
+        chunk: Option<Chunk>,
+        finished: bool,
+    }
+
+    impl Operator for OneChunkSource {
+        fn name(&self) -> &str {
+            "one_chunk_source"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for OneChunkSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            self.chunk.is_some()
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("source does not accept input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            let chunk = self.chunk.take();
+            self.finished = chunk.is_some();
+            Ok(chunk)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finished = true;
+            Ok(())
+        }
+    }
+
+    struct CollectSink {
+        chunks: Arc<std::sync::Mutex<Vec<Chunk>>>,
+        finished: bool,
+    }
+
+    impl Operator for CollectSink {
+        fn name(&self) -> &str {
+            "collect_sink"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finished
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for CollectSink {
+        fn need_input(&self) -> bool {
+            !self.finished
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+            self.chunks.lock().expect("collected chunks").push(chunk);
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finished = true;
+            Ok(())
+        }
+    }
 
     /// A minimal provider that owns nothing but a marker payload, so the tests
     /// exercise the operator contract rather than a provider implementation.
@@ -554,12 +690,13 @@ pub(crate) mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ConnectorWriteExecution for TestWriteExecution {
         fn catalog_handle(&self) -> &CatalogHandle {
             &self.catalog_handle
         }
 
-        fn open_writer(
+        async fn open_writer(
             &self,
             request: ConnectorOpenWriterRequest,
         ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
@@ -589,13 +726,14 @@ pub(crate) mod tests {
         fragment_bytes: usize,
     }
 
+    #[async_trait::async_trait]
     impl ConnectorBatchWriter for TestBatchWriter {
-        fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
             self.rows += batch.num_rows();
             Ok(())
         }
 
-        fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+        async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
             self.stats.finished.fetch_add(1, Ordering::Relaxed);
             self.writer_rows
                 .lock()
@@ -611,7 +749,7 @@ pub(crate) mod tests {
                 .collect())
         }
 
-        fn abort(&mut self) -> Result<(), ConnectorError> {
+        async fn abort(&mut self) -> Result<(), ConnectorError> {
             self.stats.aborted.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
@@ -690,11 +828,12 @@ pub(crate) mod tests {
     #[test]
     fn table_writer_node_rejects_a_foreign_catalog_generation() {
         struct ForeignExecution(CatalogHandle);
+        #[async_trait::async_trait]
         impl ConnectorWriteExecution for ForeignExecution {
             fn catalog_handle(&self) -> &CatalogHandle {
                 &self.0
             }
-            fn open_writer(
+            async fn open_writer(
                 &self,
                 _request: ConnectorOpenWriterRequest,
             ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
@@ -736,21 +875,23 @@ pub(crate) mod tests {
         let dop = 4;
         let mut operators: Vec<Box<dyn Operator>> =
             (0..dop).map(|driver| factory.create(dop, driver)).collect();
-        assert_eq!(stats.opened.load(Ordering::Relaxed), dop as usize);
-        assert_eq!(
-            *execution.driver_ids.lock().expect("driver ids"),
-            vec![0, 1, 2, 3]
-        );
-
-        let state = RuntimeState::default();
+        let state = test_runtime_state();
         for (driver, operator) in operators.iter_mut().enumerate() {
-            operator.prepare().expect("prepare");
+            bind(operator, &state);
             let processor = operator.as_processor_mut().expect("processor");
             processor
                 .push_chunk(&state, input_chunk(vec![driver as i32; driver + 1]))
                 .expect("append");
             processor.set_finishing(&state).expect("finish");
         }
+        assert!(poll_until(
+            || stats.finished.load(Ordering::Relaxed) == dop as usize,
+            Duration::from_secs(5)
+        ));
+        assert_eq!(stats.opened.load(Ordering::Relaxed), dop as usize);
+        let mut driver_ids = execution.driver_ids.lock().expect("driver ids").clone();
+        driver_ids.sort_unstable();
+        assert_eq!(driver_ids, vec![0, 1, 2, 3]);
 
         // Each driver finished its own writer with only its own rows.
         let mut rows = writer_rows.lock().expect("writer rows").clone();
@@ -769,8 +910,8 @@ pub(crate) mod tests {
             );
             let factory = TableWriterOperatorFactory::new(&writer_node(execution));
             let mut operator = factory.create(1, 0);
-            operator.prepare().expect("prepare");
-            let state = RuntimeState::default();
+            let state = test_runtime_state();
+            bind(&mut operator, &state);
             let processor = operator.as_processor_mut().expect("processor");
             processor
                 .push_chunk(&state, input_chunk(vec![1, 2, 3, 4, 5]))
@@ -778,7 +919,7 @@ pub(crate) mod tests {
             assert!(!processor.has_output(), "nothing is emitted before finish");
             processor.set_finishing(&state).expect("finish");
 
-            let chunks = drain(&mut operator, &state);
+            let chunks = wait_for_output(&mut operator, &state).expect("writer output");
             assert_eq!(chunks.len(), 1);
             let chunk = &chunks[0];
             assert_eq!(chunk.len(), fragment_count + 1);
@@ -808,14 +949,14 @@ pub(crate) mod tests {
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
         let factory = TableWriterOperatorFactory::new(&writer_node(execution));
         let mut operator = factory.create(1, 0);
-        operator.prepare().expect("prepare");
-        let state = RuntimeState::default();
+        let state = test_runtime_state();
+        bind(&mut operator, &state);
         operator
             .as_processor_mut()
             .expect("processor")
             .set_finishing(&state)
             .expect("finish");
-        let chunks = drain(&mut operator, &state);
+        let chunks = wait_for_output(&mut operator, &state).expect("writer output");
         let columns = TableWriteRelationColumns::try_from_chunk(&chunks[0]).expect("columns");
         assert_eq!(chunks[0].len(), 1);
         assert_eq!(columns.row_counts.value(0), 0);
@@ -831,13 +972,14 @@ pub(crate) mod tests {
         );
         let factory = TableWriterOperatorFactory::new(&writer_node(execution));
         let mut operator = factory.create(1, 0);
-        operator.prepare().expect("prepare");
-        let state = RuntimeState::default();
+        let state = test_runtime_state();
+        bind(&mut operator, &state);
         operator
             .as_processor_mut()
             .expect("processor")
             .set_finishing(&state)
             .expect("the exact single-fragment budget is legal");
+        wait_for_output(&mut operator, &state).expect("exact-budget output");
 
         // One byte more is a typed rejection, and the writer is aborted.
         let stats = Arc::new(WriteExecutionStats::default());
@@ -847,13 +989,20 @@ pub(crate) mod tests {
         );
         let factory = TableWriterOperatorFactory::new(&writer_node(execution));
         let mut operator = factory.create(1, 0);
-        operator.prepare().expect("prepare");
-        let error = operator
+        let state = test_runtime_state();
+        bind(&mut operator, &state);
+        operator
             .as_processor_mut()
             .expect("processor")
             .set_finishing(&state)
-            .expect_err("over the single-fragment budget");
+            .expect("finish request is asynchronous");
+        let error =
+            wait_for_output(&mut operator, &state).expect_err("over the single-fragment budget");
         assert!(error.contains("exceeds the frozen single-fragment budget"));
+        assert!(poll_until(
+            || stats.aborted.load(Ordering::Relaxed) == 1,
+            Duration::from_secs(5)
+        ));
         assert_eq!(stats.aborted.load(Ordering::Relaxed), 1);
     }
 
@@ -864,34 +1013,47 @@ pub(crate) mod tests {
         let factory = TableWriterOperatorFactory::new(&writer_node(execution));
         let mut first = factory.create(2, 0);
         let mut second = factory.create(2, 1);
-        first.prepare().expect("prepare");
-        second.prepare().expect("prepare");
+        let state = test_runtime_state();
+        bind(&mut first, &state);
+        bind(&mut second, &state);
+        assert!(poll_until(
+            || stats.opened.load(Ordering::Relaxed) == 2,
+            Duration::from_secs(5)
+        ));
 
         first.cancel();
+        assert!(poll_until(
+            || stats.aborted.load(Ordering::Relaxed) == 1,
+            Duration::from_secs(5)
+        ));
         assert_eq!(stats.aborted.load(Ordering::Relaxed), 1);
         // A second cancel of the same driver is idempotent.
         first.cancel();
         assert_eq!(stats.aborted.load(Ordering::Relaxed), 1);
 
         // The other driver is untouched and still finishes normally.
-        let state = RuntimeState::default();
         second
             .as_processor_mut()
             .expect("processor")
             .set_finishing(&state)
             .expect("second driver finishes independently");
+        assert!(poll_until(
+            || stats.finished.load(Ordering::Relaxed) == 1,
+            Duration::from_secs(5)
+        ));
         assert_eq!(stats.finished.load(Ordering::Relaxed), 1);
         assert_eq!(stats.aborted.load(Ordering::Relaxed), 1);
     }
 
     #[test]
-    fn a_failed_writer_open_fails_the_driver_at_prepare() {
+    fn a_failed_writer_open_fails_the_driver_asynchronously() {
         struct FailingExecution(CatalogHandle);
+        #[async_trait::async_trait]
         impl ConnectorWriteExecution for FailingExecution {
             fn catalog_handle(&self) -> &CatalogHandle {
                 &self.0
             }
-            fn open_writer(
+            async fn open_writer(
                 &self,
                 _request: ConnectorOpenWriterRequest,
             ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
@@ -905,10 +1067,220 @@ pub(crate) mod tests {
         let execution = Arc::new(FailingExecution(catalog_handle()));
         let factory = TableWriterOperatorFactory::new(&writer_node(execution));
         let mut operator = factory.create(1, 0);
-        let error = operator
-            .prepare()
-            .expect_err("a failed writer open must fail its driver");
-        assert!(error.contains("open table writer for driver 0"));
+        let state = test_runtime_state();
+        bind(&mut operator, &state);
+        assert!(poll_until(
+            || state.error().is_some(),
+            Duration::from_secs(5)
+        ));
+        let error = state
+            .error()
+            .expect("a failed writer open must fail its driver");
+        assert!(error.contains("open connector writer"));
+    }
+
+    #[test]
+    fn driver_resumes_after_async_writer_finish_to_deliver_its_output() {
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
+        let factory = TableWriterOperatorFactory::new(&writer_node(execution));
+        let runtime_state = Arc::new(test_runtime_state());
+        let mut writer = factory.create(1, 0);
+        bind(&mut writer, runtime_state.as_ref());
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut driver = PipelineDriver::new(
+            0,
+            vec![
+                Box::new(OneChunkSource {
+                    chunk: Some(input_chunk(vec![1, 2, 3])),
+                    finished: false,
+                }),
+                writer,
+                Box::new(CollectSink {
+                    chunks: Arc::clone(&collected),
+                    finished: false,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            None,
+        );
+
+        let mut saw_pending_finish = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match driver.process(Duration::from_millis(10)) {
+                DriverState::PendingFinish => saw_pending_finish = true,
+                DriverState::Finished => break,
+                DriverState::Failed(error) => panic!("driver failed: {error}"),
+                state if Instant::now() >= deadline => {
+                    panic!("driver did not finish before timeout: {state:?}")
+                }
+                _ => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+
+        assert!(saw_pending_finish);
+        let chunks = collected.lock().expect("collected chunks");
+        assert_eq!(chunks.len(), 1);
+        let columns = TableWriteRelationColumns::try_from_chunk(&chunks[0]).expect("columns");
+        assert_eq!(columns.row_counts.value(0), 3);
+        assert_eq!(stats.finished.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.aborted.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn fragment_cancel_waits_for_writer_abort_and_releases_queued_memory() {
+        struct GatedAbortExecution {
+            catalog_handle: CatalogHandle,
+            append_started: Arc<AtomicBool>,
+            abort_started: Arc<AtomicBool>,
+            append_gate: Arc<Notify>,
+            abort_gate: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl ConnectorWriteExecution for GatedAbortExecution {
+            fn catalog_handle(&self) -> &CatalogHandle {
+                &self.catalog_handle
+            }
+
+            async fn open_writer(
+                &self,
+                _request: ConnectorOpenWriterRequest,
+            ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+                Ok(Box::new(GatedAbortWriter {
+                    append_started: Arc::clone(&self.append_started),
+                    abort_started: Arc::clone(&self.abort_started),
+                    append_gate: Arc::clone(&self.append_gate),
+                    abort_gate: Arc::clone(&self.abort_gate),
+                }))
+            }
+        }
+
+        struct GatedAbortWriter {
+            append_started: Arc<AtomicBool>,
+            abort_started: Arc<AtomicBool>,
+            append_gate: Arc<Notify>,
+            abort_gate: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl ConnectorBatchWriter for GatedAbortWriter {
+            async fn append(&mut self, _batch: RecordBatch) -> Result<(), ConnectorError> {
+                self.append_started.store(true, Ordering::Release);
+                self.append_gate.notified().await;
+                Ok(())
+            }
+
+            async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+                panic!("a cancelled writer must not finish")
+            }
+
+            async fn abort(&mut self) -> Result<(), ConnectorError> {
+                self.abort_started.store(true, Ordering::Release);
+                self.abort_gate.notified().await;
+                Ok(())
+            }
+        }
+
+        let append_started = Arc::new(AtomicBool::new(false));
+        let abort_started = Arc::new(AtomicBool::new(false));
+        let append_gate = Arc::new(Notify::new());
+        let abort_gate = Arc::new(Notify::new());
+        let execution = Arc::new(GatedAbortExecution {
+            catalog_handle: catalog_handle(),
+            append_started: Arc::clone(&append_started),
+            abort_started: Arc::clone(&abort_started),
+            append_gate,
+            abort_gate: Arc::clone(&abort_gate),
+        });
+        let memory = MemTracker::new_root("table-writer-cancel-test");
+        let runtime_state = Arc::new(test_runtime_state_with_mem(Some(Arc::clone(&memory))));
+        let factory = TableWriterOperatorFactory::new(&writer_node(execution));
+        let mut writer = factory.create(1, 0);
+        bind(&mut writer, runtime_state.as_ref());
+        let mut driver = PipelineDriver::new(
+            0,
+            vec![
+                Box::new(OneChunkSource {
+                    chunk: Some(input_chunk(vec![1, 2, 3])),
+                    finished: false,
+                }),
+                writer,
+                Box::new(CollectSink {
+                    chunks: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    finished: false,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            None,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !append_started.load(Ordering::Acquire) {
+            match driver.process(Duration::from_millis(10)) {
+                DriverState::Failed(error) => panic!("driver failed before cancellation: {error}"),
+                state if Instant::now() >= deadline => {
+                    panic!("writer append did not start before timeout: {state:?}")
+                }
+                _ => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        assert!(memory.current() > 0, "queued Arrow input must be charged");
+
+        let fragment = Arc::new(FragmentContext::new(
+            None,
+            Arc::clone(&runtime_state),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(1);
+        assert!(completion.fail("injected fragment cancellation".to_string()));
+        let task = DriverTask::new(
+            driver,
+            Arc::clone(&completion),
+            fragment,
+            Duration::from_millis(10),
+        );
+        let task = task
+            .finish_due_to_abort()
+            .expect("driver must remain pending while writer abort is in flight");
+        assert!(poll_until(
+            || abort_started.load(Ordering::Acquire),
+            Duration::from_secs(5)
+        ));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = Arc::clone(&completion);
+        let waiter = std::thread::spawn(move || tx.send(waiting.wait()).expect("send result"));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "fragment completion must wait for the writer actor's bounded abort"
+        );
+        assert_eq!(
+            memory.current(),
+            0,
+            "cancel must release queued Arrow input"
+        );
+
+        abort_gate.notify_one();
+        assert!(poll_until(|| task.check_is_ready(), Duration::from_secs(5)));
+        assert!(
+            task.finish_due_to_abort().is_none(),
+            "driver must become terminal after the writer actor joins"
+        );
+        let error = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fragment completion after writer abort")
+            .expect_err("the injected cancellation remains first-wins");
+        assert_eq!(error, "injected fragment cancellation");
+        waiter.join().expect("completion waiter");
+        assert_eq!(memory.current(), 0);
     }
 
     #[test]

@@ -812,8 +812,8 @@ pub fn compose_iceberg_execution_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<IcebergExecutionResources> {
-    let binding = compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Be)?;
-    Ok(IcebergExecutionResources::new(binding, runtime))
+    let binding = compose_iceberg_access_template(config, runtime, ClusterRole::Be)?;
+    Ok(IcebergExecutionResources::new(binding))
 }
 
 /// Build one process-local, credential-aware Iceberg access template. The

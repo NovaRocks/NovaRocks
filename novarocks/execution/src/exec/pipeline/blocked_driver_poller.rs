@@ -113,7 +113,15 @@ fn run_poller(state: Arc<PollerState>) {
         drain_blocked(&state, &mut ready_tasks, &mut aborted_tasks);
 
         for task in aborted_tasks {
-            task.finish_due_to_abort();
+            if let Some(task) = task.finish_due_to_abort() {
+                let next_poll_at = Instant::now() + state.poll_interval;
+                state
+                    .blocked
+                    .lock()
+                    .expect("blocked poller lock")
+                    .push_back(BlockedTask { task, next_poll_at });
+                state.cv.notify_one();
+            }
         }
         for task in ready_tasks {
             enqueue_one(&state.shared, task);

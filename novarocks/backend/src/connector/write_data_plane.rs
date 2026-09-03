@@ -253,12 +253,13 @@ impl ObservedConnectorWriteExecution {
     }
 }
 
+#[async_trait::async_trait]
 impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
     fn catalog_handle(&self) -> &CatalogHandle {
         self.inner.catalog_handle()
     }
 
-    fn open_writer(
+    async fn open_writer(
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
@@ -270,7 +271,7 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
             .catalog_name()
             .as_str()
             .to_string();
-        match self.inner.open_writer(request) {
+        match self.inner.open_writer(request).await {
             Ok(writer) => {
                 crate::metrics::record_connector_write_writer_open("opened");
                 tracing::info!(
@@ -329,16 +330,17 @@ struct ObservedConnectorBatchWriter {
     rows: u64,
 }
 
+#[async_trait::async_trait]
 impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
-    fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         let rows = batch.num_rows() as u64;
-        self.inner.append(batch)?;
+        self.inner.append(batch).await?;
         self.rows = self.rows.saturating_add(rows);
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
-        match self.inner.finish() {
+    async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+        match self.inner.finish().await {
             Ok(fragments) => {
                 let produced = fragments.len() as u64;
                 crate::metrics::record_connector_write_writer_finished(self.rows, produced);
@@ -378,7 +380,7 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
         }
     }
 
-    fn abort(&mut self) -> Result<(), ConnectorError> {
+    async fn abort(&mut self) -> Result<(), ConnectorError> {
         tracing::info!(
             target: WRITE_EVENT_TARGET,
             role = "be",
@@ -392,7 +394,7 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
             rows = self.rows,
             "aborted a driver-local connector writer"
         );
-        self.inner.abort()
+        self.inner.abort().await
     }
 }
 
@@ -712,29 +714,31 @@ mod tests {
         rows: Arc<Mutex<u64>>,
     }
 
+    #[async_trait::async_trait]
     impl ConnectorBatchWriter for CountingWriter {
-        fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
             *self.rows.lock().expect("rows") += batch.num_rows() as u64;
             Ok(())
         }
 
-        fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+        async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
             Ok(vec![adapter().wrap_commit_fragment(data_file_fragment(
                 "s3://b/t/a.parquet",
             ))])
         }
 
-        fn abort(&mut self) -> Result<(), ConnectorError> {
+        async fn abort(&mut self) -> Result<(), ConnectorError> {
             Ok(())
         }
     }
 
+    #[async_trait::async_trait]
     impl ConnectorWriteExecution for CountingWriteExecution {
         fn catalog_handle(&self) -> &CatalogHandle {
             &self.catalog_handle
         }
 
-        fn open_writer(
+        async fn open_writer(
             &self,
             request: ConnectorOpenWriterRequest,
         ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
@@ -748,8 +752,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_observed_execution_forwards_its_binding_and_counts_each_open() {
+    #[tokio::test]
+    async fn the_observed_execution_forwards_its_binding_and_counts_each_open() {
         let opened = Arc::new(Mutex::new(Vec::new()));
         let inner = Arc::new(CountingWriteExecution {
             catalog_handle: catalog_handle(),
@@ -768,8 +772,9 @@ mod tests {
                     ),
                     context: request_context(),
                 })
+                .await
                 .expect("open writer");
-            assert_eq!(writer.finish().expect("finish").len(), 1);
+            assert_eq!(writer.finish().await.expect("finish").len(), 1);
         }
         assert_eq!(
             *opened.lock().expect("opened"),

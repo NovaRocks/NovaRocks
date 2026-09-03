@@ -208,10 +208,12 @@ impl DriverTask {
         self.should_abort()
     }
 
-    pub(crate) fn finish_due_to_abort(mut self) {
-        self.driver.cancel_for_fragment_abort();
+    pub(crate) fn finish_due_to_abort(mut self) -> Option<Self> {
+        if self.driver.cancel_for_fragment_abort() == DriverState::PendingFinish {
+            return Some(self);
+        }
         self.driver_finished();
-        drop(self);
+        None
     }
 
     pub(crate) fn fail(&self, err: String) {
@@ -368,7 +370,9 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
         };
 
         if task.completion.should_abort() {
-            task.finish_due_to_abort();
+            if let Some(task) = task.finish_due_to_abort() {
+                poller.add_pending_finish(task);
+            }
             continue;
         }
 
@@ -387,7 +391,9 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
         });
 
         if task.completion.should_abort() {
-            task.finish_due_to_abort();
+            if let Some(task) = task.finish_due_to_abort() {
+                poller.add_pending_finish(task);
+            }
             continue;
         }
 
@@ -404,7 +410,9 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
         match state {
             DriverState::Ready | DriverState::Running => {
                 if task.completion.should_abort() {
-                    task.finish_due_to_abort();
+                    if let Some(task) = task.finish_due_to_abort() {
+                        poller.add_pending_finish(task);
+                    }
                     continue;
                 }
                 let mut queue = shared.queue.lock().expect("global executor queue lock");
@@ -413,7 +421,9 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
             }
             DriverState::Blocked(reason) => {
                 if task.should_abort_immediately() {
-                    task.finish_due_to_abort();
+                    if let Some(task) = task.finish_due_to_abort() {
+                        poller.add_pending_finish(task);
+                    }
                     continue;
                 }
                 match reason {

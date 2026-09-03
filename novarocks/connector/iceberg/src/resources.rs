@@ -105,56 +105,15 @@ impl std::fmt::Debug for IcebergMetadataResources {
 #[derive(Clone, Debug)]
 pub struct IcebergExecutionResources {
     binding: IcebergReadBinding,
-    runtime: IcebergExecutionRuntime,
 }
 
 impl IcebergExecutionResources {
-    pub fn new(binding: IcebergReadBinding, runtime: tokio::runtime::Handle) -> Self {
-        Self {
-            binding,
-            runtime: IcebergExecutionRuntime::new(runtime),
-        }
+    pub fn new(binding: IcebergReadBinding) -> Self {
+        Self { binding }
     }
 
     pub fn binding(&self) -> &IcebergReadBinding {
         &self.binding
-    }
-
-    pub fn runtime(&self) -> &IcebergExecutionRuntime {
-        &self.runtime
-    }
-}
-
-/// Explicit role-local runtime for synchronous BE writer callbacks.
-///
-/// `ConnectorBatchWriter` is synchronous while Iceberg file I/O is async. The
-/// execution host supplies this runtime during installer composition; provider
-/// code must never recover a process-global runtime for that bridge.
-#[derive(Clone)]
-pub struct IcebergExecutionRuntime {
-    handle: tokio::runtime::Handle,
-}
-
-impl IcebergExecutionRuntime {
-    pub fn new(handle: tokio::runtime::Handle) -> Self {
-        Self { handle }
-    }
-
-    pub fn block_on<F>(&self, future: F) -> Result<F::Output, String>
-    where
-        F: Future,
-    {
-        let handle = self.handle.clone();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Ok(tokio::task::block_in_place(|| handle.block_on(future)));
-        }
-        Ok(handle.block_on(future))
-    }
-}
-
-impl std::fmt::Debug for IcebergExecutionRuntime {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("IcebergExecutionRuntime(<explicit tokio handle>)")
     }
 }
 
@@ -176,11 +135,10 @@ mod tests {
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
         let control = IcebergMetadataResources::new(binding.clone(), runtime.handle().clone());
-        let execution = IcebergExecutionResources::new(binding.clone(), runtime.handle().clone());
+        let execution = IcebergExecutionResources::new(binding.clone());
 
         assert!(format!("{:?}", control.planning_binding()).contains("IcebergReadBinding"));
         assert!(format!("{:?}", execution.binding()).contains("IcebergReadBinding"));
-        assert_eq!(execution.runtime().block_on(async { 13_u8 }), Ok(13));
         assert_eq!(control.catalog_runtime().block_on(async { 7_u8 }), Ok(7));
     }
 
@@ -188,11 +146,5 @@ mod tests {
     async fn catalog_runtime_bridges_from_a_runtime_worker_without_context_probe() {
         let runtime = IcebergCatalogRuntime::new(tokio::runtime::Handle::current());
         assert_eq!(runtime.block_on(async { 11_u8 }), Ok(11));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn execution_runtime_uses_its_injected_handle_from_a_runtime_worker() {
-        let runtime = IcebergExecutionRuntime::new(tokio::runtime::Handle::current());
-        assert_eq!(runtime.block_on(async { 17_u8 }), Ok(17));
     }
 }

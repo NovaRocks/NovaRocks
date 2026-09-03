@@ -34,7 +34,6 @@ use parquet::file::statistics::{Statistics, ValueStatistics};
 
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::report::IcebergColumnStats;
-use crate::resources::IcebergExecutionRuntime;
 use crate::theta_sketch::{ThetaSketchHandle, compute_theta_sketches_for_batch};
 
 /// Parquet facts returned to the provider's writer report adapter.
@@ -80,9 +79,8 @@ pub fn build_staged_file_io(
 }
 
 /// Encode and persist one Parquet file through one request-scoped storage binding.
-pub fn write_parquet_file(
+pub async fn write_parquet_file(
     binding: &IcebergReadBinding,
-    runtime: &IcebergExecutionRuntime,
     path: &str,
     schema: SchemaRef,
     batch: &RecordBatch,
@@ -102,11 +100,10 @@ pub fn write_parquet_file(
                 "resolve Iceberg parquet output path {path}: expected exactly one path"
             ));
         };
-        runtime
-            .block_on(access.operator().write(relative_path, data))
-            .map_err(|error| {
-                format!("run object-store write on execution runtime failed: {error}")
-            })?
+        access
+            .operator()
+            .write(relative_path, data)
+            .await
             .map_err(|error| format!("opendal write failed: {error}"))?;
         return Ok(write_result);
     }
@@ -380,7 +377,6 @@ mod tests {
 
     use super::{unique_file_path, write_parquet_file};
     use crate::access_binding::IcebergReadBinding;
-    use crate::resources::IcebergExecutionRuntime;
 
     #[test]
     fn unique_file_path_requires_one_reference() {
@@ -418,14 +414,14 @@ mod tests {
         assert!(unique_file_path(&wrong).is_err());
     }
 
-    #[test]
-    fn local_parquet_write_returns_provider_stats() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    #[tokio::test]
+    async fn local_parquet_write_returns_provider_stats() {
+        let runtime = tokio::runtime::Handle::current();
         let binding = IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
-            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
         );
         let mut metadata = HashMap::new();
         metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string());
@@ -444,12 +440,12 @@ mod tests {
 
         let result = write_parquet_file(
             &binding,
-            &IcebergExecutionRuntime::new(runtime.handle().clone()),
             &path,
             schema,
             &batch,
             parquet::basic::Compression::UNCOMPRESSED,
         )
+        .await
         .expect("write parquet");
 
         assert!(result.file_size > 0);

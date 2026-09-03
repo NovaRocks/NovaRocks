@@ -2208,7 +2208,6 @@ dependencies = [
  "arrow-string",
  "as-any",
  "async-trait",
- "backon",
  "base64 0.22.1",
  "bimap",
  "bytes",
