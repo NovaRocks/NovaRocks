@@ -593,6 +593,8 @@ impl NativeTaskExecutionHost {
     fn deliver_splits(
         &self,
         runtime: &TaskRuntime,
+        identity: TaskIdentity,
+        fragment_instance_id: UniqueId,
         assignment: &SplitAssignment,
     ) -> Result<u64, HostRejection> {
         let node = assignment.plan_node_id();
@@ -633,9 +635,57 @@ impl NativeTaskExecutionHost {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| protocol(format!("split payload is not decodable: {error}")))?
         };
-        queue
+        let outcome = queue
             .offer_splits(node, received, assignment.no_more_splits())
             .map_err(split_queue_rejection)?;
+        // Acceptance evidence for distributed runs: it proves a real remote
+        // assignment reached this task, which a single-process smoke cannot
+        // show. The retired fragment service emitted this from its own
+        // delivery path; the cutover moved the work here and has to move the
+        // evidence with it, or every case asserting it counts zero on a
+        // cluster where splits are in fact being delivered.
+        if crate::config::debug_emit_connector_reader_marker() {
+            let execution_id = identity.query_execution_id();
+            let finst = fragment_instance_id;
+            let duplicate_count = preflight.duplicate_sequences().len();
+            println!(
+                "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED execution_id={}:{}:{} finst={:x}:{:x} plan_node={} enqueued={} duplicate={} accepted_through={}",
+                execution_id.query_id().high(),
+                execution_id.query_id().low(),
+                execution_id.attempt_id().get(),
+                finst.high(),
+                finst.low(),
+                node,
+                outcome.enqueued.len(),
+                duplicate_count,
+                outcome.max_accepted_sequence.unwrap_or_default(),
+            );
+            if duplicate_count > 0 {
+                println!(
+                    "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_DUPLICATE execution_id={}:{}:{} finst={:x}:{:x} plan_node={} duplicate={} duplicate_splits_skipped={}",
+                    execution_id.query_id().high(),
+                    execution_id.query_id().low(),
+                    execution_id.attempt_id().get(),
+                    finst.high(),
+                    finst.low(),
+                    node,
+                    duplicate_count,
+                    queue.stats().duplicate_splits_skipped,
+                );
+            }
+            if outcome.no_more_splits {
+                println!(
+                    "NOVAROCKS_TASK_SPLIT_NO_MORE execution_id={}:{}:{} finst={:x}:{:x} plan_node={}",
+                    execution_id.query_id().high(),
+                    execution_id.query_id().low(),
+                    execution_id.attempt_id().get(),
+                    finst.high(),
+                    finst.low(),
+                    node,
+                );
+            }
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
         // Measured after the offer, because that is what the sender needs:
         // how full this node's queue is now, not how full it was before it
         // sent. Defaulting it to zero would tell the sender the task is idle
@@ -978,7 +1028,13 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                         assignment.plan_node_id()
                     )));
                 }
-                self.deliver_splits(&runtime, &assignment).map(Some)
+                self.deliver_splits(
+                    &runtime,
+                    identity,
+                    descriptor.fragment_instance_id(),
+                    &assignment,
+                )
+                .map(Some)
             }
             TaskDomainUpdate::TaskDynamicFilter { version, payload } => {
                 self.context_facts

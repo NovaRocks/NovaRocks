@@ -106,6 +106,25 @@ impl RegistryTaskExecutionIngress {
             }
             DecodedOperation::UpdateTask(request) => {
                 let receipt = self.registry.update_task(request.request());
+                // Read off the receipt, not the request: the condition is that
+                // this backend durably accepted a delivery that both carried
+                // splits and sealed its plan node, and the receipt's watermark
+                // is where that fact lives. The request's payload would have to
+                // be decoded again to learn the same thing.
+                let terminal_nonempty = receipt.acknowledgement().is_some_and(|ack| {
+                    ack.domains().iter().any(|domain| match domain {
+                        novarocks_execution::task_execution::TaskDomainReceipt::SplitAssignment { nodes, .. } => nodes.iter().any(|node| {
+                            node.watermark().no_more_splits()
+                                && node.watermark().accepted_through().is_some()
+                        }),
+                        _ => false,
+                    })
+                });
+                fault::task_update_terminal_ack_dropped(
+                    request.request().identity(),
+                    receipt.outcome(),
+                    terminal_nonempty,
+                )?;
                 encode_item(&receipt, |ack| {
                     encode_update_task_ack(ack).map(ReceiptAck::UpdateTask)
                 })

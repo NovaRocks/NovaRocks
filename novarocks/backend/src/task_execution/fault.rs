@@ -79,6 +79,48 @@ pub(super) fn lease_renewal_ack_dropped(
 /// It claims only on an accepted create, so a converging duplicate or a
 /// refused descriptor leaves the arming for the create that really admitted a
 /// task.
+/// Drops the acknowledgement of a task update that both carried splits and
+/// closed its plan node.
+///
+/// The retired `TaskUpdate` RPC claimed this fault in its own handler. The
+/// cutover moved split delivery onto `ApplyTaskOperations`, so the claim has
+/// to move with it -- otherwise the fault is armed, nothing consumes it, the
+/// query succeeds untouched, and the case asserting the drop waits out its
+/// whole budget for a marker that no longer has an emitter.
+///
+/// Only a terminal, non-empty delivery claims it. A malformed, refused or
+/// non-terminal one must leave the token for the real terminal
+/// acknowledgement, which is the case's actual subject.
+pub(super) fn task_update_terminal_ack_dropped(
+    identity: TaskIdentity,
+    outcome: OperationOutcome,
+    terminal_nonempty: bool,
+) -> Result<(), tonic::Status> {
+    if !terminal_nonempty || outcome != OperationOutcome::Accepted {
+        return Ok(());
+    }
+    let execution = identity.query_execution_id();
+    let Some(scope) = claim(
+        QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
+        execution,
+        identity.backend_process_id(),
+    )?
+    else {
+        return Ok(());
+    };
+    eprintln!(
+        "NOVAROCKS_TASK_UPDATE_TERMINAL_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        scope.backend_index,
+        scope.token,
+    );
+    Err(tonic::Status::deadline_exceeded(
+        "runner-owned TaskUpdate terminal acknowledgement dropped after acceptance",
+    ))
+}
+
 pub(super) fn create_task_ack_dropped(
     identity: TaskIdentity,
     outcome: OperationOutcome,
