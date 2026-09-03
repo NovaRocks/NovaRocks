@@ -1912,6 +1912,9 @@ impl FrontendDistributedQueryCoordinator {
             &wake,
             split_assignment.as_ref(),
             statement_deadline,
+            self.task_execution_budgets
+                .transport
+                .frontend_queue_residence(),
             execution_id,
             &mut final_task_info,
         );
@@ -2881,6 +2884,42 @@ mod tests {
     /// membership owner independently proving that an exact captured process
     /// was replaced. Only the failure that evidence is applied to moved.
     #[test]
+    fn a_drain_never_inherits_the_remainder_of_a_long_statement_timeout() {
+        // The client-visible answer is linearized before the drain starts, so
+        // every moment the drain spends is a moment the caller waits for a
+        // result already in hand. A query that finished in a second against
+        // one stuck backend must return in about the drain budget, not in five
+        // minutes.
+        let now = Instant::now();
+        let statement_deadline = now + Duration::from_secs(300);
+        let budget = Duration::from_secs(15);
+
+        let deadline = super::drain_deadline(statement_deadline, budget, now);
+        assert_eq!(
+            deadline - now,
+            budget,
+            "the drain's own budget bounds it, not the statement's remaining time"
+        );
+
+        // A statement already near its end has no time left to lend: the drain
+        // cannot extend a query past the deadline its caller was promised.
+        let nearly_over = now + Duration::from_millis(50);
+        assert_eq!(
+            super::drain_deadline(nearly_over, budget, now),
+            nearly_over,
+            "the statement deadline still caps the drain"
+        );
+
+        // And an already-expired statement yields no drain time at all rather
+        // than wrapping into a long wait.
+        let expired = now - Duration::from_secs(1);
+        assert!(
+            super::drain_deadline(expired, budget, now) <= now,
+            "an expired statement leaves the drain no budget"
+        );
+    }
+
+    #[test]
     fn a_replaced_captured_process_replans_the_round_once_before_establish() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3343,15 +3382,39 @@ impl<'a> FinalTaskInfoCollector<'a> {
 /// inside it is reported and left to the query execution lease, which is the
 /// mechanism that exists for exactly this: it never fails a completion that
 /// has already been linearized.
+/// When a drain gives up, whichever of its own budget and the statement's
+/// deadline runs out first.
+///
+/// Split out from the drain so the rule is assertable: the client-visible
+/// answer is already linearized when this is computed, so a drain that
+/// silently inherited the statement deadline would hold the caller for the
+/// remainder of a long statement timeout with a finished result in hand.
+fn drain_deadline(statement_deadline: Instant, drain_budget: Duration, now: Instant) -> Instant {
+    statement_deadline.min(now + drain_budget)
+}
+
 fn drain_task_round(
     round: &mut TaskRound,
     split_delivery: &SplitDeliveryBridge,
     wake: &CondvarWake,
     split_assignment: Option<&SplitAssignmentRoundGuard>,
-    deadline: Instant,
+    statement_deadline: Instant,
+    drain_budget: Duration,
     execution_id: QueryExecutionId,
     final_task_info: &mut FinalTaskInfoCollector<'_>,
 ) {
+    // The drain gets a budget of its own rather than the statement's. The
+    // client-visible answer is already linearized, so every moment spent here
+    // is a moment the client waits for a result it could already have had: a
+    // query that finished in a second against one stuck backend must not hold
+    // its caller for the rest of a five-minute statement timeout.
+    //
+    // The bound is the transport's own queue-residence budget, not a number
+    // invented here. That is how long a released operation may sit before the
+    // transport itself calls it lost, so a release still unanswered after it
+    // is not going to be answered. The statement deadline still caps it: a
+    // statement already past its deadline has no time left to lend.
+    let deadline = drain_deadline(statement_deadline, drain_budget, Instant::now());
     loop {
         let split_worker_stopped =
             split_assignment.is_none_or(SplitAssignmentRoundGuard::is_finished);
@@ -3363,7 +3426,7 @@ fn drain_task_round(
                 execution_id = ?execution_id,
                 drained = round.attempt_drained(),
                 split_worker_stopped,
-                "attempt did not finish draining inside the statement deadline; \
+                "attempt did not finish draining inside its drain budget; \
                  the query execution lease closes what is left"
             );
             return;
