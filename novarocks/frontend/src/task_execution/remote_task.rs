@@ -31,14 +31,14 @@ use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
     CancelReason, CancelTask, CreateTask, DomainConflict, DomainProgression, DomainVersion,
-    ExchangeEdgeDomain, FrontendAction, GoneObservation, OperationKind, OperationOutcome,
-    QueryContextRef, SplitDomain, StatusObservation, TaskDescriptor, TaskDomainKind,
-    TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor,
-    TaskTransition, TerminationDetail, UpdateTask, classify_gone, classify_observation,
-    classify_task_transition,
+    ExchangeEdgeDomain, ExchangeEdgeId, FrontendAction, GoneObservation, OperationKind,
+    OperationOutcome, QueryContextRef, SplitDomain, StatusObservation, TaskDescriptor,
+    TaskDomainKind, TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus,
+    TaskStatusCursor, TaskTransition, TerminationDetail, UpdateTask, classify_gone,
+    classify_observation, classify_task_transition,
 };
 
-use super::error::TaskExecutionError;
+use super::error::{CapacityBound, TaskExecutionError};
 use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
 
 /// The three states of one remote task.
@@ -265,6 +265,36 @@ impl RemoteTask {
         self.admit_domain(&update)?;
         self.pending.push_back(update);
         Ok(UpdateAdmission::Queued)
+    }
+
+    /// Records the decision to open one of this producer's frozen edges.
+    ///
+    /// The version is minted here because it is a token of *this task's*
+    /// edge-open domain, and only one version may ever name one edge set. A
+    /// producer feeding several exchange nodes -- which is what a multi-cast
+    /// CTE, and any plan that consumes one fragment twice, produces -- has its
+    /// edges decided one at a time as each edge's destinations acknowledge
+    /// creation. Giving every one of those decisions the first version would
+    /// replay that version with a different edge set, which is
+    /// `SameTokenDifferentContent` and fails the whole attempt.
+    pub fn enqueue_edge_open(
+        &mut self,
+        edge: ExchangeEdgeId,
+    ) -> Result<UpdateAdmission, TaskExecutionError> {
+        if matches!(self.state, RemoteTaskState::Terminal) {
+            return Ok(UpdateAdmission::DiscardedTerminal);
+        }
+        let version =
+            self.progress
+                .edges
+                .next_open_version()
+                .ok_or(TaskExecutionError::Capacity(
+                    CapacityBound::EdgeOpenVersions { limit: u32::MAX },
+                ))?;
+        self.enqueue_update(TaskDomainUpdate::OpenExchangeEdges {
+            version,
+            edges: vec![edge],
+        })
     }
 
     fn admit_domain(&mut self, update: &TaskDomainUpdate) -> Result<(), TaskExecutionError> {

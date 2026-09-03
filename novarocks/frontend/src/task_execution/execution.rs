@@ -484,7 +484,7 @@ impl QueryTaskExecution {
                     );
                     continue;
                 };
-                task.enqueue_update(EdgeOpenTracker::open_update(edge_id))?;
+                task.enqueue_edge_open(edge_id)?;
                 tracing::debug!(
                     edge = %edge_id,
                     producer = %producer,

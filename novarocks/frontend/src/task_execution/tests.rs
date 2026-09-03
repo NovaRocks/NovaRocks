@@ -31,12 +31,12 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     AbortCause, CancelReason, CodecOwnedContent, ConfidentialContent, ContentFingerprint,
     CreateTaskReceipt, CredentialEpoch, CredentialLeaseId, CredentialUpdate, DispatchBudget,
-    DispatchLane, DomainVersion, DynamicFilterAdvertisement, LeaseReceipt, LeaseSequence,
-    LeaseValidFor, MonotonicInstant, OperationKind, OperationOutcome, PhysicalFragmentPlan,
-    PlanNodeId, QueryContextReceipt, QueryContextRef, QueryContextState, ReleaseOutcome,
-    RenewSchedule, SplitAssignmentIntent, SplitSequence, StageState, TaskDomainUpdate,
-    TaskIdentity, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
-    TransportBudget, UpdateTaskReceipt,
+    DispatchLane, DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion, ExchangeEdgeId,
+    LeaseReceipt, LeaseSequence, LeaseValidFor, MonotonicInstant, OperationKind, OperationOutcome,
+    PhysicalFragmentPlan, PlanNodeId, QueryContextReceipt, QueryContextRef, QueryContextState,
+    ReleaseOutcome, RenewSchedule, SplitAssignmentIntent, SplitSequence, StageState,
+    TaskDomainUpdate, TaskIdentity, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
+    TerminationDetail, TransportBudget, UpdateTaskReceipt,
 };
 use novarocks_sql::plan_read::{
     DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
@@ -74,6 +74,7 @@ const MIDDLE_FRAGMENT: FragmentId = 2;
 const ROOT_FRAGMENT: FragmentId = 3;
 const LEAF_TO_MIDDLE_NODE: i32 = 20;
 const MIDDLE_TO_ROOT_NODE: i32 = 30;
+const LEAF_TO_ROOT_NODE: i32 = 31;
 const SCAN_NODE: i32 = 5;
 
 // ---------------------------------------------------------------------------
@@ -309,6 +310,19 @@ fn chain_edges() -> Vec<FragmentEdge> {
     vec![
         stream_edge(LEAF_FRAGMENT, MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
         stream_edge(MIDDLE_FRAGMENT, ROOT_FRAGMENT, MIDDLE_TO_ROOT_NODE),
+    ]
+}
+
+/// The chain plus a second consumer of the leaf stage's output, so every leaf
+/// task is a producer on two exchange edges.
+///
+/// This is the shape a CTE consumed twice schedules, and it is what any plan
+/// that reuses one fragment's output through a second exchange node produces.
+fn multicast_edges() -> Vec<FragmentEdge> {
+    vec![
+        stream_edge(LEAF_FRAGMENT, MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
+        stream_edge(MIDDLE_FRAGMENT, ROOT_FRAGMENT, MIDDLE_TO_ROOT_NODE),
+        stream_edge(LEAF_FRAGMENT, ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
     ]
 }
 
@@ -881,6 +895,98 @@ fn an_edge_stays_closed_until_its_producer_is_created() {
         request.domains().first(),
         Some(TaskDomainUpdate::OpenExchangeEdges { .. })
     ));
+}
+
+#[test]
+fn a_producer_of_two_edges_opens_each_edge_at_its_own_version() {
+    // The defect this catches: every edge-open decision was minted at version
+    // one, while one version may only ever name one exact edge set. A producer
+    // that feeds two exchange nodes has its edges decided separately, so its
+    // second decision replayed version one with a different edge set --
+    // `SameTokenDifferentContent`, refused where it is produced. The
+    // consequence was that every multi-cast query failed the moment its second
+    // edge was decided: the whole `cte` suite, and any plan that consumes one
+    // fragment's output twice.
+    let processes = backends(3);
+    let schedule = chain_schedule(&[0, 1, 2], &[0, 1, 2]);
+    let graph = build_graph(&schedule, &multicast_edges(), &processes, 512)
+        .expect("a multi-cast schedule is a legal task graph");
+    let mut harness = Harness::from_graph(graph);
+    let leaves = harness.stage_tasks(1);
+
+    let mut opens = BTreeMap::<TaskId, Vec<(EdgeOpenVersion, Vec<ExchangeEdgeId>)>>::new();
+    loop {
+        let released = harness.released();
+        if released.is_empty() {
+            break;
+        }
+        for intent in &released {
+            match intent.kind() {
+                OperationKind::UpdateQueryContext => {
+                    harness.context_ack(intent, Duration::from_secs(10));
+                }
+                OperationKind::CreateTask => harness
+                    .create_ack(intent, OperationOutcome::Accepted)
+                    .expect("a create settles and its edge-open decisions are admitted"),
+                OperationKind::UpdateTask => {
+                    let OperationIntent::UpdateTask(request) = intent else {
+                        unreachable!("an update intent carries its request");
+                    };
+                    if let Some(TaskDomainUpdate::OpenExchangeEdges { version, edges }) =
+                        request.domains().first()
+                    {
+                        opens
+                            .entry(request.identity().task_id())
+                            .or_default()
+                            .push((*version, edges.clone()));
+                    }
+                    harness
+                        .update_ack(intent, OperationOutcome::Accepted)
+                        .expect("an edge open settles");
+                }
+                kind => unreachable!("this fixture does not release {kind}"),
+            }
+        }
+    }
+
+    for &leaf in &leaves {
+        let decisions = opens
+            .get(&leaf)
+            .expect("every leaf task produces on both of its edges");
+        assert_eq!(
+            decisions.len(),
+            2,
+            "a leaf feeding two exchange nodes opens two edges"
+        );
+        let versions: BTreeSet<EdgeOpenVersion> =
+            decisions.iter().map(|(version, _)| *version).collect();
+        assert_eq!(
+            versions.len(),
+            2,
+            "one version may not name two different edge sets"
+        );
+        let edges: BTreeSet<ExchangeEdgeId> = decisions
+            .iter()
+            .flat_map(|(_, edges)| edges.iter().copied())
+            .collect();
+        assert_eq!(
+            edges.len(),
+            2,
+            "each decision names exactly the edge it opened"
+        );
+    }
+
+    for task in harness.execution.graph().tasks().collect::<Vec<_>>() {
+        assert_eq!(
+            harness
+                .execution
+                .task(task.task_id())
+                .expect("the task is owned")
+                .state(),
+            RemoteTaskState::Created,
+            "a multi-cast attempt must reach a fully created schedule"
+        );
+    }
 }
 
 #[test]

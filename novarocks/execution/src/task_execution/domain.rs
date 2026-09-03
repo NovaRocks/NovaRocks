@@ -782,13 +782,16 @@ pub enum EdgeSendPermission {
 
 /// Version of an edge-open decision.
 ///
-/// Only version one exists in this release; a different version is a conflict
-/// rather than a reconfiguration.
+/// One version means one exact edge set, never a reconfiguration of an
+/// already-open edge. A producer whose edges become decided at different
+/// moments therefore needs one version per decision: reusing a version for a
+/// second edge set is [`DomainConflict::SameTokenDifferentContent`], not an
+/// increment.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct EdgeOpenVersion(std::num::NonZeroU32);
 
 impl EdgeOpenVersion {
-    /// The only version this release accepts.
+    /// The first version a producer's edge-open domain can publish.
     pub const FIRST: Self = Self(std::num::NonZeroU32::new(1).expect("one is nonzero"));
 
     pub fn new(value: u32) -> Result<Self, ZeroExchangeEdgeId> {
@@ -843,6 +846,24 @@ impl ExchangeEdgeDomain {
         self.edges
             .values()
             .all(|state| *state == EdgeSendPermission::Open)
+    }
+
+    /// The next version this domain has not applied.
+    ///
+    /// The producer of edge-open decisions mints one version per request, and
+    /// one version means one exact edge set, so a second request may never
+    /// carry the version of the first. Deriving the next value from
+    /// `opened_sets` rather than from a counter kept somewhere else is what
+    /// makes that true of whatever state this domain actually holds.
+    ///
+    /// `None` only once the whole version space is spent, which the caller
+    /// must refuse rather than wrap: a wrapped version would claim to be the
+    /// request that opened a different edge set.
+    pub fn next_open_version(&self) -> Option<EdgeOpenVersion> {
+        match self.opened_sets.keys().next_back() {
+            Some(highest) => EdgeOpenVersion::new(highest.get().checked_add(1)?).ok(),
+            None => Some(EdgeOpenVersion::FIRST),
+        }
     }
 
     /// Classifies an `OpenExchangeEdges` request.
@@ -1219,6 +1240,58 @@ mod tests {
             domain.classify_open(second, &[edge(1)]),
             DomainProgression::Conflict(DomainConflict::SameTokenDifferentContent),
             "a version may not later claim an edge another version opened"
+        );
+    }
+
+    #[test]
+    fn the_next_open_version_is_always_one_this_domain_has_not_applied() {
+        // The defect this catches: a producer whose edges are decided one at a
+        // time reused the first version for every decision, so the second edge
+        // set replayed an applied version with different content. Minting from
+        // the applied set is what keeps each decision its own version.
+        let mut domain = ExchangeEdgeDomain::from_frozen_edges([edge(1), edge(2), edge(3)]);
+        assert_eq!(domain.next_open_version(), Some(EdgeOpenVersion::FIRST));
+
+        let first = domain
+            .next_open_version()
+            .expect("a fresh domain has a version to mint");
+        assert_eq!(
+            domain.classify_open(first, &[edge(1)]),
+            DomainProgression::Apply
+        );
+        domain.apply_open(first, &[edge(1)]);
+
+        let second = domain
+            .next_open_version()
+            .expect("an applied version leaves a successor");
+        assert!(second > first, "a minted version is strictly newer");
+        assert_eq!(
+            domain.classify_open(second, &[edge(2)]),
+            DomainProgression::Apply,
+            "the second decision must not conflict with the first"
+        );
+        domain.apply_open(second, &[edge(2)]);
+
+        let third = domain
+            .next_open_version()
+            .expect("two applied versions leave a successor");
+        assert!(third > second);
+        assert_eq!(
+            domain.classify_open(third, &[edge(3)]),
+            DomainProgression::Apply
+        );
+        domain.apply_open(third, &[edge(3)]);
+        assert!(domain.all_open());
+
+        // Every minted version is still exactly replayable, which is what the
+        // unknown-outcome retry rule needs.
+        assert_eq!(
+            domain.classify_open(first, &[edge(1)]),
+            DomainProgression::Idempotent
+        );
+        assert_eq!(
+            domain.classify_open(second, &[edge(2)]),
+            DomainProgression::Idempotent
         );
     }
 

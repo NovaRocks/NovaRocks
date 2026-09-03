@@ -451,14 +451,14 @@ pub fn decode_task_domain(
         }
         novarocks::task_domain_update::Domain::OpenExchangeEdges(open) => {
             let open_path = path.field("open_exchange_edges");
+            // Any nonzero version decodes. One version means one exact edge
+            // set, and a producer whose edges are decided one at a time mints
+            // a fresh version per decision, so pinning the wire to version one
+            // refused every edge after a multi-edge producer's first. Whether
+            // a version is a legal progression is the receiving domain's
+            // question, not this decoder's.
             let version = EdgeOpenVersion::new(open.version)
                 .map_err(|error| invalid(open_path.clone().field("version"), error.to_string()))?;
-            if version != EdgeOpenVersion::FIRST {
-                return Err(invalid(
-                    open_path.clone().field("version"),
-                    "this release opens an edge exactly once, at version one",
-                ));
-            }
             if open.edge_ids.is_empty() {
                 return Err(missing(
                     open_path.clone().field("edge_ids"),

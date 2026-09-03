@@ -1179,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn task_domains_decode_their_tokens_and_refuse_a_reconfigure() {
+    fn task_domains_decode_their_tokens_and_leave_progression_to_the_domain() {
         let process = backend();
         let (_, envelope_value) = envelope(OperationKind::UpdateTask);
         let update = |domain: novarocks::TaskDomainUpdate| novarocks::ApplyTaskOperationsRequest {
@@ -1207,23 +1207,47 @@ mod tests {
                 .is_ok()
         );
 
-        let reconfigure = update(novarocks::TaskDomainUpdate {
+        // The defect this catches: the decoder pinned an edge open to version
+        // one. A producer that feeds several exchange nodes has its edges
+        // decided one at a time and mints a version per decision, so pinning
+        // the wire rejected every edge after the first -- which is every
+        // multi-cast query. Whether a version is a legal progression belongs
+        // to the receiving domain, which sees the accepted edge sets; the
+        // decoder only sees one message.
+        let second_version = update(novarocks::TaskDomainUpdate {
             domain: Some(novarocks::task_domain_update::Domain::OpenExchangeEdges(
                 novarocks::OpenExchangeEdgesDomain {
                     version: 2,
+                    edge_ids: vec![3],
+                },
+            )),
+        });
+        assert!(
+            decode_operation_batch(
+                &second_version,
+                TransportBudget::DEFAULT,
+                FieldPath::root("batch")
+            )
+            .is_ok(),
+            "a producer's later edge-open decision carries a later version"
+        );
+
+        let zero_version = update(novarocks::TaskDomainUpdate {
+            domain: Some(novarocks::task_domain_update::Domain::OpenExchangeEdges(
+                novarocks::OpenExchangeEdgesDomain {
+                    version: 0,
                     edge_ids: vec![1],
                 },
             )),
         });
-        assert_eq!(
+        assert!(
             decode_operation_batch(
-                &reconfigure,
+                &zero_version,
                 TransportBudget::DEFAULT,
                 FieldPath::root("batch")
             )
-            .expect_err("this release has no reconfigure")
-            .detail(),
-            "this release opens an edge exactly once, at version one"
+            .is_err(),
+            "an edge-open version is nonzero"
         );
 
         let empty_edges = update(novarocks::TaskDomainUpdate {

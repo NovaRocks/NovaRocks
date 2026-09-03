@@ -26,8 +26,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_execution::task_execution::{
-    CancelReason, EdgeOpenVersion, ExchangeEdgeId, StageRef, StageState, TaskDomainUpdate,
-    TaskIdentity, TaskState, derive_stage_state, parent_released_children,
+    CancelReason, ExchangeEdgeId, StageRef, StageState, TaskIdentity, TaskState,
+    derive_stage_state, parent_released_children,
 };
 use novarocks_sql::plan_read::FragmentId;
 use novarocks_types::identity::{StageId, TaskId};
@@ -228,16 +228,5 @@ impl EdgeOpenTracker {
 
     pub fn is_decided(&self, edge_id: ExchangeEdgeId) -> bool {
         self.decided.contains(&edge_id)
-    }
-
-    /// The edge-open fact one producer records for one decided edge.
-    ///
-    /// Only version one exists in this release, so this cannot express a
-    /// reconfiguration.
-    pub fn open_update(edge_id: ExchangeEdgeId) -> TaskDomainUpdate {
-        TaskDomainUpdate::OpenExchangeEdges {
-            version: EdgeOpenVersion::FIRST,
-            edges: vec![edge_id],
-        }
     }
 }

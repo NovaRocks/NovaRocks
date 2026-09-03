@@ -98,6 +98,13 @@ pub enum CapacityBound {
     },
     /// One descriptor's encoded plan.
     DescriptorBytes { limit: usize, actual: usize },
+    /// Edge-open versions one producer task can mint.
+    ///
+    /// A task mints one per edge-open decision and never reuses one, so this
+    /// bound is the version space itself. It fails closed rather than wrapping
+    /// because a wrapped version would claim to be the request that opened a
+    /// different edge set.
+    EdgeOpenVersions { limit: u32 },
 }
 
 impl CapacityBound {
@@ -134,6 +141,9 @@ impl fmt::Display for CapacityBound {
                 formatter,
                 "descriptor plan is {actual} bytes, limit is {limit}"
             ),
+            Self::EdgeOpenVersions { limit } => {
+                write!(formatter, "edge-open versions for one task reached {limit}")
+            }
         }
     }
 }
