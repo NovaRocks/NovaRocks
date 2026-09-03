@@ -69,6 +69,7 @@ fn visit(
         }
         ExecNodeKind::AssertNumRows(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Project(node) => visit(&node.input, instance, bindings),
+        ExecNodeKind::Unpivot(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Filter(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Repeat(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::ChangeEventExpand(node) => visit(&node.input, instance, bindings),

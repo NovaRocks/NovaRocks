@@ -24,7 +24,8 @@ use crate::column_id::ColumnId;
 use crate::planner::payload::{
     AggregateCall, PlanAssertOneRowNode, PlanCTEAnchorNode, PlanCTEConsumeNode, PlanCTEProduceNode,
     PlanFilterNode, PlanGenerateSeriesNode, PlanLimitNode, PlanProjectNode, PlanRepeatNode,
-    PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
+    PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanUnpivotNode, PlanValuesNode,
+    PlanWindowNode,
 };
 use crate::planner::physical::runtime_filter::{
     AggregateTopNRuntimeFilterBuildIntent, RuntimeFilterBuildIntent, RuntimeFilterProbeIntent,
@@ -156,6 +157,7 @@ pub enum PhysicalPlanKind {
     Scan(PlanScanNode),
     Filter(PlanFilterNode),
     Project(PlanProjectNode),
+    Unpivot(PlanUnpivotNode),
     Sort(PlanSortNode),
     Limit(PlanLimitNode),
     Values(PlanValuesNode),
@@ -183,6 +185,7 @@ impl PhysicalPlanKind {
             "Scan",
             "Filter",
             "Project",
+            "Unpivot",
             "Sort",
             "Limit",
             "Values",

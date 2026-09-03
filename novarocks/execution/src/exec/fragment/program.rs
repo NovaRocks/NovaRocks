@@ -410,6 +410,7 @@ fn root_plan_node_id(plan: &ExecPlan) -> i32 {
         ExecNodeKind::AssertNumRows(node) => node.node_id,
         ExecNodeKind::Values(node) => node.node_id,
         ExecNodeKind::Project(node) => node.node_id,
+        ExecNodeKind::Unpivot(node) => node.node_id,
         ExecNodeKind::Filter(node) => node.node_id,
         ExecNodeKind::Repeat(node) => node.node_id,
         ExecNodeKind::ChangeEventExpand(node) => node.node_id,

@@ -19,7 +19,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::analysis::{OutputColumn, ProjectItem, SortItem, TypedExpr};
+use crate::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::column_id::ColumnId;
 use crate::common::{ScanVariantColumn, SqlTopNType};
 use crate::planner::table::TableDef;
@@ -48,6 +48,337 @@ pub(crate) struct PlanFilterNode {
 pub(crate) struct PlanProjectNode {
     pub items: Vec<ProjectItem>,
     pub output_qualifier: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanUnpivotNode {
+    pub passthrough_columns: Vec<PlanUnpivotPassthroughColumn>,
+    pub value_output_column_id: ColumnId,
+    pub literal_output_column_ids: Vec<ColumnId>,
+    pub value_mappings: Vec<PlanUnpivotValueMapping>,
+    pub output_columns: Vec<OutputColumn>,
+    pub max_output_rows: usize,
+    pub max_output_bytes: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanUnpivotPassthroughColumn {
+    pub input_column_id: ColumnId,
+    pub output_column_id: ColumnId,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanUnpivotValueMapping {
+    pub input_value_column_id: ColumnId,
+    pub literals: Vec<TypedExpr>,
+}
+
+impl PlanUnpivotNode {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The typed unpivot contract keeps independently validated column roles explicit."
+    )]
+    #[allow(dead_code)]
+    pub(crate) fn try_new(
+        input_columns: &[OutputColumn],
+        passthrough_columns: Vec<PlanUnpivotPassthroughColumn>,
+        value_output_column_id: ColumnId,
+        literal_output_column_ids: Vec<ColumnId>,
+        value_mappings: Vec<PlanUnpivotValueMapping>,
+        output_columns: Vec<OutputColumn>,
+        max_output_rows: usize,
+        max_output_bytes: usize,
+    ) -> Result<Self, String> {
+        let node = Self {
+            passthrough_columns,
+            value_output_column_id,
+            literal_output_column_ids,
+            value_mappings,
+            output_columns,
+            max_output_rows,
+            max_output_bytes,
+        };
+        node.validate_against(input_columns)?;
+        Ok(node)
+    }
+
+    pub(crate) fn validate_against(&self, input_columns: &[OutputColumn]) -> Result<(), String> {
+        use std::collections::{HashMap, HashSet};
+
+        if self.max_output_rows == 0 {
+            return Err("Unpivot max_output_rows must be greater than zero".to_string());
+        }
+        if self.max_output_bytes == 0 {
+            return Err("Unpivot max_output_bytes must be greater than zero".to_string());
+        }
+        if self.value_mappings.is_empty() {
+            return Err("Unpivot requires at least one value mapping".to_string());
+        }
+
+        let mut input_by_id = HashMap::with_capacity(input_columns.len());
+        for column in input_columns {
+            if input_by_id.insert(column.column_id, column).is_some() {
+                return Err(format!(
+                    "Unpivot input contains duplicate column id {}",
+                    column.column_id
+                ));
+            }
+        }
+        let mut output_by_id = HashMap::with_capacity(self.output_columns.len());
+        for column in &self.output_columns {
+            if output_by_id.insert(column.column_id, column).is_some() {
+                return Err(format!(
+                    "Unpivot output contains duplicate column id {}",
+                    column.column_id
+                ));
+            }
+        }
+
+        let mut assigned_outputs = HashSet::new();
+        for mapping in &self.passthrough_columns {
+            if !assigned_outputs.insert(mapping.output_column_id) {
+                return Err(format!(
+                    "Unpivot output column id {} has multiple producers",
+                    mapping.output_column_id
+                ));
+            }
+            let input = input_by_id.get(&mapping.input_column_id).ok_or_else(|| {
+                format!(
+                    "Unpivot passthrough input column id {} is not produced by its child",
+                    mapping.input_column_id
+                )
+            })?;
+            let output = output_by_id.get(&mapping.output_column_id).ok_or_else(|| {
+                format!(
+                    "Unpivot passthrough output column id {} is missing from output columns",
+                    mapping.output_column_id
+                )
+            })?;
+            require_exact_column_shape("passthrough", input, output)?;
+        }
+
+        if !assigned_outputs.insert(self.value_output_column_id) {
+            return Err(format!(
+                "Unpivot value output column id {} has multiple producers",
+                self.value_output_column_id
+            ));
+        }
+        let value_output = output_by_id
+            .get(&self.value_output_column_id)
+            .ok_or_else(|| {
+                format!(
+                    "Unpivot value output column id {} is missing from output columns",
+                    self.value_output_column_id
+                )
+            })?;
+        let mut value_nullable = false;
+        for (index, mapping) in self.value_mappings.iter().enumerate() {
+            let input = input_by_id
+                .get(&mapping.input_value_column_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Unpivot value mapping {index} input column id {} is not produced by its child",
+                        mapping.input_value_column_id
+                    )
+                })?;
+            if input.data_type != value_output.data_type {
+                return Err(format!(
+                    "Unpivot value mapping {index} type mismatch: input {:?}, output {:?}",
+                    input.data_type, value_output.data_type
+                ));
+            }
+            value_nullable |= input.nullable;
+            if mapping.literals.len() != self.literal_output_column_ids.len() {
+                return Err(format!(
+                    "Unpivot value mapping {index} literal count mismatch: expected {}, got {}",
+                    self.literal_output_column_ids.len(),
+                    mapping.literals.len()
+                ));
+            }
+        }
+        if value_output.nullable != value_nullable {
+            return Err(format!(
+                "Unpivot value output column id {} nullability mismatch: expected {}, got {}",
+                self.value_output_column_id, value_nullable, value_output.nullable
+            ));
+        }
+
+        let mut literal_outputs = HashSet::new();
+        for (literal_index, output_id) in self.literal_output_column_ids.iter().enumerate() {
+            if !literal_outputs.insert(*output_id) {
+                return Err(format!(
+                    "Unpivot has duplicate literal output column id {output_id}"
+                ));
+            }
+            if !assigned_outputs.insert(*output_id) {
+                return Err(format!(
+                    "Unpivot output column id {output_id} has multiple producers"
+                ));
+            }
+            let output = output_by_id.get(output_id).ok_or_else(|| {
+                format!(
+                    "Unpivot literal output column id {output_id} is missing from output columns"
+                )
+            })?;
+            let mut nullable = false;
+            for (mapping_index, mapping) in self.value_mappings.iter().enumerate() {
+                let literal = &mapping.literals[literal_index];
+                if !matches!(literal.kind, ExprKind::Literal(_)) {
+                    return Err(format!(
+                        "Unpivot value mapping {mapping_index} literal {literal_index} is not a literal expression"
+                    ));
+                }
+                if literal.data_type != output.data_type {
+                    return Err(format!(
+                        "Unpivot value mapping {mapping_index} literal {literal_index} type mismatch: literal {:?}, output {:?}",
+                        literal.data_type, output.data_type
+                    ));
+                }
+                nullable |= literal.nullable;
+            }
+            if output.nullable != nullable {
+                return Err(format!(
+                    "Unpivot literal output column id {output_id} nullability mismatch: expected {nullable}, got {}",
+                    output.nullable
+                ));
+            }
+        }
+
+        if assigned_outputs.len() != output_by_id.len() {
+            let extras = output_by_id
+                .keys()
+                .filter(|id| !assigned_outputs.contains(id))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Unpivot output columns contain unassigned column ids [{extras}]"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn require_exact_column_shape(
+    role: &str,
+    input: &OutputColumn,
+    output: &OutputColumn,
+) -> Result<(), String> {
+    if input.data_type != output.data_type || input.nullable != output.nullable {
+        Err(format!(
+            "Unpivot {role} column shape mismatch: input id {} is {:?} nullable={}, output id {} is {:?} nullable={}",
+            input.column_id,
+            input.data_type,
+            input.nullable,
+            output.column_id,
+            output.data_type,
+            output.nullable
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unpivot_tests {
+    use super::*;
+    use crate::analysis::LiteralValue;
+
+    fn column(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn string_literal(value: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
+            data_type: DataType::Utf8,
+            nullable: false,
+        }
+    }
+
+    fn valid_node() -> Result<PlanUnpivotNode, String> {
+        PlanUnpivotNode::try_new(
+            &[
+                column(1, "group", DataType::Utf8, false),
+                column(2, "v1", DataType::Int64, true),
+                column(3, "v2", DataType::Int64, false),
+            ],
+            vec![PlanUnpivotPassthroughColumn {
+                input_column_id: ColumnId(1),
+                output_column_id: ColumnId(11),
+            }],
+            ColumnId(13),
+            vec![ColumnId(12)],
+            vec![
+                PlanUnpivotValueMapping {
+                    input_value_column_id: ColumnId(2),
+                    literals: vec![string_literal("first")],
+                },
+                PlanUnpivotValueMapping {
+                    input_value_column_id: ColumnId(3),
+                    literals: vec![string_literal("second")],
+                },
+            ],
+            vec![
+                column(11, "group", DataType::Utf8, false),
+                column(12, "label", DataType::Utf8, false),
+                column(13, "value", DataType::Int64, true),
+            ],
+            1024,
+            1024 * 1024,
+        )
+    }
+
+    #[test]
+    fn validates_typed_unpivot_contract() {
+        let node = valid_node().unwrap();
+        assert_eq!(node.value_mappings.len(), 2);
+    }
+
+    #[test]
+    fn rejects_value_type_drift() {
+        let error = PlanUnpivotNode::try_new(
+            &[column(1, "v", DataType::Int64, false)],
+            Vec::new(),
+            ColumnId(2),
+            Vec::new(),
+            vec![PlanUnpivotValueMapping {
+                input_value_column_id: ColumnId(1),
+                literals: Vec::new(),
+            }],
+            vec![column(2, "value", DataType::Utf8, false)],
+            1,
+            1024,
+        )
+        .unwrap_err();
+        assert!(error.contains("type mismatch"), "{error}");
+    }
+
+    #[test]
+    fn rejects_non_literal_tag() {
+        let mut node = valid_node().unwrap();
+        node.value_mappings[0].literals[0].kind = ExprKind::ColumnRef {
+            column_id: ColumnId(1),
+            qualifier: None,
+            column: "group".to_string(),
+        };
+        let input = [
+            column(1, "group", DataType::Utf8, false),
+            column(2, "v1", DataType::Int64, true),
+            column(3, "v2", DataType::Int64, false),
+        ];
+        let error = node.validate_against(&input).unwrap_err();
+        assert!(error.contains("not a literal expression"), "{error}");
+    }
 }
 
 #[allow(dead_code)]

@@ -160,6 +160,7 @@ message PlanNode {
     CteProduceNode cte_produce = 29;                 // CTE producer node.
     CteConsumeNode cte_consume = 30;                 // CTE consumer node.
     RedistributeNode redistribute = 31;              // explicit redistribution node.
+    UnpivotNode unpivot = 32;                        // typed wide-to-long expansion node.
   }
 }
 
@@ -690,6 +691,37 @@ message ProjectItem {
   novarocks.expr.Expr expr = 1; // projected expression.
   string output_name = 2;       // display output name.
   uint32 output_column_id = 3;  // analyzer-minted output ColumnId.
+}
+
+// Generic typed wide-to-long expansion.
+//
+// Each input row is expanded once for every value mapping. Passthrough columns
+// are copied to every expanded row, the selected input value is written to the
+// common value output, and the mapping's literals populate the literal output
+// columns. Column descriptors and their exact Arrow types/nullability live in
+// PlanNode.output_columns; this payload carries identities and bounded batching
+// only. Output row order is not contractual; consumers must not depend on
+// input-major or mapping-major iteration.
+message UnpivotNode {
+  repeated UnpivotPassthroughColumn passthrough_columns = 1;
+  uint32 value_output_column_id = 2;
+  repeated uint32 literal_output_column_ids = 3;
+  repeated UnpivotValueMapping value_mappings = 4;
+  uint64 max_output_rows = 5;
+  uint64 max_output_bytes = 6;
+}
+
+// One input column copied to one output column for every expanded row.
+message UnpivotPassthroughColumn {
+  uint32 input_column_id = 1;
+  uint32 output_column_id = 2;
+}
+
+// One source value column and the literal tags attached to its expanded rows.
+// `literals` is positional with UnpivotNode.literal_output_column_ids.
+message UnpivotValueMapping {
+  uint32 input_value_column_id = 1;
+  repeated novarocks.expr.Expr literals = 2;
 }
 
 // Sort physical node.

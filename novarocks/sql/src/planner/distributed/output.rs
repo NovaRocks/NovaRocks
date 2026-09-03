@@ -494,6 +494,7 @@ fn node_execution_output_columns(
             unary_passthrough_output_columns(node, fragment_roots)
         }
         DistributedNodeKind::Project(project) => Ok(project_execution_output_columns(project)),
+        DistributedNodeKind::Unpivot(unpivot) => Ok(unpivot.output_columns.clone()),
         DistributedNodeKind::HashAggregate(aggregate) => {
             // The aggregate's execution output is its visible-or-full output
             // columns with per-mode intermediate aggregate-state types applied
@@ -1346,6 +1347,7 @@ fn wire_node_output_columns(
         DistributedNodeKind::Project(project) => {
             wire_project_output_columns(node, project, fragment_id, node_outputs)
         }
+        DistributedNodeKind::Unpivot(unpivot) => Ok(unpivot.output_columns.clone()),
         DistributedNodeKind::Filter(_)
         | DistributedNodeKind::AssertOneRow(_)
         | DistributedNodeKind::Sort(_)

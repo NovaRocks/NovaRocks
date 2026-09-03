@@ -48,6 +48,7 @@ pub(crate) fn exec_node_kind_label(kind: &ExecNodeKind) -> &'static str {
     match kind {
         ExecNodeKind::Scan(_) => "Scan",
         ExecNodeKind::Project(_) => "Project",
+        ExecNodeKind::Unpivot(_) => "Unpivot",
         ExecNodeKind::Filter(_) => "Filter",
         ExecNodeKind::Aggregate(_) => "Aggregate",
         ExecNodeKind::Join(_) => "Join",

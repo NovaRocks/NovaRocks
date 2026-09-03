@@ -56,6 +56,7 @@ mod statistics_sink;
 mod table_finish;
 mod table_function_processor;
 pub(crate) mod table_writer;
+mod unpivot_processor;
 mod values_source;
 
 pub use aggregate::AggregateProcessorFactory;
@@ -102,4 +103,5 @@ pub use statistics_sink::{StatisticsSinkFactory, StatisticsSinkHandle};
 pub use table_finish::TableFinishOperatorFactory;
 pub use table_function_processor::TableFunctionProcessorFactory;
 pub use table_writer::TableWriterOperatorFactory;
+pub use unpivot_processor::UnpivotProcessorFactory;
 pub use values_source::ValuesSourceFactory;

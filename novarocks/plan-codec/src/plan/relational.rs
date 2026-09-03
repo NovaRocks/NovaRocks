@@ -41,6 +41,7 @@ pub(super) fn encoded_physical_variant_names_for_test() -> &'static [&'static st
         "Scan",
         "Filter",
         "Project",
+        "Unpivot",
         "Sort",
         "Limit",
         "Values",
@@ -95,6 +96,37 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
                     })
                     .collect::<Result<Vec<_>, String>>()?,
                 output_qualifier: node.output_qualifier.clone(),
+            }),
+        ),
+        SqlPhysicalPlanRead::Unpivot(node) => (
+            encode_output_columns(&node.output_columns)?,
+            Kind::Unpivot(plan::UnpivotNode {
+                passthrough_columns: node
+                    .passthrough_columns
+                    .iter()
+                    .map(|mapping| plan::UnpivotPassthroughColumn {
+                        input_column_id: mapping.input_column_id.0,
+                        output_column_id: mapping.output_column_id.0,
+                    })
+                    .collect(),
+                value_output_column_id: node.value_output_column_id.0,
+                literal_output_column_ids: node
+                    .literal_output_column_ids
+                    .iter()
+                    .map(|id| id.0)
+                    .collect(),
+                value_mappings: node
+                    .value_mappings
+                    .iter()
+                    .map(|mapping| {
+                        Ok(plan::UnpivotValueMapping {
+                            input_value_column_id: mapping.input_value_column_id.0,
+                            literals: encode_exprs(&mapping.literals)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                max_output_rows: usize_to_u64(node.max_output_rows),
+                max_output_bytes: usize_to_u64(node.max_output_bytes),
             }),
         ),
         SqlPhysicalPlanRead::Sort(node) => (
@@ -421,5 +453,35 @@ fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {
         PlanRowCountAssertion::Le => plan::RowCountAssertion::Le as i32,
         PlanRowCountAssertion::Gt => plan::RowCountAssertion::Gt as i32,
         PlanRowCountAssertion::Ge => plan::RowCountAssertion::Ge as i32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_typed_unpivot_contract() {
+        let physical = novarocks_sql::plan_read::unpivot_physical_plan_for_test();
+        let encoded = encode_physical_node(
+            &physical,
+            7,
+            &NativePlanEncodeContext {
+                scan_facts: None,
+                node_outputs: None,
+                fragment_edge_outputs: None,
+                write_contracts: None,
+                write_targets: None,
+            },
+        )
+        .unwrap();
+        let Some(plan::plan_node::Kind::Unpivot(unpivot)) = encoded.kind else {
+            panic!("expected Unpivot");
+        };
+        assert_eq!(unpivot.passthrough_columns.len(), 1);
+        assert_eq!(unpivot.value_mappings.len(), 2);
+        assert_eq!(unpivot.literal_output_column_ids, vec![12]);
+        assert_eq!(unpivot.max_output_rows, 128);
+        assert_eq!(unpivot.max_output_bytes, 4096);
     }
 }

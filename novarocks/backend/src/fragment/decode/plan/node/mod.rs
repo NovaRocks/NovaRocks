@@ -35,6 +35,7 @@ mod sort;
 mod table_function;
 mod table_write;
 mod topn;
+mod unpivot;
 mod values;
 mod window;
 
@@ -331,6 +332,9 @@ fn validate_distributed_node_children(
                 }
                 plan::plan_node::Kind::Project(_) => {
                     require_exact_children(node_path, "ProjectNode", 1, actual)
+                }
+                plan::plan_node::Kind::Unpivot(_) => {
+                    require_exact_children(node_path, "UnpivotNode", 1, actual)
                 }
                 plan::plan_node::Kind::Filter(_) => {
                     require_exact_children(node_path, "FilterNode", 1, actual)
@@ -1552,6 +1556,16 @@ fn lower_physical_node(
             node,
             project,
             path.clone().field("project"),
+            children,
+            arena,
+            ctx,
+        ),
+        plan::plan_node::Kind::Unpivot(unpivot) => unpivot::lower_unpivot_node(
+            node,
+            physical,
+            unpivot,
+            path.clone().field("unpivot"),
+            physical_output_path.clone(),
             children,
             arena,
             ctx,

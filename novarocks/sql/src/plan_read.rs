@@ -417,6 +417,7 @@ pub enum SqlPhysicalPlanRead {
         predicate: TypedExpr,
     },
     Project(SqlProjectPlanRead),
+    Unpivot(SqlUnpivotPlanRead),
     Sort(SqlSortPlanRead),
     Limit {
         limit: Option<i64>,
@@ -505,6 +506,29 @@ pub struct SqlSortPlanRead {
 pub struct SqlValuesPlanRead {
     pub rows: Vec<Vec<TypedExpr>>,
     pub columns: Vec<OutputColumn>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SqlUnpivotPlanRead {
+    pub passthrough_columns: Vec<SqlUnpivotPassthroughColumnRead>,
+    pub value_output_column_id: ColumnId,
+    pub literal_output_column_ids: Vec<ColumnId>,
+    pub value_mappings: Vec<SqlUnpivotValueMappingRead>,
+    pub output_columns: Vec<OutputColumn>,
+    pub max_output_rows: usize,
+    pub max_output_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SqlUnpivotPassthroughColumnRead {
+    pub input_column_id: ColumnId,
+    pub output_column_id: ColumnId,
+}
+
+#[derive(Clone, Debug)]
+pub struct SqlUnpivotValueMappingRead {
+    pub input_value_column_id: ColumnId,
+    pub literals: Vec<TypedExpr>,
 }
 
 #[derive(Clone, Debug)]
@@ -714,6 +738,29 @@ pub fn physical_plan_read(src: &PhysicalPlanKind) -> SqlPhysicalPlanRead {
                 .collect(),
             output_qualifier: node.output_qualifier.clone(),
         }),
+        Node::Unpivot(node) => SqlPhysicalPlanRead::Unpivot(SqlUnpivotPlanRead {
+            passthrough_columns: node
+                .passthrough_columns
+                .iter()
+                .map(|mapping| SqlUnpivotPassthroughColumnRead {
+                    input_column_id: mapping.input_column_id,
+                    output_column_id: mapping.output_column_id,
+                })
+                .collect(),
+            value_output_column_id: node.value_output_column_id,
+            literal_output_column_ids: node.literal_output_column_ids.clone(),
+            value_mappings: node
+                .value_mappings
+                .iter()
+                .map(|mapping| SqlUnpivotValueMappingRead {
+                    input_value_column_id: mapping.input_value_column_id,
+                    literals: mapping.literals.clone(),
+                })
+                .collect(),
+            output_columns: node.output_columns.clone(),
+            max_output_rows: node.max_output_rows,
+            max_output_bytes: node.max_output_bytes,
+        }),
         Node::Sort(node) => SqlPhysicalPlanRead::Sort(SqlSortPlanRead {
             output_columns: node.output_columns.clone(),
             items: node.items.clone(),
@@ -882,6 +929,61 @@ pub fn physical_plan_read(src: &PhysicalPlanKind) -> SqlPhysicalPlanRead {
             output_columns: node.output_columns.clone(),
         }),
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn unpivot_physical_plan_for_test() -> PhysicalPlanKind {
+    use crate::analysis::LiteralValue;
+    use crate::planner::payload::{
+        PlanUnpivotNode, PlanUnpivotPassthroughColumn, PlanUnpivotValueMapping,
+    };
+
+    let column = |id, name: &str, data_type, nullable| OutputColumn {
+        column_id: ColumnId(id),
+        name: name.to_string(),
+        data_type,
+        nullable,
+        is_internal: false,
+    };
+    let input = vec![
+        column(1, "group", arrow::datatypes::DataType::Utf8, false),
+        column(2, "value_a", arrow::datatypes::DataType::Int64, true),
+        column(3, "value_b", arrow::datatypes::DataType::Int64, false),
+    ];
+    let literal = |value: &str| TypedExpr {
+        kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
+        data_type: arrow::datatypes::DataType::Utf8,
+        nullable: false,
+    };
+    PhysicalPlanKind::Unpivot(
+        PlanUnpivotNode::try_new(
+            &input,
+            vec![PlanUnpivotPassthroughColumn {
+                input_column_id: ColumnId(1),
+                output_column_id: ColumnId(11),
+            }],
+            ColumnId(13),
+            vec![ColumnId(12)],
+            vec![
+                PlanUnpivotValueMapping {
+                    input_value_column_id: ColumnId(2),
+                    literals: vec![literal("a")],
+                },
+                PlanUnpivotValueMapping {
+                    input_value_column_id: ColumnId(3),
+                    literals: vec![literal("b")],
+                },
+            ],
+            vec![
+                column(11, "group", arrow::datatypes::DataType::Utf8, false),
+                column(12, "label", arrow::datatypes::DataType::Utf8, false),
+                column(13, "value", arrow::datatypes::DataType::Int64, true),
+            ],
+            128,
+            4096,
+        )
+        .expect("valid unpivot test plan"),
+    )
 }
 
 fn sql_scan_source_read(source: &crate::planner::table::ScanSource) -> SqlScanSourceRead {

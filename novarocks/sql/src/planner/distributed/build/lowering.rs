@@ -85,7 +85,7 @@ pub(super) fn lower_fragment_local_node_with_payload(
             let tuple_id = ids.alloc_tuple();
             (node_id, vec![tuple_id])
         }
-        PhysicalPlanKind::Project(_) => {
+        PhysicalPlanKind::Project(_) | PhysicalPlanKind::Unpivot(_) => {
             let node_id = ids.alloc_node();
             let tuple_id = ids.alloc_tuple();
             (node_id, vec![tuple_id])

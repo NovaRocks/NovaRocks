@@ -78,7 +78,8 @@ use crate::exec::operators::{
     LocalExchangeSourceFactory, LookUpSourceFactory, PartitionedJoinProbeProcessorFactory,
     ProjectProcessorFactory, RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory,
     TableFinishOperatorFactory, TableFunctionProcessorFactory, TableWriterOperatorFactory,
-    UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory, ValuesSourceFactory,
+    UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory, UnpivotProcessorFactory,
+    ValuesSourceFactory,
 };
 use crate::exec::operators::{ExceptSharedState, IntersectSharedState, SetOpStageController};
 use crate::exec::operators::{
@@ -628,6 +629,7 @@ pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chun
         }
         ExecNodeKind::Values(values) => Some(values.chunk.chunk_schema_ref()),
         ExecNodeKind::Project(project) => Some(Arc::clone(&project.output_chunk_schema)),
+        ExecNodeKind::Unpivot(unpivot) => Some(Arc::clone(&unpivot.output_chunk_schema)),
         ExecNodeKind::Filter(FilterNode { input, .. })
         | ExecNodeKind::Repeat(RepeatNode { input, .. })
         | ExecNodeKind::Limit(LimitNode { input, .. })
@@ -1049,6 +1051,25 @@ fn build_pipeline_for_node(
                     output_indices.clone(),
                     output_chunk_schema.clone(),
                 )));
+            build.stream = StreamDesc::any(build.pipeline.dop);
+            Ok(build)
+        }
+        ExecNodeKind::Unpivot(node) => {
+            let mut build = build_pipeline_for_node(&node.input, ctx)?;
+            build
+                .pipeline
+                .factories
+                .push(Box::new(UnpivotProcessorFactory::new(
+                    node.node_id,
+                    Arc::clone(&ctx.arena),
+                    node.passthrough_columns.clone(),
+                    node.value_output_slot_id,
+                    node.literal_output_slot_ids.clone(),
+                    node.value_mappings.clone(),
+                    Arc::clone(&node.output_chunk_schema),
+                    node.max_output_rows,
+                    node.max_output_bytes,
+                )?));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
