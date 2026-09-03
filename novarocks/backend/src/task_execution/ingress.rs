@@ -55,11 +55,10 @@ use novarocks_execution::task_execution::operation::{OperationOutcome, Transport
 use novarocks_execution::task_execution::status::{SafeDetail, TaskFailureCategory};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::task_execution::operation::{
-    DecodedOperation, decode_fetch_dynamic_filters, decode_fetch_task_result,
-    decode_get_final_task_info, decode_operation_batch, decode_subscribe_task_status,
-    encode_abort_cause_field, encode_create_task_ack, encode_operation_outcome,
-    encode_query_context_ack, encode_receipt, encode_release_ack, encode_status_event,
-    encode_task_gone_event, encode_update_task_ack,
+    DecodedOperation, decode_fetch_dynamic_filters, decode_get_final_task_info,
+    decode_operation_batch, decode_subscribe_task_status, encode_abort_cause_field,
+    encode_create_task_ack, encode_operation_outcome, encode_query_context_ack, encode_receipt,
+    encode_release_ack, encode_status_event, encode_task_gone_event, encode_update_task_ack,
 };
 use novarocks_proto_codec::task_execution::status::{encode_final_task_info, encode_task_status};
 use novarocks_proto_models::novarocks as proto;
@@ -70,9 +69,7 @@ use super::observation::{TaskStatusEvent, TaskStatusSource};
 use super::receipt::OperationReceipt;
 use super::registry::TaskExecutionRegistry;
 use super::shared_facts::encode_dynamic_filter_read;
-use super::status::{RootResultRoute, StatusAdvance};
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
-use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
 
 type ReceiptAck = proto::task_operation_receipt::Ack;
 
@@ -299,83 +296,10 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         &self,
         request: proto::FetchTaskResultRequest,
     ) -> Result<proto::FetchResultResponse, tonic::Status> {
-        use proto::fetch_result_response::Status as FetchStatus;
-
-        let (identity, max_wait) =
-            decode_fetch_task_result(&request, FieldPath::root("fetch_task_result"))
-                .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        // Owning a result buffer and owing the coordinator a result are
-        // different facts. Every task has a kernel key, so routing by key
-        // alone would let a poll aimed at an exchange producer drain that
-        // producer's output as if it were the query's answer. The owner
-        // decides, and it also fences a replaced process and a terminal task
-        // whose buffer is gone.
-        let route = self.registry.root_result_route(identity);
-        let binding = match route {
-            RootResultRoute::Serve(binding) => binding,
-            refused => {
-                return Ok(fetch_result_response(
-                    FetchStatus::Error,
-                    refused
-                        .refusal_detail()
-                        .unwrap_or_else(|| "result poll refused".to_owned()),
-                    0,
-                    false,
-                    Vec::new(),
-                ));
-            }
-        };
-        // The decoder already bounds the wait by `MaxWait::MAX_REPRESENTABLE`,
-        // so this conversion cannot shorten a wait a caller asked for.
-        let max_wait_ms = i64::try_from(max_wait.as_millis()).unwrap_or(i64::MAX);
-        Ok(match wait_fetch_typed(binding.kernel_key(), max_wait_ms) {
-            TryFetchTypedResult::Ready(result) => {
-                // Delivering the end of the stream is the one moment a root's
-                // output responsibility completes, and the owner has to hear
-                // it from the poll that delivered it.
-                if result.eos {
-                    let advance = binding.note_result_stream_drained();
-                    if !matches!(
-                        advance,
-                        StatusAdvance::Published(_) | StatusAdvance::AlreadyTerminal(_)
-                    ) {
-                        return Err(tonic::Status::internal(format!(
-                            "root result stream drained but its status could not advance: \
-                             {advance:?}"
-                        )));
-                    }
-                }
-                fetch_result_response(
-                    FetchStatus::Ready,
-                    String::new(),
-                    result.packet_seq,
-                    result.eos,
-                    result.payload,
-                )
-            }
-            TryFetchTypedResult::NotReady => {
-                fetch_result_response(FetchStatus::NotReady, String::new(), 0, false, Vec::new())
-            }
-            TryFetchTypedResult::Error(error) => {
-                fetch_result_response(FetchStatus::Error, error.message, 0, false, Vec::new())
-            }
-        })
-    }
-}
-
-fn fetch_result_response(
-    status: proto::fetch_result_response::Status,
-    message: String,
-    packet_seq: i64,
-    eos: bool,
-    result_arrow_ipc: Vec<u8>,
-) -> proto::FetchResultResponse {
-    proto::FetchResultResponse {
-        status: status as i32,
-        message,
-        packet_seq,
-        eos,
-        result_arrow_ipc,
+        // The semantics live with the result plane, beside the buffer they
+        // read. Two implementations of one RPC drift, and the one that drifts
+        // is always the one nobody is looking at.
+        crate::rpc::data_plane::fetch_task_result(&self.registry, request)
     }
 }
 
