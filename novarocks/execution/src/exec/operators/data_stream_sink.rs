@@ -1086,6 +1086,7 @@ impl DataStreamSinkFactory {
     /// The barrier's behavior is covered at the operator level; this exists so
     /// materialization can be shown to have supplied the gates at all, which
     /// is the failure it actually had.
+    #[cfg(test)]
     pub(crate) const fn is_edge_gated(&self) -> bool {
         self.edge_gates.is_some()
     }

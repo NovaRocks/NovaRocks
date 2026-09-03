@@ -317,8 +317,12 @@ const UNROUTED_DETAIL: &str = "the native task protocol has no execution binding
 /// establish or a create is answered with a typed refusal, while every
 /// decision the owner makes on its own — termination, observation, retention —
 /// keeps working. Binding this to real execution is a separate step.
+/// A host that installs nothing, for the one test that drives the deadline
+/// tick without binding a fragment.
+#[cfg(test)]
 struct UnroutedQueryContextHost;
 
+#[cfg(test)]
 impl QueryContextHost for UnroutedQueryContextHost {
     fn materialize(&self, _request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
         Err(HostRejection::new(
@@ -342,8 +346,10 @@ impl QueryContextHost for UnroutedQueryContextHost {
 }
 
 /// The task half of the same missing binding.
+#[cfg(test)]
 struct UnroutedTaskExecutionHost;
 
+#[cfg(test)]
 impl TaskExecutionHost for UnroutedTaskExecutionHost {
     fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
         Err(HostRejection::new(
@@ -706,7 +712,7 @@ fn compose_backend_application_services(
     let native_fragment_service = Arc::new(
         NativeFragmentService::new_with_controls(
             grpc_exchange_transmitter(data_runtime.clone()),
-            grpc_fragment_lookup_client(data_runtime),
+            grpc_fragment_lookup_client(data_runtime.clone()),
             native_result_writer(),
             Arc::clone(&controls),
             Arc::clone(&query_lifecycle_registry),
@@ -727,11 +733,43 @@ fn compose_backend_application_services(
             fragments: Arc::clone(&native_fragment_service),
         });
     // One task protocol owner per process, on this process's own identity and
-    // its monotonic clock. It is reachable over the wire and routes nothing.
+    // its monotonic clock, routed to the real execution owners.
+    //
+    // The runtime-filter participant factory is built here rather than shared
+    // with the lifecycle registry because it holds nothing but the data
+    // runtime: the participants it makes are per-query and belong to whoever
+    // installed them, so a second factory instance creates no second
+    // authority.
+    let context_host = Arc::new(crate::task_execution::NativeQueryContextHost::new(
+        Arc::clone(&catalog_manager),
+        Arc::clone(&execution_role_binding_factories),
+        Arc::new(
+            crate::runtime_filter::participant::BackendRuntimeFilterParticipantFactory::new(
+                data_runtime.clone(),
+            ),
+        ),
+        data_runtime.clone(),
+    ));
+    let inbound_capabilities = crate::task_execution::TaskInboundCapabilities::new();
+    let execution_host = Arc::new(crate::task_execution::NativeTaskExecutionHost::new(
+        crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global(),
+        Arc::clone(&context_host) as Arc<dyn crate::task_execution::TaskQueryContextFacts>,
+        Arc::clone(&inbound_capabilities),
+        grpc_exchange_transmitter(data_runtime.clone()),
+        grpc_fragment_lookup_client(data_runtime.clone()),
+        native_result_writer(),
+        Arc::clone(&exchange_receiver_port),
+        Arc::new(
+            crate::runtime::sink_commit::ConfiguredBackendSinkCommitPort::new(
+                write_commit_evidence_limits,
+            ),
+        ),
+        Arc::clone(&execution_runtime),
+    ));
     let task_execution_registry = TaskExecutionRegistry::with_process_clock(
         TaskExecutionRegistryConfig::for_process(query_lifecycle_ingress.backend_process_id()),
-        Arc::new(UnroutedQueryContextHost),
-        Arc::new(UnroutedTaskExecutionHost),
+        context_host,
+        execution_host,
     );
     let task_execution_ingress: Arc<dyn TaskExecutionIngress> =
         RegistryTaskExecutionIngress::new(Arc::clone(&task_execution_registry));

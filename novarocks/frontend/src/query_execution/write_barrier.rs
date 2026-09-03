@@ -139,6 +139,15 @@ impl WriteCommitBarrier {
     /// over a `true` derived from a weaker rule: the reason a write may not
     /// commit has to survive the trip to this gate, or the gate can only say
     /// "no" without saying what to look at.
+    // The tests exercise it; production gains its caller when the coordinator
+    // cuts over. `expect` rather than `allow` so this fails once that lands.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the coordinator calls this when it cuts over to the task substrate"
+        )
+    )]
     pub(crate) const fn observe_task_execution(&mut self, verdict: WriteVerdict) {
         self.execution = match self.execution {
             ExecutionEvidence::None | ExecutionEvidence::TaskVerdict(_) => {

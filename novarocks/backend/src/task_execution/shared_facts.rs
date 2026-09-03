@@ -136,24 +136,6 @@ pub fn fragment_plan(plan: &dyn PhysicalFragmentPlan) -> Result<&WireFragmentPla
         .ok_or_else(|| internal("task descriptor plan is not a codec-produced fragment plan"))
 }
 
-/// The version a projection will report, without building it.
-///
-/// A caller that has to decide an outcome before encoding needs this; encoding
-/// twice to find out would be the only alternative.
-pub const fn dynamic_filter_read_version(
-    read: Option<&TaskDynamicFilterRead>,
-) -> Option<DomainVersion> {
-    match read {
-        Some(read) => Some(read.version()),
-        None => None,
-    }
-}
-
-/// A payload this process stored and cannot read back.
-///
-/// Every one of these is an invariant violation inside this binary rather than
-/// something a peer can cause: the codec produced the handle, so failing to
-/// recognise it means two owners disagree about which domain they are holding.
 fn internal(detail: &str) -> HostRejection {
     HostRejection::new(TaskFailureCategory::Internal, detail)
 }

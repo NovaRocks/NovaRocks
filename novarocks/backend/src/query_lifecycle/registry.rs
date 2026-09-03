@@ -1500,22 +1500,6 @@ impl QueryLifecycleRegistry {
         )
     }
 
-    pub(crate) fn new_with_runtime(
-        runtime: BackendDataRuntime,
-        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
-        config: QueryLifecycleRegistryConfig,
-        native_compatibility_id: NativeCompatibilityId,
-    ) -> Arc<Self> {
-        Self::new_with_runtime_and_execution_role_binding_factories(
-            runtime,
-            local_runtime,
-            config,
-            native_compatibility_id,
-            empty_execution_role_binding_factories(),
-            default_catalog_manager(),
-        )
-    }
-
     pub(crate) fn new_with_runtime_and_execution_role_binding_factories(
         runtime: BackendDataRuntime,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,

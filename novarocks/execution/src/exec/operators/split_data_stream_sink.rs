@@ -117,6 +117,7 @@ impl SplitDataStreamSinkFactory {
     /// set governs all of them; forwarding here keeps the send path's
     /// permission check in exactly one place.
     /// Whether every branch is bound by a gate set.
+    #[cfg(test)]
     pub(crate) fn is_edge_gated(&self) -> bool {
         !self.sinks.is_empty() && self.sinks.iter().all(|spec| spec.factory.is_edge_gated())
     }
