@@ -1830,6 +1830,181 @@ impl crate::task_execution::round::StatusSubscriptions for RecordingSubscription
     }
 }
 
+/// The defect this catches: a create acknowledgement adopted the receipt's
+/// snapshot outright instead of classifying it. The create response and the
+/// status stream are independent transports, so the stream can deliver
+/// version 2 (RUNNING) before the create response is settled -- and adopting
+/// the receipt's version 1 (PLANNED) then regressed a running task, which
+/// fails the whole attempt with an illegal transition. Observed in a real
+/// 1FE+3BE run as "task state RUNNING may not become PLANNED".
+#[test]
+fn a_create_receipt_snapshot_older_than_the_observed_one_is_ignored_not_adopted() {
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let creates = harness
+        .establish_all(Duration::from_secs(30))
+        .into_iter()
+        .filter(|intent| matches!(intent.kind(), OperationKind::CreateTask))
+        .collect::<Vec<_>>();
+    assert!(!creates.is_empty(), "the attempt owes creates");
+    let OperationIntent::CreateTask(request) = &creates[0] else {
+        unreachable!("a create intent carries its request");
+    };
+    let task_id = request.identity().task_id();
+
+    // The backend already started this task and published RUNNING while its
+    // create response was still in flight.
+    harness.publish_with_filters(task_id, TaskState::Running, None, false, None);
+    let observed = harness
+        .execution
+        .task(task_id)
+        .expect("the task is owned")
+        .status()
+        .expect("a published status")
+        .clone();
+    assert_eq!(observed.state(), TaskState::Running);
+    assert_eq!(observed.version(), TaskStatusVersion::new(2).expect("v2"));
+
+    // Settling the create must not regress that.
+    harness
+        .create_ack(&creates[0], OperationOutcome::Accepted)
+        .expect("a create receipt carrying a stale snapshot still settles");
+    let held = harness
+        .execution
+        .task(task_id)
+        .expect("the task is owned")
+        .status()
+        .expect("a published status");
+    assert_eq!(held.state(), TaskState::Running);
+    assert_eq!(held.version(), TaskStatusVersion::new(2).expect("v2"));
+    assert_eq!(
+        harness
+            .execution
+            .task(task_id)
+            .expect("the task is owned")
+            .state(),
+        RemoteTaskState::Created,
+        "the create is still acknowledged"
+    );
+}
+
+/// Builds the acknowledgement a released establish settles with.
+///
+/// A fresh attempt's establish creates its context, so its lease sequence is
+/// the initial one and nothing has to be read back out of the execution.
+fn establish_ack(intent: &OperationIntent) -> OperationAcknowledgement {
+    let OperationIntent::UpdateQueryContext(request) = intent else {
+        unreachable!("an update-context intent carries its request");
+    };
+    assert!(
+        request.may_create(),
+        "a fresh attempt's establish creates its context"
+    );
+    let receipt = QueryContextReceipt::new(request.context(), QueryContextState::Active)
+        .with_lease(LeaseReceipt::new(
+            LeaseSequence::INITIAL,
+            LeaseValidFor::new(Duration::from_secs(30)).expect("a legal request"),
+            Duration::from_secs(30),
+        ));
+    OperationAcknowledgement::new(
+        intent.operation_id(),
+        OperationKind::UpdateQueryContext,
+        OperationOutcome::Accepted,
+        AckPayload::Context(receipt),
+    )
+}
+
+/// Every establish intent one sink recorded.
+fn released_establishes(sink: &RecordingSink) -> Vec<OperationIntent> {
+    sink.take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .filter(|intent| matches!(intent.kind(), OperationKind::UpdateQueryContext))
+        .collect()
+}
+
+/// The defect this catches: the runner subscribed to task status for every
+/// context on the same turn that merely *released* the establish, so the
+/// subscription and the establish raced to the backend as two independent
+/// RPCs. A subscription that won named a query context the backend did not
+/// hold yet, the backend answered FailedPrecondition, and the frontend
+/// classifies that as fatal -- so that context was never observed again for
+/// the life of the attempt. Losing the root's context hangs the query to its
+/// deadline; losing any other burns the whole drain budget.
+#[test]
+fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let contexts = graph.contexts().count();
+    assert!(contexts > 1, "this test needs more than one context");
+    let harness = Harness::from_graph(graph);
+    let sink = Arc::clone(&harness.sink);
+    let wake = Arc::clone(&harness.wake);
+    let subscriptions = Arc::new(RecordingSubscriptions::default());
+    let intake = TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>);
+    let acks = intake.handle();
+
+    let mut round = TaskRound::new(
+        harness.execution,
+        intake,
+        Box::new(FakeEstablish),
+        Arc::clone(&subscriptions) as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+    round.seal_pumps();
+
+    let first = round.turn().expect("a turn on a fresh attempt");
+    assert!(
+        first.operations > 0,
+        "the first turn owes an establish to every context"
+    );
+    assert!(
+        subscriptions.ensured.lock().expect("ledger").is_empty(),
+        "a released establish is not an acknowledged one, so no context may be subscribed yet"
+    );
+
+    // Answer exactly one establish. Only that context becomes subscribable;
+    // the other is still a context its backend does not hold.
+    let establishes = released_establishes(&sink);
+    assert_eq!(establishes.len(), contexts);
+    let OperationIntent::UpdateQueryContext(first_request) = &establishes[0] else {
+        unreachable!("an establish carries its request");
+    };
+    let established_context = first_request.context();
+    acks.publish(establish_ack(&establishes[0]));
+
+    round.turn().expect("a turn that settles one establish");
+    assert_eq!(
+        subscriptions
+            .ensured
+            .lock()
+            .expect("ledger")
+            .iter()
+            .map(|(context, _)| *context)
+            .collect::<Vec<_>>(),
+        vec![established_context],
+        "exactly the acknowledged context is subscribed"
+    );
+
+    // Answer the rest, and every context becomes subscribable.
+    for intent in &establishes[1..] {
+        acks.publish(establish_ack(intent));
+    }
+    round.turn().expect("a turn that settles the rest");
+    let ensured = subscriptions.ensured.lock().expect("ledger").clone();
+    assert_eq!(
+        ensured.len(),
+        1 + contexts,
+        "the acknowledged context keeps being ensured and the rest join it"
+    );
+    let mut subscribed: Vec<_> = ensured.iter().map(|(context, _)| *context).collect();
+    subscribed.sort_unstable();
+    subscribed.dedup();
+    assert_eq!(subscribed.len(), contexts);
+}
+
 #[test]
 fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
     use crate::native::task_transport::TaskAckIntake;
@@ -1838,18 +2013,22 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
     // The runner owns no policy: a turn moves the state machine and reports
     // what moved. What it does own is the order -- acknowledgements settle
     // before the pump, so a permit freed this turn is usable this turn rather
-    // than a turn later -- and starting exactly one subscription per context.
+    // than a turn later -- and starting exactly one subscription per
+    // established context.
     let processes = backends(2);
     let schedule = chain_schedule(&[0, 1], &[0]);
     let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
     let contexts = graph.contexts().count();
     let harness = Harness::from_graph(graph);
+    let sink = Arc::clone(&harness.sink);
     let wake = Arc::clone(&harness.wake);
     let subscriptions = Arc::new(RecordingSubscriptions::default());
+    let intake = TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>);
+    let acks = intake.handle();
 
     let mut round = TaskRound::new(
         harness.execution,
-        TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>),
+        intake,
         Box::new(FakeEstablish),
         Arc::clone(&subscriptions) as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
     );
@@ -1866,10 +2045,15 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
     );
     assert!(!first.is_idle());
 
+    for intent in released_establishes(&sink) {
+        acks.publish(establish_ack(&intent));
+    }
+    let settled = round.turn().expect("a turn that settles every establish");
+    assert_eq!(settled.acknowledgements, contexts);
     let ensured = subscriptions.ensured.lock().expect("ledger").len();
     assert_eq!(
         ensured, contexts,
-        "every context needs its one subscription"
+        "every established context needs its one subscription"
     );
 
     // `ensure` is idempotent, so a second turn does not start a second

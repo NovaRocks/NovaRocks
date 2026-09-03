@@ -410,7 +410,16 @@ impl RemoteTask {
             }
             // The acknowledgement carries the task's own first snapshot, which
             // closes the window between creating a task and observing it.
-            self.adopt_status(receipt.current_status())?;
+            //
+            // It is classified exactly like a subscribed snapshot rather than
+            // adopted outright. The create response and the status stream are
+            // two independent transports, so the stream can already have
+            // delivered a newer version by the time this response is settled;
+            // adopting version 1 over a held version 2 regressed a running
+            // task back to PLANNED and failed the attempt on an illegal
+            // transition. One classification owns whether a snapshot is
+            // adoptable, whichever channel carried it.
+            self.observe_status(receipt.current_status())?;
             return Ok(CreateSettlement::Created);
         }
         match ack.outcome().frontend_action() {

@@ -9,9 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use novarocks_types::UniqueId;
 
 use super::data_plane_handlers;
+use super::data_plane_handlers::{ExchangeRouteAuthority, ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::query_lifecycle::QueryLifecycleIngress;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
-use crate::task_execution::{RootResultRoute, StatusAdvance, TaskExecutionRegistry};
+use crate::task_execution::{
+    RootResultRoute, StatusAdvance, TaskExecutionRegistry, TaskInboundCapabilities,
+};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
@@ -22,10 +25,45 @@ use std::sync::Arc;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+/// The fragment-based query lifecycle as an exchange-route authority.
+///
+/// It holds the destinations of every query admitted through `InitQuery`,
+/// which is what `EXPLAIN ANALYZE` still runs on.
+struct LifecycleRouteAuthority(Arc<dyn QueryLifecycleIngress>);
+
+impl ExchangeRouteAuthority for LifecycleRouteAuthority {
+    fn authority_name(&self) -> &'static str {
+        "the fragment query lifecycle"
+    }
+
+    fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
+        self.0.claim_exchange_route(query)
+    }
+}
+
+/// The task substrate as an exchange-route authority.
+///
+/// It holds the destinations of every created task, and its frozen descriptor
+/// is the only place a task's inbound topology exists. Without this authority
+/// wired, no query on the task protocol can receive an exchange frame at all.
+struct TaskRouteAuthority(Arc<TaskInboundCapabilities>);
+
+impl ExchangeRouteAuthority for TaskRouteAuthority {
+    fn authority_name(&self) -> &'static str {
+        "the task substrate"
+    }
+
+    fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
+        self.0.claim_frame(query)
+    }
+}
+
 #[derive(Clone)]
 pub struct BackendDataPlane {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-    query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
+    /// Every owner of exchange destinations on this backend. One frame is
+    /// admitted only when exactly one of them claims its destination.
+    exchange_route_authorities: Vec<Arc<dyn ExchangeRouteAuthority>>,
 }
 
 impl std::fmt::Debug for BackendDataPlane {
@@ -46,17 +84,26 @@ impl BackendDataPlane {
     pub fn query_scoped() -> Self {
         Self {
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
-            query_lifecycle_ingress: None,
+            exchange_route_authorities: Vec::new(),
         }
     }
 
+    /// Composes the data plane with both exchange-destination owners.
+    ///
+    /// Both are wired unconditionally. They are not a fallback chain: each
+    /// answers only for the destinations it holds, and a frame is admitted
+    /// only when exactly one of them claims its destination.
     pub fn with_exchange_receiver_port(
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
+        task_inbound_capabilities: Arc<TaskInboundCapabilities>,
     ) -> Self {
         Self {
             exchange_receiver_port,
-            query_lifecycle_ingress: Some(query_lifecycle_ingress),
+            exchange_route_authorities: vec![
+                Arc::new(LifecycleRouteAuthority(query_lifecycle_ingress)),
+                Arc::new(TaskRouteAuthority(task_inbound_capabilities)),
+            ],
         }
     }
 
@@ -64,9 +111,14 @@ impl BackendDataPlane {
         &self,
         request: proto::novarocks::ExchangeRequest,
     ) -> proto::novarocks::ExchangeResponse {
+        let authorities: Vec<&dyn ExchangeRouteAuthority> = self
+            .exchange_route_authorities
+            .iter()
+            .map(Arc::as_ref)
+            .collect();
         data_plane_handlers::handle_transmit_chunk(
             self.exchange_receiver_port.as_ref(),
-            self.query_lifecycle_ingress.as_deref(),
+            &authorities,
             request,
         )
     }

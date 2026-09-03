@@ -61,6 +61,7 @@ use crate::metrics::{
     publish_backend_query_lifecycle_terminal_limits,
 };
 use crate::rpc::client::BackendRpcClient;
+use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::runtime::profile_codec::encode_runtime_profile_tree;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
 use crate::runtime_filter::domain::{
@@ -1777,48 +1778,76 @@ impl QueryLifecycleRegistry {
     /// Admission-derived authorization for the native exchange data plane.
     /// Routes exist only while the owning lifecycle entry can still execute;
     /// tombstone/terminal retention therefore automatically revokes frames.
-    pub(crate) fn authorize_exchange(
-        &self,
-        destination_fragment_instance_id: UniqueId,
-        destination_node_id: i32,
-        source_fragment_instance_id: UniqueId,
-        sender_ordinal: u32,
-        sender_count: u32,
-    ) -> Result<(), String> {
-        if sender_count == 0 || sender_ordinal >= sender_count {
-            return Err("exchange sender ordinal/count is invalid".to_string());
-        }
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| "query lifecycle registry lock is poisoned".to_string())?;
+    ///
+    /// This owner holds a destination exactly while one of its active entries
+    /// lists that fragment instance among the instances it admitted. That is
+    /// what separates "this destination is not mine" from "this route is
+    /// illegal": the task substrate owns the destinations of every query that
+    /// runs on the task protocol, and a lifecycle refusal for one of those
+    /// would be this owner deciding another owner's frame.
+    pub(crate) fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            // A poisoned owner lock cannot prove ownership either way, and
+            // claiming the destination in order to refuse it would hide a
+            // legal frame the other owner holds.
+            Err(_) => {
+                return ExchangeRouteClaim::NotHeld;
+            }
+        };
+        let mut held_by_active_entry = false;
+        let mut authorized = false;
         for entry in state.entries.values() {
-            let phase = entry
-                .state
-                .lock()
-                .map_err(|_| "query lifecycle entry lock is poisoned".to_string())?
-                .phase;
+            let Ok(entry_state) = entry.state.lock() else {
+                continue;
+            };
+            let phase = entry_state.phase;
+            drop(entry_state);
             if !matches!(
                 phase,
                 QueryLifecyclePhase::Staged | QueryLifecyclePhase::Running
             ) {
                 continue;
             }
+            if !entry
+                .manifest
+                .expected_fragment_instance_ids()
+                .into_iter()
+                .any(|instance| {
+                    UniqueId::new(instance.hi, instance.lo)
+                        == query.destination_fragment_instance_id
+                })
+            {
+                continue;
+            }
+            held_by_active_entry = true;
             for route in validated(entry.manifest.exchange_routes()) {
                 let source = validated(route.source_fragment_instance_id());
                 let destination = validated(route.destination_fragment_instance_id());
-                if UniqueId::new(source.hi, source.lo) == source_fragment_instance_id
+                if UniqueId::new(source.hi, source.lo) == query.source_fragment_instance_id
                     && UniqueId::new(destination.hi, destination.lo)
-                        == destination_fragment_instance_id
-                    && route.destination_node_id() == destination_node_id
-                    && route.sender_ordinal() == sender_ordinal
-                    && route.sender_count() == sender_count
+                        == query.destination_fragment_instance_id
+                    && route.destination_node_id() == query.destination_node_id
+                    && route.sender_ordinal() == query.sender_ordinal
+                    && route.sender_count() == query.sender_count
                 {
-                    return Ok(());
+                    authorized = true;
+                    break;
                 }
             }
+            if authorized {
+                break;
+            }
         }
-        Err("exchange route is absent from every active participant manifest".to_string())
+        match (held_by_active_entry, authorized) {
+            (_, true) => ExchangeRouteClaim::Authorized,
+            (true, false) => ExchangeRouteClaim::Refused(
+                "the route is absent from the active participant manifest that admitted this \
+                 destination"
+                    .to_string(),
+            ),
+            (false, false) => ExchangeRouteClaim::NotHeld,
+        }
     }
 
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
@@ -5592,22 +5621,8 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
         outcome
     }
 
-    fn authorize_exchange(
-        &self,
-        destination_fragment_instance_id: UniqueId,
-        destination_node_id: i32,
-        source_fragment_instance_id: UniqueId,
-        sender_ordinal: u32,
-        sender_count: u32,
-    ) -> Result<(), String> {
-        QueryLifecycleRegistry::authorize_exchange(
-            self,
-            destination_fragment_instance_id,
-            destination_node_id,
-            source_fragment_instance_id,
-            sender_ordinal,
-            sender_count,
-        )
+    fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
+        QueryLifecycleRegistry::claim_exchange_route(self, query)
     }
 
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {

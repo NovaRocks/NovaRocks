@@ -88,6 +88,7 @@ use crate::fragment::decode::plan::context::{
 };
 use crate::fragment::decode::request::NativeFragmentRequest;
 use crate::fragment::ingress::{ReceivedReadSplit, TypedReadAttemptContext};
+use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 
 use super::host::{HostRejection, RunnableTask, TaskExecutionHost};
@@ -243,6 +244,41 @@ impl TaskInboundCapabilities {
             destination: descriptor.identity(),
             source,
         })
+    }
+
+    /// Whether this owner holds the frame's destination, and if so whether
+    /// the frame's route is legal.
+    ///
+    /// The data plane composes this with the fragment-based lifecycle owner,
+    /// which is why an unheld kernel key must be answerable as non-ownership
+    /// rather than as a refusal: a refusal here would decide a frame that
+    /// belongs to a query the other owner admitted. The uniform wire text for
+    /// a destination nobody holds is the caller's, so this distinction still
+    /// does not let a sender tell "not created yet" from "not yours".
+    pub fn claim_frame(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
+        let node_id = FragmentNodeId::new(query.destination_node_id);
+        let descriptor = {
+            let installed = self.installed.lock().expect(CAPABILITY_LOCK);
+            installed
+                .get(&query.destination_fragment_instance_id)
+                .map(Arc::clone)
+        };
+        let Some(descriptor) = descriptor else {
+            return ExchangeRouteClaim::NotHeld;
+        };
+        match descriptor.authorize_inbound_frame(
+            query.destination_fragment_instance_id,
+            node_id,
+            query.source_fragment_instance_id,
+            query.sender_ordinal,
+            query.sender_count,
+        ) {
+            Ok(_) => ExchangeRouteClaim::Authorized,
+            Err(rejection) => ExchangeRouteClaim::Refused(format!(
+                "task {} froze this destination but {rejection}",
+                descriptor.identity()
+            )),
+        }
     }
 
     /// How many tasks currently accept inbound frames.
@@ -1240,9 +1276,10 @@ fn resource_exhausted(detail: impl AsRef<str>) -> HostRejection {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompositeFragmentEventSink, FragmentStandDown, InboundFrameAdmission, NativeRunnableTask,
-        NativeTaskExecutionHost, StandDown, TaskInboundCapabilities, TaskOperatorStatisticsSink,
-        TaskQueryContextFacts, report_terminal,
+        CompositeFragmentEventSink, ExchangeRouteClaim, ExchangeRouteQuery, FragmentStandDown,
+        InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, StandDown,
+        TaskInboundCapabilities, TaskOperatorStatisticsSink, TaskQueryContextFacts,
+        report_terminal,
     };
 
     use std::num::{NonZeroU32, NonZeroUsize};
@@ -1692,6 +1729,232 @@ mod tests {
                 expected: 1,
                 received: 2,
             })
+        );
+    }
+
+    /// The defect this catches: the exchange data plane asked only the
+    /// fragment-based lifecycle registry, which has no entry and no
+    /// participant manifest for a query that runs on the task protocol. Every
+    /// cross-backend frame of every such query was refused as "absent from
+    /// every active participant manifest", so every distributed query with an
+    /// exchange failed. This is the authority the data plane needs instead:
+    /// the task substrate answers from the frozen descriptor, distinguishing
+    /// a destination it does not hold from a route it holds and refuses.
+    #[test]
+    fn the_task_substrate_claims_its_own_destinations_and_refuses_each_mismatch_by_reason() {
+        let consumer = identity(14, 1, 1);
+        let producer = identity(14, 2, 1);
+        let producer_key = UniqueId::new(81, 82);
+        let node = FragmentNodeId::new(11);
+        let kernel_key = UniqueId::new(91, 92);
+        let descriptor = descriptor_with(
+            consumer,
+            kernel_key,
+            1,
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+            wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
+        );
+        let capabilities = TaskInboundCapabilities::new();
+
+        let query = |destination: UniqueId,
+                     destination_node_id: i32,
+                     source: UniqueId,
+                     sender_ordinal: u32,
+                     sender_count: u32| {
+            ExchangeRouteQuery {
+                destination_fragment_instance_id: destination,
+                destination_node_id,
+                source_fragment_instance_id: source,
+                sender_ordinal,
+                sender_count,
+            }
+        };
+
+        // With nothing installed this owner holds no destination. It must not
+        // refuse, because the fragment lifecycle may hold the same frame.
+        assert_eq!(
+            capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 1)),
+            ExchangeRouteClaim::NotHeld
+        );
+
+        capabilities
+            .install(Arc::new(descriptor.clone()))
+            .expect("first claim on this kernel key");
+
+        // The frozen topology authorizes exactly the route the frontend froze.
+        assert_eq!(
+            capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 1)),
+            ExchangeRouteClaim::Authorized
+        );
+
+        // A destination this process never created stays a disclaimer, not a
+        // refusal: another owner may hold it.
+        assert_eq!(
+            capabilities.claim_frame(query(UniqueId::new(1, 1), node.get(), producer_key, 0, 1)),
+            ExchangeRouteClaim::NotHeld
+        );
+
+        // Every remaining mismatch is a refusal by this owner, each carrying
+        // its own reason so an operator is not told the wrong thing.
+        for (case, claim) in [
+            (
+                "unknown node",
+                capabilities.claim_frame(query(kernel_key, 12, producer_key, 0, 1)),
+            ),
+            (
+                "unknown source key",
+                capabilities.claim_frame(query(
+                    kernel_key,
+                    node.get(),
+                    UniqueId::new(99, 99),
+                    0,
+                    1,
+                )),
+            ),
+            (
+                "wrong sender count",
+                capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 2)),
+            ),
+            (
+                "ordinal above the frozen count",
+                capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 3, 1)),
+            ),
+        ] {
+            let ExchangeRouteClaim::Refused(detail) = claim else {
+                panic!("{case} must be refused by the holding owner, got {claim:?}");
+            };
+            assert!(
+                detail.contains(&consumer.to_string()),
+                "{case} refusal must name the holding task: {detail}"
+            );
+        }
+
+        let unknown_node = capabilities.claim_frame(query(kernel_key, 12, producer_key, 0, 1));
+        let unknown_source =
+            capabilities.claim_frame(query(kernel_key, node.get(), UniqueId::new(99, 99), 0, 1));
+        let wrong_count =
+            capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 2));
+        assert_ne!(unknown_node, unknown_source);
+        assert_ne!(unknown_source, wrong_count);
+        assert_ne!(unknown_node, wrong_count);
+
+        // Retirement withdraws the claim rather than converting it into a
+        // refusal, so a frame arriving after teardown reads as unowned.
+        capabilities.remove(&descriptor);
+        assert_eq!(
+            capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 1)),
+            ExchangeRouteClaim::NotHeld
+        );
+    }
+
+    /// The same defect, asserted at the composition boundary the cluster
+    /// actually runs: the RPC data plane must reach the task substrate. Before
+    /// this wiring existed the plane held only the fragment lifecycle owner,
+    /// so a created task's destination was refused as absent from every
+    /// participant manifest and no distributed query with an exchange could
+    /// move a single frame.
+    #[test]
+    fn the_composed_data_plane_admits_a_frame_only_the_task_substrate_holds() {
+        use crate::query_lifecycle::{
+            QueryControlAttachment, QueryLifecycleError, QueryLifecycleIngress,
+        };
+        use crate::rpc::data_plane::BackendDataPlane;
+        use novarocks_proto_codec::lifecycle::{
+            QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest,
+            QueryTerminationAck,
+        };
+        use novarocks_types::BackendProcessId;
+
+        /// A lifecycle owner with no admitted query at all, which is exactly
+        /// its state while a query runs on the task protocol.
+        struct EmptyLifecycleIngress;
+
+        impl QueryLifecycleIngress for EmptyLifecycleIngress {
+            fn backend_process_id(&self) -> BackendProcessId {
+                BackendProcessId::new_v7()
+            }
+
+            fn init_query(&self, _request: QueryInitRequest) -> QueryInitAck {
+                unreachable!("this test initializes no query")
+            }
+
+            fn abort_query(
+                &self,
+                _request: QueryAbortRequest,
+            ) -> Result<QueryTerminationAck, QueryLifecycleError> {
+                unreachable!("this test aborts no query")
+            }
+
+            fn attach_control(
+                &self,
+                _attach: QueryControlAttach,
+            ) -> Result<QueryControlAttachment, QueryLifecycleError> {
+                unreachable!("this test attaches no query control")
+            }
+        }
+
+        let consumer = identity(15, 1, 1);
+        let producer = identity(15, 2, 1);
+        let producer_key = UniqueId::new(101, 102);
+        let node = FragmentNodeId::new(11);
+        let kernel_key = UniqueId::new(111, 112);
+        let capabilities = TaskInboundCapabilities::new();
+        capabilities
+            .install(Arc::new(descriptor_with(
+                consumer,
+                kernel_key,
+                1,
+                inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+                wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
+            )))
+            .expect("a legal install");
+
+        let plane = BackendDataPlane::with_exchange_receiver_port(
+            Arc::new(UnavailableExchangeReceiverPort),
+            Arc::new(EmptyLifecycleIngress),
+            Arc::clone(&capabilities),
+        );
+        let request = |destination: UniqueId, source: UniqueId| proto::ExchangeRequest {
+            finst_id_hi: destination.high(),
+            finst_id_lo: destination.low(),
+            node_id: node.get(),
+            source_finst_id_hi: source.high(),
+            source_finst_id_lo: source.low(),
+            sender_ordinal: 0,
+            sender_count: 1,
+            sender_id: 7,
+            be_number: 0,
+            eos: false,
+            sequence: 1,
+            payload: vec![0x01],
+        };
+
+        // The receiver port is deliberately unavailable, so reaching delivery
+        // is the proof the route was authorized.
+        let status = plane
+            .exchange(request(kernel_key, producer_key))
+            .status
+            .expect("status");
+        assert_eq!(status.code, 1);
+        assert!(
+            status.message.contains("exchange ingress failed"),
+            "the composed plane must admit a task-held route: {}",
+            status.message
+        );
+
+        // A destination neither owner holds is still refused, and the refusal
+        // names no owner.
+        let status = plane
+            .exchange(request(UniqueId::new(1, 1), producer_key))
+            .status
+            .expect("status");
+        assert_eq!(status.code, 1);
+        assert!(
+            status
+                .message
+                .contains("no active exchange owner on this backend holds this destination"),
+            "unexpected refusal: {}",
+            status.message
         );
     }
 

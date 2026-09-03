@@ -53,6 +53,7 @@ use super::{
     CatalogPruneOutcome, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
     QueryLifecycleIngress, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
+use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::rpc::runtime::test_backend_data_runtime;
 use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::observation::RuntimeFilterObservationSnapshot;
@@ -62,6 +63,22 @@ use crate::runtime_filter::participant::{
 use novarocks_failpoint::QueryLifecycleFaultKind;
 
 const ATTEMPT_1: u64 = 1;
+
+fn route_query(
+    destination_fragment_instance_id: UniqueId,
+    destination_node_id: i32,
+    source_fragment_instance_id: UniqueId,
+    sender_ordinal: u32,
+    sender_count: u32,
+) -> ExchangeRouteQuery {
+    ExchangeRouteQuery {
+        destination_fragment_instance_id,
+        destination_node_id,
+        source_fragment_instance_id,
+        sender_ordinal,
+        sender_count,
+    }
+}
 
 fn local_process_id() -> BackendProcessId {
     BackendProcessId::try_from_bytes([
@@ -1518,10 +1535,11 @@ fn exchange_route_becomes_authorized_only_after_stage_and_revokes_on_abort() {
             .expect("init acknowledgement"),
         QueryInitOutcome::QueryInitApplied
     );
-    assert!(
-        registry
-            .authorize_exchange(destination, 77, source, 0, 1)
-            .is_err()
+    // Before Stage this owner has no active entry, so it holds no
+    // destination at all rather than refusing a route it cannot decide.
+    assert_eq!(
+        registry.claim_exchange_route(route_query(destination, 77, source, 0, 1)),
+        ExchangeRouteClaim::NotHeld
     );
 
     let _control = attach_control(&registry, &request);
@@ -1530,9 +1548,16 @@ fn exchange_route_becomes_authorized_only_after_stage_and_revokes_on_abort() {
         registry.stage_fragments(stage).outcome(),
         QueryStageOutcome::Applied
     );
-    registry
-        .authorize_exchange(destination, 77, source, 0, 1)
-        .expect("staged route is authorized");
+    assert_eq!(
+        registry.claim_exchange_route(route_query(destination, 77, source, 0, 1)),
+        ExchangeRouteClaim::Authorized
+    );
+    // The destination is now held, so a route the manifest does not carry is
+    // this owner's refusal rather than a disclaimer.
+    assert!(matches!(
+        registry.claim_exchange_route(route_query(destination, 78, source, 0, 1)),
+        ExchangeRouteClaim::Refused(_)
+    ));
 
     registry
         .abort_query(QueryAbortRequest::new(
@@ -1545,10 +1570,9 @@ fn exchange_route_becomes_authorized_only_after_stage_and_revokes_on_abort() {
             "test abort",
         ))
         .expect("abort accepted");
-    assert!(
-        registry
-            .authorize_exchange(destination, 77, source, 0, 1)
-            .is_err()
+    assert_eq!(
+        registry.claim_exchange_route(route_query(destination, 77, source, 0, 1)),
+        ExchangeRouteClaim::NotHeld
     );
 }
 

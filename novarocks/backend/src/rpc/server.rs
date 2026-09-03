@@ -30,6 +30,7 @@ use std::thread::JoinHandle;
 
 use crate::rpc::data_plane::BackendDataPlane;
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
+use crate::task_execution::TaskInboundCapabilities;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -89,6 +90,7 @@ impl BackendRpcService {
         task_execution_ingress: Arc<dyn TaskExecutionIngress>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+        task_inbound_capabilities: Arc<TaskInboundCapabilities>,
         process_descriptor: BackendProcessDescriptor,
     ) -> Self {
         Self {
@@ -98,6 +100,7 @@ impl BackendRpcService {
             data_plane: BackendDataPlane::with_exchange_receiver_port(
                 exchange_receiver_port,
                 Arc::clone(&query_lifecycle_ingress),
+                task_inbound_capabilities,
             ),
             runtime_filter_ingress,
             process_descriptor,

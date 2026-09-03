@@ -310,6 +310,11 @@ struct BackendApplicationServices {
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     task_execution_registry: Arc<TaskExecutionRegistry>,
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
+    /// The task substrate's exchange-destination authority. The RPC data
+    /// plane needs it directly: without it no created task can receive an
+    /// exchange frame, because the frozen descriptor is the only place a
+    /// task's inbound topology exists.
+    task_inbound_capabilities: Arc<crate::task_execution::TaskInboundCapabilities>,
 }
 
 /// What the two unrouted hosts below report.
@@ -513,21 +518,11 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
         self.registry.prune_catalogs(reachable)
     }
 
-    fn authorize_exchange(
+    fn claim_exchange_route(
         &self,
-        destination_fragment_instance_id: novarocks_types::UniqueId,
-        destination_node_id: i32,
-        source_fragment_instance_id: novarocks_types::UniqueId,
-        sender_ordinal: u32,
-        sender_count: u32,
-    ) -> Result<(), String> {
-        self.registry.authorize_exchange(
-            destination_fragment_instance_id,
-            destination_node_id,
-            source_fragment_instance_id,
-            sender_ordinal,
-            sender_count,
-        )
+        query: crate::rpc::data_plane_handlers::ExchangeRouteQuery,
+    ) -> crate::rpc::data_plane_handlers::ExchangeRouteClaim {
+        self.registry.claim_exchange_route(query)
     }
 
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
@@ -790,6 +785,7 @@ fn compose_backend_application_services(
         query_lifecycle_ingress,
         task_execution_registry,
         task_execution_ingress,
+        task_inbound_capabilities: inbound_capabilities,
     })
 }
 
@@ -980,6 +976,7 @@ impl BackendApplicationHost {
                 Arc::clone(&services.task_execution_ingress),
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
+                Arc::clone(&services.task_inbound_capabilities),
                 process_descriptor.clone(),
             ),
             native_trust,

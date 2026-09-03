@@ -1195,6 +1195,8 @@ impl OperatorFactory for DataStreamSinkFactory {
             max_transmit_batched_bytes: 1,
             finished: AtomicBool::new(false),
             finishing: AtomicBool::new(false),
+            finish_counted: AtomicBool::new(false),
+            finish_completed_set: AtomicBool::new(false),
             send_tracker: ExchangeSendTracker::new(),
             send_observable,
             error_state: None,
@@ -1251,6 +1253,19 @@ struct DataStreamSinkOperator {
     max_transmit_batched_bytes: usize,
     finished: AtomicBool,
     finishing: AtomicBool,
+    /// Whether this driver's own finish has already been counted against the
+    /// sink's driver set.
+    ///
+    /// `set_finishing` is retried by the driver for as long as
+    /// `finishing_is_pending` says this operator is still waiting -- which is
+    /// exactly what happens while the outbound edge has not been opened yet.
+    /// Counting on every retry would let one driver consume the whole set and
+    /// latch the sink's one-shot end-of-stream guard, after which no driver
+    /// could ever emit end-of-stream and the receiver would wait forever.
+    finish_counted: AtomicBool,
+    /// Whether this driver was the one that completed the set, remembered so
+    /// the retries after the edge opens still know who owes end-of-stream.
+    finish_completed_set: AtomicBool,
     send_tracker: Arc<ExchangeSendTracker>,
     send_observable: Arc<Observable>,
     error_state: Option<Arc<RuntimeErrorState>>,
@@ -2221,7 +2236,16 @@ impl ProcessorOperator for DataStreamSinkOperator {
         );
 
         self.flush_pending(true, true)?;
-        let is_last_driver = self.finish_state.driver_finished();
+        // One driver reports its own finish exactly once, however many times
+        // the driver retries this call while waiting for its edge to open.
+        let is_last_driver = if self.finish_counted.swap(true, Ordering::SeqCst) {
+            self.finish_completed_set.load(Ordering::SeqCst)
+        } else {
+            let completed_set = self.finish_state.driver_finished();
+            self.finish_completed_set
+                .store(completed_set, Ordering::SeqCst);
+            completed_set
+        };
         debug!(
             "DataStreamSink finishing progressed: finst={} driver_id={} dest_node_id={} sender_id={} last_driver={} (only last driver sends EOS)",
             format_uuid(
@@ -2417,6 +2441,8 @@ mod tests {
             max_transmit_batched_bytes: 1,
             finished: AtomicBool::new(false),
             finishing: AtomicBool::new(false),
+            finish_counted: AtomicBool::new(false),
+            finish_completed_set: AtomicBool::new(false),
             send_tracker: ExchangeSendTracker::new(),
             send_observable: Arc::new(Observable::new()),
             error_state: None,
@@ -2937,6 +2963,68 @@ mod tests {
         open_edges(&op, &[edge_id(1)]);
         op.send_eos().expect("the end-of-stream now goes out");
         assert!(!ProcessorOperator::finishing_is_pending(&op));
+    }
+
+    /// The defect this catches: `set_finishing` counted this driver against
+    /// the sink's driver set on every call, while `finishing_is_pending` had
+    /// the driver retry that same call for as long as the edge stayed closed.
+    /// One driver's retries therefore consumed the whole set and latched the
+    /// one-shot end-of-stream guard, so once the edge finally opened no driver
+    /// was the last one any more and end-of-stream was never sent. The
+    /// destination then counted senders forever: observed in a real 1FE+3BE
+    /// run as a distributed SELECT hanging until its statement deadline.
+    #[test]
+    fn retrying_set_finishing_while_an_edge_is_closed_does_not_consume_the_driver_set() {
+        let state = Arc::new(DataStreamSinkFinishState::default());
+        // Two drivers on one sink, both sharing the frozen finish state.
+        state.register_driver();
+        state.register_driver();
+        let runtime = RuntimeState::default();
+
+        let mut first = make_test_operator();
+        first.finish_state = Arc::clone(&state);
+        first.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        gate_destinations(&mut first, vec![make_test_destination()]);
+
+        let mut second = make_test_operator();
+        second.driver_id = 1;
+        second.finish_state = Arc::clone(&state);
+        second.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        gate_destinations(&mut second, vec![make_test_destination()]);
+
+        // The first driver drains while the edge is still closed and is
+        // retried, exactly as the pipeline driver retries a pending finish.
+        for _ in 0..8 {
+            ProcessorOperator::set_finishing(&mut first, &runtime)
+                .expect("a closed edge parks the drain rather than failing");
+            assert!(
+                ProcessorOperator::finishing_is_pending(&first),
+                "the driver is told to come back while the edge is closed"
+            );
+        }
+        assert_eq!(
+            state.remaining_drivers.load(Ordering::SeqCst),
+            1,
+            "eight retries by one driver must count once"
+        );
+
+        // The second driver finishes, which completes the set.
+        ProcessorOperator::set_finishing(&mut second, &runtime).expect("the second driver drains");
+        assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 0);
+
+        // The edge opens. The driver that completed the set still owes the
+        // end-of-stream, and its next retry sends it.
+        open_edges(&second, &[edge_id(1)]);
+        ProcessorOperator::set_finishing(&mut second, &runtime)
+            .expect("the end-of-stream now goes out");
+        assert!(
+            !ProcessorOperator::finishing_is_pending(&second),
+            "the sink no longer owes output once the end-of-stream is enqueued"
+        );
+        assert!(
+            !state.force_eos_sent.load(Ordering::SeqCst),
+            "the one-shot guard is for a genuine accounting error, not for retries"
+        );
     }
 
     #[test]

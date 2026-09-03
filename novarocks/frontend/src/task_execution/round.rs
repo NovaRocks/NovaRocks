@@ -34,7 +34,7 @@ use novarocks_execution::task_execution::status::TerminationDetail;
 use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::status::TaskStatusCursor;
 
-use super::context_owner::ContextEstablishSource;
+use super::context_owner::{ContextEstablishSource, QueryContextOwner};
 use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
 use super::intent::OperationAcknowledgement;
@@ -281,7 +281,23 @@ impl TaskRound {
         // here rather than at establish time keeps the runner the only thing
         // that touches the subscriber, and `ensure` is idempotent, so a
         // context that already has one costs a map lookup.
+        //
+        // A context is subscribed only once its own establish has been
+        // acknowledged. A backend holds no context until it applies the
+        // establish, so a subscription that overtakes it names a context that
+        // backend does not hold yet -- and that refusal is classified as
+        // fatal, which permanently blinds the frontend to that backend's task
+        // status. Waiting for the acknowledgement is the ordering every other
+        // operation on this protocol already obeys; tolerating the refusal
+        // instead would make an observation loss the normal case.
         for &context in self.execution.graph().contexts() {
+            if self
+                .execution
+                .owner(context)
+                .is_none_or(QueryContextOwner::needs_establish)
+            {
+                continue;
+            }
             let cursors = self.execution.status_cursors(context);
             self.subscriber
                 .ensure(context, cursors)
