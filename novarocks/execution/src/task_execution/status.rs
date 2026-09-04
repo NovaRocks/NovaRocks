@@ -353,6 +353,18 @@ impl TerminationDetail {
     pub const fn is_success_compatible(&self) -> bool {
         matches!(self, Self::Canceled(_))
     }
+
+    /// Whether this cause only reports that something else ended the attempt.
+    ///
+    /// `PeerTaskFailed` is the one such cause: a query context carries it to
+    /// say a task of the same query failed, and the backend that sends it
+    /// deliberately does not claim to know which or why -- the failing task's
+    /// own terminal is the authority on that. It is therefore a placeholder,
+    /// not an explanation, and an attempt that reports it to a client has told
+    /// them nothing they can act on.
+    pub const fn is_derived(&self) -> bool {
+        matches!(self, Self::Aborted(AbortCause::PeerTaskFailed))
+    }
 }
 
 /// Monotonic status version.

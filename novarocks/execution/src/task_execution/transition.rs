@@ -147,6 +147,10 @@ pub enum LatchOutcome {
     Won,
     /// Another cause already won; this one is reported but changes nothing.
     Lost(TerminationDetail),
+    /// This cause replaced a derived placeholder. The attempt still terminates
+    /// for the reason it already began terminating for, so this must not
+    /// re-run the side effects of `Won`; only the reported cause improves.
+    Refined(TerminationDetail),
 }
 
 impl TerminationLatch {
@@ -163,8 +167,20 @@ impl TerminationLatch {
     }
 
     /// Races `cause` for the latch, reporting who won.
+    ///
+    /// One exception to first-wins: a derived cause is a placeholder, and an
+    /// originating cause replaces it. Without that, a query context's
+    /// "another task failed" -- which arrives first precisely because it is a
+    /// reaction to the failure -- becomes the only thing the client is ever
+    /// told, and the failing task's own message is dropped. The latch still
+    /// holds exactly one cause; it holds the best one it has been offered.
     pub fn latch(&mut self, cause: TerminationDetail) -> LatchOutcome {
         match &self.first {
+            Some(existing) if existing.is_derived() && !cause.is_derived() => {
+                let replaced = existing.clone();
+                self.first = Some(cause);
+                LatchOutcome::Refined(replaced)
+            }
             Some(existing) => LatchOutcome::Lost(existing.clone()),
             None => {
                 self.first = Some(cause);
@@ -1065,6 +1081,47 @@ mod tests {
             !RootReadFacts::new(TaskState::Finished, true, true).client_visible_completion(),
             "a latched failure wins over an otherwise complete root"
         );
+    }
+
+    #[test]
+    fn an_originating_failure_replaces_a_derived_placeholder_once() {
+        // The defect this catches: a query context reports "another task
+        // failed" as soon as it reacts to a failure, so it reaches the latch
+        // first and, under strict first-wins, becomes the only thing the
+        // client is ever told. Every engine-level message -- a CAST mismatch,
+        // an array_map length error -- was replaced by PEER_TASK_FAILED, which
+        // tells the user nothing they can act on.
+        let mut latch = TerminationLatch::open();
+        let derived = TerminationDetail::Aborted(AbortCause::PeerTaskFailed);
+        let originating = TerminationDetail::Failed(TaskFailure::new(
+            TaskFailureCategory::Execution,
+            SafeDetail::truncating("array_map() element sizes differ"),
+        ));
+
+        assert!(matches!(latch.latch(derived.clone()), LatchOutcome::Won));
+        assert!(matches!(
+            latch.latch(originating.clone()),
+            LatchOutcome::Refined(_)
+        ));
+        assert_eq!(latch.cause(), Some(&originating));
+
+        // Once. A second originating cause does not keep rewriting the answer:
+        // the attempt reports the first real explanation it was given.
+        let second = TerminationDetail::Failed(TaskFailure::new(
+            TaskFailureCategory::Execution,
+            SafeDetail::truncating("a later, unrelated failure"),
+        ));
+        assert!(matches!(latch.latch(second), LatchOutcome::Lost(_)));
+        assert_eq!(latch.cause(), Some(&originating));
+
+        // And a derived cause never displaces a real one.
+        let mut other = TerminationLatch::open();
+        assert!(matches!(
+            other.latch(originating.clone()),
+            LatchOutcome::Won
+        ));
+        assert!(matches!(other.latch(derived), LatchOutcome::Lost(_)));
+        assert_eq!(other.cause(), Some(&originating));
     }
 
     #[test]
