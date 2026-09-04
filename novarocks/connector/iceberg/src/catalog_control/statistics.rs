@@ -569,7 +569,7 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
                 .ok_or_else(|| corrupt("non-empty statistics artifacts produced no Puffin file"))?;
 
             let table_for_stage = this.physical_table.clone();
-            let mut staged = this
+            let staged_result = this
                 .provider
                 .runtime()
                 .resources()
@@ -580,13 +580,50 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
                         statistics_file,
                     )
                     .await
-                })
-                .map_err(unavailable)?
-                .map_err(corrupt)?;
+                });
+            let mut staged = match staged_result {
+                Ok(Ok(staged)) => staged,
+                Ok(Err(error)) => {
+                    let error = abort_statistics_frontier(&this.provider, frontier, corrupt(error));
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
+                    return Err(error);
+                }
+                Err(error) => {
+                    let error =
+                        abort_statistics_frontier(&this.provider, frontier, unavailable(error));
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
+                    return Err(error);
+                }
+            };
             staged.add_requirement(crate::iceberg::TableRequirement::UuidMatch {
                 uuid: expected_uuid,
             });
-            frontier.stage(staged)?;
+            if let Err(error) = frontier.stage(staged) {
+                let error = abort_statistics_frontier(&this.provider, frontier, error);
+                cleanup_uncommitted_statistics_file(
+                    &this.provider,
+                    this.physical_table.file_io().clone(),
+                    path.clone(),
+                );
+                return Err(error);
+            }
+            if let Err(error) = validate_context(&this.context) {
+                let error = abort_statistics_frontier(&this.provider, frontier, error);
+                cleanup_uncommitted_statistics_file(
+                    &this.provider,
+                    this.physical_table.file_io().clone(),
+                    path.clone(),
+                );
+                return Err(error);
+            }
             let outcome = this
                 .provider
                 .runtime()
@@ -610,6 +647,11 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
                     );
                 }
                 CatalogOutcome::KnownUncommitted { failure } => {
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
                     let Some(next_attempt) =
                         next_statistics_attempt(&failure, attempt, MAX_ATTEMPTS)
                     else {
@@ -619,6 +661,11 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
                     continue;
                 }
                 CatalogOutcome::Unsupported(unsupported) => {
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
                     return Ok(ExternalMutationOutcome::KnownUncommitted {
                         failure: ConnectorMutationFailure::new(
                             ConnectorMutationFailureKind::Unsupported,
@@ -641,6 +688,54 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
             }
         }
         unreachable!("statistics publication attempt loop always returns")
+    }
+}
+
+fn abort_statistics_frontier(
+    provider: &IcebergMetadata,
+    mut frontier: Box<crate::catalog::transaction::Transaction>,
+    mut error: ConnectorError,
+) -> ConnectorError {
+    let abort = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { frontier.abort().await });
+    match abort {
+        Ok(Ok(())) => {}
+        Ok(Err(abort_error)) => {
+            error = error.with_cleanup_context(format!(
+                "statistics transaction abort failed: {abort_error}"
+            ));
+        }
+        Err(abort_error) => {
+            error = error.with_cleanup_context(format!(
+                "statistics transaction abort runtime bridge failed: {abort_error}"
+            ));
+        }
+    }
+    error
+}
+
+fn cleanup_uncommitted_statistics_file(
+    provider: &IcebergMetadata,
+    file_io: crate::iceberg::io::FileIO,
+    path: String,
+) {
+    let cleanup_path = path.clone();
+    let cleanup = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { file_io.delete(&cleanup_path).await });
+    match cleanup {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(path = %path, source = ?error, "statistics Puffin cleanup failed");
+        }
+        Err(error) => {
+            tracing::warn!(path = %path, source = ?error, "statistics Puffin cleanup runtime bridge failed");
+        }
     }
 }
 
@@ -1230,15 +1325,27 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use novarocks_spi::connector::{
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
         ConnectorMutationOperationId, ConnectorProviderId, ConnectorRequestContext,
         ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
         ProviderBindingEpoch,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::access_binding::IcebergReadBinding;
+    use crate::catalog::error::CatalogCommitEvidence;
+    use crate::catalog::transaction::{
+        CatalogCommitDispatch, CommitProof, Transaction, TransactionShape,
+    };
     use crate::catalog_control::IcebergCatalogControlState;
+    use crate::iceberg::io::FileIO;
+    use crate::iceberg::spec::{
+        FormatVersion, Operation, PartitionSpec, Snapshot, SortOrder, Summary, TableMetadataBuilder,
+    };
+    use crate::iceberg::table::Table;
+    use crate::iceberg::{Error as IcebergError, TableIdent};
     use crate::metadata_context::IcebergMetadataContext;
     use crate::resources::IcebergMetadataResources;
 
@@ -1247,6 +1354,76 @@ mod tests {
     impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
         fn is_cancelled(&self) -> bool {
             false
+        }
+    }
+
+    struct CancelOnCheck {
+        checks: AtomicUsize,
+        cancel_on: usize,
+    }
+
+    impl novarocks_spi::connector::ConnectorCancellation for CancelOnCheck {
+        fn is_cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.cancel_on
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DispatchBehavior {
+        Commit,
+        Conflict,
+        RejectDefinitely,
+        LoseResponse,
+    }
+
+    #[derive(Debug)]
+    struct CountingDispatch {
+        behavior: DispatchBehavior,
+        dispatches: AtomicUsize,
+        aborts: AtomicUsize,
+    }
+
+    impl CountingDispatch {
+        fn new(behavior: DispatchBehavior) -> Arc<Self> {
+            Arc::new(Self {
+                behavior,
+                dispatches: AtomicUsize::new(0),
+                aborts: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CatalogCommitDispatch for CountingDispatch {
+        async fn dispatch_once(
+            &self,
+            _staged: Option<crate::iceberg::TableCommit>,
+        ) -> Result<CommitProof, IcebergError> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                DispatchBehavior::Commit => Ok(CommitProof::applied(Some(7))),
+                DispatchBehavior::Conflict => Err(IcebergError::new(
+                    crate::iceberg::ErrorKind::CatalogCommitConflicts,
+                    "injected statistics conflict",
+                )),
+                DispatchBehavior::RejectDefinitely => Err(IcebergError::new(
+                    crate::iceberg::ErrorKind::DataInvalid,
+                    "injected definite statistics rejection",
+                )),
+                DispatchBehavior::LoseResponse => Err(IcebergError::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    "injected lost statistics response",
+                )),
+            }
+        }
+
+        async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
+            Ok(None)
+        }
+
+        async fn abort_before_dispatch(&self) -> Result<(), ConnectorError> {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -1313,6 +1490,230 @@ mod tests {
             logical_type_columns: BTreeMap::new(),
             hidden_columns: Vec::new(),
         }
+    }
+
+    fn table_with_snapshot(file_io: FileIO) -> Table {
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(7)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list("memory://warehouse/db/t/metadata/snap-7.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(0)
+            .build();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://warehouse/db/t".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .set_branch_snapshot(snapshot, "main")
+        .expect("current snapshot")
+        .build()
+        .expect("metadata")
+        .metadata;
+        Table::builder()
+            .identifier(TableIdent::from_strs(["db", "t"]).expect("identifier"))
+            .metadata(metadata)
+            .file_io(file_io)
+            .build()
+            .expect("table")
+    }
+
+    fn nonempty_statistics_session(
+        provider: IcebergMetadata,
+        physical_table: Table,
+        operation_id: ConnectorMutationOperationId,
+        context: ConnectorRequestContext,
+        dispatch: Arc<CountingDispatch>,
+    ) -> (
+        IcebergStatisticsCollectionSession,
+        StatisticsArtifactDraft,
+        String,
+    ) {
+        let path = puffin_path_for_statistics_operation(
+            physical_table.metadata(),
+            7,
+            statistics_attempt_identity(operation_id, 0),
+        );
+        let frontier = Transaction::new(
+            TransactionIdentity::new("statistics-cleanup-test", [9; 16]),
+            CatalogTableName::new("db", "t"),
+            TransactionShape::Existing,
+            CatalogCommitEvidence::for_target("db.t"),
+            dispatch,
+        );
+        let identity = StatisticsArtifactIdentity::try_new(vec![1], APACHE_DATASKETCHES_THETA_V1)
+            .expect("identity");
+        let body = Bytes::from_static(include_bytes!(
+            "../../../../../tests/datasketches-tck/fixtures/theta/rust_quickselect_n1000_ordered_v3.sk"
+        ));
+        let artifact = StatisticsArtifactDraft::try_new(
+            identity.input_fields().to_vec(),
+            identity.blob_type(),
+            body,
+            BTreeMap::new(),
+        )
+        .expect("artifact");
+        (
+            IcebergStatisticsCollectionSession {
+                provider,
+                operation_id,
+                table_payload: table_payload(),
+                data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-7"))
+                    .expect("data version"),
+                physical_table,
+                snapshot_id: Some(7),
+                sequence_number: Some(1),
+                expectations: vec![identity],
+                context,
+                frontier: Some(Box::new(frontier)),
+            },
+            artifact,
+            path,
+        )
+    }
+
+    #[test]
+    fn cancellation_after_puffin_stage_vetoes_statistics_dispatch_and_cleans_attempt_file() {
+        let (executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let operation_id = ConnectorMutationOperationId::new();
+        let cancellation = Arc::new(CancelOnCheck {
+            checks: AtomicUsize::new(0),
+            cancel_on: 3,
+        });
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + std::time::Duration::from_secs(5),
+            cancellation.clone(),
+            1024 * 1024,
+            1024 * 1024,
+        )
+        .expect("context");
+        let dispatch = CountingDispatch::new(DispatchBehavior::Commit);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            operation_id,
+            context,
+            Arc::clone(&dispatch),
+        );
+
+        let error = Box::new(session)
+            .finish(vec![artifact])
+            .expect_err("late cancellation must veto catalog dispatch");
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(cancellation.checks.load(Ordering::SeqCst), 3);
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 1);
+        assert!(
+            !executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect attempt Puffin"),
+            "the known-uncommitted attempt must clean its Puffin file"
+        );
+    }
+
+    #[test]
+    fn terminal_known_uncommitted_statistics_attempt_cleans_its_puffin() {
+        let (executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let dispatch = CountingDispatch::new(DispatchBehavior::RejectDefinitely);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            ConnectorMutationOperationId::new(),
+            context(),
+            Arc::clone(&dispatch),
+        );
+
+        let outcome = Box::new(session)
+            .finish(vec![artifact])
+            .expect("definite catalog rejection");
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownUncommitted { ref failure }
+                if failure.kind() == ConnectorMutationFailureKind::InvalidRequest
+        ));
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
+        assert!(
+            !executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect rejected attempt Puffin"),
+            "a definitely uncommitted attempt must clean its Puffin file"
+        );
+    }
+
+    #[test]
+    fn conflict_cleans_attempt_puffin_before_fresh_base_reload() {
+        let (executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let dispatch = CountingDispatch::new(DispatchBehavior::Conflict);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            ConnectorMutationOperationId::new(),
+            context(),
+            Arc::clone(&dispatch),
+        );
+
+        Box::new(session)
+            .finish(vec![artifact])
+            .expect_err("the synthetic provider has no fresh catalog base");
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
+        assert!(
+            !executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect conflicted attempt Puffin"),
+            "a conflicted attempt must clean its Puffin before fresh-base retry"
+        );
+    }
+
+    #[test]
+    fn commit_unknown_statistics_attempt_retains_its_puffin() {
+        let (executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let dispatch = CountingDispatch::new(DispatchBehavior::LoseResponse);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            ConnectorMutationOperationId::new(),
+            context(),
+            Arc::clone(&dispatch),
+        );
+
+        let outcome = Box::new(session)
+            .finish(vec![artifact])
+            .expect("lost response is a typed outcome");
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
+        assert!(
+            executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect unknown attempt Puffin"),
+            "unknown publication may have referenced its Puffin, so cleanup is forbidden"
+        );
     }
 
     #[test]

@@ -175,8 +175,10 @@ impl IcebergWriteSessionControl {
     }
 }
 
-/// Reject a request whose attempt is already cancelled or past its deadline,
-/// before any external work starts.
+/// Reject a request whose attempt is already cancelled or past its deadline.
+///
+/// Callers use this both before staging work and immediately before the single
+/// external catalog mutation dispatch.
 pub(crate) fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
     if context.cancellation().is_cancelled() {
         return Err(ConnectorError::new(
@@ -191,6 +193,24 @@ pub(crate) fn validate_context(context: &ConnectorRequestContext) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+async fn commit_eager_frontier(
+    frontier: &mut crate::catalog::transaction::Transaction,
+    context: &ConnectorRequestContext,
+) -> Result<
+    crate::catalog::error::CatalogOutcome<crate::catalog::transaction::CommitProof>,
+    ConnectorError,
+> {
+    if let Err(mut error) = validate_context(context) {
+        if let Err(abort_error) = frontier.abort().await {
+            error = error.with_cleanup_context(format!(
+                "Iceberg eager transaction abort failed: {abort_error}"
+            ));
+        }
+        return Err(error);
+    }
+    Ok(frontier.commit().await)
 }
 
 /// One typed fragment resolved against the sealed target set.
@@ -1513,6 +1533,9 @@ impl IcebergWriteSessionControl {
             ));
             let operation = handle.commit_op_kind();
             let bridge_collector = Arc::clone(&collector);
+            let dispatch_context = context.clone();
+            let dispatch_context_failure = Arc::new(std::sync::OnceLock::new());
+            let dispatch_context_failure_for_attempt = Arc::clone(&dispatch_context_failure);
             let attempt_result = self
                 .runtime
                 .resources()
@@ -1613,7 +1636,14 @@ impl IcebergWriteSessionControl {
                         }
                     };
                     frontier.stage(staged).map_err(|error| error.to_string())?;
-                    let outcome = frontier.commit().await;
+                    let outcome =
+                        match commit_eager_frontier(&mut frontier, &dispatch_context).await {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                let _ = dispatch_context_failure_for_attempt.set(error.clone());
+                                return Err(error.to_string());
+                            }
+                        };
                     Ok((outcome, data_outcome, collector))
                 });
             let (catalog_outcome, data_outcome, collector) = match attempt_result {
@@ -1628,6 +1658,9 @@ impl IcebergWriteSessionControl {
                             Arc::clone(&session_abort),
                         ],
                     );
+                    if let Some(context_error) = dispatch_context_failure.get() {
+                        return Err(context_error.clone());
+                    }
                     return Ok(ExternalMutationOutcome::KnownUncommitted {
                         failure: failure(
                             ConnectorMutationFailureKind::InvalidRequest,
@@ -3395,6 +3428,14 @@ mod eager_attempt_io_tests {
 
     const DATA_PATH: &str = "memory://warehouse/db/t/data/already-written.parquet";
 
+    struct NeverCancelled;
+
+    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
     #[derive(Debug, Default)]
     struct IoTrace {
         data_input_opens: AtomicUsize,
@@ -3708,6 +3749,7 @@ mod eager_attempt_io_tests {
     struct CountingDispatch {
         behavior: DispatchBehavior,
         dispatches: AtomicUsize,
+        aborts: AtomicUsize,
     }
 
     impl CountingDispatch {
@@ -3715,6 +3757,7 @@ mod eager_attempt_io_tests {
             Arc::new(Self {
                 behavior,
                 dispatches: AtomicUsize::new(0),
+                aborts: AtomicUsize::new(0),
             })
         }
     }
@@ -3745,6 +3788,11 @@ mod eager_attempt_io_tests {
 
         async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
             Ok(None)
+        }
+
+        async fn abort_before_dispatch(&self) -> Result<(), ConnectorError> {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -3977,6 +4025,43 @@ mod eager_attempt_io_tests {
             puffin_writes, 2,
             "each attempt must rebuild one Puffin file"
         );
+    }
+
+    #[tokio::test]
+    async fn elapsed_deadline_after_eager_stage_vetoes_catalog_dispatch() {
+        let fixture = fixture().await;
+        let dispatch = CountingDispatch::new(DispatchBehavior::Commit);
+        let mut attempt = stage_attempt(&fixture, 9, Arc::clone(&dispatch)).await;
+        assert!(
+            fixture
+                .table
+                .file_io()
+                .exists(&attempt.puffin_path)
+                .await
+                .expect("inspect staged Puffin"),
+            "the test must cross manifest and Puffin staging before the dispatch gate"
+        );
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+            Arc::new(NeverCancelled),
+            64 * 1024,
+            1024 * 1024,
+        )
+        .expect("expired context");
+
+        let error = commit_eager_frontier(&mut attempt.frontier, &context)
+            .await
+            .expect_err("elapsed deadline must veto catalog dispatch");
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 1);
+
+        fixture
+            .table
+            .file_io()
+            .delete(&attempt.puffin_path)
+            .await
+            .expect("clean test Puffin");
     }
 
     #[tokio::test]
