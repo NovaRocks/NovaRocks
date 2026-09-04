@@ -283,6 +283,10 @@ struct TaskState {
     /// One update at a time: a driver waits for the acknowledgement before it
     /// sends the next, so a slow task cannot accumulate unbounded work.
     in_flight: bool,
+    /// This destination finished before a delivery reached it, so it needs
+    /// nothing more. Kept per task rather than per round: the other
+    /// destinations of the same round are still consuming.
+    finished: bool,
 }
 
 /// The coordinator-side driver for one execution round.
@@ -484,6 +488,16 @@ impl SplitAssignmentDriver {
                     },
                 ));
             }
+            // A destination that already finished needs nothing more, and
+            // enumerating splits for it would allocate sequences no one will
+            // ever accept.
+            if self
+                .task_state
+                .get(&target)
+                .is_some_and(|state| state.finished)
+            {
+                continue;
+            }
             // Sequences are allocated once and the resulting immutable request
             // stays alive until a strict acknowledgement confirms it. A retry
             // never enumerates splits or allocates a replacement sequence.
@@ -529,6 +543,19 @@ impl SplitAssignmentDriver {
                         reason,
                         detail,
                     });
+                }
+                Ok(TaskUpdateOutcome::DestinationFinished { detail }) => {
+                    // Not an error: the consumer stopped before this delivery
+                    // arrived, which is ordinary for an early-terminating
+                    // branch. Its queue depth is left as it was -- nothing was
+                    // enqueued -- and the loop moves on to the destinations
+                    // that are still consuming.
+                    tracing::debug!(
+                        target = ?target,
+                        detail = %detail,
+                        "split delivery stopped for a destination that already finished"
+                    );
+                    state.finished = true;
                 }
                 Err(error) => {
                     return Err(SplitAssignmentDriverError::Transport {

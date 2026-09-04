@@ -167,6 +167,8 @@ enum DeliveryOutcome {
     /// No backend outcome was established, and resending would not establish
     /// one either.
     Local(String),
+    /// The destination finished before this update reached it.
+    DestinationFinished(String),
     /// The outcome is genuinely unknown, so the identical request may be
     /// resent.
     Unknown(String),
@@ -328,6 +330,18 @@ impl SplitDeliveryBridge {
             FrontendAction::RetryExactRequest
         ) {
             DeliveryOutcome::Unknown(format!("task update outcome unknown: {:?}", ack.outcome()))
+        } else if matches!(
+            ack.outcome().frontend_action(),
+            FrontendAction::StopSendingAndReconcile | FrontendAction::Settled
+        ) {
+            // The destination is gone or already finished. That is not this
+            // producer's failure: it held a status older than the terminal by
+            // construction. Delivery stops for that one destination and the
+            // round keeps serving the rest.
+            DeliveryOutcome::DestinationFinished(format!(
+                "the task update was answered with {:?}",
+                ack.outcome()
+            ))
         } else {
             // Every remaining action -- fail closed, fail the attempt, or stop
             // sending and reconcile -- is a decision about this attempt that
@@ -564,6 +578,9 @@ fn delivered(outcome: DeliveryOutcome) -> Result<TaskUpdateOutcome, TaskUpdateTr
         DeliveryOutcome::Accepted(nodes) => Ok(TaskUpdateOutcome::Accepted(nodes)),
         DeliveryOutcome::Rejected { reason, detail } => {
             Ok(TaskUpdateOutcome::Rejected { reason, detail })
+        }
+        DeliveryOutcome::DestinationFinished(detail) => {
+            Ok(TaskUpdateOutcome::DestinationFinished { detail })
         }
         DeliveryOutcome::Local(detail) => Err(TaskUpdateTransportError::fatal(detail)),
         DeliveryOutcome::Unknown(detail) => {

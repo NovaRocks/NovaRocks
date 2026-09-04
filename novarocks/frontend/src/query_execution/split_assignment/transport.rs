@@ -50,6 +50,18 @@ pub(crate) enum TaskUpdateOutcome {
         reason: String,
         detail: String,
     },
+    /// The destination finished before this update reached it, so there is
+    /// nothing left to deliver there.
+    ///
+    /// Neither accepted nor refused: no split was enqueued, and the backend
+    /// did not judge the request -- it had already stopped consuming. The
+    /// sender must stop delivering to this destination and keep serving the
+    /// others rather than failing the round, because the frontend held a
+    /// status older than that terminal by construction and could not have
+    /// known.
+    DestinationFinished {
+        detail: String,
+    },
 }
 
 /// Whether a TaskUpdate failure has an unknown remote outcome and may be
