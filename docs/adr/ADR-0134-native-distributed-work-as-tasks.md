@@ -15,6 +15,8 @@ code-anchors:
   - "novarocks/proto-codec/src/task_execution/descriptor.rs (WireFragmentPlan)"
   - "novarocks/frontend/src/task_execution/mod.rs (QueryContextOwner, RemoteTask, StageExecution)"
   - "novarocks/backend/src/task_execution/mod.rs (query context and task registry)"
+  - "novarocks/frontend/src/native/task_transport.rs (SubscriptionState: the transport evidence that decides a lost backend)"
+  - "novarocks/execution/src/exec/operators/data_stream_sink.rs (the driver set's single end-of-stream)"
 ---
 
 ## 问题
