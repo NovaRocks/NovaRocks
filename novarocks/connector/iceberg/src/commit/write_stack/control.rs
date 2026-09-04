@@ -3373,7 +3373,7 @@ mod statistics_contract_tests {
 mod eager_attempt_io_tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
@@ -3402,12 +3402,24 @@ mod eager_attempt_io_tests {
         data_metadata_calls: AtomicUsize,
         data_read_calls: AtomicUsize,
         data_reader_calls: AtomicUsize,
+        data_read_bytes: AtomicU64,
+        puffin_input_opens: AtomicUsize,
+        puffin_output_opens: AtomicUsize,
+        puffin_metadata_calls: AtomicUsize,
+        puffin_read_calls: AtomicUsize,
+        puffin_read_bytes: AtomicU64,
+        puffin_write_calls: AtomicUsize,
+        puffin_write_bytes: AtomicU64,
         written_paths: Mutex<Vec<String>>,
     }
 
     impl IoTrace {
         fn is_data(&self, path: &str) -> bool {
             path == DATA_PATH
+        }
+
+        fn is_puffin(&self, path: &str) -> bool {
+            path.ends_with(".puffin")
         }
 
         fn observe_write(&self, path: &str) {
@@ -3423,6 +3435,7 @@ mod eager_attempt_io_tests {
             assert_eq!(self.data_metadata_calls.load(Ordering::SeqCst), 0);
             assert_eq!(self.data_read_calls.load(Ordering::SeqCst), 0);
             assert_eq!(self.data_reader_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(self.data_read_bytes.load(Ordering::SeqCst), 0);
         }
 
         fn attempt_derivative_counts(&self) -> (usize, usize) {
@@ -3434,6 +3447,123 @@ mod eager_attempt_io_tests {
                     .filter(|path| path.ends_with(".puffin"))
                     .count(),
             )
+        }
+
+        fn publication_observation(&self) -> serde_json::Value {
+            serde_json::json!({
+                "record": "iceberg_publication_io",
+                "schema_version": 1,
+                "scope": "one_eager_collect_on_write_attempt",
+                "observations": {
+                    "puffin_write_calls": observed(
+                        self.puffin_write_calls.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.FileWrite.write",
+                    ),
+                    "puffin_write_bytes": observed(
+                        self.puffin_write_bytes.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.FileWrite.write.bytes",
+                    ),
+                    "puffin_read_calls": observed(
+                        self.puffin_read_calls.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.FileRead.read",
+                    ),
+                    "puffin_read_bytes": observed(
+                        self.puffin_read_bytes.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.FileRead.read.bytes",
+                    ),
+                    "puffin_metadata_calls": observed(
+                        self.puffin_metadata_calls.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.Storage.metadata",
+                    ),
+                    "puffin_input_opens": observed(
+                        self.puffin_input_opens.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.Storage.new_input",
+                    ),
+                    "puffin_output_opens": observed(
+                        self.puffin_output_opens.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.Storage.new_output",
+                    ),
+                    "data_input_opens": observed(
+                        self.data_input_opens.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.Storage.new_input[data_file]",
+                    ),
+                    "data_exists_calls": observed(
+                        self.data_exists_calls.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.Storage.exists[data_file]",
+                    ),
+                    "data_metadata_calls": observed(
+                        self.data_metadata_calls.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.Storage.metadata[data_file]",
+                    ),
+                    "data_read_calls": observed(
+                        self.data_read_calls.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.Storage.read_or_FileRead.read[data_file]",
+                    ),
+                    "data_reader_calls": observed(
+                        self.data_reader_calls.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.Storage.reader[data_file]",
+                    ),
+                    "data_read_bytes": observed(
+                        self.data_read_bytes.load(Ordering::SeqCst),
+                        "iceberg.counting_file_io.read_bytes[data_file]",
+                    ),
+                },
+            })
+        }
+    }
+
+    fn observed(value: impl Serialize, source: &'static str) -> serde_json::Value {
+        serde_json::json!({"value": value, "source": source, "observed": true})
+    }
+
+    struct CountingFileRead {
+        inner: Box<dyn FileRead>,
+        trace: Arc<IoTrace>,
+        path: String,
+    }
+
+    #[async_trait]
+    impl FileRead for CountingFileRead {
+        async fn read(&self, range: std::ops::Range<u64>) -> crate::iceberg::Result<Bytes> {
+            let bytes = self.inner.read(range).await?;
+            if self.trace.is_data(&self.path) {
+                self.trace.data_read_calls.fetch_add(1, Ordering::SeqCst);
+                self.trace
+                    .data_read_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            }
+            if self.trace.is_puffin(&self.path) {
+                self.trace.puffin_read_calls.fetch_add(1, Ordering::SeqCst);
+                self.trace
+                    .puffin_read_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            }
+            Ok(bytes)
+        }
+    }
+
+    struct CountingFileWrite {
+        inner: Box<dyn FileWrite>,
+        trace: Arc<IoTrace>,
+        path: String,
+    }
+
+    #[async_trait]
+    impl FileWrite for CountingFileWrite {
+        async fn write(&mut self, bytes: Bytes) -> crate::iceberg::Result<()> {
+            let len = bytes.len() as u64;
+            self.inner.write(bytes).await?;
+            if self.trace.is_puffin(&self.path) {
+                self.trace.puffin_write_calls.fetch_add(1, Ordering::SeqCst);
+                self.trace
+                    .puffin_write_bytes
+                    .fetch_add(len, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        async fn close(&mut self) -> crate::iceberg::Result<()> {
+            self.inner.close().await
         }
     }
 
@@ -3464,31 +3594,62 @@ mod eager_attempt_io_tests {
                     .data_metadata_calls
                     .fetch_add(1, Ordering::SeqCst);
             }
+            if self.trace.is_puffin(path) {
+                self.trace
+                    .puffin_metadata_calls
+                    .fetch_add(1, Ordering::SeqCst);
+            }
             self.inner.metadata(path).await
         }
 
         async fn read(&self, path: &str) -> crate::iceberg::Result<Bytes> {
+            let bytes = self.inner.read(path).await?;
             if self.trace.is_data(path) {
                 self.trace.data_read_calls.fetch_add(1, Ordering::SeqCst);
+                self.trace
+                    .data_read_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::SeqCst);
             }
-            self.inner.read(path).await
+            if self.trace.is_puffin(path) {
+                self.trace.puffin_read_calls.fetch_add(1, Ordering::SeqCst);
+                self.trace
+                    .puffin_read_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            }
+            Ok(bytes)
         }
 
         async fn reader(&self, path: &str) -> crate::iceberg::Result<Box<dyn FileRead>> {
             if self.trace.is_data(path) {
                 self.trace.data_reader_calls.fetch_add(1, Ordering::SeqCst);
             }
-            self.inner.reader(path).await
+            Ok(Box::new(CountingFileRead {
+                inner: self.inner.reader(path).await?,
+                trace: Arc::clone(&self.trace),
+                path: path.to_string(),
+            }))
         }
 
         async fn write(&self, path: &str, bytes: Bytes) -> crate::iceberg::Result<()> {
+            let len = bytes.len() as u64;
             self.trace.observe_write(path);
-            self.inner.write(path, bytes).await
+            self.inner.write(path, bytes).await?;
+            if self.trace.is_puffin(path) {
+                self.trace.puffin_write_calls.fetch_add(1, Ordering::SeqCst);
+                self.trace
+                    .puffin_write_bytes
+                    .fetch_add(len, Ordering::SeqCst);
+            }
+            Ok(())
         }
 
         async fn writer(&self, path: &str) -> crate::iceberg::Result<Box<dyn FileWrite>> {
             self.trace.observe_write(path);
-            self.inner.writer(path).await
+            Ok(Box::new(CountingFileWrite {
+                inner: self.inner.writer(path).await?,
+                trace: Arc::clone(&self.trace),
+                path: path.to_string(),
+            }))
         }
 
         async fn delete(&self, path: &str) -> crate::iceberg::Result<()> {
@@ -3503,10 +3664,18 @@ mod eager_attempt_io_tests {
             if self.trace.is_data(path) {
                 self.trace.data_input_opens.fetch_add(1, Ordering::SeqCst);
             }
+            if self.trace.is_puffin(path) {
+                self.trace.puffin_input_opens.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
         }
 
         fn new_output(&self, path: &str) -> crate::iceberg::Result<OutputFile> {
+            if self.trace.is_puffin(path) {
+                self.trace
+                    .puffin_output_opens
+                    .fetch_add(1, Ordering::SeqCst);
+            }
             Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
         }
     }
@@ -3807,6 +3976,37 @@ mod eager_attempt_io_tests {
         assert_eq!(
             puffin_writes, 2,
             "each attempt must rebuild one Puffin file"
+        );
+    }
+
+    #[tokio::test]
+    async fn ac32_publication_observability_report_has_real_puffin_io_and_no_data_reread() {
+        let fixture = fixture().await;
+        let committed = CountingDispatch::new(DispatchBehavior::Commit);
+        let mut attempt = stage_attempt(&fixture, 8, Arc::clone(&committed)).await;
+        let outcome = attempt.frontier.commit().await;
+        assert!(matches!(outcome, CatalogOutcome::KnownCommitted { .. }));
+        assert_eq!(committed.dispatches.load(Ordering::SeqCst), 1);
+        fixture.trace.assert_data_was_not_reopened();
+        assert!(
+            fixture.trace.puffin_write_calls.load(Ordering::SeqCst) > 0,
+            "the publication observer must see actual Puffin writes"
+        );
+        assert!(
+            fixture.trace.puffin_write_bytes.load(Ordering::SeqCst) > 0,
+            "the publication observer must see actual Puffin write bytes"
+        );
+        assert!(
+            fixture.trace.puffin_read_calls.load(Ordering::SeqCst) > 0,
+            "the publication observer must see the Puffin sizing read"
+        );
+        assert!(
+            fixture.trace.puffin_read_bytes.load(Ordering::SeqCst) > 0,
+            "the publication observer must see actual Puffin read bytes"
+        );
+        println!(
+            "NCP8_AC32_ICEBERG_IO={}",
+            fixture.trace.publication_observation()
         );
     }
 

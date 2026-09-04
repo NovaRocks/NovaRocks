@@ -22,8 +22,10 @@
 //! fixture. The two cases differ only in whether the frozen auxiliary plan is
 //! empty or contains the Iceberg-owned Theta aggregate.
 
-use std::sync::Arc;
+#![recursion_limit = "256"]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array};
@@ -38,6 +40,9 @@ use novarocks_execution::exec::expr::agg::{
     contribute_builtin_aggregate_implementations,
 };
 use novarocks_execution::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use novarocks_execution::exec::fragment::sink::{
+    DataStreamPartitionType, DataStreamSinkFactoryInput,
+};
 use novarocks_execution::exec::node::table_finish::TableFinishNode;
 use novarocks_execution::exec::node::table_write_aggregate::{
     WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
@@ -54,11 +59,16 @@ use novarocks_execution::exec::node::unpivot::UnpivotConstant;
 use novarocks_execution::exec::node::values::ValuesNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_execution::exec::operators::{
-    TableFinishOperatorFactory, TableWriterOperatorFactory,
+    DataStreamSinkFactory, TableFinishOperatorFactory, TableWriterOperatorFactory,
 };
 use novarocks_execution::exec::pipeline::operator::Operator;
 use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
+use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_execution::runtime::exchange::{ExchangeKey, ExecutionExchangeRegistry};
 use novarocks_execution::runtime::execution_runtime::ExecutionSpillStorageConfig;
+use novarocks_execution::runtime::fragment::io::{
+    ExchangeFrame, ExchangeFrameTransmitter, FragmentIoError,
+};
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::{OperatorProfiles, RuntimeProfile};
 use novarocks_execution::runtime::runtime_state::RuntimeState;
@@ -78,7 +88,8 @@ use novarocks_spi::connector::{
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
-use novarocks_types::SlotId;
+use novarocks_types::{SlotId, UniqueId};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 const INPUT_SLOT: SlotId = SlotId::new(1);
@@ -86,7 +97,11 @@ const THETA_PARTIAL_SLOT: SlotId = SlotId::new(10_000);
 const THETA_FINAL_SLOT: SlotId = SlotId::new(10_001);
 const GROUPING_OUTPUT_SLOT: SlotId = SlotId::new(10_002);
 const POLL_TIMEOUT: Duration = Duration::from_secs(60);
-const BENCHMARK_SCHEMA_VERSION: u8 = 2;
+const BENCHMARK_SCHEMA_VERSION: u8 = 3;
+const EXCHANGE_SOURCE_FINST: UniqueId = UniqueId::new(8, 1);
+const EXCHANGE_DESTINATION_FINST: UniqueId = UniqueId::new(8, 2);
+const EXCHANGE_DESTINATION_NODE_ID: i32 = 8_003;
+const EXCHANGE_SENDER_ID: i32 = 8_004;
 
 #[derive(Clone, Copy, Debug)]
 enum AuxiliaryCase {
@@ -123,11 +138,11 @@ impl Config {
         let warmup_rounds = env_usize("NOVAROCKS_BENCH_WARMUP_ROUNDS", 2)?;
         let measurement_rounds = env_usize("NOVAROCKS_BENCH_MEASUREMENT_ROUNDS", 5)?;
         let append_delay_us = env_u64("NOVAROCKS_BENCH_APPEND_DELAY_US", 0)?;
-        if rows == 0 || batch_rows == 0 || cardinality == 0 || measurement_rounds == 0 {
-            return Err(
-                "rows, batch rows, cardinality, and measurement rounds must be positive"
-                    .to_string(),
-            );
+        if rows == 0 || batch_rows == 0 || cardinality == 0 {
+            return Err("rows, batch rows, and cardinality must be positive".to_string());
+        }
+        if warmup_rounds == 0 || measurement_rounds < 2 {
+            return Err("AC32 requires at least one warmup and two measurement rounds".to_string());
         }
         if cardinality > i32::MAX as usize {
             return Err("cardinality must fit i32".to_string());
@@ -189,12 +204,14 @@ struct ProviderCounters {
     appended_rows: AtomicUsize,
     finish_calls: AtomicUsize,
     abort_calls: AtomicUsize,
+    driver_thread_calls: AtomicUsize,
 }
 
 struct BenchWriteExecution {
     adapter: WriteRuntimeAdapter<BenchProvider>,
     counters: Arc<ProviderCounters>,
     append_delay_us: u64,
+    driver_thread_id: std::thread::ThreadId,
 }
 
 #[async_trait::async_trait]
@@ -207,11 +224,13 @@ impl ConnectorWriteExecution for BenchWriteExecution {
         &self,
         _request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+        observe_provider_thread(&self.counters, self.driver_thread_id);
         self.counters.open_calls.fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(BenchBatchWriter {
             adapter: self.adapter.clone(),
             counters: Arc::clone(&self.counters),
             append_delay_us: self.append_delay_us,
+            driver_thread_id: self.driver_thread_id,
             rows: 0,
         }))
     }
@@ -221,12 +240,14 @@ struct BenchBatchWriter {
     adapter: WriteRuntimeAdapter<BenchProvider>,
     counters: Arc<ProviderCounters>,
     append_delay_us: u64,
+    driver_thread_id: std::thread::ThreadId,
     rows: usize,
 }
 
 #[async_trait::async_trait]
 impl ConnectorBatchWriter for BenchBatchWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        observe_provider_thread(&self.counters, self.driver_thread_id);
         if self.append_delay_us != 0 {
             tokio::time::sleep(Duration::from_micros(self.append_delay_us)).await;
         }
@@ -239,6 +260,7 @@ impl ConnectorBatchWriter for BenchBatchWriter {
     }
 
     async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+        observe_provider_thread(&self.counters, self.driver_thread_id);
         self.counters.finish_calls.fetch_add(1, Ordering::Relaxed);
         let bytes = u64::try_from(self.rows)
             .unwrap_or(u64::MAX)
@@ -250,8 +272,15 @@ impl ConnectorBatchWriter for BenchBatchWriter {
     }
 
     async fn abort(&mut self) -> Result<(), ConnectorError> {
+        observe_provider_thread(&self.counters, self.driver_thread_id);
         self.counters.abort_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+fn observe_provider_thread(counters: &ProviderCounters, driver_thread_id: std::thread::ThreadId) {
+    if std::thread::current().id() == driver_thread_id {
+        counters.driver_thread_calls.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -287,11 +316,41 @@ impl ConnectorCancellation for NeverCancelled {
 struct BuiltPlans {
     writer: TableWriterOperatorFactory,
     finish: TableFinishOperatorFactory,
+    writer_relation_schema: novarocks_execution::exec::chunk::ChunkSchemaRef,
 }
 
 struct RunResult {
     value: Value,
     theta_body: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct CapturingExchangeTransmitter {
+    frames: Mutex<Vec<ExchangeFrame>>,
+}
+
+impl CapturingExchangeTransmitter {
+    fn take_frames(&self) -> Vec<ExchangeFrame> {
+        std::mem::take(&mut *self.frames.lock().expect("exchange capture lock"))
+    }
+}
+
+impl ExchangeFrameTransmitter for CapturingExchangeTransmitter {
+    fn transmit(&self, frame: ExchangeFrame) -> Result<(), FragmentIoError> {
+        self.frames
+            .lock()
+            .expect("exchange capture lock")
+            .push(frame);
+        Ok(())
+    }
+}
+
+struct ExchangeObservation {
+    encoded_payload_bytes: u64,
+    sent_payload_bytes: u64,
+    request_count: u64,
+    data_frame_count: u64,
+    eos_frame_count: u64,
 }
 
 fn main() {
@@ -321,8 +380,13 @@ fn run() -> Result<(), String> {
         "available_parallelism": std::thread::available_parallelism().map(usize::from).ok(),
         "cpu_clock": "getrusage_process_user_plus_system",
         "peak_memory": "query_mem_tracker_accounted_bytes",
-        "production_object_read_calls": null,
-        "production_object_read_calls_note": "not observable through the execution write API",
+        "measurement_scope": "execution_writer_exchange_decode_finish",
+        "publication_io_observer": {
+            "observed": false,
+            "source": "iceberg_owner_required_separate_report",
+            "reason": "the provider-neutral execution benchmark cannot observe Iceberg object I/O",
+        },
+        "standalone_completeness": "incomplete_without_iceberg_owner_report",
     }));
 
     for case in AuxiliaryCase::ALL {
@@ -448,6 +512,7 @@ fn run_once(
     function_set: Arc<SealedExecutionFunctionSet>,
     runtime: Arc<ExecutionRuntime>,
 ) -> Result<RunResult, String> {
+    let driver_thread_id = std::thread::current().id();
     let provider = BenchProvider::new();
     let adapter = WriteRuntimeAdapter::new(provider);
     let provider_counters = Arc::new(ProviderCounters::default());
@@ -455,8 +520,13 @@ fn run_once(
         adapter: adapter.clone(),
         counters: Arc::clone(&provider_counters),
         append_delay_us: config.append_delay_us,
+        driver_thread_id,
     });
-    let plans = build_plans(case, &adapter, execution, Arc::clone(&function_set))?;
+    let BuiltPlans {
+        writer: writer_factory,
+        finish: finish_factory,
+        writer_relation_schema,
+    } = build_plans(case, &adapter, execution, Arc::clone(&function_set))?;
     let query_tracker = MemTracker::new_root(format!("ncp8_{}_{}", case.name(), iteration));
     let state = RuntimeState::new(
         None,
@@ -472,22 +542,66 @@ fn run_once(
     );
     let writer_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkTableWriter"));
     let finish_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkTableFinish"));
-    let mut writer = plans.writer.create(1, 0);
+    let exchange_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkExchangeSink"));
+    let capture = Arc::new(CapturingExchangeTransmitter::default());
+    let destination = FragmentDestination::new(
+        EXCHANGE_DESTINATION_FINST,
+        RuntimeEndpoint::new("127.0.0.1", 1)?,
+        EXCHANGE_SOURCE_FINST,
+        0,
+        1,
+    )?;
+    let exchange_input = DataStreamSinkFactoryInput::try_new(
+        EXCHANGE_DESTINATION_NODE_ID,
+        DataStreamPartitionType::Unpartitioned,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![destination],
+    )?;
+    let exchange_transmitter: Arc<dyn ExchangeFrameTransmitter> = capture.clone();
+    let exchange_factory = DataStreamSinkFactory::new(
+        exchange_input,
+        EXCHANGE_SOURCE_FINST,
+        Some(EXCHANGE_SENDER_ID),
+        2,
+        ExprArena::default(),
+        exchange_transmitter,
+    );
+    let exchange_registry = ExecutionExchangeRegistry::default();
+    let exchange_key = ExchangeKey {
+        finst_id_hi: EXCHANGE_DESTINATION_FINST.high(),
+        finst_id_lo: EXCHANGE_DESTINATION_FINST.low(),
+        node_id: EXCHANGE_DESTINATION_NODE_ID,
+    };
+    exchange_registry.register_expected_chunk_schema(
+        exchange_key,
+        1,
+        Arc::clone(&writer_relation_schema),
+    )?;
+
+    let mut writer = writer_factory.create(1, 0);
     writer.set_mem_tracker(Arc::clone(&query_tracker));
     writer.set_profiles(writer_profiles.clone());
     writer.prepare()?;
     writer.bind_runtime_state(&state)?;
-    let mut finish = plans.finish.create(1, 0);
+    let mut exchange_sink = exchange_factory.create(1, 0);
+    exchange_sink.set_mem_tracker(Arc::clone(&query_tracker));
+    exchange_sink.set_profiles(exchange_profiles.clone());
+    exchange_sink.prepare()?;
+    exchange_sink.bind_runtime_state(&state)?;
+    let mut finish = finish_factory.create(1, 0);
     finish.set_mem_tracker(Arc::clone(&query_tracker));
     finish.set_profiles(finish_profiles.clone());
     finish.prepare()?;
     finish.bind_runtime_state(&state)?;
 
-    let cpu_start = process_cpu_time_ns();
+    let cpu_start = process_cpu_time_ns()?;
     let wall_start = Instant::now();
     let deadline = wall_start + POLL_TIMEOUT;
     let mut input_index = 0usize;
     let mut driver_writer_blocked_polls = 0u64;
+    let mut driver_exchange_blocked_polls = 0u64;
     let mut driver_finish_blocked_polls = 0u64;
     let mut writer_output_batches = 0u64;
 
@@ -504,12 +618,12 @@ fn run_once(
                 .pull_chunk(&state)?
             {
                 writer_output_batches += 1;
-                push_finish_chunk(
-                    &mut finish,
+                push_processor_chunk(
+                    &mut exchange_sink,
                     &state,
                     chunk,
                     deadline,
-                    &mut driver_finish_blocked_polls,
+                    &mut driver_exchange_blocked_polls,
                 )?;
             }
             continue;
@@ -547,12 +661,12 @@ fn run_once(
                 .pull_chunk(&state)?
             {
                 writer_output_batches += 1;
-                push_finish_chunk(
-                    &mut finish,
+                push_processor_chunk(
+                    &mut exchange_sink,
                     &state,
                     chunk,
                     deadline,
-                    &mut driver_finish_blocked_polls,
+                    &mut driver_exchange_blocked_polls,
                 )?;
             }
         } else {
@@ -560,6 +674,28 @@ fn run_once(
             std::thread::yield_now();
         }
     }
+
+    exchange_sink
+        .as_processor_mut()
+        .expect("exchange sink processor")
+        .set_finishing(&state)?;
+    while !exchange_sink.is_finished() {
+        check_progress(deadline, &state)?;
+        driver_exchange_blocked_polls = driver_exchange_blocked_polls.saturating_add(1);
+        std::thread::yield_now();
+    }
+    exchange_sink.close()?;
+    drop(exchange_sink);
+    let exchange_observation = decode_exchange_into_finish(
+        capture.take_frames(),
+        &exchange_registry,
+        exchange_key,
+        &exchange_profiles,
+        &mut finish,
+        &state,
+        deadline,
+        &mut driver_finish_blocked_polls,
+    )?;
 
     finish
         .as_processor_mut()
@@ -606,9 +742,13 @@ fn run_once(
     drop(writer);
     drop(finish);
     let wall_ns = u64::try_from(wall_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let cpu_ns = process_cpu_time_ns().saturating_sub(cpu_start);
+    let cpu_ns = process_cpu_time_ns()?.saturating_sub(cpu_start);
     let peak_memory_bytes = query_tracker.peak();
     let current_memory_bytes_after_drop = query_tracker.current();
+    let writer_queue_blocked_time_ns =
+        required_u64_counter(&writer_profiles, "WriterQueueBlockedTime")?;
+    let final_aggregate_blocked_time_ns =
+        required_u64_counter(&finish_profiles, "FinalAggregateBlockedTime")?;
 
     if summary_rows != 1
         || prepared_fragment_rows != 1
@@ -616,6 +756,10 @@ fn run_once(
         || artifact_rows != usize::from(matches!(case, AuxiliaryCase::Theta))
         || provider_counters.appended_rows.load(Ordering::Relaxed) != config.rows
         || provider_counters.abort_calls.load(Ordering::Relaxed) != 0
+        || provider_counters
+            .driver_thread_calls
+            .load(Ordering::Relaxed)
+            != 0
     {
         return Err(format!(
             "invalid benchmark output for {}: summary={summary_rows}, fragments={prepared_fragment_rows}, artifacts={artifact_rows}, row_count={published_row_count:?}",
@@ -644,11 +788,12 @@ fn run_once(
             "peak_accounted_memory_bytes": peak_memory_bytes,
             "current_accounted_memory_bytes_after_drop": current_memory_bytes_after_drop,
             "driver_writer_blocked_polls": driver_writer_blocked_polls,
+            "driver_exchange_blocked_polls": driver_exchange_blocked_polls,
             "driver_finish_blocked_polls": driver_finish_blocked_polls,
             "writer_queue_blocked_checks": counter(&writer_profiles, "WriterQueueBlockedChecks"),
             "composite_writer_blocked_checks": counter(&writer_profiles, "CompositeWriterBlockedChecks"),
             "writer_queue_blocked_intervals": counter(&writer_profiles, "WriterQueueBlockedIntervals"),
-            "writer_queue_blocked_time_ns": counter(&writer_profiles, "WriterQueueBlockedTime"),
+            "writer_queue_blocked_time_ns": writer_queue_blocked_time_ns,
             "composite_writer_blocked_intervals": counter(&writer_profiles, "CompositeWriterBlockedIntervals"),
             "composite_writer_blocked_time_ns": counter(&writer_profiles, "CompositeWriterBlockedTime"),
             "writer_queue_peak_batches": counter(&writer_profiles, "WriterQueuePeakBatches"),
@@ -661,19 +806,50 @@ fn run_once(
                 &finish_profiles,
                 "FinalAggregateBlockedCount",
             ),
-            "final_aggregate_blocked_time_ns": counter(&finish_profiles, "FinalAggregateBlockedTime"),
+            "final_aggregate_blocked_time_ns": final_aggregate_blocked_time_ns,
             "final_aggregate_cpu_time_ns": counter(&finish_profiles, "FinalAggregateCpuTime"),
             "writer_multiplex_rows": counter(&finish_profiles, "WriterMultiplexRows"),
             "writer_multiplex_bytes": counter(&finish_profiles, "WriterMultiplexBytes"),
             "root_output_rows": counter(&finish_profiles, "RootOutputRows"),
             "root_output_bytes": counter(&finish_profiles, "RootOutputBytes"),
             "root_output_logical_bytes_observed": root_logical_bytes,
+            "exchange_writer_relation_encoded_payload_bytes": exchange_observation.encoded_payload_bytes,
+            "exchange_writer_relation_sent_payload_bytes": exchange_observation.sent_payload_bytes,
+            "exchange_writer_relation_request_count": exchange_observation.request_count,
+            "exchange_writer_relation_data_frame_count": exchange_observation.data_frame_count,
+            "exchange_writer_relation_eos_frame_count": exchange_observation.eos_frame_count,
             "writer_output_batches": writer_output_batches,
             "root_output_batches": root_output_batches,
             "provider_open_calls": provider_counters.open_calls.load(Ordering::Relaxed),
             "provider_append_calls": provider_counters.append_calls.load(Ordering::Relaxed),
             "provider_finish_calls": provider_counters.finish_calls.load(Ordering::Relaxed),
             "provider_abort_calls": provider_counters.abort_calls.load(Ordering::Relaxed),
+            "provider_driver_thread_calls": provider_counters.driver_thread_calls.load(Ordering::Relaxed),
+            "observations": {
+                "throughput": observation(throughput, "harness.monotonic_wall_clock"),
+                "cpu": observation(cpu_ns, "os.getrusage_process_user_plus_system"),
+                "peak_memory": observation(peak_memory_bytes, "execution.query_mem_tracker.peak"),
+                "writer_queue_blocked_time": observation(
+                    writer_queue_blocked_time_ns,
+                    "execution.TableWriter.CommonMetrics.WriterQueueBlockedTime",
+                ),
+                "final_aggregate_blocked_time": observation(
+                    final_aggregate_blocked_time_ns,
+                    "execution.TableFinish.CommonMetrics.FinalAggregateBlockedTime",
+                ),
+                "exchange_encoded_payload_bytes": observation(
+                    exchange_observation.encoded_payload_bytes,
+                    "execution.DataStreamSink.CommonMetrics.SerializedBytes",
+                ),
+                "exchange_sent_payload_bytes": observation(
+                    exchange_observation.sent_payload_bytes,
+                    "execution.DataStreamSink.CommonMetrics.BytesSent",
+                ),
+                "provider_calls_on_driver_thread": observation(
+                    provider_counters.driver_thread_calls.load(Ordering::Relaxed),
+                    "benchmark_provider.thread_identity_probe",
+                ),
+            },
         }),
         theta_body,
     })
@@ -727,6 +903,7 @@ fn build_plans(
     .map_err(|error| error.to_string())?;
     let writer = TableWriterOperatorFactory::try_new(&writer_node, function_set)
         .map_err(|error| format!("build writer factory: {error}"))?;
+    let writer_relation_schema = Arc::clone(writer_relation.chunk_schema());
     let finish_node = TableFinishNode::try_new_with_relations(
         vec![*values_input()],
         3,
@@ -740,6 +917,7 @@ fn build_plans(
     Ok(BuiltPlans {
         writer,
         finish: TableFinishOperatorFactory::new_with_arena(&finish_node, Arc::new(arena)),
+        writer_relation_schema,
     })
 }
 
@@ -840,8 +1018,8 @@ fn ensure_theta_types(resolved: &ResolvedAggregateSignature) -> Result<(), Strin
     Ok(())
 }
 
-fn push_finish_chunk(
-    finish: &mut Box<dyn Operator>,
+fn push_processor_chunk(
+    processor: &mut Box<dyn Operator>,
     state: &RuntimeState,
     chunk: Chunk,
     deadline: Instant,
@@ -849,19 +1027,99 @@ fn push_finish_chunk(
 ) -> Result<(), String> {
     loop {
         check_progress(deadline, state)?;
-        if finish
+        if processor
             .as_processor_ref()
-            .expect("finish processor")
+            .expect("processor")
             .need_input()
         {
-            return finish
+            return processor
                 .as_processor_mut()
-                .expect("finish processor")
+                .expect("processor")
                 .push_chunk(state, chunk);
         }
         *blocked_polls = blocked_polls.saturating_add(1);
         std::thread::yield_now();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_exchange_into_finish(
+    mut frames: Vec<ExchangeFrame>,
+    registry: &ExecutionExchangeRegistry,
+    key: ExchangeKey,
+    profiles: &OperatorProfiles,
+    finish: &mut Box<dyn Operator>,
+    state: &RuntimeState,
+    deadline: Instant,
+    blocked_polls: &mut u64,
+) -> Result<ExchangeObservation, String> {
+    frames.sort_by_key(|frame| frame.sequence);
+    if frames.is_empty() {
+        return Err("writer relation exchange emitted no frames".to_string());
+    }
+    let mut actual_sent_bytes = 0u64;
+    let mut data_frame_count = 0u64;
+    let mut eos_frame_count = 0u64;
+    let mut saw_eos = false;
+    for frame in frames {
+        if saw_eos {
+            return Err("writer relation exchange emitted a frame after EOS".to_string());
+        }
+        if frame.destination_fragment_instance_id != EXCHANGE_DESTINATION_FINST
+            || frame.sender_fragment_instance_id != EXCHANGE_SOURCE_FINST
+            || frame.destination_node_id != EXCHANGE_DESTINATION_NODE_ID
+            || frame.sender_id != EXCHANGE_SENDER_ID
+        {
+            return Err("writer relation exchange frame identity drifted".to_string());
+        }
+        actual_sent_bytes = actual_sent_bytes.saturating_add(
+            u64::try_from(frame.payload.len())
+                .map_err(|_| "exchange payload length overflow".to_string())?,
+        );
+        if frame.eos {
+            saw_eos = true;
+            eos_frame_count = eos_frame_count.saturating_add(1);
+        } else {
+            data_frame_count = data_frame_count.saturating_add(1);
+        }
+        let decoded = registry.decode_chunks_for_sender(
+            key,
+            frame.sender_id,
+            frame.backend_number,
+            &frame.payload,
+        )?;
+        if frame.eos && !decoded.is_empty() {
+            return Err("writer relation exchange EOS decoded data rows".to_string());
+        }
+        for chunk in decoded {
+            push_processor_chunk(finish, state, chunk, deadline, blocked_polls)?;
+        }
+    }
+    if eos_frame_count != 1 || data_frame_count == 0 {
+        return Err(format!(
+            "writer relation exchange frame coverage is invalid: data={data_frame_count}, eos={eos_frame_count}"
+        ));
+    }
+
+    let encoded_payload_bytes = required_u64_counter(profiles, "SerializedBytes")?;
+    let sent_payload_bytes = required_u64_counter(profiles, "BytesSent")?;
+    let request_count = required_u64_counter(profiles, "RequestSent")?;
+    let expected_requests = data_frame_count.saturating_add(eos_frame_count);
+    if encoded_payload_bytes != sent_payload_bytes
+        || sent_payload_bytes != actual_sent_bytes
+        || request_count != expected_requests
+    {
+        return Err(format!(
+            "writer relation exchange accounting mismatch: encoded={encoded_payload_bytes}, profile_sent={sent_payload_bytes}, transmitter_sent={actual_sent_bytes}, requests={request_count}, frames={expected_requests}"
+        ));
+    }
+    Ok(ExchangeObservation {
+        encoded_payload_bytes,
+        sent_payload_bytes,
+        request_count,
+        data_frame_count,
+        eos_frame_count,
+    })
 }
 
 fn inspect_root_chunk(
@@ -940,6 +1198,23 @@ fn counter(profiles: &OperatorProfiles, name: &str) -> i64 {
     profiles.common.counter_value(name).unwrap_or(0)
 }
 
+fn required_u64_counter(profiles: &OperatorProfiles, name: &str) -> Result<u64, String> {
+    let value = profiles
+        .common
+        .counter_value(name)
+        .ok_or_else(|| format!("required benchmark observer {name} is missing"))?;
+    u64::try_from(value)
+        .map_err(|_| format!("required benchmark observer {name} is negative: {value}"))
+}
+
+fn observation(value: impl Serialize, source: &'static str) -> Value {
+    json!({
+        "value": value,
+        "source": source,
+        "observed": true,
+    })
+}
+
 fn check_progress(deadline: Instant, state: &RuntimeState) -> Result<(), String> {
     if let Some(error) = state.error() {
         return Err(format!("execution runtime failed: {error}"));
@@ -982,30 +1257,50 @@ fn summarize(case: AuxiliaryCase, samples: &[Value]) -> Result<Value, String> {
     throughputs.sort_by(f64::total_cmp);
     cpu.sort_unstable();
     peak.sort_unstable();
+    let median_throughput = throughputs[throughputs.len() / 2];
+    let median_cpu = cpu[cpu.len() / 2];
+    let max_peak = peak.last().copied().unwrap_or(0);
     Ok(json!({
         "record": "summary",
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "case": case.name(),
         "measurement_rounds": selected.len(),
-        "median_throughput_rows_per_second": throughputs[throughputs.len() / 2],
-        "median_process_cpu_time_ns": cpu[cpu.len() / 2],
-        "max_peak_accounted_memory_bytes": peak.last().copied().unwrap_or(0),
+        "median_throughput_rows_per_second": median_throughput,
+        "median_process_cpu_time_ns": median_cpu,
+        "max_peak_accounted_memory_bytes": max_peak,
+        "observations": {
+            "median_throughput": observation(
+                median_throughput,
+                "derived.median.execution.sample.observations.throughput",
+            ),
+            "median_cpu": observation(
+                median_cpu,
+                "derived.median.execution.sample.observations.cpu",
+            ),
+            "max_peak_memory": observation(
+                max_peak,
+                "derived.max.execution.sample.observations.peak_memory",
+            ),
+        },
         "performance_gate": null,
         "performance_gate_note": "measurement only; compare distributions outside the harness",
     }))
 }
 
-fn process_cpu_time_ns() -> u64 {
+fn process_cpu_time_ns() -> Result<u64, String> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: getrusage initializes the supplied `rusage` on success. The
     // pointer is valid for the duration of the call and not retained.
     let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
     if status != 0 {
-        return 0;
+        return Err(format!(
+            "getrusage failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: the successful getrusage call initialized the value.
     let usage = unsafe { usage.assume_init() };
-    timeval_ns(usage.ru_utime).saturating_add(timeval_ns(usage.ru_stime))
+    Ok(timeval_ns(usage.ru_utime).saturating_add(timeval_ns(usage.ru_stime)))
 }
 
 fn timeval_ns(value: libc::timeval) -> u64 {
