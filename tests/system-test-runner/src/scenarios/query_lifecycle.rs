@@ -1,11 +1,12 @@
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext};
+use crate::scenarios::task_evidence;
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
-    ParticipantTerminalOutcomeKind, QueryExecutionResourceSnapshot,
-    QueryLifecycleStructuredSnapshot, ServerHandle,
+    QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot, ServerHandle,
 };
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::thread;
@@ -15,9 +16,15 @@ const REQUIRED_BACKENDS: usize = 3;
 const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
-/// Unlike the coordinator-local baseline, this must create BE fragment work so
-/// StageFragments and StartPreparedQuery cross the native lifecycle boundary.
-const NID2_STARTUP_FENCE_QUERY: &str =
+/// The query the three identity-fence cases below issue.
+///
+/// Unlike the coordinator-local baseline it has to place real tasks on a
+/// backend, because every one of these faults is claimed on an operation about
+/// a task: two on `CreateTask` and one on a status frame. The sleep keeps a
+/// task running rather than being needed by any fault -- a status frame exists
+/// only while a task does, and a constant relation can finish before its
+/// subscription has carried one.
+const NID2_FENCE_QUERY: &str =
     "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -25,9 +32,9 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedBaseline),
         Box::new(MysqlDisconnect),
         Box::new(QueryTimeout),
-        Box::new(Nid2StageConflict),
-        Box::new(Nid2StartDigestConflict),
-        Box::new(Nid2PostInitForeignRef),
+        Box::new(Nid2CreateConflict),
+        Box::new(Nid2CreateReceiptForeignTask),
+        Box::new(Nid2ForeignStatusProcess),
     ]
 }
 
@@ -58,10 +65,11 @@ impl Scenario for DistributedBaseline {
         let before_third = second.execution_id.clone();
         execute_baseline_query(&mut connection, "third")?;
         let third = await_terminal_snapshot(context, before_third.as_deref())?;
-        assert_process_attribution(&[&first, &second, &third])?;
-        assert_process_attribution_diagnostics(context, &third)?;
+        let snapshots = [&first, &second, &third];
+        assert_process_attribution(&snapshots)?;
+        assert_process_attribution_diagnostics(context, &snapshots)?;
         context.action(format!(
-            "verified three native terminal snapshots share namespace=0x{:016x}, use consecutive sequence {}, {}, {}, attempt=1, and cover all 3 backend diagnostics",
+            "verified three native terminal snapshots share namespace=0x{:016x}, use consecutive sequence {}, {}, {}, and attempt=1",
             first.process_namespace,
             first.local_sequence,
             second.local_sequence,
@@ -148,117 +156,300 @@ impl Scenario for QueryTimeout {
     }
 }
 
-struct Nid2StageConflict;
-
-impl Scenario for Nid2StageConflict {
-    fn name(&self) -> &'static str {
-        "query-lifecycle/nid-2-stage-conflict"
-    }
-
-    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        run_nid2_startup_rejection(
-            context,
-            "stage-conflict-after-apply",
-            "NOVAROCKS_STAGE_CONFLICT_AFTER_APPLY",
-        )
-    }
-}
-
-struct Nid2StartDigestConflict;
-
-impl Scenario for Nid2StartDigestConflict {
-    fn name(&self) -> &'static str {
-        "query-lifecycle/nid-2-start-digest-conflict"
-    }
-
-    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        run_nid2_startup_rejection(
-            context,
-            "start-digest-corrupt",
-            "NOVAROCKS_START_DIGEST_CORRUPTED",
-        )
-    }
-}
-
-struct Nid2PostInitForeignRef;
-
-impl Scenario for Nid2PostInitForeignRef {
-    fn name(&self) -> &'static str {
-        "query-lifecycle/nid-2-post-init-foreign-ref"
-    }
-
-    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        require_three_backends(context)?;
-        let baseline = resource_snapshot(context)?;
-        let connect_timeout = bounded_io_timeout(context, "connect foreign-observation client")?;
-        let mut connection =
-            mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
-        for backend_index in 0..REQUIRED_BACKENDS {
-            context
-                .handle()
-                .arm_query_lifecycle_fault(backend_index, "observation-foreign-participant")
-                .with_context(|| format!("arm foreign observation ref for BE[{backend_index}]"))?;
-        }
-        execute_baseline_query(&mut connection, "foreign-observation")?;
-        let marker = "NOVAROCKS_FRAGMENT_OBSERVATION_FOREIGN_PARTICIPANT";
-        let observed = (0..REQUIRED_BACKENDS)
-            .map(|backend_index| context.handle().be_log_count(backend_index, marker))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .sum::<usize>();
-        ensure!(
-            observed > 0,
-            "runner fault did not emit any foreign participant observation marker"
-        );
-        context
-            .handle()
-            .clear_query_lifecycle_faults()
-            .context("clear foreign observation participant fault tokens")?;
-        await_resource_convergence(context, &baseline, true)?;
-        context.action(
-            "foreign post-Init observation refs were emitted only by the runner fault and rejected before frontend mutable telemetry state",
-        );
-        Ok(())
-    }
-}
-
-fn run_nid2_startup_rejection(
-    context: &mut ScenarioContext,
+/// One NID-2 identity fence, expressed as the wire value a backend misstates
+/// and the frontend refusal that must follow.
+struct Nid2Fence {
+    /// The runner-owned fault kind, armed by name through the cluster harness.
     fault: &'static str,
+    /// The marker that fault prints, token-scoped to one arming.
     marker: &'static str,
-) -> Result<()> {
+    /// What the misstated value was, for the accepted-action line.
+    subject: &'static str,
+    /// Substrings the client-visible error must carry.
+    ///
+    /// Both halves matter. The first is the shape of the refusal --- which
+    /// `TaskExecutionError` variant answered --- and the second names the fence
+    /// inside it, so a statement that failed for an unrelated reason cannot
+    /// satisfy the case. A bare `expect_err` would have been satisfied by any
+    /// failure at all, including one the fault did not cause.
+    error_fragments: &'static [&'static str],
+}
+
+/// A `CreateTask` conflict verdict on a task that really was admitted.
+///
+/// # Why the subject moved, and why it had to
+///
+/// This case was `nid-2-stage-conflict`. Its fault claimed
+/// `handle_stage_fragments` (`novarocks/backend/src/query_lifecycle/rpc.rs`)
+/// and rewrote a staged participant's outcome to
+/// `StageFragmentsRejectedConflict`; no production query reaches that handler
+/// any more, so on the task path the fault was armed, nothing consumed it, the
+/// query succeeded, and the case waited out its whole budget for a marker with
+/// no emitter.
+///
+/// The fence itself did not move far. `CreateTask` is the task protocol's
+/// single per-task admission point and `CreateConflict` is its refusal, so the
+/// successor fault answers an admitted create with that verdict. The frontend
+/// half is `RemoteTask::on_create_ack` reporting `CreateSettlement::FailedClosed`
+/// and `QueryTaskExecution::acknowledge_task` turning it into
+/// `TaskExecutionError::OperationFailed`
+/// (`novarocks/frontend/src/task_execution/execution.rs`).
+///
+/// What is preserved verbatim is the "after apply" half, which is the whole
+/// reason this case can fail: the task is admitted and running on that backend,
+/// so a frontend that retried the conflict or ignored it would find working
+/// state behind the lie and the statement would return rows.
+struct Nid2CreateConflict;
+
+impl Scenario for Nid2CreateConflict {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/nid-2-create-conflict"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_nid2_fence(
+            context,
+            &Nid2Fence {
+                fault: "create-task-conflict-after-apply",
+                marker: "NOVAROCKS_TASK_CREATE_CONFLICT_AFTER_APPLY",
+                subject: "a CreateTask conflict verdict answered after the task was admitted",
+                error_fragments: &["failed closed", "runner-owned CreateTask conflict"],
+            },
+        )
+    }
+}
+
+/// A `CreateTask` acknowledgement that names a task the frontend never asked
+/// about.
+///
+/// # Why the digest this replaces has no counterpart
+///
+/// This case was `nid-2-start-digest-conflict`. Its fault flipped a bit of the
+/// `stage_digest` carried by `StartPreparedQuery`
+/// (`novarocks/backend/src/query_lifecycle/rpc.rs`), and the fence it met was
+/// `QueryLifecycleRegistry::start_prepared_query` refusing a start whose digest
+/// was not the one it had staged.
+///
+/// That fence does not exist on the task protocol, and no substitute was
+/// invented for it. There is no second operation that commits an already
+/// staged plan --- a descriptor travels once, on `CreateTask` --- and
+/// `WireFragmentPlan::parse`
+/// (`novarocks/proto-codec/src/task_execution/descriptor.rs`) derives a plan's
+/// fingerprint from the bytes the receiver just read, so no field of a first
+/// delivery can be corrupted into disagreeing with a plan the receiver already
+/// holds. The fingerprint is compared only against an installed one, on a
+/// replay, and that comparison is the same `CreateConflict` the case above now
+/// covers; restating it here would be a second copy of one fact.
+///
+/// What survives as a distinct fence is the identity half. `TaskIdentity` is
+/// indivisible, and an answer that names another task is refused rather than
+/// adopted --- by `decode_create_task_ack` against the request's own identity
+/// (`novarocks/proto-codec/src/task_execution/operation.rs`) and again by
+/// `TaskIdentity::verify_matches` in `RemoteTask::on_create_ack`. So the
+/// forgery is the acknowledgement's task id, and the direction of the
+/// substitution flips with it: the corrupted value is now in the answer rather
+/// than in the request, because a `CreateTask` request is a validated neutral
+/// value whose identity and context are checked against each other at
+/// construction and therefore cannot be built inconsistent.
+///
+/// A frontend that adopted the foreign receipt would mark this attempt's task
+/// created and the statement would return rows, so the refusal is what the case
+/// rests on.
+struct Nid2CreateReceiptForeignTask;
+
+impl Scenario for Nid2CreateReceiptForeignTask {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/nid-2-create-receipt-foreign-task"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_nid2_fence(
+            context,
+            &Nid2Fence {
+                fault: "create-task-receipt-foreign-task",
+                marker: "NOVAROCKS_TASK_CREATE_RECEIPT_FOREIGN_TASK",
+                subject: "a CreateTask acknowledgement naming a task the request never addressed",
+                error_fragments: &["failed closed", "InvalidStateOrRequest"],
+            },
+        )
+    }
+}
+
+/// A delivered task status event that names a foreign backend process.
+///
+/// # Why the subject moved, and why the verdict changed with it
+///
+/// This case was `nid-2-post-init-foreign-ref`. Its fault replaced the
+/// `ParticipantAttemptRef` of a fragment observation published on the retired
+/// control stream (`observation_participant_ref` in
+/// `novarocks/backend/src/query_lifecycle/registry.rs`), and the frontend
+/// dropped that observation before it could reach mutable telemetry state ---
+/// so the old case asserted that the statement *succeeded* while the forged
+/// reference was refused.
+///
+/// The surviving observation channel is `SubscribeTaskStatus`. It names no
+/// participant of its own, so the forgeable fact is the backend process inside
+/// the event's `TaskIdentity`, and the fence is `observe_event`
+/// (`novarocks/frontend/src/native/task_transport.rs`) comparing it against the
+/// subscription's own query context.
+///
+/// The verdict is genuinely different, and this case now asserts the new one
+/// rather than the old one: `SubscriptionState::ProcessMismatch` is fatal by
+/// design, and `TaskRound::turn` reads it through `settled_fatally` and fails
+/// the attempt with `TaskExecutionError::ParticipantUnobservable` naming the
+/// backend. Asserting the old success would now be asserting the opposite of
+/// what the protocol does.
+///
+/// The "never reached mutable state" half is still proved, just not from a
+/// cluster: `observe_event` returns before `intake.publish`, and
+/// `a_status_event_from_another_process_is_fatal` in that module asserts the
+/// intake stayed empty. What only a cluster can show is that the fence fires at
+/// all on a real subscription --- which is this case.
+struct Nid2ForeignStatusProcess;
+
+impl Scenario for Nid2ForeignStatusProcess {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/nid-2-foreign-status-process"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_nid2_fence(
+            context,
+            &Nid2Fence {
+                fault: "task-status-foreign-process",
+                marker: "NOVAROCKS_TASK_STATUS_FOREIGN_PROCESS",
+                subject: "a task status event naming a backend process other than its own",
+                error_fragments: &["no longer observable", "process_mismatch"],
+            },
+        )
+    }
+}
+
+/// Drives one identity fence: arm, run, prove the refusal, disarm, converge.
+///
+/// The arming is cleared on every path, including a failed assertion, and that
+/// is not tidiness. An arm the frontend has already bound to this attempt is
+/// harmless -- its trigger names a dead execution identity and can never match
+/// again -- but a case that fails before its statement is scheduled leaves
+/// three *unbound* arms behind, and the scheduler binds whatever it finds to
+/// the next attempt it plans. That would perturb an unrelated scenario, and the
+/// failure would be attributed to it.
+fn run_nid2_fence(context: &mut ScenarioContext, fence: &Nid2Fence) -> Result<()> {
     require_three_backends(context)?;
     let baseline = resource_snapshot(context)?;
-    let connect_timeout = bounded_io_timeout(context, "connect NID-2 lifecycle client")?;
+    let connect_timeout = bounded_io_timeout(context, "connect NID-2 identity-fence client")?;
     let mut connection =
         mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
+    let tokens = arm_on_every_backend(context, fence.fault)?;
+    context.action(format!(
+        "armed NID-2 {} across every Backend participant with tokens {tokens:?}",
+        fence.fault
+    ));
+
+    let observed = observe_nid2_fence(context, fence, &tokens, &mut connection);
+    let cleared = context
+        .handle()
+        .clear_query_lifecycle_faults()
+        .with_context(|| format!("clear {} tokens", fence.fault));
+    let (backend, error) = observed?;
+    cleared?;
+    await_resource_convergence(context, &baseline, true)?;
+    context.action(format!(
+        "BE[{backend}] published {} and the frontend fenced {}: {error}",
+        fence.marker, fence.subject
+    ));
+    Ok(())
+}
+
+/// Runs the query under one armed fence and returns the backend that fired
+/// together with the client-visible refusal.
+fn observe_nid2_fence(
+    context: &mut ScenarioContext,
+    fence: &Nid2Fence,
+    tokens: &[String],
+    connection: &mut mysql::Conn,
+) -> Result<(usize, String)> {
+    let error = match connection.query::<i64, _>(NID2_FENCE_QUERY) {
+        Ok(rows) => bail!(
+            "{} was armed on every backend but the public query returned {rows:?} instead of \
+             failing closed",
+            fence.fault
+        ),
+        Err(error) => error.to_string(),
+    };
+    for fragment in fence.error_fragments {
+        ensure!(
+            error.contains(fragment),
+            "{} rejected the public query without naming its fence: expected {fragment:?} in {error}",
+            fence.fault
+        );
+    }
+    // Read after the refusal, and polled rather than sampled once. The marker
+    // is printed before the answer that carries the forgery is sent, so it is
+    // always already produced by now -- but backend output reaches the harness
+    // through an asynchronous pump, so a single read can be a few milliseconds
+    // early. The previous form read once and accepted any nonzero count, which
+    // could be satisfied by an earlier scenario's marker in the same log.
+    let backend = await_token_scoped_marker(context, fence.marker, tokens)?;
+    Ok((backend, error))
+}
+
+/// Arms one fault on every backend and returns each arming's token.
+///
+/// Every backend is armed because the fence is not about placement: the
+/// scheduler places this query's tasks without regard to where an arming sits,
+/// and a query with no split assignment can establish a single context. Arming
+/// one backend would make the case a coin flip on which one that is. Each arm
+/// carries its own token, which is what keeps the assertion scoped to this
+/// scenario rather than to whatever the shared backend logs already hold.
+fn arm_on_every_backend(context: &mut ScenarioContext, fault: &'static str) -> Result<Vec<String>> {
+    let mut tokens = Vec::with_capacity(REQUIRED_BACKENDS);
     for backend_index in 0..REQUIRED_BACKENDS {
         context
             .handle()
             .arm_query_lifecycle_fault(backend_index, fault)
             .with_context(|| format!("arm {fault} for BE[{backend_index}]"))?;
+        let token = context
+            .handle()
+            .armed_query_lifecycle_fault_token(backend_index, fault)
+            .with_context(|| format!("read the {fault} token armed for BE[{backend_index}]"))?
+            .with_context(|| format!("armed {fault} for BE[{backend_index}] has no token"))?;
+        tokens.push(token);
     }
-    context.action(format!(
-        "armed NID-2 {fault} across every Backend participant"
-    ));
-    let error = connection
-        .query::<i64, _>(NID2_STARTUP_FENCE_QUERY)
-        .expect_err("NID-2 startup fault must reject the public query");
-    context.action(format!("public query rejected by {fault}: {error}"));
-    let observed = (0..REQUIRED_BACKENDS)
-        .map(|backend_index| context.handle().be_log_count(backend_index, marker))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .sum::<usize>();
-    ensure!(
-        observed > 0,
-        "runner fault {fault} did not emit any {marker} marker"
-    );
-    context
-        .handle()
-        .clear_query_lifecycle_faults()
-        .with_context(|| format!("clear {fault} tokens"))?;
-    await_resource_convergence(context, &baseline, true)
+    Ok(tokens)
+}
+
+/// Waits until some backend logged `marker` carrying one of `tokens`.
+///
+/// The marker name and the token have to come from the same line, so the
+/// evidence is one emission of this scenario's own arming rather than a marker
+/// from an earlier case standing next to a token from this one.
+fn await_token_scoped_marker(
+    context: &mut ScenarioContext,
+    marker: &str,
+    tokens: &[String],
+) -> Result<usize> {
+    let needles = tokens
+        .iter()
+        .map(|token| format!("token={token}"))
+        .collect::<Vec<_>>();
+    loop {
+        for backend_index in 0..context.handle().be_count() {
+            let log = context
+                .handle()
+                .be_log_contents(backend_index)
+                .with_context(|| format!("read BE[{backend_index}] log for {marker}"))?;
+            if log.lines().any(|line| {
+                line.contains(marker) && needles.iter().any(|needle| line.contains(needle))
+            }) {
+                return Ok(backend_index);
+            }
+        }
+        let remaining = context.remaining(&format!(
+            "observe {marker} carrying one of this arming's tokens {tokens:?}"
+        ))?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
@@ -336,23 +527,17 @@ fn assert_process_attribution(snapshots: &[&QueryLifecycleStructuredSnapshot]) -
             "baseline query {ordinal} used unexpected attempt id {}",
             snapshot.attempt_id
         );
-        ensure!(
-            !snapshot.participant_outcomes.is_empty(),
-            "baseline query {ordinal} terminal snapshot had no participant outcome",
-        );
-        ensure!(
-            snapshot.participant_outcomes.len() <= REQUIRED_BACKENDS,
-            "baseline query {ordinal} terminal snapshot covered {} participants, exceeding the 1FE+{REQUIRED_BACKENDS} topology",
-            snapshot.participant_outcomes.len()
-        );
-        ensure!(
-            snapshot
-                .participant_outcomes
-                .iter()
-                .all(|outcome| matches!(outcome, ParticipantTerminalOutcomeKind::Proof)),
-            "baseline query {ordinal} terminal snapshot contains a non-proof participant outcome: {:?}",
-            snapshot.participant_outcomes
-        );
+        // Three participant-outcome assertions stood here: the list was not
+        // empty, it held no more entries than the topology, and every entry
+        // was a positive proof. All three are retired rather than restated,
+        // because their subject no longer exists: the task protocol mints no
+        // `ParticipantTerminalOutcome` at all, and the frontend deliberately
+        // publishes an empty list instead of inventing proofs the protocol
+        // never made (ADR-0134). What they were proving -- that a backend
+        // really executed the attempt and its work completed -- is now proved
+        // per query by `assert_query_completed_across_boundary`, from the
+        // establish and release receipts and the frontend's own report that
+        // every placed context answered.
     }
     ensure!(
         snapshots.len() >= 2,
@@ -363,8 +548,11 @@ fn assert_process_attribution(snapshots: &[&QueryLifecycleStructuredSnapshot]) -
 
 fn assert_process_attribution_diagnostics(
     context: &mut ScenarioContext,
-    snapshot: &QueryLifecycleStructuredSnapshot,
+    snapshots: &[&QueryLifecycleStructuredSnapshot],
 ) -> Result<()> {
+    let snapshot = snapshots
+        .last()
+        .context("attribution diagnostics require at least one snapshot")?;
     let namespace = format!("0x{:016x}", snapshot.process_namespace);
     let namespace_field = format!("query_process_namespace={namespace}");
     let startup_message = "NOVAROCKS_QUERY_PROCESS_NAMESPACE";
@@ -380,14 +568,35 @@ fn assert_process_attribution_diagnostics(
             .contains(&namespace_field),
         "FE startup diagnostics did not publish {namespace_field}"
     );
-    for backend in 0..REQUIRED_BACKENDS {
-        context
-            .handle()
-            .assert_be_log(backend, "NOVAROCKS_QUERY_INIT_APPLIED")?;
-        context.handle().assert_be_log(backend, &namespace_field)?;
+    // A per-backend loop over `NOVAROCKS_QUERY_INIT_APPLIED` and
+    // `query_process_namespace=<namespace>` stood here. Both were emitted only
+    // by the retired lifecycle registry, so neither has a producer on the task
+    // path, and neither can be restated as an all-three-backends fact: a query
+    // context is established only where the scheduler placed a task, and this
+    // baseline query -- constant rows, no scan, no splits -- places tasks on
+    // one backend. The loop also matched the whole accumulated log, so it
+    // never actually attributed a marker to this query.
+    //
+    // The replacement is scoped to the attempt instead of to the cluster.
+    // Backend markers carry the execution identity, whose high and low halves
+    // are the namespace and local sequence the frontend published, so an
+    // establish admitted under this identity is the same cross-process
+    // attribution fact the retired `namespace_field` assertion was making --
+    // now provably about this query.
+    //
+    // Checked for every baseline query rather than only the last, because the
+    // retired participant-outcome assertions it replaces also ran per query.
+    let mut backends = BTreeSet::new();
+    for (ordinal, snapshot) in snapshots.iter().enumerate() {
+        backends.extend(task_evidence::assert_query_completed_across_boundary(
+            context,
+            snapshot,
+            &format!("baseline query {}", ordinal + 1),
+        )?);
     }
     context.action(format!(
-        "verified one FE startup namespace publication and matching BE lifecycle diagnostics for {namespace}"
+        "verified one FE startup namespace publication for {namespace} and matching task-protocol \
+         attribution on the backends that ran the attempts: {backends:?}"
     ));
     Ok(())
 }

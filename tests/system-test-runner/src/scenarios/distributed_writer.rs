@@ -50,7 +50,7 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::{CrossProcessChildEnvironment, QueryLifecyclePhase, ServerHandle};
+use novarocks_cluster_harness::{CrossProcessChildEnvironment, ServerHandle};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -80,6 +80,17 @@ const SEED_FILES: i64 = 6;
 const SEED_ROWS: i64 = SEED_ROWS_PER_FILE * SEED_FILES;
 /// `SEED_ROWS * (SEED_ROWS + 1) / 2`, the sum of `1..=SEED_ROWS`.
 const SEED_SUM: i64 = SEED_ROWS * (SEED_ROWS + 1) / 2;
+
+/// One sleeping row per file for the abort case's source, and how long each
+/// row sleeps.
+///
+/// Three files so the scan reaches more than one backend, and five seconds so
+/// the write stays in flight long enough for a task-creation marker to be
+/// observed and a KILL QUERY to be delivered, without adding a wait the
+/// scenario's budget would notice. The rows sleep in parallel across splits,
+/// so the statement runs for about one delay rather than three.
+const ABORT_SOURCE_FILES: i64 = 3;
+const ABORT_DELAY_S: i64 = 5;
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -448,6 +459,41 @@ fn seed_source_files(
                  SELECT generate_series FROM TABLE(generate_series({low}, {high}))"
             ))
             .with_context(|| format!("seed {catalog}.{database}.{source} rows {low}..{high}"))?;
+    }
+    Ok(())
+}
+
+/// Seeds the one-row-per-file source the abort case writes from.
+///
+/// Separate from `seed_source_files` because it exists for its delay, not its
+/// data. The matrix's own source is twelve thousand rows across six files and
+/// a write of it finishes in well under a second, so a KILL QUERY aimed at it
+/// would race the commit: the case would pass or fail on scheduling luck
+/// rather than on whether an aborted attempt can commit. One row per file
+/// gives one sleeping row per split, so the delay is bounded by the sleep
+/// rather than multiplied by the row count -- the same shape
+/// `distributed-resilience`'s cancellation cases use.
+///
+/// Written with one statement per row so each row lands in its own file, and
+/// therefore its own split: a single statement would leave one file, one
+/// split, and a write that reaches one backend.
+fn seed_delay_source_files(
+    control: &mut mysql::Conn,
+    catalog: &str,
+    database: &str,
+    source: &str,
+) -> Result<()> {
+    control
+        .query_drop(format!(
+            "CREATE TABLE {catalog}.{database}.{source} (v BIGINT, delay_s BIGINT)"
+        ))
+        .with_context(|| format!("create {catalog}.{database}.{source}"))?;
+    for row in 1..=ABORT_SOURCE_FILES {
+        control
+            .query_drop(format!(
+                "INSERT INTO {catalog}.{database}.{source} VALUES ({row}, {ABORT_DELAY_S})"
+            ))
+            .with_context(|| format!("seed {catalog}.{database}.{source} row {row}"))?;
     }
     Ok(())
 }
@@ -1075,29 +1121,76 @@ impl Scenario for DistributedWriterRowLevel {
 
 /// One entry in the fault matrix: how the write data plane is broken, and how
 /// the scenario undoes the arming afterwards.
+///
+/// # The retired sixth case
+///
+/// This matrix used to carry `CompleteSetTerminalFailure`: every writer
+/// finished, the root's prepared set was complete, and one lifecycle
+/// participant never reported its terminal outcome, so the write had to fail
+/// on the second half of the barrier alone. It is deliberately gone rather
+/// than ported, for two independent reasons.
+///
+/// It has no fault to arm. `TerminalOutcomeSuppress` is claimed only by
+/// `QueryLifecycleRegistry`, which no production query reaches, and the
+/// outcome it suppressed does not exist: `publish_task_round_convergence`
+/// publishes an empty participant-outcome list because the task protocol's
+/// per-domain receipts and termination latch replaced that funnel (ADR-0134).
+///
+/// And its property is one the task protocol deliberately inverts. A lost
+/// terminal acknowledgement is *recovered* here, by replaying the exact
+/// request -- which is precisely what
+/// `tests/sql/correctness/distributed-resilience/sql/task-update-ack-loss.sql`
+/// asserts. "Suppress the terminal and the write must fail" would therefore
+/// assert the opposite of the design.
+///
+/// The state it described also cannot reach the commit barrier any more. In
+/// `novarocks/frontend/src/coordinator/execution.rs` the task round's drain
+/// loop keeps turning past its `client_visible_completion` gate while any
+/// declared writer or the root finish task has not published `FINISHED`, and
+/// a latched failure cause breaks that loop with an error propagated before
+/// the barrier is built. "Complete set, participant silent" is therefore a
+/// wait that ends at the statement deadline rather than a commit decision --
+/// and the barrier's own refusal of it is covered by the frontend unit tests
+/// in `query_execution/write_barrier.rs`. Keeping one matrix case honestly
+/// retired beats keeping one that asserts the opposite of the protocol.
 enum WriteFault {
     /// A writer fails at commit-fragment egress, after it already staged.
     WriterEgress,
     /// The root rejects a commit-fragment carrier at validation.
     RootValidation,
-    /// One backend's participant fragment is failed at Start. Its writers were
-    /// already opened during prepare, but the fragment never runs, so the
-    /// stream it owes the root aggregation never carries a row and never
-    /// reaches end-of-stream: the gather cannot close.
+    /// One backend's participant task is failed after it published RUNNING.
+    /// Its writers were already opened while the task was prepared, but the
+    /// drivers never run, so the stream it owes the root aggregation never
+    /// carries a row and never reaches end-of-stream: the gather cannot close.
     SeveredWriterStream,
-    /// The frontend's attempt is aborted while the fragments are running, so
-    /// it never fetches the root's complete prepared write set.
+    /// The frontend's attempt is aborted while its tasks are running, so it
+    /// never fetches the root's complete prepared write set.
     FetchAbort,
-    /// Every writer finishes and the root's set is complete, but a lifecycle
-    /// participant never reports its terminal outcome.
-    CompleteSetTerminalFailure,
 }
 
-/// The backend the severed-stream case arms, and the backend the complete-set
-/// case pins its root to. Both are fixed so the scenario can name the process
-/// its evidence must come from.
+/// The backend the severed-stream case arms. Fixed so the scenario can name
+/// the process its evidence must come from; a backend index, never a count.
 const SEVERED_BACKEND: usize = 2;
-const SUPPRESSED_BACKEND: usize = 1;
+
+/// The task protocol's evidence that one task really failed on the backend the
+/// fault was armed on.
+///
+/// It replaces `NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED`, which is
+/// emitted only by `NativeFragmentService`'s Stage/Start ingress: the task
+/// protocol runs its fragments from `NativeTaskExecutionHost`, so no
+/// production query reaches that emitter.
+const TASK_EXECUTION_FAILURE: &str = "task-execution-failure";
+const TASK_EXECUTION_FAILURE_INJECTED: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED";
+
+/// One task was admitted on a backend, which is this protocol's earliest
+/// evidence that an attempt is actually running out there.
+const TASK_CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+
+/// One backend applied this query's abort. Client cancellation reaches a
+/// backend as this operation, so it is what a case about aborting a running
+/// write has to count -- the retired chain's own abort and phase markers have
+/// no live emitter.
+const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
 
 impl WriteFault {
     /// How many times this fault has left evidence in a backend process.
@@ -1107,37 +1200,41 @@ impl WriteFault {
     /// statement fails for some unrelated reason and the scenario still passes.
     /// Every case therefore has to show that its own injection fired.
     fn injection_marker_count(&self, context: &mut ScenarioContext) -> Result<usize> {
-        let (index, marker) = match self {
-            Self::WriterEgress => (
-                None,
-                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-writer-failure ",
-            ),
-            Self::RootValidation => (
-                None,
-                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-root-failure ",
-            ),
-            Self::SeveredWriterStream => (
-                Some(SEVERED_BACKEND),
-                "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED",
-            ),
-            Self::FetchAbort => (None, "NOVAROCKS_QUERY_LIFECYCLE_PHASE"),
-            Self::CompleteSetTerminalFailure => (
-                None,
-                "NOVAROCKS_QUERY_FAULT_BOUND kind=terminal-outcome-suppress ",
-            ),
-        };
-        match index {
-            Some(index) => context
-                .handle()
-                .be_log_count(index, marker)
-                .with_context(|| format!("count {marker} on BE[{index}]")),
-            None => {
+        match self.injection_evidence() {
+            InjectionEvidence::Frontend(marker) => {
                 let log = context
                     .handle()
                     .fe_log_contents()
                     .context("read FE log for fault-injection evidence")?;
                 Ok(log.matches(marker).count())
             }
+            InjectionEvidence::Backend(index, marker) => context
+                .handle()
+                .be_log_count(index, marker)
+                .with_context(|| format!("count {marker} on BE[{index}]")),
+            InjectionEvidence::EveryBackend(marker) => backend_marker_total(context, marker),
+        }
+    }
+
+    /// Where this case's own injection leaves its evidence.
+    const fn injection_evidence(&self) -> InjectionEvidence {
+        match self {
+            Self::WriterEgress => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-writer-failure ",
+            ),
+            Self::RootValidation => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-root-failure ",
+            ),
+            Self::SeveredWriterStream => {
+                InjectionEvidence::Backend(SEVERED_BACKEND, TASK_EXECUTION_FAILURE_INJECTED)
+            }
+            // Summed across the cluster rather than pinned to one backend: an
+            // abort reaches the backends the scheduler placed this attempt on,
+            // which is a property of the plan and of the splits. What the case
+            // needs is that the abort was delivered somewhere at all, because
+            // the alternative -- a client error with no abort behind it -- is
+            // exactly what a timeout looks like.
+            Self::FetchAbort => InjectionEvidence::EveryBackend(TASK_CONTEXT_ABORT_APPLIED),
         }
     }
 
@@ -1148,44 +1245,23 @@ impl WriteFault {
         match self {
             Self::WriterEgress => Some("injected connector write writer failure"),
             Self::RootValidation => Some("injected connector write root failure"),
-            Self::SeveredWriterStream | Self::FetchAbort | Self::CompleteSetTerminalFailure => None,
+            Self::SeveredWriterStream | Self::FetchAbort => None,
+        }
+    }
+
+    /// Which of the scenario's two write statements this case runs.
+    const fn statement<'a>(&self, statements: &WriteStatements<'a>) -> &'a str {
+        match self {
+            Self::FetchAbort => statements.delayed,
+            Self::WriterEgress | Self::RootValidation | Self::SeveredWriterStream => {
+                statements.full
+            }
         }
     }
 
     /// The evidence only this case can produce.
-    fn assert_case_evidence(
-        &self,
-        delta: &WriteDelta,
-        after: &[WriteCounters],
-        case: &str,
-    ) -> Result<()> {
+    fn assert_case_evidence(&self, delta: &WriteDelta, case: &str) -> Result<()> {
         match self {
-            Self::CompleteSetTerminalFailure => {
-                // The data plane closed completely: every writer finished and
-                // the pinned root accepted every fragment they produced. Only
-                // the lifecycle half of the barrier failed, which is exactly
-                // the case a commit gate built on "the result arrived" alone
-                // would get wrong. This runs first in the matrix, so the root
-                // peak is still an exact statement about this attempt.
-                if delta.commit_fragments < delta.writing_backends.len() as f64 {
-                    bail!(
-                        "{case}: writers produced {} commit fragments across {} writing backends, \
-                         so the prepared write set was not complete before the lifecycle failed",
-                        delta.commit_fragments,
-                        delta.writing_backends.len()
-                    );
-                }
-                let root_entries = after[SUPPRESSED_BACKEND].root_peak_entries;
-                if (root_entries - delta.commit_fragments).abs() > f64::EPSILON {
-                    bail!(
-                        "{case}: BE[{SUPPRESSED_BACKEND}] aggregated {root_entries} prepared-set \
-                         entries but the cluster's writers produced {} commit fragments; the root \
-                         must have held the complete set",
-                        delta.commit_fragments
-                    );
-                }
-                Ok(())
-            }
             Self::SeveredWriterStream => {
                 // Writers opened on the other backends, so the root really did
                 // lose a live sender rather than never having had one.
@@ -1198,7 +1274,7 @@ impl WriteFault {
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            Self::WriterEgress | Self::RootValidation | Self::FetchAbort => Ok(()),
         }
     }
 
@@ -1208,11 +1284,30 @@ impl WriteFault {
             Self::RootValidation => "a root that rejects a commit-fragment carrier",
             Self::SeveredWriterStream => "a writer stream that never reaches the root aggregation",
             Self::FetchAbort => "an aborted attempt that never fetches the root's result",
-            Self::CompleteSetTerminalFailure => {
-                "a complete prepared set whose lifecycle participant never reports"
-            }
         }
     }
+}
+
+/// Where one case's injection leaves the evidence that it actually fired.
+enum InjectionEvidence {
+    /// In the frontend's own log, because the fault is bound there.
+    Frontend(&'static str),
+    /// On the one backend the fault was armed on.
+    Backend(usize, &'static str),
+    /// Anywhere across the backends, summed, because which backends the
+    /// marker reaches is a property of the plan rather than of the cluster.
+    EveryBackend(&'static str),
+}
+
+/// The two write statements the fault matrix runs.
+struct WriteStatements<'a> {
+    /// The whole seeded source. Every case that does not have to act on a
+    /// running write uses it, so the case's own fault is the only reason the
+    /// statement takes any time at all.
+    full: &'a str,
+    /// The sleeping source, for the one case that has to abort a write while
+    /// it is still running.
+    delayed: &'a str,
 }
 
 /// A failed write must leave nothing behind.
@@ -1256,6 +1351,7 @@ impl Scenario for DistributedWriterFaults {
         const CATALOG: &str = "distributed_writer_faults";
         const DATABASE: &str = "distributed_writer_fault_db";
         const SOURCE: &str = "distributed_writer_fault_source";
+        const DELAY_SOURCE: &str = "distributed_writer_fault_delay";
         const TABLE: &str = "distributed_writer_fault_data";
         let target = format!("{CATALOG}.{DATABASE}.{TABLE}");
 
@@ -1268,6 +1364,7 @@ impl Scenario for DistributedWriterFaults {
             SOURCE,
             "distributed-writer-faults",
         )?;
+        seed_delay_source_files(&mut control, CATALOG, DATABASE, DELAY_SOURCE)?;
         control
             .query_drop(format!(
                 "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
@@ -1276,17 +1373,21 @@ impl Scenario for DistributedWriterFaults {
 
         let snapshots_before = snapshot_count(&mut control, &target)?;
         let insert = format!("INSERT INTO {target} SELECT v FROM {CATALOG}.{DATABASE}.{SOURCE}");
+        // One sleeping row per file, so the write is genuinely in flight while
+        // the scenario acts on it. `sleep` is on the engine's
+        // non-deterministic list, so it survives constant folding.
+        let delayed_insert = format!(
+            "INSERT INTO {target} SELECT v FROM {CATALOG}.{DATABASE}.{DELAY_SOURCE} \
+             WHERE sleep(delay_s)"
+        );
+        let statements = WriteStatements {
+            full: &insert,
+            delayed: &delayed_insert,
+        };
 
         // A committed row would prove the frontend committed despite a broken
         // write, so seed nothing into the target and require it to stay empty.
-        //
-        // The complete-set case runs first, while every root prepared-set peak
-        // is still zero. That is the only point at which the peak gauge -- a
-        // high-water mark -- can be read as an exact statement about one
-        // attempt, and this is the case that needs it: it has to show that the
-        // root really did aggregate the whole set before the lifecycle failed.
         for fault in [
-            WriteFault::CompleteSetTerminalFailure,
             WriteFault::WriterEgress,
             WriteFault::RootValidation,
             WriteFault::SeveredWriterStream,
@@ -1298,7 +1399,7 @@ impl Scenario for DistributedWriterFaults {
             let before = all_write_counters(context)?;
             let before_injections = fault.injection_marker_count(context)?;
 
-            let outcome = run_faulted_write(context, &fault, &user, port, &insert)?;
+            let outcome = run_faulted_write(context, &fault, &user, port, &statements)?;
             let Err(error) = outcome else {
                 bail!("{case} did not fail the write");
             };
@@ -1326,7 +1427,7 @@ impl Scenario for DistributedWriterFaults {
                      unrelated reason"
                 );
             }
-            fault.assert_case_evidence(&delta, &after, case)?;
+            fault.assert_case_evidence(&delta, case)?;
 
             let rows = row_count(&mut control, &target)?;
             if rows != 0 {
@@ -1370,9 +1471,10 @@ fn run_faulted_write(
     fault: &WriteFault,
     user: &str,
     port: u16,
-    insert: &str,
+    statements: &WriteStatements<'_>,
 ) -> Result<Result<(), mysql::Error>> {
     let case = fault.case();
+    let insert = fault.statement(statements);
     match fault {
         WriteFault::WriterEgress | WriteFault::RootValidation => {
             let kind = match fault {
@@ -1393,59 +1495,73 @@ fn run_faulted_write(
             Ok(outcome)
         }
         WriteFault::SeveredWriterStream => {
-            // The first participant fragment to start on this backend is failed
-            // at Start, so the root's gather keeps a sender that never reaches
-            // end-of-stream. Publishing the release before the write runs is
-            // deliberate: the backend consumes the trigger and finds the
-            // release already waiting, so the fragment fails without the
-            // thirty-second rendezvous timeout.
+            // One task on this backend is failed after it published RUNNING,
+            // so the root's gather keeps a sender that never reaches
+            // end-of-stream.
             //
-            // This is the closest injection the existing fault channel offers
-            // to a transport-level loss between a writer and the root. There is
-            // no failpoint inside the exchange itself, and the exchange ingress
+            // This replaced `arm_fragment_executor_failure`, whose injection
+            // point is `NativeFragmentService`'s Stage/Start ingress: the task
+            // protocol runs its fragments from `NativeTaskExecutionHost`, so
+            // that trigger is never consumed, the write succeeds untouched,
+            // and the case waits out its budget for a marker with no emitter.
+            // `TaskExecutionFailure` is the successor with the same shape --
+            // the task is genuinely admitted and genuinely started before it
+            // fails -- and it needs no release, because it is an injection
+            // rather than a rendezvous.
+            //
+            // It is still the closest injection the fault channel offers to a
+            // transport-level loss between a writer and the root. There is no
+            // failpoint inside the exchange itself, and the exchange ingress
             // handler has no query execution identity to scope one to, so a
-            // transport fault would have to be a second, unscoped fault channel.
+            // transport fault would have to be a second, unscoped channel.
+            //
+            // The fault is not one of the kinds that pin a single-instance
+            // fragment, so the root finish task may land on this backend and
+            // be the task that fails. The case's own evidence covers that: it
+            // requires writers to have opened on at least two backends, so a
+            // root that failed still failed with live senders behind it.
             context
                 .handle()
-                .arm_fragment_executor_failure(SEVERED_BACKEND)
-                .context("arm the severed writer fragment")?;
-            context
-                .handle()
-                .release_fragment_executor_failure(SEVERED_BACKEND)
-                .context("release the severed writer fragment rendezvous")?;
+                .arm_query_lifecycle_fault(SEVERED_BACKEND, TASK_EXECUTION_FAILURE)
+                .context("arm the severed writer task failure")?;
             let outcome = run_write_on_own_connection(context, user, port, insert, case)?;
             context
                 .handle()
-                .disarm_fragment_executor_failure(SEVERED_BACKEND)
-                .context("disarm the severed writer fragment")?;
+                .clear_query_lifecycle_faults()
+                .context("clear the severed writer task failure")?;
             Ok(outcome)
         }
         WriteFault::FetchAbort => {
-            // The frontend blocks at the running phase, after every fragment
-            // has started and while the root is aggregating, and the scenario
-            // aborts the attempt there. The frontend therefore never fetches
-            // the root's complete prepared write set.
-            const PHASE: QueryLifecyclePhase = QueryLifecyclePhase::Running;
-            let marker_baseline = lifecycle_phase_marker_count(context, PHASE)?;
-            context
-                .handle()
-                .arm_kill_query_at_lifecycle_phase(PHASE)
-                .context("arm the running-phase abort")?;
+            // The attempt is aborted while its tasks are running, so the
+            // frontend never fetches the root's complete prepared write set.
+            //
+            // The retired chain gave this case a frontend rendezvous: the
+            // runner armed a phase trigger and the coordinator parked at
+            // `running` until the kill landed. That barrier is
+            // `FrontendQueryLifecycleBarrier::start_all`, which only ANALYZE
+            // reaches now, so waiting on its marker waits out the whole
+            // budget. The task protocol's anchor is a task actually being
+            // created on a backend -- the same trigger
+            // `distributed-resilience`'s `task-kill-query` case uses -- and
+            // the sleeping source is what keeps the write in flight long
+            // enough for the kill to land inside it rather than after it.
+            let created_baseline = backend_marker_total(context, TASK_CREATE_APPLIED)?;
             let write = start_write_on_own_connection(user, port, insert)?;
             let connection_id = write
                 .connection_id
                 .recv_timeout(context.remaining("receive aborted write connection id")?)
                 .context("aborted write session ended before publishing its connection id")?;
-            await_lifecycle_phase_marker(context, PHASE, marker_baseline)?;
+            await_backend_marker_above(
+                context,
+                TASK_CREATE_APPLIED,
+                created_baseline,
+                "a task admitted for the write this case aborts",
+            )?;
             let deadline = context.deadline();
             context
                 .handle()
                 .kill_query_until(connection_id, deadline)
                 .context("abort the in-flight distributed write")?;
-            context
-                .handle()
-                .release_query_lifecycle_phase_fault(PHASE)
-                .context("release the running-phase abort")?;
             let outcome = write
                 .done
                 .recv_timeout(context.remaining("await the aborted write result")?)
@@ -1454,26 +1570,6 @@ fn run_faulted_write(
                 .thread
                 .join()
                 .map_err(|_| anyhow::anyhow!("aborted write session thread panicked"))??;
-            Ok(outcome)
-        }
-        WriteFault::CompleteSetTerminalFailure => {
-            // Terminal outcome suppression is one of the fault kinds the
-            // frontend also uses to pin single-instance fragments, so arming
-            // it on exactly one backend places the finish fragment there. The
-            // root therefore aggregates a complete prepared write set and the
-            // write data plane closes normally -- and then that same backend
-            // never delivers its lifecycle terminal. Only the second half of
-            // the barrier fails, which is precisely the case a commit gate
-            // built on "the result arrived" alone would get wrong.
-            context
-                .handle()
-                .arm_query_lifecycle_fault(SUPPRESSED_BACKEND, "terminal-outcome-suppress")
-                .context("arm terminal outcome suppression on the root backend")?;
-            let outcome = run_write_on_own_connection(context, user, port, insert, case)?;
-            context
-                .handle()
-                .clear_query_lifecycle_faults()
-                .context("clear terminal outcome suppression tokens")?;
             Ok(outcome)
         }
     }
@@ -1535,39 +1631,37 @@ fn start_write_on_own_connection(user: &str, port: u16, insert: &str) -> Result<
     })
 }
 
-fn lifecycle_phase_marker_count(
-    context: &mut ScenarioContext,
-    phase: QueryLifecyclePhase,
-) -> Result<usize> {
-    let log = context
-        .handle()
-        .fe_log_contents()
-        .context("read FE log for lifecycle phase markers")?;
-    Ok(log
-        .lines()
-        .filter(|line| line.contains("NOVAROCKS_QUERY_LIFECYCLE_PHASE"))
-        .filter(|line| {
-            line.contains(&format!("phase={}", phase.as_str()))
-                && line.contains("action=kill_query")
-        })
-        .count())
+/// How many times `marker` appears across every Backend log.
+///
+/// Summed rather than counted per Backend: which Backends an attempt reaches
+/// is a property of its plan and its splits, so a per-Backend expectation
+/// would be asserting the scheduler's current choice. Every use below cares
+/// only that the total moved.
+fn backend_marker_total(context: &mut ScenarioContext, marker: &str) -> Result<usize> {
+    let mut total = 0;
+    for index in 0..context.handle().be_count() {
+        total += context
+            .handle()
+            .be_log_count(index, marker)
+            .with_context(|| format!("count {marker} on BE[{index}]"))?;
+    }
+    Ok(total)
 }
 
-fn await_lifecycle_phase_marker(
+/// Waits until `marker` has appeared somewhere it had not before.
+fn await_backend_marker_above(
     context: &mut ScenarioContext,
-    phase: QueryLifecyclePhase,
+    marker: &str,
     baseline: usize,
+    subject: &str,
 ) -> Result<()> {
     let deadline = context.deadline();
     loop {
-        if lifecycle_phase_marker_count(context, phase)? > baseline {
+        if backend_marker_total(context, marker)? > baseline {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!(
-                "timed out waiting for a fresh {} lifecycle phase marker",
-                phase.as_str()
-            );
+            bail!("timed out waiting for {subject}: {marker} stayed at {baseline}");
         }
         thread::sleep(Duration::from_millis(20));
     }

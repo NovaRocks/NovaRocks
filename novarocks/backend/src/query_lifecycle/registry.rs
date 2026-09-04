@@ -101,10 +101,11 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
     ) {
         use novarocks_proto_models::novarocks as wire;
 
-        #[cfg(debug_assertions)]
-        let outcome = force_feedback_unavailable(validated(self.participant.execution_id()))
-            .unwrap_or(outcome);
-
+        // No runner-owned perturbation is claimed here any more. The three
+        // feedback faults moved to `TaskRuntimeFilterFeedbackEgress`, which is
+        // the carrier every production query publishes through; claiming them
+        // on both carriers would let an ANALYZE consume an arming a task-path
+        // case is waiting on.
         let terminal_outcome = match outcome {
             BackendFrontendFeedbackOutcome::CanonicalDomain(domain) => {
                 wire::runtime_filter_feedback_event::TerminalOutcome::CanonicalDomain(
@@ -132,19 +133,11 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
                 )
             }
         };
-        let mut contract_digest = publication.contract_digest().to_vec();
-        #[cfg(debug_assertions)]
-        if corrupt_feedback_contract_digest(validated(self.participant.execution_id())) {
-            contract_digest[0] ^= 1;
-        }
+        let contract_digest = publication.contract_digest().to_vec();
         let event =
             protocol_control_event(wire::query_control_response::Event::RuntimeFilterFeedback(
                 wire::RuntimeFilterFeedbackEvent {
-                    participant_attempt: Some(
-                        feedback_participant_ref(&self.participant)
-                            .as_proto()
-                            .clone(),
-                    ),
+                    participant_attempt: Some(self.participant.as_proto().clone()),
                     participant_id: self.participant_id,
                     deployment_epoch,
                     channel_id: channel_id.get(),
@@ -154,70 +147,6 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
             ));
         let _ = self.events.try_send(event);
     }
-}
-
-#[cfg(debug_assertions)]
-fn corrupt_feedback_contract_digest(execution_id: QueryExecutionId) -> bool {
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return false;
-    };
-    matches!(
-        novarocks_failpoint::claim_matching_receiver_agnostic_fault(
-            &root,
-            QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
-            execution_id,
-        ),
-        Ok(Some(_))
-    )
-}
-
-#[cfg(debug_assertions)]
-fn force_feedback_unavailable(
-    execution_id: QueryExecutionId,
-) -> Option<BackendFrontendFeedbackOutcome> {
-    let root = novarocks_failpoint::configured_root()?;
-    matches!(
-        novarocks_failpoint::claim_matching_receiver_agnostic_fault(
-            &root,
-            QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
-            execution_id,
-        ),
-        Ok(Some(_))
-    )
-    .then_some(BackendFrontendFeedbackOutcome::ProducerUnavailable)
-}
-
-#[cfg(debug_assertions)]
-fn feedback_participant_ref(participant: &ParticipantAttemptRef) -> ParticipantAttemptRef {
-    let execution_id = validated(participant.execution_id());
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return participant.clone();
-    };
-    match novarocks_failpoint::claim_matching_fault_for_process(
-        &root,
-        QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignParticipant,
-        execution_id,
-        validated(participant.backend_process_id()),
-    ) {
-        Ok(Some(scope)) => {
-            eprintln!(
-                "NOVAROCKS_RUNTIME_FILTER_FEEDBACK_FOREIGN_PARTICIPANT execution_id={}:{}:{} backend_index={} token={}",
-                execution_id.query_id().high(),
-                execution_id.query_id().low(),
-                execution_id.attempt_id().get(),
-                scope.backend_index,
-                scope.token
-            );
-            ParticipantAttemptRef::new(execution_id, BackendProcessId::new_v7())
-                .expect("valid generated process creates a foreign participant ref")
-        }
-        Ok(None) | Err(_) => participant.clone(),
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn feedback_participant_ref(participant: &ParticipantAttemptRef) -> ParticipantAttemptRef {
-    participant.clone()
 }
 
 #[cfg(debug_assertions)]

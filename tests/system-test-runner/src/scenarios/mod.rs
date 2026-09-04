@@ -12,6 +12,7 @@ mod query_lifecycle;
 mod runtime_filter;
 mod state_family;
 mod table_maintenance;
+mod task_evidence;
 mod task_execution;
 
 pub fn all() -> Vec<Box<dyn Scenario>> {

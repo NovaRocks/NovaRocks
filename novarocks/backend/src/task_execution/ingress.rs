@@ -96,13 +96,26 @@ impl RegistryTaskExecutionIngress {
     ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
         match operation {
             DecodedOperation::CreateTask(request) => {
+                let identity = request.request().identity();
                 let receipt = self.registry.create_task(request.request());
                 // Claimed after the owner applied it: the task is admitted and
                 // running, and only this answer is lost.
-                fault::create_task_ack_dropped(request.request().identity(), receipt.outcome())?;
-                encode_item(&receipt, |ack| {
+                fault::create_task_ack_dropped(identity, receipt.outcome())?;
+                let mut encoded = encode_item(&receipt, |ack| {
                     encode_create_task_ack(ack).map(ReceiptAck::CreateTask)
-                })
+                })?;
+                // The two wire-value faults are claimed on the encoded answer,
+                // because the value each one misstates exists only there: the
+                // owner's receipt is a validated neutral value whose identity
+                // and verdict cannot be made to disagree with each other.
+                //
+                // The identity forgery goes first. The conflict rewrite drops
+                // the acknowledgement body, as a genuine rejection has none, so
+                // the reverse order would leave the identity fault nothing to
+                // forge and silently consume its arming.
+                fault::create_task_receipt_foreign_task(identity, receipt.outcome(), &mut encoded)?;
+                fault::create_task_conflict_after_apply(identity, receipt.outcome(), &mut encoded)?;
+                Ok(encoded)
             }
             DecodedOperation::UpdateTask(request) => {
                 let receipt = self.registry.update_task(request.request());
@@ -425,10 +438,16 @@ impl Stream for TaskStatusSubscription {
 }
 
 fn encode_event(event: &TaskStatusEvent) -> proto::TaskStatusStreamEvent {
-    match event {
-        TaskStatusEvent::Status(status) => encode_status_event(status),
-        TaskStatusEvent::Gone(identity) => encode_task_gone_event(*identity),
-    }
+    let (identity, mut encoded) = match event {
+        TaskStatusEvent::Status(status) => (status.identity(), encode_status_event(status)),
+        TaskStatusEvent::Gone(identity) => (*identity, encode_task_gone_event(*identity)),
+    };
+    // Claimed on the frame that is about to leave this process, which is the
+    // only place the observation names a backend process the frontend will
+    // check. Both the catch-up frames and the live ones are encoded here, so
+    // no delivery path escapes it.
+    fault::task_status_foreign_process(identity, &mut encoded);
+    encoded
 }
 
 #[cfg(test)]

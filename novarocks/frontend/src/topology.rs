@@ -1452,6 +1452,199 @@ mod tests {
             BackendReportedState::Draining
         );
     }
+    /// One `SHOW BACKENDS` row as the cross-process topology barrier reads it.
+    ///
+    /// The barrier in `tests/cluster-harness` counts rows that satisfy
+    /// `is_eligible_live()`: `DiagnosticStatus == "Live"`, `Eligible`, both
+    /// identities present, **and an empty `StatusDetail`**. That last clause is
+    /// what makes this projection load-bearing rather than diagnostic, so the
+    /// test below reads exactly these six fields and nothing else.
+    struct BarrierRow {
+        process_id: String,
+        diagnostic_status: String,
+        eligible: bool,
+        build_identity: String,
+        compatibility_id: String,
+        status_detail: String,
+    }
+
+    impl BarrierRow {
+        fn is_eligible_live(&self) -> bool {
+            self.diagnostic_status == "Live"
+                && self.eligible
+                && !self.build_identity.is_empty()
+                && !self.compatibility_id.is_empty()
+                && self.status_detail.is_empty()
+        }
+    }
+
+    fn barrier_rows(service: &ClusterBackendService) -> Vec<BarrierRow> {
+        let result = service.show_backends().expect("SHOW BACKENDS projection");
+        let names = result
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let index = |name: &str| {
+            names
+                .iter()
+                .position(|candidate| candidate == name)
+                .unwrap_or_else(|| panic!("SHOW BACKENDS has no {name} column"))
+        };
+        let mut rows = Vec::new();
+        for chunk in &result.chunks {
+            let column = |name: &str| {
+                chunk
+                    .batch
+                    .column(index(name))
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("SHOW BACKENDS projects every column as Utf8")
+                    .clone()
+            };
+            let process_id = column("ProcessId");
+            let diagnostic_status = column("DiagnosticStatus");
+            let eligible = column("Eligible");
+            let build_identity = column("BuildIdentity");
+            let compatibility_id = column("NativeCompatibilityId");
+            let status_detail = column("StatusDetail");
+            for row in 0..chunk.batch.num_rows() {
+                rows.push(BarrierRow {
+                    process_id: process_id.value(row).to_string(),
+                    diagnostic_status: diagnostic_status.value(row).to_string(),
+                    eligible: eligible.value(row) == "true",
+                    build_identity: build_identity.value(row).to_string(),
+                    compatibility_id: compatibility_id.value(row).to_string(),
+                    status_detail: status_detail.value(row).to_string(),
+                });
+            }
+        }
+        rows
+    }
+
+    /// What the frontend's exact refusal of a heartbeat aimed at a retired
+    /// process id looks like by the time it reaches `StatusDetail`.
+    const REFUSED_RETIRED_HEARTBEAT: &str = "heartbeat rpc failed: status: FailedPrecondition, \
+         message: \"heartbeat expected backend process id does not match this backend\"";
+
+    #[test]
+    fn a_same_endpoint_replacement_leaves_the_barrier_projection_clean() {
+        // A replaced backend permanently plants that refusal in this
+        // projection. The frontend keeps heartbeating a retired process id for
+        // as long as its announce lease lives, the process that now owns the
+        // listener refuses it by exact identity, and the text lands in
+        // `BackendFacts::last_err` -- which is never pruned and clears only on
+        // that same process id's next *successful* heartbeat, something a
+        // retired process can never produce again.
+        //
+        // So the question this settles is not whether the text appears. It is
+        // where it lands: on the retired row, which the barrier must not count,
+        // and never on the replacement, which it must. Without this the only
+        // place the contract is written down is the harness's own two fixtures,
+        // which pin the endpoints of the transition and not the state a real
+        // replacement is left in.
+        //
+        // Two retries, because that is the cross-process fixture's
+        // `heartbeat_timeout_retries`. It matters: one missed heartbeat sets
+        // `last_err` without clearing `exact_identity_verified`, so a row can
+        // be Live, Eligible and carrying a detail all at once. That has to be a
+        // window the replacement closes rather than the resting state.
+        let service = ClusterBackendService::new_transient_for_test(2);
+        let endpoints = ["127.0.0.1:9070", "127.0.0.1:9071", "127.0.0.1:9072"];
+        let announced = endpoints
+            .iter()
+            .map(|endpoint| {
+                let descriptor = descriptor(endpoint.parse().expect("test endpoint"));
+                service
+                    .record_announce(descriptor.clone(), BackendReportedState::Running)
+                    .expect("announce backend");
+                verify(&service, &descriptor);
+                descriptor
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            barrier_rows(&service)
+                .iter()
+                .filter(|row| row.is_eligible_live())
+                .count(),
+            endpoints.len(),
+            "a verified 1FE+3BE cluster must satisfy the barrier before anything is replaced"
+        );
+
+        // The replaced process's first refused heartbeat. Under two retries
+        // this does not yet retire it, which is the ambiguous window.
+        let retired = announced[0].process_id().expect("retired process id");
+        service.record_heartbeat_failure_with_error(retired, REFUSED_RETIRED_HEARTBEAT);
+        let during = barrier_rows(&service);
+        let retired_row = during
+            .iter()
+            .find(|row| row.process_id == retired.to_string())
+            .expect("the retired process is retained");
+        assert_eq!(
+            retired_row.diagnostic_status, "Live",
+            "a single missed heartbeat may not retire a backend: loss affects future \
+             admission, not an attempt in flight"
+        );
+        assert!(
+            retired_row.eligible,
+            "eligibility survives one missed heartbeat by design"
+        );
+        assert_eq!(
+            retired_row.status_detail, REFUSED_RETIRED_HEARTBEAT,
+            "the refusal is published as this row's StatusDetail"
+        );
+        assert_eq!(
+            during.iter().filter(|row| row.is_eligible_live()).count(),
+            endpoints.len() - 1,
+            "the barrier reads a Live row carrying a current error as not countable, so \
+             the window is one backend short and must be transient"
+        );
+
+        // The replacement announces on the same endpoint and passes its own
+        // exact pull, which is what transfers endpoint ownership and supersedes
+        // the retired process.
+        let replacement = descriptor(endpoints[0].parse().expect("test endpoint"));
+        service
+            .record_announce(replacement.clone(), BackendReportedState::Running)
+            .expect("announce replacement");
+        verify(&service, &replacement);
+
+        let after = barrier_rows(&service);
+        let live = after
+            .iter()
+            .filter(|row| row.is_eligible_live())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live.len(),
+            endpoints.len(),
+            "the barrier must count the whole cluster again once the replacement is verified"
+        );
+        assert!(
+            live.iter().all(|row| row.status_detail.is_empty()),
+            "no backend the barrier counts may carry a status detail"
+        );
+        assert!(
+            live.iter().any(|row| row.process_id
+                == replacement
+                    .process_id()
+                    .expect("replacement process id")
+                    .to_string()),
+            "the replacement is one of the counted backends"
+        );
+        let retired_row = after
+            .iter()
+            .find(|row| row.process_id == retired.to_string())
+            .expect("the retired process stays visible for triage");
+        assert_ne!(
+            retired_row.diagnostic_status, "Live",
+            "the retired process must be retained as a non-Live row, not counted"
+        );
+        assert_eq!(
+            retired_row.status_detail, REFUSED_RETIRED_HEARTBEAT,
+            "the refusal stays where it explains something: on the process it was aimed at"
+        );
+    }
+
     #[test]
     fn show_exposes_orthogonal_facts() {
         let service = ClusterBackendService::new_transient_for_test(1);

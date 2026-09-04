@@ -29,6 +29,15 @@ use std::time::{Duration, Instant};
 
 const REQUIRED_BACKENDS: usize = 3;
 
+/// The task protocol's restart rendezvous: it holds one applied
+/// `EstablishQueryContext` open so the harness can replace that exact process.
+/// It replaces the retired protocol's `restart-after-init-ack` because
+/// establish is the task protocol's first per-backend admission point.
+const RESTART_AFTER_ESTABLISH_CONTEXT: &str = "restart-after-establish-context";
+
+/// The token-scoped marker that rendezvous emits once the establish applied.
+const ESTABLISH_CONTEXT_OBSERVED_MARKER: &str = "NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED";
+
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(BackendSelfRegistration),
@@ -151,22 +160,61 @@ impl Scenario for PreReadyReplan {
             context.handle().be_count() == REQUIRED_BACKENDS,
             "pre-ready replan acceptance requires exactly {REQUIRED_BACKENDS} BEs"
         );
+        // The subject is a backend replaced after it admitted the attempt and
+        // before the attempt became ready, so the query has to place a task on
+        // that exact backend. A constant-relation query does not: a fragment
+        // with no scan gets one instance, and the scheduler puts it on a
+        // backend chosen from the query id. A connector scan is what fans a
+        // fragment out to every live backend, which is why this fixture is a
+        // real table rather than a UNION ALL of literals.
+        let catalog = "pre_ready_replan";
+        let warehouse = context.runtime_dir().join("pre-ready-replan-warehouse");
+        fs::create_dir_all(&warehouse)
+            .with_context(|| format!("create replan warehouse {}", warehouse.display()))?;
+        let mut setup = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect replan setup client")?,
+        )?;
+        setup
+            .query_drop(format!(
+                "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
+                warehouse.display()
+            ))
+            .context("create replan Hadoop Iceberg catalog")?;
+        setup
+            .query_drop(format!("CREATE DATABASE {catalog}.ns"))
+            .context("create replan Iceberg namespace")?;
+        setup
+            .query_drop(format!("SET CATALOG {catalog}"))
+            .context("select replan Iceberg catalog")?;
+        setup
+            .query_drop("USE ns")
+            .context("select replan Iceberg namespace")?;
+        setup
+            .query_drop("CREATE TABLE probe (v BIGINT)")
+            .context("create replan scan table")?;
+        setup
+            .query_drop("INSERT INTO probe VALUES (1), (2)")
+            .context("seed replan scan table")?;
+        drop(setup);
+
         let target = 0;
         let old_process_id = context.handle().backend_process_id(target)?;
         context
             .handle()
-            .arm_be_restart_after_init_ack(target)
-            .context("arm token-scoped BE restart after InitAck")?;
+            .arm_query_lifecycle_fault(target, RESTART_AFTER_ESTABLISH_CONTEXT)
+            .context("arm token-scoped BE restart after EstablishQueryContext")?;
         let token = context
             .handle()
-            .armed_query_lifecycle_fault_token(target, "restart-after-init-ack")?
+            .armed_query_lifecycle_fault_token(target, RESTART_AFTER_ESTABLISH_CONTEXT)?
             .context("armed pre-ready restart has no token")?;
         let before_execution = context
             .handle()
             .query_lifecycle_structured_snapshot()?
             .and_then(|snapshot| snapshot.execution_id);
         context.action(format!(
-            "armed token-scoped restart after BE[{target}] InitAck; old_process_id={old_process_id}"
+            "armed token-scoped restart after BE[{target}] EstablishQueryContext; old_process_id={old_process_id}"
         ));
 
         let mysql_user = context.mysql_user().to_string();
@@ -177,18 +225,18 @@ impl Scenario for PreReadyReplan {
                 let mut connection =
                     mysql_actor::connect(&mysql_user, mysql_port, Duration::from_secs(30))?;
                 connection
-                    .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+                    .query(format!("SELECT v FROM {catalog}.ns.probe ORDER BY v"))
                     .context("run query during pre-ready replacement")
             })();
             let _ = sender.send(result);
         });
 
-        wait_for_token_scoped_init_ack(context, target, &token)?;
+        wait_for_token_scoped_marker(context, target, ESTABLISH_CONTEXT_OBSERVED_MARKER, &token)?;
         let deadline = context.deadline();
         context
             .handle()
             .restart_be_until(target, deadline)
-            .context("replace BE immediately after token-scoped InitAck")?;
+            .context("replace BE immediately after token-scoped EstablishQueryContext")?;
         let replacement_process_id = context.handle().backend_process_id(target)?;
         ensure!(
             replacement_process_id != old_process_id,
@@ -218,7 +266,7 @@ impl Scenario for PreReadyReplan {
             terminal.attempt_id
         );
         context.action(format!(
-            "replaced BE[{target}] after InitAck and observed successful statement attempt=2 completion with new_process_id={replacement_process_id}"
+            "replaced BE[{target}] after EstablishQueryContext and observed successful statement attempt=2 completion with new_process_id={replacement_process_id}"
         ));
         Ok(())
     }
@@ -267,20 +315,26 @@ impl Scenario for PreReadyDmlReplan {
 
         let target = 0;
         let old_process_id = context.handle().backend_process_id(target)?;
+        // The same rendezvous the read case uses. `restart-after-init-ack`
+        // parks inside the retired `InitQuery` handler, which a distributed
+        // write no longer reaches: `runs_on_query_lifecycle` keeps only
+        // Statistics on that chain, so arming it here left the fault with no
+        // emitter and this case waiting out its budget for
+        // `NOVAROCKS_QUERY_INIT_ACK_OBSERVED`.
         context
             .handle()
-            .arm_be_restart_after_init_ack(target)
-            .context("arm token-scoped BE restart after DML InitAck")?;
+            .arm_query_lifecycle_fault(target, RESTART_AFTER_ESTABLISH_CONTEXT)
+            .context("arm token-scoped BE restart after DML EstablishQueryContext")?;
         let token = context
             .handle()
-            .armed_query_lifecycle_fault_token(target, "restart-after-init-ack")?
+            .armed_query_lifecycle_fault_token(target, RESTART_AFTER_ESTABLISH_CONTEXT)?
             .context("armed pre-ready DML restart has no token")?;
         let before_execution = context
             .handle()
             .query_lifecycle_structured_snapshot()?
             .and_then(|snapshot| snapshot.execution_id);
         context.action(format!(
-            "armed token-scoped restart after BE[{target}] DML InitAck; old_process_id={old_process_id}"
+            "armed token-scoped restart after BE[{target}] DML EstablishQueryContext; old_process_id={old_process_id}"
         ));
 
         let mysql_user = context.mysql_user().to_string();
@@ -297,12 +351,12 @@ impl Scenario for PreReadyDmlReplan {
             let _ = sender.send(result);
         });
 
-        wait_for_token_scoped_init_ack(context, target, &token)?;
+        wait_for_token_scoped_marker(context, target, ESTABLISH_CONTEXT_OBSERVED_MARKER, &token)?;
         let deadline = context.deadline();
         context
             .handle()
             .restart_be_until(target, deadline)
-            .context("replace BE immediately after token-scoped DML InitAck")?;
+            .context("replace BE immediately after token-scoped DML EstablishQueryContext")?;
         let replacement_process_id = context.handle().backend_process_id(target)?;
         ensure!(
             replacement_process_id != old_process_id,
@@ -345,29 +399,37 @@ impl Scenario for PreReadyDmlReplan {
             "pre-ready DML retry must publish one result set, got {rows:?}"
         );
         context.action(format!(
-            "replaced BE[{target}] after DML InitAck and observed one Iceberg write result with successful statement attempt=2 completion; new_process_id={replacement_process_id}"
+            "replaced BE[{target}] after DML EstablishQueryContext and observed one Iceberg write result with successful statement attempt=2 completion; new_process_id={replacement_process_id}"
         ));
         Ok(())
     }
 }
 
-fn wait_for_token_scoped_init_ack(
+/// Waits until the armed rendezvous reports that this exact backend applied the
+/// admission the fault parks on.
+///
+/// The token is part of the match rather than the marker name alone: the log is
+/// preserved across restarts, so an earlier scenario's rendezvous line would
+/// otherwise satisfy this wait and the harness would replace a process that had
+/// admitted nothing.
+fn wait_for_token_scoped_marker(
     context: &mut ScenarioContext,
     backend_index: usize,
+    marker: &str,
     token: &str,
 ) -> Result<()> {
     let deadline = context.deadline();
     loop {
         let log = context.handle().be_log_contents(backend_index)?;
-        if log.lines().any(|line| {
-            line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
-                && line.contains(&format!("token={token}"))
-        }) {
+        if log
+            .lines()
+            .any(|line| line.contains(marker) && line.contains(&format!("token={token}")))
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
             bail!(
-                "timed out waiting for token-scoped InitAck on BE[{backend_index}] token={token}; log_tail={:?}",
+                "timed out waiting for token-scoped {marker} on BE[{backend_index}] token={token}; log_tail={:?}",
                 log.lines().rev().take(20).collect::<Vec<_>>()
             );
         }

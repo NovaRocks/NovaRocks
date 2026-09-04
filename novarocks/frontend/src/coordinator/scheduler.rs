@@ -396,6 +396,12 @@ fn query_lifecycle_fault_preferred_live_index(
     };
     let fault_kinds = [
         QueryLifecycleFaultKind::RestartAfterInitAck,
+        // The task protocol's successor of the entry above. Without it a
+        // single-instance fragment lands on `query_id.low() % backend_count`,
+        // so a fault armed on one backend has a one-in-N chance of being
+        // reached at all -- which is the difference between a scenario that
+        // proves something and one that passes because the fault never fired.
+        QueryLifecycleFaultKind::RestartAfterEstablishContext,
         QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
         QueryLifecycleFaultKind::ObservationP2BudgetPressure,
         QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,

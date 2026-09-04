@@ -95,13 +95,58 @@ pub enum QueryLifecycleFaultKind {
     /// The successor of `RestartAfterInitAck`: the establish is the task
     /// protocol's first per-backend admission point, so it is where a process
     /// replacement can still be observed against a context the backend really
-    /// installed. It perturbs nothing on its own -- it publishes a
-    /// token-scoped marker and waits to be killed.
+    /// installed. It fabricates nothing -- it publishes a token-scoped marker
+    /// and waits to be killed.
+    ///
+    /// Its arming is matched rather than consumed. The frontend's own operation
+    /// wait is shorter than the hold, so it replays the establish while the
+    /// rendezvous is still waiting, and answering that replay would tell the
+    /// frontend this backend is ready moments before the harness replaces it.
     RestartAfterEstablishContext,
     StageConflictAfterApply,
     StartDigestCorrupt,
     ObservationForeignParticipant,
-    RuntimeFilterFeedbackForeignParticipant,
+    /// Answers one admitted `CreateTask` with the task protocol's own
+    /// `CreateConflict` verdict.
+    ///
+    /// The successor of `StageConflictAfterApply`, and the same shape: the
+    /// operation really applied -- the task is admitted and running on this
+    /// backend -- and only the answer says otherwise. That is what makes the
+    /// resulting failure a statement about the frontend's fence rather than
+    /// about the backend's state, because a frontend that retried or ignored a
+    /// conflict verdict would find a working task and the query would succeed.
+    CreateTaskConflictAfterApply,
+    /// Makes one admitted `CreateTask` acknowledgement name a different task
+    /// than the request it answers.
+    ///
+    /// The successor of `StartDigestCorrupt`. The digest that fault corrupted
+    /// has no counterpart: the task protocol has no second operation that
+    /// commits a previously staged plan, and a descriptor's fingerprint is
+    /// derived by the receiver from the bytes it just read, so no request field
+    /// can disagree with a plan the receiver already holds. What survives is
+    /// the identity half of the same fence -- `TaskIdentity` is indivisible and
+    /// an answer that names another task is refused rather than adopted -- so
+    /// that is the value this fault misstates.
+    CreateTaskReceiptForeignTask,
+    /// Makes one delivered task status event name a foreign backend process.
+    ///
+    /// The successor of `ObservationForeignParticipant`, which swapped the
+    /// `ParticipantAttemptRef` of a fragment observation on the retired control
+    /// stream. The surviving observation channel is `SubscribeTaskStatus`, and
+    /// the identity it carries is the event's own `TaskIdentity`, so the
+    /// forgeable fact is that identity's backend process.
+    TaskStatusForeignProcess,
+    /// Makes one terminal logical feedback publication claim it belongs to
+    /// another attempt of the same query.
+    ///
+    /// It replaces the retired `RuntimeFilterFeedbackForeignParticipant`,
+    /// which swapped the publisher's `ParticipantAttemptRef` on the control
+    /// stream. The task carrier names no publisher on the wire -- the
+    /// frontend derives it from the `TaskIdentity` it fetched from -- so that
+    /// forgery has no expression on the surviving carrier. The attempt the
+    /// publication claims is the part a backend can still misstate, and the
+    /// frontend fences it ahead of the pruning winner.
+    RuntimeFilterFeedbackForeignAttempt,
     /// Fails one connector writer at commit-fragment egress. It only fails a
     /// writer that already staged its artifacts; it never substitutes a
     /// fabricated carrier, so it cannot become a production fallback.
@@ -112,7 +157,7 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 35] = [
         Self::InitAckDrop,
         Self::StartAckSuppress,
         Self::RestartAfterInitAck,
@@ -142,7 +187,10 @@ impl QueryLifecycleFaultKind {
         Self::StageConflictAfterApply,
         Self::StartDigestCorrupt,
         Self::ObservationForeignParticipant,
-        Self::RuntimeFilterFeedbackForeignParticipant,
+        Self::CreateTaskConflictAfterApply,
+        Self::CreateTaskReceiptForeignTask,
+        Self::TaskStatusForeignProcess,
+        Self::RuntimeFilterFeedbackForeignAttempt,
         Self::ConnectorWriteWriterFailure,
         Self::ConnectorWriteRootFailure,
     ];
@@ -180,9 +228,10 @@ impl QueryLifecycleFaultKind {
             Self::StageConflictAfterApply => "stage-conflict-after-apply",
             Self::StartDigestCorrupt => "start-digest-corrupt",
             Self::ObservationForeignParticipant => "observation-foreign-participant",
-            Self::RuntimeFilterFeedbackForeignParticipant => {
-                "runtime-filter-feedback-foreign-participant"
-            }
+            Self::CreateTaskConflictAfterApply => "create-task-conflict-after-apply",
+            Self::CreateTaskReceiptForeignTask => "create-task-receipt-foreign-task",
+            Self::TaskStatusForeignProcess => "task-status-foreign-process",
+            Self::RuntimeFilterFeedbackForeignAttempt => "runtime-filter-feedback-foreign-attempt",
             Self::ConnectorWriteWriterFailure => "connector-write-writer-failure",
             Self::ConnectorWriteRootFailure => "connector-write-root-failure",
         }
@@ -204,7 +253,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 27] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 30] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -238,7 +287,15 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 27] = [
     QueryLifecycleFaultKind::StageConflictAfterApply,
     QueryLifecycleFaultKind::StartDigestCorrupt,
     QueryLifecycleFaultKind::ObservationForeignParticipant,
-    QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignParticipant,
+    // The task protocol's three identity-fencing faults, successors of the
+    // three entries above. Each misstates one fact on the wire after the
+    // operation it follows has genuinely applied: the create's verdict, the
+    // create acknowledgement's task, and a status event's backend process.
+    // None of them skips an operation, and none fabricates a success.
+    QueryLifecycleFaultKind::CreateTaskConflictAfterApply,
+    QueryLifecycleFaultKind::CreateTaskReceiptForeignTask,
+    QueryLifecycleFaultKind::TaskStatusForeignProcess,
+    QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignAttempt,
     // The write data plane's two faults. Both only ever fail: a writer fault
     // fires at commit-fragment egress, after the writer already staged, and a
     // root fault fires at carrier validation. Neither substitutes a value.
@@ -682,14 +739,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 32);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 35);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 27);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 30);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)
@@ -725,6 +782,18 @@ mod tests {
         assert_eq!(
             parse_runner_rfo_kind("restart-after-establish-context"),
             Some(QueryLifecycleFaultKind::RestartAfterEstablishContext)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("create-task-conflict-after-apply"),
+            Some(QueryLifecycleFaultKind::CreateTaskConflictAfterApply)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("create-task-receipt-foreign-task"),
+            Some(QueryLifecycleFaultKind::CreateTaskReceiptForeignTask)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("task-status-foreign-process"),
+            Some(QueryLifecycleFaultKind::TaskStatusForeignProcess)
         );
         assert_eq!(
             parse_runner_rfo_kind("connector-write-writer-failure"),

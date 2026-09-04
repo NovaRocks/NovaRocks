@@ -535,6 +535,14 @@ impl NativeQueryContextHost {
             return Ok(());
         }
 
+        // Past this point at least one catalog runtime has to be built, so
+        // this establish is a cold install. That is the only state the
+        // runner-owned rendezvous below is about, and it is the state the
+        // marker names.
+        emit_catalog_install_started(execution_id, catalogs.len());
+        hold_cold_catalog_install(installed)?;
+        inject_catalog_install_failure(execution_id, installed)?;
+
         for properties in catalogs {
             let factories = Arc::clone(&self.execution_role_binding_factories);
             self.catalog_manager
@@ -885,6 +893,103 @@ fn sealed_participant() -> HostRejection {
         "a runtime filter participant is already installed for this query context and is sealed \
          for the attempt",
     )
+}
+
+/// How long a held cold install waits between checks for its own retirement.
+///
+/// The same interval the retired stack's hold used. It bounds how long a
+/// cancelled establish stays parked after its context is released, and nothing
+/// else: the rendezvous itself ends on a file the runner removes.
+const CATALOG_INSTALL_HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// One backend is about to build at least one catalog runtime for this
+/// attempt.
+///
+/// The successor of the retired `NOVAROCKS_CATALOG_LOADING`, and deliberately
+/// narrower than it: this is emitted only after the whole-set ready fast path
+/// has already declined, so it means "a cold install starts here" rather than
+/// "an install pass ran". A warm establish emits nothing, which is what makes
+/// a case asserting that a warm query rebuilds no runtime able to fail.
+///
+/// The identity is printed in the task protocol's marker shape -- the same
+/// `execution_id=<high>:<low>:<attempt>` word the operation markers use -- so
+/// one execution's evidence can be selected across all of them.
+fn emit_catalog_install_started(execution_id: QueryExecutionId, catalog_count: usize) {
+    if !crate::config::debug_emit_catalog_lifecycle_marker() {
+        return;
+    }
+    println!(
+        "NOVAROCKS_CATALOG_INSTALL_STARTED execution_id={}:{}:{} catalog_count={catalog_count}",
+        execution_id.query_id().high(),
+        execution_id.query_id().low(),
+        execution_id.attempt_id().get(),
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+/// Parks a cold catalog install while the runner's hold file exists.
+///
+/// The task protocol installs shared facts inside the establish rather than in
+/// a background pass, so this is the one place a cold install is observably
+/// in flight. A case about cancelling an install mid-flight has nowhere else
+/// to stand: without the hold the install is a few milliseconds long and the
+/// cancellation always arrives before or after it, never during.
+///
+/// The wait ends on the context's own retirement as well as on the file, and
+/// that ordering matters: an abort that arrives while this is parked has to
+/// end the install rather than wait for the runner. Returning the cancelled
+/// rejection here is what keeps the provider bind below from running at all,
+/// so a cancelled attempt materializes no catalog runtime.
+fn hold_cold_catalog_install(installed: &InstalledContext) -> Result<(), HostRejection> {
+    let Some(hold_file) = crate::config::debug_catalog_install_hold_file() else {
+        return Ok(());
+    };
+    while hold_file.exists() {
+        if installed.is_released() {
+            return Err(cancelled_establish());
+        }
+        std::thread::sleep(CATALOG_INSTALL_HOLD_POLL);
+    }
+    // Checked once more after the file is gone: the release may have landed in
+    // the same instant the runner lifted the hold.
+    if installed.is_released() {
+        return Err(cancelled_establish());
+    }
+    Ok(())
+}
+
+/// Fails one selected backend's cold catalog install on the runner's trigger.
+///
+/// Checked before the catalog manager is touched, exactly as the retired stack
+/// checked it: a failure recorded in a manager cell would be suppressed for
+/// its retry cooldown, and the case that clears the trigger and retries
+/// immediately would then be measuring the cooldown instead of the retry.
+///
+/// The detail is routed through `catalog_rejection` so an injected failure is
+/// classified by the same rule as a real one, rather than by a category chosen
+/// here.
+fn inject_catalog_install_failure(
+    execution_id: QueryExecutionId,
+    installed: &InstalledContext,
+) -> Result<(), HostRejection> {
+    let armed = crate::config::debug_catalog_install_failure_file()
+        .is_some_and(|failure_file| failure_file.exists());
+    if !armed {
+        return Ok(());
+    }
+    if crate::config::debug_emit_catalog_lifecycle_marker() {
+        println!(
+            "NOVAROCKS_CATALOG_INSTALL_FAILED execution_id={}:{}:{}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+    Err(catalog_rejection(
+        installed,
+        CatalogManagerError::materialization_failed("runner-injected catalog install failure"),
+    ))
 }
 
 /// Maps a catalog install failure onto this protocol's categories.

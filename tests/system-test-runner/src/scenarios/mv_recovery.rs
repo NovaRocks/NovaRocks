@@ -20,6 +20,15 @@ use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The task protocol's only fault that fails a participant which was admitted,
+/// published RUNNING, and then failed on its own. It replaces the retired
+/// protocol's `start-ack-suppress` here because a suppressed start acknowledged
+/// nothing, while a staged MV snapshot only exists once a task really ran.
+const TASK_EXECUTION_FAILURE: &str = "task-execution-failure";
+
+/// Stable evidence that the injection above actually fired.
+const TASK_EXECUTION_FAILURE_MARKER: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED";
+
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(MvStateStoreRestart),
@@ -458,14 +467,36 @@ impl Scenario for MvFirstRefreshStaging {
             "create MV used to prove failed first refresh is not published",
             "CREATE MATERIALIZED VIEW orders_start_fault_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
         )?;
-        context.handle().arm_start_ack_suppress(0)?;
-        context.action("armed native StartAck suppression for MV first refresh");
+        // The refresh has to fail from inside a task that was really admitted
+        // and really started, because that is what leaves a staged main
+        // snapshot behind for the publication rule to discard. A refused
+        // admission would prove nothing about staging. The fault fires on the
+        // backend it is armed for; the MV's base table is a connector scan, so
+        // its scan fragment is placed on every live backend and that backend
+        // does get a task.
+        let injected_baseline = total_be_marker_count(context, TASK_EXECUTION_FAILURE_MARKER)?;
+        context
+            .handle()
+            .arm_query_lifecycle_fault(0, TASK_EXECUTION_FAILURE)?;
+        context.action("armed an injected task execution failure for MV first refresh");
         let refresh_result = conn.query_drop("REFRESH MATERIALIZED VIEW orders_start_fault_mv");
         let cleanup_result = context.handle().clear_query_lifecycle_faults();
-        cleanup_result.context("clear native StartAck suppression")?;
-        let error = refresh_result.expect_err("suppressed native start must fail MV first refresh");
+        cleanup_result.context("clear injected task execution failure")?;
+        let error = refresh_result
+            .expect_err("an injected task execution failure must fail the MV first refresh");
         if error.to_string().is_empty() {
-            bail!("suppressed native start returned an empty MV refresh error");
+            bail!("injected task execution failure returned an empty MV refresh error");
+        }
+        // Without this the remaining assertions would also hold for a refresh
+        // that failed for an unrelated reason, or for one that never ran a
+        // distributed task at all.
+        let injected = total_be_marker_count(context, TASK_EXECUTION_FAILURE_MARKER)?;
+        if injected <= injected_baseline {
+            bail!(
+                "MV first refresh failed without the injected task execution failure firing; \
+                 expected a new {TASK_EXECUTION_FAILURE_MARKER} across the BE logs, \
+                 count stayed at {injected_baseline}"
+            );
         }
         assert_rows(
             context,
@@ -603,6 +634,23 @@ impl Scenario for MvLakePublicationRestartRebuild {
         );
         Ok(())
     }
+}
+
+/// Counts one marker across every backend's log.
+///
+/// A single injected failure happens on one backend, so the sum is the honest
+/// quantity here: counting the number of distinct backends that saw it would
+/// assert a fanout the injection never claims.
+fn total_be_marker_count(context: &mut ScenarioContext, marker: &str) -> Result<usize> {
+    let be_count = context.handle().be_count();
+    let mut total = 0;
+    for index in 0..be_count {
+        total += context
+            .handle()
+            .be_log_count(index, marker)
+            .with_context(|| format!("count {marker} in BE[{index}] log"))?;
+    }
+    Ok(total)
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {

@@ -39,9 +39,37 @@
 //! rather than a lost message. Neither fabricates a success and neither skips
 //! the operation it follows.
 //!
-//! Each fault fires once per arming: the trigger file is consumed by the
+//! A third group perturbs the dynamic-filter feedback this backend publishes
+//! ([`corrupt_feedback_contract_digest`], [`force_feedback_unavailable`],
+//! [`forge_feedback_foreign_attempt`]). They are not acknowledgement drops
+//! either: feedback is a retained payload the frontend polls, so there is no
+//! answer to lose. They perturb the payload's own facts and are claimed at the
+//! publication rather than where the sink is installed, because a fault
+//! claimed at install time would say only that a carrier exists.
+//!
+//! A fourth group misstates one fact on the wire about an operation that
+//! genuinely applied ([`create_task_conflict_after_apply`],
+//! [`create_task_receipt_foreign_task`], [`task_status_foreign_process`]).
+//! They are the task protocol's identity fences seen from the outside: the
+//! backend's own state is untouched and correct, and only the value the
+//! frontend is told is wrong -- a verdict, an acknowledgement's task, or an
+//! event's backend process. Requiring the operation to have applied first is
+//! what makes them provable rather than merely red: a frontend that failed to
+//! fence any of the three would find real, working state behind the lie and
+//! the query would succeed.
+//!
+//! Most faults fire once per arming: the trigger file is consumed by the
 //! claim, so the replay that follows reaches an untouched boundary and settles
 //! on the owner's idempotent verdict.
+//!
+//! Two deliberately do not, and both are cases where the frontend's *own*
+//! replay is what the fault has to survive. [`lease_renewal_stopped`] must
+//! refuse every renewal or the lease never expires, and
+//! [`restart_after_establish_context`] must withhold every establish of its
+//! attempt or the replay's idempotent answer closes the pre-ready window the
+//! case exists to observe. Both therefore match the arming without consuming
+//! it, and both are scoped to one exact attempt and one exact backend process,
+//! so a replanned attempt is untouched.
 #![expect(
     clippy::result_large_err,
     reason = "The tonic service boundary must preserve Status without changing its generated signature."
@@ -50,6 +78,7 @@
 use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution::task_execution::operation::OperationOutcome;
 use novarocks_failpoint::QueryLifecycleFaultKind;
+use novarocks_proto_models::novarocks as proto;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 
 /// Drops the acknowledgement of one applied `EstablishQueryContext`.
@@ -124,15 +153,42 @@ pub(super) fn task_execution_failure_injected(identity: TaskIdentity) -> Result<
 /// that ends this wait deliberately, so a timeout means the harness never
 /// acted, and reporting that as a backend error would blame this process for
 /// the harness's own missed deadline.
+///
+/// # Why the arming is matched rather than consumed
+///
+/// The hold has to cover every establish of this attempt, not just the one it
+/// started on, and the protocol guarantees there will be more. The frontend
+/// requests `MaxWait::DEFAULT_CREATE` (15 s) for an `UpdateQueryContext` while
+/// this rendezvous waits up to 30 s, so a hold that outlasts the frontend's own
+/// wait is the normal case: the operation times out client-side and
+/// `QueryContextOwner` replays the exact same request.
+///
+/// That replay reaches a process whose context is already installed, so the
+/// registry answers `Idempotent` -- and `is_applied()` counts `Idempotent`, so
+/// the frontend would mark the establish acknowledged, `contexts_established()`
+/// would flip, and `close_after_control_ready()` would shut the pre-ready retry
+/// window. The kill that follows would then be a post-ControlReady loss, which
+/// is correctly not replannable. The case asserting the replan would be
+/// asserting the opposite of what it set up, and only when the harness happens
+/// to be slower than 15 s -- a flake, not a failure.
+///
+/// So a one-shot claim is the wrong shape here. The arming is matched without
+/// being consumed, and the replay is answered the way the first operation was:
+/// not at all. Only the `Accepted` establish parks a thread; a replay is
+/// refused immediately, so the hold cannot accumulate blocked threads however
+/// many times the frontend resends.
 pub(super) fn restart_after_establish_context(
     context: QueryContextRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
-    if outcome != OperationOutcome::Accepted {
+    if !matches!(
+        outcome,
+        OperationOutcome::Accepted | OperationOutcome::Idempotent
+    ) {
         return Ok(());
     }
     let execution = context.query_execution_id();
-    let Some(scope) = claim(
+    let Some(scope) = match_persistent(
         QueryLifecycleFaultKind::RestartAfterEstablishContext,
         execution,
         context.backend_process_id(),
@@ -140,6 +196,14 @@ pub(super) fn restart_after_establish_context(
     else {
         return Ok(());
     };
+    if outcome == OperationOutcome::Idempotent {
+        // Loss, not a rejection: the establish really is applied here, and
+        // withholding its answer is what keeps the frontend replaying instead
+        // of concluding this backend is ready.
+        return Err(tonic::Status::deadline_exceeded(
+            "runner-owned establish rendezvous withholds the answer to a replayed establish",
+        ));
+    }
     eprintln!(
         "NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED execution_id={}:{}:{} backend_index={} process_id={} token={}",
         execution.query_id().high(),
@@ -313,6 +377,308 @@ pub(super) fn create_task_ack_dropped(
     Err(tonic::Status::deadline_exceeded(
         "runner-owned CreateTask acknowledgement dropped after the task was admitted",
     ))
+}
+
+/// What a create answered with a runner-owned conflict reports as its reason.
+///
+/// It names the fault rather than a protocol condition, for the same reason
+/// [`TASK_EXECUTION_FAILURE_DETAIL`] does: this text reaches the client through
+/// the attempt's failure, and a message that read like a real conflict would
+/// make an injected one indistinguishable from a genuine descriptor
+/// disagreement in a cluster log.
+const CREATE_CONFLICT_AFTER_APPLY_DETAIL: &str =
+    "runner-owned CreateTask conflict answered after the task was admitted";
+
+/// Answers one admitted `CreateTask` with the protocol's `CreateConflict`.
+///
+/// The retired protocol's `stage-conflict-after-apply` claimed its fault in
+/// `handle_stage_fragments` and rewrote a staged participant's wire outcome to
+/// `StageFragmentsRejectedConflict`. `CreateTask` is the task protocol's single
+/// per-task admission point, so the claim moves here, and the perturbation is
+/// the same one: the answer, not the operation.
+///
+/// # Why the operation must really have applied
+///
+/// This is what makes the case it serves impossible to satisfy by accident. The
+/// task is admitted and running on this backend, so a frontend that retried the
+/// conflict, or ignored it, would find a working task and the query would
+/// return rows. Only a frontend that treats a conflict verdict as fatal can
+/// fail the statement -- which is the fence being asserted.
+///
+/// The receipt is rewritten into the exact shape a genuine refusal has: a
+/// rejection carries no acknowledgement body, so leaving the applied one
+/// attached would be a wire value no owner can produce, and the frontend would
+/// refuse it for its shape instead of for its verdict.
+pub(super) fn create_task_conflict_after_apply(
+    identity: TaskIdentity,
+    outcome: OperationOutcome,
+    encoded: &mut proto::TaskOperationReceipt,
+) -> Result<(), tonic::Status> {
+    if outcome != OperationOutcome::Accepted {
+        return Ok(());
+    }
+    let execution = identity.query_execution_id();
+    let Some(scope) = claim(
+        QueryLifecycleFaultKind::CreateTaskConflictAfterApply,
+        execution,
+        identity.backend_process_id(),
+    )?
+    else {
+        return Ok(());
+    };
+    eprintln!(
+        "NOVAROCKS_TASK_CREATE_CONFLICT_AFTER_APPLY execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        identity.stage_id().get(),
+        identity.task_id().get(),
+        scope.backend_index,
+        scope.token,
+    );
+    encoded.outcome = proto::TaskOperationOutcome::CreateConflict as i32;
+    encoded.safe_detail = CREATE_CONFLICT_AFTER_APPLY_DETAIL.to_owned();
+    encoded.safe_field_path = None;
+    encoded.ack = None;
+    Ok(())
+}
+
+/// Makes one admitted `CreateTask` acknowledgement name a different task.
+///
+/// The successor of the retired `start-digest-corrupt`, which flipped a bit of
+/// the `stage_digest` a `StartPreparedQuery` carried so it disagreed with the
+/// plan the backend had staged. That fault has no direct expression here: the
+/// task protocol has no second operation that commits an already staged plan,
+/// and `WireFragmentPlan::parse` derives a descriptor's fingerprint from the
+/// bytes the receiver just read, so no request field can be corrupted into
+/// disagreeing with a plan the receiver already holds.
+///
+/// What survives is the identity half of the same fence. `TaskIdentity` is
+/// indivisible, and an answer that names another task is refused rather than
+/// adopted -- by `decode_create_task_ack` against the request's own identity,
+/// and again by `RemoteTask::on_create_ack`. So the forged value is the
+/// acknowledgement's task, and only that field: forging the carried status
+/// identity as well would move the refusal onto the status cross-check and the
+/// case would no longer be about the identity the frontend asked for.
+///
+/// Claimed only once the applied acknowledgement is present, so a malformed or
+/// refused create leaves the arming for the create that really admitted a task.
+pub(super) fn create_task_receipt_foreign_task(
+    identity: TaskIdentity,
+    outcome: OperationOutcome,
+    encoded: &mut proto::TaskOperationReceipt,
+) -> Result<(), tonic::Status> {
+    if outcome != OperationOutcome::Accepted {
+        return Ok(());
+    }
+    let Some(proto::task_operation_receipt::Ack::CreateTask(ack)) = encoded.ack.as_mut() else {
+        return Ok(());
+    };
+    let Some(wire_identity) = ack.identity.as_mut() else {
+        return Ok(());
+    };
+    let execution = identity.query_execution_id();
+    let Some(scope) = claim(
+        QueryLifecycleFaultKind::CreateTaskReceiptForeignTask,
+        execution,
+        identity.backend_process_id(),
+    )?
+    else {
+        return Ok(());
+    };
+    // A task id is nonzero on the wire, so the forgery has to stay a legal
+    // identity: a zero would be refused as a malformed field and the case would
+    // be asserting the decoder's range check instead of its identity fence.
+    let foreign_task_id = wire_identity.task_id.checked_add(1).unwrap_or(1);
+    eprintln!(
+        "NOVAROCKS_TASK_CREATE_RECEIPT_FOREIGN_TASK execution_id={}:{}:{} stage={} task={} foreign_task={foreign_task_id} backend_index={} token={}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        identity.stage_id().get(),
+        identity.task_id().get(),
+        scope.backend_index,
+        scope.token,
+    );
+    wire_identity.task_id = foreign_task_id;
+    Ok(())
+}
+
+/// Makes one delivered task status event name a foreign backend process.
+///
+/// The successor of the retired `observation-foreign-participant`, which
+/// replaced the `ParticipantAttemptRef` of a fragment observation published on
+/// the control stream. The surviving observation channel is
+/// `SubscribeTaskStatus`; it names no participant of its own, so the forgeable
+/// fact is the backend process inside the event's own `TaskIdentity`.
+///
+/// Claimed at the encode boundary rather than in
+/// [`super::observation::TaskStatusSource`], which is a process-local snapshot
+/// holder with no wire and no identity of its own to misstate: a status
+/// published there is the truth this backend holds, and the lie belongs where
+/// the frame leaves the process. Both the catch-up frames and the live ones
+/// pass through here, so no delivery path escapes the forgery.
+///
+/// # Why a malformed arming is warned about rather than returned
+///
+/// The caller is a stream body, so the only error it could report would tear
+/// the subscription down -- which is a different perturbation entirely, and one
+/// `task_status_subscription_dropped` already owns. A fault that cannot be
+/// claimed must not silently become that other fault.
+pub(super) fn task_status_foreign_process(
+    identity: TaskIdentity,
+    encoded: &mut proto::TaskStatusStreamEvent,
+) {
+    // The frame's own identity is located before the arming is claimed, so a
+    // frame this fault could not have forged leaves the token for the next one
+    // instead of consuming it invisibly.
+    if wire_status_identity(encoded).is_none() {
+        return;
+    }
+    let execution = identity.query_execution_id();
+    let scope = match claim_by_detail(
+        QueryLifecycleFaultKind::TaskStatusForeignProcess,
+        execution,
+        identity.backend_process_id(),
+    ) {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return,
+        Err(detail) => {
+            tracing::warn!(
+                task = %identity,
+                detail,
+                "runner-owned foreign task status process fault could not be claimed"
+            );
+            return;
+        }
+    };
+    let foreign = BackendProcessId::new_v7();
+    eprintln!(
+        "NOVAROCKS_TASK_STATUS_FOREIGN_PROCESS execution_id={}:{}:{} stage={} task={} backend={} foreign_backend={foreign} backend_index={} token={}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        identity.stage_id().get(),
+        identity.task_id().get(),
+        identity.backend_process_id(),
+        scope.backend_index,
+        scope.token,
+    );
+    if let Some(wire_identity) = wire_status_identity(encoded) {
+        wire_identity.backend_process_id = Some(proto::BackendProcessId {
+            value: foreign.to_bytes().to_vec(),
+        });
+    }
+}
+
+/// The identity of whichever status event body this frame carries.
+fn wire_status_identity(
+    encoded: &mut proto::TaskStatusStreamEvent,
+) -> Option<&mut proto::TaskIdentity> {
+    match encoded.event.as_mut()? {
+        proto::task_status_stream_event::Event::TaskStatus(status) => status.identity.as_mut(),
+        proto::task_status_stream_event::Event::TaskGone(gone) => gone.identity.as_mut(),
+    }
+}
+
+/// Corrupts the contract digest of one terminal logical feedback publication.
+///
+/// The retired protocol claimed this fault inside its control-stream
+/// `BackendFrontendFeedbackSink`. The cutover moved the feedback carrier onto
+/// the task substrate, so the claim has to move with it -- otherwise the fault
+/// is armed, nothing consumes it, the query succeeds untouched, and the case
+/// asserting the fail-closed rejection waits out its whole budget for a
+/// perturbation that no longer has a producer.
+///
+/// The digest is the frontend's fence: `admit_terminal` refuses a publication
+/// whose digest is not the contract it declared. Corrupting it therefore has
+/// to fail the query closed rather than prune on a domain nobody declared.
+pub(super) fn corrupt_feedback_contract_digest(carrier: TaskIdentity) -> bool {
+    claim_feedback_perturbation(
+        QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
+        "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_CONTRACT_DIGEST_CORRUPT",
+        carrier,
+    )
+}
+
+/// Forces one channel's terminal outcome to report no usable domain.
+///
+/// Moved from the retired sink for the same reason as the digest fault. This
+/// one is the fail-*open* half of the pair: an unavailable channel is a
+/// statement the frontend admits, and the split source then enumerates
+/// unpruned. Correctness may not move; only the pruning optimization may.
+pub(super) fn force_feedback_unavailable(carrier: TaskIdentity) -> bool {
+    claim_feedback_perturbation(
+        QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
+        "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_UNAVAILABLE",
+        carrier,
+    )
+}
+
+/// Makes one publication claim it belongs to another attempt of this query.
+///
+/// This is the task carrier's whole forgeable share of the retired
+/// `runtime-filter-feedback-foreign-participant` fault, and the rename is not
+/// cosmetic. That fault replaced the publisher's `ParticipantAttemptRef` on
+/// the wire, because the control stream *named* its publisher and the frontend
+/// then checked the name against the authenticated process. The task carrier
+/// names no publisher at all: `RuntimeFilterEnvelope` has no participant
+/// field the frontend reads, and `DynamicFilterFeedbackPump` derives the
+/// publisher from the `TaskIdentity` it fetched from. A backend cannot claim
+/// another process's publisher slot because the claim never travels, so that
+/// injection has no expression here and inventing one would assert a threat
+/// the carrier structurally does not have.
+///
+/// What a backend *can* still misstate is which attempt the publication
+/// belongs to, and the deployment epoch is exactly that fact. The fence it
+/// meets is the first check in `admit_terminal`, ahead of the pruning winner,
+/// so the query must fail closed with the winner untouched.
+pub(super) fn forge_feedback_foreign_attempt(carrier: TaskIdentity) -> bool {
+    claim_feedback_perturbation(
+        QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignAttempt,
+        "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_FOREIGN_ATTEMPT",
+        carrier,
+    )
+}
+
+/// The claim the three feedback perturbations share.
+///
+/// It is process-scoped like every other task-protocol fault: the carrier that
+/// publishes is the backend the frontend reads this domain from, so there is
+/// no third party whose arming this could consume. A malformed arming is
+/// reported rather than silently read as "not armed" -- a publication may not
+/// fail because a test file was wrong, but a fault that never fires must not
+/// look like one that did not reproduce.
+fn claim_feedback_perturbation(
+    kind: QueryLifecycleFaultKind,
+    marker: &str,
+    carrier: TaskIdentity,
+) -> bool {
+    let execution = carrier.query_execution_id();
+    let scope = match claim_by_detail(kind, execution, carrier.backend_process_id()) {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return false,
+        Err(detail) => {
+            tracing::warn!(
+                kind = kind.file_stem(),
+                task = %carrier,
+                detail,
+                "runner-owned runtime filter feedback fault could not be claimed"
+            );
+            return false;
+        }
+    };
+    eprintln!(
+        "{marker} execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        carrier.stage_id().get(),
+        carrier.task_id().get(),
+        scope.backend_index,
+        scope.token,
+    );
+    true
 }
 
 /// Drops one established `SubscribeTaskStatus` stream.

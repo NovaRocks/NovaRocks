@@ -34,8 +34,29 @@ use std::time::Duration;
 const REQUIRED_BACKENDS: usize = 3;
 const ACK_DROP_TARGET_BACKEND: usize = 1;
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const RUNTIME_FILTER_SERVICE_RESOURCE: &str = "native_runtime_filter_services";
 const NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE: &str = "native_query_active_fragments";
+
+/// The task protocol's terminal acknowledgement loss: the split delivery that
+/// closed a plan node was applied and only its answer is dropped.
+const TASK_UPDATE_TERMINAL_ACK_DROP: &str = "task-update-terminal-ack-drop";
+const TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER: &str = "NOVAROCKS_TASK_UPDATE_TERMINAL_ACK_DROPPED";
+/// The replay verdict the resend must reach: the same splits recognised again,
+/// not assigned twice.
+const TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER: &str = "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_DUPLICATE";
+/// Delivery of a client cancellation to a backend.
+const TASK_CONTEXT_ABORT_APPLIED_MARKER: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
+/// A task was admitted and is running on this backend.
+const TASK_CREATE_APPLIED_MARKER: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+/// The three dynamic-filter feedback perturbations, each emitted by the task
+/// carrier at the publication it perturbed. They are asserted alongside every
+/// client-visible outcome below: a fault whose claim did not move emits
+/// nothing, and a case that only reads the client's side cannot tell that
+/// apart from the fault firing.
+const TASK_FEEDBACK_CONTRACT_DIGEST_CORRUPT_MARKER: &str =
+    "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_CONTRACT_DIGEST_CORRUPT";
+const TASK_FEEDBACK_UNAVAILABLE_MARKER: &str = "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_UNAVAILABLE";
+const TASK_FEEDBACK_FOREIGN_ATTEMPT_MARKER: &str =
+    "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_FOREIGN_ATTEMPT";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -43,15 +64,21 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(CancelWithTerminalAckReplay),
         Box::new(Ncp5FeedbackContractDigestCorrupt),
         Box::new(Ncp5FeedbackUnavailable),
-        Box::new(Nid2ParticipantRefRejection),
+        Box::new(Nid2ForeignAttemptRejection),
         Box::new(Ncp5PartitionedFeedbackPruning),
     ]
 }
 
 /// Trust acceptance needs directional evidence from the same native 1FE+3BE
-/// launcher: FE-to-BE lifecycle admission, BE-to-BE Runtime Filter transport,
-/// and the BE-to-FE unary terminal fallback.  Keep this as one scenario per
-/// transport profile so no alternate orchestration owns those assertions.
+/// launcher: FE-to-BE task admission and control, and BE-to-BE Runtime Filter
+/// transport.  Keep this as one scenario per transport profile so no alternate
+/// orchestration owns those assertions.
+///
+/// The BE-to-FE unary terminal fallback is no longer among them. That direction
+/// belonged to the retired lifecycle's terminal report; on the task protocol
+/// every operation is frontend-initiated, so a distributed SELECT opens no
+/// BE-to-FE call for this profile to exercise. Asserting it here would have
+/// meant asserting a direction the protocol does not use.
 pub fn native_trust_directional_scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(NativeTrustDirectional {
@@ -129,15 +156,15 @@ impl Scenario for Ncp5FeedbackUnavailable {
     }
 }
 
-struct Nid2ParticipantRefRejection;
+struct Nid2ForeignAttemptRejection;
 
-impl Scenario for Nid2ParticipantRefRejection {
+impl Scenario for Nid2ForeignAttemptRejection {
     fn name(&self) -> &'static str {
-        "runtime-filter/nid-2-participant-ref-rejection"
+        "runtime-filter/nid-2-foreign-attempt-rejection"
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        run_nid2_participant_ref_rejection(context)
+        run_nid2_foreign_attempt_rejection(context)
     }
 }
 
@@ -161,7 +188,7 @@ impl Scenario for NativeTrustDirectional {
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_accepted_after_ack_drop(context)?;
         run_cancel_with_terminal_ack_replay(context)?;
-        context.action("proved FE-to-BE lifecycle admission, BE-to-BE Runtime Filter transport, and BE-to-FE terminal fallback using the same 1FE+3BE Native trust profile");
+        context.action("proved FE-to-BE task admission and control, and BE-to-BE Runtime Filter transport, using the same 1FE+3BE Native trust profile");
         Ok(())
     }
 }
@@ -214,23 +241,49 @@ fn run_accepted_after_ack_drop(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
+/// Cancellation of an in-flight Runtime Filter query whose terminal
+/// acknowledgement was lost.
+///
+/// Two properties, and they need two different kinds of evidence.
+///
+/// The lost-acknowledgement half is the task protocol's own terminal ack:
+/// `task-update-terminal-ack-drop` loses the answer to a terminal, non-empty
+/// split delivery the backend already applied. The frontend resends the exact
+/// request and the backend must recognise it as a replay rather than assign the
+/// same splits twice, which is what the accepted/duplicate marker pair says.
+/// Both are waited for *before* the cancellation, so the loss and its replay are
+/// facts of this attempt rather than a race against the kill.
+///
+/// The cancellation half is delivery, not the client's error: a client error is
+/// also what a timeout looks like. `NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED` is the
+/// only evidence that KILL QUERY reached the backends.
+///
+/// What is deliberately not asserted here: the retired protocol's complete
+/// per-participant Runtime Filter terminal rollup. On the task path a backend's
+/// sealed Runtime Filter observation rides `ReleaseQueryContextAck`, and release
+/// requires an `Active` context — an aborted one never releases, so the
+/// frontend refuses the rollup as incomplete rather than summing the backends
+/// that did answer. `runtime-filter/accepted-after-ack-drop` keeps that rollup
+/// assertion, on a query that completes. The BE-to-FE `terminal_fallback_accepted`
+/// counter is likewise retired-protocol-only and is not replaced.
 fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<()> {
     require_three_backends(context)?;
     let mut control = connect_control(context, "connect cancellation scenario control session")?;
     let tables = create_runtime_filter_tables(context, &mut control, "cancel")?;
     configure_broadcast_runtime_filter(&mut control)?;
     let baseline = resource_snapshot(context)?;
-    let before_execution_id = latest_execution_id(context)?;
-    let fallback_before = context
-        .handle()
-        .backend_terminal_fallback_accepted(0)
-        .context("read terminal fallback baseline for BE[0]")?;
+    // Captured before the query under test starts, so every count below is this
+    // query's own. The fixture setup above already ran distributed statements.
+    let created_baseline = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
+    let ack_dropped_baseline = be_marker_counts(context, TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER)?;
+    let duplicate_baseline = be_marker_counts(context, TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER)?;
+    let abort_baseline = be_marker_counts(context, TASK_CONTEXT_ABORT_APPLIED_MARKER)?;
 
     context
         .handle()
-        .arm_terminal_ack_drop(0)
-        .context("arm terminal ACK drop for the targeted backend")?;
-    context.action("armed a terminal ACK-drop replay fault for the targeted native backend");
+        .arm_query_lifecycle_fault(0, TASK_UPDATE_TERMINAL_ACK_DROP)
+        .context("arm terminal task-update ACK drop for the targeted backend")?;
+    context.action("armed a terminal task-update ACK-drop replay fault for BE[0]");
 
     let target = start_blocking_runtime_filter_query(
         context.mysql_user(),
@@ -243,9 +296,24 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
         .recv_timeout(context.remaining("receive Runtime Filter query connection id")?)
         .context("Runtime Filter query terminated before publishing its connection id")?;
     context.action("started an in-flight native Runtime Filter query through public MySQL");
-    await_runtime_filter_activity(context, &baseline)?;
+    await_runtime_filter_activity(context, &baseline, &created_baseline)?;
     context.action(
-        "observed active Runtime Filter services, all participant ControlReady events, and an admitted native fragment through the typed resource oracle",
+        "observed an admitted task on more than one backend and an active native fragment through the typed resource oracle",
+    );
+    await_total_advanced(
+        context,
+        TASK_UPDATE_TERMINAL_ACK_DROPPED_MARKER,
+        &ack_dropped_baseline,
+        1,
+    )?;
+    await_total_advanced(
+        context,
+        TASK_SPLIT_ASSIGNMENT_DUPLICATE_MARKER,
+        &duplicate_baseline,
+        1,
+    )?;
+    context.action(
+        "observed the terminal task-update acknowledgement dropped and its exact resend recognised as a duplicate assignment",
     );
 
     control
@@ -261,17 +329,22 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
         .map_err(|_| anyhow::anyhow!("Runtime Filter query actor panicked"))??;
     context.action("cancelled the active Runtime Filter query through public MySQL");
 
-    let snapshot = await_terminal_snapshot(context, before_execution_id.as_deref())?;
-    assert_cancelled_replay_conformance(&snapshot)?;
-    context.action(
-        "typed terminal oracle proved replay retained one complete, non-duplicated Runtime Filter view",
-    );
-    await_terminal_fallback_accepted(context, 0, fallback_before)?;
-    context.action("observed BE[0] terminal fallback acceptance counter advance after the dropped terminal ACK");
+    // Participants, not the cluster size: a query context exists only where a
+    // task was placed, and which backends receive a table's splits is the
+    // scheduler's business. What this case is about survives that -- the abort
+    // was delivered to more than one backend rather than only observed by the
+    // client.
+    await_backends_advanced(
+        context,
+        TASK_CONTEXT_ABORT_APPLIED_MARKER,
+        &abort_baseline,
+        2,
+    )?;
+    context.action("observed the cancellation applied as an abort on more than one backend");
     context
         .handle()
         .clear_query_lifecycle_faults()
-        .context("clear terminal ACK-drop replay fault tokens")?;
+        .context("clear terminal task-update ACK-drop replay fault tokens")?;
     let deadline = context.deadline();
     context
         .handle()
@@ -325,12 +398,23 @@ fn run_ncp5_partitioned_feedback_pruning(context: &mut ScenarioContext) -> Resul
     Ok(())
 }
 
+/// A backend that publishes a domain under the wrong contract digest must fail
+/// the query, not prune on it.
+///
+/// The fault now fires on the task carrier
+/// (`TaskRuntimeFilterFeedbackEgress::try_publish`) rather than on the retired
+/// control stream, so the assertion pairs the client's error with the
+/// backend's own marker. Without the marker the `expect_err` would also be
+/// satisfied by a query that failed for any unrelated reason -- including the
+/// fault never firing at all and something else going wrong -- which is the
+/// exact failure mode a moved claim has to rule out.
 fn run_ncp5_feedback_contract_digest_corrupt(context: &mut ScenarioContext) -> Result<()> {
     require_three_backends(context)?;
     let mut control = connect_control(context, "connect NCP-5 corrupt-feedback control session")?;
     let tables = create_ncp5_pruning_tables(context, &mut control)?;
     configure_broadcast_runtime_filter(&mut control)?;
     let baseline = resource_snapshot(context)?;
+    let corrupt_baseline = be_marker_counts(context, TASK_FEEDBACK_CONTRACT_DIGEST_CORRUPT_MARKER)?;
     for backend_index in 0..REQUIRED_BACKENDS {
         context
             .handle()
@@ -351,6 +435,12 @@ fn run_ncp5_feedback_contract_digest_corrupt(context: &mut ScenarioContext) -> R
             runtime_filter_count_query(&tables)
         ))
         .expect_err("active-attempt feedback contract corruption must fail the query closed");
+    await_total_advanced(
+        context,
+        TASK_FEEDBACK_CONTRACT_DIGEST_CORRUPT_MARKER,
+        &corrupt_baseline,
+        1,
+    )?;
     context.action(format!(
         "public MySQL query failed closed after invalid Runtime Filter feedback: {error}"
     ));
@@ -367,6 +457,14 @@ fn run_ncp5_feedback_contract_digest_corrupt(context: &mut ScenarioContext) -> R
     Ok(())
 }
 
+/// A channel with no usable domain must fail open: correct rows, no pruning.
+///
+/// `runtime-filter/ncp-5-partitioned-feedback-pruning` proves the same fixture
+/// prunes a positive number of whole files with the loop intact, so the
+/// zero here is this fault's effect rather than a fixture that never prunes.
+/// The marker is still asserted, because a claim that failed to move would
+/// leave that zero unreachable and this case would then pass only if the
+/// pruning optimization had regressed on its own.
 fn run_ncp5_feedback_unavailable(context: &mut ScenarioContext) -> Result<()> {
     require_three_backends(context)?;
     let mut control = connect_control(
@@ -375,6 +473,7 @@ fn run_ncp5_feedback_unavailable(context: &mut ScenarioContext) -> Result<()> {
     )?;
     let tables = create_ncp5_pruning_tables(context, &mut control)?;
     configure_broadcast_runtime_filter(&mut control)?;
+    let unavailable_baseline = be_marker_counts(context, TASK_FEEDBACK_UNAVAILABLE_MARKER)?;
     for backend_index in 0..REQUIRED_BACKENDS {
         context
             .handle()
@@ -393,6 +492,12 @@ fn run_ncp5_feedback_unavailable(context: &mut ScenarioContext) -> Result<()> {
         profile.contains("ConnectorWholeFilesPruned=0"),
         "typed unavailable must fail open for FE whole-file pruning; profile={profile}"
     );
+    await_total_advanced(
+        context,
+        TASK_FEEDBACK_UNAVAILABLE_MARKER,
+        &unavailable_baseline,
+        1,
+    )?;
     context
         .handle()
         .clear_query_lifecycle_faults()
@@ -403,48 +508,77 @@ fn run_ncp5_feedback_unavailable(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn run_nid2_participant_ref_rejection(context: &mut ScenarioContext) -> Result<()> {
+/// Feedback that names an attempt other than the running one must be fenced
+/// before it can become the pruning winner.
+///
+/// # Why the subject moved, and why it had to
+///
+/// This case was `nid-2-participant-ref-rejection`: the backend replaced the
+/// publisher's `ParticipantAttemptRef` on the control stream and the frontend
+/// refused it, leaving pruning conservatively failed open. The forgery it
+/// performed does not exist on the task carrier.
+/// `filter::RuntimeFilterEnvelope` carries no participant field the frontend
+/// reads, and `DynamicFilterFeedbackPump` derives the publisher from the
+/// `TaskIdentity` it fetched from -- so a backend cannot claim another
+/// process's publisher slot, because the claim never travels. Keeping the old
+/// injection here would have meant arming a fault with no producer and
+/// asserting a zero that any query with no feedback also satisfies.
+///
+/// The surviving fence is the same one, reached by the identity a backend can
+/// still misstate: the attempt. `admit_terminal` checks the deployment epoch
+/// against the active attempt first, ahead of the winner, so a forged epoch
+/// must fail the query closed with the winner untouched. That inverts the old
+/// expression -- an `expect_err` where there used to be a zero-pruning profile
+/// -- because on the task path an inadmissible publication is a
+/// `TaskExecutionError::Schedule`, not a widened channel.
+///
+/// The publisher-authorization half of the old assertion is not lost, only
+/// moved to where it can still be provoked:
+/// `the_task_carrier_is_authorized_by_the_process_that_ran_the_producing_task`
+/// in `novarocks/frontend/src/runtime_filter/feedback.rs` drives an undeclared
+/// process straight into `admit_task_feedback` and asserts both the
+/// "publisher is not authorized" refusal and an untouched winner.
+fn run_nid2_foreign_attempt_rejection(context: &mut ScenarioContext) -> Result<()> {
     require_three_backends(context)?;
-    let mut control = connect_control(context, "connect NID-2 foreign-ref control session")?;
+    let mut control = connect_control(context, "connect NID-2 foreign-attempt control session")?;
     let tables = create_ncp5_pruning_tables(context, &mut control)?;
     configure_broadcast_runtime_filter(&mut control)?;
+    let baseline = resource_snapshot(context)?;
+    let foreign_baseline = be_marker_counts(context, TASK_FEEDBACK_FOREIGN_ATTEMPT_MARKER)?;
     for backend_index in 0..REQUIRED_BACKENDS {
         context
             .handle()
-            .arm_query_lifecycle_fault(backend_index, "runtime-filter-feedback-foreign-participant")
+            .arm_query_lifecycle_fault(backend_index, "runtime-filter-feedback-foreign-attempt")
             .with_context(|| {
-                format!("arm foreign Runtime Filter participant ref for BE[{backend_index}]")
+                format!("arm foreign-attempt Runtime Filter feedback for BE[{backend_index}]")
             })?;
     }
-    let profile: Vec<String> = control
-        .query(format!(
+    context.action("armed a foreign-attempt Runtime Filter feedback fault on every backend");
+
+    let error = control
+        .query::<String, _>(format!(
             "EXPLAIN ANALYZE {}",
             runtime_filter_count_query(&tables)
         ))
-        .context("foreign Runtime Filter participant ref must preserve query correctness")?;
-    let profile = profile.join("\n");
-    assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
-    ensure!(
-        profile.contains("ConnectorWholeFilesPruned=0"),
-        "foreign Runtime Filter feedback must be rejected before mutating the pruning winner; profile={profile}"
-    );
-    let marker = "NOVAROCKS_RUNTIME_FILTER_FEEDBACK_FOREIGN_PARTICIPANT";
-    let observed = (0..REQUIRED_BACKENDS)
-        .map(|backend_index| context.handle().be_log_count(backend_index, marker))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .sum::<usize>();
-    ensure!(
-        observed > 0,
-        "runner fault did not emit any foreign Runtime Filter participant marker"
-    );
+        .expect_err("feedback naming another attempt must fail the query closed");
+    await_total_advanced(
+        context,
+        TASK_FEEDBACK_FOREIGN_ATTEMPT_MARKER,
+        &foreign_baseline,
+        1,
+    )?;
     context
         .handle()
         .clear_query_lifecycle_faults()
-        .context("clear foreign Runtime Filter participant fault tokens")?;
-    context.action(
-        "foreign Runtime Filter participant refs were rejected and pruning conservatively failed open",
-    );
+        .context("clear foreign-attempt Runtime Filter feedback fault tokens")?;
+    let deadline = context.deadline();
+    context
+        .handle()
+        .await_query_execution_resource_convergence(&baseline, true, deadline)
+        .context("await resource convergence after fail-closed foreign-attempt rejection")?;
+    context.action(format!(
+        "Runtime Filter feedback naming a foreign attempt was fenced ahead of the pruning winner and failed the query closed: {error}"
+    ));
     Ok(())
 }
 
@@ -759,50 +893,100 @@ fn resource_snapshot(context: &mut ScenarioContext) -> Result<QueryExecutionReso
         .context("cross-process Runtime Filter scenario requires resource oracle")
 }
 
-fn await_terminal_fallback_accepted(
+/// One marker's count in each backend's log.
+///
+/// Every assertion below compares against a captured vector of these rather
+/// than against an absolute number. A scenario's own setup already runs
+/// distributed statements, so an absolute count would credit this step with
+/// evidence an earlier one produced.
+fn be_marker_counts(context: &mut ScenarioContext, marker: &str) -> Result<Vec<usize>> {
+    let be_count = context.handle().be_count();
+    let mut counts = Vec::with_capacity(be_count);
+    for index in 0..be_count {
+        counts.push(
+            context
+                .handle()
+                .be_log_count(index, marker)
+                .with_context(|| format!("count {marker} in BE[{index}] log"))?,
+        );
+    }
+    Ok(counts)
+}
+
+/// How many backends emitted this marker at least once more than the baseline.
+///
+/// The comparison is per backend on purpose. "How many distinct backends have
+/// this marker" saturates at the backend count, so it cannot be compared as
+/// `baseline + n`: a setup step that already touched every backend would leave
+/// no headroom and the wait could never be satisfied.
+fn backends_advanced(baseline: &[usize], current: &[usize]) -> usize {
+    baseline
+        .iter()
+        .zip(current)
+        .filter(|(baseline, current)| current > baseline)
+        .count()
+}
+
+fn total_advanced(baseline: &[usize], current: &[usize]) -> usize {
+    baseline
+        .iter()
+        .zip(current)
+        .map(|(baseline, current)| current.saturating_sub(*baseline))
+        .sum()
+}
+
+/// Waits until this step produced `required` more of one marker in total.
+fn await_total_advanced(
     context: &mut ScenarioContext,
-    backend: usize,
-    before: f64,
+    marker: &str,
+    baseline: &[usize],
+    required: usize,
 ) -> Result<()> {
     loop {
-        let current = context
-            .handle()
-            .backend_terminal_fallback_accepted(backend)
-            .with_context(|| format!("read terminal fallback count from BE[{backend}]"))?;
-        if current >= before + 1.0 {
+        let current = be_marker_counts(context, marker)?;
+        if total_advanced(baseline, &current) >= required {
             return Ok(());
         }
-        let remaining = context.remaining("await BE-to-FE terminal fallback acceptance")?;
+        let remaining = context.remaining(&format!("observe {required} more of {marker}"))?;
         thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
     }
 }
 
+/// Waits until this step produced one marker on `required` more backends.
+fn await_backends_advanced(
+    context: &mut ScenarioContext,
+    marker: &str,
+    baseline: &[usize],
+    required: usize,
+) -> Result<()> {
+    loop {
+        let current = be_marker_counts(context, marker)?;
+        if backends_advanced(baseline, &current) >= required {
+            return Ok(());
+        }
+        let remaining = context.remaining(&format!(
+            "observe {marker} newly emitted on {required} backends"
+        ))?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+/// Waits until the query under test is really running distributed.
+///
+/// Both halves are needed. `NOVAROCKS_TASK_CREATE_APPLIED` newly emitted on
+/// more than one backend is the task protocol's own statement that this attempt
+/// was admitted past a single process; the active-fragment gauge is the
+/// statement that work is in flight right now, which a log line -- never
+/// retracted -- cannot make. The retired protocol's `control_ready` count and
+/// its `native_runtime_filter_services` gauge are both published only by the
+/// lifecycle chain, so neither can gate anything on the task path.
 fn await_runtime_filter_activity(
     context: &mut ScenarioContext,
     baseline: &QueryExecutionResourceSnapshot,
+    created_baseline: &[usize],
 ) -> Result<()> {
     loop {
         let current = resource_snapshot(context)?;
-        let runtime_filter_active =
-            current
-                .backends
-                .iter()
-                .zip(&baseline.backends)
-                .any(|(current, baseline)| {
-                    current
-                        .resources
-                        .get(RUNTIME_FILTER_SERVICE_RESOURCE)
-                        .copied()
-                        .unwrap_or_default()
-                        > baseline
-                            .resources
-                            .get(RUNTIME_FILTER_SERVICE_RESOURCE)
-                            .copied()
-                            .unwrap_or_default()
-                });
-        let required_control_ready = u64::try_from(context.handle().be_count())?;
-        let control_ready = current.frontend_control_ready
-            >= baseline.frontend_control_ready + required_control_ready as f64;
         let native_fragment_active =
             current
                 .backends
@@ -820,11 +1004,12 @@ fn await_runtime_filter_activity(
                             .copied()
                             .unwrap_or_default()
                 });
-        if runtime_filter_active && control_ready && native_fragment_active {
+        let created = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
+        if native_fragment_active && backends_advanced(created_baseline, &created) >= 2 {
             return Ok(());
         }
         let remaining = context.remaining(
-            "observe active Runtime Filter services, ControlReady, and native fragment admission",
+            "observe an admitted task on more than one backend and an active fragment",
         )?;
         thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
     }
@@ -924,18 +1109,6 @@ fn assert_remote_contribution_candidate(snapshot: &QueryLifecycleStructuredSnaps
     ensure!(
         totals.transport_routes.sent_count >= 1,
         "partitioned Runtime Filter candidate retained no Runtime Filter transport route: {snapshot:?}"
-    );
-    Ok(())
-}
-
-fn assert_cancelled_replay_conformance(snapshot: &QueryLifecycleStructuredSnapshot) -> Result<()> {
-    let (participants, totals) = available_rollup(snapshot)?;
-    assert_complete_nonduplicated_rollup(participants, totals)?;
-    ensure!(
-        totals.channels.count >= 1
-            && totals.producer_streams.accepted_count >= 1
-            && totals.transport_routes.sent_count >= 1,
-        "cancelled query retained no Runtime Filter terminal contribution after terminal ACK replay: {snapshot:?}"
     );
     Ok(())
 }

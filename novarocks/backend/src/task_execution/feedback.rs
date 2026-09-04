@@ -56,6 +56,7 @@ use crate::runtime_filter::domain::{
     BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication, BackendFrontendFeedbackSink,
 };
 
+use super::fault;
 use super::status::TaskStatusReporter;
 
 /// Publishes one query context's terminal logical feedback through one task.
@@ -93,6 +94,24 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
         publication: &BackendFrontendFeedbackPublication,
         outcome: BackendFrontendFeedbackOutcome,
     ) {
+        // Runner-owned perturbation is claimed here, at the publication the
+        // frontend actually reads, because this is where the retired control
+        // stream's feedback sink used to claim it. A claim left behind on the
+        // retired carrier is armed and unconsumed: the query succeeds
+        // untouched and the case waits out its budget.
+        let outcome = if fault::force_feedback_unavailable(self.carrier) {
+            BackendFrontendFeedbackOutcome::ProducerUnavailable
+        } else {
+            outcome
+        };
+        let deployment_epoch = if fault::forge_feedback_foreign_attempt(self.carrier) {
+            // Any epoch but this attempt's. Wrapping keeps it a legal u64
+            // rather than saturating onto a value the frontend could still
+            // read as the active attempt.
+            deployment_epoch.wrapping_add(1)
+        } else {
+            deployment_epoch
+        };
         let (kind, payload) = match &outcome {
             BackendFrontendFeedbackOutcome::CanonicalDomain(domain) => (
                 filter::RuntimeFilterEnvelopeKind::DegradedLogical,
@@ -118,6 +137,13 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
             }
         };
         let query_id = self.carrier.query_execution_id().query_id();
+        let mut schema_digest = publication.contract_digest().to_vec();
+        if fault::corrupt_feedback_contract_digest(self.carrier) {
+            // One bit, not a truncation: the frontend refuses a digest of the
+            // wrong width before it ever compares one, so a shortened digest
+            // would exercise the decoder instead of the contract fence.
+            schema_digest[0] ^= 1;
+        }
         let envelope = filter::RuntimeFilterEnvelope {
             kind: kind as i32,
             query_id: Some(novarocks_proto_models::common::UniqueId {
@@ -130,7 +156,7 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
             // consumer binding, it is read by the coordinator. Naming one would
             // claim a producer route this publication never used.
             route_identity: None,
-            schema_digest: publication.contract_digest().to_vec(),
+            schema_digest,
             payload,
             producer_open: None,
         };

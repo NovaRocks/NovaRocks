@@ -1829,6 +1829,7 @@ impl FrontendDistributedQueryCoordinator {
                         .checked_add(establish_wait)
                         .unwrap_or(statement_deadline),
                 ),
+                cancellation: &cancellation,
             };
             if cancellation.is_cancelled() {
                 break Err(self.fail_task_round(
@@ -1900,6 +1901,7 @@ impl FrontendDistributedQueryCoordinator {
                         .checked_add(establish_wait)
                         .unwrap_or(statement_deadline),
                 ),
+                cancellation: &cancellation,
             };
             if let Some(detail) = round.failure_cause() {
                 let detail = format!("task execution terminated: {detail:?}");
@@ -2340,20 +2342,20 @@ impl FrontendDistributedQueryCoordinator {
     ) -> DistributedQueryError {
         let message = message.into();
         split_delivery.abandon(message.clone());
+        // Released to the transport before any judgement below, and released
+        // unconditionally: a backend that applies its establish after this
+        // frontend has given up must not be left holding the context. What
+        // the judgement decides is only whether this worker waits, never
+        // whether the backends are told.
         abort_task_round(round, &message);
-        if !classification.before_contexts_established {
-            return self.fail_and_cancel(query_id, message);
-        }
-        let classified = reclassify_pre_ready_lifecycle_failure(
+        match judge_pre_ready_task_round_failure(
             self.backend_topology.as_ref(),
-            classification.captured,
-            DistributedQueryError::pre_ready_topology_observation(message),
-            classification.observation_deadline,
-        );
-        if classified.pre_ready_topology_outcome().is_some() {
-            return classified;
+            classification,
+            &message,
+        ) {
+            Some(classified) => classified,
+            None => self.fail_and_cancel(query_id, message),
         }
-        self.fail_and_cancel(query_id, classified.message().to_owned())
     }
 
     fn fail_and_cancel(
@@ -2831,7 +2833,7 @@ mod tests {
     use crate::common::backend_topology::{
         BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
     };
-    use crate::common::query_cancellation::QueryCancellationSource;
+    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::connector::{
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
     };
@@ -3215,6 +3217,100 @@ mod tests {
         assert!(
             super::drain_deadline(expired, budget, now) <= now,
             "an expired statement leaves the drain no budget"
+        );
+    }
+
+    /// A killed statement's worker must not wait out the pre-establish
+    /// membership observation.
+    ///
+    /// `KILL QUERY` is withheld from the client until this worker unwinds, so
+    /// a pre-ControlReady failure that stops to ask the membership owner
+    /// whether a backend was replaced spends that entire window inside the
+    /// client's wait for its own interrupt. On a healthy cluster no
+    /// replacement ever arrives, so the window is spent in full -- and the
+    /// window is the fifteen-second establish wait, which is exactly the
+    /// interrupt latency a real 1FE+3BE cluster reported for a statement
+    /// killed while its `EstablishQueryContext` was still in flight.
+    ///
+    /// Both directions are asserted, and the uncancelled one comes first
+    /// because it is the direction that can pass for the wrong reason. A
+    /// change that simply stopped observing would satisfy the cancelled half
+    /// and break the other, and that observation is the only evidence a
+    /// pre-establish replan is ever allowed to rest on.
+    #[test]
+    fn a_cancelled_attempt_does_not_wait_out_the_pre_establish_membership_observation() {
+        let endpoint: SocketAddr = "127.0.0.1:19061".parse().expect("test endpoint");
+        let backend = descriptor(BackendProcessId::new_v7(), endpoint);
+        let topology = Arc::new(ClusterBackendService::new_transient_for_test(1));
+        topology
+            .record_announce(backend.clone(), BackendReportedState::Running)
+            .expect("announce the only backend");
+        verify(topology.as_ref(), &backend, 1);
+        let captured = topology.snapshot().expect("captured topology");
+
+        // Short enough to keep this test quick, long enough that spending it
+        // is unmistakable. Production's window is the establish wait.
+        const OBSERVATION: Duration = Duration::from_secs(1);
+        const MESSAGE: &str = "query cancelled while fetching result";
+
+        let cancellation = QueryCancellationSource::new();
+        let view = cancellation.view();
+
+        // Nothing has cancelled this attempt, so the membership owner is
+        // asked. This topology's revision never advances, so being asked
+        // means the whole window is spent before the failure is judged to be
+        // this attempt's own.
+        let started = Instant::now();
+        let observed = super::judge_pre_ready_task_round_failure(
+            topology.as_ref(),
+            super::TaskRoundFailureClassification {
+                before_contexts_established: true,
+                captured: &captured,
+                observation_deadline: started + OBSERVATION,
+                cancellation: &view,
+            },
+            MESSAGE,
+        );
+        let uncancelled = started.elapsed();
+        assert!(
+            observed.is_none(),
+            "an unchanged topology proves no replacement, so the failure is this attempt's own"
+        );
+        assert!(
+            uncancelled >= OBSERVATION.mul_f32(0.75),
+            "an uncancelled pre-establish failure must still consult the membership owner, \
+             yet it was judged after only {uncancelled:?}"
+        );
+
+        // Latch the cancellation the statement source latches for a
+        // `KILL QUERY`, and ask again. Nothing about the topology changed;
+        // only the answer's already being decided has.
+        cancellation.request(QueryCancellationReason::ExplicitKill {
+            requester_connection_id: 7,
+        });
+        assert!(view.is_cancelled(), "the statement source latches the kill");
+
+        let started = Instant::now();
+        let cancelled = super::judge_pre_ready_task_round_failure(
+            topology.as_ref(),
+            super::TaskRoundFailureClassification {
+                before_contexts_established: true,
+                captured: &captured,
+                observation_deadline: started + OBSERVATION,
+                cancellation: &view,
+            },
+            MESSAGE,
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            cancelled.is_none(),
+            "a cancelled attempt is never reclassified into topology-retry evidence, \
+             because a replan must never re-run a statement the client killed"
+        );
+        assert!(
+            elapsed < OBSERVATION / 4,
+            "a killed statement's worker must unwind without waiting out the membership \
+             observation, yet it was judged after {elapsed:?}"
         );
     }
 
@@ -3875,11 +3971,77 @@ fn advance_task_round(
 /// backend that was replaced or went unavailable between the schedule and the
 /// establish. The failure's own text never decides that; this only records
 /// that the membership owner should be asked, and for how long.
+///
+/// A cancelled attempt asks nobody. The cancellation is held as the live view
+/// rather than a snapshot so that question is answered when the failure is
+/// judged rather than when this turn's classification was built: the two
+/// differ, because one classification judges several break sites.
 #[derive(Clone, Copy)]
 struct TaskRoundFailureClassification<'a> {
     before_contexts_established: bool,
     captured: &'a BackendTopologySnapshot,
     observation_deadline: Instant,
+    cancellation: &'a crate::common::query_cancellation::QueryCancellationView,
+}
+
+impl TaskRoundFailureClassification<'_> {
+    /// Whether a membership observation could still change this attempt's
+    /// answer.
+    ///
+    /// It cannot once cancellation is latched, and there are only two
+    /// consumers of what such an observation would prove. The client is one:
+    /// a cancelled statement finishes `Cancelled`, so it is owed
+    /// `ER_QUERY_INTERRUPTED` whatever the membership owner goes on to say.
+    /// The pre-ready replan is the other, and it must never re-run a
+    /// statement the client killed.
+    ///
+    /// So the observation is pure cost, and on the `KILL QUERY` form it is
+    /// cost the killing client pays directly: that interrupt is deliberately
+    /// withheld until this worker unwinds, so the client may reuse its
+    /// connection (`cancellation_requires_statement_fence` in
+    /// `crate::query`). Entering a blocking wait on the membership owner here
+    /// is therefore the drain's own rule broken one stage earlier -- the
+    /// answer is decided, and every moment spent proving something about it
+    /// is a moment the client waits for an answer it could already have had.
+    fn observation_can_change_the_answer(self) -> bool {
+        !self.cancellation.is_cancelled()
+    }
+}
+
+/// Whether a pre-ControlReady failure is really this attempt's own, or the
+/// shadow of a backend the membership owner can prove was replaced.
+///
+/// `Some` is typed pre-ready evidence the caller returns as it stands; `None`
+/// means the failure belongs to this attempt and the caller fails it closed.
+///
+/// Split out of `fail_task_round` so the rule is assertable on its own. What
+/// it protects is a latency, not a value, and a judgement reachable only
+/// through a method that needs a whole live attempt cannot be timed.
+fn judge_pre_ready_task_round_failure(
+    topology: &dyn BackendTopologyPort,
+    classification: TaskRoundFailureClassification<'_>,
+    message: &str,
+) -> Option<DistributedQueryError> {
+    if !classification.before_contexts_established {
+        return None;
+    }
+    // Checked before the observation rather than inside it, because the
+    // observation is a blocking wait on the membership owner and the whole
+    // point is not to enter one. See
+    // `TaskRoundFailureClassification::observation_can_change_the_answer`.
+    if !classification.observation_can_change_the_answer() {
+        return None;
+    }
+    let classified = reclassify_pre_ready_lifecycle_failure(
+        topology,
+        classification.captured,
+        DistributedQueryError::pre_ready_topology_observation(message.to_owned()),
+        classification.observation_deadline,
+    );
+    classified
+        .pre_ready_topology_outcome()
+        .is_some()
+        .then_some(classified)
 }
 
 /// Whether this task's creation has been acknowledged.
