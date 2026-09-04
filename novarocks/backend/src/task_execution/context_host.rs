@@ -297,6 +297,36 @@ impl NativeQueryContextHost {
         facts.participant.clone()
     }
 
+    /// The participant this host installed for the exact attempt.
+    ///
+    /// This is the read side a peer backend reaches: a runtime-filter envelope
+    /// carries a wire participant identity, not an execution id, so the
+    /// attempt has to be recovered from the query id and deployment epoch it
+    /// does carry. Ownership only — accept, duplicate and reject stay the
+    /// participant's own verdict.
+    ///
+    /// Without this, every cross-backend runtime-filter envelope of a
+    /// task-protocol query is refused at the peer: contributions never reach
+    /// their aggregator, artifacts never reach their consumers, and each
+    /// consumer waits out its whole wait cap before scanning unfiltered.
+    pub(crate) fn claim_runtime_filter_participant(
+        &self,
+        participant: crate::runtime_filter::domain::BackendParticipantIdentity,
+    ) -> Option<Arc<RuntimeFilterParticipant>> {
+        let execution = {
+            let contexts = self
+                .contexts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            contexts.by_execution.keys().copied().find(|execution| {
+                execution.query_id().high() == participant.query_id().high()
+                    && execution.query_id().low() == participant.query_id().low()
+                    && execution.attempt_id().get() == participant.deployment_epoch()
+            })?
+        };
+        self.participant_for_execution(execution)
+    }
+
     /// Which task carries this query context's dynamic filter feedback.
     ///
     /// This is the supply observable of the backend half of that loop: a sink

@@ -3187,22 +3187,25 @@ impl QueryLifecycleRegistry {
         state.runtime_filter.clone()
     }
 
-    /// Dispatches an already decoded envelope through an existing exact
-    /// attempt. A miss is deliberately lookup-only and cannot release a gate.
-    pub(crate) fn dispatch_runtime_filter_envelope(
+    /// The participant this registry installed for the exact attempt.
+    ///
+    /// Ownership only: whether the envelope is legal is the participant's own
+    /// verdict, and `None` says nothing about attempts installed by another
+    /// owner. The task protocol creates no `InitQuery` manifest, so its
+    /// attempts are never found here — that is correct, not a miss.
+    pub(crate) fn claim_runtime_filter_participant(
         &self,
-        envelope: BackendNativeRuntimeFilterEnvelope,
-    ) -> crate::runtime_filter::domain::BackendIngressResult {
-        let participant = self
-            .state
+        participant: crate::runtime_filter::domain::BackendParticipantIdentity,
+    ) -> Option<Arc<RuntimeFilterParticipant>> {
+        self.state
             .lock()
             .expect("query lifecycle registry lock")
             .entries
             .iter()
             .find(|(execution_id, _)| {
-                execution_id.query_id().high() == envelope.participant().query_id().high()
-                    && execution_id.query_id().low() == envelope.participant().query_id().low()
-                    && execution_id.attempt_id().get() == envelope.participant().deployment_epoch()
+                execution_id.query_id().high() == participant.query_id().high()
+                    && execution_id.query_id().low() == participant.query_id().low()
+                    && execution_id.attempt_id().get() == participant.deployment_epoch()
             })
             .map(|(_, entry)| entry)
             .and_then(|entry| {
@@ -3212,8 +3215,16 @@ impl QueryLifecycleRegistry {
                     .expect("query lifecycle entry lock")
                     .runtime_filter
                     .clone()
-            });
-        match participant {
+            })
+    }
+
+    /// Dispatches an already decoded envelope through an existing exact
+    /// attempt. A miss is deliberately lookup-only and cannot release a gate.
+    pub(crate) fn dispatch_runtime_filter_envelope(
+        &self,
+        envelope: BackendNativeRuntimeFilterEnvelope,
+    ) -> crate::runtime_filter::domain::BackendIngressResult {
+        match self.claim_runtime_filter_participant(envelope.participant()) {
             Some(participant) => participant.dispatch_envelope(envelope),
             None => crate::runtime_filter::domain::BackendIngressResult::rejected(
                 "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace",

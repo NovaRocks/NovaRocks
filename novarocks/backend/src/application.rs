@@ -37,6 +37,7 @@ use crate::rpc::client::BackendRpcClient;
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
 use crate::rpc::task_execution::TaskExecutionIngress;
+use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
 use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
 use crate::task_execution::{
     RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
@@ -315,6 +316,10 @@ struct BackendApplicationServices {
     /// exchange frame, because the frozen descriptor is the only place a
     /// task's inbound topology exists.
     task_inbound_capabilities: Arc<crate::task_execution::TaskInboundCapabilities>,
+    /// The task substrate's runtime-filter participant owner. The RPC ingress
+    /// needs it directly, for the same reason: an `EstablishQueryContext`
+    /// install is the only place a task-protocol query's participant exists.
+    query_context_host: Arc<crate::task_execution::NativeQueryContextHost>,
 }
 
 /// What the two unrouted hosts below report.
@@ -772,7 +777,7 @@ fn compose_backend_application_services(
     ));
     let task_execution_registry = TaskExecutionRegistry::with_process_clock(
         TaskExecutionRegistryConfig::for_process(query_lifecycle_ingress.backend_process_id()),
-        context_host,
+        Arc::clone(&context_host) as Arc<dyn crate::task_execution::QueryContextHost>,
         execution_host,
     );
     let task_execution_ingress: Arc<dyn TaskExecutionIngress> =
@@ -786,6 +791,7 @@ fn compose_backend_application_services(
         task_execution_registry,
         task_execution_ingress,
         task_inbound_capabilities: inbound_capabilities,
+        query_context_host: context_host,
     })
 }
 
@@ -966,8 +972,15 @@ impl BackendApplicationHost {
             TASK_DEADLINE_TICK_INTERVAL,
         );
 
+        // Both participant owners, because an attempt is reachable only
+        // through the one that installed it: the fragment query lifecycle for
+        // EXPLAIN ANALYZE, and the query-context host for every intent that
+        // runs on the task protocol.
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
-            services.query_lifecycle_registry.clone();
+            native_runtime_filter_envelope_ingress(
+                Arc::clone(&services.query_lifecycle_registry),
+                Arc::clone(&services.query_context_host),
+            );
         let mut grpc_server = match BackendRpcServerHandle::start(
             &bind_host,
             grpc_port,
@@ -1569,6 +1582,111 @@ mod tests {
             Arc::strong_count(&services.query_lifecycle_registry),
             3,
             "application, Stage ingress, and fragment service must share exactly one registry"
+        );
+    }
+
+    /// Every cross-backend runtime-filter envelope arrives through the ingress
+    /// this composes, and a participant is reachable only through the owner
+    /// that installed it.
+    ///
+    /// The task protocol installs its participant with
+    /// `EstablishQueryContext` and creates no `InitQuery` manifest, so the
+    /// fragment query lifecycle holds nothing for such an attempt. With only
+    /// that owner wired, every producer contribution and every materialized
+    /// artifact is refused at the peer as query-unavailable. Nothing fails --
+    /// a runtime filter is a conservative pre-filter -- so each consumer
+    /// simply waits out its whole wait cap and then scans unfiltered.
+    #[test]
+    fn the_composed_runtime_filter_ingress_reaches_a_task_protocol_participant() {
+        use super::native_runtime_filter_envelope_ingress;
+        use crate::runtime_filter::domain::BackendEnvelopeKind;
+        use crate::runtime_filter::test_support::delivery_envelope_for_test;
+        use crate::task_execution::{QueryContextHost, SharedFactsRequest};
+        use novarocks_execution::task_execution::CredentialUpdate;
+        use novarocks_execution::task_execution::domain::{
+            CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
+        };
+        use novarocks_proto_codec::FieldPath;
+        use novarocks_proto_codec::catalog::CatalogSet;
+        use novarocks_proto_codec::task_execution::domain::{WireContent, WireCredential};
+        use novarocks_proto_models::filter;
+        use novarocks_types::identity::FrontendProcessId;
+
+        let services = compose_backend_application_services(
+            test_data_runtime(),
+            execution_runtime_config(),
+            query_lifecycle_registry_config(Duration::from_millis(5_000)),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            WriteCommitEvidenceLimits::default(),
+            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            &[],
+        )
+        .expect("compose backend application services");
+
+        // The exact attempt the fixture envelope is addressed to, established
+        // the way the task protocol establishes one.
+        let envelope = delivery_envelope_for_test(BackendEnvelopeKind::CompletedWithoutArtifact);
+        let context = QueryContextRef::new(
+            crate::runtime_filter::test_support::participant_execution_id(),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let catalogs: Arc<dyn CodecOwnedContent> = Arc::new(WireContent::new(
+            b"catalog",
+            CatalogSet::new(Vec::new())
+                .expect("an empty catalog set is legal")
+                .as_proto()
+                .clone(),
+        ));
+        let filter: Arc<dyn CodecOwnedContent> = Arc::new(WireContent::new(
+            b"contribution",
+            protocol::RuntimeFilterContribution {
+                participant_id: 1,
+                lifecycle: Some(filter::RuntimeFilterQueryLifecycleOptions {
+                    delivery_expire_ms: 1,
+                    query_expire_ms: 1,
+                    transport_retry_interval_ms: 1,
+                    transport_max_attempts: 1,
+                    transport_deadline_ms: 1,
+                    transport_max_pending_entries: 1,
+                    transport_max_pending_bytes: 1,
+                }),
+                install: Some(filter::RuntimeFilterParticipantInstall::default()),
+            },
+        ));
+        let credential = CredentialUpdate::new(
+            CredentialLeaseId::new(1),
+            CredentialEpoch::FIRST,
+            Arc::new(
+                WireCredential::decode(&[], &[], FieldPath::root("credential"))
+                    .expect("an empty rotation is legal"),
+            ),
+        );
+        services
+            .query_context_host
+            .materialize(SharedFactsRequest::new(
+                context,
+                &catalogs,
+                &filter,
+                &credential,
+            ))
+            .expect("establishing a query context with a participant is legal");
+
+        let ingress = native_runtime_filter_envelope_ingress(
+            Arc::clone(&services.query_lifecycle_registry),
+            Arc::clone(&services.query_context_host),
+        );
+        let reason = ingress
+            .accept(envelope)
+            .rejection_reason()
+            .map(str::to_string)
+            .expect("a channel-less participant refuses this delivery itself");
+        // Reaching the participant is the whole claim: it refuses the delivery
+        // on its own route authority, which no composition refusal can say.
+        assert!(
+            reason.contains("[artifact-delivery]"),
+            "the envelope must be decided by the participant the query context \
+             installed, not refused for having no owner: {reason}"
         );
     }
 
