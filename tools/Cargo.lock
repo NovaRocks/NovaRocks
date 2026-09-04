@@ -2028,7 +2028,6 @@ dependencies = [
  "arrow-string",
  "as-any",
  "async-trait",
- "backon",
  "base64 0.22.1",
  "bimap",
  "bytes",
@@ -2830,6 +2829,7 @@ dependencies = [
  "novarocks-connector-binding",
  "novarocks-execution",
  "novarocks-failpoint",
+ "novarocks-functions",
  "novarocks-native-trust",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -2872,12 +2872,12 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
- "datasketches",
  "futures",
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
  "novarocks-connector-binding",
+ "novarocks-connector-iceberg-functions",
  "novarocks-fs",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -2899,6 +2899,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-connector-iceberg-functions"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "datasketches",
+ "novarocks-functions",
+]
+
+[[package]]
 name = "novarocks-connector-starrocks"
 version = "0.1.0"
 dependencies = [
@@ -2917,6 +2927,7 @@ dependencies = [
 name = "novarocks-execution"
 version = "0.1.0"
 dependencies = [
+ "allocator-api2",
  "arrow",
  "arrow-buffer",
  "arrow-data",
@@ -2927,10 +2938,12 @@ dependencies = [
  "chrono-tz",
  "crc32c",
  "datasketches",
+ "futures",
  "hashbrown 0.14.5",
  "hex",
  "libm",
  "md-5",
+ "novarocks-functions",
  "novarocks-spi",
  "novarocks-types",
  "num-traits",
@@ -2972,7 +2985,6 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
- "datasketches",
  "futures",
  "hex",
  "libc",
@@ -2981,6 +2993,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-fs",
+ "novarocks-functions",
  "novarocks-native-trust",
  "novarocks-parser",
  "novarocks-proto-codec",
@@ -3029,6 +3042,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-functions"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "sha2",
+]
+
+[[package]]
 name = "novarocks-native-trust"
 version = "0.1.0"
 dependencies = [
@@ -3064,6 +3086,7 @@ dependencies = [
 name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",
@@ -3094,18 +3117,22 @@ dependencies = [
  "atty",
  "chrono",
  "futures",
+ "hex",
  "libc",
  "novarocks-backend",
  "novarocks-connector-binding",
  "novarocks-connector-iceberg",
+ "novarocks-connector-iceberg-functions",
  "novarocks-connector-starrocks",
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-frontend",
  "novarocks-fs",
+ "novarocks-functions",
  "novarocks-native-trust",
  "novarocks-secret",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-state-store-sqlite",
  "novarocks-types",
  "novarocks-version",
@@ -3141,6 +3168,7 @@ dependencies = [
  "chrono",
  "hex",
  "md-5",
+ "novarocks-functions",
  "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",

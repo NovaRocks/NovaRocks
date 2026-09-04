@@ -2364,6 +2364,7 @@ dependencies = [
 name = "novarocks-execution"
 version = "0.1.0"
 dependencies = [
+ "allocator-api2",
  "arrow",
  "arrow-buffer",
  "arrow-data",
@@ -2374,10 +2375,12 @@ dependencies = [
  "chrono-tz",
  "crc32c",
  "datasketches",
+ "futures",
  "hashbrown 0.14.5",
  "hex",
  "libm",
  "md-5",
+ "novarocks-functions",
  "novarocks-spi",
  "novarocks-types",
  "num-traits",
@@ -2419,7 +2422,6 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
- "datasketches",
  "futures",
  "hex",
  "libc",
@@ -2428,6 +2430,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-fs",
+ "novarocks-functions",
  "novarocks-native-trust",
  "novarocks-parser",
  "novarocks-plan-codec",
@@ -2474,6 +2477,15 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "novarocks-functions"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "sha2",
 ]
 
 [[package]]
@@ -2525,6 +2537,7 @@ dependencies = [
 name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
  "novarocks-execution",
  "novarocks-proto-models",
  "novarocks-spi",
@@ -2572,6 +2585,7 @@ dependencies = [
  "chrono",
  "hex",
  "md-5",
+ "novarocks-functions",
  "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",
