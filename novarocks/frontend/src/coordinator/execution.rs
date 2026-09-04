@@ -30,8 +30,8 @@ use crate::common::backend_topology::{
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
 };
 use crate::native::fragment_transport::{
-    FetchOutcome, FinalTaskInfoRead, FragmentDispatcher, NativeTaskResultTransport,
-    RootResultOutcome, TaskReadGrace, TaskResultTransport,
+    ExpectedOutputSchemaView, FetchOutcome, FinalTaskInfoRead, FragmentDispatcher,
+    NativeTaskResultTransport, RootResultOutcome, TaskReadGrace, TaskResultTransport,
 };
 use crate::query_execution::artifact::{
     PreparedDistributedQuery, RunningNativeExecutionParts,
@@ -1803,6 +1803,11 @@ impl FrontendDistributedQueryCoordinator {
         // write commits on the strength of this fact.
         let mut observed_result_eof = false;
         let mut last_root_poll = RootResultPoll::default();
+        // Taken before the loop because the polls run beside it: the schema
+        // is shared, immutable and only read, while `expected_output` itself
+        // is consumed by this attempt's answer.
+        let root_output_schema = Arc::clone(expected_output.fetch_view().chunk_schema());
+        let mut root_result_polls: Option<RootResultPolls> = None;
         let mut wait_witness = TaskRoundWaitWitness::new(
             task_round_wait_facts(&round, root_task, 0, last_root_poll),
             Instant::now(),
@@ -1920,13 +1925,43 @@ impl FrontendDistributedQueryCoordinator {
                 ));
             }
 
-            if !observed_result_eof && task_is_created(&round, root_task) {
-                let wait = max_root_result_wait(now, statement_deadline);
-                match result_transport.fetch_root_result(
+            // The polls run until this loop has observed the end of the
+            // result stream, and that fact alone stops them. Not the root
+            // task leaving its created state: delivering the end of stream is
+            // what retires that task, so stopping on its terminal status
+            // races the last answer -- and losing that answer leaves the read
+            // waiting for an end of stream nothing will send again.
+            //
+            // Its creation being acknowledged is still what starts the first
+            // poll, because the result plane refuses a poll for a task it
+            // does not hold yet.
+            if observed_result_eof {
+                root_result_polls = None;
+            } else if root_result_polls.is_none() && task_is_created(&round, root_task) {
+                match RootResultPolls::start(
+                    Arc::clone(&result_transport) as Arc<dyn TaskResultTransport>,
                     root_task,
-                    wait,
-                    Some(expected_output.fetch_view()),
+                    Arc::clone(&root_output_schema),
+                    statement_deadline,
+                    Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
                 ) {
+                    Ok(polls) => root_result_polls = Some(polls),
+                    Err(error) => {
+                        break Err(self.fail_task_round(
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            error,
+                        ));
+                    }
+                }
+            }
+            // One answer per turn. Consuming it makes the turn non-idle, so
+            // the loop comes straight back for the next one instead of
+            // parking on the wake the poller raised.
+            if let Some(answer) = root_result_polls.as_mut().and_then(RootResultPolls::take) {
+                match answer {
                     Ok(RootResultOutcome::Ready {
                         packet_sequence,
                         batch,
@@ -1961,25 +1996,29 @@ impl FrontendDistributedQueryCoordinator {
                         moved = true;
                     }
                     Ok(RootResultOutcome::NotReady) => {
+                        // Deliberately not progress. The poller is already
+                        // asking again, so a turn that claimed this moved
+                        // something would keep the loop spinning through
+                        // that whole wait instead of parking until the
+                        // poller, an acknowledgement or a status event wakes
+                        // it.
                         last_root_poll = RootResultPoll::NotReady;
-                        moved = true;
                     }
-                    Ok(RootResultOutcome::Failed(detail)) => {
+                    Ok(RootResultOutcome::Failed(detail)) | Err(detail) => {
+                        // A refused or failed poll is also how a read ends
+                        // when the task it names has already gone. If this
+                        // attempt has a failure of its own, that failure is
+                        // the cause and this answer is the reaction to it, so
+                        // it is the one reported.
+                        let detail = round.failure_cause().map_or(detail, |cause| {
+                            format!("task execution terminated: {cause:?}")
+                        });
                         break Err(self.fail_task_round(
                             query_id,
                             &mut round,
                             &split_delivery,
                             classification,
                             detail,
-                        ));
-                    }
-                    Err(error) => {
-                        break Err(self.fail_task_round(
-                            query_id,
-                            &mut round,
-                            &split_delivery,
-                            classification,
-                            error,
                         ));
                     }
                 }
@@ -2717,7 +2756,8 @@ mod tests {
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
     };
     use crate::native::fragment_transport::{
-        ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
+        DynamicFilterRead, DynamicFilterReadError, ExpectedOutputSchemaView, FetchOutcome,
+        FinalTaskInfoRead, FragmentDispatcher, RootResultOutcome,
     };
     use crate::query_execution::completion::{
         PreReadyRetryBoundary, PreparedDistributedQuery, PreparedDistributedRequestFactory,
@@ -2731,9 +2771,13 @@ mod tests {
     };
     use crate::query_execution::preparation::{ScanPreparationOptions, prepare_fragments};
     use crate::topology::ClusterBackendService;
+    use novarocks_execution::task_execution::domain::DomainVersion;
+    use novarocks_execution::task_execution::{MaxWait, TaskIdentity};
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
+    use novarocks_types::identity::{StageId, TaskId};
+    use novarocks_types::{AttemptId, QueryExecutionId};
     use novarocks_types::{
         BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace, UniqueId,
     };
@@ -3334,6 +3378,175 @@ mod tests {
         assert_eq!(control_ready_closures.load(Ordering::SeqCst), 0);
         assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 0);
     }
+
+    /// A root result transport whose every poll answers only when this test
+    /// says so, so that "a poll is in flight" is a state the test holds
+    /// rather than one it races.
+    struct ScriptedRootResult {
+        /// One answer per poll, in the order they are given.
+        answers: Mutex<std::collections::VecDeque<RootResultOutcome>>,
+        /// Received once per poll before it answers.
+        releases: Mutex<std::sync::mpsc::Receiver<()>>,
+        polls: AtomicUsize,
+    }
+
+    impl super::TaskResultTransport for ScriptedRootResult {
+        fn fetch_root_result(
+            &self,
+            _root_task: TaskIdentity,
+            _max_wait: MaxWait,
+            _expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
+        ) -> Result<RootResultOutcome, String> {
+            self.releases
+                .lock()
+                .expect("scripted release lock")
+                .recv()
+                .map_err(|_| "the test stopped releasing polls".to_owned())?;
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.answers
+                .lock()
+                .expect("scripted answer lock")
+                .pop_front()
+                .ok_or_else(|| "the script ran out of answers".to_owned())
+        }
+
+        fn final_task_info(&self, _identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
+            Err("this transport answers only root result polls".to_owned())
+        }
+
+        fn dynamic_filters(
+            &self,
+            _identity: TaskIdentity,
+            _acknowledged: Option<DomainVersion>,
+        ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
+            Err(DynamicFilterReadError::Refused(
+                "this transport answers only root result polls".to_owned(),
+            ))
+        }
+    }
+
+    fn root_task_for_test() -> TaskIdentity {
+        TaskIdentity::new(
+            QueryExecutionId::new(
+                QueryId::new(0x1234, 0x5678),
+                AttemptId::new(1).expect("attempt one is nonzero"),
+            )
+            .expect("a nonzero query id"),
+            StageId::new(1).expect("a nonzero stage id"),
+            TaskId::new(1).expect("a nonzero task id"),
+            BackendProcessId::new_v7(),
+        )
+    }
+
+    /// Waits for the poller to answer, bounded, so a failure is a failure
+    /// rather than a hang.
+    fn answer_within(
+        polls: &mut super::RootResultPolls,
+        budget: Duration,
+    ) -> Option<Result<RootResultOutcome, String>> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(answer) = polls.take() {
+                return Some(answer);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The defect this pins: one root result poll asks a backend to hold its
+    /// answer for up to `MAX_ROOT_RESULT_WAIT`, and an attempt has exactly
+    /// one thread -- the one that turns its task state machine. While that
+    /// thread waited out a poll it dispatched nothing, so every decision made
+    /// by another thread meanwhile waited for the poll instead of for its own
+    /// facts. A distributed `SELECT` opens its producers' exchange edges
+    /// exactly there: each edge-open decision cost one whole poll wait, and
+    /// the cost was invisible as anything but latency. Measured on a 1FE+3BE
+    /// cluster, every statement of the `filter` suite took ~0.85 s of which
+    /// ~0.05 s was work, and the suite took 92 s against its baseline's 4 s.
+    ///
+    /// So the answers must reach the loop without the loop ever waiting for
+    /// one, and the polls must stop themselves once the read is over: a poll
+    /// after the end of the stream is refused by a backend that has already
+    /// handed its result over.
+    #[test]
+    fn root_result_polls_answer_a_loop_that_never_waits_for_one() {
+        let (release, releases) = std::sync::mpsc::channel();
+        let transport = Arc::new(ScriptedRootResult {
+            answers: Mutex::new(
+                [
+                    RootResultOutcome::NotReady,
+                    RootResultOutcome::EndOfStream { packet_sequence: 7 },
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            releases: Mutex::new(releases),
+            polls: AtomicUsize::new(0),
+        });
+        let wake = Arc::new(crate::task_execution::status_intake::CountingWake::default());
+        let mut polls = super::RootResultPolls::start(
+            Arc::clone(&transport) as Arc<dyn super::TaskResultTransport>,
+            root_task_for_test(),
+            Arc::new(novarocks_execution::exec::chunk::ChunkSchema::empty()),
+            Instant::now() + Duration::from_secs(60),
+            Arc::clone(&wake) as Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
+        )
+        .expect("the poller starts");
+
+        // A poll is in flight and this test is holding its answer. Taking
+        // from the poller answers immediately anyway, and that is the whole
+        // property: the loop is free to turn its state machine.
+        assert!(
+            polls.take().is_none(),
+            "a poll in flight must not hand the loop an answer"
+        );
+        assert_eq!(wake.count(), 0, "nothing has been answered yet");
+
+        // The first answer says nothing is ready. It still wakes the loop,
+        // and the poller asks again on its own.
+        release
+            .send(())
+            .expect("the poller is waiting for a release");
+        let first = answer_within(&mut polls, Duration::from_secs(10))
+            .expect("the first answer reaches the loop");
+        assert!(
+            matches!(first, Ok(RootResultOutcome::NotReady)),
+            "actual: {first:?}"
+        );
+        assert!(wake.count() >= 1, "an answer wakes the loop");
+
+        release.send(()).expect("the poller polls again by itself");
+        let second = answer_within(&mut polls, Duration::from_secs(10))
+            .expect("the second answer reaches the loop");
+        assert!(
+            matches!(
+                second,
+                Ok(RootResultOutcome::EndOfStream { packet_sequence: 7 })
+            ),
+            "actual: {second:?}"
+        );
+
+        // Nothing is polled after the end of the stream. The poller has let
+        // go of the transport, which is what says it stopped rather than
+        // merely paused.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&transport) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            Arc::strong_count(&transport),
+            1,
+            "the poller must stop itself once the read is over"
+        );
+        assert_eq!(
+            transport.polls.load(Ordering::SeqCst),
+            2,
+            "exactly the two polls this test released"
+        );
+    }
 }
 
 /// How long the coordinator parks when one turn moved nothing at all.
@@ -3344,9 +3557,16 @@ const TASK_ROUND_IDLE_WAIT: Duration = Duration::from_millis(5);
 
 /// The longest one root result poll may block a backend.
 ///
-/// Kept short so the loop keeps turning the state machine while it waits: the
-/// same thread owns both, and a poll that parked for the whole statement
-/// budget would stop settling acknowledgements and opening edges.
+/// It bounds how long a backend holds one request, and nothing else: the polls
+/// run on [`RootResultPolls`], so the attempt's own loop keeps settling
+/// acknowledgements and opening edges throughout one. What the number still
+/// buys is diagnostics and shutdown -- the interval at which a poll that
+/// answers nothing refreshes the wait facts, and the longest a poller lingers
+/// after the loop stops reading it.
+///
+/// It must not be read as a bound on the loop's responsiveness. It was one
+/// once, and being one is what made every statement of a distributed suite
+/// wait a poll per edge-open decision.
 const MAX_ROOT_RESULT_WAIT: Duration = Duration::from_millis(200);
 
 /// How long an attempt may make no observable progress before it says, in the
@@ -3604,6 +3824,94 @@ fn max_root_result_wait(now: Instant, deadline: Instant) -> MaxWait {
     // inside what `MaxWait` represents, so the fallback is unreachable rather
     // than a silent widening of a wait the deadline had bounded.
     MaxWait::new(wait).unwrap_or_else(|_| MaxWait::default_for(OperationKind::GetFinalTaskInfo))
+}
+
+/// One attempt's root result polls, run beside the loop that owns the attempt.
+///
+/// A poll asks the root task's backend to hold the request until it has
+/// something to say, for up to [`MAX_ROOT_RESULT_WAIT`]. An attempt has
+/// exactly one thread, and it is the thread that turns the task state
+/// machine: waiting out the poll on it stops that machine for the whole wait,
+/// and turning it is what dispatches an edge open, settles an
+/// acknowledgement and folds status.
+///
+/// Every one of those decisions is made by another thread -- a create
+/// acknowledgement arriving, a status event published -- so each one that
+/// lands while the poll is in flight waits for the poll instead of for its
+/// own facts. A distributed `SELECT` opens its producers' edges exactly
+/// there, which cost one whole poll wait per edge decision and showed up
+/// nowhere except as latency: measured on a 1FE+3BE cluster, every statement
+/// of the `filter` suite took ~0.85 s, of which ~0.05 s was work.
+///
+/// So the polls run here instead. One is in flight at a time, in order, and
+/// each answer wakes the loop -- the read is exactly as sequential and as
+/// prompt as it was, while the loop stays free to move a decision the moment
+/// it is made.
+struct RootResultPolls {
+    answers: std::sync::mpsc::Receiver<Result<RootResultOutcome, String>>,
+}
+
+impl RootResultPolls {
+    /// Starts polling `root_task`.
+    ///
+    /// The caller has already observed that this task's creation was
+    /// acknowledged: the result plane refuses a poll for a task it does not
+    /// hold yet, and that refusal fails the attempt.
+    fn start(
+        transport: Arc<dyn TaskResultTransport>,
+        root_task: TaskIdentity,
+        expected_output_schema: novarocks_execution::exec::chunk::ChunkSchemaRef,
+        statement_deadline: Instant,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Result<Self, String> {
+        // One answer of slack, so the next poll may already be in flight
+        // while the loop folds the last one. More would buy nothing: the
+        // answers are one ordered stream with one consumer.
+        let (sender, answers) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("root-result-polls".to_owned())
+            .spawn(move || {
+                loop {
+                    let now = Instant::now();
+                    if now >= statement_deadline {
+                        break;
+                    }
+                    let answer = transport.fetch_root_result(
+                        root_task,
+                        max_root_result_wait(now, statement_deadline),
+                        Some(ExpectedOutputSchemaView::new(&expected_output_schema)),
+                    );
+                    // Nothing is polled after an answer the loop cannot ask
+                    // to be repeated. The stream has ended or the read
+                    // failed, and a poll past that point is refused by a
+                    // backend that has already handed its result over -- an
+                    // error the loop would read as this query's failure.
+                    let last = !matches!(
+                        answer,
+                        Ok(RootResultOutcome::Ready { .. } | RootResultOutcome::NotReady)
+                    );
+                    if sender.send(answer).is_err() {
+                        // The loop stopped reading, so this attempt is over.
+                        break;
+                    }
+                    wake.wake();
+                    if last {
+                        break;
+                    }
+                }
+            })
+            .map(|_| Self { answers })
+            .map_err(|error| format!("root result poller thread could not start: {error}"))
+    }
+
+    /// The next answer, if one has arrived.
+    ///
+    /// A disconnected poller answers `None` for the rest of the attempt: it
+    /// stops only after a terminal answer this loop already folded, or at the
+    /// statement deadline the loop checks itself.
+    fn take(&mut self) -> Option<Result<RootResultOutcome, String>> {
+        self.answers.try_recv().ok()
+    }
 }
 
 /// Feeds every task's latest status to the write completion tracker.
