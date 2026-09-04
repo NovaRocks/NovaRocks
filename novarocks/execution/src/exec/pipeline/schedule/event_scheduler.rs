@@ -149,7 +149,8 @@ impl EventScheduler {
         self.reschedule_cv.notify_all();
     }
 
-    pub(crate) fn register_driver(self: &Arc<Self>, task: &DriverTask) {
+    pub(crate) fn register_driver(self: &Arc<Self>, task: &DriverTask) -> bool {
+        let mut registered_new = false;
         let mut observer: Option<Arc<PipelineObserver>> = None;
         let mut get_observer = || {
             observer
@@ -166,6 +167,7 @@ impl EventScheduler {
         };
         if let Some(observable) = task.source_observable() {
             if task.try_mark_source_observer_registered(&observable) {
+                registered_new = true;
                 let observer = get_observer();
                 self.add_observer(observable, Arc::clone(&observer), ObserverKind::Source);
             }
@@ -178,6 +180,7 @@ impl EventScheduler {
         }
         if let Some(observable) = task.sink_observable() {
             if task.try_mark_sink_observer_registered(&observable) {
+                registered_new = true;
                 let observer = get_observer();
                 self.add_observer(observable, observer, ObserverKind::Sink);
             }
@@ -188,6 +191,7 @@ impl EventScheduler {
                 task.driver_id()
             );
         }
+        registered_new
     }
 
     pub(crate) fn add_blocked(
@@ -377,7 +381,7 @@ impl EventScheduler {
         }
     }
 
-    fn try_schedule_key(&self, key: DriverKey) {
+    fn try_schedule_key(self: &Arc<Self>, key: DriverKey) {
         let mut task = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             blocked.remove(&key)
@@ -407,8 +411,18 @@ impl EventScheduler {
             return;
         }
 
-        let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
-        blocked.insert(key, task);
+        // Readiness checks may advance an async processor and expose a different
+        // observable. Register that identity before parking again. A newly
+        // registered observable gets one immediate recheck so a transition that
+        // happened just before registration cannot be lost.
+        let registered_new = self.register_driver(&task);
+        {
+            let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
+            blocked.insert(key, task);
+        }
+        if registered_new {
+            self.enqueue(key);
+        }
     }
 
     fn enqueue_ready(&self, task: DriverTask) {
@@ -758,7 +772,6 @@ mod tests {
         scheduler.register_driver(&task);
         assert_eq!(terminal_observable.num_observers(), 1);
 
-        internal_ready.store(false, Ordering::Release);
         let reason = match task.process_for_test(Duration::from_millis(10)) {
             DriverState::Blocked(reason @ BlockedReason::OutputFull) => reason,
             state => panic!("expected output-full block, got {state:?}"),
@@ -767,7 +780,7 @@ mod tests {
             scheduler.add_blocked(task, reason).is_ok(),
             "dynamic sink observable is registrable"
         );
-        assert_eq!(internal_observable.num_observers(), 1);
+        assert_eq!(internal_observable.num_observers(), 0);
 
         let key = scheduler
             .reschedule_queue
@@ -775,7 +788,9 @@ mod tests {
             .expect("event scheduler queue lock")
             .pop_front()
             .expect("initial readiness recheck");
+        internal_ready.store(false, Ordering::Release);
         scheduler.try_schedule_key(key);
+        assert_eq!(internal_observable.num_observers(), 1);
         assert_eq!(
             scheduler
                 .blocked
@@ -791,6 +806,14 @@ mod tests {
                 .expect("global executor queue lock")
                 .is_empty()
         );
+
+        let key = scheduler
+            .reschedule_queue
+            .lock()
+            .expect("event scheduler queue lock")
+            .pop_front()
+            .expect("new sink observable must receive a closing readiness recheck");
+        scheduler.try_schedule_key(key);
 
         internal_ready.store(true, Ordering::Release);
         terminal_ready.store(true, Ordering::Release);
@@ -872,7 +895,6 @@ mod tests {
         scheduler.register_driver(&task);
         assert_eq!(first_observable.num_observers(), 1);
 
-        use_second_observable.store(true, Ordering::Release);
         let reason = match task.process_for_test(Duration::from_millis(10)) {
             DriverState::Blocked(reason @ BlockedReason::InputEmpty) => reason,
             state => panic!("expected input-empty block, got {state:?}"),
@@ -881,7 +903,7 @@ mod tests {
             scheduler.add_blocked(task, reason).is_ok(),
             "dynamic source observable is registrable"
         );
-        assert_eq!(second_observable.num_observers(), 1);
+        assert_eq!(second_observable.num_observers(), 0);
 
         let key = scheduler
             .reschedule_queue
@@ -889,7 +911,9 @@ mod tests {
             .expect("event scheduler queue lock")
             .pop_front()
             .expect("initial readiness recheck");
+        use_second_observable.store(true, Ordering::Release);
         scheduler.try_schedule_key(key);
+        assert_eq!(second_observable.num_observers(), 1);
         assert_eq!(
             scheduler
                 .blocked
@@ -905,6 +929,14 @@ mod tests {
                 .expect("global executor queue lock")
                 .is_empty()
         );
+
+        let key = scheduler
+            .reschedule_queue
+            .lock()
+            .expect("event scheduler queue lock")
+            .pop_front()
+            .expect("new source observable must receive a closing readiness recheck");
+        scheduler.try_schedule_key(key);
 
         source_ready.store(true, Ordering::Release);
         second_observable.notify_observers();
