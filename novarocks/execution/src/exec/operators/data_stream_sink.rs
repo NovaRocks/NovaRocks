@@ -2385,6 +2385,28 @@ impl ProcessorOperator for DataStreamSinkOperator {
             self.awaits_edge_permission(),
             self.has_pending_data(),
         );
+        // A driver holding rows is not finished, whatever the driver set's
+        // arithmetic says.
+        //
+        // The pending buffers are per driver, but the end-of-stream is per
+        // sender: whichever driver completes the set sends one marker for all
+        // of them, and the receiver's sender count closes on that one marker.
+        // A driver that counted itself while still holding rows would let a
+        // sibling seal the sender over frames nobody has sent, and the
+        // receiver would report the exchange complete and silently short --
+        // no error anywhere, just fewer rows.
+        //
+        // So the count means "this driver has handed over everything it
+        // holds", which is what earns the last-driver verdict the right to
+        // speak for the others. `finishing_wait` already reports owed output
+        // for a driver with pending data and parks one whose edge is still
+        // closed, so returning here costs a turn, not the rows. Permission
+        // deliberately does not withhold the count: an edge that is closed
+        // with nothing behind it owes nothing, and withholding on that would
+        // stall the seal on a driver that has no rows to lose.
+        if self.has_pending_data() {
+            return Ok(());
+        }
         // One driver reports its own finish exactly once, however many times
         // the driver retries this call while waiting for its edge to open.
         let is_last_driver = if self.finish_counted.swap(true, Ordering::SeqCst) {
@@ -2409,12 +2431,12 @@ impl ProcessorOperator for DataStreamSinkOperator {
         if !is_last_driver {
             return Ok(());
         }
-        // End of stream must not overtake data this sink still owes. The
-        // last-driver verdict is latched, so returning here keeps it for the
-        // retry that `finishing_wait` asks for: the receiver would
-        // otherwise see the seal before the frames it seals and report the
-        // exchange complete with rows still parked on the sender.
-        if self.awaits_edge_permission() || self.has_pending_data() {
+        // The marker is output like any other frame, so it needs this
+        // driver's edges open. The last-driver verdict is latched, so
+        // returning here keeps it for the retry that `finishing_wait` asks
+        // for. Pending data needs no second check: no driver reaches the
+        // count while it still holds any.
+        if self.awaits_edge_permission() {
             return Ok(());
         }
         self.send_eos()?;
@@ -3266,6 +3288,77 @@ mod tests {
         assert!(
             !state.force_eos_sent.load(Ordering::SeqCst),
             "the one-shot guard is for a genuine accounting error, not for retries"
+        );
+    }
+
+    /// The defect this catches: the driver that completes a sink's driver set
+    /// sends one end-of-stream for the whole set, but the pending buffers are
+    /// per driver. That driver checked only its own, so a sibling that had
+    /// finished while still holding rows had them dropped -- the receiver's
+    /// sender count closed on the marker and reported the exchange complete,
+    /// silently short, with no error anywhere. Observed on a real 1FE+3BE run
+    /// as `SELECT ... UNION SELECT ...` returning one row of two and as
+    /// `COUNT(*)` over a union returning 0; it reproduced in 3 of 8 suite
+    /// runs and in none on the commit before the cutover.
+    #[test]
+    fn a_driver_still_holding_rows_is_not_counted_against_the_driver_set() {
+        let state = Arc::new(DataStreamSinkFinishState::default());
+        // Two drivers on one sink, both sharing the frozen finish state.
+        state.register_driver();
+        state.register_driver();
+        let runtime = RuntimeState::default();
+
+        let mut holder = make_test_operator();
+        holder.finish_state = Arc::clone(&state);
+        holder.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        gate_destinations(&mut holder, vec![make_test_destination()]);
+
+        let mut sibling = make_test_operator();
+        sibling.driver_id = 1;
+        sibling.finish_state = Arc::clone(&state);
+        sibling.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        gate_destinations(&mut sibling, vec![make_test_destination()]);
+
+        // One driver finishes holding rows it has not been able to hand over.
+        holder.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        assert!(holder.has_pending_chunks());
+        ProcessorOperator::set_finishing(&mut holder, &runtime)
+            .expect("a closed edge parks the drain rather than failing");
+        assert!(
+            holder.has_pending_data(),
+            "the closed edge leaves the rows on this driver"
+        );
+        assert_eq!(
+            state.remaining_drivers.load(Ordering::SeqCst),
+            2,
+            "a driver holding rows has not finished, so it must not count"
+        );
+
+        // Its sibling finishing must therefore not complete the set, and must
+        // not seal the sender over rows the first driver still holds.
+        ProcessorOperator::set_finishing(&mut sibling, &runtime)
+            .expect("the sibling drains with nothing to hand over");
+        assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 1);
+        assert!(
+            !sibling.end_of_stream_sent.load(Ordering::SeqCst),
+            "no end-of-stream may go out while a sibling still holds rows"
+        );
+
+        // The edge opens: the holder hands its rows over on its next turn,
+        // counts, completes the set, and only then does the marker follow the
+        // frames it seals.
+        open_edges(&holder, &[edge_id(1)]);
+        ProcessorOperator::set_finishing(&mut holder, &runtime)
+            .expect("the parked rows and then the seal go out");
+        assert!(!holder.has_pending_data());
+        assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 0);
+        assert!(
+            holder.end_of_stream_sent.load(Ordering::SeqCst),
+            "the driver that counted last seals, and it seals after its rows"
+        );
+        assert!(
+            !state.force_eos_sent.load(Ordering::SeqCst),
+            "the one-shot guard is for a genuine accounting error, not for this"
         );
     }
 
