@@ -50,6 +50,18 @@ if ! grep -Fx \
   echo "local full CI must run the DataSketches source mutation stage" >&2
   exit 1
 fi
+if ! grep -Fx \
+  "NCP-8 statistics boundary|ncp8-statistics-boundary.log|tools/ci/check-ncp8-statistics-boundary.py" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must run the NCP-8 statistics boundary stage" >&2
+  exit 1
+fi
+if ! grep -Fx \
+  "NCP-8 statistics boundary mutations|ncp8-statistics-boundary-test.log|tools/ci/tests/ncp8-statistics-boundary-test.sh" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must run the NCP-8 statistics boundary mutation stage" >&2
+  exit 1
+fi
 
 baseline="$tmpdir/known-failures.toml"
 run_dir="$tmpdir/run"
