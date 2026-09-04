@@ -253,7 +253,6 @@ const ONE_ARG_AGGREGATES: &[&str] = &[
     "count_distinct_state",
     "count_distinct_state_merge",
     "count_if",
-    "dict_merge",
     "ds_hll_count_distinct_merge",
     "ds_hll_count_distinct_union",
     "hll_raw_agg",
@@ -261,7 +260,6 @@ const ONE_ARG_AGGREGATES: &[&str] = &[
     "hll_union_agg",
     "max",
     "min",
-    "multi_distinct_count",
     "multi_distinct_sum",
     "ndv",
     "percentile_union",
@@ -331,6 +329,8 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
     );
     declarations.extend([
         AggregateDeclaration::ranged("count", 0, 1, "()->i64 | (any)->i64"),
+        AggregateDeclaration::ranged("multi_distinct_count", 1, usize::MAX, "(any...)->i64"),
+        AggregateDeclaration::exact("dict_merge", 2, "(utf8|list<utf8>,i64)->utf8"),
         AggregateDeclaration::ranged("group_concat", 2, usize::MAX, "(any,utf8...)->utf8"),
         AggregateDeclaration::ranged("string_agg", 2, usize::MAX, "(any,utf8...)->utf8"),
         AggregateDeclaration::exact("map_agg", 2, "(any,any)->map"),
@@ -611,6 +611,35 @@ mod tests {
             ),
             Err(FunctionResolutionError::BadSignature(message))
                 if message.contains("does not support function ORDER BY update channels")
+        ));
+    }
+
+    #[test]
+    fn variadic_distinct_count_and_dict_merge_keep_their_logical_arities() {
+        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
+
+        let distinct = catalog
+            .resolve_aggregate_user(
+                "multi_distinct_count",
+                &[DataType::Int64, DataType::Utf8, DataType::Boolean],
+            )
+            .expect("multi-column distinct count resolves");
+        assert_eq!(
+            distinct.argument_types,
+            [DataType::Int64, DataType::Utf8, DataType::Boolean]
+        );
+        assert!(matches!(
+            catalog.resolve_aggregate_user("multi_distinct_count", &[]),
+            Err(FunctionResolutionError::NoMatchingSignature { .. })
+        ));
+
+        let dict = catalog
+            .resolve_aggregate_user("dict_merge", &[DataType::Utf8, DataType::Int64])
+            .expect("dict_merge logical value and threshold arguments resolve");
+        assert_eq!(dict.argument_types, [DataType::Utf8, DataType::Int64]);
+        assert!(matches!(
+            catalog.resolve_aggregate_user("dict_merge", &[DataType::Utf8]),
+            Err(FunctionResolutionError::NoMatchingSignature { .. })
         ));
     }
 

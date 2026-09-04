@@ -90,16 +90,14 @@ pub(super) fn lower_hash_aggregate_node(
         .clone()
         .field("output_layout")
         .field("aggregate_columns");
-    let mut aggregate_slot_schemas = ctx
-        .decode_output_layout(&output_layout.group_key_columns, group_key_path)?
-        .slot_schemas()
-        .to_vec();
-    aggregate_slot_schemas.extend(
-        ctx.decode_output_layout(&output_layout.aggregate_columns, aggregate_columns_path)?
-            .slot_schemas()
-            .iter()
-            .cloned(),
-    );
+    let decoded_group_key_columns =
+        ctx.decode_output_layout(&output_layout.group_key_columns, group_key_path)?;
+    let decoded_aggregate_columns = ctx.decode_output_layout(
+        &output_layout.aggregate_columns,
+        aggregate_columns_path.clone(),
+    )?;
+    let mut aggregate_slot_schemas = decoded_group_key_columns.slot_schemas().to_vec();
+    aggregate_slot_schemas.extend(decoded_aggregate_columns.slot_schemas().iter().cloned());
     let aggregate_layout =
         Layout::for_slots(aggregate_slot_schemas.iter().map(|slot| slot.slot_id()));
     let aggregate_output_schema = Arc::new(ChunkSchema::try_new(aggregate_slot_schemas).map_err(
@@ -247,16 +245,30 @@ pub(super) fn lower_hash_aggregate_node(
                 ),
             ));
         }
-        let expected_result_type = if need_finalize {
+        if result_type != selected.output_type {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                call_path.clone().field("result_type"),
+                format!(
+                    "HashAggregateNode aggregate {idx} SQL result type drift: wire={result_type:?} expected={:?}",
+                    selected.output_type
+                ),
+            ));
+        }
+        let expected_phase_type = if need_finalize {
             &selected.output_type
         } else {
             &selected.intermediate_type
         };
-        if &result_type != expected_result_type {
+        let phase_output_type = decoded_aggregate_columns
+            .slot_schemas()
+            .get(idx)
+            .expect("aggregate output arity was validated")
+            .data_type();
+        if phase_output_type != expected_phase_type {
             return Err(NativeFragmentDecodeError::invalid_value(
-                call_path.clone().field("result_type"),
+                aggregate_columns_path.clone().index(idx).field("type"),
                 format!(
-                    "HashAggregateNode aggregate {idx} phase result type drift: wire={result_type:?} expected={expected_result_type:?}"
+                    "HashAggregateNode aggregate {idx} phase output type drift: output_layout={phase_output_type:?} expected={expected_phase_type:?}"
                 ),
             ));
         }
@@ -827,7 +839,7 @@ mod tests {
                     name: "avg".to_string(),
                     args: vec![column_ref(1, DataType::Int64)],
                     distinct: false,
-                    result_type: Some(type_desc(&DataType::Utf8)),
+                    result_type: Some(type_desc(&DataType::Float64)),
                     order_by: Vec::new(),
                     output_column_id: 2,
                     resolved_signature: resolved_aggregate_signature("avg", &[DataType::Int64]),
@@ -860,6 +872,86 @@ mod tests {
                 .expect("avg output field")
                 .data_type(),
             &DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_rejects_sql_result_type_drift() {
+        let output_columns = vec![output_column(2, "avg_id", DataType::Utf8)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Local as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_ref(1, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Utf8)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                    resolved_signature: resolved_aggregate_signature("avg", &[DataType::Int64]),
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_node(
+            &aggregate,
+            &mut ExprArena::default(),
+            &aggregate_decode_context(),
+        )
+        .expect_err("SQL result type drift must fail");
+        assert!(
+            error.to_string().contains("SQL result type drift"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_rejects_phase_output_layout_type_drift() {
+        let output_columns = vec![output_column(2, "avg_id", DataType::Float64)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Local as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_ref(1, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Float64)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                    resolved_signature: resolved_aggregate_signature("avg", &[DataType::Int64]),
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_node(
+            &aggregate,
+            &mut ExprArena::default(),
+            &aggregate_decode_context(),
+        )
+        .expect_err("phase output layout type drift must fail");
+        assert!(
+            error.to_string().contains("phase output type drift"),
+            "{error}"
         );
     }
 
@@ -933,7 +1025,7 @@ mod tests {
                     name: "group_concat".to_string(),
                     args: vec![column_ref(2, DataType::Utf8), string_literal("|")],
                     distinct: true,
-                    result_type: Some(type_desc(&intermediate_type)),
+                    result_type: Some(type_desc(&DataType::Utf8)),
                     order_by: vec![sort_item(1)],
                     output_column_id: 3,
                     resolved_signature,

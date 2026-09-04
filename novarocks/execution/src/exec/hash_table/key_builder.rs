@@ -17,9 +17,9 @@
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
     DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray, StringArray,
-    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray, NullArray,
+    StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
@@ -825,7 +825,7 @@ fn encode_nullable_nested<S: KeyByteSink>(
     out: &mut S,
     context: &str,
 ) -> Result<(), String> {
-    if array.is_null(row) {
+    if matches!(array.data_type(), DataType::Null) || array.is_null(row) {
         out.push_byte(0)?;
         return Ok(());
     }
@@ -937,7 +937,7 @@ fn nested_sequence_encoded_len(
 }
 
 fn nested_value_encoded_len(array: &ArrayRef, row: usize) -> Result<usize, String> {
-    if array.is_null(row) {
+    if matches!(array.data_type(), DataType::Null) || array.is_null(row) {
         Ok(1)
     } else {
         encoded_group_key_non_null_len(array, row)?
@@ -970,6 +970,12 @@ pub(crate) fn decode_group_key_rows(
     }
 
     match data_type {
+        DataType::Null => {
+            if rows.iter().any(Option::is_some) {
+                return Err("canonical Null group-key contains a non-null value".to_string());
+            }
+            Ok(Arc::new(NullArray::new(rows.len())))
+        }
         DataType::Boolean => fixed_array!(1, 1, BooleanArray, |bytes: &[u8]| Ok(bytes[0] != 0)),
         DataType::Int8 => fixed_array!(2, 1, Int8Array, |bytes: &[u8]| Ok(bytes[0] as i8)),
         DataType::Int16 => fixed_array!(3, 2, Int16Array, |bytes: &[u8]| {
@@ -2244,6 +2250,14 @@ mod tests {
 
     #[test]
     fn canonical_complex_keys_round_trip_list_struct_and_map() {
+        let null_list = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Null, true)),
+            OffsetBuffer::new(vec![0, 0, 1, 1].into()),
+            Arc::new(NullArray::new(1)),
+            Some(NullBuffer::from(vec![true, true, false])),
+        )) as ArrayRef;
+        assert_canonical_round_trip(null_list);
+
         let list = Arc::new(ListArray::new(
             Arc::new(Field::new("item", DataType::Int64, true)),
             OffsetBuffer::new(vec![0, 2, 4, 4].into()),
