@@ -29,7 +29,7 @@ use std::fmt;
 use novarocks_execution::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution::task_execution::domain::{
     DomainProgression, EdgeOpenVersion, ExchangeEdgeDomain, ExchangeEdgeId, PlanNodeId,
-    ScalarDomain, SplitDomain, SplitSequence, SplitWatermark,
+    ScalarDomain, SplitDomain, SplitOffer, SplitWatermark,
 };
 use novarocks_execution::task_execution::operation::{
     OperationOutcome, PlanNodeSplitReceipt, TaskDomainReceipt, TaskDomainUpdate,
@@ -288,17 +288,11 @@ fn classify(
     let progression = match update {
         TaskDomainUpdate::SplitAssignment(intent) => {
             let watermark = domains.splits.watermark(intent.node());
-            let progression = SplitWatermark::classify_offer(
-                watermark,
-                intent.first(),
-                intent.last(),
-                intent.no_more_splits(),
-            );
+            let progression = SplitWatermark::classify_offer(watermark, intent.offer());
             if matches!(progression, DomainProgression::Apply) {
-                domains.splits.set_watermark(
-                    intent.node(),
-                    watermark.apply_offer(intent.last(), intent.no_more_splits()),
-                );
+                domains
+                    .splits
+                    .set_watermark(intent.node(), watermark.apply_offer(intent.offer()));
             }
             progression
         }
@@ -343,11 +337,9 @@ fn classify(
 fn conflicting_token(update: &TaskDomainUpdate) -> String {
     match update {
         TaskDomainUpdate::SplitAssignment(intent) => format!(
-            "domain=split_assignment plan_node={} offered={}..={} no_more={}",
+            "domain=split_assignment plan_node={} {}",
             intent.node(),
-            intent.first().get(),
-            intent.last().get(),
-            intent.no_more_splits()
+            intent.offer()
         ),
         TaskDomainUpdate::TaskDynamicFilter { version, .. } => {
             format!("domain=task_dynamic_filter version={}", version.get())
@@ -374,7 +366,7 @@ fn commit(
         TaskDomainUpdate::SplitAssignment(intent) => {
             let watermark = domains.splits.watermark(intent.node());
             let watermark = if matches!(progression, DomainProgression::Apply) {
-                let next = watermark.apply_offer(intent.last(), intent.no_more_splits());
+                let next = watermark.apply_offer(intent.offer());
                 domains.splits.set_watermark(intent.node(), next);
                 next
             } else {
@@ -431,9 +423,7 @@ fn opened_edges(domain: &ExchangeEdgeDomain, requested: &[ExchangeEdgeId]) -> Ve
 pub(super) enum InitialDomainKey {
     SplitAssignment {
         node: PlanNodeId,
-        first: SplitSequence,
-        last: SplitSequence,
-        no_more: bool,
+        offer: SplitOffer,
         payload: novarocks_execution::task_execution::domain::ContentFingerprint,
     },
     TaskDynamicFilter {
@@ -452,9 +442,7 @@ pub(super) fn initial_domain_keys(updates: &[TaskDomainUpdate]) -> Vec<InitialDo
         .map(|update| match update {
             TaskDomainUpdate::SplitAssignment(intent) => InitialDomainKey::SplitAssignment {
                 node: intent.node(),
-                first: intent.first(),
-                last: intent.last(),
-                no_more: intent.no_more_splits(),
+                offer: intent.offer(),
                 payload: intent.payload().fingerprint(),
             },
             TaskDomainUpdate::TaskDynamicFilter { version, payload } => {

@@ -34,7 +34,8 @@ use std::sync::Arc;
 
 use novarocks_execution::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
-    DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitSequence, SplitWatermark,
+    DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer, SplitSequence,
+    SplitWatermark,
 };
 use novarocks_execution::task_execution::operation::{
     CredentialUpdate, PlanNodeSplitReceipt, QueryContextDomainUpdate, SplitAssignmentIntent,
@@ -349,6 +350,48 @@ impl DecodedTaskDomain {
     }
 }
 
+/// The split-domain offer one wire assignment names.
+///
+/// Both sides of the boundary derive the offer here, from the same message the
+/// frontend puts on the wire and the backend takes off it. A second derivation
+/// -- however carefully mirrored -- would be a second authority over one wire
+/// fact, and the two sides would then classify the same assignment against
+/// different watermarks.
+///
+/// An assignment carrying no splits is the standalone terminal marker for its
+/// plan node: it names no range, so it decodes to [`SplitOffer::Seal`] rather
+/// than to a placeholder range that a genuine one-split batch could also
+/// produce.
+pub fn split_offer(
+    assignment: &novarocks_proto_models::connector_read::SplitAssignment,
+    path: FieldPath,
+) -> Result<SplitOffer, ProtocolError> {
+    let (Some(first), Some(last)) = (assignment.splits.first(), assignment.splits.last()) else {
+        if !assignment.no_more_splits {
+            return Err(missing(
+                path.field("splits"),
+                "an assignment with no splits must carry no_more_splits",
+            ));
+        }
+        return Ok(SplitOffer::Seal);
+    };
+    let sequence = |raw: u64| {
+        SplitSequence::new(raw)
+            .map_err(|error| out_of_range(path.clone().field("splits"), error.to_string()))
+    };
+    SplitOffer::batch(
+        sequence(first.sequence_id)?,
+        sequence(last.sequence_id)?,
+        assignment.no_more_splits,
+    )
+    .ok_or_else(|| {
+        invalid(
+            path.field("splits"),
+            "split batch sequences must not descend",
+        )
+    })
+}
+
 /// Decodes one task-scoped domain change.
 pub fn decode_task_domain(
     src: &novarocks::TaskDomainUpdate,
@@ -376,54 +419,12 @@ pub fn decode_task_domain(
                 )
             })?;
             let content = WireContent::new(SPLIT_DOMAIN_TAG, assignment.as_proto().clone());
-            let splits = assignment.splits();
-            let intent = match (splits.first(), splits.last()) {
-                (Some(first), Some(last)) => {
-                    let first = SplitSequence::new(first.sequence_id()).map_err(|error| {
-                        out_of_range(
-                            split_path.clone().field("assignment").field("splits"),
-                            error.to_string(),
-                        )
-                    })?;
-                    let last = SplitSequence::new(last.sequence_id()).map_err(|error| {
-                        out_of_range(
-                            split_path.clone().field("assignment").field("splits"),
-                            error.to_string(),
-                        )
-                    })?;
-                    SplitAssignmentIntent::new(
-                        node,
-                        first,
-                        last,
-                        assignment.no_more_splits(),
-                        Arc::new(content) as Arc<dyn CodecOwnedContent>,
-                    )
-                    .ok_or_else(|| {
-                        invalid(
-                            split_path.clone().field("assignment").field("splits"),
-                            "split batch sequences must not descend",
-                        )
-                    })?
-                }
-                // An assignment with no splits is the standalone terminal
-                // marker for its plan node.
-                _ => {
-                    if !assignment.no_more_splits() {
-                        return Err(missing(
-                            split_path.field("assignment").field("splits"),
-                            "an assignment with no splits must carry no_more_splits",
-                        ));
-                    }
-                    SplitAssignmentIntent::new(
-                        node,
-                        SplitSequence::FIRST,
-                        SplitSequence::FIRST,
-                        true,
-                        Arc::new(content) as Arc<dyn CodecOwnedContent>,
-                    )
-                    .expect("first equals last")
-                }
-            };
+            let offer = split_offer(assignment.as_proto(), split_path.field("assignment"))?;
+            let intent = SplitAssignmentIntent::new(
+                node,
+                offer,
+                Arc::new(content) as Arc<dyn CodecOwnedContent>,
+            );
             Ok(DecodedTaskDomain::SplitAssignment { intent, assignment })
         }
         novarocks::task_domain_update::Domain::DynamicFilter(filter) => {

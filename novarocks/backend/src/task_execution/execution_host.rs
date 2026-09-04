@@ -1411,7 +1411,7 @@ mod tests {
     };
     use novarocks_execution::task_execution::domain::{
         CodecOwnedContent, ContentFingerprint, DomainVersion, EdgeOpenVersion, ExchangeEdgeId,
-        PlanNodeId, SplitSequence,
+        PlanNodeId, SplitOffer, SplitSequence,
     };
     use novarocks_execution::task_execution::identity::TaskIdentity;
     use novarocks_execution::task_execution::operation::TaskDomainUpdate;
@@ -2407,8 +2407,9 @@ mod tests {
         node: PlanNodeId,
         payload_node: i32,
         splits: Vec<connector_dto::ScheduledSplit>,
-        no_more: bool,
+        offer: SplitOffer,
     ) -> TaskDomainUpdate {
+        let no_more = offer.no_more_splits();
         let assignment = connector_dto::SplitAssignment {
             plan_node_id: payload_node,
             splits,
@@ -2419,13 +2420,8 @@ mod tests {
         );
         TaskDomainUpdate::SplitAssignment(
             novarocks_execution::task_execution::operation::SplitAssignmentIntent::new(
-                node,
-                SplitSequence::FIRST,
-                SplitSequence::FIRST,
-                no_more,
-                payload,
-            )
-            .expect("first equals last"),
+                node, offer, payload,
+            ),
         )
     }
 
@@ -2443,17 +2439,14 @@ mod tests {
         let update = TaskDomainUpdate::SplitAssignment(
             novarocks_execution::task_execution::operation::SplitAssignmentIntent::new(
                 PlanNodeId::new(10).expect("nonnegative node"),
-                SplitSequence::FIRST,
-                SplitSequence::FIRST,
-                true,
+                SplitOffer::Seal,
                 Arc::new(
                     novarocks_proto_codec::task_execution::domain::WireContent::new(
                         b"filter",
                         novarocks_proto_models::filter::RuntimeFilterEnvelope::default(),
                     ),
                 ),
-            )
-            .expect("first equals last"),
+            ),
         );
         let rejection = host
             .apply_task_domain(&descriptor, &update)
@@ -2488,7 +2481,7 @@ mod tests {
                     PlanNodeId::new(10).expect("nonnegative node"),
                     11,
                     Vec::new(),
-                    true,
+                    SplitOffer::Seal,
                 ),
             )
             .expect_err("two plan nodes is not one assignment");
@@ -2520,7 +2513,7 @@ mod tests {
                 PlanNodeId::new(10).expect("nonnegative node"),
                 10,
                 Vec::new(),
-                true,
+                SplitOffer::Seal,
             ),
         )
         .expect("a terminal marker needs no provider payload");
@@ -2548,7 +2541,8 @@ mod tests {
                     vec![crate::connector::typed_runtime::test_support::split_proto(
                         10, 1,
                     )],
-                    false,
+                    SplitOffer::batch(SplitSequence::FIRST, SplitSequence::FIRST, false)
+                        .expect("one split"),
                 ),
             )
             .expect_err("no typed connector read execution exists");

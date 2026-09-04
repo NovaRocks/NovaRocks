@@ -397,6 +397,84 @@ impl fmt::Display for SplitSequence {
     }
 }
 
+/// What one split-domain offer names.
+///
+/// The two shapes are kept structurally distinct because they say different
+/// things. A batch names its own contiguous sequence range and is judged
+/// against the watermark by that range. A standalone terminal marker carries
+/// no splits at all, so it has no sequences of its own: it seals whatever the
+/// node has already accepted, and there is nothing in it to compare.
+///
+/// Representing the marker as a placeholder range instead -- it used to travel
+/// as `1..=1` -- makes it byte-identical to a genuine one-split batch at
+/// sequence 1. Every classification then reads it as a claim to have delivered
+/// only split 1, so a node that already accepted splits 1..=171 judges its own
+/// seal a regression and the attempt fails. `Seal` says "no range" exactly,
+/// and `no_more = false` with no range is unrepresentable.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SplitOffer {
+    /// A contiguous batch of splits, from its lowest to its highest sequence,
+    /// which may also close the node.
+    Batch {
+        first: SplitSequence,
+        last: SplitSequence,
+        no_more: bool,
+    },
+    /// The standalone terminal marker: no splits, and therefore no range.
+    Seal,
+}
+
+impl SplitOffer {
+    /// One contiguous batch, or `None` if its range descends.
+    pub const fn batch(first: SplitSequence, last: SplitSequence, no_more: bool) -> Option<Self> {
+        if last.get() < first.get() {
+            return None;
+        }
+        Some(Self::Batch {
+            first,
+            last,
+            no_more,
+        })
+    }
+
+    /// Whether this offer closes the node. A standalone seal always does.
+    pub const fn no_more_splits(self) -> bool {
+        match self {
+            Self::Batch { no_more, .. } => no_more,
+            Self::Seal => true,
+        }
+    }
+
+    /// The sequence range this offer names, if it names one at all.
+    pub const fn range(self) -> Option<(SplitSequence, SplitSequence)> {
+        match self {
+            Self::Batch { first, last, .. } => Some((first, last)),
+            Self::Seal => None,
+        }
+    }
+}
+
+impl fmt::Display for SplitOffer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Batch {
+                first,
+                last,
+                no_more,
+            } => write!(
+                formatter,
+                "offered={}..={} no_more={no_more}",
+                first.get(),
+                last.get()
+            ),
+            // A standalone marker names no range, so none is rendered.
+            // Printing a placeholder here would restate in the log the exact
+            // confusion this type removes from the protocol.
+            Self::Seal => formatter.write_str("offered=none no_more=true"),
+        }
+    }
+}
+
 /// The accepted split watermark of one plan node.
 ///
 /// This reproduces the delivery contract of ADR-0123 exactly: sequences are
@@ -499,7 +577,24 @@ impl SplitWatermark {
             (Some(through), None) if through.get() > 0 => {
                 DomainProgression::Conflict(DomainConflict::Gap)
             }
-            (None, Some(_)) => DomainProgression::Conflict(DomainConflict::NotMonotonic),
+            // Sealing a node that has already accepted splits, naming no
+            // `through`, is the ordinary end of a scan: the scheduler ran out
+            // of splits after delivering some, and says so with a marker that
+            // carries none. It advances `no_more` alone -- `apply_no_more`
+            // leaves `accepted_through` exactly where it is -- so there is
+            // nothing here that could move backwards.
+            //
+            // This arm answered `Conflict(NotMonotonic)` before, and that was
+            // defensible only while a standalone marker was forced to travel
+            // as the placeholder range `1..=1`: `None` then meant a caller had
+            // lost the range rather than that no range existed, and refusing
+            // was the conservative reading. With `SplitOffer::Seal` stating
+            // "no range" outright, `None` means what it says, and refusing it
+            // fails every query whose scan is sealed after its splits were
+            // delivered. The genuine regression this rule exists to catch --
+            // a `through` below the watermark -- is still refused by the arm
+            // above, which is the only one that has a `through` to compare.
+            (None, Some(_)) => DomainProgression::Apply,
             _ => DomainProgression::Apply,
         }
     }
@@ -516,8 +611,8 @@ impl SplitWatermark {
         }
     }
 
-    /// Classifies one offered batch, including a re-offered range that newly
-    /// seals the node.
+    /// Classifies one offer, including a re-offered range that newly seals the
+    /// node and a standalone marker that names no range at all.
     ///
     /// [`Self::classify_batch`] answers about the range alone, so a range the
     /// node already accepted is a duplicate whatever else the batch carries.
@@ -526,12 +621,19 @@ impl SplitWatermark {
     /// final message is a re-offered range plus a seal. Judging it by the
     /// range alone rejects it as a regression and the scan waits forever for
     /// a terminal it was already told about.
-    pub fn classify_offer(
-        self,
-        first: SplitSequence,
-        last: SplitSequence,
-        no_more: bool,
-    ) -> DomainProgression {
+    ///
+    /// [`SplitOffer::Seal`] is the same ending without a range: it seals
+    /// whatever was accepted, so it goes to [`Self::classify_no_more`] with no
+    /// `through` rather than being judged against a range it never named.
+    pub fn classify_offer(self, offer: SplitOffer) -> DomainProgression {
+        let SplitOffer::Batch {
+            first,
+            last,
+            no_more,
+        } = offer
+        else {
+            return self.classify_no_more(None);
+        };
         let already_accepted = last.get() < self.next_expected();
         if no_more && already_accepted && !self.no_more_splits() {
             return self.classify_no_more(Some(last));
@@ -541,7 +643,12 @@ impl SplitWatermark {
 
     /// Applies an offer this watermark already classified as
     /// [`DomainProgression::Apply`].
-    pub fn apply_offer(self, last: SplitSequence, no_more: bool) -> Self {
+    pub fn apply_offer(self, offer: SplitOffer) -> Self {
+        let SplitOffer::Batch { last, no_more, .. } = offer else {
+            // A standalone marker delivered nothing, so it moves the seal and
+            // leaves the accepted watermark untouched.
+            return self.apply_no_more();
+        };
         if last.get() < self.next_expected() {
             // The range was already accepted; only the seal is new.
             return self.apply_no_more();
@@ -925,7 +1032,8 @@ mod tests {
     use super::{
         ContentFingerprint, CredentialDomain, CredentialEpoch, CredentialLeaseId, DomainConflict,
         DomainProgression, DomainVersion, EdgeOpenVersion, EdgeSendPermission, ExchangeEdgeDomain,
-        ExchangeEdgeId, PlanNodeId, ScalarDomain, SplitDomain, SplitSequence, SplitWatermark,
+        ExchangeEdgeId, PlanNodeId, ScalarDomain, SplitDomain, SplitOffer, SplitSequence,
+        SplitWatermark,
     };
 
     fn fingerprint(byte: u8) -> ContentFingerprint {
@@ -1049,7 +1157,9 @@ mod tests {
         );
         assert_eq!(
             accepted.classify_no_more(None),
-            DomainProgression::Conflict(DomainConflict::NotMonotonic)
+            DomainProgression::Apply,
+            "naming no watermark is not naming a lower one: a marker carrying \
+             no splits seals what was accepted and moves nothing backwards"
         );
         assert_eq!(
             accepted.classify_no_more(Some(sequence(5))),
@@ -1063,6 +1173,46 @@ mod tests {
         assert_eq!(
             SplitWatermark::empty().classify_no_more(Some(sequence(2))),
             DomainProgression::Conflict(DomainConflict::Gap)
+        );
+    }
+
+    #[test]
+    fn a_standalone_seal_closes_a_node_that_already_accepted_its_splits() {
+        // The ordinary end of a scan: the scheduler delivers a node's splits,
+        // its source runs out, and it closes the node with a marker that
+        // carries none. That marker names no range at all -- it seals whatever
+        // was accepted -- so there is nothing in it that could regress.
+        let accepted = SplitWatermark::empty().apply_batch(sequence(171), false);
+        assert_eq!(
+            accepted.classify_offer(SplitOffer::Seal),
+            DomainProgression::Apply,
+            "a marker that names no range cannot name a lower one"
+        );
+        let sealed = accepted.apply_offer(SplitOffer::Seal);
+        assert!(sealed.no_more_splits());
+        assert_eq!(
+            sealed.accepted_through(),
+            Some(sequence(171)),
+            "a marker delivers no splits, so it must not move the watermark"
+        );
+
+        // What made this fail before: the marker was forced to travel as the
+        // placeholder range 1..=1, which is exactly what a genuine one-split
+        // batch at sequence 1 produces. Read as that batch it claims to have
+        // delivered only sequence 1, so every node past sequence 1 refused its
+        // own seal and every query whose scan is sealed after its splits were
+        // delivered failed.
+        //
+        // The refusal itself is right for the batch that really does say
+        // 1..=1, and stays right here. The two shapes are now distinct, which
+        // is what lets one be accepted without the other being tolerated.
+        assert_eq!(
+            accepted.classify_offer(
+                SplitOffer::batch(SplitSequence::FIRST, SplitSequence::FIRST, true)
+                    .expect("one split")
+            ),
+            DomainProgression::Conflict(DomainConflict::NotMonotonic),
+            "a batch that does claim sequence 1 is still a regression"
         );
     }
 

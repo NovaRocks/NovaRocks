@@ -37,7 +37,7 @@ use std::sync::Arc;
 use crate::task_execution::descriptor::TaskDescriptor;
 use crate::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, CredentialEpoch, CredentialLeaseId, DomainProgression,
-    DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitSequence, SplitWatermark,
+    DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer, SplitWatermark,
     TaskDomainKind,
 };
 use crate::task_execution::identity::{
@@ -838,54 +838,43 @@ impl TransportBudget {
     }
 }
 
-/// One contiguous split assignment batch for one plan node.
+/// One split-domain offer for one plan node: a contiguous batch, or the
+/// standalone terminal marker that names no range.
 ///
 /// The tokens are neutral and the connector payload is codec-owned, so this
 /// layer can validate the watermark contract of ADR-0123 without ever
-/// interpreting a connector split.
+/// interpreting a connector split. [`SplitOffer`] carries the range invariant,
+/// so an intent cannot be built around a descending or invented range.
 #[derive(Clone, Debug)]
 pub struct SplitAssignmentIntent {
     node: PlanNodeId,
-    first: SplitSequence,
-    last: SplitSequence,
-    no_more: bool,
+    offer: SplitOffer,
     payload: Arc<dyn CodecOwnedContent>,
 }
 
 impl SplitAssignmentIntent {
-    pub fn new(
+    pub const fn new(
         node: PlanNodeId,
-        first: SplitSequence,
-        last: SplitSequence,
-        no_more: bool,
+        offer: SplitOffer,
         payload: Arc<dyn CodecOwnedContent>,
-    ) -> Option<Self> {
-        if last < first {
-            return None;
-        }
-        Some(Self {
+    ) -> Self {
+        Self {
             node,
-            first,
-            last,
-            no_more,
+            offer,
             payload,
-        })
+        }
     }
 
     pub const fn node(&self) -> PlanNodeId {
         self.node
     }
 
-    pub const fn first(&self) -> SplitSequence {
-        self.first
-    }
-
-    pub const fn last(&self) -> SplitSequence {
-        self.last
+    pub const fn offer(&self) -> SplitOffer {
+        self.offer
     }
 
     pub const fn no_more_splits(&self) -> bool {
-        self.no_more
+        self.offer.no_more_splits()
     }
 
     pub fn payload(&self) -> &Arc<dyn CodecOwnedContent> {
@@ -1883,7 +1872,7 @@ mod request_tests {
     };
     use crate::task_execution::domain::{
         CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch,
-        CredentialLeaseId, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId,
+        CredentialLeaseId, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer,
         SplitSequence, TaskDomainKind,
     };
     use crate::task_execution::identity::{
@@ -2070,15 +2059,20 @@ mod request_tests {
         let first = SplitSequence::new(1).expect("nonzero");
         let last = SplitSequence::new(3).expect("nonzero");
         assert!(
-            SplitAssignmentIntent::new(node, last, first, false, content()).is_none(),
+            SplitOffer::batch(last, first, false).is_none(),
             "a descending batch is not a batch"
         );
-        let intent =
-            SplitAssignmentIntent::new(node, first, last, true, content()).expect("legal batch");
+        let offer = SplitOffer::batch(first, last, true).expect("legal batch");
+        let intent = SplitAssignmentIntent::new(node, offer, content());
         assert_eq!(intent.node(), node);
-        assert_eq!(intent.first(), first);
-        assert_eq!(intent.last(), last);
+        assert_eq!(intent.offer().range(), Some((first, last)));
         assert!(intent.no_more_splits());
+
+        // A standalone terminal marker names no range at all, so nothing about
+        // it can be read as a claim to have delivered sequence 1.
+        let seal = SplitAssignmentIntent::new(node, SplitOffer::Seal, content());
+        assert_eq!(seal.offer().range(), None);
+        assert!(seal.no_more_splits());
         assert_eq!(intent.payload().encoded_len(), 64);
         assert_eq!(
             TaskDomainUpdate::SplitAssignment(intent).kind(),

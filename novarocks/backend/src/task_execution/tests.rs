@@ -33,7 +33,7 @@ use novarocks_execution::task_execution::descriptor::{
 };
 use novarocks_execution::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
-    DomainProgression, DomainVersion, PlanNodeId, SplitSequence,
+    DomainProgression, DomainVersion, PlanNodeId, SplitOffer, SplitSequence,
 };
 use novarocks_execution::task_execution::identity::{
     QueryContextRef, TaskIdentity, TaskOperationId,
@@ -636,16 +636,16 @@ fn filter_update(version: u64, payload: u8) -> TaskDomainUpdate {
 }
 
 fn split_update(node: i32, first: u64, last: u64, no_more: bool, payload: u8) -> TaskDomainUpdate {
-    TaskDomainUpdate::SplitAssignment(
-        SplitAssignmentIntent::new(
-            PlanNodeId::new(node).expect("nonnegative node"),
+    TaskDomainUpdate::SplitAssignment(SplitAssignmentIntent::new(
+        PlanNodeId::new(node).expect("nonnegative node"),
+        SplitOffer::batch(
             SplitSequence::new(first).expect("nonzero sequence"),
             SplitSequence::new(last).expect("nonzero sequence"),
             no_more,
-            FakeContent::arc(payload),
         )
         .expect("a legal split batch"),
-    )
+        FakeContent::arc(payload),
+    ))
 }
 
 // --------------------------------------------------------------------- create

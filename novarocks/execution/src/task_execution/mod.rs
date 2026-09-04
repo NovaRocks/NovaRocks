@@ -47,7 +47,7 @@ pub use domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialDomain, CredentialEpoch,
     CredentialLeaseId, DomainConflict, DomainProgression, DomainVersion, EdgeOpenVersion,
     EdgeSendPermission, ExchangeEdgeDomain, ExchangeEdgeId, PlanNodeId, QueryContextDomainKind,
-    ScalarDomain, SplitDomain, SplitSequence, SplitWatermark, TaskDomainKind,
+    ScalarDomain, SplitDomain, SplitOffer, SplitSequence, SplitWatermark, TaskDomainKind,
 };
 pub use identity::{
     IdentityField, IdentityMismatch, QueryContextRef, StageRef, TaskIdentity, TaskOperationId,

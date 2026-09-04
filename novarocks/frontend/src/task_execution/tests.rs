@@ -34,7 +34,7 @@ use novarocks_execution::task_execution::{
     DispatchLane, DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion, ExchangeEdgeId,
     LeaseReceipt, LeaseSequence, LeaseValidFor, MonotonicInstant, OperationKind, OperationOutcome,
     PhysicalFragmentPlan, PlanNodeId, QueryContextReceipt, QueryContextRef, QueryContextState,
-    ReleaseOutcome, RenewSchedule, SplitAssignmentIntent, SplitSequence, StageState,
+    ReleaseOutcome, RenewSchedule, SplitAssignmentIntent, SplitOffer, SplitSequence, StageState,
     TaskDomainUpdate, TaskIdentity, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion,
     TerminationDetail, TransportBudget, UpdateTaskReceipt,
 };
@@ -673,16 +673,11 @@ impl Harness {
 
 fn split_update(node: i32, sequence: u64, no_more: bool) -> TaskDomainUpdate {
     let sequence = SplitSequence::new(sequence).expect("a nonzero split sequence");
-    TaskDomainUpdate::SplitAssignment(
-        SplitAssignmentIntent::new(
-            PlanNodeId::new(node).expect("a nonnegative plan node"),
-            sequence,
-            sequence,
-            no_more,
-            FakeContent::new(0xb1, 128),
-        )
-        .expect("a contiguous split batch"),
-    )
+    TaskDomainUpdate::SplitAssignment(SplitAssignmentIntent::new(
+        PlanNodeId::new(node).expect("a nonnegative plan node"),
+        SplitOffer::batch(sequence, sequence, no_more).expect("a contiguous split batch"),
+        FakeContent::new(0xb1, 128),
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -66,8 +66,9 @@ use novarocks_execution::task_execution::{
     SplitAssignmentIntent, SplitSequence, TaskDomainReceipt, TaskDomainUpdate, TaskOperationId,
     UpdateTaskReceipt,
 };
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_proto_codec::task_execution::domain::wire_split_assignment;
+use novarocks_proto_codec::task_execution::domain::{split_offer, wire_split_assignment};
 use novarocks_types::UniqueId;
 use novarocks_types::identity::TaskId;
 
@@ -77,7 +78,7 @@ use super::intent::{
     AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationSink,
 };
 use super::remote_task::UpdateAdmission;
-use crate::query_execution::connector_domain::{SplitAssignment, TaskUpdateRequest};
+use crate::query_execution::connector_domain::TaskUpdateRequest;
 use crate::query_execution::split_assignment::{
     AcceptedPlanNode, AssignmentTarget, SplitAssignmentStop, TaskUpdateOutcome,
     TaskUpdateTransport, TaskUpdateTransportError,
@@ -635,56 +636,18 @@ fn task_update(request: &TaskUpdateRequest) -> Result<TaskDomainUpdate, String> 
     };
     let node = PlanNodeId::new(assignment.plan_node_id())
         .map_err(|error| format!("plan node {}: {error}", assignment.plan_node_id()))?;
-    let (first, last) = split_range(assignment)?;
     let proto = request
         .to_proto_assignments()?
         .into_iter()
         .next()
         .ok_or_else(|| "a validated assignment produced no wire assignment".to_owned())?;
-    let intent = SplitAssignmentIntent::new(
-        node,
-        first,
-        last,
-        assignment.no_more_splits(),
-        wire_split_assignment(proto),
-    )
-    .ok_or_else(|| format!("split batch sequences {first}..{last} of plan node {node} descend"))?;
+    // Derived by the codec, from the very message this request puts on the
+    // wire, so this side classifies the offer the backend will classify. The
+    // frontend deliberately owns no second derivation of it.
+    let offer = split_offer(&proto, FieldPath::root("split_assignment"))
+        .map_err(|error| error.to_string())?;
+    let intent = SplitAssignmentIntent::new(node, offer, wire_split_assignment(proto));
     Ok(TaskDomainUpdate::SplitAssignment(intent))
-}
-
-/// The batch's sequence range in the protocol's own sequence space.
-///
-/// This reproduces `decode_task_domain` exactly, including its rule that an
-/// assignment with no splits is the standalone terminal marker. Deriving the
-/// range differently here would let the frontend and the backend classify the
-/// same wire assignment against different watermarks.
-fn split_range(assignment: &SplitAssignment) -> Result<(SplitSequence, SplitSequence), String> {
-    let splits = assignment.splits();
-    match (splits.first(), splits.last()) {
-        (Some(first), Some(last)) => {
-            let sequence = |raw: u64| {
-                SplitSequence::new(raw).map_err(|error| {
-                    format!(
-                        "plan node {} split sequence {raw}: {error}",
-                        assignment.plan_node_id()
-                    )
-                })
-            };
-            Ok((
-                sequence(first.sequence_id())?,
-                sequence(last.sequence_id())?,
-            ))
-        }
-        _ => {
-            if !assignment.no_more_splits() {
-                return Err(format!(
-                    "plan node {} assignment carries no splits and no terminal marker",
-                    assignment.plan_node_id()
-                ));
-            }
-            Ok((SplitSequence::FIRST, SplitSequence::FIRST))
-        }
-    }
 }
 
 /// The watermarks an applied acknowledgement reports, as the driver reads
@@ -751,9 +714,7 @@ fn same_split_update(held: &TaskDomainUpdate, offered: &TaskDomainUpdate) -> boo
         return false;
     };
     held.node() == offered.node()
-        && held.first() == offered.first()
-        && held.last() == offered.last()
-        && held.no_more_splits() == offered.no_more_splits()
+        && held.offer() == offered.offer()
         && fingerprint(held) == fingerprint(offered)
 }
 
@@ -766,8 +727,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use novarocks_execution::task_execution::{
-        DispatchLane, DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitWatermark,
-        TaskIdentity, UpdateTask,
+        DispatchLane, DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer,
+        SplitWatermark, TaskIdentity, UpdateTask,
     };
     use novarocks_proto_codec::connector_read::{ConnectorReadCodecError, ConnectorReadEncoder};
     use novarocks_types::identity::{BackendProcessId, StageId};
@@ -1428,15 +1389,18 @@ mod tests {
 
     #[test]
     fn an_empty_terminal_assignment_translates_to_the_codecs_own_terminal_intent() {
-        // The backend derives the same range from the same wire assignment. A
-        // different range here would classify one payload against two
-        // watermarks.
+        // Both sides derive the offer from the same wire assignment through
+        // the codec, so one payload can never be classified against two
+        // watermarks. An assignment with no splits names no range: it must not
+        // arrive as a batch covering sequence 1, which a real one-split batch
+        // also produces and which every watermark past 1 reads as a
+        // regression.
         let update = task_update(&terminal_request(true)).expect("a terminal marker translates");
         let TaskDomainUpdate::SplitAssignment(intent) = update else {
             panic!("a split assignment translates to its own domain")
         };
-        assert_eq!(intent.first(), SplitSequence::FIRST);
-        assert_eq!(intent.last(), SplitSequence::FIRST);
+        assert_eq!(intent.offer(), SplitOffer::Seal);
+        assert_eq!(intent.offer().range(), None);
         assert!(intent.no_more_splits());
         assert_eq!(intent.node().get(), SCAN_NODE);
     }
@@ -1444,9 +1408,14 @@ mod tests {
     #[test]
     fn an_assignment_with_no_splits_and_no_terminal_marker_is_refused() {
         // Such an update enqueues nothing and seals nothing, so no
-        // acknowledgement of it could ever cover a request.
+        // acknowledgement of it could ever cover a request. The refusal is
+        // worded by the codec, which is the one place either side derives an
+        // offer from a wire assignment.
         let detail = task_update(&terminal_request(false))
             .expect_err("an empty non-terminal assignment carries nothing");
-        assert!(detail.contains("no splits and no terminal marker"));
+        assert!(
+            detail.contains("an assignment with no splits must carry no_more_splits"),
+            "{detail}"
+        );
     }
 }

@@ -159,11 +159,9 @@ fn split_regression(
         // state it lost against, and reporting only the offer leaves the
         // reader to obtain the other half from a cluster run.
         token: format!(
-            "plan_node={} offered={}..={} no_more={} against accepted_through={:?} sealed={}",
+            "plan_node={} {} against accepted_through={:?} sealed={}",
             intent.node(),
-            intent.first().get(),
-            intent.last().get(),
-            intent.no_more_splits(),
+            intent.offer(),
             watermark.accepted_through().map(|s| s.get()),
             watermark.no_more_splits()
         ),
@@ -350,16 +348,11 @@ impl RemoteTask {
                 // receives once its splits already arrived, and that task's
                 // scan then waits forever for a seal it was already told
                 // about.
-                match watermark.classify_offer(
-                    intent.first(),
-                    intent.last(),
-                    intent.no_more_splits(),
-                ) {
+                match watermark.classify_offer(intent.offer()) {
                     DomainProgression::Apply => {
-                        self.progress.splits.set_watermark(
-                            intent.node(),
-                            watermark.apply_offer(intent.last(), intent.no_more_splits()),
-                        );
+                        self.progress
+                            .splits
+                            .set_watermark(intent.node(), watermark.apply_offer(intent.offer()));
                         Ok(())
                     }
                     // An offer this owner already applied. ADR-0123 makes the
