@@ -185,7 +185,9 @@ fn apply_plan_inner(
         output_column_id: win_id,
         name: m.inner_agg.name.clone(),
         args: agg_args,
-        distinct: false,
+        distinct: m.inner_agg.distinct,
+        function_order_by: m.inner_agg.order_by.clone(),
+        aggregate_binding: Some(m.inner_agg.resolved.clone()),
         partition_by: m.partition_by.clone(),
         order_by: vec![],
         window_frame: None,
@@ -866,6 +868,11 @@ mod tests {
                     result_type: DataType::Float64,
                     order_by: vec![],
                     output_column_id: AVG_RESULT,
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "avg",
+                        &[DataType::Float64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![
                     OutputColumn {
@@ -1193,6 +1200,15 @@ mod tests {
         assert_eq!(window_node.window_exprs.len(), 1);
         let win_expr = &window_node.window_exprs[0];
         assert_eq!(win_expr.name, "avg");
+        assert_eq!(
+            win_expr.aggregate_binding.as_ref(),
+            Some(&crate::functions::test_resolved_aggregate(
+                "avg",
+                &[DataType::Float64],
+                false,
+            )),
+            "ApplyToWindow must preserve the exact aggregate overload selected before rewrite"
+        );
 
         // Partition-by: one ColumnRef pointing to OUTER p_partkey (P_PARTKEY = 10).
         assert_eq!(win_expr.partition_by.len(), 1);
@@ -1747,6 +1763,11 @@ mod tests {
                 result_type: DataType::Float64,
                 order_by: vec![],
                 output_column_id: AVG_RESULT,
+                resolved: crate::functions::test_resolved_aggregate(
+                    "avg",
+                    &[DataType::Float64],
+                    false,
+                ),
             }],
             output_columns: vec![
                 OutputColumn {
@@ -1983,6 +2004,11 @@ mod tests {
                     result_type: DataType::Float64,
                     order_by: vec![],
                     output_column_id: AVG_RESULT,
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "avg",
+                        &[DataType::Float64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![OutputColumn {
                     column_id: AVG_RESULT,

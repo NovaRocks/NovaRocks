@@ -1031,6 +1031,11 @@ fn native_local_average_stream_edge_plan() -> Result<DistributedPlan, String> {
                     result_type: DataType::Float64,
                     order_by: Vec::new(),
                     output_column_id: ColumnId(15),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "avg",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 is_merge: vec![false],
                 output_layout: AggregateOutputLayout::new(
@@ -2270,6 +2275,11 @@ pub fn native_expression_variants() -> Vec<TypedExpr> {
                 args: vec![column.clone()],
                 distinct: true,
                 order_by: vec![sort_item.clone()],
+                resolved: crate::functions::test_resolved_aggregate(
+                    "sum",
+                    &[DataType::Int64],
+                    true,
+                ),
             },
             data_type: DataType::Int64,
             nullable: true,
@@ -2346,6 +2356,8 @@ pub fn native_expression_variants() -> Vec<TypedExpr> {
                 name: "rank".to_string(),
                 args: vec![],
                 distinct: false,
+                function_order_by: vec![],
+                aggregate_binding: None,
                 partition_by: vec![column],
                 order_by: vec![sort_item],
                 window_frame: Some(WindowFrame {
@@ -2413,6 +2425,8 @@ pub fn native_window_expression() -> TypedExpr {
             name: "rank".to_string(),
             args: vec![],
             distinct: false,
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![column.clone()],
             order_by: vec![SortItem {
                 expr: column,

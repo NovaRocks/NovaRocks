@@ -192,10 +192,28 @@ pub struct DmlExecutionKernel {
         Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy>,
 }
 
-impl DmlExecutionKernel {
+/// Immutable SQL planning authorities shared by every DML statement.
+#[derive(Clone)]
+pub struct DmlPlanningServices {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    catalog_service: Arc<QueryCatalogService>,
+}
+
+impl DmlPlanningServices {
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
+    ) -> Self {
+        Self {
+            functions,
+            catalog_service,
+        }
+    }
+}
+
+impl DmlExecutionKernel {
+    pub fn new(
+        planning: DmlPlanningServices,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<ConnectorControlHost>,
@@ -203,6 +221,10 @@ impl DmlExecutionKernel {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
     ) -> Self {
+        let DmlPlanningServices {
+            functions,
+            catalog_service,
+        } = planning;
         Self {
             functions,
             catalog_service,
@@ -415,6 +437,7 @@ impl MvExecutionKernel {
 /// View command dependencies.
 #[derive(Clone)]
 pub struct ViewExecutionKernel {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -423,17 +446,23 @@ pub struct ViewExecutionKernel {
 
 impl ViewExecutionKernel {
     pub fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         view_service: Arc<dyn ViewService>,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
             view_service,
         }
+    }
+
+    pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
+        &self.functions
     }
 
     pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {
@@ -456,6 +485,7 @@ impl ViewExecutionKernel {
 /// Table-maintenance command dependencies.
 #[derive(Clone)]
 pub struct MaintenanceExecutionKernel {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -468,6 +498,7 @@ pub struct MaintenanceExecutionKernel {
 impl MaintenanceExecutionKernel {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -477,6 +508,7 @@ impl MaintenanceExecutionKernel {
         service: Arc<dyn TableMaintenanceService>,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -485,6 +517,10 @@ impl MaintenanceExecutionKernel {
             query_execution,
             service,
         }
+    }
+
+    pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
+        &self.functions
     }
 
     /// The typed connector controls a maintenance-owned read may resolve.

@@ -29,7 +29,6 @@ use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };
 use arrow::datatypes::DataType;
-use novarocks_execution::exec::statistics::statistics_scalar_bounds_supported;
 use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 use novarocks_sql::planning::catalog::materialization_statistics_facts;
 use novarocks_sql::planning::dml::{
@@ -308,6 +307,22 @@ pub(crate) fn visible_row_metric_request<'a>(
         metrics.push(StatisticsMetric::ThetaNdv { column: name });
     }
     StatisticsMetricRequest::try_new(metrics)
+}
+
+fn statistics_scalar_bounds_supported(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+    ) || novarocks_types::largeint::is_largeint_data_type(data_type)
 }
 
 fn metric_request(

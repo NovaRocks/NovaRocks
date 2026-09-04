@@ -215,7 +215,7 @@ fn percentile_hash_encodes_value_and_empty_state() {
 
     let decoded = percentile::decode_state(out.value(0)).expect("decode");
     assert_eq!(decoded.digest.count(), 1.0);
-    assert_eq!(percentile::quantile_value(&decoded, 0.5), Some(7.0));
+    assert_eq!(percentile::quantile_value(&decoded, 0.5), Ok(Some(7.0)));
     let empty = percentile::decode_state(out.value(1)).expect("decode empty");
     assert_eq!(empty.digest.count(), 0.0);
     assert!(empty.quantiles.is_none());

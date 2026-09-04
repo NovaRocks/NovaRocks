@@ -175,7 +175,7 @@ pub fn infer_agg_function_types(
         "mann_whitney_u_test" => Ok((DataType::Utf8, Some(DataType::Binary))),
         "max_by" | "min_by" => Ok((first_arg, Some(DataType::Binary))),
         "covar_pop" | "covar_samp" | "corr" | "var_pop" | "var_samp" | "variance"
-        | "variance_pop" | "variance_samp" | "stddev" | "stddev_pop" | "stddev_samp" => {
+        | "variance_pop" | "variance_samp" | "stddev" | "stddev_pop" | "stddev_samp" | "std" => {
             Ok((DataType::Float64, Some(DataType::Binary)))
         }
         "percentile_cont" | "percentile_disc" | "percentile_disc_lc" => {
@@ -208,14 +208,7 @@ pub fn infer_agg_function_types(
         }
         "approx_top_k" => Ok((approx_top_k_output_type(first_arg), Some(DataType::Binary))),
         "min_n" | "max_n" => Ok((list_output_type(first_arg), Some(DataType::Binary))),
-        _ => {
-            let out = if arg_types.is_empty() {
-                DataType::Int64
-            } else {
-                first_arg
-            };
-            Ok((out.clone(), Some(out)))
-        }
+        _ => Err(format!("unknown aggregate function `{name}`")),
     }
 }
 
@@ -374,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn infers_state_collection_and_fallback_contracts() {
+    fn infers_state_collection_and_rejects_unknown_aggregates() {
         assert_eq!(
             infer_agg_function_types("sum_state_merge", &[DataType::Int64], false).unwrap(),
             (DataType::Binary, Some(DataType::Binary))
@@ -385,8 +378,8 @@ mod tests {
             (list.clone(), Some(list))
         );
         assert_eq!(
-            infer_agg_function_types("unknown_zero_arg", &[], false).unwrap(),
-            (DataType::Int64, Some(DataType::Int64))
+            infer_agg_function_types("unknown_zero_arg", &[], false).unwrap_err(),
+            "unknown aggregate function `unknown_zero_arg`"
         );
     }
 

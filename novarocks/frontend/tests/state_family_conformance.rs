@@ -236,6 +236,10 @@ async fn open_application(
             19310,
             std::num::NonZeroUsize::new(1).unwrap(),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            std::sync::Arc::new(
+                novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                    .expect("builtin function catalog"),
+            ),
         ),
         backend_config(),
         Vec::new(),

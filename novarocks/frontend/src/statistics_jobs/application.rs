@@ -20,23 +20,19 @@
 //! This module deliberately contains no parser AST or raw-SQL interception.
 //! The frontend owns target resolution, current-process job state, and worker composition.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorCancellation, ConnectorControlPlanningLease,
-    ConnectorControlRegistry, ConnectorError, ConnectorInstanceId, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectBinding,
-    ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
-    ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableRequest,
-    ConnectorTableResolution, ExternalMutationEvidence, LakePublicationId,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsBasisRelation, StatisticsDataVersion,
-    StatisticsMetric, StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState,
-    StatisticsMetricValue, StatisticsNumericNature, StatisticsReadRequest,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorControlPlanningLease, ConnectorControlRegistry,
+    ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableMetadata, ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
+    ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
+    ConnectorTableObjectSelector, ConnectorTableRequest, ConnectorTableResolution,
+    LakePublicationId, MAX_CONNECTOR_STATISTICS_METRICS, StatisticsBasisRelation,
+    StatisticsDataVersion, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricSource,
+    StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature, StatisticsReadRequest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -98,6 +94,7 @@ pub trait StatisticsTargetResolver: Send + Sync {
     fn capture_table_object(
         &self,
         target: &StatisticsTableTarget,
+        context: ConnectorRequestContext,
     ) -> Result<StatisticsTargetCapture, StatisticsApplicationError>;
 }
 
@@ -118,6 +115,7 @@ pub trait StatisticsTableReader: Send + Sync {
     fn show_table_stats(
         &self,
         target: &StatisticsTableTarget,
+        context: ConnectorRequestContext,
     ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError>;
 }
 
@@ -131,36 +129,14 @@ pub trait StatisticsTableReaderSink: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// Attempt-local material retained only by the execution/publish boundary.
-pub trait StatisticsCollectedAttempt: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-
-    /// The rebound provider version collected by this exact attempt. It is
-    /// retained only until the worker atomically records the publish boundary.
-    fn basis_data_version(&self) -> &StatisticsDataVersion;
-}
-
 /// Frontend-owned implementation of provider-native collection and
-/// publication. The frontend retains this process-worker port and the immutable
-/// request types; the frontend owns connector leases, native mapping, the
-/// distributed request, and `ExternalMutationOutcome` handling.
+/// publication. One consuming call owns the session from provider begin through
+/// ordinary distributed execution and the single external finish attempt.
 pub trait StatisticsAttemptExecutor: Send + Sync {
-    fn collect(
+    fn execute(
         &self,
         request: &StatisticsAttemptRequest,
-    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsApplicationError>;
-
-    fn prepare_publish(
-        &self,
-        request: &StatisticsAttemptRequest,
-        collected: &dyn StatisticsCollectedAttempt,
-    ) -> Result<ExternalMutationEvidence, StatisticsApplicationError>;
-
-    fn publish(
-        &self,
-        request: &StatisticsAttemptRequest,
-        collected: &dyn StatisticsCollectedAttempt,
-        evidence: &ExternalMutationEvidence,
+        cancellation: crate::common::query_cancellation::QueryCancellationView,
     ) -> Result<(), StatisticsApplicationError>;
 }
 
@@ -187,14 +163,8 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
     fn capture_table_object(
         &self,
         target: &StatisticsTableTarget,
+        context: ConnectorRequestContext,
     ) -> Result<StatisticsTargetCapture, StatisticsApplicationError> {
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
-            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let instance_id = ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let lease = self
@@ -306,8 +276,8 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
     fn show_table_stats(
         &self,
         target: &StatisticsTableTarget,
+        context: ConnectorRequestContext,
     ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError> {
-        let context = statistics_request_context()?;
         let metadata = load_statistics_table_metadata(
             self.controls.as_ref(),
             context.clone(),
@@ -400,16 +370,6 @@ fn load_statistics_table_metadata(
             context,
         })
         .map_err(|error| error.to_string())
-}
-
-fn statistics_request_context() -> Result<ConnectorRequestContext, StatisticsApplicationError> {
-    ConnectorRequestContext::try_new(
-        Instant::now() + Duration::from_secs(30),
-        Arc::new(NeverCancelled),
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    )
-    .map_err(|error| StatisticsApplicationError::new(error.to_string()))
 }
 
 /// Placeholder for the per-metric columns of a row that has no measured value.
@@ -506,14 +466,6 @@ fn statistics_metric_value(value: StatisticsMetricValue) -> String {
         // Do not surface opaque connector bytes through SQL. Providers that
         // choose a byte metric must publish a user-safe scalar representation.
         StatisticsMetricValue::Bytes(_) => "<opaque>".to_string(),
-    }
-}
-
-struct NeverCancelled;
-
-impl ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
     }
 }
 

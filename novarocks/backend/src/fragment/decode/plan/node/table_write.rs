@@ -41,22 +41,37 @@ use std::time::Instant;
 
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::table_finish::TableFinishNode;
+use novarocks_execution::exec::node::table_write_aggregate::{
+    WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
+    WriterGroupedUnpivotPlan, WriterPartialAggregateCall, WriterPartialAggregatePlan,
+};
 use novarocks_execution::exec::node::table_write_relation::{
-    WRITE_RELATION_SLOT_IDS, root_relation_chunk_schema, writer_relation_chunk_schema,
-    writer_relation_schema,
+    RootWriteResultRelationSchema, WriterMultiplexRelationSchema,
 };
 use novarocks_execution::exec::node::table_writer::{
     TableWriterInputProjection, TableWriterNode, TableWriterPhysicalContextTemplate,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_execution::runtime::query_options::query_expire_durations;
-use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_write::ValidatedWriterHandle;
+use novarocks_proto_codec::{FieldPath, arrow_physical};
 use novarocks_proto_models::plan;
 use novarocks_spi::connector::ConnectorRequestContext;
-use novarocks_spi::connector::write_stack::{WriteTargetOrdinal, validate_writer_handle_bytes};
+use novarocks_spi::connector::write_stack::{
+    ROOT_WRITE_RESULT_COLUMN_COUNT, ROOT_WRITE_RESULT_SCHEMA_VERSION, RootWriteResultSchema,
+    WRITE_RELATION_COLUMN_COUNT, WRITER_MULTIPLEX_SCHEMA_VERSION, WriteTargetOrdinal,
+    WriterAuxiliaryChannel, WriterMultiplexSchema, arrow_schemas_exact,
+    validate_writer_handle_bytes,
+};
+use novarocks_types::SlotId;
+
+const MAX_WRITE_AGGREGATE_CALLS: usize = 4_096;
+const MAX_WRITE_UNPIVOT_MAPPINGS: usize = 4_096;
+const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 
 use super::DecodedNode;
+use super::aggregate::decode_resolved_aggregate_signature;
+use super::unpivot::decode_unpivot_constant;
 use crate::connector::write_data_plane::{
     ObservedConnectorWriteExecution, RoleBoundCommitFragmentEncoder,
     RootCommitFragmentCarrierValidator,
@@ -64,6 +79,583 @@ use crate::connector::write_data_plane::{
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use crate::fragment::decode::plan::layout::Layout;
+
+fn decode_writer_multiplex_schema(
+    wire: Option<&plan::WriterMultiplexSchema>,
+    path: FieldPath,
+) -> Result<WriterMultiplexRelationSchema, NativeFragmentDecodeError> {
+    let wire = wire.ok_or_else(|| {
+        NativeFragmentDecodeError::missing(path.clone(), "writer multiplex schema is required")
+    })?;
+    if wire.contract_version != WRITER_MULTIPLEX_SCHEMA_VERSION {
+        return Err(NativeFragmentDecodeError::invalid_value(
+            path.clone().field("contract_version"),
+            format!(
+                "writer multiplex schema contract version {} is unsupported; expected {}",
+                wire.contract_version, WRITER_MULTIPLEX_SCHEMA_VERSION
+            ),
+        ));
+    }
+    if wire.columns.len() < WRITE_RELATION_COLUMN_COUNT {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("columns"),
+            "writer multiplex schema is missing its fixed prefix",
+        ));
+    }
+    let decoded = arrow_physical::decode_schema(&wire.columns, &wire.schema_metadata, path.clone())
+        .map_err(NativeFragmentDecodeError::from)?;
+    for (index, is_internal) in decoded.internal().iter().enumerate() {
+        if !is_internal {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                path.clone()
+                    .field("columns")
+                    .index(index)
+                    .field("is_internal"),
+                "write relation columns must be internal",
+            ));
+        }
+    }
+    let actual = decoded.schema();
+    let channels = wire.columns[WRITE_RELATION_COLUMN_COUNT..]
+        .iter()
+        .zip(actual.fields()[WRITE_RELATION_COLUMN_COUNT..].iter())
+        .map(|(column, field)| {
+            WriterAuxiliaryChannel::try_new(
+                column.slot_id,
+                field.name().clone(),
+                field.data_type().clone(),
+            )
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("columns"),
+                    format!("writer multiplex auxiliary channel: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let contract = WriterMultiplexSchema::try_new(channels).map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(
+            path.clone().field("columns"),
+            format!("writer multiplex schema: {error}"),
+        )
+    })?;
+    contract
+        .validate_exact_arrow_schema(actual.as_ref())
+        .map_err(|error| {
+            NativeFragmentDecodeError::inconsistent(
+                path.clone().field("columns"),
+                format!("writer multiplex schema: {error}"),
+            )
+        })?;
+    if decoded.slot_ids() != contract.slot_ids() {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.field("columns"),
+            "writer multiplex column ids do not match the frozen relation",
+        ));
+    }
+    WriterMultiplexRelationSchema::try_new(contract)
+        .map_err(|error| NativeFragmentDecodeError::invalid_value(path, error))
+}
+
+fn decode_root_result_schema(
+    wire: Option<&plan::RootWriteResultSchema>,
+    path: FieldPath,
+) -> Result<RootWriteResultRelationSchema, NativeFragmentDecodeError> {
+    let wire = wire.ok_or_else(|| {
+        NativeFragmentDecodeError::missing(path.clone(), "root write result schema is required")
+    })?;
+    if wire.contract_version != ROOT_WRITE_RESULT_SCHEMA_VERSION {
+        return Err(NativeFragmentDecodeError::invalid_value(
+            path.clone().field("contract_version"),
+            format!(
+                "root write result schema contract version {} is unsupported; expected {}",
+                wire.contract_version, ROOT_WRITE_RESULT_SCHEMA_VERSION
+            ),
+        ));
+    }
+    if wire.columns.len() != ROOT_WRITE_RESULT_COLUMN_COUNT {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("columns"),
+            format!(
+                "root write result schema has {} columns; expected {}",
+                wire.columns.len(),
+                ROOT_WRITE_RESULT_COLUMN_COUNT
+            ),
+        ));
+    }
+    let decoded = arrow_physical::decode_schema(&wire.columns, &wire.schema_metadata, path.clone())
+        .map_err(NativeFragmentDecodeError::from)?;
+    for (index, is_internal) in decoded.internal().iter().enumerate() {
+        if !is_internal {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                path.clone()
+                    .field("columns")
+                    .index(index)
+                    .field("is_internal"),
+                "write relation columns must be internal",
+            ));
+        }
+    }
+    let contract = RootWriteResultSchema::new();
+    let actual = decoded.schema();
+    contract
+        .validate_exact_arrow_schema(actual.as_ref())
+        .map_err(|error| {
+            NativeFragmentDecodeError::inconsistent(
+                path.clone().field("columns"),
+                format!("root write result schema: {error}"),
+            )
+        })?;
+    if decoded.slot_ids() != contract.slot_ids() {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("columns"),
+            "root write result column ids do not match the fixed relation",
+        ));
+    }
+    RootWriteResultRelationSchema::try_new(contract)
+        .map_err(|error| NativeFragmentDecodeError::invalid_value(path, error))
+}
+
+fn decode_partial_aggregate_plan(
+    wire: Option<&plan::WriterPartialAggregatePlan>,
+    projected_input_schema: &novarocks_execution::exec::chunk::ChunkSchema,
+    writer_schema: &WriterMultiplexRelationSchema,
+    path: FieldPath,
+    ctx: &NativePlanDecodeContext,
+) -> Result<WriterPartialAggregatePlan, NativeFragmentDecodeError> {
+    let wire = wire.ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone(),
+            "writer partial aggregate plan is required",
+        )
+    })?;
+    if wire.calls.len() > MAX_WRITE_AGGREGATE_CALLS {
+        return Err(NativeFragmentDecodeError::out_of_range(
+            path.clone().field("calls"),
+            "writer partial aggregate call count exceeds the limit",
+        ));
+    }
+    let catalog = if wire.calls.is_empty() {
+        None
+    } else {
+        Some(ctx.function_catalog().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone(),
+                "writer partial aggregates require the process engine function catalog",
+            )
+        })?)
+    };
+    let mut slots = BTreeSet::new();
+    let mut calls = Vec::with_capacity(wire.calls.len());
+    for (index, call) in wire.calls.iter().enumerate() {
+        let call_path = path.clone().field("calls").index(index);
+        let planned = decode_resolved_aggregate_signature(
+            call.resolved_signature.as_ref(),
+            &call.function_name,
+            call_path.clone().field("resolved_signature"),
+        )?;
+        if planned.argument_types.len() != 1 {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                call_path
+                    .clone()
+                    .field("resolved_signature")
+                    .field("argument_types"),
+                "writer partial aggregate requires exactly one input",
+            ));
+        }
+        let selected = catalog
+            .expect("nonempty calls require catalog")
+            .resolve_aggregate_trusted(&call.function_name, &planned.argument_types)
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(
+                    call_path.clone(),
+                    format!("writer partial aggregate resolution: {error}"),
+                )
+            })?;
+        if selected != planned {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                call_path.clone().field("resolved_signature"),
+                "writer partial aggregate signature differs from the process catalog",
+            ));
+        }
+        let input_slot_id = SlotId::new(call.input_slot_id);
+        let input = projected_input_schema.slot(input_slot_id).ok_or_else(|| {
+            NativeFragmentDecodeError::inconsistent(
+                call_path.clone().field("input_slot_id"),
+                "writer partial aggregate input slot is absent from the projected writer input",
+            )
+        })?;
+        if input.data_type() != &planned.argument_types[0] {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                call_path.clone().field("input_slot_id"),
+                "writer partial aggregate input type differs from its resolved signature",
+            ));
+        }
+        let intermediate_slot_id = SlotId::new(call.intermediate_slot_id);
+        if !slots.insert(intermediate_slot_id) {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                call_path.clone().field("intermediate_slot_id"),
+                "writer partial aggregate repeats an intermediate slot",
+            ));
+        }
+        let output = writer_schema
+            .chunk_schema()
+            .slot(intermediate_slot_id)
+            .ok_or_else(|| {
+                NativeFragmentDecodeError::inconsistent(
+                    call_path.clone().field("intermediate_slot_id"),
+                    "writer partial aggregate output is absent from the typed writer tail",
+                )
+            })?;
+        if output.data_type() != &planned.intermediate_type || !output.nullable() {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                call_path.clone().field("intermediate_slot_id"),
+                "writer partial aggregate output differs from the typed writer tail",
+            ));
+        }
+        calls.push(WriterPartialAggregateCall {
+            input_slot_id,
+            function_name: Arc::from(call.function_name.as_str()),
+            resolved: planned,
+            intermediate_slot_id,
+        });
+    }
+    Ok(WriterPartialAggregatePlan { calls })
+}
+
+fn decode_final_aggregate_plan(
+    wire: Option<&plan::WriterFinalAggregatePlan>,
+    expected_targets: &BTreeSet<WriteTargetOrdinal>,
+    writer_schema: &WriterMultiplexRelationSchema,
+    root_schema: &RootWriteResultRelationSchema,
+    path: FieldPath,
+    arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
+) -> Result<WriterFinalAggregatePlan, NativeFragmentDecodeError> {
+    let wire = wire.ok_or_else(|| {
+        NativeFragmentDecodeError::missing(path.clone(), "writer final aggregate plan is required")
+    })?;
+    if wire.calls.len() > MAX_WRITE_AGGREGATE_CALLS {
+        return Err(NativeFragmentDecodeError::out_of_range(
+            path.clone().field("calls"),
+            "writer final aggregate call count exceeds the limit",
+        ));
+    }
+    let catalog = if wire.calls.is_empty() {
+        None
+    } else {
+        Some(ctx.function_catalog().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone(),
+                "writer final aggregates require the process engine function catalog",
+            )
+        })?)
+    };
+    let auxiliary_slots = writer_schema
+        .contract()
+        .auxiliary_channels()
+        .iter()
+        .map(|channel| SlotId::new(channel.slot_id()))
+        .collect::<BTreeSet<_>>();
+    let mut consumed_slots = BTreeSet::new();
+    let mut final_slots = BTreeSet::new();
+    let mut calls = Vec::with_capacity(wire.calls.len());
+    for (index, call) in wire.calls.iter().enumerate() {
+        let call_path = path.clone().field("calls").index(index);
+        let planned = decode_resolved_aggregate_signature(
+            call.resolved_signature.as_ref(),
+            &call.function_name,
+            call_path.clone().field("resolved_signature"),
+        )?;
+        let selected = catalog
+            .expect("nonempty calls require catalog")
+            .resolve_aggregate_trusted(&call.function_name, &planned.argument_types)
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(
+                    call_path.clone(),
+                    format!("writer final aggregate resolution: {error}"),
+                )
+            })?;
+        if selected != planned {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                call_path.clone().field("resolved_signature"),
+                "writer final aggregate signature differs from the process catalog",
+            ));
+        }
+        let intermediate_input_slot_id = SlotId::new(call.intermediate_input_slot_id);
+        if !consumed_slots.insert(intermediate_input_slot_id) {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                call_path.clone().field("intermediate_input_slot_id"),
+                "writer final aggregate repeats an intermediate input slot",
+            ));
+        }
+        let input = writer_schema
+            .chunk_schema()
+            .slot(intermediate_input_slot_id)
+            .ok_or_else(|| {
+                NativeFragmentDecodeError::inconsistent(
+                    call_path.clone().field("intermediate_input_slot_id"),
+                    "writer final aggregate input is absent from the typed writer tail",
+                )
+            })?;
+        if input.data_type() != &planned.intermediate_type {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                call_path.clone().field("intermediate_input_slot_id"),
+                "writer final aggregate input type differs from its resolved signature",
+            ));
+        }
+        let final_output_slot_id = SlotId::new(call.final_output_slot_id);
+        if !final_slots.insert(final_output_slot_id)
+            || writer_schema
+                .chunk_schema()
+                .slot(final_output_slot_id)
+                .is_some()
+            || root_schema
+                .chunk_schema()
+                .slot(final_output_slot_id)
+                .is_some()
+        {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                call_path.clone().field("final_output_slot_id"),
+                "writer final aggregate output slot is duplicated or collides with a relation slot",
+            ));
+        }
+        calls.push(WriterFinalAggregateCall {
+            function_name: Arc::from(call.function_name.as_str()),
+            resolved: planned,
+            intermediate_input_slot_id,
+            final_output_slot_id,
+        });
+    }
+    if consumed_slots != auxiliary_slots {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("calls"),
+            "writer final aggregates do not exactly cover the typed writer tail",
+        ));
+    }
+
+    let unpivot = match (&wire.unpivot, calls.is_empty()) {
+        (None, true) => None,
+        (Some(_), true) => {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().field("unpivot"),
+                "writer grouped Unpivot is present without final aggregates",
+            ));
+        }
+        (None, false) => {
+            return Err(NativeFragmentDecodeError::missing(
+                path.clone().field("unpivot"),
+                "writer final aggregates require grouped Unpivot facts",
+            ));
+        }
+        (Some(unpivot), false) => Some(decode_writer_grouped_unpivot(
+            unpivot,
+            expected_targets,
+            writer_schema,
+            root_schema,
+            &final_slots,
+            path.clone().field("unpivot"),
+            arena,
+            ctx,
+        )?),
+    };
+    Ok(WriterFinalAggregatePlan { calls, unpivot })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen grouped Unpivot boundary validates each independent relation explicitly."
+)]
+fn decode_writer_grouped_unpivot(
+    wire: &plan::WriterGroupedUnpivotPlan,
+    expected_targets: &BTreeSet<WriteTargetOrdinal>,
+    writer_schema: &WriterMultiplexRelationSchema,
+    root_schema: &RootWriteResultRelationSchema,
+    final_slots: &BTreeSet<SlotId>,
+    path: FieldPath,
+    arena: &mut ExprArena,
+    ctx: &NativePlanDecodeContext,
+) -> Result<WriterGroupedUnpivotPlan, NativeFragmentDecodeError> {
+    if wire.mappings.is_empty() || wire.mappings.len() > MAX_WRITE_UNPIVOT_MAPPINGS {
+        return Err(NativeFragmentDecodeError::out_of_range(
+            path.clone().field("mappings"),
+            "writer grouped Unpivot mapping count is outside the supported range",
+        ));
+    }
+    let max_output_rows = usize::try_from(wire.max_output_rows)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::out_of_range(
+                path.clone().field("max_output_rows"),
+                "writer grouped Unpivot row budget is invalid",
+            )
+        })?;
+    let max_output_bytes = usize::try_from(wire.max_output_bytes)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::out_of_range(
+                path.clone().field("max_output_bytes"),
+                "writer grouped Unpivot byte budget is invalid",
+            )
+        })?;
+    let grouping_input_slot_id = SlotId::new(wire.grouping_input_slot_id);
+    let grouping_input = writer_schema
+        .chunk_schema()
+        .slot(grouping_input_slot_id)
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::inconsistent(
+                path.clone().field("grouping_input_slot_id"),
+                "writer grouped Unpivot grouping input is absent from the writer relation",
+            )
+        })?;
+    if grouping_input.data_type() != &arrow::datatypes::DataType::Int32 || grouping_input.nullable()
+    {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("grouping_input_slot_id"),
+            "writer grouped Unpivot grouping input must be non-null Int32",
+        ));
+    }
+    let grouping_output_slot_id = SlotId::new(wire.grouping_output_slot_id);
+    let passthrough_output_slot_id = SlotId::new(wire.passthrough_output_slot_id);
+    let value_output_slot_id = SlotId::new(wire.value_output_slot_id);
+    let literal_output_slot_ids = wire
+        .literal_output_slot_ids
+        .iter()
+        .copied()
+        .map(SlotId::new)
+        .collect::<Vec<_>>();
+    let mut output_roles = BTreeSet::new();
+    for slot in std::iter::once(passthrough_output_slot_id)
+        .chain(std::iter::once(value_output_slot_id))
+        .chain(literal_output_slot_ids.iter().copied())
+    {
+        if !output_roles.insert(slot) || root_schema.chunk_schema().slot(slot).is_none() {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                "writer grouped Unpivot output roles are duplicated or absent from Root schema",
+            ));
+        }
+    }
+    let root_slots = root_schema
+        .chunk_schema()
+        .slot_ids()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if grouping_output_slot_id.0 == 0
+        || root_slots.contains(&grouping_output_slot_id)
+        || writer_schema
+            .chunk_schema()
+            .slot(grouping_output_slot_id)
+            .is_some()
+        || final_slots.contains(&grouping_output_slot_id)
+    {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("grouping_output_slot_id"),
+            "writer grouped Unpivot grouping output collides with another slot",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut referenced_final_slots = BTreeSet::new();
+    let mut decoded_constant_count = 0usize;
+    let mut decoded_nested_elements = 0usize;
+    let mut decoded_constant_bytes = 0usize;
+    let mut mappings = Vec::with_capacity(wire.mappings.len());
+    for (index, mapping) in wire.mappings.iter().enumerate() {
+        let mapping_path = path.clone().field("mappings").index(index);
+        let target = WriteTargetOrdinal::try_new(mapping.grouping_key).map_err(|error| {
+            NativeFragmentDecodeError::out_of_range(
+                mapping_path.clone().field("grouping_key"),
+                error.to_string(),
+            )
+        })?;
+        if !expected_targets.contains(&target) {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                mapping_path.clone().field("grouping_key"),
+                "writer grouped Unpivot mapping targets an unexpected group",
+            ));
+        }
+        let input_value_slot_id = SlotId::new(mapping.input_value_slot_id);
+        if !final_slots.contains(&input_value_slot_id)
+            || !seen.insert((target, input_value_slot_id))
+        {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                mapping_path.clone(),
+                "writer grouped Unpivot mapping is duplicated or references an unknown final slot",
+            ));
+        }
+        referenced_final_slots.insert(input_value_slot_id);
+        if mapping.constants.len() != literal_output_slot_ids.len() {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                mapping_path.clone().field("constants"),
+                "writer grouped Unpivot constant arity differs from its output roles",
+            ));
+        }
+        decoded_constant_count = decoded_constant_count
+            .checked_add(mapping.constants.len())
+            .ok_or_else(|| {
+                NativeFragmentDecodeError::out_of_range(
+                    mapping_path.clone().field("constants"),
+                    "writer grouped Unpivot constant count overflowed",
+                )
+            })?;
+        if decoded_constant_count > MAX_WRITE_UNPIVOT_CONSTANTS {
+            return Err(NativeFragmentDecodeError::out_of_range(
+                mapping_path.clone().field("constants"),
+                "writer grouped Unpivot constant count exceeds the limit",
+            ));
+        }
+        let mut constants = Vec::with_capacity(mapping.constants.len());
+        for (constant_index, constant) in mapping.constants.iter().enumerate() {
+            let constant_path = mapping_path
+                .clone()
+                .field("constants")
+                .index(constant_index);
+            let (decoded, data_type, _) = decode_unpivot_constant(
+                constant,
+                constant_path.clone(),
+                arena,
+                ctx,
+                &mut decoded_nested_elements,
+                &mut decoded_constant_bytes,
+            )?;
+            let output = root_schema
+                .chunk_schema()
+                .slot(literal_output_slot_ids[constant_index])
+                .expect("validated Root output slot");
+            if output.data_type() != &data_type {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    constant_path,
+                    "writer grouped Unpivot constant type differs from its Root output slot",
+                ));
+            }
+            constants.push(decoded);
+        }
+        mappings.push(WriterGroupedUnpivotMapping {
+            grouping_key: target.get(),
+            input_value_slot_id,
+            constants,
+        });
+    }
+    if referenced_final_slots != *final_slots {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("mappings"),
+            "writer grouped Unpivot mappings do not cover every final aggregate output",
+        ));
+    }
+    Ok(WriterGroupedUnpivotPlan {
+        grouping_input_slot_id,
+        grouping_output_slot_id,
+        passthrough_output_slot_id,
+        value_output_slot_id,
+        literal_output_slot_ids,
+        mappings,
+        max_output_rows,
+        max_output_bytes,
+    })
+}
 
 /// Decode one `TableWriterNode` and bind it to this attempt's write role
 /// binding.
@@ -79,7 +671,10 @@ pub(super) fn lower_table_writer_node(
         .next()
         .expect("table writer child arity is validated before lowering");
     let node_id = node.node_id;
-
+    let writer_multiplex_schema = decode_writer_multiplex_schema(
+        writer.writer_multiplex_schema.as_ref(),
+        path.clone().field("writer_multiplex_schema"),
+    )?;
     let runtime = ctx.typed_scan_runtime().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
             path.clone().field("catalog_handle"),
@@ -151,10 +746,30 @@ pub(super) fn lower_table_writer_node(
             format!("native node_id={node_id} table writer requires a target schema"),
         ));
     }
-    let expected_schema = ctx
-        .decode_output_layout(&writer.target_schema, path.clone().field("target_schema"))?
-        .chunk_schema()
-        .arrow_schema_ref();
+    let projected_input_layout =
+        ctx.decode_output_layout(&writer.target_schema, path.clone().field("target_schema"))?;
+    let expected_slot_ids = (0..writer.target_schema.len())
+        .map(|ordinal| {
+            ordinal
+                .checked_add(1)
+                .and_then(|slot| u32::try_from(slot).ok())
+                .map(SlotId::new)
+                .ok_or_else(|| {
+                    NativeFragmentDecodeError::out_of_range(
+                        path.clone().field("target_schema"),
+                        "table writer projected input slot ID overflowed",
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if projected_input_layout.slot_ids() != expected_slot_ids {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("target_schema"),
+            "table writer target schema column ids must equal their one-based ordinals",
+        ));
+    }
+    let projected_input_schema = projected_input_layout.chunk_schema();
+    let expected_schema = projected_input_schema.arrow_schema_ref();
 
     // The input binding is a sealed description of which execution outputs feed
     // the writer. The projection itself is always the sealed output
@@ -194,6 +809,13 @@ pub(super) fn lower_table_writer_node(
                     format!("native node_id={node_id} table writer projection: {error}"),
                 )
             })?;
+    let partial_aggregate_plan = decode_partial_aggregate_plan(
+        writer.partial_aggregate_plan.as_ref(),
+        projected_input_schema.as_ref(),
+        &writer_multiplex_schema,
+        path.clone().field("partial_aggregate_plan"),
+        ctx,
+    )?;
 
     // The query and attempt come from the execution identity this fragment was
     // admitted under, never from the plan node: a plan carries no attempt, and
@@ -239,7 +861,7 @@ pub(super) fn lower_table_writer_node(
         node_id,
     ));
 
-    let lowered = TableWriterNode::try_new(
+    let lowered = TableWriterNode::try_new_with_relation(
         Box::new(child.node),
         node_id,
         handle,
@@ -250,6 +872,8 @@ pub(super) fn lower_table_writer_node(
         physical_template,
         request_context,
         fragment_encoder,
+        writer_multiplex_schema,
+        partial_aggregate_plan,
     )
     .map_err(|error| {
         NativeFragmentDecodeError::inconsistent(
@@ -258,12 +882,14 @@ pub(super) fn lower_table_writer_node(
         )
     })?;
 
+    let output_schema = Arc::clone(lowered.writer_multiplex_schema().chunk_schema());
+    let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::TableWriter(lowered),
         },
-        layout: Layout::for_slots(WRITE_RELATION_SLOT_IDS),
-        output_schema: writer_relation_chunk_schema(),
+        layout,
+        output_schema,
     })
 }
 
@@ -273,9 +899,18 @@ pub(super) fn lower_table_finish_node(
     finish: &plan::TableFinishNode,
     path: FieldPath,
     children: Vec<DecodedNode>,
+    arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let node_id = node.node_id;
+    let writer_multiplex_schema = decode_writer_multiplex_schema(
+        finish.writer_multiplex_schema.as_ref(),
+        path.clone().field("writer_multiplex_schema"),
+    )?;
+    let root_result_schema = decode_root_result_schema(
+        finish.root_result_schema.as_ref(),
+        path.clone().field("root_result_schema"),
+    )?;
     let ordinals_path = path.clone().field("expected_target_ordinals");
     let mut expected = Vec::with_capacity(finish.expected_target_ordinals.len());
     for (index, ordinal) in finish.expected_target_ordinals.iter().enumerate() {
@@ -290,18 +925,13 @@ pub(super) fn lower_table_finish_node(
     // Every input must already carry the writer relation. The finish node reads
     // its columns positionally, so a foreign input would otherwise only fail
     // once rows arrive.
-    let relation_types = writer_relation_schema()
-        .fields()
-        .iter()
-        .map(|field| field.data_type().clone())
-        .collect::<Vec<_>>();
+    let expected_schema = writer_multiplex_schema.chunk_schema();
     for (index, child) in children.iter().enumerate() {
-        let slots = child.output_schema.slots();
-        let matches = slots.len() == relation_types.len()
-            && slots
-                .iter()
-                .zip(relation_types.iter())
-                .all(|(slot, data_type)| slot.data_type() == data_type);
+        let matches = child.output_schema.slot_ids() == expected_schema.slot_ids()
+            && arrow_schemas_exact(
+                child.output_schema.arrow_schema_ref().as_ref(),
+                expected_schema.arrow_schema_ref().as_ref(),
+            );
         if !matches {
             return Err(NativeFragmentDecodeError::inconsistent(
                 path.clone().field("children").index(index),
@@ -337,6 +967,16 @@ pub(super) fn lower_table_finish_node(
         }
     }
 
+    let final_aggregate_plan = decode_final_aggregate_plan(
+        finish.final_aggregate_plan.as_ref(),
+        &sealed,
+        &writer_multiplex_schema,
+        &root_result_schema,
+        path.clone().field("final_aggregate_plan"),
+        arena,
+        ctx,
+    )?;
+
     let validator = Arc::new(RootCommitFragmentCarrierValidator::new(
         ctx.typed_scan_runtime()
             .map(|runtime| runtime.execution_id())
@@ -352,20 +992,30 @@ pub(super) fn lower_table_finish_node(
     ));
 
     let inputs = children.into_iter().map(|child| child.node).collect();
-    let lowered =
-        TableFinishNode::try_new(inputs, node_id, expected, validator).map_err(|error| {
-            NativeFragmentDecodeError::invalid_value(
-                ordinals_path,
-                format!("native node_id={node_id} table finish: {error}"),
-            )
-        })?;
+    let lowered = TableFinishNode::try_new_with_relations(
+        inputs,
+        node_id,
+        expected,
+        validator,
+        writer_multiplex_schema,
+        root_result_schema,
+        final_aggregate_plan,
+    )
+    .map_err(|error| {
+        NativeFragmentDecodeError::invalid_value(
+            ordinals_path,
+            format!("native node_id={node_id} table finish: {error}"),
+        )
+    })?;
 
+    let output_schema = Arc::clone(lowered.root_result_schema().chunk_schema());
+    let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::TableFinish(lowered),
         },
-        layout: Layout::for_slots(WRITE_RELATION_SLOT_IDS),
-        output_schema: root_relation_chunk_schema(),
+        layout,
+        output_schema,
     })
 }
 
@@ -480,26 +1130,35 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::table_write_relation::RootWriteResultRelationSchema;
     use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
     use novarocks_execution::runtime::runtime_state::RuntimeState;
-    use novarocks_proto_codec::ProtocolErrorKind;
+    use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
     use novarocks_proto_models::connector_write as write_dto;
     use novarocks_proto_models::plan;
     use novarocks_spi::connector::write_stack::{
         ConnectorOpenWriterRequest, ConnectorWriterPhysicalContext,
-        MAX_CONNECTOR_WRITER_HANDLE_BYTES, WriteTargetOrdinal,
+        MAX_CONNECTOR_WRITER_HANDLE_BYTES, WRITE_RELATION_COLUMN_COUNT,
+        WRITE_RELATION_FRAGMENT_COLUMN, WRITE_RELATION_KIND_COLUMN,
+        WRITE_RELATION_ROW_COUNT_COLUMN, WRITE_RELATION_TARGET_COLUMN, WriteTargetOrdinal,
+        WriterAuxiliaryChannel, WriterMultiplexSchema, write_relation_column_id,
     };
-    use novarocks_types::{AttemptId, QueryExecutionId, QueryId, UniqueId};
+    use novarocks_types::{AttemptId, QueryExecutionId, QueryId, SlotId, UniqueId};
 
-    use super::super::tests::{column_ref, one_col_values_node_with, output_column};
+    use super::super::tests::{
+        column_ref, one_col_values_node_with, output_column, output_column_with_nullable,
+        physical_node, resolved_aggregate_signature,
+    };
     use super::super::{DecodedNode, NativePlanDecodeContext, decode_node};
+    use super::decode_writer_multiplex_schema;
     use crate::connector::write_test_support::{
         RecordingWriteExecution, TEST_WRITE_CATALOG, finish_node, iceberg_writer_handle,
         table_writer_payload, test_request_context, test_write_adapter, test_write_binding,
-        test_write_catalog_handle, test_write_scan_runtime, wire_catalog_handle, writer_node,
+        test_write_catalog_handle, test_write_scan_runtime, wire_catalog_handle,
+        writer_multiplex_schema, writer_node,
     };
     use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 
@@ -521,30 +1180,45 @@ mod tests {
         Arc::new(RecordingWriteExecution::new())
     }
 
+    fn test_execution_function_set()
+    -> Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet> {
+        let mut builder = novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
+        novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+            .expect("builtin function metadata");
+        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+            &mut builder,
+        )
+        .expect("builtin aggregate implementations");
+        Arc::new(builder.seal().expect("builtin execution function set"))
+    }
+
     fn writer_runtime_state() -> RuntimeState {
         let runtime = Arc::new(
-            ExecutionRuntime::new(ExecutionRuntimeConfig {
-                driver_threads: 1,
-                scan_threads: 1,
-                scan_queue_capacity: 1,
-                spill_io_threads: 1,
-                spill_io_queue_capacity: 1,
-                spill_storage: ExecutionSpillStorageConfig::default(),
-                exchange_wait_ms: 120_000,
-                exchange_io_threads: 1,
-                exchange_io_max_inflight_bytes: 1024,
-                exchange_max_transmit_batched_bytes: 1024,
-                operator_buffer_chunks: 1,
-                local_exchange_buffer_mem_limit_per_driver: 1024,
-                local_exchange_max_buffered_rows: 1024,
-                connector_io_tasks_per_scan_operator: 1,
-                scan_submit_fail_max: 1,
-                scan_submit_fail_timeout_ms: 1,
-                runtime_filter_scan_wait_time_ms_override: None,
-                runtime_filter_wait_timeout_ms_override: None,
-                sink_io_worker_threads: 1,
-                sink_io_max_blocking_threads: 1,
-            })
+            ExecutionRuntime::new(
+                ExecutionRuntimeConfig {
+                    driver_threads: 1,
+                    scan_threads: 1,
+                    scan_queue_capacity: 1,
+                    spill_io_threads: 1,
+                    spill_io_queue_capacity: 1,
+                    spill_storage: ExecutionSpillStorageConfig::default(),
+                    exchange_wait_ms: 120_000,
+                    exchange_io_threads: 1,
+                    exchange_io_max_inflight_bytes: 1024,
+                    exchange_max_transmit_batched_bytes: 1024,
+                    operator_buffer_chunks: 1,
+                    local_exchange_buffer_mem_limit_per_driver: 1024,
+                    local_exchange_max_buffered_rows: 1024,
+                    connector_io_tasks_per_scan_operator: 1,
+                    scan_submit_fail_max: 1,
+                    scan_submit_fail_timeout_ms: 1,
+                    runtime_filter_scan_wait_time_ms_override: None,
+                    runtime_filter_wait_timeout_ms_override: None,
+                    sink_io_worker_threads: 1,
+                    sink_io_max_blocking_threads: 1,
+                },
+                test_execution_function_set(),
+            )
             .expect("writer execution runtime"),
         );
         RuntimeState::new(
@@ -570,12 +1244,16 @@ mod tests {
             )))
             .with_connector_cancellation(crate::connector::write_test_support::never_cancelled())
             .with_fragment_instance_id(fragment_instance_id())
+            .with_function_catalog(Arc::new(
+                novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                    .expect("builtin function catalog"),
+            ))
     }
 
     fn writer_payload() -> plan::TableWriterNode {
         table_writer_payload(
             column_ref(CHILD_COLUMN_ID, DataType::Int64),
-            vec![output_column(7, "id", DataType::Int64)],
+            vec![output_column(1, "id", DataType::Int64)],
         )
     }
 
@@ -584,6 +1262,64 @@ mod tests {
             30,
             writer,
             vec![one_col_values_node_with(10, CHILD_COLUMN_ID, "id", 42)],
+        )
+    }
+
+    fn writer_payload_with_count_partial(input_slot_id: u32) -> plan::TableWriterNode {
+        let mut writer = writer_payload();
+        let channel = WriterAuxiliaryChannel::try_new(17, "count_partial", DataType::Int64)
+            .expect("count channel");
+        let relation = WriterMultiplexSchema::try_new(vec![channel]).expect("writer relation");
+        writer.writer_multiplex_schema = Some(writer_multiplex_schema(&relation));
+        writer.partial_aggregate_plan = Some(plan::WriterPartialAggregatePlan {
+            calls: vec![plan::WriterPartialAggregateCall {
+                input_slot_id,
+                function_name: "count".to_string(),
+                resolved_signature: resolved_aggregate_signature("count", &[DataType::Int64]),
+                intermediate_slot_id: 17,
+            }],
+        });
+        writer
+    }
+
+    fn four_column_write_relation_values(
+        mutate: impl FnOnce(&mut Vec<novarocks_proto_models::common::OutputColumn>),
+    ) -> plan::DistributedNode {
+        let mut columns = vec![
+            output_column_with_nullable(
+                write_relation_column_id(0),
+                WRITE_RELATION_KIND_COLUMN,
+                DataType::Int8,
+                false,
+            ),
+            output_column_with_nullable(
+                write_relation_column_id(1),
+                WRITE_RELATION_TARGET_COLUMN,
+                DataType::Int32,
+                false,
+            ),
+            output_column_with_nullable(
+                write_relation_column_id(2),
+                WRITE_RELATION_ROW_COUNT_COLUMN,
+                DataType::Int64,
+                true,
+            ),
+            output_column_with_nullable(
+                write_relation_column_id(3),
+                WRITE_RELATION_FRAGMENT_COLUMN,
+                DataType::Binary,
+                true,
+            ),
+        ];
+        mutate(&mut columns);
+        physical_node(
+            10,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: Vec::new(),
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
         )
     }
 
@@ -632,7 +1368,42 @@ mod tests {
         );
         assert_eq!(
             decoded.output_schema,
-            novarocks_execution::exec::node::table_write_relation::writer_relation_chunk_schema()
+            *writer.writer_multiplex_schema().chunk_schema()
+        );
+    }
+
+    #[test]
+    fn writer_partial_input_is_bound_to_the_projected_target_schema() {
+        let decoded = decode_with(
+            &simple_writer_plan(writer_payload_with_count_partial(1)),
+            recording_execution(),
+        )
+        .expect("target-ordinal partial input decodes");
+        let ExecNodeKind::TableWriter(writer) = &decoded.node.kind else {
+            panic!("expected a table writer");
+        };
+        assert_eq!(
+            writer.partial_aggregate_plan().calls[0].input_slot_id,
+            SlotId::new(1)
+        );
+
+        let error = decode_error(&simple_writer_plan(writer_payload_with_count_partial(7)));
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_writer.partial_aggregate_plan.calls[0].input_slot_id",
+            ProtocolErrorKind::InconsistentFields,
+        );
+    }
+
+    #[test]
+    fn writer_target_schema_ids_are_one_based_ordinals() {
+        let mut writer = writer_payload();
+        writer.target_schema[0].column_id = 7;
+        let error = decode_error(&simple_writer_plan(writer));
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_writer.target_schema",
+            ProtocolErrorKind::InconsistentFields,
         );
     }
 
@@ -674,7 +1445,11 @@ mod tests {
         let ExecNodeKind::TableWriter(writer) = &decoded.node.kind else {
             panic!("expected a table writer");
         };
-        let factory = novarocks_execution::exec::operators::TableWriterOperatorFactory::new(writer);
+        let factory = novarocks_execution::exec::operators::TableWriterOperatorFactory::try_new(
+            writer,
+            test_execution_function_set(),
+        )
+        .expect("table writer factory");
         assert!(!factory.is_sink(), "a table writer is not a terminal sink");
         let runtime_state = writer_runtime_state();
         let mut operators = Vec::new();
@@ -715,7 +1490,9 @@ mod tests {
         assert!(!finish.accepts_target(WriteTargetOrdinal::try_new(1).expect("bounded ordinal")));
         assert_eq!(
             decoded.output_schema,
-            novarocks_execution::exec::node::table_write_relation::root_relation_chunk_schema()
+            RootWriteResultRelationSchema::fixed()
+                .chunk_schema()
+                .clone()
         );
     }
 
@@ -732,6 +1509,179 @@ mod tests {
             ProtocolErrorKind::InvalidValue,
         );
         assert!(error.contains("query-leased"), "unexpected detail: {error}");
+    }
+
+    #[test]
+    fn a_writer_requires_the_versioned_exact_multiplex_schema() {
+        let mut writer = writer_payload();
+        writer.writer_multiplex_schema = None;
+        let error = decode_error(&simple_writer_plan(writer));
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_writer.writer_multiplex_schema",
+            ProtocolErrorKind::MissingField,
+        );
+
+        let mut writer = writer_payload();
+        writer
+            .writer_multiplex_schema
+            .as_mut()
+            .expect("schema")
+            .contract_version += 1;
+        let error = decode_error(&simple_writer_plan(writer));
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_writer.writer_multiplex_schema.contract_version",
+            ProtocolErrorKind::InvalidValue,
+        );
+    }
+
+    #[test]
+    fn writer_multiplex_prefix_tampering_is_rejected() {
+        let mutators: [fn(&mut plan::ArrowPhysicalColumn); 3] = [
+            |column: &mut plan::ArrowPhysicalColumn| {
+                column.field.as_mut().expect("field").name = "wrong".to_string()
+            },
+            |column: &mut plan::ArrowPhysicalColumn| {
+                column.field.as_mut().expect("field").nullable = true
+            },
+            |column: &mut plan::ArrowPhysicalColumn| column.slot_id -= 1,
+        ];
+        for mutate in mutators {
+            let mut writer = writer_payload();
+            mutate(
+                &mut writer
+                    .writer_multiplex_schema
+                    .as_mut()
+                    .expect("schema")
+                    .columns[0],
+            );
+            let error = decode_error(&simple_writer_plan(writer));
+            assert!(
+                error.contains("writer multiplex"),
+                "unexpected detail: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_multiplex_dictionary_ipc_attributes_are_exact() {
+        let contract = WriterMultiplexSchema::try_new(vec![
+            WriterAuxiliaryChannel::try_new(
+                17,
+                "dictionary",
+                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            )
+            .expect("dictionary channel"),
+        ])
+        .expect("writer schema");
+        let mut wire = writer_multiplex_schema(&contract);
+        let dictionary = wire.columns[WRITE_RELATION_COLUMN_COUNT]
+            .field
+            .as_mut()
+            .expect("dictionary field");
+        dictionary.dictionary_id = Some(41);
+        dictionary.dictionary_is_ordered = Some(true);
+
+        let error =
+            decode_writer_multiplex_schema(Some(&wire), FieldPath::root("writer_multiplex_schema"))
+                .expect_err("dictionary IPC attributes drifted from the frozen schema");
+        assert_protocol(
+            &error,
+            "writer_multiplex_schema.columns",
+            ProtocolErrorKind::InconsistentFields,
+        );
+    }
+
+    #[test]
+    fn a_finish_requires_both_exact_relation_contracts() {
+        let mut node = finish_node(40, vec![0], vec![simple_writer_plan(writer_payload())]);
+        let Some(plan::distributed_node::Payload::TableFinish(finish)) = node.payload.as_mut()
+        else {
+            panic!("finish payload");
+        };
+        finish.root_result_schema = None;
+        let error = decode_error(&node);
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_finish.root_result_schema",
+            ProtocolErrorKind::MissingField,
+        );
+
+        let mut node = finish_node(40, vec![0], vec![simple_writer_plan(writer_payload())]);
+        let Some(plan::distributed_node::Payload::TableFinish(finish)) = node.payload.as_mut()
+        else {
+            panic!("finish payload");
+        };
+        finish
+            .root_result_schema
+            .as_mut()
+            .expect("root schema")
+            .columns
+            .pop();
+        let error = decode_error(&node);
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_finish.root_result_schema.columns",
+            ProtocolErrorKind::InconsistentFields,
+        );
+    }
+
+    #[test]
+    fn root_relation_type_and_internal_marker_tampering_is_rejected() {
+        let mut node = finish_node(40, vec![0], vec![simple_writer_plan(writer_payload())]);
+        let Some(plan::distributed_node::Payload::TableFinish(finish)) = node.payload.as_mut()
+        else {
+            panic!("finish payload");
+        };
+        finish
+            .root_result_schema
+            .as_mut()
+            .expect("root schema")
+            .columns[7]
+            .is_internal = false;
+        let error = decode_error(&node);
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_finish.root_result_schema.columns[7].is_internal",
+            ProtocolErrorKind::InvalidValue,
+        );
+
+        let mut node = finish_node(40, vec![0], vec![simple_writer_plan(writer_payload())]);
+        let Some(plan::distributed_node::Payload::TableFinish(finish)) = node.payload.as_mut()
+        else {
+            panic!("finish payload");
+        };
+        let root = finish.root_result_schema.as_mut().expect("root schema");
+        root.columns[0].field.as_mut().expect("field").r#type =
+            Some(Box::new(plan::ArrowPhysicalType {
+                kind: Some(plan::arrow_physical_type::Kind::Primitive(
+                    plan::ArrowPrimitiveType::Int64 as i32,
+                )),
+            }));
+        let error = decode_error(&node);
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_finish.root_result_schema.columns",
+            ProtocolErrorKind::InconsistentFields,
+        );
+
+        let mut node = finish_node(40, vec![0], vec![simple_writer_plan(writer_payload())]);
+        let Some(plan::distributed_node::Payload::TableFinish(finish)) = node.payload.as_mut()
+        else {
+            panic!("finish payload");
+        };
+        finish
+            .root_result_schema
+            .as_mut()
+            .expect("root schema")
+            .contract_version += 1;
+        let error = decode_error(&node);
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_finish.root_result_schema.contract_version",
+            ProtocolErrorKind::InvalidValue,
+        );
     }
 
     #[test]
@@ -917,6 +1867,101 @@ mod tests {
         assert_protocol(
             &error,
             "plan_fragment.root.payload.table_finish.children[0]",
+            ProtocolErrorKind::InconsistentFields,
+        );
+    }
+
+    #[test]
+    fn a_finish_input_must_match_slot_name_type_nullability_and_order() {
+        let mutations: [fn(&mut Vec<novarocks_proto_models::common::OutputColumn>); 4] = [
+            |columns| columns[0].column_id -= 1,
+            |columns| columns[0].name = "wrong_kind".to_string(),
+            |columns| {
+                columns[0].r#type = Some(
+                    crate::fragment::decode::type_decode::encode_type(&DataType::Int64)
+                        .expect("type"),
+                )
+            },
+            |columns| columns[0].nullable = true,
+        ];
+        for mutate in mutations {
+            let node = finish_node(40, vec![0], vec![four_column_write_relation_values(mutate)]);
+            let error = decode_error(&node);
+            assert_protocol(
+                &error,
+                "plan_fragment.root.payload.table_finish.children[0]",
+                ProtocolErrorKind::InconsistentFields,
+            );
+        }
+
+        let node = finish_node(
+            40,
+            vec![0],
+            vec![four_column_write_relation_values(|columns| {
+                columns.swap(0, 1)
+            })],
+        );
+        let error = decode_error(&node);
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_finish.children[0]",
+            ProtocolErrorKind::InconsistentFields,
+        );
+    }
+
+    #[test]
+    fn root_nested_physical_contract_tampering_is_rejected() {
+        let mut node = finish_node(40, vec![0], vec![simple_writer_plan(writer_payload())]);
+        let Some(plan::distributed_node::Payload::TableFinish(finish)) = node.payload.as_mut()
+        else {
+            panic!("finish payload");
+        };
+        let input_type = finish
+            .root_result_schema
+            .as_mut()
+            .expect("root schema")
+            .columns[4]
+            .field
+            .as_mut()
+            .expect("field")
+            .r#type
+            .as_mut()
+            .expect("type");
+        let Some(plan::arrow_physical_type::Kind::List(item)) = input_type.kind.as_mut() else {
+            panic!("input_fields list");
+        };
+        item.nullable = true;
+        let error = decode_error(&node);
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_finish.root_result_schema.columns",
+            ProtocolErrorKind::InconsistentFields,
+        );
+
+        let mut node = finish_node(40, vec![0], vec![simple_writer_plan(writer_payload())]);
+        let Some(plan::distributed_node::Payload::TableFinish(finish)) = node.payload.as_mut()
+        else {
+            panic!("finish payload");
+        };
+        let map_type = finish
+            .root_result_schema
+            .as_mut()
+            .expect("root schema")
+            .columns[7]
+            .field
+            .as_mut()
+            .expect("field")
+            .r#type
+            .as_mut()
+            .expect("type");
+        let Some(plan::arrow_physical_type::Kind::Map(map)) = map_type.kind.as_mut() else {
+            panic!("properties map");
+        };
+        map.ordered = true;
+        let error = decode_error(&node);
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_finish.root_result_schema.columns",
             ProtocolErrorKind::InconsistentFields,
         );
     }

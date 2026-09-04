@@ -890,6 +890,7 @@ mod tests {
             args: vec![one],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
         };
         let count_null = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9002),
@@ -897,6 +898,7 @@ mod tests {
             args: vec![null],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Null], false),
         };
 
         assert!(is_eliminable_count(&count_one, &arena));

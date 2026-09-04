@@ -55,7 +55,6 @@ pub enum StatisticsJobState {
     Submitted,
     Preparing,
     Running,
-    Publishing,
     Succeeded,
     Failed,
     Stale,
@@ -80,13 +79,11 @@ impl StatisticsJobState {
                 | (Self::Preparing, Self::Failed)
                 | (Self::Preparing, Self::Stale)
                 | (Self::Preparing, Self::Cancelled)
-                | (Self::Running, Self::Publishing)
+                | (Self::Running, Self::Succeeded)
+                | (Self::Running, Self::CommitUnknown)
                 | (Self::Running, Self::Failed)
                 | (Self::Running, Self::Stale)
                 | (Self::Running, Self::Cancelled)
-                | (Self::Publishing, Self::Succeeded)
-                | (Self::Publishing, Self::Failed)
-                | (Self::Publishing, Self::CommitUnknown)
         )
     }
 }

@@ -23,7 +23,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use crate::runtime::mem_tracker::MemTracker;
 use novarocks_types::SlotId;
 
-use super::memory::{ChunkAccounting, chunk_bytes_i64, record_batch_bytes};
+use super::memory::{ChunkAccounting, ChunkMemoryLease, chunk_bytes_i64, record_batch_bytes};
 use super::schema::{
     ChunkSchema, ChunkSchemaRef, align_chunk_schema_to_batch, align_chunk_schema_to_columns,
 };
@@ -175,6 +175,39 @@ impl Chunk {
             return;
         }
         self.accounting = Some(Arc::new(ChunkAccounting::new(bytes, tracker)));
+    }
+
+    /// Transfers this chunk's complete accounting lease while enforcing the
+    /// destination tracker limit. A failed first charge remains attached to
+    /// the chunk so dropping it releases the live bytes instead of leaking an
+    /// exceeded counter.
+    pub fn try_transfer_to(&mut self, tracker: &Arc<MemTracker>) -> Result<(), String> {
+        if let Some(accounting) = self.accounting.as_ref() {
+            return accounting.try_transfer_to(tracker);
+        }
+        let bytes = chunk_bytes_i64(&self.batch);
+        if bytes <= 0 {
+            return Ok(());
+        }
+        let result = tracker.consume_and_check_limit(bytes);
+        self.accounting = Some(Arc::new(ChunkAccounting::from_charged(bytes, tracker)));
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory_lease(&self) -> Option<ChunkMemoryLease> {
+        self.accounting.as_ref().map(|accounting| ChunkMemoryLease {
+            accounting: Arc::clone(accounting),
+        })
+    }
+
+    /// Moves this chunk's accounting owner without cloning it. Consumers that
+    /// retain only a zero-copy projection can then split the projected bytes
+    /// from the unprojected remainder exactly.
+    pub(crate) fn take_memory_lease(&mut self) -> Option<ChunkMemoryLease> {
+        self.accounting
+            .take()
+            .map(|accounting| ChunkMemoryLease { accounting })
     }
 }
 

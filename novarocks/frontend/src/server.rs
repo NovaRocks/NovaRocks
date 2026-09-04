@@ -201,6 +201,7 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&typed_connector_control),
             topology.clone(),
             query_execution.clone(),
+            Arc::clone(&function_catalog),
             host.lake_publication_runtime_policy()
                 .max_attempt_duration(),
         ),
@@ -208,6 +209,7 @@ pub fn build_frontend_query_session_factory(
     .map_err(FrontendApplicationError::server)?;
 
     let maintenance_ports = core_capabilities::MaintenanceCommandPorts::new(
+        Arc::clone(&function_catalog),
         Arc::clone(&catalog_service),
         Some(Arc::clone(&catalog_application)),
         Arc::clone(&connector_control),
@@ -299,6 +301,7 @@ pub fn build_frontend_query_session_factory(
     );
     let view_command_executor =
         core_capabilities::view_command_executor(core_capabilities::ViewCommandPorts::new(
+            Arc::clone(&function_catalog),
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
@@ -962,6 +965,13 @@ mod tests {
         ))
     }
 
+    fn builtin_function_catalog() -> Arc<novarocks_functions::EngineFunctionCatalog> {
+        Arc::new(
+            novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin function catalog"),
+        )
+    }
+
     #[derive(Debug)]
     struct RecordingHostPort;
 
@@ -987,6 +997,7 @@ mod tests {
                 0,
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
             ),
             backend_open: frontend_backend_open_config(),
             report_bind_host: "127.0.0.1".to_string(),
@@ -1091,6 +1102,7 @@ mod tests {
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
             )
             .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::DynamicStateStore),
             frontend_backend_open_config(),
@@ -1191,6 +1203,7 @@ mod tests {
                 0,
                 std::num::NonZeroUsize::new(1).unwrap(),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
             ),
             frontend_backend_open_config(),
             Vec::new(),
@@ -1241,6 +1254,7 @@ mod tests {
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
             ),
             frontend_backend_open_config(),
             Vec::new(),

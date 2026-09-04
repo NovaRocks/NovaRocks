@@ -317,6 +317,7 @@ mod tests {
             args: vec![intern_typed(arena, &col_typed_expr("b"))],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         };
         let aggregates = vec![count_spec];
         let output_columns = vec![output_col("a"), output_col("sum_b")];

@@ -348,6 +348,7 @@ pub(crate) fn scalar_display_name(arena: &ScalarArena, expr: ScalarId) -> String
             args,
             distinct,
             order_by,
+            ..
         } => aggregate_display_name(arena, name, args, *distinct, order_by),
         ScalarNode::Cast { child, target } => {
             format!(

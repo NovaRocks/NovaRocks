@@ -393,6 +393,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: vec![],
                     output_column_id: out_sum,
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int32],
+                        false,
+                    ),
                 }],
                 output_columns: vec![
                     OutputColumn {

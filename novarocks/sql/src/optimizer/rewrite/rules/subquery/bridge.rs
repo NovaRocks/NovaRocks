@@ -281,6 +281,11 @@ mod tests {
                     args: vec![value],
                     distinct: false,
                     order_by: vec![],
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 AggregateOutputLayout::new(vec![group_output.clone()], vec![sum_output.clone()]),
                 vec![sum_output.clone()],

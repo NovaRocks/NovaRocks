@@ -46,13 +46,13 @@ use crate::iceberg::spec::{
     SnapshotReference, SnapshotRetention, Summary,
 };
 use crate::iceberg::table::Table;
+use crate::iceberg::transaction::Transaction;
 use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::fast_append::register_puffin_stats;
 use super::helpers::{
     OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary, submit_occ_action,
@@ -60,7 +60,6 @@ use super::helpers::{
 };
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
-use crate::stats_assembler::CommitType;
 
 pub struct OverwriteCommit;
 
@@ -68,7 +67,6 @@ pub struct OverwriteCommit;
 impl IcebergCommitAction for OverwriteCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
         let staged = prepare_overwrite_action(&ctx)?;
-        let sketch_sets = ctx.collector.take_sketch_sets();
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
         match submit_occ_action(
             ctx.catalog,
@@ -89,18 +87,6 @@ impl IcebergCommitAction for OverwriteCommit {
                     Err(_) if prev_snapshot_id.is_none() => 0,
                     Err(err) => return Err(err),
                 };
-                let new_sequence_number = table_after.metadata().last_sequence_number();
-                register_puffin_stats(
-                    &table_after,
-                    ctx.catalog,
-                    ctx.file_io,
-                    CommitType::Overwrite,
-                    sketch_sets,
-                    new_snapshot_id,
-                    new_sequence_number,
-                    prev_snapshot_id,
-                )
-                .await;
                 Ok(CommitOutcome {
                     new_snapshot_id,
                     written_manifest_paths: staged.written_manifest_paths(),
@@ -211,6 +197,31 @@ pub(crate) async fn build_staged_overwrite_action(
         table_ident: ctx.collector.table_ident.clone(),
         catalog: ctx.catalog,
     })
+}
+
+/// Eagerly stage a full-table overwrite without catalog I/O so statistics can
+/// be bound to the transaction-local snapshot before one combined dispatch.
+pub(crate) async fn stage_eager_overwrite(
+    ctx: CommitCtx<'_>,
+    initial_updates: Vec<TableUpdate>,
+) -> Result<(Transaction, CommitOutcome), String> {
+    let prepared = prepare_overwrite_action(&ctx)?;
+    let action: Arc<dyn TransactionAction> = prepared.action.clone();
+    let tx = Transaction::new(ctx.table)
+        .stage_action_commit(ActionCommit::new(initial_updates, Vec::new()))
+        .map_err(|error| format!("Overwrite initial eager stage failed: {error}"))?
+        .stage_action(action)
+        .await
+        .map_err(|error| format!("Overwrite eager stage failed: {error}"))?;
+    let snapshot_id = target_ref_snapshot_id(tx.staged_table().metadata(), ctx.target_ref)
+        .ok_or_else(|| "staged overwrite did not produce a target snapshot".to_string())?;
+    Ok((
+        tx,
+        CommitOutcome {
+            new_snapshot_id: snapshot_id,
+            written_manifest_paths: prepared.written_manifest_paths(),
+        },
+    ))
 }
 
 struct OverwriteTxnAction {

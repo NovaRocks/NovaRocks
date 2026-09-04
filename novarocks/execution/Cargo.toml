@@ -19,9 +19,10 @@ bytes = "1"
 chrono = "0.4"
 chrono-tz = "0.10"
 crc32c = "0.6"
-datasketches = { workspace = true, features = ["hll", "theta"] }
+datasketches = { workspace = true, features = ["hll"] }
 futures = "0.3"
 hashbrown = { version = "0.14", features = ["raw"] }
+allocator-api2 = "0.2"
 hex = "0.4"
 libm = "0.2"
 md-5 = "0.10"
@@ -48,4 +49,11 @@ url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
+libc = "0.2"
+novarocks-connector-iceberg-functions = { path = "../connector/iceberg-functions" }
+novarocks-sql = { path = "../sql" }
 tempfile = "3"
+
+[[bench]]
+name = "table_write_statistics"
+harness = false

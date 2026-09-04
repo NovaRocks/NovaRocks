@@ -46,9 +46,11 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::datatypes::DataType;
 use novarocks_functions::{
-    EngineFunctionCatalog, EngineFunctionCatalogBuilder, FunctionCatalogError,
-    FunctionDefinition, FunctionKind, FunctionResolutionError, FunctionSignatureResolver,
-    FunctionVisibility, ResolvedFunctionSignature,
+    AggregateOverloadDeclaration, AggregateOverloadIdentity, AggregateSignatureResolver,
+    AggregateStateFormatIdentity, EngineFunctionCatalog, EngineFunctionCatalogBuilder,
+    FunctionCatalogError, FunctionDefinition, FunctionKind, FunctionResolutionError,
+    FunctionSignatureResolver, FunctionVisibility, ResolvedAggregateSignature,
+    ResolvedFunctionSignature,
 };
 
 #[cfg(test)]
@@ -66,6 +68,10 @@ pub(crate) use resolver::{
 pub(crate) use novarocks_functions::FunctionVolatility;
 
 impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
+    fn snapshot(&self) -> Arc<dyn crate::compiler::SqlFunctionCatalog> {
+        Arc::new(self.clone())
+    }
+
     fn resolve_scalar_signature(
         &self,
         name: &str,
@@ -74,11 +80,241 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         self.resolve_user(name, FunctionKind::Scalar, arg_types)
     }
 
+    fn contains_aggregate(&self, name: &str) -> bool {
+        self.definition(name, FunctionKind::Aggregate).is_some()
+    }
+
+    fn resolve_aggregate_signature(
+        &self,
+        name: &str,
+        arg_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        self.resolve_aggregate_user(name, arg_types)
+    }
+
+    fn resolve_aggregate_trusted(
+        &self,
+        name: &str,
+        arg_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        EngineFunctionCatalog::resolve_aggregate_trusted(self, name, arg_types)
+    }
+
     fn volatility(&self, name: &str) -> FunctionVolatility {
         self.definition(name, FunctionKind::Scalar)
             .map(FunctionDefinition::volatility)
             .unwrap_or_default()
     }
+}
+
+#[derive(Clone, Copy)]
+struct AggregateDeclaration {
+    name: &'static str,
+    signature: &'static str,
+    min_args: usize,
+    max_args: usize,
+}
+
+impl AggregateDeclaration {
+    const fn exact(name: &'static str, args: usize, signature: &'static str) -> Self {
+        Self {
+            name,
+            signature,
+            min_args: args,
+            max_args: args,
+        }
+    }
+
+    const fn ranged(
+        name: &'static str,
+        min_args: usize,
+        max_args: usize,
+        signature: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            signature,
+            min_args,
+            max_args,
+        }
+    }
+}
+
+struct BuiltinAggregateResolver {
+    declaration: AggregateDeclaration,
+}
+
+impl AggregateSignatureResolver for BuiltinAggregateResolver {
+    fn resolve_aggregate(
+        &self,
+        argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let declaration = self.declaration;
+        if !(declaration.min_args..=declaration.max_args).contains(&argument_types.len()) {
+            return Err(FunctionResolutionError::NoMatchingSignature {
+                candidates: 1,
+                binding_enforced: true,
+            });
+        }
+        let (output_type, intermediate_type) =
+            novarocks_types::aggregate::infer_agg_function_types(
+                declaration.name,
+                argument_types,
+                false,
+            )
+            .map_err(FunctionResolutionError::BadSignature)?;
+        let intermediate_type = intermediate_type.ok_or_else(|| {
+            FunctionResolutionError::BadSignature(format!(
+                "aggregate `{}` has no intermediate type",
+                declaration.name
+            ))
+        })?;
+        Ok(ResolvedAggregateSignature {
+            overload: AggregateOverloadIdentity::try_new(format!(
+                "builtin/{}/v1",
+                declaration.name
+            ))
+            .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
+            argument_types: argument_types.to_vec(),
+            intermediate_type,
+            output_type,
+            state_format: AggregateStateFormatIdentity::try_new(format!(
+                "novarocks/{}/state-v1",
+                declaration.name
+            ))
+            .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
+        })
+    }
+}
+
+const ONE_ARG_AGGREGATES: &[&str] = &[
+    "any_value",
+    "approx_count_distinct",
+    "array_agg",
+    "array_agg_distinct",
+    "array_unique_agg",
+    "avg",
+    "bitmap_agg",
+    "bitmap_union",
+    "bitmap_union_count",
+    "bitmap_union_int",
+    "bool_and",
+    "bool_or",
+    "booland_agg",
+    "boolor_agg",
+    "count_distinct_state",
+    "count_distinct_state_merge",
+    "count_if",
+    "dict_merge",
+    "ds_hll_count_distinct_merge",
+    "ds_hll_count_distinct_union",
+    "hll_raw_agg",
+    "hll_union",
+    "hll_union_agg",
+    "max",
+    "min",
+    "multi_distinct_count",
+    "multi_distinct_sum",
+    "ndv",
+    "percentile_union",
+    "sum",
+    "sum_map",
+    "variance",
+    "variance_pop",
+    "variance_samp",
+    "var_pop",
+    "var_samp",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "std",
+    "approx_count_distinct_state_merge",
+    "avg_state_merge",
+    "bool_and_state_merge",
+    "bool_or_state_merge",
+    "count_state_merge",
+    "max_state_merge",
+    "min_state_merge",
+    "sum_state_merge",
+];
+
+const STATE_ONE_ARG_AGGREGATES: &[&str] = &[
+    "approx_count_distinct_state",
+    "avg_state",
+    "bool_and_state",
+    "bool_or_state",
+    "count_state",
+    "max_state",
+    "min_state",
+    "sum_state",
+];
+
+const SIGNED_STATE_ONE_ARG_AGGREGATES: &[&str] = &[
+    "approx_count_distinct_state_signed",
+    "avg_state_signed",
+    "bool_and_state_signed",
+    "bool_or_state_signed",
+    "count_distinct_state_signed",
+    "count_state_signed",
+    "max_state_signed",
+    "min_state_signed",
+    "sum_state_signed",
+];
+
+fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
+    let mut declarations = Vec::new();
+    declarations.extend(
+        ONE_ARG_AGGREGATES
+            .iter()
+            .copied()
+            .map(|name| AggregateDeclaration::exact(name, 1, "(any)->derived")),
+    );
+    declarations.extend(
+        STATE_ONE_ARG_AGGREGATES
+            .iter()
+            .copied()
+            .map(|name| AggregateDeclaration::exact(name, 1, "(any)->binary")),
+    );
+    declarations.extend(
+        SIGNED_STATE_ONE_ARG_AGGREGATES
+            .iter()
+            .copied()
+            .map(|name| AggregateDeclaration::exact(name, 1, "(row(value,change_op))->binary")),
+    );
+    declarations.extend([
+        AggregateDeclaration::ranged("count", 0, 1, "()->i64 | (any)->i64"),
+        AggregateDeclaration::ranged("group_concat", 2, usize::MAX, "(any,utf8...)->utf8"),
+        AggregateDeclaration::ranged("string_agg", 2, usize::MAX, "(any,utf8...)->utf8"),
+        AggregateDeclaration::exact("map_agg", 2, "(any,any)->map"),
+        AggregateDeclaration::exact("max_by", 2, "(any,any)->any"),
+        AggregateDeclaration::exact("min_by", 2, "(any,any)->any"),
+        AggregateDeclaration::exact("min_n", 2, "(any,i64)->list<any>"),
+        AggregateDeclaration::exact("max_n", 2, "(any,i64)->list<any>"),
+        AggregateDeclaration::exact("corr", 2, "(any,any)->f64"),
+        AggregateDeclaration::exact("covar_pop", 2, "(any,any)->f64"),
+        AggregateDeclaration::exact("covar_samp", 2, "(any,any)->f64"),
+        AggregateDeclaration::exact("percentile_cont", 2, "(any,f64)->any"),
+        AggregateDeclaration::exact("percentile_disc", 2, "(any,f64)->any"),
+        AggregateDeclaration::exact("percentile_disc_lc", 2, "(any,f64)->any"),
+        AggregateDeclaration::ranged("percentile_approx", 2, 3, "(any,f64[,i64])->f64"),
+        AggregateDeclaration::ranged(
+            "percentile_approx_weighted",
+            3,
+            4,
+            "(any,i64,f64[,i64])->f64",
+        ),
+        AggregateDeclaration::ranged("approx_top_k", 1, 3, "(any[,i64[,i64]])->list<struct>"),
+        AggregateDeclaration::ranged("ds_hll_count_distinct", 1, 3, "(any[,i64[,utf8]])->i64"),
+        AggregateDeclaration::ranged(
+            "approx_count_distinct_hll_sketch",
+            1,
+            3,
+            "(any[,i64[,utf8]])->i64",
+        ),
+        AggregateDeclaration::ranged("mann_whitney_u_test", 2, 4, "(any,bool[,utf8[,i64]])->utf8"),
+    ]);
+    declarations.sort_unstable_by_key(|declaration| declaration.name);
+    declarations
 }
 
 struct BuiltinScalarResolver {
@@ -129,6 +365,22 @@ pub fn contribute_builtin_functions(
             resolver,
         )?)?;
     }
+    for declaration in builtin_aggregate_declarations() {
+        let overload = AggregateOverloadDeclaration::try_new(
+            format!("builtin/{}/v1", declaration.name),
+            declaration.signature,
+            "derived",
+            "derived",
+            format!("novarocks/{}/state-v1", declaration.name),
+        )?;
+        builder.register(FunctionDefinition::try_new_parametric_aggregate(
+            declaration.name,
+            FunctionVisibility::Public,
+            FunctionVolatility::Immutable,
+            [overload],
+            Arc::new(BuiltinAggregateResolver { declaration }),
+        )?)?;
+    }
     Ok(())
 }
 
@@ -145,6 +397,26 @@ static BUILTIN_ENGINE_FUNCTION_CATALOG: LazyLock<EngineFunctionCatalog> = LazyLo
 
 pub fn builtin_sql_function_catalog() -> &'static dyn crate::compiler::SqlFunctionCatalog {
     &*BUILTIN_ENGINE_FUNCTION_CATALOG
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_resolved_aggregate(
+    name: &str,
+    argument_types: &[DataType],
+    distinct: bool,
+) -> ResolvedAggregateSignature {
+    let executable_name =
+        novarocks_types::aggregate::mangle_distinct_aggregate_name(name, distinct);
+    builtin_sql_function_catalog()
+        .resolve_aggregate_trusted(&executable_name, argument_types)
+        .unwrap_or_else(|error| {
+            panic!("test aggregate `{executable_name}` must resolve exactly: {error}")
+        })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_function_catalog_snapshot() -> Arc<dyn crate::compiler::SqlFunctionCatalog> {
+    builtin_sql_function_catalog().snapshot()
 }
 
 pub fn builtin_engine_function_catalog() -> &'static EngineFunctionCatalog {
@@ -224,8 +496,111 @@ mod tests {
         assert_eq!(first.digest(), second.digest());
         assert!(!first.definitions().is_empty());
         assert!(first.definitions().windows(2).all(|pair| {
-            (pair[0].canonical_name(), pair[0].kind())
-                < (pair[1].canonical_name(), pair[1].kind())
+            (pair[0].canonical_name(), pair[0].kind()) < (pair[1].canonical_name(), pair[1].kind())
         }));
+    }
+
+    #[test]
+    fn aggregate_resolution_is_catalog_backed_and_exact() {
+        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
+        let resolved = catalog
+            .resolve_aggregate_user("count", &[])
+            .expect("count star resolves");
+        assert_eq!(resolved.overload.as_str(), "builtin/count/v1");
+        assert!(resolved.argument_types.is_empty());
+        assert_eq!(resolved.intermediate_type, DataType::Int64);
+        assert_eq!(resolved.output_type, DataType::Int64);
+        assert_eq!(resolved.state_format.as_str(), "novarocks/count/state-v1");
+        assert!(matches!(
+            catalog.resolve_aggregate_user("map_agg", &[DataType::Int64]),
+            Err(FunctionResolutionError::NoMatchingSignature { .. })
+        ));
+        assert_eq!(
+            catalog.resolve_aggregate_user("not_an_aggregate", &[]),
+            Err(FunctionResolutionError::UnknownFunction)
+        );
+
+        let std_user = catalog
+            .resolve_aggregate_user("std", &[DataType::Int64])
+            .expect("std alias resolves for user SQL");
+        let std_trusted = catalog
+            .resolve_aggregate_trusted("std", &[DataType::Int64])
+            .expect("std alias resolves for trusted planning");
+        assert_eq!(std_user, std_trusted);
+        assert_eq!(std_user.overload.as_str(), "builtin/std/v1");
+        assert_eq!(std_user.intermediate_type, DataType::Binary);
+        assert_eq!(std_user.output_type, DataType::Float64);
+        assert_eq!(std_user.state_format.as_str(), "novarocks/std/state-v1");
+    }
+
+    #[test]
+    fn analyzer_macros_are_not_published_as_executable_aggregate_overloads() {
+        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
+        for name in ["ds_hll_accumulate", "ds_hll_combine", "ds_hll_estimate"] {
+            assert!(
+                catalog.definition(name, FunctionKind::Aggregate).is_none(),
+                "{name} is analyzer syntax, not an executable aggregate"
+            );
+        }
+        assert!(
+            catalog
+                .definition("ds_hll_count_distinct_state", FunctionKind::Aggregate)
+                .is_none(),
+            "ds_hll_count_distinct_state is an executable scalar"
+        );
+        assert!(
+            catalog
+                .definition("ds_hll_count_distinct_state", FunctionKind::Scalar)
+                .is_some()
+        );
+        assert!(
+            catalog
+                .definition("every", FunctionKind::Aggregate)
+                .is_none(),
+            "EVERY is normalized to the executable BOOL_AND aggregate"
+        );
+        assert!(
+            catalog
+                .definition("bool_and", FunctionKind::Aggregate)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn hidden_aggregate_is_rejected_by_sql_user_resolution() {
+        let declaration = AggregateDeclaration::exact("$hidden_stat", 1, "(any)->i64");
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        builder
+            .register(
+                FunctionDefinition::try_new_parametric_aggregate(
+                    declaration.name,
+                    FunctionVisibility::Hidden,
+                    FunctionVolatility::Immutable,
+                    [AggregateOverloadDeclaration::try_new(
+                        "builtin/$hidden_stat/v1",
+                        declaration.signature,
+                        "derived",
+                        "derived",
+                        "novarocks/$hidden_stat/state-v1",
+                    )
+                    .expect("hidden overload")],
+                    Arc::new(BuiltinAggregateResolver { declaration }),
+                )
+                .expect("hidden definition"),
+            )
+            .expect("register hidden definition");
+        let catalog = builder.seal().expect("hidden catalog");
+        assert!(crate::compiler::SqlFunctionCatalog::contains_aggregate(
+            &catalog,
+            "$hidden_stat"
+        ));
+        assert_eq!(
+            crate::compiler::SqlFunctionCatalog::resolve_aggregate_signature(
+                &catalog,
+                "$hidden_stat",
+                &[DataType::Int64]
+            ),
+            Err(FunctionResolutionError::HiddenFunction)
+        );
     }
 }

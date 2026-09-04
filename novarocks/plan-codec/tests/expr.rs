@@ -20,7 +20,7 @@ use prost::Message;
 
 use novarocks_plan_codec::encode_expr;
 use novarocks_proto_models::{common, expr};
-use novarocks_sql::plan_read::{LiteralValue, TypedExpr};
+use novarocks_sql::plan_read::{ExprKind, LiteralValue, TypedExpr};
 use novarocks_sql::test_support::{
     native_cast_expression, native_expression_variants, native_lambda_expression,
     native_lambda_parameter_expression, native_literal_expression, native_window_expression,
@@ -152,6 +152,7 @@ fn typed_expr_variants_encode_to_expected_oneof_arms() {
 
     let names = variants
         .iter()
+        .filter(|expr| !matches!(&expr.kind, ExprKind::WindowCall { .. }))
         .map(|expr| {
             let encoded = encode_expr(expr).expect("encode variant");
             let decoded = assert_expr_roundtrip(encoded);
@@ -177,9 +178,15 @@ fn typed_expr_variants_encode_to_expected_oneof_arms() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(names.len(), 17);
+    let window = variants
+        .iter()
+        .find(|expr| matches!(&expr.kind, ExprKind::WindowCall { .. }))
+        .expect("window variant");
+    let error = encode_expr(window).expect_err("generic window expression must fail closed");
+    assert!(error.contains("physical Window node"), "{error}");
+
+    assert_eq!(names.len(), 16);
     assert!(names.contains(&"lambda_param_ref"));
-    assert!(names.contains(&"window_call"));
     assert!(names.contains(&"aggregate_call"));
     assert!(names.contains(&"case"));
 }
@@ -214,19 +221,8 @@ fn representative_nested_expr_fields_are_preserved() {
     assert_eq!(param.name.as_deref(), Some("x"));
 
     let window = native_window_expression();
-    let Some(expr::expr::Kind::WindowCall(window)) =
-        encode_expr(&window).expect("encode window").kind
-    else {
-        panic!("expected window call");
-    };
-    assert_eq!(window.function_name, "rank");
-    assert_eq!(window.order_by.len(), 1);
-    assert!(!window.order_by[0].asc);
-    assert!(window.order_by[0].nulls_first);
-    assert_eq!(
-        window.frame.as_ref().expect("window frame").frame_type,
-        expr::WindowFrameType::Rows as i32
-    );
+    let error = encode_expr(&window).expect_err("generic window expression must fail closed");
+    assert!(error.contains("physical Window node"), "{error}");
 }
 
 #[test]

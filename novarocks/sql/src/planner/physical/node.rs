@@ -34,7 +34,8 @@ use crate::planner::physical::{
     AggMode, AggregateOutputLayout, HashSource, JoinDistribution, JoinExecutionMode,
     PhysicalPlanStats, TopNPhase,
 };
-use novarocks_types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
+#[cfg(test)]
+use novarocks_types::aggregate::mangle_distinct_aggregate_name;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -245,27 +246,18 @@ pub(crate) fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
 }
 
 /// The intermediate aggregate-state Arrow type an aggregate `call` exposes,
-/// derived from its canonical function name and argument types via
-/// [`infer_agg_function_types`]. Errors when the function exposes no intermediate
-/// type.
+/// frozen by analyzer resolution in the call's immutable catalog signature.
 ///
 /// Only the call's positional `args` participate (matching the wire the encoder
 /// historically emitted); `order_by` inputs are intentionally excluded.
 pub(crate) fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
-    let function_name = aggregate_function_name(call);
-    let arg_types = call
-        .args
-        .iter()
-        .map(|arg| arg.data_type.clone())
-        .collect::<Vec<_>>();
-    infer_agg_function_types(&function_name, &arg_types, call.distinct)?
-        .1
-        .ok_or_else(|| format!("{function_name} does not expose an intermediate type"))
+    Ok(call.resolved.intermediate_type.clone())
 }
 
 /// The canonical aggregate function name for a `call`, delegating the DISTINCT
 /// name-mangling table to the single source of truth
 /// [`mangle_distinct_aggregate_name`].
+#[cfg(test)]
 pub(crate) fn aggregate_function_name(call: &AggregateCall) -> String {
     mangle_distinct_aggregate_name(&call.name, call.distinct)
 }
@@ -281,6 +273,7 @@ mod aggregate_wire_tests {
     use crate::planner::payload::AggregateCall;
 
     fn agg_call(name: &str, distinct: bool, args: Vec<DataType>) -> AggregateCall {
+        let resolved = crate::functions::test_resolved_aggregate(name, &args, distinct);
         AggregateCall {
             name: name.to_string(),
             args: args
@@ -295,6 +288,7 @@ mod aggregate_wire_tests {
             result_type: DataType::Int64,
             order_by: Vec::new(),
             output_column_id: ColumnId::new_for_test(1),
+            resolved,
         }
     }
 

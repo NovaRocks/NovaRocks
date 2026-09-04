@@ -152,6 +152,7 @@ fn build_aggregate_layout_for_refresh_select_sql(
         &provider,
         current_database,
         &visible_query,
+        ports.function_catalog().as_ref(),
     )?;
     let facts = visible_analysis
         .refresh_input
@@ -477,6 +478,7 @@ fn prepare_managed_repartition_transition(
         &provider,
         current_database,
         &query,
+        source.function_catalog().as_ref(),
     )?;
     validate_mv_partition_columns(Some(fields), &analysis.output_columns)?;
     if derive_fragment_property(&analysis)?.is_composed_aggregate_schema_contract_fallback() {
@@ -1032,7 +1034,7 @@ fn frontend_refresh_publication_intent(
         attempt.publication_id,
         definition.source_revision.target_object_id.clone(),
         expected_target_snapshot(contract),
-        managed_descriptor_properties(&definition)?,
+        managed_descriptor_properties(definition)?,
         MvRefreshPublicationTechnique::Full,
         &snapshots,
         base_table_object_ids,

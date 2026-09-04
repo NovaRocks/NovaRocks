@@ -417,6 +417,22 @@ impl TableCommit {
         take(&mut self.updates)
     }
 
+    /// Add a requirement to this staged commit if it is not already present.
+    ///
+    /// This keeps provider-owned publication frontiers on the vendor commit
+    /// type while allowing them to add admission requirements before the
+    /// single catalog dispatch.
+    pub fn add_requirement(&mut self, requirement: TableRequirement) {
+        if !self.requirements.contains(&requirement) {
+            self.requirements.push(requirement);
+        }
+    }
+
+    /// Return whether this staged commit carries no metadata updates.
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_empty()
+    }
+
     /// Applies this [`TableCommit`] to the given [`Table`] as part of a catalog update.
     /// Typically used by [`Catalog::update_table`] to validate requirements and apply metadata updates.
     ///

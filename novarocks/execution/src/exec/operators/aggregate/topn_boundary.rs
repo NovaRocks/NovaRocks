@@ -934,7 +934,7 @@ mod tests {
         ];
         let mut key_table = KeyTable::new(vec![DataType::Int64, DataType::Utf8], false).unwrap();
         let key_views = build_group_key_views(&group_arrays).unwrap();
-        let rows = key_table.build_rows(&group_arrays).unwrap();
+        let rows = key_table.build_rows_fallback(&group_arrays).unwrap();
         let hashes = key_table
             .build_group_hashes(&key_views, group_arrays[0].len())
             .unwrap();
@@ -942,7 +942,7 @@ mod tests {
 
         for (row, hash) in hashes.into_iter().enumerate() {
             let lookup = key_table
-                .find_or_insert_from_row(&key_views, row, rows.row(row).data(), hash)
+                .find_or_insert_from_row(&key_views, row, rows[row].as_slice(), hash)
                 .unwrap();
             lookups.push((lookup.group_id, lookup.is_new));
             observe_key_table_group(&mut bindings, &lookup, &group_arrays, row).unwrap();

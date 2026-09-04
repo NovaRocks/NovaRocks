@@ -193,13 +193,37 @@ impl SqlImvPlanningInput {
 ///
 /// The function implementation and its execution kernels are explicitly out
 /// of scope for this compiler-facing contract.
-pub trait SqlFunctionCatalog: Send + Sync {
+pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
+    /// Freeze an owned handle to exactly the immutable catalog used for
+    /// analysis so optimizer rewrites cannot consult ambient state.
+    fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog>;
+
     fn resolve_scalar_signature(
         &self,
         name: &str,
         arg_types: &[arrow::datatypes::DataType],
     ) -> Result<
         novarocks_functions::ResolvedFunctionSignature,
+        novarocks_functions::FunctionResolutionError,
+    >;
+
+    fn contains_aggregate(&self, name: &str) -> bool;
+
+    fn resolve_aggregate_signature(
+        &self,
+        name: &str,
+        arg_types: &[arrow::datatypes::DataType],
+    ) -> Result<
+        novarocks_functions::ResolvedAggregateSignature,
+        novarocks_functions::FunctionResolutionError,
+    >;
+
+    fn resolve_aggregate_trusted(
+        &self,
+        name: &str,
+        arg_types: &[arrow::datatypes::DataType],
+    ) -> Result<
+        novarocks_functions::ResolvedAggregateSignature,
         novarocks_functions::FunctionResolutionError,
     >;
 
@@ -435,6 +459,7 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) environment: SqlPlanningEnvironment,
     pub(crate) catalog: Option<&'a dyn SqlCatalogSnapshot>,
     pub(crate) functions: Option<&'a dyn SqlFunctionCatalog>,
+    pub(crate) owned_functions: Option<Arc<dyn SqlFunctionCatalog>>,
     pub(crate) constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
@@ -461,6 +486,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             environment,
             catalog: Some(catalog),
             functions: Some(functions),
+            owned_functions: None,
             constant_evaluator: Some(constant_evaluator),
             mv_rewrite,
             imv_rewrite: None,
@@ -492,6 +518,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             environment,
             catalog: None,
             functions: None,
+            owned_functions: None,
             constant_evaluator,
             mv_rewrite: None,
             imv_rewrite: None,
@@ -501,6 +528,15 @@ impl<'a> SqlAnalyzeRequest<'a> {
 
     pub(crate) fn check_control(&self) -> Result<(), SqlCompileError> {
         self.control.check()
+    }
+
+    pub(crate) fn with_function_catalog(mut self, functions: Arc<dyn SqlFunctionCatalog>) -> Self {
+        self.owned_functions = Some(functions);
+        self
+    }
+
+    fn function_catalog(&self) -> Option<&dyn SqlFunctionCatalog> {
+        self.functions.or(self.owned_functions.as_deref())
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -522,6 +558,7 @@ pub struct SqlAnalyzedQuery {
     settings: SessionOptimizerSettings,
     change_stream: crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     mv_rewrite: mv_rewrite::SqlMvRewriteAnalysis,
+    function_catalog: Arc<dyn SqlFunctionCatalog>,
     /// Carried from the analyze request because folding runs in the optimize
     /// phase, which outlives the analyze request borrow.
     constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
@@ -586,6 +623,7 @@ pub(crate) struct SqlAnalysisOutput {
 )]
 pub(crate) struct SqlOptimizedOutput {
     pub(crate) optimized_tree: crate::optimizer::OptimizedOperatorNode,
+    pub(crate) function_catalog: Arc<dyn SqlFunctionCatalog>,
     pub(crate) statistics: SqlStatisticsPlan,
     pub(crate) change_stream: crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     pub(crate) mv_rewrite_diagnostics: Vec<mv_rewrite::SqlMvRewriteDiagnostic>,
@@ -651,6 +689,7 @@ pub struct SqlMvRefreshAnalysisContext<'a> {
     pub query: Box<novarocks_parser::ast::Query>,
     pub current_database: String,
     pub catalog: &'a dyn SqlCatalogSnapshot,
+    pub functions: &'a dyn SqlFunctionCatalog,
 }
 
 /// Analyze a prepared MV query without exposing analyzer nodes, CTE state, or
@@ -662,15 +701,20 @@ pub fn analyze_mv_refresh_input(
         query,
         current_database,
         catalog,
+        functions,
     } = context;
     // The public MV-refresh facade still returns String while its frontend
     // owner is outside SQLP-7. Keep the typed parser rejection intact until
     // that boundary; no category is inferred from this message.
     crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
         .map_err(|error| error.to_string())?;
-    let (resolved, _, _) =
-        crate::analyzer::analyze(&query, catalog.planner_table_provider(), &current_database)
-            .map_err(|error| error.to_string())?;
+    let (resolved, _, _) = crate::analyzer::analyze_with_function_catalog(
+        &query,
+        catalog.planner_table_provider(),
+        &current_database,
+        functions,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
 }
 
@@ -1108,7 +1152,7 @@ impl SqlCompiler {
                         )
                     })?
                     .planner_table_provider();
-                let functions = request.functions.ok_or_else(|| {
+                let functions = request.function_catalog().ok_or_else(|| {
                     SqlCompileError::InvalidRequest(
                         "SQL analysis requires a function catalog".to_string(),
                     )
@@ -1184,6 +1228,15 @@ impl SqlCompiler {
                     disabled_rules: settings.disabled_rules.clone(),
                     deadline: request.deadline(),
                     column_ref_factory: std::rc::Rc::clone(&factory_cell),
+                    #[cfg(not(test))]
+                    function_catalog: request
+                        .function_catalog()
+                        .ok_or_else(|| {
+                            SqlCompileError::InvalidRequest(
+                                "IMV rewrite requires a function catalog".to_string(),
+                            )
+                        })?
+                        .snapshot(),
                 },
             )
             .map_err(|error| SqlCompileError::Compilation(format!("imv rewrite: {error}")))?;
@@ -1217,7 +1270,7 @@ impl SqlCompiler {
                     )
                 })?
                 .planner_table_provider();
-            let functions = request.functions.ok_or_else(|| {
+            let functions = request.function_catalog().ok_or_else(|| {
                 SqlCompileError::InvalidRequest(
                     "MV rewrite analysis requires a function catalog".to_string(),
                 )
@@ -1236,6 +1289,14 @@ impl SqlCompiler {
             mv_rewrite::SqlMvRewriteAnalysis::empty()
         };
         request.check_control()?;
+        let function_catalog = request
+            .function_catalog()
+            .ok_or_else(|| {
+                SqlCompileError::InvalidRequest(
+                    "SQL optimization requires an immutable function catalog".to_string(),
+                )
+            })?
+            .snapshot();
 
         Ok(SqlAnalyzeOutput::Pending(SqlAnalyzedQuery {
             logical_plan,
@@ -1244,6 +1305,7 @@ impl SqlCompiler {
             settings,
             change_stream,
             mv_rewrite,
+            function_catalog,
             constant_evaluator: request.constant_evaluator,
             control: request.control,
         }))
@@ -1257,6 +1319,7 @@ impl SqlCompiler {
             settings,
             change_stream,
             mv_rewrite,
+            function_catalog,
             constant_evaluator,
             control,
         } = request.analyzed;
@@ -1293,8 +1356,11 @@ impl SqlCompiler {
                 &statistics.snapshot,
                 factory,
                 root_distribution,
-                &settings,
-                constant_evaluator,
+                crate::optimizer::OptimizerEnvironment::new(
+                    &settings,
+                    constant_evaluator,
+                    Arc::clone(&function_catalog),
+                ),
             ),
             None => crate::optimizer::optimize(
                 optimizer_expr,
@@ -1302,8 +1368,11 @@ impl SqlCompiler {
                 &statistics.snapshot,
                 factory,
                 mv_candidates,
-                &settings,
-                constant_evaluator,
+                crate::optimizer::OptimizerEnvironment::new(
+                    &settings,
+                    constant_evaluator,
+                    Arc::clone(&function_catalog),
+                ),
             ),
         }
         .map_err(SqlCompileError::Compilation)?;
@@ -1336,6 +1405,7 @@ impl SqlCompiler {
         ) {
             return Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
                 optimized_tree,
+                function_catalog,
                 statistics,
                 change_stream,
                 mv_rewrite_diagnostics,
@@ -1538,13 +1608,40 @@ mod tests {
             panic!("control tests must not reach catalog resolution")
         }
     }
+    #[derive(Debug)]
     struct Functions;
     impl SqlFunctionCatalog for Functions {
+        fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog> {
+            Arc::new(Self)
+        }
+
         fn resolve_scalar_signature(
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
         ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError>
+        {
+            Err(crate::functions::ResolveError::UnknownFunction)
+        }
+
+        fn contains_aggregate(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn resolve_aggregate_signature(
+            &self,
+            _name: &str,
+            _arg_types: &[arrow::datatypes::DataType],
+        ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
+        {
+            Err(crate::functions::ResolveError::UnknownFunction)
+        }
+
+        fn resolve_aggregate_trusted(
+            &self,
+            _name: &str,
+            _arg_types: &[arrow::datatypes::DataType],
+        ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
         {
             Err(crate::functions::ResolveError::UnknownFunction)
         }
@@ -2000,10 +2097,13 @@ mod tests {
             )
             .expect("register catalog-visible MV table");
         let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let functions = crate::functions::build_builtin_engine_function_catalog()
+            .expect("builtin function catalog");
         let input = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
             query: mv_analysis_query("SELECT order_id FROM orders"),
             current_database: "db".to_string(),
             catalog: &catalog,
+            functions: &functions,
         })
         .expect("analyze MV query through opaque terminal");
 
@@ -2023,10 +2123,13 @@ mod tests {
             .create_database("db")
             .expect("create MV analysis database");
         let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let functions = crate::functions::build_builtin_engine_function_catalog()
+            .expect("builtin function catalog");
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
             query: mv_analysis_query("SELECT order_id FROM missing_orders"),
             current_database: "db".to_string(),
             catalog: &catalog,
+            functions: &functions,
         })
         .expect_err("unregistered MV table must not analyze");
         assert!(

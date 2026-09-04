@@ -89,7 +89,8 @@ impl RewriteRule for AggregatePushdownRule {
             push,
             &mut factory,
             &mut arena,
-        )))
+            ctx.function_catalog(),
+        )?))
     }
 }
 
@@ -240,6 +241,7 @@ mod tests {
             args: vec![sum_arg],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         };
         let output_layout = AggregateOutputLayout::new(
             vec![OutputColumn {

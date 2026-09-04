@@ -1524,6 +1524,7 @@ fn register_aggregate_in_expr_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "stddev",
         "stddev_pop",
         "stddev_samp",
+        "std",
     ] {
         add(
             m,

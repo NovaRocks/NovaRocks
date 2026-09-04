@@ -48,9 +48,12 @@
 
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::{CrossProcessChildEnvironment, ServerHandle};
+use novarocks_cluster_harness::{CrossProcessChildEnvironment, QueryLifecyclePhase, ServerHandle};
+use novarocks_connector_iceberg::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -95,6 +98,7 @@ const ABORT_DELAY_S: i64 = 5;
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedWriterDataflow),
+        Box::new(DistributedStatisticsDataflow),
         Box::new(DistributedWriterOverwrite),
         Box::new(DistributedWriterRowLevel),
         Box::new(DistributedWriterFaults),
@@ -658,6 +662,411 @@ impl Scenario for DistributedWriterDataflow {
         await_resource_convergence(context, &baseline, "distributed writer dataflow")?;
         Ok(())
     }
+}
+
+/// Native acceptance for the ordinary-aggregate statistics data plane.
+///
+/// This intentionally combines a full-table ANALYZE with a collect-on-write
+/// INSERT in one fresh cluster. ANALYZE proves that an ordinary scan/aggregate
+/// plan reaches every backend. The INSERT then proves that rows written by all
+/// three backend processes contribute to one current-snapshot Theta artifact,
+/// while exactly one root aggregates the prepared set and the frontend records
+/// exactly one provider publication.
+///
+/// The Hadoop catalog's version hint is part of the external catalog format.
+/// Requiring it to advance by one is the process-independent assertion that
+/// data and SetStatistics were committed by one catalog transaction rather
+/// than by a data commit followed by a statistics commit.
+struct DistributedStatisticsDataflow;
+
+impl Scenario for DistributedStatisticsDataflow {
+    fn name(&self) -> &'static str {
+        "statistics/native-aggregate-and-collect-on-write"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(connector_launch_config())
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect native statistics control session")?,
+        )?;
+
+        const CATALOG: &str = "native_statistics";
+        const DATABASE: &str = "native_statistics_db";
+        const SOURCE: &str = "native_statistics_source";
+        const TABLE: &str = "native_statistics_target";
+        let warehouse = create_warehouse(context, "native-statistics-dataflow")?;
+        let source = format!("{CATALOG}.{DATABASE}.{SOURCE}");
+        let target = format!("{CATALOG}.{DATABASE}.{TABLE}");
+
+        context.action("seed six source files for a three-backend statistics scan");
+        create_catalog(&mut control, CATALOG, &warehouse)?;
+        control
+            .query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+            .context("create native statistics database")?;
+        control
+            .query_drop(format!(
+                "CREATE TABLE {source} (v BIGINT) TBLPROPERTIES \
+                 ('novarocks.statistics.collect-on-write' = 'false')"
+            ))
+            .context("create native statistics source")?;
+        for file in 0..SEED_FILES {
+            let low = file * SEED_ROWS_PER_FILE + 1;
+            let high = (file + 1) * SEED_ROWS_PER_FILE;
+            control
+                .query_drop(format!(
+                    "INSERT INTO {source} SELECT generate_series FROM \
+                     TABLE(generate_series({low}, {high}))"
+                ))
+                .with_context(|| format!("seed native statistics rows {low}..{high}"))?;
+        }
+
+        let source_root = hadoop_table_root(&warehouse, DATABASE, SOURCE);
+        let source_metadata_before = hadoop_metadata_version(&source_root)?;
+        let source_snapshots_before = snapshot_count(&mut control, &source)?;
+        let analyze_fragments_before = fragment_acceptance_counts(context)?;
+
+        context.action("run ordinary ANALYZE across all three backend processes");
+        control
+            .query_drop(format!("ANALYZE TABLE {source}"))
+            .context("run native distributed ANALYZE")?;
+
+        let analyze_fragments_after = fragment_acceptance_counts(context)?;
+        let analyze_fragment_delta = assert_every_backend_accepted_fragment(
+            &analyze_fragments_before,
+            &analyze_fragments_after,
+            "native distributed ANALYZE",
+        )?;
+        let source_metadata_after = hadoop_metadata_version(&source_root)?;
+        if source_metadata_after != source_metadata_before + 1 {
+            bail!(
+                "ANALYZE advanced Hadoop metadata from v{source_metadata_before} to \
+                 v{source_metadata_after}; one statistics publication must create exactly one \
+                 metadata version"
+            );
+        }
+        let source_snapshots_after = snapshot_count(&mut control, &source)?;
+        if source_snapshots_after != source_snapshots_before {
+            bail!(
+                "ANALYZE changed {source} snapshot count from {source_snapshots_before} to \
+                 {source_snapshots_after}; statistics publication must attach to the existing \
+                 snapshot"
+            );
+        }
+        let analyze_ndv = assert_current_theta_metadata(
+            &source_root,
+            SEED_ROWS as f64,
+            "native distributed ANALYZE",
+        )?;
+        assert_show_theta_statistics(
+            &mut control,
+            &source,
+            "v",
+            SEED_ROWS as f64,
+            "native distributed ANALYZE",
+        )?;
+
+        control
+            .query_drop(format!(
+                "CREATE TABLE {target} (v BIGINT) TBLPROPERTIES \
+                 ('novarocks.statistics.collect-on-write' = 'true')"
+            ))
+            .context("create collect-on-write target")?;
+        let target_root = hadoop_table_root(&warehouse, DATABASE, TABLE);
+        let metadata_before = hadoop_metadata_version(&target_root)?;
+        let snapshots_before = snapshot_count(&mut control, &target)?;
+        let before = all_write_counters(context)?;
+        let ceiling = peak_ceiling(&before);
+        let terminals_before = publication_terminals(context, WRITE_FAMILY)?;
+        let fragments_before = fragment_acceptance_counts(context)?;
+
+        context.action("collect statistics from the same pages written on all three backends");
+        control
+            .query_drop(format!("INSERT INTO {target} SELECT v FROM {source}"))
+            .context("run native collect-on-write INSERT")?;
+
+        let after = all_write_counters(context)?;
+        let delta = write_delta(&before, &after);
+        if delta.writing_backends.len() != 3 {
+            bail!(
+                "collect-on-write opened writers on {:?}; native 1FE+3BE acceptance requires \
+                 all three backends",
+                delta.writing_backends
+            );
+        }
+        if (delta.rows - SEED_ROWS as f64).abs() > f64::EPSILON {
+            bail!(
+                "collect-on-write writers accepted {} rows; expected {SEED_ROWS}",
+                delta.rows
+            );
+        }
+        if delta.commit_fragments < 3.0 {
+            bail!(
+                "collect-on-write produced {} commit fragments across three writing backends",
+                delta.commit_fragments
+            );
+        }
+        let root = identify_root(
+            &after,
+            ceiling,
+            delta.commit_fragments,
+            "native collect-on-write",
+        )?;
+        if !delta.writing_backends.iter().any(|&index| index != root) {
+            bail!(
+                "collect-on-write root BE[{root}] was also the only writer; no writer result \
+                 crossed a process boundary"
+            );
+        }
+        let fragments_after = fragment_acceptance_counts(context)?;
+        let write_fragment_delta = assert_every_backend_accepted_fragment(
+            &fragments_before,
+            &fragments_after,
+            "native collect-on-write INSERT",
+        )?;
+
+        let terminals_after = publication_terminals(context, WRITE_FAMILY)?;
+        assert_committed_once(terminals_before, terminals_after, "native collect-on-write")?;
+        let snapshots_after = snapshot_count(&mut control, &target)?;
+        if snapshots_after != snapshots_before + 1 {
+            bail!(
+                "collect-on-write moved {target} from {snapshots_before} to {snapshots_after} \
+                 snapshots; data and statistics must publish as one snapshot"
+            );
+        }
+        let metadata_after = hadoop_metadata_version(&target_root)?;
+        if metadata_after != metadata_before + 1 {
+            bail!(
+                "collect-on-write advanced Hadoop metadata from v{metadata_before} to \
+                 v{metadata_after}; data and SetStatistics must share one catalog commit"
+            );
+        }
+        let write_ndv = assert_current_theta_metadata(
+            &target_root,
+            SEED_ROWS as f64,
+            "native collect-on-write",
+        )?;
+        assert_show_theta_statistics(
+            &mut control,
+            &target,
+            "v",
+            SEED_ROWS as f64,
+            "native collect-on-write",
+        )?;
+        let rows = row_count(&mut control, &target)?;
+        if rows != SEED_ROWS {
+            bail!("collect-on-write target contains {rows} rows; expected {SEED_ROWS}");
+        }
+
+        println!(
+            "native-statistics-dataflow topology=1FE+3BE \
+             analyze_fragment_delta={analyze_fragment_delta:?} analyze_ndv={analyze_ndv} \
+             write_fragment_delta={write_fragment_delta:?} writing_backends={:?} root_be={} \
+             commit_fragments={} write_ndv={} metadata_versions={}=>{}",
+            delta.writing_backends,
+            root,
+            delta.commit_fragments,
+            write_ndv,
+            metadata_before,
+            metadata_after,
+        );
+
+        await_frontend_attempts_drained(context, "the native statistics dataflow")?;
+        await_resource_convergence(context, &baseline, "native statistics dataflow")?;
+        Ok(())
+    }
+}
+
+type TableStatisticsRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+fn assert_show_theta_statistics(
+    control: &mut mysql::Conn,
+    table: &str,
+    column: &str,
+    expected_ndv: f64,
+    label: &str,
+) -> Result<()> {
+    let rows: Vec<TableStatisticsRow> = control
+        .query(format!("SHOW TABLE STATS {table}"))
+        .with_context(|| format!("read {label} statistics through the provider"))?;
+    let metric = format!("theta_ndv:{column}");
+    let Some((_, value, status, basis_version, source, numeric_nature, basis_relation)) =
+        rows.into_iter().find(|row| row.0 == metric)
+    else {
+        bail!("{label} did not expose {metric} through SHOW TABLE STATS");
+    };
+    let value = value
+        .with_context(|| format!("{label} {metric} is AVAILABLE but has no scalar value"))?
+        .parse::<f64>()
+        .with_context(|| format!("parse {label} {metric} value"))?;
+    assert_theta_estimate(value, expected_ndv, label)?;
+    if status != "AVAILABLE"
+        || basis_version != "SAME"
+        || source != "PROVIDER_ARTIFACT"
+        || numeric_nature != "APPROXIMATE"
+        || basis_relation != "IDENTICAL"
+    {
+        bail!(
+            "{label} {metric} has unexpected provider evidence: status={status:?} \
+             basis_version={basis_version:?} source={source:?} \
+             numeric_nature={numeric_nature:?} basis_relation={basis_relation:?}"
+        );
+    }
+    Ok(())
+}
+
+fn hadoop_table_root(warehouse: &Path, database: &str, table: &str) -> std::path::PathBuf {
+    warehouse.join(database).join(table)
+}
+
+fn hadoop_metadata_version(table_root: &Path) -> Result<u32> {
+    let hint = table_root.join("metadata/version-hint.text");
+    std::fs::read_to_string(&hint)
+        .with_context(|| format!("read Hadoop version hint {}", hint.display()))?
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("parse Hadoop version hint {}", hint.display()))
+}
+
+fn assert_current_theta_metadata(table_root: &Path, expected_ndv: f64, label: &str) -> Result<f64> {
+    let version = hadoop_metadata_version(table_root)?;
+    let path = table_root
+        .join("metadata")
+        .join(format!("v{version}.metadata.json"));
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read {label} metadata {}", path.display()))?;
+    let metadata: TableMetadata = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode {label} Iceberg metadata {}", path.display()))?;
+    let current = metadata
+        .current_snapshot()
+        .with_context(|| format!("{label} table has no current snapshot"))?;
+    let statistics = metadata
+        .statistics_iter()
+        .filter(|statistics| statistics.snapshot_id == current.snapshot_id())
+        .collect::<Vec<_>>();
+    let [statistics] = statistics.as_slice() else {
+        bail!(
+            "{label} has {} StatisticsFiles for current snapshot {}; expected exactly one",
+            statistics.len(),
+            current.snapshot_id()
+        );
+    };
+    let theta = statistics
+        .blob_metadata
+        .iter()
+        .filter(|blob| blob.r#type == APACHE_DATASKETCHES_THETA_V1)
+        .collect::<Vec<_>>();
+    let [theta] = theta.as_slice() else {
+        bail!(
+            "{label} current StatisticsFile has {} Theta blobs; a one-column table requires one",
+            theta.len()
+        );
+    };
+    if theta.snapshot_id != current.snapshot_id()
+        || theta.sequence_number != current.sequence_number()
+        || theta.fields.len() != 1
+    {
+        bail!(
+            "{label} Theta provenance does not match the current snapshot: \
+             snapshot={} sequence={} fields={:?}, expected snapshot={} sequence={}",
+            theta.snapshot_id,
+            theta.sequence_number,
+            theta.fields,
+            current.snapshot_id(),
+            current.sequence_number()
+        );
+    }
+    let ndv = theta
+        .properties
+        .get("ndv")
+        .with_context(|| format!("{label} Theta blob has no ndv property"))?
+        .parse::<f64>()
+        .with_context(|| format!("parse {label} Theta ndv property"))?;
+    assert_theta_estimate(ndv, expected_ndv, label)?;
+    let puffin_location = statistics
+        .statistics_path
+        .strip_prefix("file://")
+        .ok_or_else(|| {
+            anyhow!(
+                "{label} expected a local file URI for Puffin verification, got {}",
+                statistics.statistics_path
+            )
+        })?;
+    let puffin_path = Path::new(puffin_location);
+    if !puffin_path.is_file() || statistics.file_size_in_bytes <= 0 {
+        bail!(
+            "{label} published missing or empty Puffin file {} (metadata size={})",
+            puffin_path.display(),
+            statistics.file_size_in_bytes
+        );
+    }
+    Ok(ndv)
+}
+
+fn assert_theta_estimate(actual: f64, expected: f64, label: &str) -> Result<()> {
+    // The default nominal entries give a much tighter interval at this scale;
+    // 15% deliberately avoids freezing one DataSketches sampling realization
+    // while still rejecting the loss of any one of three balanced BE inputs.
+    let tolerance = expected * 0.15;
+    if (actual - expected).abs() > tolerance {
+        bail!(
+            "{label} Theta NDV {actual} is outside {expected} +/- {tolerance}; a current-snapshot \
+             artifact must include the disjoint values written or scanned by every backend"
+        );
+    }
+    Ok(())
+}
+
+fn fragment_acceptance_counts(context: &mut ScenarioContext) -> Result<Vec<usize>> {
+    (0..context.handle().be_count())
+        .map(|index| {
+            context
+                .handle()
+                .be_log_count(index, "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED")
+                .with_context(|| format!("count accepted fragments on BE[{index}]"))
+        })
+        .collect()
+}
+
+fn assert_every_backend_accepted_fragment(
+    before: &[usize],
+    after: &[usize],
+    label: &str,
+) -> Result<Vec<usize>> {
+    if before.len() != 3 || after.len() != 3 {
+        bail!("{label} fragment evidence is not from exactly three backends");
+    }
+    let delta = before
+        .iter()
+        .zip(after)
+        .map(|(before, after)| after.saturating_sub(*before))
+        .collect::<Vec<_>>();
+    if delta.iter().any(|count| *count == 0) {
+        bail!(
+            "{label} accepted-fragment deltas are {delta:?}; every backend in native 1FE+3BE \
+             must accept at least one fragment from this statement"
+        );
+    }
+    Ok(delta)
 }
 
 /// The same dataflow claims for a full-table overwrite.

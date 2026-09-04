@@ -153,7 +153,6 @@ impl RuntimeFilterContract {
 pub enum FragmentSinkKind {
     Result,
     Noop,
-    Statistics,
     DataStream,
     MultiCastDataStream,
     SplitDataStream,
@@ -187,7 +186,6 @@ impl FragmentSinkSpec {
         let (kind, assignment_requirement) = match &program {
             FragmentSinkProgram::Result => (FragmentSinkKind::Result, None),
             FragmentSinkProgram::Noop => (FragmentSinkKind::Noop, None),
-            FragmentSinkProgram::Statistics(_) => (FragmentSinkKind::Statistics, None),
             FragmentSinkProgram::DataStream(_) => {
                 (FragmentSinkKind::DataStream, Required(StreamDestinations))
             }

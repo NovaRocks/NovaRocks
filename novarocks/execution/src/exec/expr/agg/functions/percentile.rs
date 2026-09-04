@@ -19,100 +19,27 @@ use arrow::array::{Array, ArrayRef, BinaryBuilder, ListArray, StructArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
-use crate::exec::expr::agg::functions::common::{
-    AggScalarValue, build_scalar_array, scalar_from_array,
-};
+use crate::exec::expr::agg::functions::common::{AggScalarValue, build_scalar_array};
 use crate::exec::expr::function::object::percentile_functions::{
     numeric_value_at, payload_bytes_at,
 };
 use crate::exec::node::aggregate::AggFunction;
 use crate::exec::percentile;
+use crate::runtime::mem_tracker::MemTracker;
 
 use super::super::*;
 use super::AggregateFunction;
 
 pub(super) struct PercentileAgg;
 
-fn unweighted_state_slot(ptr: *mut u8) -> *mut *mut percentile::PercentileState {
-    ptr as *mut *mut percentile::PercentileState
+type TrackedPercentileState = percentile::PercentileState<AggregateAllocator>;
+
+unsafe fn state_mut<'a>(ptr: *mut u8) -> &'a mut TrackedPercentileState {
+    unsafe { &mut *(ptr as *mut TrackedPercentileState) }
 }
 
-fn weighted_state_slot(ptr: *mut u8) -> *mut *mut percentile::PercentileState {
-    ptr as *mut *mut percentile::PercentileState
-}
-
-unsafe fn get_or_init_unweighted<'a>(ptr: *mut u8) -> &'a mut percentile::PercentileState {
-    let slot = unweighted_state_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        let boxed: Box<percentile::PercentileState> = Box::default();
-        let raw = Box::into_raw(boxed);
-        unsafe {
-            *slot = raw;
-            &mut *raw
-        }
-    } else {
-        unsafe { &mut *raw }
-    }
-}
-
-unsafe fn get_unweighted<'a>(ptr: *mut u8) -> Option<&'a percentile::PercentileState> {
-    let raw = unsafe { *unweighted_state_slot(ptr) };
-    if raw.is_null() {
-        None
-    } else {
-        Some(unsafe { &*raw })
-    }
-}
-
-unsafe fn take_unweighted(ptr: *mut u8) -> Option<Box<percentile::PercentileState>> {
-    let slot = unweighted_state_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        None
-    } else {
-        unsafe {
-            *slot = std::ptr::null_mut();
-            Some(Box::from_raw(raw))
-        }
-    }
-}
-
-unsafe fn get_or_init_weighted<'a>(ptr: *mut u8) -> &'a mut percentile::PercentileState {
-    let slot = weighted_state_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        let boxed: Box<percentile::PercentileState> = Box::default();
-        let raw = Box::into_raw(boxed);
-        unsafe {
-            *slot = raw;
-            &mut *raw
-        }
-    } else {
-        unsafe { &mut *raw }
-    }
-}
-
-unsafe fn get_weighted<'a>(ptr: *mut u8) -> Option<&'a percentile::PercentileState> {
-    let raw = unsafe { *weighted_state_slot(ptr) };
-    if raw.is_null() {
-        None
-    } else {
-        Some(unsafe { &*raw })
-    }
-}
-
-unsafe fn take_weighted(ptr: *mut u8) -> Option<Box<percentile::PercentileState>> {
-    let slot = weighted_state_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        None
-    } else {
-        unsafe {
-            *slot = std::ptr::null_mut();
-            Some(Box::from_raw(raw))
-        }
-    }
+unsafe fn state_ref<'a>(ptr: *const u8) -> &'a TrackedPercentileState {
+    unsafe { &*(ptr as *const TrackedPercentileState) }
 }
 
 fn canonical_agg_name(name: &str) -> &str {
@@ -134,7 +61,7 @@ fn validate_quantile(context: &str, quantile: f64) -> Result<(), String> {
 }
 
 fn apply_unweighted_quantiles(
-    state: &mut percentile::PercentileState,
+    state: &mut TrackedPercentileState,
     array: &ArrayRef,
     row: usize,
     context: &str,
@@ -151,7 +78,17 @@ fn apply_unweighted_quantiles(
         let start = offsets[row] as usize;
         let end = offsets[row + 1] as usize;
         let values = list.values();
-        let mut quantiles = Vec::with_capacity(end.saturating_sub(start));
+        let count = end.saturating_sub(start);
+        if count > percentile::MAX_QUANTILE_COUNT {
+            return Err(format!(
+                "{context}: percentile quantile count {count} exceeds {}",
+                percentile::MAX_QUANTILE_COUNT
+            ));
+        }
+        let mut quantiles = Vec::new();
+        quantiles
+            .try_reserve_exact(count)
+            .map_err(|_| format!("ResourceExhausted: {context} quantile array"))?;
         for (idx, value_row) in (start..end).enumerate() {
             let Some(quantile) = numeric_value_at(values, value_row, context)? else {
                 return Err(format!(
@@ -161,7 +98,7 @@ fn apply_unweighted_quantiles(
             validate_quantile(context, quantile)?;
             quantiles.push(quantile);
         }
-        return percentile::set_quantiles(state, quantiles);
+        return percentile::set_quantiles(state, &quantiles);
     }
 
     match numeric_value_at(array, row, context)? {
@@ -174,7 +111,7 @@ fn apply_unweighted_quantiles(
 }
 
 fn apply_weighted_quantiles(
-    state: &mut percentile::PercentileState,
+    state: &mut TrackedPercentileState,
     array: &ArrayRef,
     row: usize,
     context: &str,
@@ -191,7 +128,17 @@ fn apply_weighted_quantiles(
         let start = offsets[row] as usize;
         let end = offsets[row + 1] as usize;
         let values = list.values();
-        let mut quantiles = Vec::with_capacity(end.saturating_sub(start));
+        let count = end.saturating_sub(start);
+        if count > percentile::MAX_QUANTILE_COUNT {
+            return Err(format!(
+                "{context}: percentile quantile count {count} exceeds {}",
+                percentile::MAX_QUANTILE_COUNT
+            ));
+        }
+        let mut quantiles = Vec::new();
+        quantiles
+            .try_reserve_exact(count)
+            .map_err(|_| format!("ResourceExhausted: {context} quantile array"))?;
         for (idx, value_row) in (start..end).enumerate() {
             let Some(quantile) = numeric_value_at(values, value_row, context)? else {
                 return Err(format!(
@@ -201,7 +148,7 @@ fn apply_weighted_quantiles(
             validate_quantile(context, quantile)?;
             quantiles.push(quantile);
         }
-        return percentile::set_quantiles(state, quantiles);
+        return percentile::set_quantiles(state, &quantiles);
     }
 
     match numeric_value_at(array, row, context)? {
@@ -214,7 +161,7 @@ fn apply_weighted_quantiles(
 }
 
 fn apply_compression_to_unweighted(
-    state: &mut percentile::PercentileState,
+    state: &mut TrackedPercentileState,
     array: &ArrayRef,
     row: usize,
     context: &str,
@@ -226,7 +173,7 @@ fn apply_compression_to_unweighted(
 }
 
 fn apply_compression_to_weighted(
-    state: &mut percentile::PercentileState,
+    state: &mut TrackedPercentileState,
     array: &ArrayRef,
     row: usize,
     context: &str,
@@ -248,8 +195,8 @@ fn merge_unweighted_payload_array(
             continue;
         };
         let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { get_or_init_unweighted(ptr) };
-        percentile::merge_serialized_state_into(state, payload)?;
+        let state = unsafe { state_mut(ptr) };
+        percentile::merge_bounded_serialized_state_into(state, payload)?;
     }
     Ok(())
 }
@@ -265,8 +212,8 @@ fn merge_weighted_payload_array(
             continue;
         };
         let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { get_or_init_weighted(ptr) };
-        percentile::merge_serialized_state_into(state, payload)?;
+        let state = unsafe { state_mut(ptr) };
+        percentile::merge_bounded_serialized_state_into(state, payload)?;
     }
     Ok(())
 }
@@ -293,7 +240,7 @@ fn update_unweighted_struct(
 
     for (row, &base) in state_ptrs.iter().enumerate() {
         let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { get_or_init_unweighted(ptr) };
+        let state = unsafe { state_mut(ptr) };
         apply_unweighted_quantiles(state, &quantiles, row, context)?;
         if let Some(compression) = &compression {
             apply_compression_to_unweighted(state, compression, row, context)?;
@@ -301,12 +248,13 @@ fn update_unweighted_struct(
         match values.data_type() {
             DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
                 if let Some(payload) = payload_bytes_at(&values, row, context)? {
-                    percentile::merge_serialized_state_into(state, payload)?;
+                    percentile::merge_bounded_serialized_state_into(state, payload)?;
                 }
             }
             _ => {
                 if let Some(value) = numeric_value_at(&values, row, context)? {
-                    percentile::add_value(state, value);
+                    percentile::add_value(state, value)?;
+                    percentile::validate_state(state)?;
                 }
             }
         }
@@ -338,7 +286,7 @@ fn update_weighted_struct(
 
     for (row, &base) in state_ptrs.iter().enumerate() {
         let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { get_or_init_weighted(ptr) };
+        let state = unsafe { state_mut(ptr) };
         apply_weighted_quantiles(state, &quantiles, row, context)?;
         if let Some(compression) = &compression {
             apply_compression_to_weighted(state, compression, row, context)?;
@@ -354,6 +302,7 @@ fn update_weighted_struct(
             ));
         }
         percentile::add_weighted_value(state, value, weight)?;
+        percentile::validate_state(state)?;
     }
 
     Ok(())
@@ -397,8 +346,8 @@ impl AggregateFunction for PercentileAgg {
             AggKind::PercentileUnion
             | AggKind::PercentileApprox
             | AggKind::PercentileApproxWeighted => (
-                std::mem::size_of::<*mut u8>(),
-                std::mem::align_of::<*mut u8>(),
+                std::mem::size_of::<TrackedPercentileState>(),
+                std::mem::align_of::<TrackedPercentileState>(),
             ),
             other => unreachable!("unexpected percentile agg kind: {:?}", other),
         }
@@ -426,32 +375,43 @@ impl AggregateFunction for PercentileAgg {
         Ok(AggInputView::Any(arr))
     }
 
-    fn init_state(&self, spec: &AggSpec, ptr: *mut u8) {
+    fn init_state(&self, _spec: &AggSpec, _ptr: *mut u8) {
+        panic!("allocation-tracked percentile requires tracker-aware initialization");
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker.ok_or_else(|| {
+            "allocation-tracked percentile requires an aggregate memory tracker".to_string()
+        })?;
         unsafe {
-            match &spec.kind {
-                AggKind::PercentileApproxWeighted => std::ptr::write(
-                    ptr as *mut *mut percentile::PercentileState,
-                    std::ptr::null_mut(),
+            std::ptr::write(
+                ptr as *mut TrackedPercentileState,
+                percentile::PercentileState::new_in(
+                    percentile::DEFAULT_COMPRESSION_FACTOR,
+                    AggregateAllocator::new(tracker),
                 ),
-                _ => std::ptr::write(
-                    ptr as *mut *mut percentile::PercentileState,
-                    std::ptr::null_mut(),
-                ),
-            }
+            );
+        }
+        Ok(())
+    }
+
+    fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
+        unsafe {
+            std::ptr::drop_in_place(ptr as *mut TrackedPercentileState);
         }
     }
 
-    fn drop_state(&self, spec: &AggSpec, ptr: *mut u8) {
-        unsafe {
-            match &spec.kind {
-                AggKind::PercentileApproxWeighted => {
-                    let _ = take_weighted(ptr);
-                }
-                _ => {
-                    let _ = take_unweighted(ptr);
-                }
-            }
-        }
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -535,8 +495,7 @@ impl AggregateFunction for PercentileAgg {
                     let mut builder = BinaryBuilder::new();
                     for &base in group_states {
                         let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let state = unsafe { get_weighted(ptr) }.cloned().unwrap_or_default();
-                        builder.append_value(percentile::encode_state(&state));
+                        builder.append_value(percentile::encode_state(unsafe { state_ref(ptr) }));
                     }
                     Ok(Arc::new(builder.finish()))
                 }
@@ -544,9 +503,9 @@ impl AggregateFunction for PercentileAgg {
                     let mut values = Vec::with_capacity(group_states.len());
                     for &base in group_states {
                         let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let value = unsafe { get_weighted(ptr) }
-                            .and_then(|state| percentile::quantile_from_state(state, None))
-                            .map(AggScalarValue::Float64);
+                        let value =
+                            percentile::quantile_from_state(unsafe { state_ref(ptr) }, None)?
+                                .map(AggScalarValue::Float64);
                         values.push(value);
                     }
                     build_scalar_array(output_type, values)
@@ -555,16 +514,15 @@ impl AggregateFunction for PercentileAgg {
                     let mut values = Vec::with_capacity(group_states.len());
                     for &base in group_states {
                         let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let value = unsafe { get_weighted(ptr) }.and_then(|state| {
-                            percentile::quantiles_from_state(state).map(|items| {
+                        let value = percentile::quantiles_from_state(unsafe { state_ref(ptr) })?
+                            .map(|items| {
                                 AggScalarValue::List(
                                     items
                                         .into_iter()
                                         .map(|item| Some(AggScalarValue::Float64(item)))
                                         .collect(),
                                 )
-                            })
-                        });
+                            });
                         values.push(value);
                     }
                     build_scalar_array(output_type, values)
@@ -579,8 +537,7 @@ impl AggregateFunction for PercentileAgg {
                     let mut builder = BinaryBuilder::new();
                     for &base in group_states {
                         let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let state = unsafe { get_unweighted(ptr) }.cloned().unwrap_or_default();
-                        builder.append_value(percentile::encode_state(&state));
+                        builder.append_value(percentile::encode_state(unsafe { state_ref(ptr) }));
                     }
                     Ok(Arc::new(builder.finish()))
                 }
@@ -588,9 +545,9 @@ impl AggregateFunction for PercentileAgg {
                     let mut values = Vec::with_capacity(group_states.len());
                     for &base in group_states {
                         let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let value = unsafe { get_unweighted(ptr) }
-                            .and_then(|state| percentile::quantile_from_state(state, None))
-                            .map(AggScalarValue::Float64);
+                        let value =
+                            percentile::quantile_from_state(unsafe { state_ref(ptr) }, None)?
+                                .map(AggScalarValue::Float64);
                         values.push(value);
                     }
                     build_scalar_array(output_type, values)
@@ -599,16 +556,15 @@ impl AggregateFunction for PercentileAgg {
                     let mut values = Vec::with_capacity(group_states.len());
                     for &base in group_states {
                         let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let value = unsafe { get_unweighted(ptr) }.and_then(|state| {
-                            percentile::quantiles_from_state(state).map(|items| {
+                        let value = percentile::quantiles_from_state(unsafe { state_ref(ptr) })?
+                            .map(|items| {
                                 AggScalarValue::List(
                                     items
                                         .into_iter()
                                         .map(|item| Some(AggScalarValue::Float64(item)))
                                         .collect(),
                                 )
-                            })
-                        });
+                            });
                         values.push(value);
                     }
                     build_scalar_array(output_type, values)

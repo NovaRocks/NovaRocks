@@ -55,8 +55,8 @@ use parquet::arrow::ArrowWriter;
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::CommitOpKind;
 use crate::commit::write_stack::control::{
-    release_session_state, session_freezes_old_deletes, session_plan_from_targets,
-    settle_empty_write_without_commit, validate_prepared_set,
+    eager_conflict_backoff, release_session_state, session_freezes_old_deletes,
+    session_plan_from_targets, settle_empty_write_without_commit, validate_prepared_set,
 };
 use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
@@ -104,6 +104,40 @@ fn request_context() -> ConnectorRequestContext {
         1024 * 1024,
     )
     .expect("request context")
+}
+
+struct SwitchCancellation(std::sync::atomic::AtomicBool);
+
+impl ConnectorCancellation for SwitchCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[test]
+fn conflict_backoff_observes_cancellation_before_another_attempt() {
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let cancellation = Arc::new(SwitchCancellation(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let context = ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(1),
+        cancellation.clone(),
+        64 * 1024,
+        1024 * 1024,
+    )
+    .expect("context");
+    let cancel = Arc::clone(&cancellation);
+    let worker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(12));
+        cancel.0.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let started = Instant::now();
+    let error =
+        eager_conflict_backoff(runtime.as_ref(), &context, 2).expect_err("cancelled backoff");
+    worker.join().expect("cancel thread");
+    assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+    assert!(started.elapsed() < Duration::from_millis(80));
 }
 
 fn descriptor(catalog: &str) -> ConnectorInstanceDescriptor {
@@ -1046,7 +1080,7 @@ fn neutral_plan(
     sealed: (IcebergCommitHandle, Vec<IcebergWriteTargetPlan>),
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let (handle, targets) = sealed;
-    session_plan_from_targets(adapter, handle, targets)
+    session_plan_from_targets(adapter, handle, targets, None)
 }
 
 fn effects(target: &ConnectorWriteTargetPlan) -> Vec<ConnectorRowMutationEffect> {
@@ -2673,6 +2707,7 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
         .finish_write(ConnectorWriteFinishRequest {
             commit: plan.commit_handle(),
             prepared: set,
+            statistics: Vec::new(),
             context: request_context(),
         })
         .expect("a staged finish needs no catalog");
@@ -2695,6 +2730,7 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
         .finish_write(ConnectorWriteFinishRequest {
             commit: plan.commit_handle(),
             prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
+            statistics: Vec::new(),
             context: request_context(),
         })
         .expect_err("a sealed session is finished");
@@ -2741,6 +2777,7 @@ fn an_empty_staged_write_seals_rather_than_settling_as_unchanged() {
         .finish_write(ConnectorWriteFinishRequest {
             commit: plan.commit_handle(),
             prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
+            statistics: Vec::new(),
             context: request_context(),
         })
         .expect("an empty staged write still seals");

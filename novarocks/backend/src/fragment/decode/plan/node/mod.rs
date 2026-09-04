@@ -267,6 +267,7 @@ fn decode_node_inner(
                 finish,
                 path.clone().field("payload").field("table_finish"),
                 children,
+                arena,
                 ctx,
             )
         }
@@ -1743,6 +1744,35 @@ mod tests {
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
+    fn test_function_catalog() -> Arc<novarocks_functions::EngineFunctionCatalog> {
+        Arc::new(
+            novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin function catalog"),
+        )
+    }
+
+    pub(super) fn resolved_aggregate_signature(
+        name: &str,
+        argument_types: &[DataType],
+    ) -> Option<plan::ResolvedAggregateSignature> {
+        let selected = test_function_catalog()
+            .resolve_aggregate_trusted(name, argument_types)
+            .expect("resolved builtin aggregate");
+        Some(plan::ResolvedAggregateSignature {
+            overload_identity: selected.overload.as_str().to_string(),
+            argument_types: selected
+                .argument_types
+                .iter()
+                .map(|data_type| encode_type(data_type).expect("encoded argument type"))
+                .collect(),
+            intermediate_type: Some(
+                encode_type(&selected.intermediate_type).expect("encoded intermediate type"),
+            ),
+            output_type: Some(encode_type(&selected.output_type).expect("encoded output type")),
+            state_format_identity: selected.state_format.as_str().to_string(),
+        })
+    }
+
     #[allow(
         dead_code,
         reason = "Retained for target-specific native integration and regression coverage."
@@ -2012,7 +2042,12 @@ mod tests {
 
     pub(super) fn lower(node: &plan::DistributedNode) -> super::DecodedNode {
         let mut arena = ExprArena::default();
-        decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
+        decode_node(
+            node,
+            &mut arena,
+            &NativePlanDecodeContext::default().with_function_catalog(test_function_catalog()),
+        )
+        .expect("lower node")
     }
 
     #[allow(
@@ -2025,7 +2060,7 @@ mod tests {
         decode_node(
             node,
             &mut ExprArena::default(),
-            &NativePlanDecodeContext::default(),
+            &NativePlanDecodeContext::default().with_function_catalog(test_function_catalog()),
         )
         .expect_err("invalid node must fail")
     }
@@ -2257,6 +2292,7 @@ mod tests {
                     result_type: Some(type_desc(&DataType::Int64)),
                     order_by: Vec::new(),
                     output_column_id: 2,
+                    resolved_signature: resolved_aggregate_signature("count", &[]),
                 }],
                 is_merge: vec![false],
                 output_layout: Some(plan::AggregateOutputLayout {

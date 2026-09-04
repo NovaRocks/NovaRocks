@@ -94,9 +94,18 @@ mod tests {
     }
 
     fn call(name: &str, distinct: bool, ordered: bool) -> AggregateCall {
+        let args = if matches!(name, "group_concat" | "string_agg") {
+            vec![arg(DataType::Int64), arg(DataType::Utf8)]
+        } else {
+            vec![arg(DataType::Int64)]
+        };
+        let argument_types = args
+            .iter()
+            .map(|arg| arg.data_type.clone())
+            .collect::<Vec<_>>();
         AggregateCall {
             name: name.into(),
-            args: vec![arg(DataType::Int64)],
+            args,
             distinct,
             result_type: DataType::Float64,
             order_by: if ordered {
@@ -109,6 +118,7 @@ mod tests {
                 vec![]
             },
             output_column_id: ColumnId::UNSET,
+            resolved: crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
         }
     }
 
@@ -140,38 +150,37 @@ mod tests {
     }
 
     #[test]
-    fn unknown_function_is_single_phase() {
-        assert_eq!(
-            aggregate_mergeability(&call("my_udaf", false, false)),
-            AggMergeability::SinglePhaseOnly
-        );
+    fn unknown_function_cannot_enter_the_aggregate_plan() {
+        let error = crate::functions::builtin_sql_function_catalog()
+            .resolve_aggregate_trusted("my_udaf", &[DataType::Int64])
+            .expect_err("unregistered aggregate must fail exact resolution");
+        assert!(matches!(
+            error,
+            novarocks_functions::FunctionResolutionError::UnknownFunction
+        ));
     }
 
     #[test]
     fn two_phase_functions_have_planning_layer_intermediate_type() {
         use arrow::datatypes::DataType;
-        use novarocks_types::aggregate::infer_agg_function_types;
+        use novarocks_functions::EngineFunctionCatalog;
 
-        // Every name the oracle calls TwoPhase must be inferrable with a defined
-        // intermediate type by the planning layer. `count` takes no args; the rest
-        // are exercised with a single Int64 arg.
-        //
-        // NOTE: this is a NECESSARY-not-sufficient guard. `infer_agg_function_types`
-        // returns `Some(intermediate)` for almost every name (including its catch-all
-        // arm), so a green result does NOT prove the execution layer can correctly
-        // merge a newly-added function. Before adding stddev/variance/percentile/
-        // sketch families to `has_two_phase_merge`, verify merge correctness with
-        // result-equality (tolerance/sketch) tests, not just this guard.
+        // Every name the oracle calls TwoPhase must resolve to an exact catalog
+        // overload with a concrete intermediate carrier. This remains a
+        // necessary-not-sufficient guard: adding another family still requires
+        // result-equality tests for its merge semantics.
+        let catalog: EngineFunctionCatalog =
+            crate::functions::build_builtin_engine_function_catalog().expect("builtin catalog");
         for name in ["sum", "min", "max", "count", "avg"] {
             let args: &[DataType] = if name == "count" {
                 &[]
             } else {
                 &[DataType::Int64]
             };
-            let inferred = infer_agg_function_types(name, args, false);
+            let resolved = catalog.resolve_aggregate_user(name, args);
             assert!(
-                matches!(inferred, Ok((_, Some(_)))),
-                "{name} must infer (output, Some(intermediate)); got {inferred:?}"
+                resolved.is_ok(),
+                "{name} must resolve exactly; got {resolved:?}"
             );
         }
     }

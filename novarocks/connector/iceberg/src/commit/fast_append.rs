@@ -37,6 +37,7 @@ use crate::iceberg::spec::{
     SnapshotReference, SnapshotRetention, Summary,
 };
 use crate::iceberg::table::Table;
+use crate::iceberg::transaction::Transaction;
 use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
@@ -51,81 +52,6 @@ use super::helpers::{
 };
 use super::overwrite::write_added_data_manifest;
 use crate::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
-use crate::stats_assembler::{
-    COLLECT_ON_WRITE_PROPERTY, CommitType, FileSketchSet, StatisticsAssemblyFailure, StatsAssembler,
-};
-
-/// Stable category emitted for best-effort collect-on-write maintenance.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StatisticsMaintenanceFailure {
-    SketchAssembly,
-    ParentStatisticsRead,
-    PuffinWrite,
-    RegistrationCommit,
-    RegistrationUnknown,
-}
-
-impl StatisticsMaintenanceFailure {
-    fn as_marker(self) -> &'static str {
-        match self {
-            Self::SketchAssembly => "SketchAssembly",
-            Self::ParentStatisticsRead => "ParentStatisticsRead",
-            Self::PuffinWrite => "PuffinWrite",
-            Self::RegistrationCommit => "RegistrationCommit",
-            Self::RegistrationUnknown => "RegistrationUnknown",
-        }
-    }
-
-    fn from_assembly_failure(error: &StatisticsAssemblyFailure) -> Self {
-        match error {
-            StatisticsAssemblyFailure::SketchAssembly(_) => Self::SketchAssembly,
-            StatisticsAssemblyFailure::ParentStatisticsRead(_) => Self::ParentStatisticsRead,
-            StatisticsAssemblyFailure::PuffinWrite(_) => Self::PuffinWrite,
-        }
-    }
-
-    fn from_registration_failure(
-        error: &crate::commit::statistics::StatisticsRegistrationFailure,
-    ) -> Self {
-        match error {
-            crate::commit::statistics::StatisticsRegistrationFailure::Commit(_) => {
-                Self::RegistrationCommit
-            }
-            crate::commit::statistics::StatisticsRegistrationFailure::Unknown(_) => {
-                Self::RegistrationUnknown
-            }
-        }
-    }
-}
-
-fn collect_on_write_enabled(table: &Table) -> bool {
-    collect_on_write_enabled_from_properties(table.metadata().properties())
-}
-
-fn collect_on_write_enabled_from_properties(
-    properties: &std::collections::HashMap<String, String>,
-) -> bool {
-    properties
-        .get(COLLECT_ON_WRITE_PROPERTY)
-        .is_none_or(|value| !value.eq_ignore_ascii_case("false"))
-}
-
-fn emit_statistics_maintenance_failure(
-    kind: StatisticsMaintenanceFailure,
-    snapshot_id: i64,
-    error: &impl std::fmt::Display,
-) {
-    eprintln!(
-        "NOVAROCKS_STATISTICS_MAINTENANCE_FAILED kind={} snapshot_id={snapshot_id}",
-        kind.as_marker(),
-    );
-    tracing::warn!(
-        snapshot_id,
-        kind = kind.as_marker(),
-        error = %error,
-        "iceberg collect-on-write statistics maintenance failed; snapshot committed without stats",
-    );
-}
 
 pub struct FastAppendCommit;
 
@@ -157,15 +83,7 @@ pub(crate) async fn commit_empty_iceberg_mv_snapshot(
         ));
     }
 
-    let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-    commit_self_assembled_append(
-        ctx,
-        Vec::new(),
-        None,
-        prev_snapshot_id,
-        "empty MV fast_append",
-    )
-    .await
+    commit_self_assembled_append(ctx, Vec::new(), None, "empty MV fast_append").await
 }
 
 #[async_trait]
@@ -206,77 +124,7 @@ impl IcebergCommitAction for FastAppendCommit {
 
         // V2 tables carry no row lineage at all: `row_lineage: None` keeps the
         // manifest list and snapshot free of `first_row_id` / row-range fields.
-        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-        commit_self_assembled_append(ctx, written, None, prev_snapshot_id, "fast_append").await
-    }
-}
-
-/// Run `StatsAssembler::assemble` and, on success, apply
-/// `UpdateStatisticsAction` against the post-commit table. Logs and swallows
-/// errors so a stats failure never reverts a successful data commit.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn register_puffin_stats(
-    table_after: &Table,
-    catalog: &dyn crate::iceberg::Catalog,
-    file_io: &FileIO,
-    commit_type: CommitType,
-    sketch_sets: Vec<FileSketchSet>,
-    new_snapshot_id: i64,
-    new_sequence_number: i64,
-    prev_snapshot_id: Option<i64>,
-) {
-    if !collect_on_write_enabled(table_after) {
-        tracing::debug!(
-            new_snapshot_id,
-            "iceberg collect-on-write statistics maintenance is disabled by table property",
-        );
-        return;
-    }
-
-    match StatsAssembler::assemble(
-        table_after,
-        commit_type,
-        sketch_sets,
-        new_snapshot_id,
-        new_sequence_number,
-        prev_snapshot_id,
-        file_io,
-    )
-    .await
-    {
-        Ok(Some(stats_file)) => {
-            match crate::commit::statistics::commit_statistics_file(
-                table_after,
-                catalog,
-                stats_file,
-                crate::stats_assembler::StatisticsCoverageMark::IncrementalUnion,
-            )
-            .await
-            {
-                Ok(crate::commit::statistics::StatisticsCommitOutcome::Registered) => {}
-                Ok(crate::commit::statistics::StatisticsCommitOutcome::YieldedToFullerCoverage) => {
-                    // An ANALYZE already covered this snapshot by scanning every
-                    // visible row. Standing down is the correct outcome, not a
-                    // degradation worth warning about.
-                    tracing::debug!(
-                        new_snapshot_id,
-                        "iceberg puffin stats yielded to an all-visible-rows entry",
-                    );
-                }
-                Err(err) => emit_statistics_maintenance_failure(
-                    StatisticsMaintenanceFailure::from_registration_failure(&err),
-                    new_snapshot_id,
-                    &err,
-                ),
-            }
-        }
-        Ok(None) => {
-            // No statistics file was assembled for this snapshot.
-        }
-        Err(err) => {
-            let kind = StatisticsMaintenanceFailure::from_assembly_failure(&err);
-            emit_statistics_maintenance_failure(kind, new_snapshot_id, &err);
-        }
+        commit_self_assembled_append(ctx, written, None, "fast_append").await
     }
 }
 
@@ -289,16 +137,10 @@ async fn commit_v3_row_lineage_append(
         sum.checked_add(f.record_count)
             .ok_or_else(|| "row-lineage added row count overflow".to_string())
     })?;
-    let prev_snapshot_id = ctx
-        .table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id());
     commit_self_assembled_append(
         ctx,
         written,
         Some((row_lineage_first_row_id, row_lineage_added_rows)),
-        prev_snapshot_id,
         "fast_append v3",
     )
     .await
@@ -308,15 +150,11 @@ async fn commit_v3_row_lineage_append(
 /// this attempt's external write fence.
 ///
 /// `row_lineage` is `Some` only for v3 row-lineage tables; v2 passes `None` and
-/// therefore produces no row-lineage fields at all. `prev_snapshot_id` is the
-/// Puffin-statistics predecessor each caller already resolves, so the two
-/// callers keep their existing (and deliberately different) notion of
-/// "previous snapshot".
+/// therefore produces no row-lineage fields at all.
 async fn commit_self_assembled_append(
     ctx: CommitCtx<'_>,
     written: Vec<WrittenFile>,
     row_lineage: Option<(u64, u64)>,
-    prev_snapshot_id: Option<i64>,
     label: &str,
 ) -> Result<CommitOutcome, String> {
     let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -336,27 +174,11 @@ async fn commit_self_assembled_append(
         fail_before_manifest_list_write: false,
     });
 
-    let sketch_sets = ctx.collector.take_sketch_sets();
-
     let guard = ctx.collector.fast_append_attempt_guard();
     match submit_occ_action(ctx.catalog, ctx.table, action, label, guard.as_deref()).await {
         Ok(OccSubmit::Committed(table_after)) => {
             let new_snapshot_id =
                 required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, label)?;
-            let new_sequence_number = table_after.metadata().last_sequence_number();
-            // Best-effort Puffin NDV registration; failure must not abort the
-            // commit because data is already published.
-            register_puffin_stats(
-                &table_after,
-                ctx.catalog,
-                ctx.file_io,
-                CommitType::Append,
-                sketch_sets,
-                new_snapshot_id,
-                new_sequence_number,
-                prev_snapshot_id,
-            )
-            .await;
             Ok(CommitOutcome {
                 new_snapshot_id,
                 written_manifest_paths: collected_manifest_paths(&manifest_paths_out),
@@ -372,6 +194,89 @@ async fn commit_self_assembled_append(
         }),
         Err(error) => Err(error.into_detail()),
     }
+}
+
+/// Eagerly stage one append against this attempt's exact base without
+/// dispatching it. The returned transaction-local table is the authority for
+/// the snapshot id/sequence used by a following `SetStatistics` action.
+pub(crate) async fn stage_eager_fast_append(
+    ctx: CommitCtx<'_>,
+) -> Result<(Transaction, CommitOutcome), String> {
+    let written = ctx.collector.take_written_files()?;
+    for file in &written {
+        if file.content != DataContentType::Data {
+            return Err(format!(
+                "FastAppendCommit received {:?} content; expected Data only",
+                file.content
+            ));
+        }
+    }
+    let row_lineage = match crate::commit::classify_iceberg_write_mode(ctx.table) {
+        IcebergWriteMode::RowLineageV3 => {
+            let first = effective_next_row_id(ctx.table.metadata())?;
+            let rows = written.iter().try_fold(0u64, |sum, file| {
+                sum.checked_add(file.record_count)
+                    .ok_or_else(|| "row-lineage added row count overflow".to_string())
+            })?;
+            Some((first, rows))
+        }
+        IcebergWriteMode::LegacyPositionDeletes => {
+            if ctx.target_ref != "main" {
+                return Err(format!(
+                    "FastAppendCommit branch target_ref={} requires the v3 row-lineage path",
+                    ctx.target_ref
+                ));
+            }
+            None
+        }
+    };
+
+    // An ordinary empty append has no data-plane effect. A managed
+    // publication carries provider properties and therefore still needs the
+    // empty snapshot the custom action builds.
+    if written.is_empty() && ctx.snapshot_properties.is_empty() {
+        let snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
+        return Ok((
+            Transaction::new(ctx.table),
+            CommitOutcome {
+                new_snapshot_id: snapshot_id,
+                written_manifest_paths: Vec::new(),
+            },
+        ));
+    }
+
+    let manifest_paths_out = Arc::new(Mutex::new(Vec::new()));
+    let action: Arc<dyn TransactionAction> = Arc::new(FastAppendV3TxnAction {
+        written,
+        commit_uuid: ctx.commit_uuid,
+        file_io: ctx.file_io.clone(),
+        partition_spec: ctx.collector.partition_spec.clone(),
+        schema: ctx.table.metadata().current_schema().clone(),
+        schema_id: ctx.table.metadata().current_schema_id(),
+        abort_handle: ctx.abort_handle,
+        manifest_paths_out: Arc::clone(&manifest_paths_out),
+        row_lineage,
+        target_ref: ctx.target_ref.to_string(),
+        snapshot_properties: ctx.snapshot_properties.clone(),
+        #[cfg(test)]
+        fail_before_manifest_list_write: false,
+    });
+    let tx = Transaction::new(ctx.table)
+        .stage_action(action)
+        .await
+        .map_err(|error| format!("FastAppend eager stage failed: {error}"))?;
+    let snapshot_id = required_target_ref_snapshot_id(
+        tx.staged_table().metadata(),
+        ctx.target_ref,
+        "FastAppend eager stage",
+    )?;
+    Ok((
+        tx,
+        CommitOutcome {
+            new_snapshot_id: snapshot_id,
+            written_manifest_paths: collected_manifest_paths(&manifest_paths_out),
+        },
+    ))
 }
 
 fn collected_manifest_paths(manifest_paths_out: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -718,76 +623,4 @@ fn append_summary(
 
 fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
     crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, s)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::*;
-
-    #[test]
-    fn collect_on_write_defaults_to_enabled_and_only_false_disables_it() {
-        assert!(collect_on_write_enabled_from_properties(&HashMap::new()));
-        assert!(collect_on_write_enabled_from_properties(&HashMap::from([
-            (COLLECT_ON_WRITE_PROPERTY.to_string(), "true".to_string(),)
-        ])));
-        assert!(!collect_on_write_enabled_from_properties(&HashMap::from([
-            (COLLECT_ON_WRITE_PROPERTY.to_string(), "FALSE".to_string(),)
-        ])));
-    }
-
-    #[test]
-    fn maintenance_failure_markers_are_stable_and_distinct() {
-        let markers = [
-            StatisticsMaintenanceFailure::SketchAssembly.as_marker(),
-            StatisticsMaintenanceFailure::ParentStatisticsRead.as_marker(),
-            StatisticsMaintenanceFailure::PuffinWrite.as_marker(),
-            StatisticsMaintenanceFailure::RegistrationCommit.as_marker(),
-            StatisticsMaintenanceFailure::RegistrationUnknown.as_marker(),
-        ];
-        assert_eq!(
-            markers.len(),
-            markers
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-        );
-    }
-
-    #[test]
-    fn maintenance_failure_mapping_preserves_all_five_failure_kinds() {
-        assert_eq!(
-            StatisticsMaintenanceFailure::from_assembly_failure(
-                &StatisticsAssemblyFailure::SketchAssembly("sketch".into())
-            ),
-            StatisticsMaintenanceFailure::SketchAssembly
-        );
-        assert_eq!(
-            StatisticsMaintenanceFailure::from_assembly_failure(
-                &StatisticsAssemblyFailure::ParentStatisticsRead("parent".into())
-            ),
-            StatisticsMaintenanceFailure::ParentStatisticsRead
-        );
-        assert_eq!(
-            StatisticsMaintenanceFailure::from_assembly_failure(
-                &StatisticsAssemblyFailure::PuffinWrite("puffin".into())
-            ),
-            StatisticsMaintenanceFailure::PuffinWrite
-        );
-        assert_eq!(
-            StatisticsMaintenanceFailure::from_registration_failure(
-                &crate::commit::statistics::StatisticsRegistrationFailure::Commit("commit".into())
-            ),
-            StatisticsMaintenanceFailure::RegistrationCommit
-        );
-        assert_eq!(
-            StatisticsMaintenanceFailure::from_registration_failure(
-                &crate::commit::statistics::StatisticsRegistrationFailure::Unknown(
-                    "unknown".into()
-                )
-            ),
-            StatisticsMaintenanceFailure::RegistrationUnknown
-        );
-    }
 }

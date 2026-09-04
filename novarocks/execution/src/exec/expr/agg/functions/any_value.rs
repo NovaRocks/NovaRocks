@@ -14,21 +14,38 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::sync::Arc;
+
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 
+use crate::exec::expr::agg::AggregateAllocator;
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{AggScalarValue, build_scalar_array, scalar_from_array};
+use super::common::{
+    TrackedAggScalarValue, build_scalar_array, tracked_scalar_from_array, tracked_scalar_to_output,
+};
 
 pub(super) struct AnyValueAgg;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 struct AnyValueState {
+    allocator: AggregateAllocator,
     has_value: bool,
-    value: Option<AggScalarValue>,
+    value: Option<TrackedAggScalarValue>,
+}
+
+impl AnyValueState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        Self {
+            allocator: AggregateAllocator::new(tracker),
+            has_value: false,
+            value: None,
+        }
+    }
 }
 
 impl AggregateFunction for AnyValueAgg {
@@ -82,14 +99,40 @@ impl AggregateFunction for AnyValueAgg {
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
-            std::ptr::write(ptr as *mut AnyValueState, AnyValueState::default());
+            std::ptr::write(
+                ptr as *mut AnyValueState,
+                AnyValueState::new(process_mem_tracker()),
+            );
         }
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker
+            .ok_or_else(|| "allocation-tracked any_value requires a memory tracker".to_string())?;
+        unsafe {
+            ptr.cast::<AnyValueState>()
+                .write(AnyValueState::new(tracker))
+        };
+        Ok(())
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             std::ptr::drop_in_place(ptr as *mut AnyValueState);
         }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -107,7 +150,7 @@ impl AggregateFunction for AnyValueAgg {
             if state.has_value {
                 continue;
             }
-            let value = scalar_from_array(array, row)?;
+            let value = tracked_scalar_from_array(array, row, &state.allocator)?;
             if value.is_some() {
                 state.has_value = true;
                 state.value = value;
@@ -138,7 +181,13 @@ impl AggregateFunction for AnyValueAgg {
         for &base in group_states {
             let state = unsafe { &*((base as *mut u8).add(offset) as *const AnyValueState) };
             if state.has_value {
-                values.push(state.value.clone());
+                values.push(
+                    state
+                        .value
+                        .as_ref()
+                        .map(tracked_scalar_to_output)
+                        .transpose()?,
+                );
             } else {
                 values.push(None);
             }

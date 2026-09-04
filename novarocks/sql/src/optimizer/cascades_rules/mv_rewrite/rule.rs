@@ -410,12 +410,20 @@ fn try_rewrite(
                         .enumerate()
                         .map(|(idx, item)| {
                             let mv_col = agg_cols[item.mv_output_index].clone()?;
+                            let resolved = memo
+                                .function_catalog()
+                                .resolve_aggregate_trusted(
+                                    item.rollup_fn,
+                                    std::slice::from_ref(&mv_col.data_type),
+                                )
+                                .ok()?;
                             Some(ScalarAggregateSpec {
                                 output_column_id: output_layout.aggregate_columns[idx].column_id,
                                 name: item.rollup_fn.to_string(),
                                 args: vec![column_ref(&mut memo.scalars, &mv_col)],
                                 distinct: false,
                                 order_by: vec![],
+                                resolved,
                             })
                         })
                         .collect::<Option<Vec<_>>>()?;
@@ -606,6 +614,7 @@ fn rewrite_aggregate_to_mv(
             .iter()
             .map(|key| rewrite_sort_key(arena, key, col_map, query_base_names))
             .collect::<Option<Vec<_>>>()?,
+        resolved: call.resolved.clone(),
     })
 }
 
@@ -669,6 +678,12 @@ mod tests {
     };
     use crate::optimizer::memo::{GroupId, Memo};
     use crate::optimizer::scalar::ScalarArena;
+
+    fn test_memo() -> Memo {
+        let mut memo = Memo::new();
+        memo.function_catalog = Some(crate::functions::test_function_catalog_snapshot());
+        memo
+    }
     use crate::planner::logical::{
         LogicalAggregateNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
     };
@@ -873,6 +888,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: out.column_id,
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         }
     }
 
@@ -884,6 +900,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: out.column_id,
+            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
         }
     }
 
@@ -1038,7 +1055,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
@@ -1097,7 +1114,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         prune_root_aggregate_outputs(&mut memo, root, vec![s.clone()]);
         advance_factory(&mut memo, 200);
@@ -1147,7 +1164,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         prune_root_aggregate_outputs(&mut memo, root, vec![s.clone()]);
         advance_factory(&mut memo, 200);
@@ -1204,7 +1221,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
@@ -1274,7 +1291,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
@@ -1319,7 +1336,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
@@ -1366,7 +1383,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
@@ -1425,7 +1442,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
@@ -1478,7 +1495,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
@@ -1541,7 +1558,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_scan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
@@ -1610,7 +1627,7 @@ mod tests {
             None,
         );
 
-        let mut memo = Memo::new();
+        let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();

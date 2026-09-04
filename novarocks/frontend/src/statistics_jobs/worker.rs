@@ -20,12 +20,10 @@
 //! There is no lease, takeover, retry queue, startup scan, or reconciliation
 //! pass. Every submission is one fresh attempt owned by this frontend process.
 
-use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use novarocks_spi::connector::ExternalMutationEvidence;
 use uuid::Uuid;
 
 use super::application::StatisticsPublicationTerminal;
@@ -75,41 +73,12 @@ impl StatisticsAttemptError {
     }
 }
 
-/// Attempt-local collection material. It never crosses a process boundary.
-pub trait StatisticsCollectedAttempt: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-    fn basis_data_version(&self) -> &[u8];
-}
-
-impl StatisticsCollectedAttempt for () {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn basis_data_version(&self) -> &[u8] {
-        b"unit-test-basis"
-    }
-}
-
 /// Connector-neutral execution owned by the frontend process worker.
 pub trait StatisticsAttemptExecutor: Send + Sync {
-    fn collect(
+    fn execute(
         &self,
         job: &StatisticsJob,
-    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError>;
-
-    /// Side-effect-free preparation for the one publication attempt.
-    fn prepare_publish(
-        &self,
-        job: &StatisticsJob,
-        collected: &dyn StatisticsCollectedAttempt,
-    ) -> Result<ExternalMutationEvidence, StatisticsAttemptError>;
-
-    fn publish(
-        &self,
-        job: &StatisticsJob,
-        collected: &dyn StatisticsCollectedAttempt,
-        evidence: &ExternalMutationEvidence,
+        cancellation: crate::common::query_cancellation::QueryCancellationView,
     ) -> Result<(), StatisticsAttemptError>;
 }
 
@@ -228,7 +197,7 @@ async fn run_worker(
         };
         run_attempt(
             &repository,
-            executor.as_ref(),
+            executor,
             job,
             STATISTICS_ATTEMPT_TIMEOUT,
             workload_lease.cancellation_source().view(),
@@ -239,7 +208,7 @@ async fn run_worker(
 
 async fn run_attempt(
     repository: &StatisticsJobRepository,
-    executor: &dyn StatisticsAttemptExecutor,
+    executor: Arc<dyn StatisticsAttemptExecutor>,
     job: StatisticsJob,
     timeout: Duration,
     cancellation: crate::common::query_cancellation::QueryCancellationView,
@@ -264,64 +233,48 @@ async fn run_attempt(
         )
         .await
         .map_err(|error| error.to_string())?;
-    let collected = match executor.collect(&running) {
-        Ok(collected) => collected,
-        Err(error) => {
-            return finish_error(
-                repository,
-                running.job_id,
-                StatisticsJobState::Running,
-                error,
-            )
-            .await;
+    let attempt_cancellation = crate::common::query_cancellation::QueryCancellationSource::new();
+    let execution_cancellation = attempt_cancellation.view();
+    let execution_job = running.clone();
+    let mut execution = tokio::task::spawn_blocking(move || {
+        executor.execute(&execution_job, execution_cancellation)
+    });
+    let result = loop {
+        tokio::select! {
+            joined = &mut execution => {
+                break joined.map_err(|error| format!("statistics attempt task failed: {error}"))?;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if cancellation.is_cancelled() {
+                    let _ = attempt_cancellation.request(
+                        crate::common::query_cancellation::QueryCancellationReason::ServerShutdown,
+                    );
+                } else if started.elapsed() >= timeout {
+                    let _ = attempt_cancellation.request(
+                        crate::common::query_cancellation::QueryCancellationReason::DeadlineExceeded {
+                            timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                        },
+                    );
+                } else if repository
+                    .cancellation_requested(running.job_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    let _ = attempt_cancellation.request(
+                        crate::common::query_cancellation::QueryCancellationReason::ExplicitKill {
+                            requester_connection_id: 0,
+                        },
+                    );
+                }
+            }
         }
     };
-    if must_stop(repository, running.job_id, started, timeout, &cancellation).await? {
-        return cancel(
-            repository,
-            running.job_id,
-            StatisticsJobState::Running,
-            "statistics job cancelled before publication preparation",
-        )
-        .await;
-    }
-    let evidence = match executor.prepare_publish(&running, collected.as_ref()) {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            return finish_error(
-                repository,
-                running.job_id,
-                StatisticsJobState::Running,
-                error,
-            )
-            .await;
-        }
-    };
-    if must_stop(repository, running.job_id, started, timeout, &cancellation).await? {
-        return cancel(
-            repository,
-            running.job_id,
-            StatisticsJobState::Running,
-            "statistics job cancelled before publication dispatch",
-        )
-        .await;
-    }
-    let publishing = repository
-        .transition(
-            running.job_id,
-            StatisticsJobState::Running,
-            StatisticsJobState::Publishing,
-            now_ms(),
-            None,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    match executor.publish(&publishing, collected.as_ref(), &evidence) {
+    match result {
         Ok(()) => {
             repository
                 .transition(
-                    publishing.job_id,
-                    StatisticsJobState::Publishing,
+                    running.job_id,
+                    StatisticsJobState::Running,
                     StatisticsJobState::Succeeded,
                     now_ms(),
                     None,
@@ -331,10 +284,35 @@ async fn run_attempt(
             Ok(())
         }
         Err(error) => {
+            if error.publication.is_none()
+                && let Some(reason) = attempt_cancellation.view().reason()
+            {
+                return match reason {
+                    crate::common::query_cancellation::QueryCancellationReason::DeadlineExceeded { .. } => {
+                        finish_error(
+                            repository,
+                            running.job_id,
+                            StatisticsJobState::Running,
+                            StatisticsAttemptError::permanent(
+                                StatisticsJobErrorKind::DeadlineExceeded,
+                                error.message,
+                            ),
+                        )
+                        .await
+                    }
+                    _ => cancel(
+                        repository,
+                        running.job_id,
+                        StatisticsJobState::Running,
+                        &error.message,
+                    )
+                    .await,
+                };
+            }
             finish_error(
                 repository,
-                publishing.job_id,
-                StatisticsJobState::Publishing,
+                running.job_id,
+                StatisticsJobState::Running,
                 error,
             )
             .await
@@ -421,9 +399,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    use super::{
-        StatisticsAttemptError, StatisticsAttemptExecutor, StatisticsCollectedAttempt, run_worker,
-    };
+    use super::{StatisticsAttemptError, StatisticsAttemptExecutor, run_worker};
     use crate::statistics_jobs::model::StatisticsJob;
     use crate::statistics_jobs::repository::StatisticsJobRepository;
     use crate::workload_lifecycle::FrontendServingLifecycle;
@@ -431,27 +407,10 @@ mod tests {
     struct NeverRunExecutor;
 
     impl StatisticsAttemptExecutor for NeverRunExecutor {
-        fn collect(
+        fn execute(
             &self,
             _job: &StatisticsJob,
-        ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError> {
-            unreachable!("draining must reject before a statistics attempt starts")
-        }
-
-        fn prepare_publish(
-            &self,
-            _job: &StatisticsJob,
-            _collected: &dyn StatisticsCollectedAttempt,
-        ) -> Result<novarocks_spi::connector::ExternalMutationEvidence, StatisticsAttemptError>
-        {
-            unreachable!("draining must reject before a statistics attempt starts")
-        }
-
-        fn publish(
-            &self,
-            _job: &StatisticsJob,
-            _collected: &dyn StatisticsCollectedAttempt,
-            _evidence: &novarocks_spi::connector::ExternalMutationEvidence,
+            _cancellation: crate::common::query_cancellation::QueryCancellationView,
         ) -> Result<(), StatisticsAttemptError> {
             unreachable!("draining must reject before a statistics attempt starts")
         }

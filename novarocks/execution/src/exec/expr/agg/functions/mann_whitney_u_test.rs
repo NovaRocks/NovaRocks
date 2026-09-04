@@ -19,7 +19,9 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 
+use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
@@ -49,26 +51,35 @@ impl TestingAlternative {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct MannWhitneyState {
+    allocator: AggregateAllocator,
     alternative: TestingAlternative,
     continuity_correction: i64,
-    stats: [Vec<f64>; 2],
+    stats: [AggregateVec<f64>; 2],
     sorted: bool,
 }
 
 impl Default for MannWhitneyState {
     fn default() -> Self {
-        Self {
-            alternative: TestingAlternative::Unknown,
-            continuity_correction: 0,
-            stats: [Vec::new(), Vec::new()],
-            sorted: true,
-        }
+        Self::new(process_mem_tracker())
     }
 }
 
 impl MannWhitneyState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            allocator: allocator.clone(),
+            alternative: TestingAlternative::Unknown,
+            continuity_correction: 0,
+            stats: [
+                AggregateVec::new_in(allocator.clone()),
+                AggregateVec::new_in(allocator),
+            ],
+            sorted: true,
+        }
+    }
     fn is_uninitialized(&self) -> bool {
         self.alternative == TestingAlternative::Unknown
     }
@@ -78,10 +89,15 @@ impl MannWhitneyState {
         self.continuity_correction = continuity_correction;
     }
 
-    fn update(&mut self, value: f64, treatment: bool) {
+    fn update(&mut self, value: f64, treatment: bool) -> Result<(), String> {
         let idx = if treatment { 1 } else { 0 };
+        self.stats[idx].try_reserve(1).map_err(|_| {
+            self.allocator
+                .allocation_error("reserve Mann-Whitney sample")
+        })?;
         self.stats[idx].push(value);
         self.sorted = false;
+        Ok(())
     }
 
     fn sort_if_needed(&mut self) {
@@ -109,7 +125,15 @@ impl MannWhitneyState {
         self.sort_if_needed();
         other.sort_if_needed();
         for idx in 0..2 {
-            let mut merged = Vec::with_capacity(self.stats[idx].len() + other.stats[idx].len());
+            let capacity = self.stats[idx]
+                .len()
+                .checked_add(other.stats[idx].len())
+                .ok_or_else(|| "mann_whitney_u_test sample count overflow".to_string())?;
+            let mut merged = AggregateVec::new_in(self.allocator.clone());
+            merged.try_reserve_exact(capacity).map_err(|_| {
+                self.allocator
+                    .allocation_error("reserve merged Mann-Whitney sample")
+            })?;
             let mut i = 0;
             let mut j = 0;
             let left = &self.stats[idx];
@@ -149,7 +173,7 @@ impl MannWhitneyState {
         out
     }
 
-    fn deserialize(mut data: &[u8]) -> Result<Self, String> {
+    fn deserialize_in(mut data: &[u8], allocator: AggregateAllocator) -> Result<Self, String> {
         if data.len() < 1 + 8 + 4 + 4 {
             return Err("mann_whitney_u_test deserialize: buffer too short".to_string());
         }
@@ -172,7 +196,10 @@ impl MannWhitneyState {
         let len1 = u32::from_le_bytes(len_bytes) as usize;
         data = &data[4..];
 
-        let mut stats0 = Vec::with_capacity(len0);
+        let mut stats0 = AggregateVec::new_in(allocator.clone());
+        stats0.try_reserve_exact(len0).map_err(|_| {
+            allocator.allocation_error("reserve decoded Mann-Whitney control sample")
+        })?;
         for _ in 0..len0 {
             if data.len() < 8 {
                 return Err("mann_whitney_u_test deserialize: buffer too short".to_string());
@@ -182,7 +209,10 @@ impl MannWhitneyState {
             stats0.push(f64::from_le_bytes(bytes));
             data = &data[8..];
         }
-        let mut stats1 = Vec::with_capacity(len1);
+        let mut stats1 = AggregateVec::new_in(allocator.clone());
+        stats1.try_reserve_exact(len1).map_err(|_| {
+            allocator.allocation_error("reserve decoded Mann-Whitney treatment sample")
+        })?;
         for _ in 0..len1 {
             if data.len() < 8 {
                 return Err("mann_whitney_u_test deserialize: buffer too short".to_string());
@@ -194,6 +224,7 @@ impl MannWhitneyState {
         }
 
         Ok(Self {
+            allocator,
             alternative,
             continuity_correction,
             stats: [stats0, stats1],
@@ -425,10 +456,34 @@ impl AggregateFunction for MannWhitneyUTestAgg {
         }
     }
 
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker.ok_or_else(|| {
+            "allocation-tracked mann_whitney_u_test requires a memory tracker".to_string()
+        })?;
+        unsafe {
+            ptr.cast::<MannWhitneyState>()
+                .write(MannWhitneyState::new(tracker))
+        };
+        Ok(())
+    }
+
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             std::ptr::drop_in_place(ptr as *mut MannWhitneyState);
         }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -512,7 +567,7 @@ impl AggregateFunction for MannWhitneyUTestAgg {
             if x.is_nan() || x.is_infinite() {
                 continue;
             }
-            state.update(x, treatment);
+            state.update(x, treatment)?;
         }
         Ok(())
     }
@@ -531,9 +586,9 @@ impl AggregateFunction for MannWhitneyUTestAgg {
             if arr.is_null(row) {
                 continue;
             }
-            let bytes = arr.value(row);
-            let other = MannWhitneyState::deserialize(bytes)?;
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MannWhitneyState) };
+            let bytes = arr.value(row);
+            let other = MannWhitneyState::deserialize_in(bytes, state.allocator.clone())?;
             if state.is_uninitialized() {
                 *state = other;
             } else {
@@ -582,6 +637,54 @@ mod tests {
     use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Fields};
     use std::mem::MaybeUninit;
+
+    #[test]
+    fn sample_growth_is_rejected_before_allocator_mutation() {
+        let values = Arc::new(Float64Array::from(vec![1.0])) as ArrayRef;
+        let treatment = Arc::new(BooleanArray::from(vec![false])) as ArrayRef;
+        let fields = vec![
+            Field::new("f0", DataType::Float64, true),
+            Field::new("f1", DataType::Boolean, true),
+        ];
+        let input_type = DataType::Struct(Fields::from(fields.clone()));
+        let input = Arc::new(StructArray::new(
+            fields.into(),
+            vec![values, treatment],
+            None,
+        )) as ArrayRef;
+        let function = AggFunction {
+            name: "mann_whitney_u_test".to_string(),
+            types: Some(crate::exec::node::aggregate::AggTypeSignature {
+                intermediate_type: Some(DataType::Binary),
+                output_type: Some(DataType::Utf8),
+                input_arg_type: Some(DataType::Float64),
+            }),
+            ..Default::default()
+        };
+        let spec = MannWhitneyUTestAgg
+            .build_spec_from_type(&function, Some(&input_type), false)
+            .unwrap();
+        let tracker = MemTracker::new_root("mann-whitney-limit");
+        tracker.install_limit_once(1).unwrap();
+        let mut state = MaybeUninit::<MannWhitneyState>::uninit();
+        MannWhitneyUTestAgg
+            .init_state_with_tracker(&spec, state.as_mut_ptr().cast(), Some(Arc::clone(&tracker)))
+            .unwrap();
+
+        let error = MannWhitneyUTestAgg
+            .update_batch(
+                &spec,
+                0,
+                &[state.as_mut_ptr() as AggStatePtr],
+                &AggInputView::Any(&input),
+            )
+            .expect_err("sample vector allocation must fail closed");
+        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert_eq!(tracker.current(), 0);
+
+        MannWhitneyUTestAgg.drop_state(&spec, state.as_mut_ptr().cast());
+        assert_eq!(tracker.current(), 0);
+    }
 
     #[test]
     fn test_mann_whitney_simple() {

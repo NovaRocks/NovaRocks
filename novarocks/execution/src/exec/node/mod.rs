@@ -33,6 +33,7 @@ pub mod set_op;
 pub mod sort;
 pub mod table_finish;
 pub mod table_function;
+pub mod table_write_aggregate;
 pub mod table_write_relation;
 pub mod table_writer;
 pub mod union_all;

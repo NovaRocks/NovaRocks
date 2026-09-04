@@ -18,21 +18,62 @@ use arrow::array::{ArrayRef, MapArray, StructArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field};
 use arrow_buffer::OffsetBuffer;
-use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::exec::expr::agg::{
+    AggregateAllocator, AggregateHashSet, AggregateVec, aggregate_hash_set,
+};
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{AggScalarValue, build_scalar_array, key_fingerprint, scalar_from_array};
+use super::common::{
+    TrackedAggScalarValue, build_scalar_array, tracked_key_fingerprint, tracked_scalar_from_array,
+    tracked_scalar_to_output,
+};
 
 pub(super) struct MapAggAgg;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 struct MapAggState {
-    seen_keys: HashSet<Vec<u8>>,
-    entries: Vec<(AggScalarValue, Option<AggScalarValue>)>,
+    allocator: AggregateAllocator,
+    seen_keys: AggregateHashSet<AggregateVec<u8>>,
+    entries: AggregateVec<(TrackedAggScalarValue, Option<TrackedAggScalarValue>)>,
+}
+
+impl MapAggState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            seen_keys: aggregate_hash_set(allocator.clone()),
+            entries: AggregateVec::new_in(allocator.clone()),
+            allocator,
+        }
+    }
+}
+
+fn append_entry(
+    state: &mut MapAggState,
+    key: TrackedAggScalarValue,
+    value: Option<TrackedAggScalarValue>,
+) -> Result<(), String> {
+    let key_fp = tracked_key_fingerprint(&key, &state.allocator)?;
+    if state.seen_keys.contains(&key_fp) {
+        return Ok(());
+    }
+    state
+        .seen_keys
+        .try_reserve(1)
+        .map_err(|_| state.allocator.allocation_error("reserve map_agg key set"))?;
+    state
+        .entries
+        .try_reserve(1)
+        .map_err(|_| state.allocator.allocation_error("reserve map_agg entries"))?;
+    let inserted = state.seen_keys.insert(key_fp);
+    debug_assert!(inserted);
+    state.entries.push((key, value));
+    Ok(())
 }
 
 impl AggregateFunction for MapAggAgg {
@@ -130,14 +171,37 @@ impl AggregateFunction for MapAggAgg {
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
-            std::ptr::write(ptr as *mut MapAggState, MapAggState::default());
+            std::ptr::write(
+                ptr as *mut MapAggState,
+                MapAggState::new(process_mem_tracker()),
+            );
         }
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker
+            .ok_or_else(|| "allocation-tracked map_agg requires a memory tracker".to_string())?;
+        unsafe { ptr.cast::<MapAggState>().write(MapAggState::new(tracker)) };
+        Ok(())
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             std::ptr::drop_in_place(ptr as *mut MapAggState);
         }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -161,15 +225,12 @@ impl AggregateFunction for MapAggAgg {
         let key_arr = struct_arr.column(0).clone();
         let value_arr = struct_arr.column(1).clone();
         for (row, &base) in state_ptrs.iter().enumerate() {
-            let Some(key) = scalar_from_array(&key_arr, row)? else {
+            let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MapAggState) };
+            let Some(key) = tracked_scalar_from_array(&key_arr, row, &state.allocator)? else {
                 continue;
             };
-            let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MapAggState) };
-            let key_fp = key_fingerprint(&key);
-            if state.seen_keys.insert(key_fp) {
-                let value = scalar_from_array(&value_arr, row)?;
-                state.entries.push((key, value));
-            }
+            let value = tracked_scalar_from_array(&value_arr, row, &state.allocator)?;
+            append_entry(state, key, value)?;
         }
         Ok(())
     }
@@ -200,14 +261,11 @@ impl AggregateFunction for MapAggAgg {
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             for idx in start..end {
-                let Some(key) = scalar_from_array(&key_arr, idx)? else {
+                let Some(key) = tracked_scalar_from_array(&key_arr, idx, &state.allocator)? else {
                     continue;
                 };
-                let key_fp = key_fingerprint(&key);
-                if state.seen_keys.insert(key_fp) {
-                    let value = scalar_from_array(&value_arr, idx)?;
-                    state.entries.push((key, value));
-                }
+                let value = tracked_scalar_from_array(&value_arr, idx, &state.allocator)?;
+                append_entry(state, key, value)?;
             }
         }
         Ok(())
@@ -237,8 +295,8 @@ impl AggregateFunction for MapAggAgg {
         for &base in group_states {
             let state = unsafe { &*((base as *mut u8).add(offset) as *const MapAggState) };
             for (key, value) in &state.entries {
-                key_values.push(Some(key.clone()));
-                value_values.push(value.clone());
+                key_values.push(Some(tracked_scalar_to_output(key)?));
+                value_values.push(value.as_ref().map(tracked_scalar_to_output).transpose()?);
                 current += 1;
                 if current > i32::MAX as i64 {
                     return Err("map_agg offset overflow".to_string());
@@ -316,7 +374,8 @@ fn build_default_map_type(key_field: Arc<Field>, value_field: Arc<Field>) -> Dat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, Int64Builder, MapBuilder, StructArray};
+    use crate::runtime::mem_tracker::MemTracker;
+    use arrow::array::{Int64Array, Int64Builder, MapBuilder, StringArray, StructArray};
     use std::mem::MaybeUninit;
 
     fn map_type_i64_i64() -> DataType {
@@ -469,5 +528,40 @@ mod tests {
         assert_eq!(vals.value(1), 20);
         assert_eq!(keys.value(2), 3);
         assert_eq!(vals.value(2), 30);
+    }
+
+    #[test]
+    fn tracked_allocations_change_only_for_new_keys_and_release_on_drop() {
+        let tracker = MemTracker::new_root("map-agg-test");
+        let mut state = MapAggState::new(Arc::clone(&tracker));
+        let keys = Arc::new(StringArray::from(vec!["key", "key", "other"])) as ArrayRef;
+        let values = Arc::new(StringArray::from(vec!["first", "ignored", "second"])) as ArrayRef;
+
+        let key = tracked_scalar_from_array(&keys, 0, &state.allocator)
+            .unwrap()
+            .unwrap();
+        let value = tracked_scalar_from_array(&values, 0, &state.allocator).unwrap();
+        append_entry(&mut state, key, value).unwrap();
+        let first = tracker.current();
+        assert!(first > 0);
+
+        let key = tracked_scalar_from_array(&keys, 1, &state.allocator)
+            .unwrap()
+            .unwrap();
+        let value = tracked_scalar_from_array(&values, 1, &state.allocator).unwrap();
+        append_entry(&mut state, key, value).unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(tracker.current(), first);
+
+        let key = tracked_scalar_from_array(&keys, 2, &state.allocator)
+            .unwrap()
+            .unwrap();
+        let value = tracked_scalar_from_array(&values, 2, &state.allocator).unwrap();
+        append_entry(&mut state, key, value).unwrap();
+        assert_eq!(state.entries.len(), 2);
+        assert!(tracker.current() > first);
+
+        drop(state);
+        assert_eq!(tracker.current(), 0);
     }
 }

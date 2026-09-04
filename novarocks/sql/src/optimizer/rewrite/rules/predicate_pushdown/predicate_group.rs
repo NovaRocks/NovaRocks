@@ -160,6 +160,7 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             args,
             distinct,
             order_by,
+            ..
         } => format!(
             "AggregateCall({name},{distinct},{},{order_by:?})",
             canonical_expr_list_key(arena, args)
@@ -237,12 +238,14 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
             ignore_nulls,
         } => format!(
-            "WindowCall({name},{distinct},{},{},{order_by:?},{window_frame:?},{ignore_nulls})",
+            "WindowCall({name},{distinct},{},{function_order_by:?},{aggregate_binding:?},{},{order_by:?},{window_frame:?},{ignore_nulls})",
             canonical_expr_list_key(arena, args),
             canonical_expr_list_key(arena, partition_by)
         ),

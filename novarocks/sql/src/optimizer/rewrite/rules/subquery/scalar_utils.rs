@@ -25,7 +25,7 @@ use crate::common::ApplyKind;
 use crate::common::{BinOp, LiteralValue};
 use crate::common::{JoinKind, OutputColumn};
 use crate::optimizer::operator::{
-    FilterOp, LogicalJoinOp, Operator, ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec,
+    FilterOp, LogicalJoinOp, Operator, ScalarAggregateSpec, ScalarProjectItem,
 };
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey};
@@ -399,11 +399,13 @@ where
             args,
             distinct,
             order_by,
+            resolved,
         } => ScalarNode::AggregateCall {
             name,
             args: rewrite_vec(arena, args, rewrite)?,
             distinct,
             order_by: rewrite_sort_keys(arena, order_by, rewrite)?,
+            resolved,
         },
         ScalarNode::Cast { child, target } => ScalarNode::Cast {
             child: rewrite(arena, child)?,
@@ -474,6 +476,8 @@ where
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -482,6 +486,8 @@ where
             name,
             args: rewrite_vec(arena, args, rewrite)?,
             distinct,
+            function_order_by: rewrite_sort_keys(arena, function_order_by, rewrite)?,
+            aggregate_binding,
             partition_by: rewrite_vec(arena, partition_by, rewrite)?,
             order_by: rewrite_sort_keys(arena, order_by, rewrite)?,
             window_frame,
@@ -582,6 +588,7 @@ pub(super) fn assert_true(
 pub(super) fn count_one_spec(
     arena: &mut ScalarArena,
     output_column_id: ColumnId,
+    resolved: novarocks_functions::ResolvedAggregateSignature,
 ) -> ScalarAggregateSpec {
     ScalarAggregateSpec {
         output_column_id,
@@ -589,16 +596,22 @@ pub(super) fn count_one_spec(
         args: vec![int_literal(arena, 1)],
         distinct: false,
         order_by: vec![],
+        resolved,
     }
 }
 
-pub(super) fn any_value_spec(arg: ScalarId, output_column_id: ColumnId) -> ScalarAggregateSpec {
+pub(super) fn any_value_spec(
+    arg: ScalarId,
+    output_column_id: ColumnId,
+    resolved: novarocks_functions::ResolvedAggregateSignature,
+) -> ScalarAggregateSpec {
     ScalarAggregateSpec {
         output_column_id,
         name: "any_value".to_string(),
         args: vec![arg],
         distinct: false,
         order_by: vec![],
+        resolved,
     }
 }
 
@@ -671,24 +684,6 @@ pub(super) fn apply_kind_is_scalar(kind: &ApplyKind) -> bool {
     *kind == ApplyKind::Scalar
 }
 
-pub(super) fn window_spec_from_aggregate(
-    name: String,
-    args: Vec<ScalarId>,
-    _result_type: DataType,
-    output_column_id: ColumnId,
-) -> ScalarWindowSpec {
-    ScalarWindowSpec {
-        output_column_id,
-        name,
-        args,
-        distinct: false,
-        partition_by: vec![],
-        order_by: vec![],
-        window_frame: None,
-        ignore_nulls: false,
-    }
-}
-
 pub(super) fn scan_column_map(expr: &OptExpr) -> HashMap<ColumnId, (String, String)> {
     let mut map = HashMap::new();
     scan_column_map_inner(expr, &mut map);
@@ -738,6 +733,7 @@ mod tests {
                     args: vec![],
                     distinct: false,
                     order_by: vec![],
+                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
                 }],
                 AggregateOutputLayout::new(
                     vec![output_column(group_id, "k")],

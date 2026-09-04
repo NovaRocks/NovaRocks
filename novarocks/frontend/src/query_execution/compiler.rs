@@ -1788,10 +1788,14 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             .sole_target_ordinal()
             .map_err(crate::dml::error::DmlExecutionError::from)?,
     };
+    let statistics_requirements = write_session
+        .statistics_requirements(ordinal)
+        .map_err(|error| crate::dml::error::DmlExecutionError::from(error.to_string()))?;
     let distributed_plan = novarocks_sql::planning::dml::compile_connector_write_dataflow_plan(
         optimize_request,
         sink,
         ordinal,
+        statistics_requirements,
         &optimizer_settings,
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(

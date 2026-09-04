@@ -615,6 +615,11 @@ mod tests {
                     result_type: DataType::Binary,
                     order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(20),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum_state_signed",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: Vec::new(),
                 already_pushed: false,

@@ -28,6 +28,7 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 use chrono::{DateTime, NaiveDate};
 use std::cmp::Ordering;
 
+use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, aggregate_bytes};
 use novarocks_types::largeint;
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
 
@@ -51,15 +52,38 @@ pub(in crate::exec::expr::agg) fn build_bool_array(
     Ok(Arc::new(builder.finish()))
 }
 
+#[derive(Debug)]
+pub(super) struct TrackedUtf8State {
+    pub(super) value: Option<AggregateVec<u8>>,
+    pub(super) allocator: AggregateAllocator,
+}
+
+impl TrackedUtf8State {
+    pub(super) fn new(allocator: AggregateAllocator) -> Self {
+        Self {
+            value: None,
+            allocator,
+        }
+    }
+
+    pub(super) fn replace(&mut self, value: &str) -> Result<(), String> {
+        let replacement = aggregate_bytes(self.allocator.clone(), value.as_bytes())?;
+        self.value = Some(replacement);
+        Ok(())
+    }
+}
+
 pub(in crate::exec::expr::agg) fn build_utf8_array(
     offset: usize,
     group_states: &[AggStatePtr],
 ) -> Result<ArrayRef, String> {
     let mut builder = StringBuilder::new();
     for &base in group_states {
-        let state = unsafe { &*((base as *mut u8).add(offset) as *const Utf8State) };
+        let state = unsafe { &*((base as *mut u8).add(offset) as *const TrackedUtf8State) };
         match &state.value {
-            Some(v) => builder.append_value(v),
+            Some(value) => {
+                builder.append_value(std::str::from_utf8(value).map_err(|error| error.to_string())?)
+            }
             None => builder.append_null(),
         }
     }
@@ -195,6 +219,657 @@ pub enum AggScalarValue {
     Struct(Vec<Option<AggScalarValue>>),
     Map(Vec<(Option<AggScalarValue>, Option<AggScalarValue>)>),
     List(Vec<Option<AggScalarValue>>),
+}
+
+/// Aggregate-state-owned scalar whose complete recursive heap graph uses the
+/// query's exact aggregate allocator. Arrow output materialization converts
+/// this value back to `AggScalarValue`; the tracked form never escapes the
+/// aggregate state.
+#[derive(Debug)]
+pub(super) enum TrackedAggScalarValue {
+    Bool(bool),
+    Int64(i64),
+    Float64(f64),
+    Utf8(AggregateVec<u8>),
+    Date32(i32),
+    Timestamp(i64),
+    Decimal128(i128),
+    Decimal256(i256),
+    Binary(AggregateVec<u8>),
+    Struct(AggregateVec<Option<TrackedAggScalarValue>>),
+    Map(AggregateVec<(Option<TrackedAggScalarValue>, Option<TrackedAggScalarValue>)>),
+    List(AggregateVec<Option<TrackedAggScalarValue>>),
+}
+
+pub(super) fn aggregate_vec_with_capacity<T>(
+    allocator: &AggregateAllocator,
+    capacity: usize,
+    operation: &str,
+) -> Result<AggregateVec<T>, String> {
+    let mut values = AggregateVec::new_in(allocator.clone());
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| allocator.allocation_error(operation))?;
+    Ok(values)
+}
+
+pub(super) fn tracked_scalar_from_array(
+    array: &ArrayRef,
+    row: usize,
+    allocator: &AggregateAllocator,
+) -> Result<Option<TrackedAggScalarValue>, String> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let value = match array.data_type() {
+        DataType::Null => return Ok(None),
+        DataType::Boolean => TrackedAggScalarValue::Bool(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?
+                .value(row),
+        ),
+        DataType::Int8 => TrackedAggScalarValue::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?
+                .value(row) as i64,
+        ),
+        DataType::Int16 => TrackedAggScalarValue::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?
+                .value(row) as i64,
+        ),
+        DataType::Int32 => TrackedAggScalarValue::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?
+                .value(row) as i64,
+        ),
+        DataType::Int64 => TrackedAggScalarValue::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?
+                .value(row),
+        ),
+        DataType::Float32 => TrackedAggScalarValue::Float64(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?
+                .value(row) as f64,
+        ),
+        DataType::Float64 => TrackedAggScalarValue::Float64(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?
+                .value(row),
+        ),
+        DataType::Utf8 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast to StringArray".to_string())?
+                .value(row);
+            TrackedAggScalarValue::Utf8(aggregate_bytes(allocator.clone(), value.as_bytes())?)
+        }
+        DataType::Binary => {
+            let value = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?
+                .value(row);
+            TrackedAggScalarValue::Binary(aggregate_bytes(allocator.clone(), value)?)
+        }
+        DataType::LargeBinary => {
+            let value = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?
+                .value(row);
+            TrackedAggScalarValue::Binary(aggregate_bytes(allocator.clone(), value)?)
+        }
+        DataType::Date32 => TrackedAggScalarValue::Date32(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?
+                .value(row),
+        ),
+        DataType::Timestamp(unit, _) => {
+            let value = match unit {
+                TimeUnit::Second => array
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?
+                    .value(row),
+                TimeUnit::Millisecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .ok_or_else(|| "failed to downcast to TimestampMillisecondArray".to_string())?
+                    .value(row),
+                TimeUnit::Microsecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?
+                    .value(row),
+                TimeUnit::Nanosecond => array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .ok_or_else(|| "failed to downcast to TimestampNanosecondArray".to_string())?
+                    .value(row),
+            };
+            TrackedAggScalarValue::Timestamp(value)
+        }
+        DataType::Decimal128(_, _) => TrackedAggScalarValue::Decimal128(
+            array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?
+                .value(row),
+        ),
+        DataType::Decimal256(_, _) => TrackedAggScalarValue::Decimal256(
+            array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?
+                .value(row),
+        ),
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            let array = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
+            TrackedAggScalarValue::Decimal128(largeint::value_at(array, row)?)
+        }
+        DataType::List(_) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+            let offsets = array.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let mut values = aggregate_vec_with_capacity(
+                allocator,
+                end.saturating_sub(start),
+                "reserve aggregate list scalar",
+            )?;
+            for index in start..end {
+                values.push(tracked_scalar_from_array(array.values(), index, allocator)?);
+            }
+            TrackedAggScalarValue::List(values)
+        }
+        DataType::Struct(fields) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
+            let mut values = aggregate_vec_with_capacity(
+                allocator,
+                fields.len(),
+                "reserve aggregate struct scalar",
+            )?;
+            for column in array.columns() {
+                values.push(tracked_scalar_from_array(column, row, allocator)?);
+            }
+            TrackedAggScalarValue::Struct(values)
+        }
+        DataType::Map(_, _) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| "failed to downcast to MapArray".to_string())?;
+            let offsets = array.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let mut entries = aggregate_vec_with_capacity(
+                allocator,
+                end.saturating_sub(start),
+                "reserve aggregate map scalar",
+            )?;
+            for index in start..end {
+                entries.push((
+                    tracked_scalar_from_array(array.keys(), index, allocator)?,
+                    tracked_scalar_from_array(array.values(), index, allocator)?,
+                ));
+            }
+            TrackedAggScalarValue::Map(entries)
+        }
+        other => return Err(format!("unsupported tracked scalar type: {other:?}")),
+    };
+    Ok(Some(value))
+}
+
+#[cfg(test)]
+pub(super) fn tracked_scalar_from_value(
+    value: AggScalarValue,
+    allocator: &AggregateAllocator,
+) -> Result<TrackedAggScalarValue, String> {
+    Ok(match value {
+        AggScalarValue::Bool(value) => TrackedAggScalarValue::Bool(value),
+        AggScalarValue::Int64(value) => TrackedAggScalarValue::Int64(value),
+        AggScalarValue::Float64(value) => TrackedAggScalarValue::Float64(value),
+        AggScalarValue::Utf8(value) => {
+            TrackedAggScalarValue::Utf8(aggregate_bytes(allocator.clone(), value.as_bytes())?)
+        }
+        AggScalarValue::Date32(value) => TrackedAggScalarValue::Date32(value),
+        AggScalarValue::Timestamp(value) => TrackedAggScalarValue::Timestamp(value),
+        AggScalarValue::Decimal128(value) => TrackedAggScalarValue::Decimal128(value),
+        AggScalarValue::Decimal256(value) => TrackedAggScalarValue::Decimal256(value),
+        AggScalarValue::Binary(value) => {
+            TrackedAggScalarValue::Binary(aggregate_bytes(allocator.clone(), &value)?)
+        }
+        AggScalarValue::Struct(values) => TrackedAggScalarValue::Struct(
+            tracked_optional_values_from_values(values, allocator, "struct")?,
+        ),
+        AggScalarValue::List(values) => TrackedAggScalarValue::List(
+            tracked_optional_values_from_values(values, allocator, "list")?,
+        ),
+        AggScalarValue::Map(entries) => {
+            let mut tracked = aggregate_vec_with_capacity(
+                allocator,
+                entries.len(),
+                "reserve aggregate map scalar",
+            )?;
+            for (key, value) in entries {
+                tracked.push((
+                    key.map(|value| tracked_scalar_from_value(value, allocator))
+                        .transpose()?,
+                    value
+                        .map(|value| tracked_scalar_from_value(value, allocator))
+                        .transpose()?,
+                ));
+            }
+            TrackedAggScalarValue::Map(tracked)
+        }
+    })
+}
+
+#[cfg(test)]
+fn tracked_optional_values_from_values(
+    values: Vec<Option<AggScalarValue>>,
+    allocator: &AggregateAllocator,
+    kind: &str,
+) -> Result<AggregateVec<Option<TrackedAggScalarValue>>, String> {
+    let operation = match kind {
+        "struct" => "reserve aggregate struct scalar",
+        "list" => "reserve aggregate list scalar",
+        _ => "reserve aggregate nested scalar",
+    };
+    let mut tracked = aggregate_vec_with_capacity(allocator, values.len(), operation)?;
+    for value in values {
+        tracked.push(
+            value
+                .map(|value| tracked_scalar_from_value(value, allocator))
+                .transpose()?,
+        );
+    }
+    Ok(tracked)
+}
+
+fn try_copy_bytes(bytes: &[u8], operation: &str) -> Result<Vec<u8>, String> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len())
+        .map_err(|_| format!("ResourceExhausted: {operation}"))?;
+    copy.extend_from_slice(bytes);
+    Ok(copy)
+}
+
+pub(super) fn tracked_scalar_to_output(
+    value: &TrackedAggScalarValue,
+) -> Result<AggScalarValue, String> {
+    Ok(match value {
+        TrackedAggScalarValue::Bool(value) => AggScalarValue::Bool(*value),
+        TrackedAggScalarValue::Int64(value) => AggScalarValue::Int64(*value),
+        TrackedAggScalarValue::Float64(value) => AggScalarValue::Float64(*value),
+        TrackedAggScalarValue::Utf8(value) => AggScalarValue::Utf8(
+            String::from_utf8(try_copy_bytes(value, "copy aggregate UTF-8 output")?)
+                .map_err(|error| error.to_string())?,
+        ),
+        TrackedAggScalarValue::Date32(value) => AggScalarValue::Date32(*value),
+        TrackedAggScalarValue::Timestamp(value) => AggScalarValue::Timestamp(*value),
+        TrackedAggScalarValue::Decimal128(value) => AggScalarValue::Decimal128(*value),
+        TrackedAggScalarValue::Decimal256(value) => AggScalarValue::Decimal256(*value),
+        TrackedAggScalarValue::Binary(value) => {
+            AggScalarValue::Binary(try_copy_bytes(value, "copy aggregate binary output")?)
+        }
+        TrackedAggScalarValue::Struct(values) => {
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(values.len())
+                .map_err(|_| "ResourceExhausted: copy aggregate struct output".to_string())?;
+            for value in values {
+                output.push(value.as_ref().map(tracked_scalar_to_output).transpose()?);
+            }
+            AggScalarValue::Struct(output)
+        }
+        TrackedAggScalarValue::Map(entries) => {
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(entries.len())
+                .map_err(|_| "ResourceExhausted: copy aggregate map output".to_string())?;
+            for (key, value) in entries {
+                output.push((
+                    key.as_ref().map(tracked_scalar_to_output).transpose()?,
+                    value.as_ref().map(tracked_scalar_to_output).transpose()?,
+                ));
+            }
+            AggScalarValue::Map(output)
+        }
+        TrackedAggScalarValue::List(values) => {
+            let mut output = Vec::new();
+            output
+                .try_reserve_exact(values.len())
+                .map_err(|_| "ResourceExhausted: copy aggregate list output".to_string())?;
+            for value in values {
+                output.push(value.as_ref().map(tracked_scalar_to_output).transpose()?);
+            }
+            AggScalarValue::List(output)
+        }
+    })
+}
+
+pub(super) fn compare_tracked_scalar_values(
+    left: &TrackedAggScalarValue,
+    right: &TrackedAggScalarValue,
+) -> Result<Ordering, String> {
+    match (left, right) {
+        (TrackedAggScalarValue::Bool(left), TrackedAggScalarValue::Bool(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Int64(left), TrackedAggScalarValue::Int64(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Float64(left), TrackedAggScalarValue::Float64(right)) => left
+            .partial_cmp(right)
+            .ok_or_else(|| "float comparison is not ordered".to_string()),
+        (TrackedAggScalarValue::Utf8(left), TrackedAggScalarValue::Utf8(right))
+        | (TrackedAggScalarValue::Binary(left), TrackedAggScalarValue::Binary(right)) => {
+            Ok(left.as_slice().cmp(right.as_slice()))
+        }
+        (TrackedAggScalarValue::Date32(left), TrackedAggScalarValue::Date32(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Timestamp(left), TrackedAggScalarValue::Timestamp(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Decimal128(left), TrackedAggScalarValue::Decimal128(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Decimal256(left), TrackedAggScalarValue::Decimal256(right)) => {
+            Ok(left.cmp(right))
+        }
+        (TrackedAggScalarValue::Struct(left), TrackedAggScalarValue::Struct(right))
+        | (TrackedAggScalarValue::List(left), TrackedAggScalarValue::List(right)) => {
+            compare_tracked_optional_slices(left, right)
+        }
+        (TrackedAggScalarValue::Map(left), TrackedAggScalarValue::Map(right)) => {
+            for ((left_key, left_value), (right_key, right_value)) in left.iter().zip(right) {
+                let ordering = compare_tracked_optional_values(left_key, right_key)?;
+                if !ordering.is_eq() {
+                    return Ok(ordering);
+                }
+                let ordering = compare_tracked_optional_values(left_value, right_value)?;
+                if !ordering.is_eq() {
+                    return Ok(ordering);
+                }
+            }
+            Ok(left.len().cmp(&right.len()))
+        }
+        _ => Err("tracked scalar comparison type mismatch".to_string()),
+    }
+}
+
+pub(super) fn tracked_key_fingerprint(
+    key: &TrackedAggScalarValue,
+    allocator: &AggregateAllocator,
+) -> Result<AggregateVec<u8>, String> {
+    let encoded_len = tracked_scalar_encoded_len(key)?;
+    let mut output = aggregate_vec_with_capacity(
+        allocator,
+        encoded_len,
+        "reserve aggregate scalar fingerprint",
+    )?;
+    encode_tracked_scalar(&mut output, key)?;
+    debug_assert_eq!(output.len(), encoded_len);
+    Ok(output)
+}
+
+pub(super) fn tracked_optional_key_fingerprint(
+    value: &Option<TrackedAggScalarValue>,
+    allocator: &AggregateAllocator,
+) -> Result<AggregateVec<u8>, String> {
+    let value_len = value
+        .as_ref()
+        .map(tracked_scalar_encoded_len)
+        .transpose()?
+        .unwrap_or(0);
+    let encoded_len = 1usize
+        .checked_add(value_len)
+        .ok_or_else(|| "aggregate scalar fingerprint length overflow".to_string())?;
+    let mut output = aggregate_vec_with_capacity(
+        allocator,
+        encoded_len,
+        "reserve optional aggregate scalar fingerprint",
+    )?;
+    encode_tracked_optional_value(&mut output, value)?;
+    debug_assert_eq!(output.len(), encoded_len);
+    Ok(output)
+}
+
+fn checked_encoded_len_add(total: &mut usize, additional: usize) -> Result<(), String> {
+    *total = total
+        .checked_add(additional)
+        .ok_or_else(|| "aggregate scalar fingerprint length overflow".to_string())?;
+    Ok(())
+}
+
+fn checked_u32_len(len: usize) -> Result<u32, String> {
+    u32::try_from(len).map_err(|_| "aggregate scalar fingerprint exceeds u32 length".to_string())
+}
+
+fn tracked_scalar_encoded_len(value: &TrackedAggScalarValue) -> Result<usize, String> {
+    let mut len = 1usize;
+    match value {
+        TrackedAggScalarValue::Bool(_) => checked_encoded_len_add(&mut len, 1)?,
+        TrackedAggScalarValue::Int64(_)
+        | TrackedAggScalarValue::Float64(_)
+        | TrackedAggScalarValue::Timestamp(_) => checked_encoded_len_add(&mut len, 8)?,
+        TrackedAggScalarValue::Date32(_) => checked_encoded_len_add(&mut len, 4)?,
+        TrackedAggScalarValue::Decimal128(_) => checked_encoded_len_add(&mut len, 16)?,
+        TrackedAggScalarValue::Decimal256(_) => checked_encoded_len_add(&mut len, 32)?,
+        TrackedAggScalarValue::Utf8(bytes) | TrackedAggScalarValue::Binary(bytes) => {
+            let _ = checked_u32_len(bytes.len())?;
+            checked_encoded_len_add(&mut len, 4)?;
+            checked_encoded_len_add(&mut len, bytes.len())?;
+        }
+        TrackedAggScalarValue::Struct(values) | TrackedAggScalarValue::List(values) => {
+            let _ = checked_u32_len(values.len())?;
+            checked_encoded_len_add(&mut len, 4)?;
+            for value in values {
+                checked_encoded_len_add(&mut len, 1)?;
+                if let Some(value) = value {
+                    checked_encoded_len_add(&mut len, tracked_scalar_encoded_len(value)?)?;
+                }
+            }
+        }
+        TrackedAggScalarValue::Map(entries) => {
+            let _ = checked_u32_len(entries.len())?;
+            checked_encoded_len_add(&mut len, 4)?;
+            for (key, value) in entries {
+                for value in [key, value] {
+                    checked_encoded_len_add(&mut len, 1)?;
+                    if let Some(value) = value {
+                        checked_encoded_len_add(&mut len, tracked_scalar_encoded_len(value)?)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(len)
+}
+
+fn encode_tracked_scalar(
+    output: &mut AggregateVec<u8>,
+    value: &TrackedAggScalarValue,
+) -> Result<(), String> {
+    match value {
+        TrackedAggScalarValue::Bool(value) => {
+            output.push(1);
+            output.push(u8::from(*value));
+        }
+        TrackedAggScalarValue::Int64(value) => {
+            output.push(2);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        TrackedAggScalarValue::Float64(value) => {
+            output.push(3);
+            let bits = if value.is_nan() {
+                f64::NAN.to_bits()
+            } else {
+                value.to_bits()
+            };
+            output.extend_from_slice(&bits.to_le_bytes());
+        }
+        TrackedAggScalarValue::Utf8(value) => {
+            output.push(4);
+            output.extend_from_slice(&checked_u32_len(value.len())?.to_le_bytes());
+            output.extend_from_slice(value);
+        }
+        TrackedAggScalarValue::Date32(value) => {
+            output.push(5);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        TrackedAggScalarValue::Timestamp(value) => {
+            output.push(6);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        TrackedAggScalarValue::Decimal128(value) => {
+            output.push(7);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        TrackedAggScalarValue::Struct(values) => {
+            output.push(8);
+            encode_tracked_optional_values(output, values)?;
+        }
+        TrackedAggScalarValue::Map(entries) => {
+            output.push(9);
+            output.extend_from_slice(&checked_u32_len(entries.len())?.to_le_bytes());
+            for (key, value) in entries {
+                encode_tracked_optional_value(output, key)?;
+                encode_tracked_optional_value(output, value)?;
+            }
+        }
+        TrackedAggScalarValue::List(values) => {
+            output.push(10);
+            encode_tracked_optional_values(output, values)?;
+        }
+        TrackedAggScalarValue::Decimal256(value) => {
+            output.push(11);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        TrackedAggScalarValue::Binary(value) => {
+            output.push(12);
+            output.extend_from_slice(&checked_u32_len(value.len())?.to_le_bytes());
+            output.extend_from_slice(value);
+        }
+    }
+    Ok(())
+}
+
+fn encode_tracked_optional_values(
+    output: &mut AggregateVec<u8>,
+    values: &[Option<TrackedAggScalarValue>],
+) -> Result<(), String> {
+    output.extend_from_slice(&checked_u32_len(values.len())?.to_le_bytes());
+    for value in values {
+        encode_tracked_optional_value(output, value)?;
+    }
+    Ok(())
+}
+
+fn encode_tracked_optional_value(
+    output: &mut AggregateVec<u8>,
+    value: &Option<TrackedAggScalarValue>,
+) -> Result<(), String> {
+    if let Some(value) = value {
+        output.push(1);
+        encode_tracked_scalar(output, value)?;
+    } else {
+        output.push(0);
+    }
+    Ok(())
+}
+
+fn compare_tracked_optional_slices(
+    left: &[Option<TrackedAggScalarValue>],
+    right: &[Option<TrackedAggScalarValue>],
+) -> Result<Ordering, String> {
+    for (left, right) in left.iter().zip(right) {
+        let ordering = compare_tracked_optional_values(left, right)?;
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    Ok(left.len().cmp(&right.len()))
+}
+
+fn compare_tracked_optional_values(
+    left: &Option<TrackedAggScalarValue>,
+    right: &Option<TrackedAggScalarValue>,
+) -> Result<Ordering, String> {
+    match (left, right) {
+        (None, None) => Ok(Ordering::Equal),
+        (None, Some(_)) => Ok(Ordering::Less),
+        (Some(_), None) => Ok(Ordering::Greater),
+        (Some(left), Some(right)) => compare_tracked_scalar_values(left, right),
+    }
+}
+
+/// Heap bytes owned by a scalar value, excluding the inline enum body.
+///
+/// This walks a newly materialized value once. Aggregate states that can hold
+/// an unbounded number of values cache the resulting sum so their
+/// `retained_bytes` implementation remains O(1).
+#[cfg(test)]
+pub(super) fn scalar_heap_bytes(value: &AggScalarValue) -> usize {
+    match value {
+        AggScalarValue::Utf8(value) => value.capacity(),
+        AggScalarValue::Binary(value) => value.capacity(),
+        AggScalarValue::Struct(values) | AggScalarValue::List(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<AggScalarValue>>())
+            .saturating_add(
+                values
+                    .iter()
+                    .flatten()
+                    .map(scalar_heap_bytes)
+                    .sum::<usize>(),
+            ),
+        AggScalarValue::Map(entries) => entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(
+                Option<AggScalarValue>,
+                Option<AggScalarValue>,
+            )>())
+            .saturating_add(
+                entries
+                    .iter()
+                    .flat_map(|(key, value)| [key.as_ref(), value.as_ref()])
+                    .flatten()
+                    .map(scalar_heap_bytes)
+                    .sum::<usize>(),
+            ),
+        _ => 0,
+    }
 }
 
 pub fn scalar_from_array(array: &ArrayRef, row: usize) -> Result<Option<AggScalarValue>, String> {
@@ -1169,5 +1844,138 @@ pub fn build_scalar_array(
             Ok(Arc::new(out))
         }
         other => Err(format!("unsupported scalar output type: {:?}", other)),
+    }
+}
+
+#[cfg(test)]
+mod retained_bytes_tests {
+    use super::*;
+    use crate::runtime::mem_tracker::MemTracker;
+    use arrow::datatypes::{Field, Fields};
+
+    #[test]
+    fn scalar_heap_bytes_counts_nested_capacities_once() {
+        let mut text = String::with_capacity(64);
+        text.push_str("value");
+        let text_capacity = text.capacity();
+        let mut binary = Vec::with_capacity(32);
+        binary.extend_from_slice(b"bytes");
+        let binary_capacity = binary.capacity();
+        let mut items = Vec::with_capacity(8);
+        items.push(Some(AggScalarValue::Utf8(text)));
+        items.push(Some(AggScalarValue::Binary(binary)));
+        let items_capacity = items.capacity();
+        let value = AggScalarValue::List(items);
+
+        assert_eq!(
+            scalar_heap_bytes(&value),
+            items_capacity * std::mem::size_of::<Option<AggScalarValue>>()
+                + text_capacity
+                + binary_capacity
+        );
+    }
+
+    #[test]
+    fn tracked_scalar_owns_nested_string_binary_list_struct_and_map_allocations() {
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let map_entry_type = DataType::Struct(Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Binary, true),
+        ]));
+        let map_type = DataType::Map(
+            Arc::new(Field::new("entries", map_entry_type, false)),
+            false,
+        );
+        let struct_type = DataType::Struct(Fields::from(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new("bytes", DataType::Binary, true),
+            Field::new("items", list_type.clone(), true),
+            Field::new("attributes", map_type.clone(), true),
+        ]));
+        let input_value = AggScalarValue::Struct(vec![
+            Some(AggScalarValue::Utf8("root".to_string())),
+            Some(AggScalarValue::Binary(vec![1, 2, 3])),
+            Some(AggScalarValue::List(vec![
+                Some(AggScalarValue::Utf8("first".to_string())),
+                None,
+            ])),
+            Some(AggScalarValue::Map(vec![(
+                Some(AggScalarValue::Utf8("key".to_string())),
+                Some(AggScalarValue::Binary(vec![4, 5])),
+            )])),
+        ]);
+        let array = build_scalar_array(&struct_type, vec![Some(input_value)]).unwrap();
+        let tracker = MemTracker::new_root("nested-tracked-scalar-test");
+        let allocator = AggregateAllocator::new(Arc::clone(&tracker));
+
+        let tracked = tracked_scalar_from_array(&array, 0, &allocator)
+            .unwrap()
+            .unwrap();
+        assert!(tracker.current() > 0);
+        let output = tracked_scalar_to_output(&tracked).unwrap();
+        let AggScalarValue::Struct(fields) = output else {
+            panic!("expected struct output");
+        };
+        assert!(matches!(
+            fields[0].as_ref(),
+            Some(AggScalarValue::Utf8(value)) if value == "root"
+        ));
+        assert!(matches!(
+            fields[1].as_ref(),
+            Some(AggScalarValue::Binary(value)) if value == &[1, 2, 3]
+        ));
+        assert!(matches!(fields[2], Some(AggScalarValue::List(_))));
+        assert!(matches!(fields[3], Some(AggScalarValue::Map(_))));
+
+        drop(tracked);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn tracked_nested_scalar_oom_releases_partial_recursive_allocations() {
+        let struct_type =
+            DataType::Struct(Fields::from(vec![Field::new("text", DataType::Utf8, true)]));
+        let array = build_scalar_array(
+            &struct_type,
+            vec![Some(AggScalarValue::Struct(vec![Some(
+                AggScalarValue::Utf8("too-large".to_string()),
+            )]))],
+        )
+        .unwrap();
+        let tracker = MemTracker::new_root("nested-tracked-scalar-oom-test");
+        tracker.install_limit_once(1).unwrap();
+        let allocator = AggregateAllocator::new(Arc::clone(&tracker));
+
+        let error = tracked_scalar_from_array(&array, 0, &allocator).unwrap_err();
+        assert!(error.contains("ResourceExhausted"));
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn tracked_fingerprint_is_exactly_reserved_and_released() {
+        let value = AggScalarValue::Struct(vec![
+            Some(AggScalarValue::Int64(7)),
+            Some(AggScalarValue::Utf8("tracked".to_string())),
+        ]);
+        let data_type = DataType::Struct(Fields::from(vec![
+            Field::new("number", DataType::Int64, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let array = build_scalar_array(&data_type, vec![Some(value.clone())]).unwrap();
+        let tracker = MemTracker::new_root("tracked-fingerprint-test");
+        let allocator = AggregateAllocator::new(Arc::clone(&tracker));
+        let tracked = tracked_scalar_from_array(&array, 0, &allocator)
+            .unwrap()
+            .unwrap();
+        let state_bytes = tracker.current();
+
+        let fingerprint = tracked_key_fingerprint(&tracked, &allocator).unwrap();
+        assert_eq!(fingerprint.as_slice(), key_fingerprint(&value));
+        assert_eq!(fingerprint.len(), fingerprint.capacity());
+        assert!(tracker.current() > state_bytes);
+
+        drop(fingerprint);
+        drop(tracked);
+        assert_eq!(tracker.current(), 0);
     }
 }

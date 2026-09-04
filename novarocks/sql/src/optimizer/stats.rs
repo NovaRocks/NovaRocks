@@ -3057,6 +3057,11 @@ mod tests {
                 result_type: arrow::datatypes::DataType::Int64,
                 order_by: vec![],
                 output_column_id: ColumnId::new_for_test(3),
+                resolved: crate::functions::test_resolved_aggregate(
+                    "count",
+                    &[arrow::datatypes::DataType::Int64],
+                    false,
+                ),
             }
         }
 
@@ -4772,6 +4777,8 @@ mod tests {
                 name: "row_number".to_string(),
                 args: vec![],
                 distinct: false,
+                function_order_by: vec![],
+                aggregate_binding: None,
                 partition_by: vec![],
                 order_by: vec![],
                 window_frame: None,

@@ -96,6 +96,7 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
             args,
             distinct,
             order_by,
+            ..
         } => agg_call_display_name_from_parts(name, args, *distinct, order_by),
         ExprKind::Cast {
             expr: inner,

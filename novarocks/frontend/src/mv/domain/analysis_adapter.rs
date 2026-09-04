@@ -226,6 +226,7 @@ pub fn analyze_mv_select_with_provider(
     provider: &dyn novarocks_sql::planning::catalog::PlannerTableProvider,
     current_database: &str,
     query: &novarocks_parser::ast::Query,
+    functions: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
 ) -> Result<MvAnalysis, String> {
     let prepared =
         prepare_mv_select_for_catalog_provider(query, current_catalog, current_database)?;
@@ -235,6 +236,7 @@ pub fn analyze_mv_select_with_provider(
             query: Box::new(prepared.query_for_analysis().clone()),
             current_database: current_database.to_string(),
             catalog: &catalog,
+            functions,
         },
     )?;
     let output_columns = refresh_input.analysis_facts().output_columns;

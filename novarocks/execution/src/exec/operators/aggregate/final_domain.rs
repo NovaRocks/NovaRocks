@@ -186,15 +186,7 @@ fn final_key_row_count(final_key_column: &KeyColumn) -> Result<usize, FinalAggre
         }
         KeyColumn::ListUtf8 { values } => Ok(values.len()),
         KeyColumn::ListInt32 { values } => Ok(values.len()),
-        KeyColumn::Complex {
-            keys,
-            nulls,
-            values,
-            ..
-        } => {
-            let rows = parallel_row_count(keys.len(), nulls.len(), "Complex")?;
-            parallel_row_count(rows, values.len(), "Complex")
-        }
+        KeyColumn::Complex { keys, .. } => Ok(keys.len()),
     }
 }
 
@@ -208,10 +200,7 @@ mod tests {
 
     #[test]
     fn final_aggregate_key_transfers_the_validated_arrow_column() {
-        let columns = vec![KeyColumn::Int64 {
-            values: vec![7, -2, 7],
-            nulls: vec![1, 1, 1],
-        }];
+        let columns = vec![KeyColumn::int64_for_test(vec![7, -2, 7], vec![1, 1, 1])];
 
         let (data_type, array) = extract_final_aggregate_key(&columns).expect("valid key column");
 
@@ -233,23 +222,14 @@ mod tests {
             Err(FinalAggregateDomainError::MembershipKeyCount { actual: 0 })
         );
         let multiple = vec![
-            KeyColumn::Int64 {
-                values: vec![1],
-                nulls: vec![1],
-            },
-            KeyColumn::Int64 {
-                values: vec![2],
-                nulls: vec![1],
-            },
+            KeyColumn::int64_for_test(vec![1], vec![1]),
+            KeyColumn::int64_for_test(vec![2], vec![1]),
         ];
         assert_eq!(
             extract_final_aggregate_key(&multiple),
             Err(FinalAggregateDomainError::MembershipKeyCount { actual: 2 })
         );
-        let malformed = vec![KeyColumn::Int64 {
-            values: vec![1, 2],
-            nulls: vec![1],
-        }];
+        let malformed = vec![KeyColumn::int64_for_test(vec![1, 2], vec![1])];
         assert!(matches!(
             extract_final_aggregate_key(&malformed),
             Err(FinalAggregateDomainError::FinalKeyStructure(_))

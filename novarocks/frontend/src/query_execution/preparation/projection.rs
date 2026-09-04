@@ -36,17 +36,12 @@ pub(crate) struct PreparedOutputColumn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PreparedFragmentRole {
     Result,
-    Statistics,
     NonTerminal,
 }
 
 impl PreparedFragmentRole {
     pub(crate) fn uses_result_buffer(self) -> bool {
         matches!(self, Self::Result)
-    }
-
-    pub(crate) fn is_statistics(self) -> bool {
-        matches!(self, Self::Statistics)
     }
 }
 
@@ -116,6 +111,11 @@ struct PreparedPlanProjection {
     topological_fragment_order: Vec<FragmentId>,
     execution_anchor_fragment_id: FragmentId,
     edges: Vec<FragmentEdge>,
+    /// Exact logical write targets owned by this query's single TableFinish.
+    ///
+    /// A write session may span several distributed queries, so this is not
+    /// interchangeable with the session-wide dense target set.
+    write_root_targets: Option<Vec<novarocks_spi::connector::write_stack::WriteTargetOrdinal>>,
 }
 
 /// Exact scan/binding preparation for one sealed distributed plan. Its fields
@@ -138,6 +138,7 @@ impl PreparedFragmentSet {
         execution_anchor_fragment_id: FragmentId,
         edges: Vec<FragmentEdge>,
         runtime_filter_facts: SqlPreparedRuntimeFilterFacts,
+        write_root_targets: Option<Vec<novarocks_spi::connector::write_stack::WriteTargetOrdinal>>,
     ) -> Self {
         Self {
             by_fragment,
@@ -146,6 +147,7 @@ impl PreparedFragmentSet {
                 topological_fragment_order,
                 execution_anchor_fragment_id,
                 edges,
+                write_root_targets,
             },
             runtime_filter_facts,
         }
@@ -173,6 +175,12 @@ impl PreparedFragmentSet {
 
     pub(crate) fn runtime_filter_facts(&self) -> &SqlPreparedRuntimeFilterFacts {
         &self.runtime_filter_facts
+    }
+
+    pub(crate) fn write_root_targets(
+        &self,
+    ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
+        self.projection.write_root_targets.as_deref()
     }
 }
 

@@ -33,14 +33,12 @@
 //!
 //! [`Chunk`]: crate::exec::chunk::Chunk
 
-use std::sync::{Arc, OnceLock};
-
-use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::write_stack::{
-    ConnectorCommitFragment, WRITE_RELATION_FRAGMENT_INDEX, WRITE_RELATION_KIND_INDEX,
-    WRITE_RELATION_ROW_COUNT_INDEX, WRITE_RELATION_TARGET_INDEX, WriteTargetOrdinal,
-    root_output_schema, write_relation_column_id, writer_output_schema,
+    ConnectorCommitFragment, ROOT_WRITE_RESULT_COLUMN_COUNT, RootWriteResultSchema,
+    WRITE_RELATION_FRAGMENT_INDEX, WRITE_RELATION_KIND_INDEX, WRITE_RELATION_ROW_COUNT_INDEX,
+    WRITE_RELATION_TARGET_INDEX, WriteTargetOrdinal, WriterMultiplexSchema,
+    write_relation_column_id,
 };
 use novarocks_types::SlotId;
 
@@ -64,14 +62,6 @@ pub const WRITE_RELATION_ROW_COUNT_SLOT: SlotId =
 pub const WRITE_RELATION_FRAGMENT_SLOT: SlotId =
     SlotId::new(write_relation_column_id(WRITE_RELATION_FRAGMENT_INDEX));
 
-/// The slot ids of both write relations, in the column order SPI froze.
-pub const WRITE_RELATION_SLOT_IDS: [SlotId; 4] = [
-    WRITE_RELATION_KIND_SLOT,
-    WRITE_RELATION_TARGET_SLOT,
-    WRITE_RELATION_ROW_COUNT_SLOT,
-    WRITE_RELATION_FRAGMENT_SLOT,
-];
-
 const _: () = {
     assert!(WRITE_RELATION_KIND_INDEX == 0);
     assert!(WRITE_RELATION_TARGET_INDEX == 1);
@@ -79,34 +69,78 @@ const _: () = {
     assert!(WRITE_RELATION_FRAGMENT_INDEX == 3);
 };
 
-fn chunk_schema_for(schema: &SchemaRef) -> ChunkSchemaRef {
-    ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &WRITE_RELATION_SLOT_IDS)
-        .expect("the frozen write relation is a valid chunk schema")
+/// Execution-local slot binding of a plan-frozen writer multiplex schema.
+/// Auxiliary fields remain generic Arrow slots.
+#[derive(Clone, Debug)]
+pub struct WriterMultiplexRelationSchema {
+    contract: WriterMultiplexSchema,
+    chunk_schema: ChunkSchemaRef,
 }
 
-/// The cached `SchemaRef` every `TableWriter` output batch is built against.
-pub fn writer_relation_schema() -> SchemaRef {
-    static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
-    Arc::clone(SCHEMA.get_or_init(writer_output_schema))
+impl WriterMultiplexRelationSchema {
+    pub fn try_new(contract: WriterMultiplexSchema) -> Result<Self, String> {
+        let slot_ids = contract
+            .slot_ids()
+            .into_iter()
+            .map(SlotId::new)
+            .collect::<Vec<_>>();
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            contract.arrow_schema().as_ref(),
+            &slot_ids,
+        )
+        .map_err(|error| format!("writer multiplex chunk schema: {error}"))?;
+        Ok(Self {
+            contract,
+            chunk_schema,
+        })
+    }
+
+    pub fn empty() -> Self {
+        Self::try_new(WriterMultiplexSchema::empty()).expect("fixed writer prefix")
+    }
+
+    pub const fn contract(&self) -> &WriterMultiplexSchema {
+        &self.contract
+    }
+
+    pub const fn chunk_schema(&self) -> &ChunkSchemaRef {
+        &self.chunk_schema
+    }
 }
 
-/// The cached `SchemaRef` the single `TableFinish` output batch is built
-/// against.
-pub fn root_relation_schema() -> SchemaRef {
-    static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
-    Arc::clone(SCHEMA.get_or_init(root_output_schema))
+/// Execution-local slot binding of the fixed Root write result relation.
+#[derive(Clone, Debug)]
+pub struct RootWriteResultRelationSchema {
+    contract: RootWriteResultSchema,
+    chunk_schema: ChunkSchemaRef,
 }
 
-/// The chunk schema of the `TableWriter` output relation.
-pub fn writer_relation_chunk_schema() -> ChunkSchemaRef {
-    static CHUNK_SCHEMA: OnceLock<ChunkSchemaRef> = OnceLock::new();
-    Arc::clone(CHUNK_SCHEMA.get_or_init(|| chunk_schema_for(&writer_relation_schema())))
-}
+impl RootWriteResultRelationSchema {
+    pub fn try_new(contract: RootWriteResultSchema) -> Result<Self, String> {
+        let slot_ids = contract.slot_ids().map(SlotId::new);
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            contract.arrow_schema().as_ref(),
+            &slot_ids,
+        )
+        .map_err(|error| format!("root write result chunk schema: {error}"))?;
+        debug_assert_eq!(slot_ids.len(), ROOT_WRITE_RESULT_COLUMN_COUNT);
+        Ok(Self {
+            contract,
+            chunk_schema,
+        })
+    }
 
-/// The chunk schema of the `TableFinish` output relation.
-pub fn root_relation_chunk_schema() -> ChunkSchemaRef {
-    static CHUNK_SCHEMA: OnceLock<ChunkSchemaRef> = OnceLock::new();
-    Arc::clone(CHUNK_SCHEMA.get_or_init(|| chunk_schema_for(&root_relation_schema())))
+    pub fn fixed() -> Self {
+        Self::try_new(RootWriteResultSchema::new()).expect("fixed root write result")
+    }
+
+    pub const fn contract(&self) -> &RootWriteResultSchema {
+        &self.contract
+    }
+
+    pub const fn chunk_schema(&self) -> &ChunkSchemaRef {
+        &self.chunk_schema
+    }
 }
 
 /// Canonical commit-fragment egress port.
@@ -147,29 +181,59 @@ mod tests {
 
     #[test]
     fn execution_binds_the_spi_relations_without_redefining_them() {
-        assert_eq!(writer_relation_schema(), writer_output_schema());
-        assert_eq!(root_relation_schema(), root_output_schema());
+        let writer = WriterMultiplexRelationSchema::empty();
+        assert_eq!(
+            writer.contract().arrow_schema().as_ref(),
+            novarocks_spi::connector::write_stack::writer_output_schema().as_ref()
+        );
+        let root = RootWriteResultRelationSchema::fixed();
+        assert_eq!(
+            root.contract().arrow_schema().as_ref(),
+            RootWriteResultSchema::new().arrow_schema().as_ref()
+        );
     }
 
     #[test]
     fn every_relation_column_carries_its_slot_id_at_the_spi_column_index() {
-        for chunk_schema in [writer_relation_chunk_schema(), root_relation_chunk_schema()] {
+        let writer = WriterMultiplexRelationSchema::empty();
+        for (index, slot_id) in writer.contract().slot_ids().into_iter().enumerate() {
             assert_eq!(
-                chunk_schema.index_of(WRITE_RELATION_KIND_SLOT),
-                Some(WRITE_RELATION_KIND_INDEX)
-            );
-            assert_eq!(
-                chunk_schema.index_of(WRITE_RELATION_TARGET_SLOT),
-                Some(WRITE_RELATION_TARGET_INDEX)
-            );
-            assert_eq!(
-                chunk_schema.index_of(WRITE_RELATION_ROW_COUNT_SLOT),
-                Some(WRITE_RELATION_ROW_COUNT_INDEX)
-            );
-            assert_eq!(
-                chunk_schema.index_of(WRITE_RELATION_FRAGMENT_SLOT),
-                Some(WRITE_RELATION_FRAGMENT_INDEX)
+                writer.chunk_schema().index_of(SlotId::new(slot_id)),
+                Some(index)
             );
         }
+        let root = RootWriteResultRelationSchema::fixed();
+        for (index, slot_id) in root.contract().slot_ids().into_iter().enumerate() {
+            assert_eq!(
+                root.chunk_schema().index_of(SlotId::new(slot_id)),
+                Some(index)
+            );
+        }
+    }
+
+    #[test]
+    fn typed_relation_carriers_bind_every_generic_slot() {
+        let writer = WriterMultiplexRelationSchema::try_new(
+            WriterMultiplexSchema::try_new(vec![
+                novarocks_spi::connector::write_stack::WriterAuxiliaryChannel::try_new(
+                    7,
+                    "opaque_aux",
+                    arrow::datatypes::DataType::Struct(arrow::datatypes::Fields::from(vec![
+                        arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Utf8, true),
+                    ])),
+                )
+                .expect("channel"),
+            ])
+            .expect("contract"),
+        )
+        .expect("execution schema");
+        assert_eq!(writer.chunk_schema().slots().len(), 5);
+        assert_eq!(writer.chunk_schema().index_of(SlotId::new(7)), Some(4));
+
+        let root = RootWriteResultRelationSchema::fixed();
+        assert_eq!(
+            root.chunk_schema().slots().len(),
+            ROOT_WRITE_RESULT_COLUMN_COUNT
+        );
     }
 }

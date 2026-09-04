@@ -21,7 +21,7 @@
 //! then exclusively owned by one `sink_io` task for its complete lifecycle, so
 //! no provider future is polled on a driver thread and no writer mutex exists.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +34,7 @@ use novarocks_spi::connector::write_stack::{
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::exec::chunk::{ChunkMemoryLease, TransferredChunkBytes};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::execution_services::IoExecutor;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
@@ -70,7 +71,8 @@ struct AppendCommand {
     batch: RecordBatch,
     rows: usize,
     bytes: usize,
-    _accounting: Option<TrackedBytes>,
+    _transferred_accounting: Option<TransferredChunkBytes>,
+    _additional_accounting: Option<TrackedBytes>,
 }
 
 enum WriterCommand {
@@ -95,9 +97,15 @@ struct WriterShared<O> {
     finish_requested: AtomicBool,
     abort_requested: AtomicBool,
     done: AtomicBool,
+    terminal_result_produced: AtomicBool,
     result: Mutex<Option<O>>,
     error: Mutex<Option<String>>,
     queue_tracker: Mutex<Option<Arc<MemTracker>>>,
+    queue_peak_batches: AtomicUsize,
+    queue_peak_rows: AtomicUsize,
+    queue_peak_bytes: AtomicUsize,
+    queue_blocked_checks: AtomicUsize,
+    abort_requests: AtomicUsize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -116,9 +124,15 @@ impl<O> WriterShared<O> {
             finish_requested: AtomicBool::new(false),
             abort_requested: AtomicBool::new(false),
             done: AtomicBool::new(false),
+            terminal_result_produced: AtomicBool::new(false),
             result: Mutex::new(None),
             error: Mutex::new(None),
             queue_tracker: Mutex::new(None),
+            queue_peak_batches: AtomicUsize::new(0),
+            queue_peak_rows: AtomicUsize::new(0),
+            queue_peak_bytes: AtomicUsize::new(0),
+            queue_blocked_checks: AtomicUsize::new(0),
+            abort_requests: AtomicUsize::new(0),
         }
     }
 
@@ -136,6 +150,15 @@ impl<O> WriterShared<O> {
         usage.bytes = usage.bytes.saturating_sub(bytes);
         drop(usage);
         self.wake();
+    }
+
+    fn observe_queue_usage(&self, usage: QueueUsage) {
+        self.queue_peak_batches
+            .fetch_max(usage.batches, Ordering::Relaxed);
+        self.queue_peak_rows
+            .fetch_max(usage.rows, Ordering::Relaxed);
+        self.queue_peak_bytes
+            .fetch_max(usage.bytes, Ordering::Relaxed);
     }
 
     fn clear_queue_usage(&self) {
@@ -158,6 +181,84 @@ impl<O> WriterShared<O> {
     fn set_done(&self) {
         self.done.store(true, Ordering::Release);
         self.wake();
+    }
+
+    fn publish_terminal_result(&self, output: O) {
+        let mut result = self.result.lock().expect("async writer result lock");
+        debug_assert!(
+            result.is_none(),
+            "async writer publishes one terminal result"
+        );
+        *result = Some(output);
+        // This latch records the actor's irreversible production event. The
+        // result slot is consumer-owned after publication and can legitimately
+        // be empty again before the task wrapper finishes.
+        self.terminal_result_produced.store(true, Ordering::Release);
+        drop(result);
+        self.wake();
+    }
+
+    fn ensure_terminal_outcome(&self, runtime_error: &RuntimeErrorState) {
+        let has_error = self
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if !self.abort_requested.load(Ordering::Acquire)
+            && !self.terminal_result_produced.load(Ordering::Acquire)
+            && !has_error
+        {
+            self.set_error(
+                "connector writer actor exited without a terminal result".to_string(),
+                runtime_error,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AsyncWriterMetrics {
+    pub(crate) queue_peak_batches: usize,
+    pub(crate) queue_peak_rows: usize,
+    pub(crate) queue_peak_bytes: usize,
+    pub(crate) queue_blocked_checks: usize,
+    pub(crate) abort_requests: usize,
+}
+
+/// Capacity, channel admission, and retained-memory ownership reserved before
+/// a composite operator mutates any other child state.
+pub(crate) struct AsyncWriterReservation<O: Send + 'static> {
+    permit: Option<mpsc::OwnedPermit<WriterCommand>>,
+    shared: Arc<WriterShared<O>>,
+    rows: usize,
+    bytes: usize,
+    transferred_accounting: Option<TransferredChunkBytes>,
+    additional_accounting: Option<TrackedBytes>,
+    committed: bool,
+}
+
+impl<O: Send + 'static> AsyncWriterReservation<O> {
+    pub(crate) fn send(mut self, batch: RecordBatch) {
+        let command = WriterCommand::Append(AppendCommand {
+            batch,
+            rows: self.rows,
+            bytes: self.bytes,
+            _transferred_accounting: self.transferred_accounting.take(),
+            _additional_accounting: self.additional_accounting.take(),
+        });
+        self.permit
+            .take()
+            .expect("async writer reservation permit")
+            .send(command);
+        self.committed = true;
+    }
+}
+
+impl<O: Send + 'static> Drop for AsyncWriterReservation<O> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.shared.release_append(self.rows, self.bytes);
+        }
     }
 }
 
@@ -243,22 +344,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
             // admission counters after the matching TrackedBytes guards have
             // released their retained Arrow memory.
             shared.clear_queue_usage();
-            let has_result = shared
-                .result
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some();
-            let has_error = shared
-                .error
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some();
-            if !shared.abort_requested.load(Ordering::Acquire) && !has_result && !has_error {
-                shared.set_error(
-                    "connector writer actor exited without a terminal result".to_string(),
-                    &runtime_error,
-                );
-            }
+            shared.ensure_terminal_outcome(&runtime_error);
             // This is the actor's lifecycle join latch: all actor-owned writer,
             // receiver, future, and queued-memory values have been dropped by
             // this point. `JoinHandle::is_finished` closes the final scheduler
@@ -280,13 +366,47 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
             .queue_usage
             .lock()
             .expect("async writer queue usage lock");
-        usage.batches < self.config.max_batches
+        let can_accept = usage.batches < self.config.max_batches
             && usage.rows.saturating_add(self.config.max_batch_rows) <= self.config.max_rows
-            && usage.bytes.saturating_add(self.config.max_batch_bytes) <= self.config.max_bytes
+            && usage.bytes.saturating_add(self.config.max_batch_bytes) <= self.config.max_bytes;
+        if !can_accept {
+            self.shared
+                .queue_blocked_checks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        can_accept
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue(&self, batch: RecordBatch, retained_bytes: usize) -> Result<(), String> {
-        let rows = batch.num_rows();
+        self.enqueue_with_accounting(batch, retained_bytes, None, retained_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enqueue_with_accounting(
+        &self,
+        batch: RecordBatch,
+        retained_bytes: usize,
+        inherited_accounting: Option<ChunkMemoryLease>,
+        additional_bytes: usize,
+    ) -> Result<(), String> {
+        let reservation = self.try_reserve_input(
+            batch.num_rows(),
+            retained_bytes,
+            inherited_accounting,
+            additional_bytes,
+        )?;
+        reservation.send(batch);
+        Ok(())
+    }
+
+    pub(crate) fn try_reserve_input(
+        &self,
+        rows: usize,
+        retained_bytes: usize,
+        inherited_accounting: Option<ChunkMemoryLease>,
+        additional_bytes: usize,
+    ) -> Result<AsyncWriterReservation<O>, String> {
         if rows > self.config.max_batch_rows {
             return Err(format!(
                 "ResourceExhausted: connector writer input batch has {rows} rows, above the per-batch limit of {} rows",
@@ -316,28 +436,74 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
             usage.batches += 1;
             usage.rows += rows;
             usage.bytes += retained_bytes;
+            self.shared.observe_queue_usage(*usage);
         }
-        let tracker = self
+        if additional_bytes > retained_bytes {
+            self.shared.release_append(rows, retained_bytes);
+            return Err(format!(
+                "connector writer additional retained bytes {additional_bytes} exceed total retained bytes {retained_bytes}"
+            ));
+        }
+        let queue_tracker = self
             .shared
             .queue_tracker
             .lock()
             .expect("async writer queue tracker lock")
             .clone();
-        let command = WriterCommand::Append(AppendCommand {
-            batch,
-            rows,
-            bytes: retained_bytes,
-            _accounting: tracker.map(|tracker| TrackedBytes::new(retained_bytes, tracker)),
-        });
-        let Some(sender) = self.sender.as_ref() else {
+        let tracker =
+            queue_tracker.or_else(|| inherited_accounting.as_ref().map(ChunkMemoryLease::tracker));
+        let shared_projected_bytes = retained_bytes - additional_bytes;
+        let transferred_accounting = match (inherited_accounting.as_ref(), tracker.as_ref()) {
+            (Some(accounting), Some(tracker)) => {
+                match accounting.try_split_to(tracker, shared_projected_bytes) {
+                    Ok(accounting) => accounting,
+                    Err(error) => {
+                        self.shared.release_append(rows, retained_bytes);
+                        return Err(error);
+                    }
+                }
+            }
+            _ => None,
+        };
+        // An exclusive source lease transfers only buffers shared with the
+        // projection. A non-exclusive lease falls back to per-batch Scheme S:
+        // charge the complete retained projection because another live owner
+        // still owns the source charge.
+        let bytes_to_charge = if transferred_accounting.is_some() {
+            additional_bytes
+        } else {
+            retained_bytes
+        };
+        let additional_accounting = match tracker {
+            Some(tracker) => match TrackedBytes::try_new(bytes_to_charge, tracker) {
+                Ok(accounting) => Some(accounting),
+                Err(error) => {
+                    self.shared.release_append(rows, retained_bytes);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        let Some(sender) = self.sender.as_ref().cloned() else {
             self.shared.release_append(rows, retained_bytes);
             return Err("connector writer enqueue after terminal transition".to_string());
         };
-        if let Err(error) = sender.try_send(command) {
-            self.shared.release_append(rows, retained_bytes);
-            return Err(format!("connector writer enqueue failed: {error}"));
-        }
-        Ok(())
+        let permit = match sender.try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.shared.release_append(rows, retained_bytes);
+                return Err(format!("connector writer enqueue failed: {error}"));
+            }
+        };
+        Ok(AsyncWriterReservation {
+            permit: Some(permit),
+            shared: Arc::clone(&self.shared),
+            rows,
+            bytes: retained_bytes,
+            transferred_accounting,
+            additional_accounting,
+            committed: false,
+        })
     }
 
     pub(crate) fn request_finish(&mut self) -> Result<(), String> {
@@ -353,11 +519,13 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
     }
 
     pub(crate) fn request_abort(&mut self) {
-        if self.shared.done.load(Ordering::Acquire) {
+        if self.shared.done.load(Ordering::Acquire)
+            || self.shared.abort_requested.swap(true, Ordering::AcqRel)
+        {
             return;
         }
+        self.shared.abort_requests.fetch_add(1, Ordering::Relaxed);
         self.sender = None;
-        self.shared.abort_requested.store(true, Ordering::Release);
         self.shared.abort_notify.notify_one();
         self.shared.wake();
     }
@@ -388,6 +556,24 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
             .lock()
             .expect("async writer result lock")
             .take()
+    }
+
+    pub(crate) fn error(&self) -> Option<String> {
+        self.shared
+            .error
+            .lock()
+            .expect("async writer error lock")
+            .clone()
+    }
+
+    pub(crate) fn metrics(&self) -> AsyncWriterMetrics {
+        AsyncWriterMetrics {
+            queue_peak_batches: self.shared.queue_peak_batches.load(Ordering::Relaxed),
+            queue_peak_rows: self.shared.queue_peak_rows.load(Ordering::Relaxed),
+            queue_peak_bytes: self.shared.queue_peak_bytes.load(Ordering::Relaxed),
+            queue_blocked_checks: self.shared.queue_blocked_checks.load(Ordering::Relaxed),
+            abort_requests: self.shared.abort_requests.load(Ordering::Relaxed),
+        }
     }
 
     #[cfg(test)]
@@ -536,7 +722,8 @@ async fn run_writer_actor<O: Send + 'static>(
                 let rows = command.rows;
                 let bytes = command.bytes;
                 let outcome = await_or_abort(writer.append(command.batch), shared.as_ref()).await;
-                drop(command._accounting);
+                drop(command._additional_accounting);
+                drop(command._transferred_accounting);
                 shared.release_append(rows, bytes);
                 match outcome {
                     AwaitResult::Completed(Ok(())) => {
@@ -626,7 +813,7 @@ async fn run_writer_actor<O: Send + 'static>(
                     .expect("connector writer finish mapper is consumed exactly once");
                 match mapper(accepted_rows, fragments) {
                     Ok(output) => {
-                        *shared.result.lock().expect("async writer result lock") = Some(output);
+                        shared.publish_terminal_result(output);
                     }
                     Err(error) => {
                         fail_with_abort(
@@ -667,6 +854,7 @@ mod tests {
     #[derive(Default)]
     struct Calls {
         opened: AtomicUsize,
+        append_started: AtomicUsize,
         appended: AtomicUsize,
         finished: AtomicUsize,
         aborted: AtomicUsize,
@@ -710,6 +898,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ConnectorBatchWriter for ControlledWriter {
         async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+            self.calls.append_started.fetch_add(1, Ordering::Relaxed);
             if let Some(gate) = &self.append_gate {
                 gate.notified().await;
             }
@@ -744,29 +933,32 @@ mod tests {
 
     fn runtime() -> Arc<ExecutionRuntime> {
         Arc::new(
-            ExecutionRuntime::new(ExecutionRuntimeConfig {
-                driver_threads: 1,
-                scan_threads: 1,
-                scan_queue_capacity: 1,
-                spill_io_threads: 1,
-                spill_io_queue_capacity: 1,
-                spill_storage:
-                    crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
-                exchange_wait_ms: 120_000,
-                exchange_io_threads: 1,
-                exchange_io_max_inflight_bytes: 1024,
-                exchange_max_transmit_batched_bytes: 1024,
-                operator_buffer_chunks: 1,
-                local_exchange_buffer_mem_limit_per_driver: 1024,
-                local_exchange_max_buffered_rows: 1024,
-                connector_io_tasks_per_scan_operator: 1,
-                scan_submit_fail_max: 1,
-                scan_submit_fail_timeout_ms: 1,
-                runtime_filter_scan_wait_time_ms_override: None,
-                runtime_filter_wait_timeout_ms_override: None,
-                sink_io_worker_threads: 1,
-                sink_io_max_blocking_threads: 1,
-            })
+            ExecutionRuntime::new(
+                ExecutionRuntimeConfig {
+                    driver_threads: 1,
+                    scan_threads: 1,
+                    scan_queue_capacity: 1,
+                    spill_io_threads: 1,
+                    spill_io_queue_capacity: 1,
+                    spill_storage:
+                        crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
+                    exchange_wait_ms: 120_000,
+                    exchange_io_threads: 1,
+                    exchange_io_max_inflight_bytes: 1024,
+                    exchange_max_transmit_batched_bytes: 1024,
+                    operator_buffer_chunks: 1,
+                    local_exchange_buffer_mem_limit_per_driver: 1024,
+                    local_exchange_max_buffered_rows: 1024,
+                    connector_io_tasks_per_scan_operator: 1,
+                    scan_submit_fail_max: 1,
+                    scan_submit_fail_timeout_ms: 1,
+                    runtime_filter_scan_wait_time_ms_override: None,
+                    runtime_filter_wait_timeout_ms_override: None,
+                    sink_io_worker_threads: 1,
+                    sink_io_max_blocking_threads: 1,
+                },
+                crate::runtime::execution_runtime::test_execution_function_set(),
+            )
             .expect("test execution runtime"),
         )
     }
@@ -801,6 +993,24 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(predicate(), "condition did not become true before timeout");
+    }
+
+    #[test]
+    fn consumed_terminal_result_still_satisfies_actor_exit_contract() {
+        let shared = WriterShared::<u64>::new();
+        let runtime_error = RuntimeErrorState::default();
+
+        shared.publish_terminal_result(17);
+        assert_eq!(shared.result.lock().expect("result lock").take(), Some(17));
+
+        // The task wrapper runs this check only after the nested actor exits.
+        // A consumer is allowed to have drained the result slot by then.
+        shared.ensure_terminal_outcome(&runtime_error);
+        assert!(runtime_error.error().is_none());
+        assert!(
+            shared.terminal_result_produced.load(Ordering::Acquire),
+            "terminal production is a monotonic event, not result-slot occupancy"
+        );
     }
 
     fn owner(
@@ -873,6 +1083,232 @@ mod tests {
     }
 
     #[test]
+    fn query_memory_limit_rejects_queue_admission_without_leaking_reservation() {
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (owner, _error, tracker, _runtime) = owner(calls, Some(gate), false, false, config);
+        tracker.install_limit_once(1).expect("install query limit");
+
+        let input = batch(2);
+        let bytes = crate::exec::chunk::record_batch_bytes(&input);
+        let error = owner
+            .enqueue(input, bytes)
+            .expect_err("queue admission must enforce query limit");
+
+        assert!(error.contains("memory limit exceeded"), "{error}");
+        assert_eq!(owner.queued_usage(), (0, 0));
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(tracker.allocated(), tracker.deallocated());
+    }
+
+    #[test]
+    fn zero_copy_projection_transfers_existing_charge_without_false_oom() {
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, error, tracker, _runtime) =
+            owner(calls, Some(Arc::clone(&gate)), false, false, config);
+        let input = batch(3);
+        let bytes = crate::exec::chunk::record_batch_bytes(&input);
+        tracker
+            .install_limit_once(i64::try_from(bytes).unwrap())
+            .expect("install exact query limit");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            input.schema().as_ref(),
+            &[novarocks_types::SlotId(1)],
+        )
+        .unwrap();
+        let mut chunk =
+            crate::exec::chunk::Chunk::try_new_with_chunk_schema(input.clone(), chunk_schema)
+                .unwrap();
+        chunk.transfer_to(&tracker);
+        let accounting = chunk.take_memory_lease();
+
+        owner
+            .enqueue_with_accounting(input, bytes, accounting, 0)
+            .expect("the existing Arrow charge transfers into the writer queue");
+        drop(chunk);
+        assert_eq!(tracker.current(), i64::try_from(bytes).unwrap());
+        assert_eq!(tracker.peak(), i64::try_from(bytes).unwrap());
+
+        gate.notify_one();
+        wait_until(|| owner.queued_usage() == (0, 0));
+        assert_eq!(tracker.current(), 0);
+        owner.request_finish().unwrap();
+        wait_until(|| owner.has_output());
+        assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn projected_queue_owns_only_projected_bytes_from_wide_source() {
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 4096,
+            max_batch_rows: 4,
+            max_batch_bytes: 4096,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, error, tracker, _runtime) =
+            owner(calls, Some(Arc::clone(&gate)), false, false, config);
+        let left = Arc::new(Int32Array::from_iter_values(0..3)) as ArrayRef;
+        let right = Arc::new(Int32Array::from_iter_values(10..13)) as ArrayRef;
+        let source = RecordBatch::try_from_iter(vec![
+            ("left", Arc::clone(&left)),
+            ("right", Arc::clone(&right)),
+        ])
+        .unwrap();
+        let projection = RecordBatch::try_from_iter(vec![("v", left)]).unwrap();
+        let source_bytes = crate::exec::chunk::record_batch_bytes(&source);
+        let projected_bytes = crate::exec::chunk::record_batch_bytes(&projection);
+        assert!(source_bytes > projected_bytes);
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            source.schema().as_ref(),
+            &[novarocks_types::SlotId(1), novarocks_types::SlotId(2)],
+        )
+        .unwrap();
+        let mut chunk =
+            crate::exec::chunk::Chunk::try_new_with_chunk_schema(source, chunk_schema).unwrap();
+        chunk.transfer_to(&tracker);
+        let accounting = chunk.take_memory_lease();
+
+        owner
+            .enqueue_with_accounting(projection, projected_bytes, accounting, 0)
+            .expect("split projected accounting into writer queue");
+        drop(chunk);
+
+        assert_eq!(tracker.current(), i64::try_from(projected_bytes).unwrap());
+        let queue_tracker = tracker
+            .children()
+            .into_iter()
+            .find(|child| child.label() == "ConnectorWriterQueue")
+            .expect("writer queue tracker");
+        assert_eq!(
+            queue_tracker.current(),
+            i64::try_from(projected_bytes).unwrap()
+        );
+
+        gate.notify_one();
+        wait_until(|| owner.queued_usage() == (0, 0));
+        assert_eq!(queue_tracker.current(), 0);
+        assert_eq!(tracker.current(), 0);
+        owner.request_finish().unwrap();
+        wait_until(|| owner.has_output());
+        assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn rejected_enqueue_rolls_accounting_transfer_back_to_input_owner() {
+        let calls = Arc::new(Calls::default());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, _error, tracker, _runtime) = owner(calls, None, false, false, config);
+        let input_tracker = MemTracker::new_child("input", &tracker);
+        let input = batch(3);
+        let bytes = crate::exec::chunk::record_batch_bytes(&input);
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            input.schema().as_ref(),
+            &[novarocks_types::SlotId(1)],
+        )
+        .unwrap();
+        let mut chunk =
+            crate::exec::chunk::Chunk::try_new_with_chunk_schema(input.clone(), chunk_schema)
+                .unwrap();
+        chunk.transfer_to(&input_tracker);
+        let lease = chunk.memory_lease().unwrap();
+        owner.request_finish().unwrap();
+
+        let error = owner
+            .enqueue_with_accounting(input, bytes, Some(lease.clone()), 0)
+            .expect_err("terminal writer must reject append");
+        assert!(error.contains("terminal transition"), "{error}");
+        assert!(Arc::ptr_eq(&lease.tracker(), &input_tracker));
+        assert_eq!(input_tracker.current(), i64::try_from(bytes).unwrap());
+
+        drop(chunk);
+        drop(lease);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn full_mailbox_releases_exclusive_split_and_usage_exactly_once() {
+        let calls = Arc::new(Calls::default());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let execution = Arc::new(ControlledExecution {
+            catalog_handle: catalog_handle(),
+            calls,
+            append_gate: None,
+            fail_append: false,
+            fail_abort: false,
+        });
+        let mut owner =
+            AsyncWriterOwner::new(execution, request(), config, Box::new(|rows, _| Ok(rows)));
+        let tracker = MemTracker::new_root("full-writer-mailbox");
+        owner.set_mem_tracker(Arc::clone(&tracker));
+        let (full_sender, _full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(WriterCommand::Finish)
+            .expect("prefill test mailbox");
+        owner.sender = Some(full_sender);
+
+        let input = batch(3);
+        let bytes = crate::exec::chunk::record_batch_bytes(&input);
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            input.schema().as_ref(),
+            &[novarocks_types::SlotId(1)],
+        )
+        .unwrap();
+        let mut chunk =
+            crate::exec::chunk::Chunk::try_new_with_chunk_schema(input.clone(), chunk_schema)
+                .unwrap();
+        chunk.transfer_to(&tracker);
+        let accounting = chunk.take_memory_lease();
+
+        let error = owner
+            .enqueue_with_accounting(input, bytes, accounting, 0)
+            .expect_err("full writer mailbox must reject append");
+        assert!(error.contains("connector writer enqueue failed"), "{error}");
+        assert_eq!(owner.queued_usage(), (0, 0));
+        assert_eq!(tracker.current(), 0);
+        let queue_tracker = tracker
+            .children()
+            .into_iter()
+            .find(|child| child.label() == "ConnectorWriterQueue")
+            .expect("writer queue tracker");
+        assert_eq!(queue_tracker.current(), 0);
+    }
+
+    #[test]
     fn append_failure_aborts_once_and_releases_queue_memory() {
         let calls = Arc::new(Calls::default());
         let config = AsyncWriterQueueConfig {
@@ -918,6 +1354,7 @@ mod tests {
         let input = batch(2);
         let bytes = crate::exec::chunk::record_batch_bytes(&input);
         owner.enqueue(input, bytes).expect("enqueue slow append");
+        wait_until(|| calls.append_started.load(Ordering::Relaxed) == 1);
         owner.request_abort();
         wait_until(|| owner.is_done());
         assert_eq!(calls.aborted.load(Ordering::Relaxed), 1);

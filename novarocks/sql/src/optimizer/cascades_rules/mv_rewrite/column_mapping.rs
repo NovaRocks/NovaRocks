@@ -287,6 +287,7 @@ fn rewrite_children(
             args,
             distinct,
             order_by,
+            resolved,
         } => ScalarNode::AggregateCall {
             name,
             args: args
@@ -295,6 +296,7 @@ fn rewrite_children(
                 .collect::<Option<Vec<_>>>()?,
             distinct,
             order_by,
+            resolved,
         },
         ScalarNode::Cast { child, target } => ScalarNode::Cast {
             child: rewrite(arena, child)?,
@@ -527,6 +529,11 @@ mod tests {
                 args: vec![col_ref(&a)],
                 distinct,
                 order_by: vec![],
+                resolved: crate::functions::test_resolved_aggregate(
+                    "count",
+                    &[DataType::Int64],
+                    distinct,
+                ),
             },
             data_type: DataType::Int64,
             nullable: true,

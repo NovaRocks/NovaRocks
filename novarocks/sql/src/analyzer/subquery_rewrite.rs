@@ -107,6 +107,7 @@ fn value_form_marker_query(
     marker_col_id: crate::column_id::ColumnId,
     marker_col_name: String,
     filter: Option<TypedExpr>,
+    resolved: novarocks_functions::ResolvedAggregateSignature,
 ) -> ResolvedQuery {
     let marker_dtype = DataType::Int32;
     let marker_output = OutputColumn {
@@ -138,6 +139,7 @@ fn value_form_marker_query(
                         }],
                         distinct: false,
                         order_by: vec![],
+                        resolved,
                     },
                     data_type: marker_dtype.clone(),
                     nullable: true,
@@ -164,8 +166,16 @@ fn value_form_nonempty_marker_query(
     source_alias: String,
     marker_col_id: crate::column_id::ColumnId,
     marker_col_name: String,
+    resolved: novarocks_functions::ResolvedAggregateSignature,
 ) -> ResolvedQuery {
-    value_form_marker_query(source, source_alias, marker_col_id, marker_col_name, None)
+    value_form_marker_query(
+        source,
+        source_alias,
+        marker_col_id,
+        marker_col_name,
+        None,
+        resolved,
+    )
 }
 
 fn value_form_null_marker_query(
@@ -174,6 +184,7 @@ fn value_form_null_marker_query(
     source_alias: String,
     marker_col_id: crate::column_id::ColumnId,
     marker_col_name: String,
+    resolved: novarocks_functions::ResolvedAggregateSignature,
 ) -> ResolvedQuery {
     let filter = is_null_expr(
         TypedExpr {
@@ -193,6 +204,7 @@ fn value_form_null_marker_query(
         marker_col_id,
         marker_col_name,
         Some(filter),
+        resolved,
     )
 }
 
@@ -540,13 +552,19 @@ impl<'a> AnalyzerContext<'a> {
         source_alias: String,
         marker_col_name: String,
         null_source_col: Option<&OutputColumn>,
-    ) -> (Relation, TypedExpr) {
+    ) -> Result<(Relation, TypedExpr), AnalyzeError> {
         let marker_col_id = self.alloc_column_id(
             Some(relation_alias.clone()),
             marker_col_name.clone(),
             DataType::Int32,
             true,
         );
+        let resolved = super::resolve_expr::resolve_aggregate_function_call(
+            self.function_catalog,
+            "max",
+            std::slice::from_ref(&DataType::Int32),
+            novarocks_parser::Span::new(0, 0),
+        )?;
         let marker_query = match null_source_col {
             Some(source_col) => value_form_null_marker_query(
                 source,
@@ -554,12 +572,14 @@ impl<'a> AnalyzerContext<'a> {
                 source_alias,
                 marker_col_id,
                 marker_col_name.clone(),
+                resolved.clone(),
             ),
             None => value_form_nonempty_marker_query(
                 source,
                 source_alias,
                 marker_col_id,
                 marker_col_name.clone(),
+                resolved,
             ),
         };
         scope.add_column_with_id(
@@ -592,7 +612,7 @@ impl<'a> AnalyzerContext<'a> {
                 is_internal: false,
             }],
         };
-        (relation, exists)
+        Ok((relation, exists))
     }
 
     /// Walk a Relation tree looking for a JoinRelation whose `condition`
@@ -1089,7 +1109,7 @@ impl<'a> AnalyzerContext<'a> {
                 format!("__sq_on_null_src_{}", sq_info.id),
                 format!("__on_has_null_{}", sq_info.id),
                 Some(&sub_col),
-            ))
+            )?)
         } else {
             None
         };
@@ -1101,7 +1121,7 @@ impl<'a> AnalyzerContext<'a> {
                 format!("__sq_on_any_src_{}", sq_info.id),
                 format!("__on_has_row_{}", sq_info.id),
                 None,
-            ))
+            )?)
         } else {
             None
         };
@@ -1910,7 +1930,7 @@ impl<'a> AnalyzerContext<'a> {
                     format!("__sq_null_src_{}", sq_info.id),
                     format!("__has_null_{}", sq_info.id),
                     Some(&sub_output_col),
-                ))
+                )?)
             } else {
                 None
             };
@@ -1922,7 +1942,7 @@ impl<'a> AnalyzerContext<'a> {
                     format!("__sq_any_src_{}", sq_info.id),
                     format!("__has_row_{}", sq_info.id),
                     None,
-                ))
+                )?)
             } else {
                 None
             };
@@ -2967,6 +2987,7 @@ fn qualify_inner_shadowing_column_refs(
             args,
             distinct,
             order_by,
+            resolved,
         } => TypedExpr {
             data_type,
             nullable,
@@ -2978,6 +2999,7 @@ fn qualify_inner_shadowing_column_refs(
                     .collect(),
                 distinct,
                 order_by: qualify_inner_shadowing_sort_items(order_by, inner_scope, outer_scope),
+                resolved,
             },
         },
         ExprKind::Cast {
@@ -3141,6 +3163,8 @@ fn qualify_inner_shadowing_column_refs(
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -3155,6 +3179,12 @@ fn qualify_inner_shadowing_column_refs(
                     .map(|arg| qualify_inner_shadowing_column_refs(arg, inner_scope, outer_scope))
                     .collect(),
                 distinct,
+                function_order_by: qualify_inner_shadowing_sort_items(
+                    function_order_by,
+                    inner_scope,
+                    outer_scope,
+                ),
+                aggregate_binding,
                 partition_by: partition_by
                     .into_iter()
                     .map(|item| qualify_inner_shadowing_column_refs(item, inner_scope, outer_scope))
@@ -4622,6 +4652,7 @@ fn replace_placeholder_in_expr(
             args,
             distinct,
             order_by,
+            resolved,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -4633,6 +4664,7 @@ fn replace_placeholder_in_expr(
                     .collect(),
                 distinct: *distinct,
                 order_by: order_by.clone(),
+                resolved: resolved.clone(),
             },
         },
         ExprKind::Cast {
@@ -4794,6 +4826,8 @@ fn replace_placeholder_in_expr(
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -4808,6 +4842,15 @@ fn replace_placeholder_in_expr(
                     .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
                     .collect(),
                 distinct: *distinct,
+                function_order_by: function_order_by
+                    .iter()
+                    .map(|item| SortItem {
+                        expr: replace_placeholder_in_expr(&item.expr, placeholder_id, replacement),
+                        asc: item.asc,
+                        nulls_first: item.nulls_first,
+                    })
+                    .collect(),
+                aggregate_binding: aggregate_binding.clone(),
                 partition_by: partition_by
                     .iter()
                     .map(|p| replace_placeholder_in_expr(p, placeholder_id, replacement))
@@ -5142,6 +5185,7 @@ mod tests {
             "__src".to_string(),
             crate::column_id::ColumnId(2),
             "__has_row".to_string(),
+            crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
         );
 
         assert!(marker.limit.is_none());

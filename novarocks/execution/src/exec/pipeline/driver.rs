@@ -211,12 +211,35 @@ pub struct PipelineDriver {
     closed: bool,
     schedule_state: Arc<DriverScheduleState>,
     pending_finish_state: Option<DriverState>,
+    operator_terminal_signal: Option<DriverState>,
 
     edge_chunks: Vec<Option<Chunk>>,
     edge_closed: Vec<bool>,
     operator_finishing_set: Vec<bool>,
     operator_mem_trackers: Vec<Option<Arc<MemTracker>>>,
     edge_mem_trackers: Vec<Option<Arc<MemTracker>>>,
+}
+
+/// Fragment-owned services bound before operator preparation.
+///
+/// Keeping these bindings together prevents driver construction from growing a
+/// positional argument for every service that must be installed before an
+/// asynchronous operator can start.
+pub(crate) struct PipelineDriverBindings {
+    event_sink: Arc<dyn FragmentEventSink>,
+    prebound_operator_mem_trackers: Option<Vec<Option<Arc<MemTracker>>>>,
+}
+
+impl PipelineDriverBindings {
+    pub(crate) fn new(
+        event_sink: Arc<dyn FragmentEventSink>,
+        prebound_operator_mem_trackers: Option<Vec<Option<Arc<MemTracker>>>>,
+    ) -> Self {
+        Self {
+            event_sink,
+            prebound_operator_mem_trackers,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -274,7 +297,7 @@ impl PipelineDriver {
             operator_profiles,
             runtime_state,
             fragment_instance_id,
-            Arc::new(NoopFragmentEventSink),
+            PipelineDriverBindings::new(Arc::new(NoopFragmentEventSink), None),
         )
     }
 
@@ -285,8 +308,12 @@ impl PipelineDriver {
         operator_profiles: Vec<OperatorProfiles>,
         runtime_state: Arc<RuntimeState>,
         fragment_instance_id: Option<(i64, i64)>,
-        event_sink: Arc<dyn FragmentEventSink>,
+        bindings: PipelineDriverBindings,
     ) -> Self {
+        let PipelineDriverBindings {
+            event_sink,
+            prebound_operator_mem_trackers,
+        } = bindings;
         let mut operators = operators;
         let operator_count = operators.len();
         let edge_count = operator_count.saturating_sub(1);
@@ -376,18 +403,26 @@ impl PipelineDriver {
             Vec::new()
         };
         let mem_root = runtime_state.mem_tracker();
-        let operator_mem_trackers = if let Some(root) = mem_root.as_ref() {
-            operators
-                .iter()
-                .enumerate()
-                .map(|(idx, op)| {
-                    let label = format!("operator {}: {}", idx, op.name());
-                    Some(MemTracker::new_child(label, root))
-                })
-                .collect()
-        } else {
-            vec![None; operator_count]
-        };
+        let operators_prebound = prebound_operator_mem_trackers.is_some();
+        let operator_mem_trackers = prebound_operator_mem_trackers.unwrap_or_else(|| {
+            if let Some(root) = mem_root.as_ref() {
+                operators
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, op)| {
+                        let label = format!("operator {}: {}", idx, op.name());
+                        Some(MemTracker::new_child(label, root))
+                    })
+                    .collect()
+            } else {
+                vec![None; operator_count]
+            }
+        });
+        assert_eq!(
+            operator_mem_trackers.len(),
+            operator_count,
+            "prebound operator memory tracker count"
+        );
         let edge_mem_trackers = if let Some(root) = mem_root.as_ref() {
             (0..edge_count)
                 .map(|idx| {
@@ -404,7 +439,9 @@ impl PipelineDriver {
             vec![None; edge_count]
         };
         for (idx, op) in operators.iter_mut().enumerate() {
-            if let Some(tracker) = operator_mem_trackers.get(idx).and_then(|v| v.as_ref()) {
+            if !operators_prebound
+                && let Some(tracker) = operator_mem_trackers.get(idx).and_then(|v| v.as_ref())
+            {
                 op.set_mem_tracker(Arc::clone(tracker));
             }
             op.set_fragment_event_sink(Arc::clone(&event_sink));
@@ -427,6 +464,7 @@ impl PipelineDriver {
             closed: false,
             schedule_state: Arc::new(DriverScheduleState::new()),
             pending_finish_state: None,
+            operator_terminal_signal: None,
 
             edge_chunks: vec![None; edge_count],
             edge_closed: vec![false; edge_count],
@@ -503,12 +541,6 @@ impl PipelineDriver {
         // `process` turn before the executor accounts it as complete. Route it
         // through the same PendingFinish latch as in-driver cancellation so an
         // async owner can finish its bounded cooperative abort first.
-        self.cancel_operators();
-        if self.has_pending_finish() {
-            self.pending_finish_state = Some(DriverState::Canceled);
-            self.state = DriverState::PendingFinish;
-            return self.state.clone();
-        }
         self.finish_with_state(DriverState::Canceled)
     }
 
@@ -554,7 +586,7 @@ impl PipelineDriver {
             if matches!(final_state, DriverState::Finished) && !self.is_finished() {
                 self.state = DriverState::Running;
             } else {
-                return self.finish_with_state(final_state);
+                return self.finish_with_state_after_operator_signal(final_state);
             }
         }
 
@@ -906,17 +938,36 @@ impl PipelineDriver {
     }
 
     fn finish_with_state(&mut self, state: DriverState) -> DriverState {
+        // Failure/cancellation signals are first-wins and reach each operator
+        // exactly once. A driver can be revisited while an asynchronous owner
+        // is still pending, so neither the executor nor the poller may replay
+        // these callbacks on every scheduling turn.
+        let state = match (&self.operator_terminal_signal, &state) {
+            (
+                Some(existing),
+                DriverState::Finished | DriverState::Canceled | DriverState::Failed(_),
+            ) => existing.clone(),
+            (None, DriverState::Canceled) => {
+                self.cancel_operators();
+                self.operator_terminal_signal = Some(state.clone());
+                state
+            }
+            (None, DriverState::Failed(_)) => {
+                self.fail_operators();
+                self.operator_terminal_signal = Some(state.clone());
+                state
+            }
+            _ => state,
+        };
+        self.finish_with_state_after_operator_signal(state)
+    }
+
+    fn finish_with_state_after_operator_signal(&mut self, state: DriverState) -> DriverState {
         self.finish_blocked_interval();
-        match &state {
-            DriverState::Canceled => self.cancel_operators(),
-            DriverState::Failed(_) => self.fail_operators(),
-            _ => {}
-        }
         if matches!(
             state,
             DriverState::Finished | DriverState::Canceled | DriverState::Failed(_)
-        ) && self.pending_finish_state.is_none()
-            && self.has_pending_finish()
+        ) && self.has_pending_finish()
         {
             self.pending_finish_state = Some(state.clone());
             self.state = DriverState::PendingFinish;
@@ -1592,5 +1643,113 @@ mod tests {
             calls.load(Ordering::SeqCst) > turns_before_parking,
             "the re-readied turn is the one that finishes the sink"
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_signal_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct SignalCountingOperator {
+        pending: Arc<AtomicBool>,
+        cancel_count: Arc<AtomicUsize>,
+        failure_count: Arc<AtomicUsize>,
+    }
+
+    impl Operator for SignalCountingOperator {
+        fn name(&self) -> &str {
+            "SIGNAL_COUNTING"
+        }
+
+        fn cancel(&mut self) {
+            self.cancel_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn on_driver_failure(&mut self) {
+            self.failure_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn pending_finish(&self) -> bool {
+            self.pending.load(Ordering::SeqCst)
+        }
+    }
+
+    fn signal_counting_driver(
+        pending: Arc<AtomicBool>,
+        cancel_count: Arc<AtomicUsize>,
+        failure_count: Arc<AtomicUsize>,
+    ) -> PipelineDriver {
+        PipelineDriver::new(
+            1,
+            vec![Box::new(SignalCountingOperator {
+                pending,
+                cancel_count,
+                failure_count,
+            })],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        )
+    }
+
+    #[test]
+    fn repeated_abort_signals_operators_once_while_finish_is_pending() {
+        let pending = Arc::new(AtomicBool::new(true));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let failure_count = Arc::new(AtomicUsize::new(0));
+        let mut driver = signal_counting_driver(
+            Arc::clone(&pending),
+            Arc::clone(&cancel_count),
+            Arc::clone(&failure_count),
+        );
+
+        assert_eq!(
+            driver.cancel_for_fragment_abort(),
+            DriverState::PendingFinish
+        );
+        assert_eq!(
+            driver.cancel_for_fragment_abort(),
+            DriverState::PendingFinish
+        );
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+        assert_eq!(failure_count.load(Ordering::SeqCst), 0);
+
+        pending.store(false, Ordering::SeqCst);
+        assert_eq!(driver.process(Duration::ZERO), DriverState::Canceled);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_failure_is_not_replaced_or_resignaled_by_abort() {
+        let pending = Arc::new(AtomicBool::new(true));
+        let cancel_count = Arc::new(AtomicUsize::new(0));
+        let failure_count = Arc::new(AtomicUsize::new(0));
+        let mut driver = signal_counting_driver(
+            Arc::clone(&pending),
+            Arc::clone(&cancel_count),
+            Arc::clone(&failure_count),
+        );
+
+        assert_eq!(
+            driver.finish_with_state(DriverState::Failed("first failure".to_string())),
+            DriverState::PendingFinish
+        );
+        assert_eq!(
+            driver.cancel_for_fragment_abort(),
+            DriverState::PendingFinish
+        );
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
+
+        pending.store(false, Ordering::SeqCst);
+        assert_eq!(
+            driver.cancel_for_fragment_abort(),
+            DriverState::Failed("first failure".to_string())
+        );
+        assert_eq!(failure_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancel_count.load(Ordering::SeqCst), 0);
     }
 }

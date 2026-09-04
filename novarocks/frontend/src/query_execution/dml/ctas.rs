@@ -701,10 +701,14 @@ fn prepare_planned_ctas_connector_write(
     let sealed = session
         .seal_write_targets()
         .map_err(|error| error.to_string())?;
+    let write_target_ordinal = sealed.sole_target_ordinal()?;
     let dataflow = novarocks_sql::planning::dml::build_ctas_connector_write_dataflow_plan(
         &planned.source,
         input_schema,
-        sealed.sole_target_ordinal()?,
+        write_target_ordinal,
+        session
+            .statistics_requirements(write_target_ordinal)
+            .map_err(|error| error.to_string())?,
         &planned.optimizer_settings,
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(

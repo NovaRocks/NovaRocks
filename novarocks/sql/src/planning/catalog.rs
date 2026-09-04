@@ -751,9 +751,11 @@ pub fn analyze_view_query(
     query: &Query,
     provider: &dyn PlannerTableProvider,
     database: &str,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<Vec<ViewOutputColumn>, String> {
-    let (resolved, _ctes, _factory) = crate::analyzer::analyze(query, provider, database)
-        .map_err(|error| format!("analyze view definition failed: {error}"))?;
+    let (resolved, _ctes, _factory) =
+        crate::analyzer::analyze_with_function_catalog(query, provider, database, functions)
+            .map_err(|error| format!("analyze view definition failed: {error}"))?;
     Ok(resolved
         .output_columns
         .into_iter()

@@ -239,6 +239,14 @@ fn apply_opt(
         inner_scalar_type.clone(),
         inner_scalar_nullable,
     );
+    let count_resolved = ctx
+        .function_catalog()
+        .resolve_aggregate_trusted("count", &[DataType::Int64])
+        .map_err(|error| format!("failed to resolve optimizer count aggregate: {error}"))?;
+    let any_value_resolved = ctx
+        .function_catalog()
+        .resolve_aggregate_trusted("any_value", std::slice::from_ref(&inner_scalar_type))
+        .map_err(|error| format!("failed to resolve optimizer any_value aggregate: {error}"))?;
     if let Some(inner_column) =
         scalar_utils::find_output_column(&agg_input_columns, a.inner_output_column_id)
     {
@@ -283,8 +291,8 @@ fn apply_opt(
         Operator::LogicalAggregate(LogicalAggregateOp::single(
             group_by,
             vec![
-                scalar_utils::count_one_spec(arena, cnt_id),
-                scalar_utils::any_value_spec(inner_scalar_ref, anyval_id),
+                scalar_utils::count_one_spec(arena, cnt_id, count_resolved),
+                scalar_utils::any_value_spec(inner_scalar_ref, anyval_id, any_value_resolved),
             ],
             output_layout,
             agg_output_cols,
@@ -548,6 +556,7 @@ mod tests {
 
     fn ctx_with_factory() -> RewriteContext {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx
@@ -641,6 +650,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: vec![],
                     output_column_id: MAX_RESULT,
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "max",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![OutputColumn {
                     column_id: MAX_RESULT,
@@ -850,6 +864,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: vec![],
                     output_column_id: MAX_RESULT,
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "max",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![
                     OutputColumn {

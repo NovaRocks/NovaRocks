@@ -202,9 +202,7 @@ fn validate_fragment_output_kind(
 ) -> Result<(), String> {
     if is_root {
         return match role {
-            NativeSubmissionFragmentRole::Result | NativeSubmissionFragmentRole::Statistics => {
-                Ok(())
-            }
+            NativeSubmissionFragmentRole::Result => Ok(()),
             NativeSubmissionFragmentRole::NonTerminal => Err(format!(
                 "root fragment {fragment_id} must have Result output kind"
             )),

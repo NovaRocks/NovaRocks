@@ -48,10 +48,15 @@ pub fn native_carrier_declarations() -> anyhow::Result<Vec<NativeCarrierDeclarat
 /// application composition opens listeners or runtime services.
 pub fn resolve_native_compatibility_material(
     function_catalog_digest: [u8; 32],
+    execution_implementation_manifest_digest: [u8; 32],
 ) -> anyhow::Result<NativeCompatibilityMaterial> {
     let declarations = native_carrier_declarations()?;
-    derive_repository_native_compatibility_material(declarations, function_catalog_digest)
-        .with_context(|| "derive native compatibility material")
+    derive_repository_native_compatibility_material(
+        declarations,
+        function_catalog_digest,
+        execution_implementation_manifest_digest,
+    )
+    .with_context(|| "derive native compatibility material")
 }
 
 fn validate_declared_provider_kinds(
@@ -114,10 +119,14 @@ mod tests {
 
     #[test]
     fn repository_material_is_nonempty_and_uses_the_server_manifest() {
-        let material = resolve_native_compatibility_material([0x31; 32])
+        let material = resolve_native_compatibility_material([0x31; 32], [0x41; 32])
             .expect("compatibility material");
+        let implementation_only_change =
+            resolve_native_compatibility_material([0x31; 32], [0x42; 32])
+                .expect("implementation-only compatibility material");
 
         assert_eq!(material.carriers(), native_carrier_declarations().unwrap());
         assert_eq!(material.id().to_string().len(), 64);
+        assert_ne!(material.id(), implementation_only_change.id());
     }
 }

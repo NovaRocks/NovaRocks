@@ -2011,6 +2011,11 @@ mod tests {
                     args: vec![col_ref(7, "agg_arg")],
                     distinct: false,
                     order_by: vec![sort_item(col_ref(3, "agg_order"))],
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }),
                 typed_expr(ExprKind::Case {
                     operand: Some(Box::new(col_ref(6, "case_operand"))),
@@ -2029,6 +2034,8 @@ mod tests {
                     name: "row_number".to_string(),
                     args: vec![col_ref(9, "window_arg")],
                     distinct: false,
+                    function_order_by: vec![],
+                    aggregate_binding: None,
                     partition_by: vec![col_ref(8, "window_partition")],
                     order_by: vec![sort_item(col_ref(1, "window_order"))],
                     window_frame: None,

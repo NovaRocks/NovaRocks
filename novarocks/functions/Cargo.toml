@@ -24,5 +24,6 @@ edition = "2024"
 doctest = false
 
 [dependencies]
+arrow-array = "58.2.0"
 arrow-schema = "58.2.0"
 sha2 = "0.10"

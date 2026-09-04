@@ -36,8 +36,15 @@ NovaRocks-specific shadow transaction:
   values.
 * `Transaction::staged_table` and `Transaction::staged_snapshot` expose the
   read-only local result needed to construct a later action.
+* `Transaction::stage_action` and `Transaction::stage_action_commit` are public
+  eager composition points for connector-owned actions and already-assembled
+  provider updates. Both update only transaction-local metadata and perform no
+  catalog I/O.
 * `Transaction::into_table_commit` consumes the transaction and exports the
   complete `TableCommit` without catalog I/O, refresh, dispatch, or retry.
+* `Transaction` is no longer `Clone`; staging, export, and commit carry one
+  structurally consuming authority rather than permitting the same staged
+  update set to be duplicated.
 * The convenience `Transaction::commit` performs at most one
   `Catalog::update_table` call. Retryable errors are returned to the caller and
   never replay actions inside the library.

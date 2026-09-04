@@ -213,7 +213,7 @@ pub(crate) fn validate_fragment_output_kind(
 ) -> Result<(), String> {
     if is_root {
         return match output_kind {
-            PreparedFragmentRole::Result | PreparedFragmentRole::Statistics => Ok(()),
+            PreparedFragmentRole::Result => Ok(()),
             PreparedFragmentRole::NonTerminal => Err(format!(
                 "root fragment {fragment_id} must have Result output kind"
             )),
@@ -319,7 +319,6 @@ pub(crate) fn validate_scheduling_placements(plan: &SchedulingPlan) -> Result<()
 
 /// Applies only placement to an already-encoded provider-neutral connector
 /// source. The traversal deliberately has no provider branch and never
-
 pub fn patch_native_change_stream_router_sink(
     fragment: &mut novarocks_proto_models::plan::PlanFragment,
     fragment_id: FragmentId,
@@ -829,8 +828,6 @@ mod tests {
 
         validate_fragment_output_kind(1, true, false, PreparedFragmentRole::Result)
             .expect("result root");
-        validate_fragment_output_kind(1, true, false, PreparedFragmentRole::Statistics)
-            .expect("statistics root");
         assert!(
             validate_fragment_output_kind(1, true, false, PreparedFragmentRole::NonTerminal)
                 .expect_err("root cannot be nonterminal")

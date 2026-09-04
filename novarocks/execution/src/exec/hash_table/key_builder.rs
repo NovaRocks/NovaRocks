@@ -16,14 +16,16 @@
 // under the License.
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
-    DictionaryArray, FixedSizeBinaryArray, Int32Array, LargeBinaryArray, LargeStringArray,
-    ListArray, MapArray, StringArray, StructArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray, StringArray,
+    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, Int32Type, TimeUnit};
+use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 use std::sync::Arc;
 
-use crate::exec::expr::agg::{FloatArrayView, IntArrayView};
+use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, FloatArrayView, IntArrayView};
 use novarocks_types::largeint;
 
 use super::hash::{
@@ -333,6 +335,7 @@ pub fn build_group_key_views<'a>(
     Ok(views)
 }
 
+#[cfg(test)]
 pub fn encode_group_key_row(array: &ArrayRef, row: usize) -> Result<Option<Vec<u8>>, String> {
     if array.is_null(row) {
         return Ok(None);
@@ -342,10 +345,198 @@ pub fn encode_group_key_row(array: &ArrayRef, row: usize) -> Result<Option<Vec<u
     Ok(Some(out))
 }
 
-fn encode_group_key_non_null_value(
+pub(crate) fn encode_group_key_row_tracked(
     array: &ArrayRef,
     row: usize,
-    out: &mut Vec<u8>,
+    allocator: AggregateAllocator,
+) -> Result<Option<AggregateVec<u8>>, String> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let encoded_len = encoded_group_key_non_null_len(array, row)?;
+    let mut out = AggregateVec::new_in(allocator.clone());
+    out.try_reserve_exact(encoded_len)
+        .map_err(|_| allocator.allocation_error("reserve canonical group-key bytes"))?;
+    encode_group_key_non_null_value(array, row, &mut out)?;
+    debug_assert_eq!(out.len(), encoded_len);
+    Ok(Some(out))
+}
+
+trait KeyByteSink {
+    fn push_byte(&mut self, value: u8) -> Result<(), String>;
+    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String>;
+}
+
+impl KeyByteSink for Vec<u8> {
+    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+        self.push(value);
+        Ok(())
+    }
+
+    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+        self.extend_from_slice(values);
+        Ok(())
+    }
+}
+
+impl KeyByteSink for AggregateVec<u8> {
+    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+        if self.len() == self.capacity() {
+            return Err("canonical group-key byte reservation was too small".to_string());
+        }
+        self.push(value);
+        Ok(())
+    }
+
+    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+        if values.len() > self.capacity().saturating_sub(self.len()) {
+            return Err("canonical group-key byte reservation was too small".to_string());
+        }
+        self.extend_from_slice(values);
+        Ok(())
+    }
+}
+
+struct ComparingKeyByteSink<'a> {
+    expected: &'a [u8],
+    offset: usize,
+    equal: bool,
+}
+
+impl KeyByteSink for ComparingKeyByteSink<'_> {
+    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+        self.extend_bytes(&[value])
+    }
+
+    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+        let end = self.offset.saturating_add(values.len());
+        if self.equal && self.expected.get(self.offset..end) != Some(values) {
+            self.equal = false;
+        }
+        self.offset = end;
+        Ok(())
+    }
+}
+
+pub(crate) fn canonical_group_key_equals(
+    array: &ArrayRef,
+    row: usize,
+    expected: &[u8],
+) -> Result<bool, String> {
+    if array.is_null(row) {
+        return Ok(false);
+    }
+    let mut sink = ComparingKeyByteSink {
+        expected,
+        offset: 0,
+        equal: true,
+    };
+    encode_group_key_non_null_value(array, row, &mut sink)?;
+    Ok(sink.equal && sink.offset == expected.len())
+}
+
+struct HashingKeyByteSink {
+    hash: u64,
+}
+
+impl HashingKeyByteSink {
+    fn new(seed: u64) -> Self {
+        Self {
+            hash: seed ^ 0xcbf29ce484222325,
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.hash
+    }
+}
+
+impl KeyByteSink for HashingKeyByteSink {
+    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+        self.hash ^= value as u64;
+        self.hash = self.hash.wrapping_mul(0x100000001b3);
+        Ok(())
+    }
+
+    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+        for value in values {
+            self.push_byte(*value)?;
+        }
+        Ok(())
+    }
+}
+
+fn canonical_group_key_hash_with_seed(
+    array: &ArrayRef,
+    row: usize,
+    seed: u64,
+) -> Result<Option<u64>, String> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let mut sink = HashingKeyByteSink::new(seed);
+    encode_group_key_non_null_value(array, row, &mut sink)?;
+    Ok(Some(sink.finish()))
+}
+
+pub(crate) fn canonical_group_key_fnv_hash(
+    array: &ArrayRef,
+    row: usize,
+) -> Result<Option<u64>, String> {
+    canonical_group_key_hash_with_seed(array, row, 0)
+}
+
+struct Crc32KeyByteSink {
+    crc: u32,
+}
+
+impl Crc32KeyByteSink {
+    fn new() -> Self {
+        Self { crc: 0xffff_ffff }
+    }
+
+    fn finish(self) -> u32 {
+        self.crc ^ 0xffff_ffff
+    }
+}
+
+impl KeyByteSink for Crc32KeyByteSink {
+    fn push_byte(&mut self, value: u8) -> Result<(), String> {
+        self.crc ^= value as u32;
+        for _ in 0..8 {
+            self.crc = if self.crc & 1 != 0 {
+                (self.crc >> 1) ^ 0xedb8_8320
+            } else {
+                self.crc >> 1
+            };
+        }
+        Ok(())
+    }
+
+    fn extend_bytes(&mut self, values: &[u8]) -> Result<(), String> {
+        for value in values {
+            self.push_byte(*value)?;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn canonical_group_key_crc32_hash(
+    array: &ArrayRef,
+    row: usize,
+) -> Result<Option<u32>, String> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let mut sink = Crc32KeyByteSink::new();
+    encode_group_key_non_null_value(array, row, &mut sink)?;
+    Ok(Some(sink.finish()))
+}
+
+fn encode_group_key_non_null_value<S: KeyByteSink>(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut S,
 ) -> Result<(), String> {
     match array.data_type() {
         DataType::Boolean => {
@@ -355,8 +546,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast BooleanArray while encoding group key".to_string()
                 })?;
-            out.push(1);
-            out.push(arr.value(row) as u8);
+            out.push_byte(1)?;
+            out.push_byte(arr.value(row) as u8)?;
             Ok(())
         }
         DataType::Int8 => {
@@ -366,8 +557,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast Int8Array while encoding group key".to_string()
                 })?;
-            out.push(2);
-            out.extend_from_slice(&arr.value(row).to_le_bytes());
+            out.push_byte(2)?;
+            out.extend_bytes(&arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Int16 => {
@@ -377,8 +568,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast Int16Array while encoding group key".to_string()
                 })?;
-            out.push(3);
-            out.extend_from_slice(&arr.value(row).to_le_bytes());
+            out.push_byte(3)?;
+            out.extend_bytes(&arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Int32 => {
@@ -388,8 +579,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast Int32Array while encoding group key".to_string()
                 })?;
-            out.push(4);
-            out.extend_from_slice(&arr.value(row).to_le_bytes());
+            out.push_byte(4)?;
+            out.extend_bytes(&arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Int64 => {
@@ -399,8 +590,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast Int64Array while encoding group key".to_string()
                 })?;
-            out.push(5);
-            out.extend_from_slice(&arr.value(row).to_le_bytes());
+            out.push_byte(5)?;
+            out.extend_bytes(&arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Float32 => {
@@ -410,8 +601,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast Float32Array while encoding group key".to_string()
                 })?;
-            out.push(6);
-            out.extend_from_slice(&canonical_f32_bits(arr.value(row)).to_le_bytes());
+            out.push_byte(6)?;
+            out.extend_bytes(&canonical_f32_bits(arr.value(row)).to_le_bytes())?;
             Ok(())
         }
         DataType::Float64 => {
@@ -421,8 +612,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast Float64Array while encoding group key".to_string()
                 })?;
-            out.push(7);
-            out.extend_from_slice(&canonical_f64_bits(arr.value(row)).to_le_bytes());
+            out.push_byte(7)?;
+            out.extend_bytes(&canonical_f64_bits(arr.value(row)).to_le_bytes())?;
             Ok(())
         }
         DataType::Utf8 => {
@@ -432,11 +623,11 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast StringArray while encoding group key".to_string()
                 })?;
-            out.push(8);
+            out.push_byte(8)?;
             let value = arr.value(row).as_bytes();
             let len = value.len() as u32;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(value);
+            out.extend_bytes(&len.to_le_bytes())?;
+            out.extend_bytes(value)?;
             Ok(())
         }
         DataType::Binary => {
@@ -446,12 +637,12 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast BinaryArray while encoding group key".to_string()
                 })?;
-            out.push(20);
+            out.push_byte(20)?;
             let value = arr.value(row);
             let len = u32::try_from(value.len())
                 .map_err(|_| "group key Binary length overflow".to_string())?;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(value);
+            out.extend_bytes(&len.to_le_bytes())?;
+            out.extend_bytes(value)?;
             Ok(())
         }
         DataType::LargeBinary => {
@@ -461,12 +652,12 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast LargeBinaryArray while encoding group key".to_string()
                 })?;
-            out.push(21);
+            out.push_byte(21)?;
             let value = arr.value(row);
             let len = u32::try_from(value.len())
                 .map_err(|_| "group key LargeBinary length overflow".to_string())?;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(value);
+            out.extend_bytes(&len.to_le_bytes())?;
+            out.extend_bytes(value)?;
             Ok(())
         }
         DataType::Date32 => {
@@ -476,8 +667,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast Date32Array while encoding group key".to_string()
                 })?;
-            out.push(9);
-            out.extend_from_slice(&arr.value(row).to_le_bytes());
+            out.push_byte(9)?;
+            out.extend_bytes(&arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Timestamp(unit, _) => {
@@ -529,8 +720,8 @@ fn encode_group_key_non_null_value(
                     arr.value(row)
                 }
             };
-            out.push(marker);
-            out.extend_from_slice(&value.to_le_bytes());
+            out.push_byte(marker)?;
+            out.extend_bytes(&value.to_le_bytes())?;
             Ok(())
         }
         DataType::Decimal128(_, _) => {
@@ -540,8 +731,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast Decimal128Array while encoding group key".to_string()
                 })?;
-            out.push(14);
-            out.extend_from_slice(&arr.value(row).to_le_bytes());
+            out.push_byte(14)?;
+            out.extend_bytes(&arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::Decimal256(_, _) => {
@@ -551,13 +742,8 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast Decimal256Array while encoding group key".to_string()
                 })?;
-            let encoded = arr.value(row).to_string();
-            out.push(19);
-            let bytes = encoded.as_bytes();
-            let len = u32::try_from(bytes.len())
-                .map_err(|_| "group key Decimal256 length overflow".to_string())?;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(bytes);
+            out.push_byte(19)?;
+            out.extend_bytes(&arr.value(row).to_le_bytes())?;
             Ok(())
         }
         DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
@@ -569,8 +755,8 @@ fn encode_group_key_non_null_value(
                 })?;
             let value = largeint::i128_from_be_bytes(arr.value(row))
                 .map_err(|e| format!("encode LARGEINT group key failed: {}", e))?;
-            out.push(15);
-            out.extend_from_slice(&value.to_le_bytes());
+            out.push_byte(15)?;
+            out.extend_bytes(&value.to_le_bytes())?;
             Ok(())
         }
         DataType::List(_) => {
@@ -581,21 +767,12 @@ fn encode_group_key_non_null_value(
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             let values = list.values();
-            out.push(16);
+            out.push_byte(16)?;
             let len = u32::try_from(end.saturating_sub(start))
                 .map_err(|_| "group key list length overflow".to_string())?;
-            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_bytes(&len.to_le_bytes())?;
             for idx in start..end {
-                match encode_group_key_row(values, idx)? {
-                    None => out.push(0),
-                    Some(encoded) => {
-                        out.push(1);
-                        let item_len = u32::try_from(encoded.len())
-                            .map_err(|_| "group key list item length overflow".to_string())?;
-                        out.extend_from_slice(&item_len.to_le_bytes());
-                        out.extend_from_slice(&encoded);
-                    }
-                }
+                encode_nullable_nested(values, idx, out, "group key list item")?;
             }
             Ok(())
         }
@@ -606,21 +783,12 @@ fn encode_group_key_non_null_value(
                 .ok_or_else(|| {
                     "failed to downcast StructArray while encoding group key".to_string()
                 })?;
-            out.push(17);
+            out.push_byte(17)?;
             let field_count = u32::try_from(struct_arr.num_columns())
                 .map_err(|_| "group key struct field count overflow".to_string())?;
-            out.extend_from_slice(&field_count.to_le_bytes());
+            out.extend_bytes(&field_count.to_le_bytes())?;
             for column in struct_arr.columns() {
-                match encode_group_key_row(column, row)? {
-                    None => out.push(0),
-                    Some(encoded) => {
-                        out.push(1);
-                        let len = u32::try_from(encoded.len())
-                            .map_err(|_| "group key struct field length overflow".to_string())?;
-                        out.extend_from_slice(&len.to_le_bytes());
-                        out.extend_from_slice(&encoded);
-                    }
-                }
+                encode_nullable_nested(column, row, out, "group key struct field")?;
             }
             Ok(())
         }
@@ -634,31 +802,13 @@ fn encode_group_key_non_null_value(
             let entries = map.entries();
             let keys = entries.column(0).clone();
             let values = entries.column(1).clone();
-            out.push(18);
+            out.push_byte(18)?;
             let len = u32::try_from(end.saturating_sub(start))
                 .map_err(|_| "group key map length overflow".to_string())?;
-            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_bytes(&len.to_le_bytes())?;
             for idx in start..end {
-                match encode_group_key_row(&keys, idx)? {
-                    None => out.push(0),
-                    Some(key) => {
-                        out.push(1);
-                        let key_len = u32::try_from(key.len())
-                            .map_err(|_| "group key map key length overflow".to_string())?;
-                        out.extend_from_slice(&key_len.to_le_bytes());
-                        out.extend_from_slice(&key);
-                    }
-                }
-                match encode_group_key_row(&values, idx)? {
-                    None => out.push(0),
-                    Some(encoded) => {
-                        out.push(1);
-                        let value_len = u32::try_from(encoded.len())
-                            .map_err(|_| "group key map value length overflow".to_string())?;
-                        out.extend_from_slice(&value_len.to_le_bytes());
-                        out.extend_from_slice(&encoded);
-                    }
-                }
+                encode_nullable_nested(&keys, idx, out, "group key map key")?;
+                encode_nullable_nested(&values, idx, out, "group key map value")?;
             }
             Ok(())
         }
@@ -666,6 +816,529 @@ fn encode_group_key_non_null_value(
             "group key encode unsupported input type: {:?}",
             other
         )),
+    }
+}
+
+fn encode_nullable_nested<S: KeyByteSink>(
+    array: &ArrayRef,
+    row: usize,
+    out: &mut S,
+    context: &str,
+) -> Result<(), String> {
+    if array.is_null(row) {
+        out.push_byte(0)?;
+        return Ok(());
+    }
+    out.push_byte(1)?;
+    let len = encoded_group_key_non_null_len(array, row)?;
+    let len = u32::try_from(len).map_err(|_| format!("{context} length overflow"))?;
+    out.extend_bytes(&len.to_le_bytes())?;
+    encode_group_key_non_null_value(array, row, out)
+}
+
+fn encoded_group_key_non_null_len(array: &ArrayRef, row: usize) -> Result<usize, String> {
+    let fixed = match array.data_type() {
+        DataType::Boolean | DataType::Int8 => Some(2),
+        DataType::Int16 => Some(3),
+        DataType::Int32 | DataType::Float32 | DataType::Date32 => Some(5),
+        DataType::Int64 | DataType::Float64 | DataType::Timestamp(_, _) => Some(9),
+        DataType::Decimal128(_, _) => Some(17),
+        DataType::Decimal256(_, _) => Some(33),
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => Some(17),
+        _ => None,
+    };
+    if let Some(fixed) = fixed {
+        return Ok(fixed);
+    }
+    match array.data_type() {
+        DataType::Utf8 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    "failed to downcast StringArray while sizing group key".to_string()
+                })?;
+            Ok(5usize.saturating_add(array.value(row).len()))
+        }
+        DataType::Binary => {
+            let array = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| {
+                    "failed to downcast BinaryArray while sizing group key".to_string()
+                })?;
+            Ok(5usize.saturating_add(array.value(row).len()))
+        }
+        DataType::LargeBinary => {
+            let array = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| {
+                    "failed to downcast LargeBinaryArray while sizing group key".to_string()
+                })?;
+            Ok(5usize.saturating_add(array.value(row).len()))
+        }
+        DataType::List(_) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| "failed to downcast ListArray while sizing group key".to_string())?;
+            let offsets = list.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let values = list.values();
+            nested_sequence_encoded_len(values, start..end, 5)
+        }
+        DataType::Struct(_) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    "failed to downcast StructArray while sizing group key".to_string()
+                })?;
+            values.columns().iter().try_fold(5usize, |total, column| {
+                nested_value_encoded_len(column, row)
+                    .and_then(|len| checked_encoded_len_add(total, len))
+            })
+        }
+        DataType::Map(_, _) => {
+            let map = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| "failed to downcast MapArray while sizing group key".to_string())?;
+            let offsets = map.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let entries = map.entries();
+            let keys = entries.column(0);
+            let values = entries.column(1);
+            (start..end).try_fold(5usize, |total, index| {
+                let key_len = nested_value_encoded_len(keys, index)?;
+                let value_len = nested_value_encoded_len(values, index)?;
+                checked_encoded_len_add(total, key_len)
+                    .and_then(|total| checked_encoded_len_add(total, value_len))
+            })
+        }
+        other => Err(format!(
+            "group key encode unsupported input type: {:?}",
+            other
+        )),
+    }
+}
+
+fn nested_sequence_encoded_len(
+    values: &ArrayRef,
+    mut rows: std::ops::Range<usize>,
+    initial: usize,
+) -> Result<usize, String> {
+    rows.try_fold(initial, |total, row| {
+        nested_value_encoded_len(values, row).and_then(|len| checked_encoded_len_add(total, len))
+    })
+}
+
+fn nested_value_encoded_len(array: &ArrayRef, row: usize) -> Result<usize, String> {
+    if array.is_null(row) {
+        Ok(1)
+    } else {
+        encoded_group_key_non_null_len(array, row)?
+            .checked_add(5)
+            .ok_or_else(|| "canonical group-key length overflow".to_string())
+    }
+}
+
+fn checked_encoded_len_add(left: usize, right: usize) -> Result<usize, String> {
+    left.checked_add(right)
+        .ok_or_else(|| "canonical group-key length overflow".to_string())
+}
+
+pub(crate) fn decode_group_key_rows(
+    data_type: &DataType,
+    rows: &[Option<&[u8]>],
+) -> Result<ArrayRef, String> {
+    macro_rules! fixed_array {
+        ($marker:expr, $size:expr, $array:ty, $decode:expr) => {{
+            let values = rows
+                .iter()
+                .map(|row| {
+                    row.as_ref()
+                        .map(|row| decode_fixed_value(row, $marker, $size, $decode))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Arc::new(<$array>::from(values)) as ArrayRef)
+        }};
+    }
+
+    match data_type {
+        DataType::Boolean => fixed_array!(1, 1, BooleanArray, |bytes: &[u8]| Ok(bytes[0] != 0)),
+        DataType::Int8 => fixed_array!(2, 1, Int8Array, |bytes: &[u8]| Ok(bytes[0] as i8)),
+        DataType::Int16 => fixed_array!(3, 2, Int16Array, |bytes: &[u8]| {
+            Ok(i16::from_le_bytes(bytes.try_into().expect("i16 bytes")))
+        }),
+        DataType::Int32 => fixed_array!(4, 4, Int32Array, |bytes: &[u8]| {
+            Ok(i32::from_le_bytes(bytes.try_into().expect("i32 bytes")))
+        }),
+        DataType::Int64 => fixed_array!(5, 8, Int64Array, |bytes: &[u8]| {
+            Ok(i64::from_le_bytes(bytes.try_into().expect("i64 bytes")))
+        }),
+        DataType::Float32 => fixed_array!(6, 4, Float32Array, |bytes: &[u8]| {
+            Ok(f32::from_bits(u32::from_le_bytes(
+                bytes.try_into().expect("f32 bytes"),
+            )))
+        }),
+        DataType::Float64 => fixed_array!(7, 8, Float64Array, |bytes: &[u8]| {
+            Ok(f64::from_bits(u64::from_le_bytes(
+                bytes.try_into().expect("f64 bytes"),
+            )))
+        }),
+        DataType::Utf8 => {
+            let values = decode_variable_rows(rows, 8)?;
+            let values = values
+                .iter()
+                .map(|value| {
+                    value
+                        .map(|value| {
+                            std::str::from_utf8(value)
+                                .map_err(|error| format!("invalid canonical utf8 key: {error}"))
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Arc::new(StringArray::from(values)))
+        }
+        DataType::Binary => Ok(Arc::new(BinaryArray::from(decode_variable_rows(rows, 20)?))),
+        DataType::LargeBinary => Ok(Arc::new(LargeBinaryArray::from(decode_variable_rows(
+            rows, 21,
+        )?))),
+        DataType::Date32 => fixed_array!(9, 4, Date32Array, |bytes: &[u8]| {
+            Ok(i32::from_le_bytes(bytes.try_into().expect("date32 bytes")))
+        }),
+        DataType::Timestamp(unit, timezone) => {
+            let marker = match unit {
+                TimeUnit::Second => 10,
+                TimeUnit::Millisecond => 11,
+                TimeUnit::Microsecond => 12,
+                TimeUnit::Nanosecond => 13,
+            };
+            let values = rows
+                .iter()
+                .map(|row| {
+                    row.as_ref()
+                        .map(|row| {
+                            decode_fixed_value(row, marker, 8, |bytes| {
+                                Ok(i64::from_le_bytes(
+                                    bytes.try_into().expect("timestamp bytes"),
+                                ))
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let array: ArrayRef = match unit {
+                TimeUnit::Second => {
+                    Arc::new(TimestampSecondArray::from(values).with_timezone_opt(timezone.clone()))
+                }
+                TimeUnit::Millisecond => Arc::new(
+                    TimestampMillisecondArray::from(values).with_timezone_opt(timezone.clone()),
+                ),
+                TimeUnit::Microsecond => Arc::new(
+                    TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.clone()),
+                ),
+                TimeUnit::Nanosecond => Arc::new(
+                    TimestampNanosecondArray::from(values).with_timezone_opt(timezone.clone()),
+                ),
+            };
+            Ok(array)
+        }
+        DataType::Decimal128(precision, scale) => {
+            let values = rows
+                .iter()
+                .map(|row| {
+                    row.as_ref()
+                        .map(|row| {
+                            decode_fixed_value(row, 14, 16, |bytes| {
+                                Ok(i128::from_le_bytes(
+                                    bytes.try_into().expect("decimal128 bytes"),
+                                ))
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Arc::new(
+                Decimal128Array::from(values)
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|error| error.to_string())?,
+            ))
+        }
+        DataType::Decimal256(precision, scale) => {
+            let values = rows
+                .iter()
+                .map(|row| {
+                    row.as_ref()
+                        .map(|row| {
+                            decode_fixed_value(row, 19, 32, |bytes| {
+                                Ok(i256::from_le_bytes(
+                                    bytes.try_into().expect("decimal256 bytes"),
+                                ))
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Arc::new(
+                Decimal256Array::from(values)
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|error| error.to_string())?,
+            ))
+        }
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            let values = rows
+                .iter()
+                .map(|row| {
+                    row.as_ref()
+                        .map(|row| {
+                            decode_fixed_value(row, 15, 16, |bytes| {
+                                Ok(i128::from_le_bytes(
+                                    bytes.try_into().expect("largeint bytes"),
+                                ))
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            largeint::array_from_i128(&values)
+        }
+        DataType::List(field) => decode_list_rows(field, rows),
+        DataType::Struct(fields) => decode_struct_rows(fields, rows),
+        DataType::Map(field, ordered) => decode_map_rows(field, *ordered, rows),
+        other => Err(format!(
+            "canonical group-key decode unsupported type: {other:?}"
+        )),
+    }
+}
+
+fn decode_fixed_value<T>(
+    bytes: &[u8],
+    marker: u8,
+    payload_len: usize,
+    decode: impl FnOnce(&[u8]) -> Result<T, String>,
+) -> Result<T, String> {
+    if bytes.first().copied() != Some(marker) || bytes.len() != payload_len.saturating_add(1) {
+        return Err("invalid canonical fixed-width group key".to_string());
+    }
+    decode(&bytes[1..])
+}
+
+fn decode_variable_rows<'a>(
+    rows: &'a [Option<&'a [u8]>],
+    marker: u8,
+) -> Result<Vec<Option<&'a [u8]>>, String> {
+    rows.iter()
+        .map(|row| {
+            row.as_ref()
+                .map(|row| decode_variable_value(row, marker))
+                .transpose()
+        })
+        .collect()
+}
+
+fn decode_variable_value(bytes: &[u8], marker: u8) -> Result<&[u8], String> {
+    let mut cursor = EncodedCursor::new(bytes);
+    cursor.expect_marker(marker)?;
+    let len = cursor.read_u32()? as usize;
+    let value = cursor.read_slice(len)?;
+    cursor.finish()?;
+    Ok(value)
+}
+
+fn decode_list_rows(
+    field: &Arc<arrow::datatypes::Field>,
+    rows: &[Option<&[u8]>],
+) -> Result<ArrayRef, String> {
+    let mut offsets = Vec::with_capacity(rows.len().saturating_add(1));
+    offsets.push(0_i32);
+    let mut nulls = NullBufferBuilder::new(rows.len());
+    let mut children = Vec::new();
+    for row in rows {
+        match row {
+            None => nulls.append_null(),
+            Some(row) => {
+                nulls.append_non_null();
+                let mut cursor = EncodedCursor::new(row);
+                cursor.expect_marker(16)?;
+                let count = cursor.read_u32()? as usize;
+                for _ in 0..count {
+                    children.push(cursor.read_nested()?);
+                }
+                cursor.finish()?;
+            }
+        }
+        offsets.push(
+            i32::try_from(children.len()).map_err(|_| "list key offset overflow".to_string())?,
+        );
+    }
+    let child_array = decode_group_key_rows(field.data_type(), &children)?;
+    Ok(Arc::new(ListArray::new(
+        Arc::clone(field),
+        OffsetBuffer::new(offsets.into()),
+        child_array,
+        nulls.finish(),
+    )))
+}
+
+fn decode_struct_rows(
+    fields: &arrow::datatypes::Fields,
+    rows: &[Option<&[u8]>],
+) -> Result<ArrayRef, String> {
+    let mut columns: Vec<Vec<Option<&[u8]>>> = (0..fields.len())
+        .map(|_| Vec::with_capacity(rows.len()))
+        .collect();
+    let mut nulls = NullBufferBuilder::new(rows.len());
+    for row in rows {
+        match row {
+            None => {
+                nulls.append_null();
+                for column in &mut columns {
+                    column.push(None);
+                }
+            }
+            Some(row) => {
+                nulls.append_non_null();
+                let mut cursor = EncodedCursor::new(row);
+                cursor.expect_marker(17)?;
+                let count = cursor.read_u32()? as usize;
+                if count != fields.len() {
+                    return Err("canonical struct group-key field count mismatch".to_string());
+                }
+                for column in &mut columns {
+                    column.push(cursor.read_nested()?);
+                }
+                cursor.finish()?;
+            }
+        }
+    }
+    let arrays = fields
+        .iter()
+        .zip(columns)
+        .map(|(field, rows)| decode_group_key_rows(field.data_type(), &rows))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(StructArray::new(
+        fields.clone(),
+        arrays,
+        nulls.finish(),
+    )))
+}
+
+fn decode_map_rows(
+    field: &Arc<arrow::datatypes::Field>,
+    ordered: bool,
+    rows: &[Option<&[u8]>],
+) -> Result<ArrayRef, String> {
+    let DataType::Struct(entry_fields) = field.data_type() else {
+        return Err("map group key requires struct entry type".to_string());
+    };
+    if entry_fields.len() != 2 {
+        return Err("map group key requires key/value entry fields".to_string());
+    }
+    let mut offsets = Vec::with_capacity(rows.len().saturating_add(1));
+    offsets.push(0_i32);
+    let mut nulls = NullBufferBuilder::new(rows.len());
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    for row in rows {
+        match row {
+            None => nulls.append_null(),
+            Some(row) => {
+                nulls.append_non_null();
+                let mut cursor = EncodedCursor::new(row);
+                cursor.expect_marker(18)?;
+                let count = cursor.read_u32()? as usize;
+                for _ in 0..count {
+                    keys.push(cursor.read_nested()?);
+                    values.push(cursor.read_nested()?);
+                }
+                cursor.finish()?;
+            }
+        }
+        offsets.push(i32::try_from(keys.len()).map_err(|_| "map key offset overflow".to_string())?);
+    }
+    let key_array = decode_group_key_rows(entry_fields[0].data_type(), &keys)?;
+    let value_array = decode_group_key_rows(entry_fields[1].data_type(), &values)?;
+    let entries = StructArray::new(entry_fields.clone(), vec![key_array, value_array], None);
+    Ok(Arc::new(MapArray::new(
+        Arc::clone(field),
+        OffsetBuffer::new(offsets.into()),
+        entries,
+        nulls.finish(),
+        ordered,
+    )))
+}
+
+struct EncodedCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> EncodedCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn expect_marker(&mut self, expected: u8) -> Result<(), String> {
+        let actual = self.read_u8()?;
+        if actual != expected {
+            return Err(format!(
+                "canonical group-key marker mismatch: expected {expected}, got {actual}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_u8(&mut self) -> Result<u8, String> {
+        let value = *self
+            .bytes
+            .get(self.offset)
+            .ok_or_else(|| "truncated canonical group key".to_string())?;
+        self.offset += 1;
+        Ok(value)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, String> {
+        let bytes = self.read_slice(4)?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("u32 bytes")))
+    }
+
+    fn read_slice(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| "canonical group-key cursor overflow".to_string())?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| "truncated canonical group key".to_string())?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn read_nested(&mut self) -> Result<Option<&'a [u8]>, String> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => {
+                let len = self.read_u32()? as usize;
+                self.read_slice(len).map(Some)
+            }
+            marker => Err(format!("invalid canonical nested marker: {marker}")),
+        }
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err("trailing bytes in canonical group key".to_string())
+        }
     }
 }
 
@@ -1014,7 +1687,7 @@ pub fn build_one_number_hashes(
         GroupKeyArrayView::Decimal256(arr) => {
             if arr.null_count() == 0 {
                 for value in arr.values() {
-                    let value_hash = hash_bytes_with_seed(seed, value.to_string().as_bytes());
+                    let value_hash = hash_bytes_with_seed(seed, &value.to_le_bytes());
                     hashes.push(combine_hash(seed, value_hash));
                 }
             } else {
@@ -1022,8 +1695,7 @@ pub fn build_one_number_hashes(
                     if arr.is_null(row) {
                         hashes.push(combine_hash(seed, null_hash));
                     } else {
-                        let value_hash =
-                            hash_bytes_with_seed(seed, arr.value(row).to_string().as_bytes());
+                        let value_hash = hash_bytes_with_seed(seed, &arr.value(row).to_le_bytes());
                         hashes.push(combine_hash(seed, value_hash));
                     }
                 }
@@ -1356,7 +2028,7 @@ fn hash_column(
         GroupKeyArrayView::Decimal256(arr) => {
             if arr.null_count() == 0 {
                 for (row, value) in arr.values().iter().enumerate() {
-                    let value_hash = hash_bytes_with_seed(seed, value.to_string().as_bytes());
+                    let value_hash = hash_bytes_with_seed(seed, &value.to_le_bytes());
                     combine_hash_at(hashes, row, value_hash);
                 }
             } else {
@@ -1364,8 +2036,7 @@ fn hash_column(
                     if arr.is_null(row) {
                         combine_hash_at(hashes, row, null_hash);
                     } else {
-                        let value_hash =
-                            hash_bytes_with_seed(seed, arr.value(row).to_string().as_bytes());
+                        let value_hash = hash_bytes_with_seed(seed, &arr.value(row).to_le_bytes());
                         combine_hash_at(hashes, row, value_hash);
                     }
                 }
@@ -1426,11 +2097,8 @@ fn hash_column(
         }
         GroupKeyArrayView::Complex(array) => {
             for row in 0..num_rows {
-                match encode_group_key_row(array, row)? {
-                    Some(encoded) => {
-                        let value_hash = hash_bytes_with_seed(seed, &encoded);
-                        combine_hash_at(hashes, row, value_hash);
-                    }
+                match canonical_group_key_hash_with_seed(array, row, seed)? {
+                    Some(value_hash) => combine_hash_at(hashes, row, value_hash),
                     None => {
                         combine_hash_at(hashes, row, null_hash);
                     }
@@ -1441,7 +2109,7 @@ fn hash_column(
     Ok(())
 }
 
-pub fn build_compressed_flags(
+pub(crate) fn build_compressed_flags(
     ctx: &CompressedKeyContext,
     views: &[GroupKeyArrayView<'_>],
     num_rows: usize,
@@ -1456,8 +2124,13 @@ pub fn build_compressed_flags(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, DictionaryArray};
-    use arrow::datatypes::Int32Type;
+    use crate::runtime::mem_tracker::MemTracker;
+    use arrow::array::{
+        ArrayRef, DictionaryArray, Int32Builder, Int64Array, MapBuilder, MapFieldNames,
+        StringBuilder,
+    };
+    use arrow::datatypes::{Field, Fields, Int32Type};
+    use arrow_buffer::NullBuffer;
     use std::sync::Arc;
 
     fn dict_utf8(values: Vec<Option<&str>>) -> ArrayRef {
@@ -1542,5 +2215,98 @@ mod tests {
         assert!(encode_group_key_row(&large_binary, 0).unwrap().is_some());
         assert_eq!(encode_group_key_row(&large_binary, 1).unwrap(), None);
         assert!(encode_group_key_row(&large_binary, 2).unwrap().is_some());
+    }
+
+    fn assert_canonical_round_trip(array: ArrayRef) {
+        let tracker = MemTracker::new_root("canonical-key-test");
+        let allocator = AggregateAllocator::new(Arc::clone(&tracker));
+        let encoded = (0..array.len())
+            .map(|row| encode_group_key_row_tracked(&array, row, allocator.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode canonical keys");
+        let borrowed = encoded
+            .iter()
+            .map(|value| value.as_ref().map(|value| value.as_slice()))
+            .collect::<Vec<_>>();
+        let decoded = decode_group_key_rows(array.data_type(), &borrowed).expect("decode keys");
+        assert_eq!(decoded.as_ref(), array.as_ref());
+        for (row, encoded) in borrowed.iter().copied().enumerate() {
+            if let Some(encoded) = encoded {
+                assert!(
+                    canonical_group_key_equals(&array, row, encoded)
+                        .expect("compare canonical key")
+                );
+            }
+        }
+        drop(encoded);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn canonical_complex_keys_round_trip_list_struct_and_map() {
+        let list = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            OffsetBuffer::new(vec![0, 2, 4, 4].into()),
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(1), None])),
+            Some(NullBuffer::from(vec![true, true, false])),
+        )) as ArrayRef;
+        assert_canonical_round_trip(list);
+
+        let fields = Fields::from(vec![
+            Arc::new(Field::new("id", DataType::Int32, true)),
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+        ]);
+        let struct_array = Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(7), Some(7), None])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("x"), None])),
+            ],
+            Some(NullBuffer::from(vec![true, true, false])),
+        )) as ArrayRef;
+        assert_canonical_round_trip(struct_array);
+
+        let mut builder = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "entries".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            Int32Builder::new(),
+            StringBuilder::new(),
+        );
+        for row in [Some(&[(1, "a")][..]), Some(&[(1, "a")][..]), None] {
+            if let Some(entries) = row {
+                for (key, value) in entries {
+                    builder.keys().append_value(*key);
+                    builder.values().append_value(*value);
+                }
+                builder.append(true).expect("append map row");
+            } else {
+                builder.append(false).expect("append null map row");
+            }
+        }
+        assert_canonical_round_trip(Arc::new(builder.finish()));
+    }
+
+    #[test]
+    fn canonical_complex_key_rejects_before_allocating_bytes() {
+        let fields = Fields::from(vec![Arc::new(Field::new("payload", DataType::Utf8, false))]);
+        let array = Arc::new(StructArray::new(
+            fields,
+            vec![Arc::new(StringArray::from(vec![
+                "a payload too large for one byte",
+            ]))],
+            None,
+        )) as ArrayRef;
+        let tracker = MemTracker::new_root("canonical-key-limit");
+        tracker.install_limit_once(1).expect("install limit");
+
+        let error =
+            encode_group_key_row_tracked(&array, 0, AggregateAllocator::new(Arc::clone(&tracker)))
+                .expect_err("canonical bytes must be rejected before allocation");
+
+        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert_eq!(tracker.current(), 0);
     }
 }

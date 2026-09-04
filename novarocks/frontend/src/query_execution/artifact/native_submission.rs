@@ -272,9 +272,6 @@ impl<'a> NativeSubmissionFragmentFacts<'a> {
             crate::query_execution::preparation::PreparedFragmentRole::Result => {
                 NativeSubmissionFragmentRole::Result
             }
-            crate::query_execution::preparation::PreparedFragmentRole::Statistics => {
-                NativeSubmissionFragmentRole::Statistics
-            }
             crate::query_execution::preparation::PreparedFragmentRole::NonTerminal => {
                 NativeSubmissionFragmentRole::NonTerminal
             }
@@ -293,7 +290,6 @@ impl<'a> NativeSubmissionFragmentFacts<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeSubmissionFragmentRole {
     Result,
-    Statistics,
     NonTerminal,
 }
 

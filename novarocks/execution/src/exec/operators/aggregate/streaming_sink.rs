@@ -35,11 +35,12 @@ use std::sync::Arc;
 use crate::runtime_filter as execution;
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use novarocks_functions::ResolvedAggregateSignature;
 
 use super::streaming_state::AggregateStreamingState;
 use super::{
-    ENABLE_GROUP_KEY_OPTIMIZATIONS, align_schema_with_arrays, build_agg_views,
-    normalize_aggregate_group_arrays,
+    ENABLE_GROUP_KEY_OPTIMIZATIONS, align_schema_with_arrays, build_agg_batches,
+    expected_agg_input_types, normalize_aggregate_group_arrays,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
@@ -60,6 +61,10 @@ use novarocks_types::SlotId;
 use super::native_runtime_filter::{
     AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,
 };
+use super::retained::{
+    AggregateOperatorVectorsMemory, AggregateRetainedMemory, AggregateStatePointers,
+    TouchedAggregateStates,
+};
 use super::topn_boundary::{
     AggregateTopNBoundaryBinding, build_topn_boundary_bindings, observe_key_table_group,
     validate_topn_boundary_specs,
@@ -71,6 +76,7 @@ pub struct AggregateStreamingSinkFactory {
     arena: Arc<ExprArena>,
     group_by: Vec<ExprId>,
     functions: Vec<AggFunction>,
+    kernels: agg::AggKernelSet,
     output_intermediate: bool,
     output_chunk_schema: ChunkSchemaRef,
     runtime_filter_execution: StreamingAggregateRuntimeFilterExecution,
@@ -93,6 +99,8 @@ impl AggregateStreamingSinkFactory {
         arena: Arc<ExprArena>,
         group_by: Vec<ExprId>,
         functions: Vec<AggFunction>,
+        function_set: Arc<agg::SealedExecutionFunctionSet>,
+        resolved_aggregates: Vec<ResolvedAggregateSignature>,
         output_intermediate: bool,
         output_chunk_schema: ChunkSchemaRef,
         state: AggregateStreamingState,
@@ -121,11 +129,19 @@ impl AggregateStreamingSinkFactory {
                 local_partition_count,
             )?))
         };
+        let expected_agg_types = expected_agg_input_types(&arena, &functions)?;
+        let kernels = agg::build_kernel_set(
+            &function_set,
+            &functions,
+            &expected_agg_types,
+            &resolved_aggregates,
+        )?;
         Ok(Self {
             name,
             arena,
             group_by,
             functions,
+            kernels,
             output_intermediate,
             output_chunk_schema,
             runtime_filter_execution: StreamingAggregateRuntimeFilterExecution { topn_producers },
@@ -156,9 +172,9 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
             functions: self.functions.clone(),
             key_table: None,
             state_arena: agg::AggStateArena::new(64 * 1024),
-            group_states: Vec::new(),
-            state_ptrs: Vec::new(),
-            kernels: None,
+            group_states: AggregateStatePointers::new(),
+            state_ptrs: AggregateStatePointers::new(),
+            kernels: Some(self.kernels.clone()),
             output_intermediate: self.output_intermediate,
             initialized: false,
             data_initialized: false,
@@ -168,6 +184,10 @@ impl OperatorFactory for AggregateStreamingSinkFactory {
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             observed_group_key_nullable: vec![false; self.group_by.len()],
             key_table_mem_tracker: None,
+            aggregate_retained_memory: AggregateRetainedMemory::new(),
+            touched_aggregate_states: TouchedAggregateStates::new(),
+            operator_vectors_memory: AggregateOperatorVectorsMemory::new(),
+            memory_bind_error: None,
             runtime_filter_execution: self.runtime_filter_execution.clone(),
             topn_rf_rows_since_publish: 0,
             topn_boundary_bindings: Vec::new(),
@@ -194,8 +214,8 @@ struct AggregateStreamingSinkOperator {
     functions: Vec<AggFunction>,
     key_table: Option<KeyTable>,
     state_arena: agg::AggStateArena,
-    group_states: Vec<agg::AggStatePtr>,
-    state_ptrs: Vec<agg::AggStatePtr>,
+    group_states: AggregateStatePointers,
+    state_ptrs: AggregateStatePointers,
     kernels: Option<agg::AggKernelSet>,
     output_intermediate: bool,
     initialized: bool,
@@ -206,6 +226,10 @@ struct AggregateStreamingSinkOperator {
     output_chunk_schema: ChunkSchemaRef,
     observed_group_key_nullable: Vec<bool>,
     key_table_mem_tracker: Option<Arc<MemTracker>>,
+    aggregate_retained_memory: AggregateRetainedMemory,
+    touched_aggregate_states: TouchedAggregateStates,
+    operator_vectors_memory: AggregateOperatorVectorsMemory,
+    memory_bind_error: Option<String>,
     runtime_filter_execution: StreamingAggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
     topn_boundary_bindings: Vec<AggregateTopNBoundaryBinding>,
@@ -221,16 +245,40 @@ impl Operator for AggregateStreamingSinkOperator {
 
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         let arena = MemTracker::new_child("AggStateArena", &tracker);
-        self.state_arena.set_mem_tracker(Arc::clone(&arena));
+        if let Err(error) = self.state_arena.try_set_mem_tracker(Arc::clone(&arena)) {
+            self.memory_bind_error = Some(error);
+        }
 
         let key_table = MemTracker::new_child("KeyTable", &tracker);
-        if let Some(table) = self.key_table.as_mut() {
-            table.set_mem_tracker(Arc::clone(&key_table));
-        }
         self.key_table_mem_tracker = Some(key_table);
+
+        if let Err(error) = self
+            .aggregate_retained_memory
+            .set_tracker(MemTracker::new_child("AggregateRetainedHeap", &tracker))
+        {
+            self.memory_bind_error = Some(error);
+        }
+        if let Err(error) = self
+            .touched_aggregate_states
+            .set_tracker(MemTracker::new_child("AggregateTouchedStates", &tracker))
+        {
+            self.memory_bind_error = Some(error);
+        }
+        if let Err(error) = self.operator_vectors_memory.set_tracker(
+            &mut self.group_states,
+            &mut self.state_ptrs,
+            MemTracker::new_child("AggregateOperatorVectors", &tracker),
+        ) {
+            self.memory_bind_error = Some(error);
+        }
     }
 
     fn prepare(&mut self) -> Result<(), String> {
+        if let Some(error) = self.memory_bind_error.clone() {
+            return Err(error);
+        }
+        self.operator_vectors_memory
+            .ensure_bound(&mut self.group_states, &mut self.state_ptrs)?;
         self.init_from_plan()
     }
 
@@ -325,6 +373,10 @@ impl AggregateStreamingSinkOperator {
         if self.finished {
             return Ok(());
         }
+        self.aggregate_retained_memory.ensure_available()?;
+        self.touched_aggregate_states.ensure_available()?;
+        self.operator_vectors_memory.ensure_available()?;
+        self.state_arena.ensure_available()?;
 
         if chunk.is_empty() && chunk.schema().fields().is_empty() {
             return Ok(());
@@ -364,28 +416,35 @@ impl AggregateStreamingSinkOperator {
                 .first()
                 .ok_or_else(|| "aggregate scalar state missing".to_string())?;
             self.state_ptrs.clear();
+            self.operator_vectors_memory.reserve_state_ptrs(
+                &self.group_states,
+                &mut self.state_ptrs,
+                num_rows,
+            )?;
             self.state_ptrs.resize(num_rows, state_ptr);
             let kernels = self
                 .kernels
                 .as_ref()
                 .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
-            let agg_views = build_agg_views(&kernels.entries, &self.functions, &agg_arrays)
-                .map_err(|e| e.to_string())?;
-            for (idx, (kernel, view)) in kernels.entries.iter().zip(agg_views.iter()).enumerate() {
-                if self
+            let agg_batches = build_agg_batches(&agg_arrays, num_rows)?;
+            for (idx, (kernel, batch)) in kernels
+                .entries
+                .iter()
+                .zip(agg_batches.iter().copied())
+                .enumerate()
+            {
+                let merge = self
                     .functions
                     .get(idx)
                     .map(|f| f.input_is_intermediate)
-                    .unwrap_or(false)
-                {
-                    kernel
-                        .merge_batch(&self.state_ptrs, view)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    kernel
-                        .update_batch(&self.state_ptrs, view)
-                        .map_err(|e| e.to_string())?;
-                }
+                    .unwrap_or(false);
+                self.aggregate_retained_memory.run_bounded_batch(
+                    &mut self.touched_aggregate_states,
+                    kernel,
+                    &self.state_ptrs,
+                    batch,
+                    merge,
+                )?;
             }
             return Ok(());
         }
@@ -399,35 +458,19 @@ impl AggregateStreamingSinkOperator {
             let mut group_ids = Vec::with_capacity(num_rows);
             match key_table.key_strategy() {
                 GroupKeyStrategy::Serialized => {
-                    let rows_result = key_table.build_rows(&group_arrays);
-                    let fallback_rows = match &rows_result {
-                        Ok(_) => None,
-                        Err(err) if err.contains("row converter not initialized") => Some(
-                            key_table
-                                .build_rows_fallback(&group_arrays)
-                                .map_err(|e| e.to_string())?,
-                        ),
-                        Err(err) => return Err(err.to_string()),
-                    };
-                    let rows = rows_result.ok();
+                    let rows = key_table
+                        .build_rows_fallback(&group_arrays)
+                        .map_err(|e| e.to_string())?;
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
                         .map_err(|e| e.to_string())?;
                     for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
-                        let row_bytes = if let Some(rows) = rows.as_ref() {
-                            rows.row(row).data()
-                        } else {
-                            fallback_rows
-                                .as_ref()
-                                .and_then(|all| all.get(row))
-                                .map(|v| v.as_slice())
-                                .ok_or_else(|| {
-                                    format!(
-                                        "fallback serialized group row missing at row={} (rows={})",
-                                        row, num_rows
-                                    )
-                                })?
-                        };
+                        let row_bytes = rows.get(row).map(|v| v.as_slice()).ok_or_else(|| {
+                            format!(
+                                "canonical serialized group row missing at row={} (rows={})",
+                                row, num_rows
+                            )
+                        })?;
                         let lookup = key_table
                             .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                             .map_err(|e| e.to_string())?;
@@ -507,12 +550,15 @@ impl AggregateStreamingSinkOperator {
                             if rows_opt.is_none() {
                                 rows_opt = Some(
                                     key_table
-                                        .build_rows(&group_arrays)
+                                        .build_rows_fallback(&group_arrays)
                                         .map_err(|e| e.to_string())?,
                                 );
                             }
                             let rows = rows_opt.as_ref().expect("group rows");
-                            let row_bytes = rows.row(row).data();
+                            let row_bytes =
+                                rows.get(row).map(|row| row.as_slice()).ok_or_else(|| {
+                                    "canonical compressed fallback row missing".to_string()
+                                })?;
                             key_table
                                 .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                                 .map_err(|e| e.to_string())?
@@ -529,7 +575,11 @@ impl AggregateStreamingSinkOperator {
             }
 
             self.state_ptrs.clear();
-            self.state_ptrs.reserve(num_rows);
+            self.operator_vectors_memory.reserve_state_ptrs(
+                &self.group_states,
+                &mut self.state_ptrs,
+                num_rows,
+            )?;
             for &group_id in &group_ids {
                 let state_ptr = *self
                     .group_states
@@ -541,23 +591,25 @@ impl AggregateStreamingSinkOperator {
                 .kernels
                 .as_ref()
                 .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
-            let agg_views = build_agg_views(&kernels.entries, &self.functions, &agg_arrays)
-                .map_err(|e| e.to_string())?;
-            for (idx, (kernel, view)) in kernels.entries.iter().zip(agg_views.iter()).enumerate() {
-                if self
+            let agg_batches = build_agg_batches(&agg_arrays, num_rows)?;
+            for (idx, (kernel, batch)) in kernels
+                .entries
+                .iter()
+                .zip(agg_batches.iter().copied())
+                .enumerate()
+            {
+                let merge = self
                     .functions
                     .get(idx)
                     .map(|f| f.input_is_intermediate)
-                    .unwrap_or(false)
-                {
-                    kernel
-                        .merge_batch(&self.state_ptrs, view)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    kernel
-                        .update_batch(&self.state_ptrs, view)
-                        .map_err(|e| e.to_string())?;
-                }
+                    .unwrap_or(false);
+                self.aggregate_retained_memory.run_bounded_batch(
+                    &mut self.touched_aggregate_states,
+                    kernel,
+                    &self.state_ptrs,
+                    batch,
+                    merge,
+                )?;
             }
             Ok(())
         })();
@@ -631,11 +683,11 @@ impl AggregateStreamingSinkOperator {
             }
         }
         for kernel in &kernels.entries {
-            arrays.push(
-                kernel
-                    .build_array(&self.group_states, self.output_intermediate)
-                    .map_err(|e| e.to_string())?,
-            );
+            arrays.push(self.aggregate_retained_memory.around(
+                kernel,
+                &self.group_states,
+                || kernel.build_array(&self.group_states, self.output_intermediate),
+            )?);
         }
         let schema = align_schema_with_arrays(&schema, &arrays, "aggregate streaming output")?;
 
@@ -661,17 +713,29 @@ impl AggregateStreamingSinkOperator {
             .map_err(|error| error.to_string())?;
 
         let expected_group_types = self.expected_group_types()?;
-        let expected_agg_types = self.expected_agg_input_types()?;
 
         if !expected_group_types.is_empty() {
-            self.key_table = Some(KeyTable::new(
-                expected_group_types.clone(),
-                ENABLE_GROUP_KEY_OPTIMIZATIONS,
-            )?);
+            let key_table = match self.key_table_mem_tracker.as_ref() {
+                Some(tracker) => KeyTable::new_with_tracker(
+                    expected_group_types.clone(),
+                    ENABLE_GROUP_KEY_OPTIMIZATIONS,
+                    Arc::clone(tracker),
+                )?,
+                #[cfg(test)]
+                None => {
+                    KeyTable::new(expected_group_types.clone(), ENABLE_GROUP_KEY_OPTIMIZATIONS)?
+                }
+                #[cfg(not(test))]
+                None => {
+                    return Err(
+                        "streaming aggregate key table memory tracker must be bound before initialization"
+                            .to_string(),
+                    );
+                }
+            };
+            self.key_table = Some(key_table);
         }
 
-        let kernels = agg::build_kernel_set(&self.functions, &expected_agg_types)?;
-        self.kernels = Some(kernels);
         if self.kernels.is_some() {
             self.rebuild_output_schema(None)?;
         }
@@ -835,38 +899,7 @@ impl AggregateStreamingSinkOperator {
     }
 
     fn expected_agg_input_types(&self) -> Result<Vec<Option<DataType>>, String> {
-        let mut types = Vec::with_capacity(self.functions.len());
-        for func in &self.functions {
-            if func.input_is_intermediate
-                && let Some(sig) = func.types.as_ref()
-                && let Some(intermediate) = sig.intermediate_type.as_ref()
-            {
-                if matches!(intermediate, DataType::Null) {
-                    return Err("aggregate intermediate type is null".to_string());
-                }
-                types.push(Some(intermediate.clone()));
-                continue;
-            }
-            let data_type = match (func.name.as_str(), func.inputs.as_slice()) {
-                ("count", []) => None,
-                (_, [expr]) => Some(
-                    self.arena
-                        .data_type(*expr)
-                        .ok_or_else(|| "aggregate input type missing".to_string())?
-                        .clone(),
-                ),
-                (_, []) => return Err("aggregate input missing".to_string()),
-                (_, _) => {
-                    return Err(format!(
-                        "aggregate inputs must be packed into a single struct expression: {} has {} inputs",
-                        func.name,
-                        func.inputs.len()
-                    ));
-                }
-            };
-            types.push(data_type);
-        }
-        Ok(types)
+        expected_agg_input_types(&self.arena, &self.functions)
     }
 
     fn validate_group_array_types(
@@ -992,25 +1025,46 @@ impl AggregateStreamingSinkOperator {
             .map(|entry| entry.state_align())
             .max()
             .unwrap_or(1);
-        let state_ptr = self.state_arena.alloc(kernels.layout.total_size, align);
-        for kernel in &kernels.entries {
-            kernel.init_state(state_ptr);
+        self.operator_vectors_memory.reserve_group_states(
+            &mut self.group_states,
+            &self.state_ptrs,
+            1,
+        )?;
+        let state_ptr = self
+            .state_arena
+            .try_alloc(kernels.layout.total_size, align)?;
+        for (initialized, kernel) in kernels.entries.iter().enumerate() {
+            if let Err(error) = self
+                .aggregate_retained_memory
+                .initialize_state(kernel, state_ptr)
+            {
+                for initialized_kernel in kernels.entries[..initialized].iter().rev() {
+                    self.aggregate_retained_memory
+                        .drop_initialized_state(initialized_kernel, state_ptr);
+                }
+                return Err(error);
+            }
         }
         self.group_states.push(state_ptr);
         Ok(())
     }
 
     fn drop_group_states(&mut self) {
+        if !self.group_states.is_bound() {
+            return;
+        }
         let Some(kernels) = self.kernels.as_ref() else {
             self.group_states.clear();
             return;
         };
-        for &state in &self.group_states {
+        for &state in self.group_states.iter() {
             for kernel in &kernels.entries {
-                kernel.drop_state(state);
+                self.aggregate_retained_memory
+                    .drop_initialized_state(kernel, state);
             }
         }
         self.group_states.clear();
+        self.aggregate_retained_memory.release_all();
     }
 }
 
@@ -1101,6 +1155,13 @@ pub(super) fn aggregate_streaming_topn_test_operator(
         arena: Arc::new(ExprArena::default()),
         group_by: Vec::new(),
         functions: Vec::new(),
+        kernels: agg::AggKernelSet {
+            entries: Vec::new(),
+            layout: agg::AggStateLayout {
+                total_size: 1,
+                descs: Vec::new(),
+            },
+        },
         output_intermediate: false,
         output_chunk_schema: Arc::new(ChunkSchema::empty()),
         runtime_filter_execution: StreamingAggregateRuntimeFilterExecution { topn_producers },
@@ -1108,4 +1169,225 @@ pub(super) fn aggregate_streaming_topn_test_operator(
         streaming_state: AggregateStreamingState::new(1),
     }
     .create(1, 0)
+}
+
+#[cfg(test)]
+mod retained_memory_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, BinaryArray, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use novarocks_types::SlotId;
+
+    use super::{AggregateStreamingSinkFactory, AggregateStreamingState};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    use crate::exec::operators::aggregate::empty_execution_function_set;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::RuntimeState;
+
+    const VALUE_SLOT: SlotId = SlotId::new(101);
+    const INTERMEDIATE_SLOT: SlotId = SlotId::new(102);
+    const FINAL_SLOT: SlotId = SlotId::new(103);
+
+    fn scalar_distinct_factory(
+        input_slot: SlotId,
+        input_type: DataType,
+        output_slot: SlotId,
+        input_is_intermediate: bool,
+        output_intermediate: bool,
+    ) -> (AggregateStreamingSinkFactory, AggregateStreamingState) {
+        let mut arena = ExprArena::default();
+        let input = arena.push_typed(ExprNode::SlotId(input_slot), input_type);
+        let output_type = if output_intermediate {
+            DataType::Binary
+        } else {
+            DataType::Int64
+        };
+        let function = AggFunction {
+            name: "multi_distinct_count".to_string(),
+            inputs: vec![input],
+            input_is_intermediate,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(DataType::Binary),
+                output_type: Some(output_type.clone()),
+                input_arg_type: Some(DataType::Int64),
+            }),
+            order: Default::default(),
+        };
+        let function_set = empty_execution_function_set();
+        let selected = function_set
+            .catalog()
+            .resolve_aggregate_trusted("multi_distinct_count", &[DataType::Int64])
+            .expect("resolve distinct aggregate");
+        let output_field = Field::new("distinct_count", output_type, false);
+        let output_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(output_slot, &output_field, None)
+                    .expect("streaming aggregate output slot"),
+            ])
+            .expect("streaming aggregate output schema"),
+        );
+        let state = AggregateStreamingState::new(1);
+        let factory = AggregateStreamingSinkFactory::new_native(
+            91,
+            Arc::new(arena),
+            Vec::new(),
+            vec![function],
+            function_set,
+            vec![selected],
+            output_intermediate,
+            output_schema,
+            state.clone(),
+            Vec::new(),
+            None,
+            1,
+        )
+        .expect("build streaming aggregate factory");
+        (factory, state)
+    }
+
+    fn int64_chunk(slot: SlotId, values: impl IntoIterator<Item = i64>) -> Chunk {
+        let field = Field::new("value", DataType::Int64, false);
+        let values = Arc::new(Int64Array::from_iter_values(values)) as ArrayRef;
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field.clone()])), vec![values])
+            .expect("streaming aggregate input batch");
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::from_field(slot, &field, None)
+                    .expect("streaming aggregate input slot"),
+            ])
+            .expect("streaming aggregate input schema"),
+        );
+        Chunk::try_new_with_chunk_schema(batch, schema).expect("streaming aggregate input chunk")
+    }
+
+    fn finish_and_take_output(
+        operator: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
+        state: &AggregateStreamingState,
+    ) -> Chunk {
+        operator
+            .as_processor_mut()
+            .expect("streaming aggregate processor")
+            .set_finishing(&RuntimeState::default())
+            .expect("finish streaming aggregate");
+        state.poll_chunk().expect("streaming aggregate output")
+    }
+
+    #[test]
+    fn streaming_update_growth_final_and_drop_release_query_memory() {
+        let (factory, state) =
+            scalar_distinct_factory(VALUE_SLOT, DataType::Int64, FINAL_SLOT, false, false);
+        let tracker = MemTracker::new_root("streaming-update");
+        let mut operator = factory.create(1, 0);
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.prepare().expect("prepare streaming aggregate");
+        operator
+            .as_processor_mut()
+            .expect("streaming aggregate processor")
+            .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, 0..256))
+            .expect("update streaming aggregate");
+        let before_finish = tracker.current();
+        assert!(before_finish > 0, "state growth must be query-accounted");
+
+        let output = finish_and_take_output(&mut operator, &state);
+        assert!(
+            tracker.current() < before_finish,
+            "finalization must release the aggregate state's dynamic heap"
+        );
+        let count = output.columns()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("distinct count output");
+        assert_eq!(count.value(0), 256);
+        drop(operator);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn streaming_merge_growth_final_and_drop_release_query_memory() {
+        let (update_factory, update_state) =
+            scalar_distinct_factory(VALUE_SLOT, DataType::Int64, INTERMEDIATE_SLOT, false, true);
+        let update_tracker = MemTracker::new_root("streaming-partial");
+        let mut update = update_factory.create(1, 0);
+        update.set_mem_tracker(Arc::clone(&update_tracker));
+        update.prepare().expect("prepare partial aggregate");
+        update
+            .as_processor_mut()
+            .expect("partial aggregate processor")
+            .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, 0..256))
+            .expect("build partial distinct state");
+        let intermediate = finish_and_take_output(&mut update, &update_state);
+        drop(update);
+        assert_eq!(update_tracker.current(), 0);
+        assert!(
+            intermediate.columns()[0]
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .is_some(),
+            "partial output must use the catalog intermediate carrier"
+        );
+
+        let (merge_factory, merge_state) =
+            scalar_distinct_factory(INTERMEDIATE_SLOT, DataType::Binary, FINAL_SLOT, true, false);
+        let merge_tracker = MemTracker::new_root("streaming-merge");
+        let mut merge = merge_factory.create(1, 0);
+        merge.set_mem_tracker(Arc::clone(&merge_tracker));
+        merge.prepare().expect("prepare merge aggregate");
+        merge
+            .as_processor_mut()
+            .expect("merge aggregate processor")
+            .push_chunk(&RuntimeState::default(), intermediate)
+            .expect("merge distinct state");
+        let before_finish = merge_tracker.current();
+        assert!(before_finish > 0, "merge growth must be query-accounted");
+        let output = finish_and_take_output(&mut merge, &merge_state);
+        assert!(merge_tracker.current() < before_finish);
+        let count = output.columns()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("merged distinct count output");
+        assert_eq!(count.value(0), 256);
+        drop(merge);
+        assert_eq!(merge_tracker.current(), 0);
+    }
+
+    #[test]
+    fn streaming_update_oom_fails_before_distinct_state_mutation() {
+        let (factory, state) =
+            scalar_distinct_factory(VALUE_SLOT, DataType::Int64, FINAL_SLOT, false, false);
+        let tracker = MemTracker::new_root("streaming-oom");
+        let mut operator = factory.create(1, 0);
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator.prepare().expect("prepare streaming aggregate");
+        operator
+            .as_processor_mut()
+            .expect("streaming aggregate processor")
+            .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, [1, 2, 3]))
+            .expect("seed distinct state");
+        let before_oom = tracker.current();
+        tracker
+            .install_limit_once(before_oom)
+            .expect("freeze memory limit at live usage");
+
+        let error = operator
+            .as_processor_mut()
+            .expect("streaming aggregate processor")
+            .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, [4]))
+            .expect_err("new distinct value must require tracked allocation");
+        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert_eq!(tracker.current(), before_oom);
+
+        let output = finish_and_take_output(&mut operator, &state);
+        let count = output.columns()[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("distinct count output");
+        assert_eq!(count.value(0), 3, "failed allocation must not mutate state");
+        drop(operator);
+        assert_eq!(tracker.current(), 0);
+    }
 }

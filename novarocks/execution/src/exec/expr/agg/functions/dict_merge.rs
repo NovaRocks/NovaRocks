@@ -14,8 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::BTreeSet;
-
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, ListArray, StringArray, StringBuilder, StructArray,
 };
@@ -24,6 +22,7 @@ use base64::Engine;
 use serde_json::json;
 
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
@@ -32,12 +31,26 @@ pub(super) struct DictMergeAgg;
 
 const DEFAULT_DICT_THRESHOLD: i32 = 255;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DictMergeState {
-    values: BTreeSet<String>,
+    allocator: AggregateAllocator,
+    values: AggregateHashSet<AggregateVec<u8>>,
     over_limit: bool,
     threshold: i32,
     threshold_initialized: bool,
+}
+
+impl DictMergeState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            values: aggregate_hash_set(allocator.clone()),
+            allocator,
+            over_limit: false,
+            threshold: 0,
+            threshold_initialized: false,
+        }
+    }
 }
 
 impl DictMergeState {
@@ -78,14 +91,41 @@ impl DictMergeState {
         }
     }
 
-    fn insert_value(&mut self, value: &str) {
+    fn insert_value(&mut self, value: &str) -> Result<(), String> {
         if self.over_limit {
-            return;
+            return Ok(());
         }
-        self.values.insert(value.to_string());
+        if self
+            .values
+            .iter()
+            .any(|existing| existing.as_slice() == value.as_bytes())
+        {
+            return Ok(());
+        }
+        self.values.try_reserve(1).map_err(|_| {
+            self.allocator
+                .allocation_error("reserve dictionary hash set")
+        })?;
+        self.values
+            .insert(aggregate_bytes(self.allocator.clone(), value.as_bytes())?);
         if self.values.len() > self.max_values_allowed() {
             self.over_limit = true;
         }
+        Ok(())
+    }
+
+    fn sorted_values(&self) -> Result<Vec<String>, String> {
+        let mut values = self
+            .values
+            .iter()
+            .map(|value| {
+                std::str::from_utf8(value.as_slice())
+                    .map(str::to_owned)
+                    .map_err(|error| format!("dict_merge retained invalid UTF8: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        values.sort_unstable();
+        Ok(values)
     }
 }
 
@@ -117,7 +157,7 @@ fn update_from_value_array_row(
                     "dict_merge failed to downcast value array to StringArray".to_string()
                 })?;
             if !arr.is_null(row) {
-                state.insert_value(arr.value(row));
+                state.insert_value(arr.value(row))?;
             }
             Ok(())
         }
@@ -141,7 +181,7 @@ fn update_from_value_array_row(
                 .ok_or_else(|| "dict_merge list items must be UTF8".to_string())?;
             for idx in start..end {
                 if !values.is_null(idx) {
-                    state.insert_value(values.value(idx));
+                    state.insert_value(values.value(idx))?;
                 }
             }
             Ok(())
@@ -169,7 +209,7 @@ fn serialize_intermediate_state(state: &DictMergeState) -> Result<String, String
     let values = if state.over_limit {
         Vec::<String>::new()
     } else {
-        state.values.iter().cloned().collect::<Vec<_>>()
+        state.sorted_values()?
     };
     serde_json::to_string(&json!({
         "t": state.threshold(),
@@ -204,7 +244,7 @@ fn merge_from_intermediate_json(
             let Some(text) = item.as_str() else {
                 return Err("dict_merge intermediate values must be strings".to_string());
             };
-            state.insert_value(text);
+            state.insert_value(text)?;
         }
     }
     Ok(true)
@@ -241,7 +281,7 @@ fn merge_from_final_dict_json(
             .as_str()
             .ok_or_else(|| "dict_merge final dict values must be strings".to_string())?;
         let decoded = decode_base64_no_pad(encoded)?;
-        state.insert_value(&decoded);
+        state.insert_value(&decoded)?;
     }
     Ok(true)
 }
@@ -268,7 +308,7 @@ fn finalize_dict_json(state: &DictMergeState) -> Result<Option<String>, String> 
     let values = if state.over_limit {
         build_fake_values(state.threshold())
     } else {
-        state.values.iter().cloned().collect::<Vec<_>>()
+        state.sorted_values()?
     };
 
     if values.is_empty() {
@@ -450,14 +490,38 @@ impl AggregateFunction for DictMergeAgg {
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
-            std::ptr::write(ptr as *mut DictMergeState, DictMergeState::default());
+            std::ptr::write(
+                ptr as *mut DictMergeState,
+                DictMergeState::new(process_mem_tracker()),
+            );
         }
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker.ok_or_else(|| {
+            "allocation-tracked dict_merge state requires a memory tracker".to_string()
+        })?;
+        unsafe { std::ptr::write(ptr.cast::<DictMergeState>(), DictMergeState::new(tracker)) };
+        Ok(())
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             std::ptr::drop_in_place(ptr as *mut DictMergeState);
         }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -635,15 +699,16 @@ mod tests {
         DEFAULT_DICT_THRESHOLD, DictMergeState, finalize_dict_json, merge_serialized_state,
         serialize_intermediate_state,
     };
+    use crate::runtime::mem_tracker::MemTracker;
 
     #[test]
     fn finalize_payload_uses_sorted_base64_strings() {
-        let mut state = DictMergeState::default();
+        let mut state = DictMergeState::new(MemTracker::new_root("dict-finalize-test"));
         state
             .set_threshold_from_i64(DEFAULT_DICT_THRESHOLD as i64)
             .unwrap();
-        state.insert_value("shanghai");
-        state.insert_value("beijing");
+        state.insert_value("shanghai").unwrap();
+        state.insert_value("beijing").unwrap();
 
         let output = finalize_dict_json(&state)
             .expect("finalize")
@@ -663,15 +728,20 @@ mod tests {
 
     #[test]
     fn merge_intermediate_payload_recovers_values() {
-        let mut left = DictMergeState::default();
+        let mut left = DictMergeState::new(MemTracker::new_root("dict-left-test"));
         left.set_threshold_from_i64(255).unwrap();
-        left.insert_value("beijing");
+        left.insert_value("beijing").unwrap();
         let raw = serialize_intermediate_state(&left).expect("serialize");
 
-        let mut right = DictMergeState::default();
+        let mut right = DictMergeState::new(MemTracker::new_root("dict-right-test"));
         right.set_threshold_from_i64(255).unwrap();
         merge_serialized_state(&mut right, &raw).expect("merge");
 
-        assert!(right.values.contains("beijing"));
+        assert!(
+            right
+                .values
+                .iter()
+                .any(|value| value.as_slice() == b"beijing")
+        );
     }
 }

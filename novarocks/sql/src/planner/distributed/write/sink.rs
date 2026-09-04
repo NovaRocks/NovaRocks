@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
+#[cfg(test)]
 use novarocks_types::schema::ColumnDef;
 
 use crate::analysis::TypedExpr;
@@ -43,6 +44,17 @@ pub(crate) struct ConnectorWritePlanInput {
 }
 
 impl ConnectorWritePlanInput {
+    pub(crate) fn target_schema_from_sql_write_plan_input(sink: &SqlWritePlanInput) -> SchemaRef {
+        let fields = sink
+            .contract
+            .input_columns
+            .iter()
+            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
+            .collect::<Vec<_>>();
+        Arc::new(Schema::new(fields))
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_target_columns(
         target_columns: &[ColumnDef],
         input: ConnectorWriteInputBinding,
@@ -63,10 +75,11 @@ impl ConnectorWritePlanInput {
     /// boundary. This consumes no provider metadata: the binding token stays
     /// in the SQL contract for application-side writer registration.
     pub(crate) fn from_sql_write_plan_input(sink: SqlWritePlanInput) -> Self {
-        Self::from_target_columns(
-            &sink.contract.input_columns,
-            sink.input,
-            sink.root_output_exprs,
-        )
+        let target_schema = Self::target_schema_from_sql_write_plan_input(&sink);
+        Self {
+            target_schema,
+            input: sink.input,
+            root_output_exprs: sink.root_output_exprs,
+        }
     }
 }

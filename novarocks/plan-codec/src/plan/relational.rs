@@ -26,6 +26,7 @@ use super::type_mapping::{
 };
 use super::{NativePlanEncodeContext, encode_exprs};
 use crate::expr::{encode_expr, encode_sort_items, encode_window_frame};
+use novarocks_proto_codec::{FieldPath, arrow_physical};
 use novarocks_proto_models::plan;
 use novarocks_sql::plan_read::{
     PhysicalPlanKind, PlanRowCountAssertion, SqlPhysicalPlanRead, physical_plan_read,
@@ -99,7 +100,7 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
             }),
         ),
         SqlPhysicalPlanRead::Unpivot(node) => (
-            encode_output_columns(&node.output_columns)?,
+            Vec::new(),
             Kind::Unpivot(plan::UnpivotNode {
                 passthrough_columns: node
                     .passthrough_columns
@@ -121,12 +122,17 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
                     .map(|mapping| {
                         Ok(plan::UnpivotValueMapping {
                             input_value_column_id: mapping.input_value_column_id.0,
-                            literals: encode_exprs(&mapping.literals)?,
+                            constants: mapping
+                                .constants
+                                .iter()
+                                .map(encode_unpivot_constant)
+                                .collect::<Result<Vec<_>, String>>()?,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?,
                 max_output_rows: usize_to_u64(node.max_output_rows),
                 max_output_bytes: usize_to_u64(node.max_output_bytes),
+                output_schema: Some(encode_unpivot_output_schema(&node.output_columns)?),
             }),
         ),
         SqlPhysicalPlanRead::Sort(node) => (
@@ -223,6 +229,12 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
                             name: expr.name.clone(),
                             args: encode_exprs(&expr.args)?,
                             distinct: expr.distinct,
+                            function_order_by: encode_sort_items(&expr.function_order_by)?,
+                            aggregate_binding: expr
+                                .aggregate_binding
+                                .as_ref()
+                                .map(encode_resolved_aggregate_signature)
+                                .transpose()?,
                             partition_by: encode_exprs(&expr.partition_by)?,
                             order_by: encode_sort_items(&expr.order_by)?,
                             window_frame: expr
@@ -320,6 +332,9 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
                                 result_type: Some(encode_type(&call.result_type)?),
                                 order_by: encode_sort_items(&call.order_by)?,
                                 output_column_id: call.output_column_id.0,
+                                resolved_signature: Some(encode_resolved_aggregate_signature(
+                                    &call.resolved,
+                                )?),
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?,
@@ -445,6 +460,92 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
     })
 }
 
+fn encode_unpivot_output_schema(
+    columns: &[novarocks_sql::plan_read::OutputColumn],
+) -> Result<plan::ArrowPhysicalSchema, String> {
+    let schema = arrow::datatypes::Schema::new(
+        columns
+            .iter()
+            .map(|column| {
+                arrow::datatypes::Field::new(
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let slot_ids = columns
+        .iter()
+        .map(|column| column.column_id.0)
+        .collect::<Vec<_>>();
+    let internal = columns
+        .iter()
+        .map(|column| column.is_internal)
+        .collect::<Vec<_>>();
+    let (columns, schema_metadata) = arrow_physical::encode_schema_with_internal(
+        &schema,
+        &slot_ids,
+        &internal,
+        FieldPath::root("unpivot.output_schema"),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(plan::ArrowPhysicalSchema {
+        columns,
+        schema_metadata,
+    })
+}
+
+pub(super) fn encode_unpivot_constant(
+    constant: &novarocks_sql::plan_read::UnpivotConstant,
+) -> Result<plan::UnpivotConstant, String> {
+    use plan::unpivot_constant::Value;
+    let value = match constant {
+        novarocks_sql::plan_read::UnpivotConstant::Scalar(expression) => {
+            if !matches!(
+                expression.kind,
+                novarocks_sql::plan_read::ExprKind::Literal(_)
+            ) {
+                return Err("Unpivot scalar constant is not a literal expression".to_string());
+            }
+            Value::ScalarLiteral(encode_expr(expression)?)
+        }
+        novarocks_sql::plan_read::UnpivotConstant::Int32List(values) => {
+            Value::Int32List(plan::Int32List {
+                values: values.clone(),
+            })
+        }
+        novarocks_sql::plan_read::UnpivotConstant::Utf8Map(entries) => {
+            Value::Utf8Map(plan::Utf8Map {
+                entries: entries
+                    .iter()
+                    .map(|(key, value)| plan::Utf8MapEntry {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+            })
+        }
+    };
+    Ok(plan::UnpivotConstant { value: Some(value) })
+}
+
+pub(super) fn encode_resolved_aggregate_signature(
+    binding: &novarocks_functions::ResolvedAggregateSignature,
+) -> Result<plan::ResolvedAggregateSignature, String> {
+    Ok(plan::ResolvedAggregateSignature {
+        overload_identity: binding.overload.as_str().to_string(),
+        argument_types: binding
+            .argument_types
+            .iter()
+            .map(encode_type)
+            .collect::<Result<Vec<_>, _>>()?,
+        intermediate_type: Some(encode_type(&binding.intermediate_type)?),
+        output_type: Some(encode_type(&binding.output_type)?),
+        state_format_identity: binding.state_format.as_str().to_string(),
+    })
+}
+
 fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {
     match assertion {
         PlanRowCountAssertion::Eq => plan::RowCountAssertion::Eq as i32,
@@ -461,6 +562,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn encodes_complete_exact_aggregate_binding() {
+        let binding = novarocks_functions::ResolvedAggregateSignature {
+            overload: novarocks_functions::AggregateOverloadIdentity::try_new(
+                "builtin/max_by/utf8-int64/v1",
+            )
+            .unwrap(),
+            argument_types: vec![
+                arrow::datatypes::DataType::Utf8,
+                arrow::datatypes::DataType::Int64,
+            ],
+            intermediate_type: arrow::datatypes::DataType::Binary,
+            output_type: arrow::datatypes::DataType::Utf8,
+            state_format: novarocks_functions::AggregateStateFormatIdentity::try_new(
+                "novarocks/max_by/state-v1",
+            )
+            .unwrap(),
+        };
+
+        let encoded = encode_resolved_aggregate_signature(&binding).unwrap();
+
+        assert_eq!(encoded.overload_identity, binding.overload.as_str());
+        assert_eq!(encoded.argument_types.len(), 2);
+        assert!(encoded.intermediate_type.is_some());
+        assert!(encoded.output_type.is_some());
+        assert_eq!(encoded.state_format_identity, binding.state_format.as_str());
+    }
+
+    #[test]
     fn encodes_typed_unpivot_contract() {
         let physical = novarocks_sql::plan_read::unpivot_physical_plan_for_test();
         let encoded = encode_physical_node(
@@ -475,7 +604,7 @@ mod tests {
             },
         )
         .unwrap();
-        let Some(plan::plan_node::Kind::Unpivot(unpivot)) = encoded.kind else {
+        let Some(plan::plan_node::Kind::Unpivot(unpivot)) = encoded.kind.as_ref() else {
             panic!("expected Unpivot");
         };
         assert_eq!(unpivot.passthrough_columns.len(), 1);
@@ -483,5 +612,16 @@ mod tests {
         assert_eq!(unpivot.literal_output_column_ids, vec![12]);
         assert_eq!(unpivot.max_output_rows, 128);
         assert_eq!(unpivot.max_output_bytes, 4096);
+        assert!(encoded.output_columns.is_empty());
+        let output_schema = unpivot.output_schema.as_ref().expect("exact output schema");
+        assert_eq!(output_schema.columns.len(), 3);
+        assert_eq!(
+            output_schema
+                .columns
+                .iter()
+                .map(|column| column.slot_id)
+                .collect::<Vec<_>>(),
+            vec![11, 12, 13]
+        );
     }
 }

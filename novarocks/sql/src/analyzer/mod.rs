@@ -69,6 +69,7 @@ struct RepeatGroupBySpec {
 
 /// Analyze a parsed SQL query and produce a fully resolved query IR,
 /// along with a registry of all non-recursive CTE definitions.
+#[cfg(test)]
 pub(crate) fn analyze(
     query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
@@ -90,9 +91,7 @@ pub(crate) fn analyze(
 }
 
 /// Analyze using the immutable function semantics captured by the compiler
-/// request.  The legacy [`analyze`] surface deliberately uses the builtin
-/// snapshot, so existing application callers retain their behaviour while
-/// SQLX-1 can inject a request-scoped catalog.
+/// request.
 pub(crate) fn analyze_with_function_catalog(
     query: &ast::Query,
     catalog: &dyn PlannerTableProvider,
@@ -115,10 +114,11 @@ pub(crate) fn analyze_with_function_catalog(
     )
 }
 
-/// Like [`analyze`], but threads an existing [`ColumnRefFactory`] so that
+/// Test-only analysis helper that threads an existing [`ColumnRefFactory`] so that
 /// ColumnIds allocated by this analysis never collide with ids the caller
 /// already minted (used by MV rewrite candidate preparation, which analyzes
 /// the MV defining SQL inside an already-planned user query).
+#[cfg(test)]
 #[allow(
     dead_code,
     reason = "Retained for staged SQL planner migration consumers and test helpers."
@@ -145,7 +145,7 @@ pub(crate) fn analyze_with_factory(
     )
 }
 
-/// Like [`analyze_with_factory`], but uses the immutable function catalog
+/// Analyze with an existing factory and the immutable function catalog
 /// supplied by one compiler request.
 pub(crate) fn analyze_with_factory_and_function_catalog(
     query: &ast::Query,
@@ -809,7 +809,8 @@ impl<'a> AnalyzerContext<'a> {
                 distinct,
                 volatility,
             } => {
-                let is_agg = crate::analyzer::functions::is_aggregate_function(&name);
+                let is_agg =
+                    crate::analyzer::functions::is_aggregate_function(self.function_catalog, &name);
                 TypedExpr {
                     data_type: expr.data_type,
                     nullable: expr.nullable,
@@ -846,6 +847,7 @@ impl<'a> AnalyzerContext<'a> {
                 args,
                 distinct,
                 order_by,
+                resolved,
             } => TypedExpr {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
@@ -869,6 +871,7 @@ impl<'a> AnalyzerContext<'a> {
                             ..item
                         })
                         .collect(),
+                    resolved,
                 },
             },
             ExprKind::Cast {
@@ -1035,6 +1038,7 @@ impl<'a> AnalyzerContext<'a> {
                 args,
                 distinct,
                 order_by,
+                resolved,
             } => TypedExpr {
                 data_type: expr.data_type,
                 nullable: expr.nullable,
@@ -1052,6 +1056,7 @@ impl<'a> AnalyzerContext<'a> {
                             ..item
                         })
                         .collect(),
+                    resolved,
                 },
             },
             ExprKind::Cast {
@@ -2089,6 +2094,7 @@ impl<'a> AnalyzerContext<'a> {
                 args,
                 distinct,
                 order_by,
+                resolved,
             } => ExprKind::AggregateCall {
                 name,
                 args: args
@@ -2104,6 +2110,7 @@ impl<'a> AnalyzerContext<'a> {
                         nulls_first: item.nulls_first,
                     })
                     .collect(),
+                resolved,
             },
             ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
                 left: Box::new(self.rebind_order_by_agg_args(*left, from_scope, inside_agg)),
@@ -2533,6 +2540,7 @@ fn replace_grouping_markers_in_typed_expr(
             args,
             distinct,
             order_by,
+            resolved,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -2561,6 +2569,7 @@ fn replace_grouping_markers_in_typed_expr(
                         )
                     })
                     .collect(),
+                resolved: resolved.clone(),
             },
         },
         ExprKind::Cast {
@@ -2690,6 +2699,8 @@ fn replace_grouping_markers_in_typed_expr(
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -2711,6 +2722,18 @@ fn replace_grouping_markers_in_typed_expr(
                     })
                     .collect(),
                 distinct: *distinct,
+                function_order_by: function_order_by
+                    .iter()
+                    .map(|ob| {
+                        replace_grouping_markers_in_sort_item(
+                            ob,
+                            grouping_fn_args,
+                            grouping_fn_ids,
+                            emitted_marker_count,
+                        )
+                    })
+                    .collect(),
+                aggregate_binding: aggregate_binding.clone(),
                 partition_by: partition_by
                     .iter()
                     .map(|p| {

@@ -17,8 +17,10 @@
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
+use std::sync::Arc;
 
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::MemTracker;
 use novarocks_types::largeint;
 
 use super::super::*;
@@ -95,8 +97,8 @@ impl AggregateFunction for MinAgg {
                 std::mem::align_of::<BoolState>(),
             ),
             AggKind::MinUtf8 => (
-                std::mem::size_of::<Utf8State>(),
-                std::mem::align_of::<Utf8State>(),
+                std::mem::size_of::<common::TrackedUtf8State>(),
+                std::mem::align_of::<common::TrackedUtf8State>(),
             ),
             AggKind::MinDate32 => (
                 std::mem::size_of::<I32State>(),
@@ -186,9 +188,9 @@ impl AggregateFunction for MinAgg {
             AggKind::MinBool => unsafe {
                 std::ptr::write(ptr as *mut BoolState, BoolState::default());
             },
-            AggKind::MinUtf8 => unsafe {
-                std::ptr::write(ptr as *mut Utf8State, Utf8State::default());
-            },
+            AggKind::MinUtf8 => {
+                panic!("allocation-tracked min UTF-8 state requires tracker-aware init");
+            }
             AggKind::MinDate32 => unsafe {
                 std::ptr::write(ptr as *mut I32State, I32State::default());
             },
@@ -202,11 +204,45 @@ impl AggregateFunction for MinAgg {
         }
     }
 
+    fn init_state_with_tracker(
+        &self,
+        spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        if matches!(spec.kind, AggKind::MinUtf8) {
+            let tracker = tracker.ok_or_else(|| {
+                "allocation-tracked min UTF-8 state requires a memory tracker".to_string()
+            })?;
+            unsafe {
+                ptr.cast::<common::TrackedUtf8State>()
+                    .write(common::TrackedUtf8State::new(AggregateAllocator::new(
+                        tracker,
+                    )))
+            };
+        } else {
+            self.init_state(spec, ptr);
+        }
+        Ok(())
+    }
+
     fn drop_state(&self, spec: &AggSpec, ptr: *mut u8) {
         if matches!(spec.kind, AggKind::MinUtf8) {
             unsafe {
-                std::ptr::drop_in_place(ptr as *mut Utf8State);
+                std::ptr::drop_in_place(ptr as *mut common::TrackedUtf8State);
             }
+        }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, spec: &AggSpec) -> RetainedMemoryPolicy {
+        if matches!(spec.kind, AggKind::MinUtf8) {
+            RetainedMemoryPolicy::AllocationTracked
+        } else {
+            RetainedMemoryPolicy::FixedZero
         }
     }
 
@@ -387,12 +423,14 @@ fn update_min_utf8(
                     continue;
                 }
                 let v = arr.value(row);
-                let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut Utf8State) };
+                let state = unsafe {
+                    &mut *((base as *mut u8).add(offset) as *mut common::TrackedUtf8State)
+                };
                 match &state.value {
-                    None => state.value = Some(v.to_string()),
+                    None => state.replace(v)?,
                     Some(cur) => {
-                        if v < cur.as_str() {
-                            state.value = Some(v.to_string());
+                        if v.as_bytes() < cur.as_slice() {
+                            state.replace(v)?;
                         }
                     }
                 }
@@ -542,14 +580,19 @@ fn update_min_decimal256(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::mem::MaybeUninit;
     use std::sync::Arc;
 
-    use arrow::array::{Array, ArrayRef, Int32Array};
+    use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::DataType;
 
     use crate::exec::expr::ExprId;
-    use crate::exec::expr::agg::{AggStateArena, build_kernel_set};
+    use crate::exec::expr::agg::{
+        AggStateArena, build_kernel_set, test_builtin_execution_function_set,
+    };
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    use crate::runtime::mem_tracker::MemTracker;
     use novarocks_types::largeint;
 
     #[test]
@@ -566,18 +609,33 @@ mod tests {
             ..Default::default()
         };
 
-        let kernels = build_kernel_set(&[func], &[Some(DataType::Int32)]).expect("build kernels");
+        let function_set = test_builtin_execution_function_set();
+        let selected = function_set
+            .catalog()
+            .resolve_aggregate_trusted("min", &[DataType::Int32])
+            .expect("resolved min");
+        let kernels = build_kernel_set(
+            &function_set,
+            &[func],
+            &[Some(DataType::Int32)],
+            &[selected],
+        )
+        .expect("build kernels");
         let kernel = &kernels.entries[0];
 
         let mut arena = AggStateArena::new(1024);
         let base = arena.alloc(kernels.layout.total_size, kernel.state_align());
-        kernel.init_state(base);
+        kernel.init_state(base).expect("init state");
 
         let input = Arc::new(Int32Array::from(vec![Some(7), Some(2), Some(9), None])) as ArrayRef;
-        let input_opt = Some(input.clone());
-        let view = kernel.build_input_view(&input_opt).expect("build view");
         let state_ptrs = vec![base; input.len()];
-        kernel.update_batch(&state_ptrs, &view).expect("update");
+        kernel
+            .update_batch(
+                &state_ptrs,
+                novarocks_functions::AggregateInputBatch::try_new(Some(&input), input.len())
+                    .expect("input batch"),
+            )
+            .expect("update");
 
         let out = kernel.build_array(&[base], false).expect("build output");
         let out = out
@@ -602,13 +660,23 @@ mod tests {
             ..Default::default()
         };
 
-        let kernels = build_kernel_set(&[func], &[Some(DataType::FixedSizeBinary(16))])
-            .expect("build kernels");
+        let function_set = test_builtin_execution_function_set();
+        let selected = function_set
+            .catalog()
+            .resolve_aggregate_trusted("min", &[DataType::FixedSizeBinary(16)])
+            .expect("resolved min");
+        let kernels = build_kernel_set(
+            &function_set,
+            &[func],
+            &[Some(DataType::FixedSizeBinary(16))],
+            &[selected],
+        )
+        .expect("build kernels");
         let kernel = &kernels.entries[0];
 
         let mut arena = AggStateArena::new(1024);
         let base = arena.alloc(kernels.layout.total_size, kernel.state_align());
-        kernel.init_state(base);
+        kernel.init_state(base).expect("init state");
 
         let input = largeint::array_from_i128(&[
             Some(-9_223_372_036_854_775_809_i128),
@@ -617,15 +685,88 @@ mod tests {
             None,
         ])
         .expect("build input");
-        let input_opt = Some(input.clone());
-        let view = kernel.build_input_view(&input_opt).expect("build view");
         let state_ptrs = vec![base; input.len()];
-        kernel.update_batch(&state_ptrs, &view).expect("update");
+        kernel
+            .update_batch(
+                &state_ptrs,
+                novarocks_functions::AggregateInputBatch::try_new(Some(&input), input.len())
+                    .expect("input batch"),
+            )
+            .expect("update");
 
         let out = kernel.build_array(&[base], false).expect("build output");
         let out = largeint::as_fixed_size_binary_array(&out, "min largeint output").unwrap();
         assert!(!out.is_null(0));
         let v = largeint::value_at(out, 0).expect("decode output");
         assert_eq!(v, -9_223_372_036_854_775_809_i128);
+    }
+
+    #[test]
+    fn min_utf8_tracks_replacement_merge_and_drop_exactly() {
+        let spec = min_spec_from_type(&DataType::Utf8).unwrap();
+        let tracker = MemTracker::new_root("min-utf8-test");
+        let mut state = MaybeUninit::<common::TrackedUtf8State>::uninit();
+        MinAgg
+            .init_state_with_tracker(&spec, state.as_mut_ptr().cast(), Some(Arc::clone(&tracker)))
+            .unwrap();
+        let state_ptr = state.as_mut_ptr() as AggStatePtr;
+
+        let initial = Some(Arc::new(StringArray::from(vec!["zzzz"])) as ArrayRef);
+        let initial_view = MinAgg.build_input_view(&spec, &initial).unwrap();
+        MinAgg
+            .update_batch(&spec, 0, &[state_ptr], &initial_view)
+            .unwrap();
+        assert_eq!(tracker.current(), 4);
+
+        let replacement_text = "a-longer-minimum";
+        let replacement = Some(Arc::new(StringArray::from(vec![replacement_text])) as ArrayRef);
+        let replacement_view = MinAgg.build_merge_view(&spec, &replacement).unwrap();
+        MinAgg
+            .merge_batch(&spec, 0, &[state_ptr], &replacement_view)
+            .unwrap();
+        assert_eq!(tracker.current(), replacement_text.len() as i64);
+
+        let output = MinAgg.build_array(&spec, 0, &[state_ptr], false).unwrap();
+        let output = output.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(output.value(0), replacement_text);
+
+        MinAgg.drop_state(&spec, state.as_mut_ptr().cast());
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn min_utf8_oom_preserves_prior_value_and_charge() {
+        let spec = min_spec_from_type(&DataType::Utf8).unwrap();
+        let tracker = MemTracker::new_root("min-utf8-oom-test");
+        tracker.install_limit_once(8).unwrap();
+        let mut state = MaybeUninit::<common::TrackedUtf8State>::uninit();
+        MinAgg
+            .init_state_with_tracker(&spec, state.as_mut_ptr().cast(), Some(Arc::clone(&tracker)))
+            .unwrap();
+        let state_ptr = state.as_mut_ptr() as AggStatePtr;
+
+        let initial = Some(Arc::new(StringArray::from(vec!["zzzzz"])) as ArrayRef);
+        let initial_view = MinAgg.build_input_view(&spec, &initial).unwrap();
+        MinAgg
+            .update_batch(&spec, 0, &[state_ptr], &initial_view)
+            .unwrap();
+        assert_eq!(tracker.current(), 5);
+
+        // The replacement would retain only 6 bytes, but the exact allocator
+        // must admit the 5 + 6 byte replacement peak before releasing the old value.
+        let rejected = Some(Arc::new(StringArray::from(vec!["aaaaaa"])) as ArrayRef);
+        let rejected_view = MinAgg.build_input_view(&spec, &rejected).unwrap();
+        let error = MinAgg
+            .update_batch(&spec, 0, &[state_ptr], &rejected_view)
+            .unwrap_err();
+        assert!(error.contains("ResourceExhausted"));
+        assert_eq!(tracker.current(), 5);
+
+        let output = MinAgg.build_array(&spec, 0, &[state_ptr], false).unwrap();
+        let output = output.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(output.value(0), "zzzzz");
+
+        MinAgg.drop_state(&spec, state.as_mut_ptr().cast());
+        assert_eq!(tracker.current(), 0);
     }
 }

@@ -52,7 +52,6 @@ pub mod scan;
 mod setop;
 mod sort;
 mod split_data_stream_sink;
-mod statistics_sink;
 mod table_finish;
 mod table_function_processor;
 pub(crate) mod table_writer;
@@ -99,7 +98,6 @@ pub use setop::{
 };
 pub use sort::SortProcessorFactory;
 pub use split_data_stream_sink::SplitDataStreamSinkFactory;
-pub use statistics_sink::{StatisticsSinkFactory, StatisticsSinkHandle};
 pub use table_finish::TableFinishOperatorFactory;
 pub use table_function_processor::TableFunctionProcessorFactory;
 pub use table_writer::TableWriterOperatorFactory;

@@ -219,7 +219,7 @@ impl Default for FragmentPrepareContext {
             root_sink_dop: None,
             group_execution_scan_dop: None,
             debug_exec_node_output: false,
-            execution_runtime: None,
+            execution_runtime: Some(crate::runtime::execution_runtime::test_execution_runtime()),
             scan_registration: None,
             commit_port: Arc::new(TestFragmentCommitPort),
             exchange_receiver_port:
@@ -487,7 +487,6 @@ pub struct DormantFragmentHandle {
     query_id: QueryId,
     fragment_instance_id: novarocks_types::UniqueId,
     profiler: Option<Profiler>,
-    statistics_sink: Option<crate::exec::operators::StatisticsSinkHandle>,
     start_failure: Option<StartFailurePoint>,
 }
 
@@ -520,7 +519,6 @@ impl DormantFragmentHandle {
             query_id,
             fragment_instance_id,
             profiler,
-            statistics_sink,
             ..
         } = self;
         let pipeline = match initial_failure {
@@ -534,7 +532,6 @@ impl DormantFragmentHandle {
                     resources,
                     cancel_reason: None,
                     terminal: None,
-                    statistics_sink,
                 }),
                 query_id,
                 fragment_instance_id,
@@ -561,7 +558,6 @@ struct RunningFragmentState {
     resources: FragmentResources,
     cancel_reason: Option<FragmentCancelReason>,
     terminal: Option<FragmentTerminalFact>,
-    statistics_sink: Option<crate::exec::operators::StatisticsSinkHandle>,
 }
 
 impl RunningFragmentHandle {
@@ -608,7 +604,7 @@ impl RunningFragmentInner {
         if let Some(fact) = state.terminal.as_ref() {
             return fact.clone();
         }
-        let mut outcome = match result {
+        let outcome = match result {
             Ok(()) => FragmentOutcome::Succeeded,
             Err(error) => match state.cancel_reason.clone() {
                 Some(reason) => FragmentOutcome::Cancelled { reason },
@@ -617,30 +613,6 @@ impl RunningFragmentInner {
                     error,
                 )),
             },
-        };
-        let statistics_payload = if matches!(outcome, FragmentOutcome::Succeeded) {
-            match state.statistics_sink.as_ref() {
-                None => Vec::new(),
-                Some(handle) => match handle.take_fragment_payload() {
-                    Ok(Some(payload)) => payload.to_vec(),
-                    Ok(None) => {
-                        outcome = FragmentOutcome::Failed(FragmentExecutionError::new(
-                            FragmentExecutionErrorKind::Pipeline,
-                            "statistics sink completed without a terminal partial",
-                        ));
-                        Vec::new()
-                    }
-                    Err(error) => {
-                        outcome = FragmentOutcome::Failed(FragmentExecutionError::new(
-                            FragmentExecutionErrorKind::Pipeline,
-                            format!("statistics sink failed to encode terminal partial: {error}"),
-                        ));
-                        Vec::new()
-                    }
-                },
-            }
-        } else {
-            Vec::new()
         };
         match &outcome {
             FragmentOutcome::Succeeded => state.resources.finish_success(),
@@ -658,7 +630,6 @@ impl RunningFragmentInner {
             self.fragment_instance_id,
             outcome,
             self.profiler.as_ref().map(Profiler::to_native_tree),
-            statistics_payload,
         );
         state.terminal = Some(fact.clone());
         fact
@@ -749,7 +720,6 @@ pub fn prepare_fragment(
             resources.result_session(),
             context.edge_gates.clone(),
         )?;
-        let statistics_sink = materialized_sink.statistics_handle;
         let sink = materialized_sink.factory;
         let _group_execution_scan_dop = context.group_execution_scan_dop;
         let exchange_bindings = materialize_exchange_bindings(
@@ -781,16 +751,14 @@ pub fn prepare_fragment(
                 error,
             )
         })
-        .map(|prepared| (prepared, statistics_sink))
     })();
     match prepare_result {
-        Ok((prepared, statistics_sink)) => Ok(DormantFragmentHandle {
+        Ok(prepared) => Ok(DormantFragmentHandle {
             prepared,
             resources,
             query_id,
             fragment_instance_id: finst_id,
             profiler: context.profiler.clone(),
-            statistics_sink,
             start_failure: context.start_failure(),
         }),
         Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),

@@ -90,7 +90,14 @@ mod tests {
             let (size, align) = agg.state_layout_for(&spec.kind);
             let layout = Layout::from_size_align(size, align).unwrap();
             let ptr = NonNull::new(unsafe { alloc(layout) }).expect("aggregate state allocation");
-            agg.init_state(&spec, ptr.as_ptr());
+            agg.init_state_with_tracker(
+                &spec,
+                ptr.as_ptr(),
+                Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                    "count-distinct-state-test",
+                )),
+            )
+            .unwrap();
             Self { spec, ptr, layout }
         }
 

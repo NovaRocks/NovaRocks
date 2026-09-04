@@ -28,7 +28,9 @@ use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::mv::state_codec::{decode_bool_state, encode_bool_state};
 use crate::exec::node::aggregate::AggFunction;
 
-use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
+use super::super::{
+    AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction, RetainedMemoryPolicy,
+};
 
 pub(in crate::exec::expr::agg::functions) struct BoolStateAgg;
 pub(in crate::exec::expr::agg::functions) struct BoolStateSignedAgg;
@@ -81,6 +83,14 @@ impl AggregateFunction for BoolStateAgg {
     }
 
     fn drop_state(&self, _spec: &AggSpec, _ptr: *mut u8) {}
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::FixedZero
+    }
 
     fn update_batch(
         &self,
@@ -156,6 +166,14 @@ impl AggregateFunction for BoolStateSignedAgg {
     }
 
     fn drop_state(&self, _spec: &AggSpec, _ptr: *mut u8) {}
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::FixedZero
+    }
 
     fn update_batch(
         &self,

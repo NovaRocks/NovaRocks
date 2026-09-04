@@ -288,6 +288,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             args,
             distinct,
             order_by,
+            resolved,
         } => {
             let (args, args_changed) = rewrite_scalar_vec(arena, &args, bindings, factory)?;
             let (order_by, order_changed) = rewrite_sort_keys(arena, &order_by, bindings, factory)?;
@@ -299,6 +300,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         args,
                         distinct,
                         order_by,
+                        resolved,
                     },
                     data_type,
                     nullable,
@@ -440,22 +442,29 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
             ignore_nulls,
         } => {
             let (args, args_changed) = rewrite_scalar_vec(arena, &args, bindings, factory)?;
+            let (function_order_by, function_order_changed) =
+                rewrite_sort_keys(arena, &function_order_by, bindings, factory)?;
             let (partition_by, partition_changed) =
                 rewrite_scalar_vec(arena, &partition_by, bindings, factory)?;
             let (order_by, order_changed) = rewrite_sort_keys(arena, &order_by, bindings, factory)?;
-            let changed = args_changed || partition_changed || order_changed;
+            let changed =
+                args_changed || function_order_changed || partition_changed || order_changed;
             Ok(changed.then(|| {
                 arena.intern(
                     ScalarNode::WindowCall {
                         name,
                         args,
                         distinct,
+                        function_order_by,
+                        aggregate_binding,
                         partition_by,
                         order_by,
                         window_frame,

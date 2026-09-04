@@ -48,6 +48,7 @@ use crate::task_execution::{
     HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
     TaskExecutionHost, TaskStatusReporter,
 };
+use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 #[cfg(test)]
 use novarocks_execution::task_execution::descriptor::TaskDescriptor;
@@ -87,8 +88,8 @@ pub struct BackendServerConfig {
     pub native_trust: Arc<NativeTrust>,
     /// Server-resolved compatibility identity frozen before role composition.
     pub native_compatibility_id: NativeCompatibilityId,
-    /// Process-wide immutable engine function catalog composed by Server.
-    pub function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    /// Process-wide immutable engine function metadata and implementations.
+    pub function_set: Arc<SealedExecutionFunctionSet>,
     pub native_transport: BackendNativeTransport,
     /// Exact FE native ingress used exclusively for authenticated membership announce.
     pub frontend_endpoint: NativeEndpoint,
@@ -673,24 +674,37 @@ impl Drop for QueryLifecycleSweepTask {
     }
 }
 
+struct BackendExecutionRuntimeInput {
+    config: ExecutionRuntimeConfig,
+    function_set: Arc<SealedExecutionFunctionSet>,
+}
+
+impl BackendExecutionRuntimeInput {
+    fn new(config: ExecutionRuntimeConfig, function_set: Arc<SealedExecutionFunctionSet>) -> Self {
+        Self {
+            config,
+            function_set,
+        }
+    }
+}
+
 fn compose_backend_application_services(
     data_runtime: BackendDataRuntime,
-    execution_runtime_config: ExecutionRuntimeConfig,
-    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    execution: BackendExecutionRuntimeInput,
     query_lifecycle_config: QueryLifecycleRegistryConfig,
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
+    let BackendExecutionRuntimeInput {
+        config: execution_runtime_config,
+        function_set,
+    } = execution;
     let execution_runtime = Arc::new(
-        ExecutionRuntime::new_with_function_catalog(
-            execution_runtime_config,
-            Arc::clone(&function_catalog),
-        )
-        .map_err(|error| {
-            BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
-        })?,
+        ExecutionRuntime::new(execution_runtime_config, Arc::clone(&function_set)).map_err(
+            |error| BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error),
+        )?,
     );
     let controls = Arc::new(FragmentControlRegistry::default());
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
@@ -902,7 +916,7 @@ impl BackendApplicationHost {
             advertise_endpoint,
             native_trust,
             native_compatibility_id,
-            function_catalog,
+            function_set,
             native_transport,
             frontend_endpoint,
             announce_interval,
@@ -926,8 +940,7 @@ impl BackendApplicationHost {
         let readiness_runtime = data_runtime.clone();
         let services = compose_backend_application_services(
             data_runtime,
-            execution_runtime_config,
-            function_catalog,
+            BackendExecutionRuntimeInput::new(execution_runtime_config, function_set),
             query_lifecycle_config,
             native_compatibility_id,
             write_commit_evidence_limits,
@@ -1236,12 +1249,14 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendServerConfig, QueryContextRef, QueryLifecycleRegistryConfig, TaskDeadlineTickTask,
-        TaskExecutionRegistryConfig, UnroutedQueryContextHost, UnroutedTaskExecutionHost,
-        combine_primary_and_shutdown, compose_backend_application_services,
+        BackendExecutionRuntimeInput, BackendServerConfig, QueryContextRef,
+        QueryLifecycleRegistryConfig, TaskDeadlineTickTask, TaskExecutionRegistryConfig,
+        UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
+        compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
     use crate::rpc::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
+    use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
@@ -1298,6 +1313,17 @@ mod tests {
             sink_io_worker_threads: 1,
             sink_io_max_blocking_threads: 1,
         }
+    }
+
+    fn test_execution_function_set() -> Arc<SealedExecutionFunctionSet> {
+        let mut builder = novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
+        novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+            .expect("builtin function metadata");
+        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+            &mut builder,
+        )
+        .expect("builtin aggregate implementations");
+        Arc::new(builder.seal().expect("builtin execution function set"))
     }
 
     fn test_data_runtime() -> crate::BackendDataRuntime {
@@ -1421,10 +1447,7 @@ mod tests {
             },
             native_trust: crate::rpc::runtime::test_backend_native_trust(),
             native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-            function_catalog: Arc::new(
-                novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                    .expect("builtin function catalog"),
-            ),
+            function_set: test_execution_function_set(),
             native_transport: crate::rpc::runtime::BackendNativeTransport::Plaintext,
             frontend_endpoint: NativeEndpoint::from_host_port("127.0.0.1", unused_port())
                 .expect("valid frontend endpoint"),
@@ -1586,10 +1609,9 @@ mod tests {
     fn application_composition_owns_one_query_lifecycle_registry() {
         let services = compose_backend_application_services(
             test_data_runtime(),
-            execution_runtime_config(),
-            Arc::new(
-                novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                    .expect("builtin function catalog"),
+            BackendExecutionRuntimeInput::new(
+                execution_runtime_config(),
+                test_execution_function_set(),
             ),
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
@@ -1635,7 +1657,10 @@ mod tests {
 
         let services = compose_backend_application_services(
             test_data_runtime(),
-            execution_runtime_config(),
+            BackendExecutionRuntimeInput::new(
+                execution_runtime_config(),
+                test_execution_function_set(),
+            ),
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             WriteCommitEvidenceLimits::default(),

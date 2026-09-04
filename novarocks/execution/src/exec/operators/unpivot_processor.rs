@@ -18,17 +18,27 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, make_array};
+use arrow::array::{
+    Array, ArrayRef, Int32Builder, ListBuilder, MapBuilder, MapFieldNames, StringBuilder,
+    make_array,
+};
+use arrow::datatypes::{DataType, Field, Fields};
 use arrow::ipc::writer::StreamWriter;
 use arrow_data::transform::MutableArrayData;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::unpivot::{UnpivotPassthroughColumn, UnpivotValueMapping};
+use crate::exec::node::unpivot::{UnpivotConstant, UnpivotPassthroughColumn, UnpivotValueMapping};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::SlotId;
+
+const MAX_UNPIVOT_MAPPINGS: usize = 4_096;
+const MAX_UNPIVOT_CONSTANTS: usize = 16_384;
+const MAX_UNPIVOT_NESTED_ELEMENTS: usize = 4_096;
+const MAX_UNPIVOT_CONSTANT_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct UnpivotProcessorFactory {
     name: String,
@@ -107,6 +117,7 @@ impl OperatorFactory for UnpivotProcessorFactory {
             output_rows_hint: None,
             finishing: false,
             finished: false,
+            mem_tracker: None,
         })
     }
 }
@@ -126,6 +137,7 @@ struct UnpivotProcessorOperator {
     output_rows_hint: Option<usize>,
     finishing: bool,
     finished: bool,
+    mem_tracker: Option<Arc<MemTracker>>,
 }
 
 impl Operator for UnpivotProcessorOperator {
@@ -135,6 +147,10 @@ impl Operator for UnpivotProcessorOperator {
 
     fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.mem_tracker = Some(tracker);
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -195,26 +211,32 @@ impl ProcessorOperator for UnpivotProcessorOperator {
         } else {
             self.output_rows_hint.unwrap_or(1).min(row_limit)
         };
-        let mut output = self.build_output(input, self.cursor, candidate_rows)?;
+        let mut output = track_candidate(
+            self.build_output(input, self.cursor, candidate_rows)?,
+            self.mem_tracker.as_ref(),
+        )?;
         let mut upper_bound = row_limit;
         let candidate_bytes = if self.max_output_bytes == usize::MAX {
             None
         } else {
-            Some(output_size(&output)?)
+            Some(output_size(&output, self.mem_tracker.as_ref())?)
         };
         if candidate_bytes.is_some_and(|bytes| bytes > self.max_output_bytes) {
             upper_bound = candidate_rows - 1;
             loop {
                 if candidate_rows == 1 {
-                    let actual_bytes = output_size(&output)?;
+                    let actual_bytes = output_size(&output, self.mem_tracker.as_ref())?;
                     return Err(format!(
                         "ResourceExhausted: one unpivot output value requires {actual_bytes} bytes, limit is {}",
                         self.max_output_bytes
                     ));
                 }
                 candidate_rows = (candidate_rows / 2).max(1);
-                output = self.build_output(input, self.cursor, candidate_rows)?;
-                if output_fits_budget(&output, self.max_output_bytes)? {
+                output = track_candidate(
+                    self.build_output(input, self.cursor, candidate_rows)?,
+                    self.mem_tracker.as_ref(),
+                )?;
+                if output_fits_budget(&output, self.max_output_bytes, self.mem_tracker.as_ref())? {
                     break;
                 }
             }
@@ -229,8 +251,11 @@ impl ProcessorOperator for UnpivotProcessorOperator {
                     .is_some_and(|bytes| bytes.saturating_mul(2) <= self.max_output_bytes)
             {
                 let next_rows = candidate_rows.saturating_mul(2).min(row_limit);
-                let next = self.build_output(input, self.cursor, next_rows)?;
-                if output_fits_budget(&next, self.max_output_bytes)? {
+                let next = track_candidate(
+                    self.build_output(input, self.cursor, next_rows)?,
+                    self.mem_tracker.as_ref(),
+                )?;
+                if output_fits_budget(&next, self.max_output_bytes, self.mem_tracker.as_ref())? {
                     candidate_rows = next_rows;
                     output = next;
                     upper_bound = candidate_rows;
@@ -242,8 +267,11 @@ impl ProcessorOperator for UnpivotProcessorOperator {
             // is too large.
             while candidate_rows < row_limit {
                 let next_rows = candidate_rows.saturating_mul(2).min(row_limit);
-                let next = self.build_output(input, self.cursor, next_rows)?;
-                if output_fits_budget(&next, self.max_output_bytes)? {
+                let next = track_candidate(
+                    self.build_output(input, self.cursor, next_rows)?,
+                    self.mem_tracker.as_ref(),
+                )?;
+                if output_fits_budget(&next, self.max_output_bytes, self.mem_tracker.as_ref())? {
                     candidate_rows = next_rows;
                     output = next;
                 } else {
@@ -254,8 +282,11 @@ impl ProcessorOperator for UnpivotProcessorOperator {
         }
         while candidate_rows < upper_bound {
             let middle = candidate_rows + (upper_bound - candidate_rows).div_ceil(2);
-            let candidate = self.build_output(input, self.cursor, middle)?;
-            if output_fits_budget(&candidate, self.max_output_bytes)? {
+            let candidate = track_candidate(
+                self.build_output(input, self.cursor, middle)?,
+                self.mem_tracker.as_ref(),
+            )?;
+            if output_fits_budget(&candidate, self.max_output_bytes, self.mem_tracker.as_ref())? {
                 candidate_rows = middle;
                 output = candidate;
             } else {
@@ -283,14 +314,27 @@ impl ProcessorOperator for UnpivotProcessorOperator {
     }
 }
 
-fn output_fits_budget(chunk: &Chunk, max_output_bytes: usize) -> Result<bool, String> {
+fn track_candidate(mut chunk: Chunk, tracker: Option<&Arc<MemTracker>>) -> Result<Chunk, String> {
+    if let Some(tracker) = tracker {
+        chunk.try_transfer_to(tracker).map_err(|error| {
+            format!("ResourceExhausted: unpivot output memory admission failed: {error}")
+        })?;
+    }
+    Ok(chunk)
+}
+
+fn output_fits_budget(
+    chunk: &Chunk,
+    max_output_bytes: usize,
+    tracker: Option<&Arc<MemTracker>>,
+) -> Result<bool, String> {
     if max_output_bytes == usize::MAX {
         return Ok(true);
     }
-    Ok(output_size(chunk)? <= max_output_bytes)
+    Ok(output_size(chunk, tracker)? <= max_output_bytes)
 }
 
-fn output_size(chunk: &Chunk) -> Result<usize, String> {
+fn output_size(chunk: &Chunk, tracker: Option<&Arc<MemTracker>>) -> Result<usize, String> {
     let retained_bytes = chunk.estimated_bytes();
     let logical_bytes = chunk.logical_bytes();
     let mut encoded = Vec::new();
@@ -305,7 +349,78 @@ fn output_size(chunk: &Chunk) -> Result<usize, String> {
             .finish()
             .map_err(|error| format!("unpivot output size encoding failed: {error}"))?;
     }
+    let _encoded_accounting = tracker
+        .map(|tracker| {
+            TrackedBytes::try_new(encoded.capacity(), Arc::clone(tracker)).map_err(|error| {
+                format!("ResourceExhausted: unpivot size probe memory admission failed: {error}")
+            })
+        })
+        .transpose()?;
     Ok(retained_bytes.max(logical_bytes).max(encoded.len()))
+}
+
+fn canonical_int32_list_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Int32, false)))
+}
+
+fn canonical_utf8_map_type() -> DataType {
+    DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, false),
+            ])),
+            false,
+        )),
+        false,
+    )
+}
+
+fn materialize_constant(
+    arena: &ExprArena,
+    constant: &UnpivotConstant,
+    input: &Chunk,
+    offset: usize,
+    len: usize,
+) -> Result<ArrayRef, String> {
+    match constant {
+        UnpivotConstant::Scalar { expr_id, .. } => arena
+            .eval(*expr_id, &input.slice(offset, len))
+            .map_err(|error| format!("unpivot scalar constant evaluation failed: {error}")),
+        UnpivotConstant::Int32List(values) => {
+            let mut builder = ListBuilder::new(Int32Builder::new())
+                .with_field(Arc::new(Field::new("item", DataType::Int32, false)));
+            for _ in 0..len {
+                builder.values().append_slice(values);
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        UnpivotConstant::Utf8Map(entries) => {
+            let mut builder = MapBuilder::new(
+                Some(MapFieldNames {
+                    entry: "entries".to_string(),
+                    key: "key".to_string(),
+                    value: "value".to_string(),
+                }),
+                StringBuilder::new(),
+                StringBuilder::new(),
+            )
+            .with_keys_field(Arc::new(Field::new("key", DataType::Utf8, false)))
+            .with_values_field(Arc::new(Field::new("value", DataType::Utf8, false)));
+            for _ in 0..len {
+                for (key, value) in entries {
+                    builder.keys().append_value(key);
+                    builder.values().append_value(value);
+                }
+                builder
+                    .append(true)
+                    .map_err(|error| format!("build Unpivot map constant: {error}"))?;
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -351,17 +466,13 @@ impl UnpivotProcessorOperator {
                 let mut parts = Vec::with_capacity(segments.len());
                 for segment in &segments {
                     let mapping = &self.value_mappings[segment.mapping_index];
-                    let input_slice = input.slice(segment.input_offset, segment.len);
-                    parts.push(
-                        self.arena
-                            .eval(mapping.literal_exprs[*literal_index], &input_slice)
-                            .map_err(|error| {
-                                format!(
-                                    "unpivot mapping {} literal {} evaluation failed: {error}",
-                                    segment.mapping_index, literal_index
-                                )
-                            })?,
-                    );
+                    parts.push(materialize_constant(
+                        &self.arena,
+                        &mapping.constants[*literal_index],
+                        input,
+                        segment.input_offset,
+                        segment.len,
+                    )?);
                 }
                 parts
             } else {
@@ -451,6 +562,12 @@ fn validate_static_contract(
     if value_mappings.is_empty() {
         return Err("unpivot requires at least one value mapping".to_string());
     }
+    if value_mappings.len() > MAX_UNPIVOT_MAPPINGS {
+        return Err("unpivot exceeds the value mapping limit".to_string());
+    }
+    let mut constant_count = 0usize;
+    let mut nested_element_count = 0usize;
+    let mut constant_bytes = 0usize;
     let mut output_roles = HashSet::new();
     for mapping in passthrough_columns {
         if !output_roles.insert(mapping.output_slot_id) {
@@ -483,33 +600,103 @@ fn validate_static_contract(
         ));
     }
     for (mapping_index, mapping) in value_mappings.iter().enumerate() {
-        if mapping.literal_exprs.len() != literal_output_slot_ids.len() {
+        constant_count = constant_count
+            .checked_add(mapping.constants.len())
+            .ok_or_else(|| "unpivot constant count overflowed".to_string())?;
+        if constant_count > MAX_UNPIVOT_CONSTANTS {
+            return Err("unpivot exceeds the constant count limit".to_string());
+        }
+        if mapping.constants.len() != literal_output_slot_ids.len() {
             return Err(format!(
                 "unpivot mapping {mapping_index} literal count mismatch: expected {}, got {}",
                 literal_output_slot_ids.len(),
-                mapping.literal_exprs.len()
+                mapping.constants.len()
             ));
         }
-        for (literal_index, expr_id) in mapping.literal_exprs.iter().enumerate() {
-            if !matches!(arena.node(*expr_id), Some(ExprNode::Literal(_))) {
-                return Err(format!(
-                    "unpivot mapping {mapping_index} literal {literal_index} is not a literal expression"
-                ));
-            }
+        for (literal_index, constant) in mapping.constants.iter().enumerate() {
             let output_slot = output_chunk_schema
                 .slot(literal_output_slot_ids[literal_index])
                 .expect("validated output slot membership");
-            let expr_type = arena.data_type(*expr_id).ok_or_else(|| {
-                format!(
-                    "unpivot mapping {mapping_index} literal {literal_index} has no declared type"
-                )
-            })?;
-            if expr_type != output_slot.data_type() {
+            let constant_type = match constant {
+                UnpivotConstant::Scalar { expr_id, .. } => {
+                    let Some(ExprNode::Literal(value)) = arena.node(*expr_id) else {
+                        return Err(format!(
+                            "unpivot mapping {mapping_index} scalar constant {literal_index} is not a literal expression"
+                        ));
+                    };
+                    constant_bytes = constant_bytes
+                        .checked_add(execution_literal_retained_bytes(value))
+                        .ok_or_else(|| "unpivot constant byte charge overflowed".to_string())?;
+                    arena.data_type(*expr_id).cloned().ok_or_else(|| {
+                        format!(
+                            "unpivot mapping {mapping_index} scalar constant {literal_index} has no declared type"
+                        )
+                    })?
+                }
+                UnpivotConstant::Int32List(values) => {
+                    nested_element_count = nested_element_count
+                        .checked_add(values.len())
+                        .ok_or_else(|| "unpivot nested element count overflowed".to_string())?;
+                    constant_bytes = constant_bytes
+                        .checked_add(values.len().saturating_mul(size_of::<i32>()))
+                        .ok_or_else(|| "unpivot constant byte charge overflowed".to_string())?;
+                    canonical_int32_list_type()
+                }
+                UnpivotConstant::Utf8Map(entries) => {
+                    nested_element_count = nested_element_count
+                        .checked_add(entries.len())
+                        .ok_or_else(|| "unpivot nested element count overflowed".to_string())?;
+                    let mut previous = None;
+                    for (entry_index, (key, value)) in entries.iter().enumerate() {
+                        if key.is_empty() {
+                            return Err(format!(
+                                "unpivot mapping {mapping_index} map constant {literal_index} entry {entry_index} has an empty key"
+                            ));
+                        }
+                        if previous.is_some_and(|previous: &str| previous >= key.as_str()) {
+                            return Err(format!(
+                                "unpivot mapping {mapping_index} map constant {literal_index} keys must be strictly increasing"
+                            ));
+                        }
+                        constant_bytes = constant_bytes
+                            .checked_add(key.len())
+                            .and_then(|total| total.checked_add(value.len()))
+                            .ok_or_else(|| "unpivot constant byte charge overflowed".to_string())?;
+                        previous = Some(key.as_str());
+                    }
+                    canonical_utf8_map_type()
+                }
+            };
+            if &constant_type != output_slot.data_type() {
                 return Err(format!(
-                    "unpivot mapping {mapping_index} literal {literal_index} type mismatch: expression {expr_type:?}, output {:?}",
+                    "unpivot mapping {mapping_index} constant {literal_index} type mismatch: constant {:?}, output {:?}",
+                    constant_type,
                     output_slot.data_type()
                 ));
             }
+        }
+    }
+    if nested_element_count > MAX_UNPIVOT_NESTED_ELEMENTS {
+        return Err("unpivot exceeds the nested element limit".to_string());
+    }
+    if constant_bytes > MAX_UNPIVOT_CONSTANT_BYTES {
+        return Err("unpivot exceeds the decoded constant byte limit".to_string());
+    }
+    for (literal_index, slot_id) in literal_output_slot_ids.iter().enumerate() {
+        let nullable = value_mappings.iter().any(|mapping| {
+            matches!(
+                mapping.constants[literal_index],
+                UnpivotConstant::Scalar { nullable: true, .. }
+            )
+        });
+        let output_slot = output_chunk_schema
+            .slot(*slot_id)
+            .expect("validated literal output slot membership");
+        if nullable != output_slot.nullable() {
+            return Err(format!(
+                "unpivot literal output slot {slot_id} nullability drift: expected {nullable}, got {}",
+                output_slot.nullable()
+            ));
         }
     }
     Ok(())
@@ -579,6 +766,14 @@ fn validate_input_contract(
         ));
     }
     Ok(())
+}
+
+fn execution_literal_retained_bytes(value: &crate::exec::expr::LiteralValue) -> usize {
+    match value {
+        crate::exec::expr::LiteralValue::Utf8(value) => value.len(),
+        crate::exec::expr::LiteralValue::Binary(value) => value.len(),
+        _ => size_of::<crate::exec::expr::LiteralValue>(),
+    }
 }
 
 #[cfg(test)]
@@ -664,11 +859,17 @@ mod tests {
             vec![
                 UnpivotValueMapping {
                     input_value_slot_id: SlotId::new(2),
-                    literal_exprs: vec![first],
+                    constants: vec![UnpivotConstant::Scalar {
+                        expr_id: first,
+                        nullable: false,
+                    }],
                 },
                 UnpivotValueMapping {
                     input_value_slot_id: SlotId::new(3),
-                    literal_exprs: vec![second],
+                    constants: vec![UnpivotConstant::Scalar {
+                        expr_id: second,
+                        nullable: false,
+                    }],
                 },
             ],
             schema(vec![
@@ -758,6 +959,62 @@ mod tests {
     }
 
     #[test]
+    fn direct_construction_rejects_noncanonical_map_constants() {
+        let error = UnpivotProcessorFactory::new(
+            1,
+            Arc::new(ExprArena::default()),
+            Vec::new(),
+            SlotId::new(11),
+            vec![SlotId::new(12)],
+            vec![UnpivotValueMapping {
+                input_value_slot_id: SlotId::new(1),
+                constants: vec![UnpivotConstant::Utf8Map(vec![
+                    ("b".to_string(), "1".to_string()),
+                    ("a".to_string(), "2".to_string()),
+                ])],
+            }],
+            schema(vec![
+                (11, "value", DataType::Int64, false),
+                (12, "properties", canonical_utf8_map_type(), false),
+            ]),
+            1,
+            1024,
+        )
+        .err()
+        .expect("unordered map keys");
+        assert!(error.contains("strictly increasing"), "{error}");
+    }
+
+    #[test]
+    fn direct_construction_preserves_scalar_constant_nullability() {
+        let mut arena = ExprArena::default();
+        let null = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Utf8);
+        let error = UnpivotProcessorFactory::new(
+            1,
+            Arc::new(arena),
+            Vec::new(),
+            SlotId::new(11),
+            vec![SlotId::new(12)],
+            vec![UnpivotValueMapping {
+                input_value_slot_id: SlotId::new(1),
+                constants: vec![UnpivotConstant::Scalar {
+                    expr_id: null,
+                    nullable: true,
+                }],
+            }],
+            schema(vec![
+                (11, "value", DataType::Int64, false),
+                (12, "label", DataType::Utf8, false),
+            ]),
+            1,
+            1024,
+        )
+        .err()
+        .expect("nullable constant into non-null output");
+        assert!(error.contains("nullability drift"), "{error}");
+    }
+
+    #[test]
     fn single_value_over_byte_budget_is_resource_exhausted() {
         let state = RuntimeState::default();
         let mut operator = factory(100, 1).create(1, 0);
@@ -780,6 +1037,7 @@ mod tests {
                 .pull_chunk(&state)
                 .unwrap()
                 .expect("one output row"),
+            None,
         )
         .unwrap();
 
@@ -793,6 +1051,7 @@ mod tests {
                 .pull_chunk(&state)
                 .unwrap()
                 .expect("complete expansion"),
+            None,
         )
         .unwrap();
         assert!(one_row_size < full_size);
@@ -807,7 +1066,7 @@ mod tests {
         let mut batches = 0;
         while bounded_processor.has_output() {
             let chunk = bounded_processor.pull_chunk(&state).unwrap().unwrap();
-            assert!(output_size(&chunk).unwrap() <= byte_budget);
+            assert!(output_size(&chunk, None).unwrap() <= byte_budget);
             rows += chunk.len();
             batches += 1;
         }
@@ -826,7 +1085,10 @@ mod tests {
         let mappings = (0..1_001)
             .map(|_| UnpivotValueMapping {
                 input_value_slot_id: SlotId::new(2),
-                literal_exprs: vec![label],
+                constants: vec![UnpivotConstant::Scalar {
+                    expr_id: label,
+                    nullable: false,
+                }],
             })
             .collect::<Vec<_>>();
         let factory = UnpivotProcessorFactory::new(
@@ -876,7 +1138,10 @@ mod tests {
             vec![SlotId::new(12)],
             vec![UnpivotValueMapping {
                 input_value_slot_id: SlotId::new(2),
-                literal_exprs: vec![label],
+                constants: vec![UnpivotConstant::Scalar {
+                    expr_id: label,
+                    nullable: false,
+                }],
             }],
             schema(vec![
                 (11, "key", DataType::Int64, false),
@@ -964,7 +1229,7 @@ mod tests {
                 vec![],
                 vec![UnpivotValueMapping {
                     input_value_slot_id: SlotId::new(1),
-                    literal_exprs: vec![],
+                    constants: vec![],
                 }],
                 Arc::clone(&output_schema),
                 max_rows,
@@ -992,7 +1257,7 @@ mod tests {
             .push_chunk(&state, make_input())
             .unwrap();
         let first_row = measuring_processor.pull_chunk(&state).unwrap().unwrap();
-        let byte_budget = output_size(&first_row).unwrap();
+        let byte_budget = output_size(&first_row, None).unwrap();
 
         let mut bounded_operator = make_factory(128, byte_budget).create(1, 0);
         let bounded_processor = bounded_operator.as_processor_mut().unwrap();
@@ -1006,5 +1271,38 @@ mod tests {
         assert_eq!(batch_rows[0], 1);
         assert!(batch_rows[1..].iter().any(|rows| *rows > 1));
         assert!(batch_rows.len() < 16, "batch rows: {batch_rows:?}");
+    }
+
+    #[test]
+    fn pending_output_is_admitted_with_retained_input_and_released_on_failure() {
+        let state = RuntimeState::default();
+        let tracker = MemTracker::new_root("unpivot-memory-limit");
+        let mut input = input_chunk();
+        let input_bytes = i64::try_from(input.logical_bytes()).expect("bounded test input");
+        tracker
+            .install_limit_once(input_bytes + 1)
+            .expect("install query memory limit");
+        input
+            .try_transfer_to(&tracker)
+            .expect("retained input fits query limit");
+
+        let mut operator = factory(2, usize::MAX).create(1, 0);
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        operator
+            .as_processor_mut()
+            .unwrap()
+            .push_chunk(&state, input)
+            .unwrap();
+
+        let error = operator
+            .as_processor_mut()
+            .unwrap()
+            .pull_chunk(&state)
+            .expect_err("retained input plus pending output must exceed the query limit");
+        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert_eq!(tracker.current(), input_bytes);
+
+        drop(operator);
+        assert_eq!(tracker.current(), 0);
     }
 }

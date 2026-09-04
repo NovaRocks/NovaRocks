@@ -22,6 +22,7 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
 use arrow::datatypes::DataType;
+use novarocks_functions::ResolvedAggregateSignature;
 
 #[derive(Clone, Debug)]
 pub struct AggTypeSignature {
@@ -137,6 +138,8 @@ pub struct AggregateNode {
     pub node_id: i32,
     pub group_by: Vec<ExprId>,
     pub functions: Vec<AggFunction>,
+    /// Exact immutable-catalog selections aligned with `functions`.
+    pub resolved_aggregates: Vec<ResolvedAggregateSignature>,
     pub need_finalize: bool,
     /// True only when *all* functions in this node are merge-aggregates.
     /// Mixed merge/update aggregates are supported via per-function flags.

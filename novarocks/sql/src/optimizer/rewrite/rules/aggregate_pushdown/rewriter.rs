@@ -165,7 +165,8 @@ pub(crate) fn rewrite(
     plan: PushPlan,
     column_ref_factory: &mut ColumnRefFactory,
     arena: &mut ScalarArena,
-) -> OptExpr {
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+) -> Result<OptExpr, String> {
     let PushPlan {
         side: plan_side,
         target_subtree,
@@ -214,6 +215,7 @@ pub(crate) fn rewrite(
                     args: partial_args,
                     distinct: false,
                     order_by: vec![],
+                    resolved: spec.resolved.clone(),
                 };
                 let output_col = OutputColumn {
                     column_id: partial_col_id,
@@ -222,9 +224,9 @@ pub(crate) fn rewrite(
                     nullable: true,
                     is_internal: false,
                 };
-                (partial_spec, output_col)
+                Ok((partial_spec, output_col))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
 
     // 2. Partial group-by output columns (column-ref pass-through).
     let partial_groupby_outputs: Vec<OutputColumn> = partial_groupby
@@ -290,7 +292,7 @@ pub(crate) fn rewrite(
         .aggregates
         .iter()
         .zip(partial_agg_output_cols.iter())
-        .map(|(orig_spec, pc)| {
+        .map(|(orig_spec, pc)| -> Result<_, String> {
             let arg_id = column_ref_scalar(
                 arena,
                 pc.column_id,
@@ -298,15 +300,22 @@ pub(crate) fn rewrite(
                 pc.data_type.clone(),
                 pc.nullable,
             );
-            ScalarAggregateSpec {
+            let name = final_fn_name(&orig_spec.name);
+            let resolved = function_catalog
+                .resolve_aggregate_trusted(&name, std::slice::from_ref(&pc.data_type))
+                .map_err(|error| {
+                    format!("failed to resolve aggregate pushdown `{name}`: {error}")
+                })?;
+            Ok(ScalarAggregateSpec {
                 output_column_id: orig_spec.output_column_id,
-                name: final_fn_name(&orig_spec.name),
+                name,
                 args: vec![arg_id],
                 distinct: false,
                 order_by: orig_spec.order_by.clone(),
-            }
+                resolved,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
     // 5. Final aggregate output columns.
     let final_group_output_cols: Vec<OutputColumn> = original
@@ -361,13 +370,13 @@ pub(crate) fn rewrite(
         group_by_len,
         arena,
     );
-    OptExpr::new(
+    Ok(OptExpr::new(
         Operator::LogicalProject(ProjectOp {
             items: project_items,
             output_qualifier: None,
         }),
         vec![final_aggregate],
-    )
+    ))
 }
 
 fn partial_fn_name(name: &str) -> String {
@@ -669,6 +678,7 @@ mod tests {
             args: vec![intern_typed(arena, &arg)],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
         }
     }
 
@@ -680,6 +690,7 @@ mod tests {
             args: vec![intern_typed(arena, &arg)],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         }
     }
 
@@ -732,7 +743,15 @@ mod tests {
             partial_aggregates: vec![count],
         };
         let mut factory = ColumnRefFactory::new();
-        let out = rewrite(&original, &join, push, &mut factory, &mut arena);
+        let out = rewrite(
+            &original,
+            &join,
+            push,
+            &mut factory,
+            &mut arena,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .expect("aggregate pushdown rewrite");
         let (_, top_plan) = unwrap_exposure_project(out);
         let Operator::LogicalAggregate(top) = &top_plan.op else {
             panic!("expected final Aggregate");
@@ -771,7 +790,15 @@ mod tests {
             partial_aggregates: vec![sum],
         };
         let mut factory = ColumnRefFactory::new();
-        let out = rewrite(&original, &join, push, &mut factory, &mut arena);
+        let out = rewrite(
+            &original,
+            &join,
+            push,
+            &mut factory,
+            &mut arena,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .expect("aggregate pushdown rewrite");
         let (_, top_plan) = unwrap_exposure_project(out);
         let Operator::LogicalAggregate(top) = &top_plan.op else {
             panic!("expected final Aggregate");
@@ -824,7 +851,15 @@ mod tests {
             partial_aggregates: vec![sum],
         };
         let mut factory = ColumnRefFactory::new();
-        let out = rewrite(&original, &join, push, &mut factory, &mut arena);
+        let out = rewrite(
+            &original,
+            &join,
+            push,
+            &mut factory,
+            &mut arena,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .expect("aggregate pushdown rewrite");
         let (items, top_plan) = unwrap_exposure_project(out);
         let Operator::LogicalAggregate(top) = &top_plan.op else {
             panic!("expected final Aggregate");
@@ -892,6 +927,7 @@ mod tests {
             args: vec![sum_arg],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int32], false),
         };
         let gb_id = intern_typed(
             &mut arena,
@@ -943,7 +979,15 @@ mod tests {
             partial_aggregates: vec![sum],
         };
 
-        let rewritten = rewrite(&original, &join, push, &mut factory, &mut arena);
+        let rewritten = rewrite(
+            &original,
+            &join,
+            push,
+            &mut factory,
+            &mut arena,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .expect("aggregate pushdown rewrite");
 
         // Verify structure: Project → Aggregate → Join → [partial_Aggregate → Scan, Scan]
         let Operator::LogicalProject(_) = &rewritten.op else {
@@ -1048,6 +1092,7 @@ mod tests {
             args: vec![sum_arg],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         };
         let gb_id = intern_typed(
             &mut arena,
@@ -1103,7 +1148,15 @@ mod tests {
             partial_aggregates: vec![sum],
         };
 
-        let rewritten = rewrite(&original, &join, push, &mut factory, &mut arena);
+        let rewritten = rewrite(
+            &original,
+            &join,
+            push,
+            &mut factory,
+            &mut arena,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .expect("aggregate pushdown rewrite");
         let (_, top_plan) = unwrap_exposure_project(rewritten);
         let join_plan = top_plan.children.first().expect("final agg child");
         let partial_plan = join_plan.children.first().expect("join left child");
@@ -1173,6 +1226,7 @@ mod tests {
             args: vec![count_arg],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int32], false),
         };
         let expected_count_display = agg_spec_display_name(&count_spec, &arena);
 
@@ -1214,7 +1268,15 @@ mod tests {
             partial_aggregates: vec![count_spec],
         };
 
-        let rewritten = rewrite(&original, &join, push, &mut factory, &mut arena);
+        let rewritten = rewrite(
+            &original,
+            &join,
+            push,
+            &mut factory,
+            &mut arena,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .expect("aggregate pushdown rewrite");
         let (items, top_plan) = unwrap_exposure_project(rewritten);
         let Operator::LogicalAggregate(top) = &top_plan.op else {
             panic!("expected final Aggregate");

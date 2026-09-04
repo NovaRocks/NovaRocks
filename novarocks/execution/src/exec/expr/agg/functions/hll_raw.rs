@@ -283,6 +283,15 @@ fn estimate_cardinality(state: &HllRawState) -> i64 {
     estimate_cardinality_from_registers(registers)
 }
 
+pub fn cardinality_from_serialized_hll(bytes: &[u8]) -> Result<i64, String> {
+    let mut state = HllRawState {
+        has_value: true,
+        ..HllRawState::default()
+    };
+    merge_hll_bytes(&mut state, bytes)?;
+    Ok(estimate_cardinality(&state))
+}
+
 pub fn estimate_cardinality_from_registers(registers: &[u8; HLL_REGISTERS_COUNT]) -> i64 {
     let num_streams = HLL_REGISTERS_COUNT as f64;
     let alpha = match HLL_REGISTERS_COUNT {
@@ -589,6 +598,28 @@ impl AggregateFunction for HllRawAgg {
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             let _ = take_state(ptr);
+        }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, ptr: *const u8) -> usize {
+        let raw = unsafe { *(ptr as *const *mut HllRawState) };
+        if raw.is_null() {
+            return 0;
+        }
+        let state = unsafe { &*raw };
+        std::mem::size_of::<HllRawState>().saturating_add(
+            state
+                .registers
+                .as_ref()
+                .map(|_| HLL_REGISTERS_COUNT)
+                .unwrap_or(0),
+        )
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::BoundedRetained {
+            max_retained_bytes_per_state: std::mem::size_of::<HllRawState>()
+                .saturating_add(HLL_REGISTERS_COUNT),
         }
     }
 

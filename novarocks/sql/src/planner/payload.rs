@@ -19,7 +19,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
+use crate::analysis::{OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::column_id::ColumnId;
 use crate::common::{ScanVariantColumn, SqlTopNType};
 use crate::planner::table::TableDef;
@@ -73,7 +73,7 @@ pub(crate) struct PlanUnpivotPassthroughColumn {
 #[derive(Clone, Debug)]
 pub(crate) struct PlanUnpivotValueMapping {
     pub input_value_column_id: ColumnId,
-    pub literals: Vec<TypedExpr>,
+    pub constants: Vec<crate::analysis::UnpivotConstant>,
 }
 
 impl PlanUnpivotNode {
@@ -108,6 +108,11 @@ impl PlanUnpivotNode {
     pub(crate) fn validate_against(&self, input_columns: &[OutputColumn]) -> Result<(), String> {
         use std::collections::{HashMap, HashSet};
 
+        const MAX_UNPIVOT_MAPPINGS: usize = 4_096;
+        const MAX_UNPIVOT_CONSTANTS: usize = 16_384;
+        const MAX_UNPIVOT_NESTED_ELEMENTS: usize = 4_096;
+        const MAX_UNPIVOT_CONSTANT_BYTES: usize = 16 * 1024 * 1024;
+
         if self.max_output_rows == 0 {
             return Err("Unpivot max_output_rows must be greater than zero".to_string());
         }
@@ -116,6 +121,74 @@ impl PlanUnpivotNode {
         }
         if self.value_mappings.is_empty() {
             return Err("Unpivot requires at least one value mapping".to_string());
+        }
+        if self.value_mappings.len() > MAX_UNPIVOT_MAPPINGS {
+            return Err("Unpivot exceeds the value mapping limit".to_string());
+        }
+
+        let mut constant_count = 0usize;
+        let mut nested_element_count = 0usize;
+        let mut constant_bytes = 0usize;
+        for (mapping_index, mapping) in self.value_mappings.iter().enumerate() {
+            constant_count = constant_count
+                .checked_add(mapping.constants.len())
+                .ok_or_else(|| "Unpivot constant count overflowed".to_string())?;
+            for (constant_index, constant) in mapping.constants.iter().enumerate() {
+                match constant {
+                    crate::analysis::UnpivotConstant::Scalar(expression) => {
+                        if !matches!(expression.kind, crate::analysis::ExprKind::Literal(_)) {
+                            return Err(format!(
+                                "Unpivot mapping {mapping_index} scalar constant {constant_index} is not a literal expression"
+                            ));
+                        }
+                        constant_bytes = constant_bytes
+                            .checked_add(scalar_literal_retained_bytes(expression))
+                            .ok_or_else(|| "Unpivot constant byte charge overflowed".to_string())?;
+                    }
+                    crate::analysis::UnpivotConstant::Int32List(values) => {
+                        nested_element_count = nested_element_count
+                            .checked_add(values.len())
+                            .ok_or_else(|| "Unpivot nested element count overflowed".to_string())?;
+                        constant_bytes = constant_bytes
+                            .checked_add(values.len().saturating_mul(size_of::<i32>()))
+                            .ok_or_else(|| "Unpivot constant byte charge overflowed".to_string())?;
+                    }
+                    crate::analysis::UnpivotConstant::Utf8Map(entries) => {
+                        nested_element_count = nested_element_count
+                            .checked_add(entries.len())
+                            .ok_or_else(|| "Unpivot nested element count overflowed".to_string())?;
+                        let mut previous = None;
+                        for (entry_index, (key, value)) in entries.iter().enumerate() {
+                            if key.is_empty() {
+                                return Err(format!(
+                                    "Unpivot mapping {mapping_index} map constant {constant_index} entry {entry_index} has an empty key"
+                                ));
+                            }
+                            if previous.is_some_and(|previous: &str| previous >= key.as_str()) {
+                                return Err(format!(
+                                    "Unpivot mapping {mapping_index} map constant {constant_index} keys must be strictly increasing"
+                                ));
+                            }
+                            constant_bytes = constant_bytes
+                                .checked_add(key.len())
+                                .and_then(|total| total.checked_add(value.len()))
+                                .ok_or_else(|| {
+                                    "Unpivot constant byte charge overflowed".to_string()
+                                })?;
+                            previous = Some(key.as_str());
+                        }
+                    }
+                }
+            }
+        }
+        if constant_count > MAX_UNPIVOT_CONSTANTS {
+            return Err("Unpivot exceeds the constant count limit".to_string());
+        }
+        if nested_element_count > MAX_UNPIVOT_NESTED_ELEMENTS {
+            return Err("Unpivot exceeds the nested element limit".to_string());
+        }
+        if constant_bytes > MAX_UNPIVOT_CONSTANT_BYTES {
+            return Err("Unpivot exceeds the decoded constant byte limit".to_string());
         }
 
         let mut input_by_id = HashMap::with_capacity(input_columns.len());
@@ -191,11 +264,11 @@ impl PlanUnpivotNode {
                 ));
             }
             value_nullable |= input.nullable;
-            if mapping.literals.len() != self.literal_output_column_ids.len() {
+            if mapping.constants.len() != self.literal_output_column_ids.len() {
                 return Err(format!(
                     "Unpivot value mapping {index} literal count mismatch: expected {}, got {}",
                     self.literal_output_column_ids.len(),
-                    mapping.literals.len()
+                    mapping.constants.len()
                 ));
             }
         }
@@ -225,19 +298,15 @@ impl PlanUnpivotNode {
             })?;
             let mut nullable = false;
             for (mapping_index, mapping) in self.value_mappings.iter().enumerate() {
-                let literal = &mapping.literals[literal_index];
-                if !matches!(literal.kind, ExprKind::Literal(_)) {
+                let constant = &mapping.constants[literal_index];
+                if constant.data_type() != output.data_type {
                     return Err(format!(
-                        "Unpivot value mapping {mapping_index} literal {literal_index} is not a literal expression"
+                        "Unpivot value mapping {mapping_index} constant {literal_index} type mismatch: constant {:?}, output {:?}",
+                        constant.data_type(),
+                        output.data_type
                     ));
                 }
-                if literal.data_type != output.data_type {
-                    return Err(format!(
-                        "Unpivot value mapping {mapping_index} literal {literal_index} type mismatch: literal {:?}, output {:?}",
-                        literal.data_type, output.data_type
-                    ));
-                }
-                nullable |= literal.nullable;
+                nullable |= constant.nullable();
             }
             if output.nullable != nullable {
                 return Err(format!(
@@ -259,6 +328,20 @@ impl PlanUnpivotNode {
             ));
         }
         Ok(())
+    }
+}
+
+fn scalar_literal_retained_bytes(expression: &TypedExpr) -> usize {
+    match &expression.kind {
+        crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Decimal(value))
+        | crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::String(value)) => {
+            value.len()
+        }
+        crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Binary(value)) => {
+            value.len()
+        }
+        crate::analysis::ExprKind::Literal(_) => size_of::<crate::analysis::LiteralValue>(),
+        _ => 0,
     }
 }
 
@@ -285,7 +368,7 @@ fn require_exact_column_shape(
 #[cfg(test)]
 mod unpivot_tests {
     use super::*;
-    use crate::analysis::LiteralValue;
+    use crate::analysis::{ExprKind, LiteralValue};
 
     fn column(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {
@@ -321,11 +404,15 @@ mod unpivot_tests {
             vec![
                 PlanUnpivotValueMapping {
                     input_value_column_id: ColumnId(2),
-                    literals: vec![string_literal("first")],
+                    constants: vec![crate::analysis::UnpivotConstant::Scalar(string_literal(
+                        "first",
+                    ))],
                 },
                 PlanUnpivotValueMapping {
                     input_value_column_id: ColumnId(3),
-                    literals: vec![string_literal("second")],
+                    constants: vec![crate::analysis::UnpivotConstant::Scalar(string_literal(
+                        "second",
+                    ))],
                 },
             ],
             vec![
@@ -353,7 +440,7 @@ mod unpivot_tests {
             Vec::new(),
             vec![PlanUnpivotValueMapping {
                 input_value_column_id: ColumnId(1),
-                literals: Vec::new(),
+                constants: Vec::new(),
             }],
             vec![column(2, "value", DataType::Utf8, false)],
             1,
@@ -364,20 +451,57 @@ mod unpivot_tests {
     }
 
     #[test]
-    fn rejects_non_literal_tag() {
+    fn rejects_constant_type_drift() {
         let mut node = valid_node().unwrap();
-        node.value_mappings[0].literals[0].kind = ExprKind::ColumnRef {
-            column_id: ColumnId(1),
-            qualifier: None,
-            column: "group".to_string(),
-        };
+        node.value_mappings[0].constants[0] = crate::analysis::UnpivotConstant::Int32List(vec![1]);
         let input = [
             column(1, "group", DataType::Utf8, false),
             column(2, "v1", DataType::Int64, true),
             column(3, "v2", DataType::Int64, false),
         ];
         let error = node.validate_against(&input).unwrap_err();
-        assert!(error.contains("not a literal expression"), "{error}");
+        assert!(error.contains("constant 0 type mismatch"), "{error}");
+    }
+
+    #[test]
+    fn accepts_maximum_mapping_count_with_three_constants_each() {
+        let list_type = crate::analysis::UnpivotConstant::Int32List(Vec::new()).data_type();
+        let map_type = crate::analysis::UnpivotConstant::Utf8Map(Vec::new()).data_type();
+        let mappings = (0..4_096)
+            .map(|_| PlanUnpivotValueMapping {
+                input_value_column_id: ColumnId(1),
+                constants: vec![
+                    crate::analysis::UnpivotConstant::Int32List(Vec::new()),
+                    crate::analysis::UnpivotConstant::Scalar(string_literal("x")),
+                    crate::analysis::UnpivotConstant::Utf8Map(Vec::new()),
+                ],
+            })
+            .collect();
+        let node = PlanUnpivotNode::try_new(
+            &[column(1, "value", DataType::Binary, false)],
+            Vec::new(),
+            ColumnId(5),
+            vec![ColumnId(2), ColumnId(3), ColumnId(4)],
+            mappings,
+            vec![
+                column(2, "input_fields", list_type, false),
+                column(3, "blob_type", DataType::Utf8, false),
+                column(4, "properties", map_type, false),
+                column(5, "body", DataType::Binary, false),
+            ],
+            4_096,
+            32 * 1024 * 1024,
+        )
+        .expect("4,096 mappings with three constants each fit the 16,384 limit");
+
+        assert_eq!(node.value_mappings.len(), 4_096);
+        assert_eq!(
+            node.value_mappings
+                .iter()
+                .map(|mapping| mapping.constants.len())
+                .sum::<usize>(),
+            12_288
+        );
     }
 }
 
@@ -528,6 +652,8 @@ pub(crate) struct WindowExpr {
     pub name: String,
     pub args: Vec<TypedExpr>,
     pub distinct: bool,
+    pub function_order_by: Vec<SortItem>,
+    pub aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
     pub partition_by: Vec<TypedExpr>,
     pub order_by: Vec<SortItem>,
     pub window_frame: Option<crate::analysis::WindowFrame>,
@@ -552,6 +678,7 @@ pub(crate) struct AggregateCall {
     pub distinct: bool,
     pub result_type: DataType,
     pub order_by: Vec<SortItem>,
+    pub resolved: novarocks_functions::ResolvedAggregateSignature,
     /// G1: id of THIS aggregate's output column. Planner-created calls are
     /// minted by `collect_aggregates`; rewrite paths should preserve existing
     /// ids or allocate ids for newly-defined aggregate outputs. Fixtures and

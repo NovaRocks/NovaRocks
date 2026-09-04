@@ -1183,6 +1183,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         prepare_frozen_rewrite_cohort_with_ports(
             self.kernel.connector_control().as_ref(),
             self.kernel.typed_connector_control(),
+            self.kernel.function_catalog().as_ref(),
             self.kernel.query_execution(),
             session.session(),
             cohort_id,
@@ -1488,6 +1489,7 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
 fn prepare_frozen_rewrite_cohort_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+    function_catalog: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
     query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
@@ -1594,6 +1596,8 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             physical_plan,
             sink,
             write_target.ordinal(),
+            write_target.statistics().requirements(),
+            function_catalog,
             &optimizer_settings,
         )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(

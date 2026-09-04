@@ -22,7 +22,9 @@ use arrow::datatypes::DataType;
 
 use crate::exec::node::aggregate::AggFunction;
 
-use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
+use super::super::{
+    AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction, RetainedMemoryPolicy,
+};
 use super::sum::{SumStateAgg, SumStateSignedAgg};
 
 pub(in crate::exec::expr::agg::functions) struct AvgStateAgg;
@@ -64,6 +66,14 @@ impl AggregateFunction for AvgStateAgg {
 
     fn drop_state(&self, spec: &AggSpec, ptr: *mut u8) {
         SumStateAgg.drop_state(spec, ptr)
+    }
+
+    fn retained_bytes(&self, spec: &AggSpec, ptr: *const u8) -> usize {
+        SumStateAgg.retained_bytes(spec, ptr)
+    }
+
+    fn retained_memory_policy(&self, spec: &AggSpec) -> RetainedMemoryPolicy {
+        SumStateAgg.retained_memory_policy(spec)
     }
 
     fn update_batch(
@@ -133,6 +143,14 @@ impl AggregateFunction for AvgStateSignedAgg {
 
     fn drop_state(&self, spec: &AggSpec, ptr: *mut u8) {
         SumStateSignedAgg.drop_state(spec, ptr)
+    }
+
+    fn retained_bytes(&self, spec: &AggSpec, ptr: *const u8) -> usize {
+        SumStateSignedAgg.retained_bytes(spec, ptr)
+    }
+
+    fn retained_memory_policy(&self, spec: &AggSpec) -> RetainedMemoryPolicy {
+        SumStateSignedAgg.retained_memory_policy(spec)
     }
 
     fn update_batch(

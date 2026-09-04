@@ -21,7 +21,7 @@
 //! This is the single public SQL plan reading surface. Construction, draft
 //! mutation, sealing, and validation remain private to the SQL compiler.
 
-pub use crate::analysis::{ExprKind, SortItem, TypedExpr};
+pub use crate::analysis::{ExprKind, SortItem, TypedExpr, UnpivotConstant};
 pub use crate::column_id::ColumnId;
 pub use crate::common::CteId;
 pub use crate::common::expr::{
@@ -31,6 +31,8 @@ pub use crate::common::plan_hints::{ScanVariantColumn, SqlTopNType};
 pub use crate::common::schema::OutputColumn;
 pub use crate::planner::distributed::write::{
     ChangeStreamRouterSink, ConnectorWriteInputBinding, TableFinishNode, TableWriterNode,
+    WriteUnpivotMapping, WriterFinalAggregateCall, WriterFinalAggregatePlan,
+    WriterPartialAggregateCall, WriterPartialAggregatePlan, WriterUnpivotPlan,
 };
 pub use crate::planner::distributed::{
     BoundaryColumn, BoundaryContract, BoundaryKind, ConnectorWriteOutputContract, DataPartition,
@@ -89,6 +91,16 @@ impl TableWriterNode {
     pub fn target_schema(&self) -> &[FinalizedWriteTargetColumn] {
         &self.output_contract.target_schema
     }
+
+    pub const fn writer_multiplex_schema(
+        &self,
+    ) -> &novarocks_spi::connector::write_stack::WriterMultiplexSchema {
+        &self.writer_multiplex_schema
+    }
+
+    pub const fn partial_aggregate_plan(&self) -> &WriterPartialAggregatePlan {
+        &self.partial_aggregate_plan
+    }
 }
 
 /// Read-only access to the single sealed NCP-6 write finish node.
@@ -98,6 +110,22 @@ impl TableFinishNode {
         &self,
     ) -> &[novarocks_spi::connector::write_stack::WriteTargetOrdinal] {
         &self.expected_target_ordinals
+    }
+
+    pub const fn writer_multiplex_schema(
+        &self,
+    ) -> &novarocks_spi::connector::write_stack::WriterMultiplexSchema {
+        &self.writer_multiplex_schema
+    }
+
+    pub const fn root_result_schema(
+        &self,
+    ) -> &novarocks_spi::connector::write_stack::RootWriteResultSchema {
+        &self.root_result_schema
+    }
+
+    pub const fn final_aggregate_plan(&self) -> &WriterFinalAggregatePlan {
+        &self.final_aggregate_plan
     }
 }
 
@@ -201,6 +229,7 @@ pub enum SqlExpressionReadKind {
         args: Vec<TypedExpr>,
         distinct: bool,
         order_by: Vec<SortItem>,
+        resolved: novarocks_functions::ResolvedAggregateSignature,
     },
     Cast {
         expr: Box<TypedExpr>,
@@ -241,6 +270,8 @@ pub enum SqlExpressionReadKind {
         name: String,
         args: Vec<TypedExpr>,
         distinct: bool,
+        function_order_by: Vec<SortItem>,
+        aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
         partition_by: Vec<TypedExpr>,
         order_by: Vec<SortItem>,
         window_frame: Option<WindowFrame>,
@@ -314,11 +345,13 @@ pub fn expression_read(expr: &TypedExpr) -> SqlExpressionRead {
             args,
             distinct,
             order_by,
+            resolved,
         } => SqlExpressionReadKind::AggregateCall {
             name: name.clone(),
             args: args.clone(),
             distinct: *distinct,
             order_by: order_by.clone(),
+            resolved: resolved.clone(),
         },
         ExprKind::Cast { expr, target } => SqlExpressionReadKind::Cast {
             expr: expr.clone(),
@@ -380,6 +413,8 @@ pub fn expression_read(expr: &TypedExpr) -> SqlExpressionRead {
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -388,6 +423,8 @@ pub fn expression_read(expr: &TypedExpr) -> SqlExpressionRead {
             name: name.clone(),
             args: args.clone(),
             distinct: *distinct,
+            function_order_by: function_order_by.clone(),
+            aggregate_binding: aggregate_binding.clone(),
             partition_by: partition_by.clone(),
             order_by: order_by.clone(),
             window_frame: window_frame.clone(),
@@ -528,7 +565,7 @@ pub struct SqlUnpivotPassthroughColumnRead {
 #[derive(Clone, Debug)]
 pub struct SqlUnpivotValueMappingRead {
     pub input_value_column_id: ColumnId,
-    pub literals: Vec<TypedExpr>,
+    pub constants: Vec<crate::analysis::UnpivotConstant>,
 }
 
 #[derive(Clone, Debug)]
@@ -556,6 +593,8 @@ pub struct SqlWindowExprRead {
     pub name: String,
     pub args: Vec<TypedExpr>,
     pub distinct: bool,
+    pub function_order_by: Vec<SortItem>,
+    pub aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
     pub partition_by: Vec<TypedExpr>,
     pub order_by: Vec<SortItem>,
     pub window_frame: Option<WindowFrame>,
@@ -621,6 +660,7 @@ pub struct SqlAggregateCallRead {
     pub result_type: arrow::datatypes::DataType,
     pub order_by: Vec<SortItem>,
     pub output_column_id: ColumnId,
+    pub resolved: novarocks_functions::ResolvedAggregateSignature,
 }
 
 #[derive(Clone, Debug)]
@@ -754,7 +794,7 @@ pub fn physical_plan_read(src: &PhysicalPlanKind) -> SqlPhysicalPlanRead {
                 .iter()
                 .map(|mapping| SqlUnpivotValueMappingRead {
                     input_value_column_id: mapping.input_value_column_id,
-                    literals: mapping.literals.clone(),
+                    constants: mapping.constants.clone(),
                 })
                 .collect(),
             output_columns: node.output_columns.clone(),
@@ -797,6 +837,8 @@ pub fn physical_plan_read(src: &PhysicalPlanKind) -> SqlPhysicalPlanRead {
                     name: expr.name.clone(),
                     args: expr.args.clone(),
                     distinct: expr.distinct,
+                    function_order_by: expr.function_order_by.clone(),
+                    aggregate_binding: expr.aggregate_binding.clone(),
                     partition_by: expr.partition_by.clone(),
                     order_by: expr.order_by.clone(),
                     window_frame: expr.window_frame.clone(),
@@ -853,6 +895,7 @@ pub fn physical_plan_read(src: &PhysicalPlanKind) -> SqlPhysicalPlanRead {
                     result_type: call.result_type.clone(),
                     order_by: call.order_by.clone(),
                     output_column_id: call.output_column_id,
+                    resolved: call.resolved.clone(),
                 })
                 .collect(),
             is_merge: node.is_merge.clone(),
@@ -967,11 +1010,11 @@ pub fn unpivot_physical_plan_for_test() -> PhysicalPlanKind {
             vec![
                 PlanUnpivotValueMapping {
                     input_value_column_id: ColumnId(2),
-                    literals: vec![literal("a")],
+                    constants: vec![crate::analysis::UnpivotConstant::Scalar(literal("a"))],
                 },
                 PlanUnpivotValueMapping {
                     input_value_column_id: ColumnId(3),
-                    literals: vec![literal("b")],
+                    constants: vec![crate::analysis::UnpivotConstant::Scalar(literal("b"))],
                 },
             ],
             vec![

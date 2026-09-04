@@ -3228,12 +3228,12 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
- "datasketches",
  "futures",
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
  "novarocks-connector-binding",
+ "novarocks-connector-iceberg-functions",
  "novarocks-fs",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -3253,6 +3253,16 @@ dependencies = [
  "typetag",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "novarocks-connector-iceberg-functions"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "datasketches",
+ "novarocks-functions",
 ]
 
 [[package]]
@@ -3282,6 +3292,7 @@ dependencies = [
 name = "novarocks-execution"
 version = "0.1.0"
 dependencies = [
+ "allocator-api2",
  "arrow",
  "arrow-buffer",
  "arrow-data",
@@ -3295,10 +3306,13 @@ dependencies = [
  "futures",
  "hashbrown 0.14.5",
  "hex",
+ "libc",
  "libm",
  "md-5",
+ "novarocks-connector-iceberg-functions",
  "novarocks-functions",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-types",
  "num-traits",
  "once_cell",
@@ -3340,7 +3354,6 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
- "datasketches",
  "futures",
  "hex",
  "libc",
@@ -3408,6 +3421,7 @@ dependencies = [
 name = "novarocks-functions"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "arrow-schema",
  "sha2",
 ]
@@ -3464,6 +3478,7 @@ dependencies = [
 name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
  "novarocks-execution",
  "novarocks-proto-models",
  "novarocks-spi",
@@ -3504,6 +3519,7 @@ dependencies = [
  "novarocks-backend",
  "novarocks-connector-binding",
  "novarocks-connector-iceberg",
+ "novarocks-connector-iceberg-functions",
  "novarocks-connector-starrocks",
  "novarocks-execution",
  "novarocks-failpoint",
@@ -3641,6 +3657,7 @@ dependencies = [
  "novarocks-types",
  "novarocks-version",
  "prost 0.13.5",
+ "serde_json",
  "tokio",
  "tonic",
 ]

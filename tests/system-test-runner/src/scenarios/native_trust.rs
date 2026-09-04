@@ -529,10 +529,14 @@ fn assert_direct_vended_init_transport(
 }
 
 fn confidential_vended_init() -> Result<proto::InitQueryRequest> {
-    let material = derive_repository_native_compatibility_material([
-        NativeCarrierDeclaration::try_new("iceberg", 1)?,
-        NativeCarrierDeclaration::try_new("starrocks", 1)?,
-    ], [0x31; 32])?;
+    let material = derive_repository_native_compatibility_material(
+        [
+            NativeCarrierDeclaration::try_new("iceberg", 1)?,
+            NativeCarrierDeclaration::try_new("starrocks", 1)?,
+        ],
+        [0x31; 32],
+        [0x41; 32],
+    )?;
     let owner = catalog::CatalogHandle {
         catalog_name: "vended_tls_gate".to_owned(),
         version: vec![7; 32],

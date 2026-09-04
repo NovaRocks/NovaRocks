@@ -26,7 +26,7 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::iceberg::{Catalog, TableCommit, TableIdent};
 
-use super::transaction::{CatalogCommitDispatch, CommitProof, StagedCommit};
+use super::transaction::{CatalogCommitDispatch, CommitProof};
 
 /// Publishes to an existing table with exactly one `update_table`.
 ///
@@ -71,19 +71,23 @@ impl UpdateTableDispatch {
 impl CatalogCommitDispatch for UpdateTableDispatch {
     async fn dispatch_once(
         &self,
-        staged: StagedCommit,
+        staged: Option<TableCommit>,
     ) -> Result<CommitProof, crate::iceberg::Error> {
+        let Some(staged) = staged else {
+            return Ok(CommitProof::no_op());
+        };
         if staged.is_empty() {
             // Nothing to publish, and nothing was sent. This is a proven no-op
             // rather than a commit, and it must not reach the catalog.
             return Ok(CommitProof::no_op());
         }
-        let commit = TableCommit::builder()
-            .ident(self.ident.clone())
-            .updates(staged.updates)
-            .requirements(staged.requirements)
-            .build();
-        let table = self.client.update_table(commit).await?;
+        if staged.identifier() != &self.ident {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                "staged Iceberg commit target does not match the admitted publication target",
+            ));
+        }
+        let table = self.client.update_table(staged).await?;
         let snapshot_id = table
             .metadata()
             .current_snapshot()
@@ -162,7 +166,7 @@ impl CreateTableDispatch {
 impl CatalogCommitDispatch for CreateTableDispatch {
     async fn dispatch_once(
         &self,
-        _staged: StagedCommit,
+        _staged: Option<TableCommit>,
     ) -> Result<CommitProof, crate::iceberg::Error> {
         let creation = self
             .creation
@@ -252,7 +256,7 @@ impl ConditionalCreateDispatch {
 impl CatalogCommitDispatch for ConditionalCreateDispatch {
     async fn dispatch_once(
         &self,
-        _staged: StagedCommit,
+        _staged: Option<TableCommit>,
     ) -> Result<CommitProof, crate::iceberg::Error> {
         let attempt = self
             .attempt

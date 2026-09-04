@@ -21,7 +21,7 @@
 //! (aliased to `MinMaxState`). It must NEVER be replaced by an HLL/approximate
 //! sketch — HLL is not invertible, so a `-1` (delete) under signed refresh
 //! would corrupt the maintained count. Query-time approximate distinct lives
-//! elsewhere (`agg::hll_raw` / `HistogramHllNdvAgg`) and must not leak here.
+//! elsewhere (`agg::hll_raw`) and must not leak here.
 
 pub(in crate::exec::expr::agg::functions) use super::min_max::{
     MinMaxStateAgg as ApproxCountDistinctStateAgg,
@@ -97,7 +97,14 @@ mod tests {
             let (size, align) = agg.state_layout_for(&spec.kind);
             let layout = Layout::from_size_align(size, align).unwrap();
             let ptr = NonNull::new(unsafe { alloc(layout) }).expect("aggregate state allocation");
-            agg.init_state(&spec, ptr.as_ptr());
+            agg.init_state_with_tracker(
+                &spec,
+                ptr.as_ptr(),
+                Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                    "approx-count-distinct-state-test",
+                )),
+            )
+            .unwrap();
             Self { spec, ptr, layout }
         }
 

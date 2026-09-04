@@ -86,15 +86,10 @@ impl DataPartition {
 }
 
 /// Planner-owned fragment sink intent lowered by codegen.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Connector write sinks stay inline in the sealed public fragment contract to avoid an allocation during native plan encoding."
-)]
 #[derive(Clone, Debug)]
 pub enum DataSink {
     Result,
     Noop,
-    Statistics(novarocks_spi::connector::StatisticsMetricRequest),
     ChangeStreamRouter(super::write::change_stream::ChangeStreamRouterSink),
 }
 

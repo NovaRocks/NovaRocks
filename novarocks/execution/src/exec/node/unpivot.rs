@@ -43,5 +43,12 @@ pub struct UnpivotPassthroughColumn {
 #[derive(Clone, Debug)]
 pub struct UnpivotValueMapping {
     pub input_value_slot_id: SlotId,
-    pub literal_exprs: Vec<ExprId>,
+    pub constants: Vec<UnpivotConstant>,
+}
+
+#[derive(Clone, Debug)]
+pub enum UnpivotConstant {
+    Scalar { expr_id: ExprId, nullable: bool },
+    Int32List(Vec<i32>),
+    Utf8Map(Vec<(String, String)>),
 }

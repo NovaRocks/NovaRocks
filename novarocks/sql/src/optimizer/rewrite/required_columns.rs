@@ -1381,6 +1381,11 @@ mod tests {
                             nulls_first: false,
                             display: None,
                         }],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "sum",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: out_count,
@@ -1388,6 +1393,11 @@ mod tests {
                         args: vec![count_arg],
                         distinct: false,
                         order_by: vec![],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                 ],
                 layout,
@@ -1448,6 +1458,11 @@ mod tests {
                     args: vec![sum_arg],
                     distinct: false,
                     order_by: vec![],
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 layout,
                 vec![sum_column],
@@ -1495,6 +1510,7 @@ mod tests {
             args: vec![col2],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         }];
         let output_columns = vec![make_output_column(ColumnId::new_for_test(301), "sum_x")];
         let output_layout = AggregateOutputLayout::new(
@@ -2000,6 +2016,8 @@ mod tests {
                     name: "row_number".to_string(),
                     args: vec![],
                     distinct: false,
+                    function_order_by: vec![],
+                    aggregate_binding: None,
                     partition_by: vec![part_by],
                     order_by: vec![SortKey {
                         expr: order_by,
@@ -2051,6 +2069,8 @@ mod tests {
                     name: "row_number".to_string(),
                     args: vec![],
                     distinct: false,
+                    function_order_by: vec![],
+                    aggregate_binding: None,
                     partition_by: vec![part_by],
                     order_by: vec![SortKey {
                         expr: order_by,

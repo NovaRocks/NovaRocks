@@ -15,64 +15,60 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Provider-neutral statistics collection values.
+//! Frontend ownership for ordinary distributed statistics execution.
 //!
-//! This module deliberately has no `QueryResult` dependency. Statistics
-//! collection is internal distributed work whose output is handed back to the
-//! connector control plane, never encoded as client MySQL rows.
+//! Connector control freezes the exact scan inputs, aggregate functions, and
+//! artifact identities. SQL then plans only ordinary scan/aggregate/exchange/
+//! unpivot/result operators. This module retains the frozen expectations and
+//! validates the Root result stream before the provider session may finish.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
-};
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
-use datasketches::theta::{CompactThetaSketch, ThetaSketch, ThetaSketchBuilder, ThetaUnionBuilder};
+use arrow::array::{Array, BinaryArray, Int32Array, ListArray, MapArray, StringArray};
+use arrow::datatypes::{DataType, Field, Fields, Schema};
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorReadSelector,
-    ConnectorRequestContext, StatisticsBasisRelation, StatisticsCollectionPlan,
-    StatisticsCollectionResult, StatisticsDataVersion, StatisticsEvidence,
-    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
-    StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
-    StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature, StatisticsRowCoverage,
+    ConnectorRequestContext, StatisticsArtifactDraft, StatisticsArtifactIdentity,
+    StatisticsDataVersion, StatisticsRequiredAggregation,
 };
 
-use crate::common::backend_topology::BackendTopologySnapshot;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryRequest,
     build_statistics_query_request_with_execution,
 };
-use sha2::{Digest, Sha256};
 
-/// Bound the in-memory, mergeable Theta state produced by one statistics
-/// collection. This is independent of the SPI's wire-payload bound.
-/// The SPI's complete opaque result is capped at 64 KiB.  Keep one Theta
-/// state safely below that ceiling so it can coexist with a data-version and
-/// other requested metrics; a larger sketch would only fail late at the SPI
-/// boundary after distributed work had already completed.
-pub const MAX_STATISTICS_THETA_RETAINED_HASHES: usize = 1 << 12;
-const THETA_PARTIAL_WIRE_VERSION: u8 = 2;
-const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 2;
-const MAX_STATISTICS_THETA_WIRE_BYTES: usize = THETA_PARTIAL_WIRE_HEADER_BYTES
-    + 24
-    + MAX_STATISTICS_THETA_RETAINED_HASHES * std::mem::size_of::<u64>();
-const VISIBLE_ROW_ARTIFACT_VERSION: u8 = 1;
-/// Versioned BE-to-coordinator payload carrying one mergeable visible-row
-/// collection partial.  It is deliberately separate from the provider
-/// artifact: this payload crosses only the native execution lifecycle,
-/// whereas the provider artifact is retained only after finalization.
-const STATISTICS_FRAGMENT_PAYLOAD_VERSION: u8 = 2;
+const MAX_STATISTICS_ROOT_ROWS: usize = 4096;
 
-/// A statistics collection is either tied to a statement wait or owned by a
-/// process-owned frontend job. Only the former observes the statement cancellation
-/// view supplied to distributed execution.
+fn charge_statistics_body_bytes(current: usize, body_bytes: usize) -> Result<usize, String> {
+    let charged = current
+        .checked_add(body_bytes)
+        .ok_or_else(|| "statistics Root body budget overflow".to_string())?;
+    if charged > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES {
+        return Err("statistics Root body budget exceeded".into());
+    }
+    Ok(charged)
+}
+
+fn artifact_input_fields_type() -> DataType {
+    DataType::List(Arc::new(Field::new("item", DataType::Int32, false)))
+}
+
+fn artifact_properties_type() -> DataType {
+    DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, false),
+            ])),
+            false,
+        )),
+        false,
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsExecutionMode {
     SynchronousWait,
@@ -85,9 +81,6 @@ impl StatisticsExecutionMode {
     }
 }
 
-/// Validated execution policy handed from the application service to Core.
-/// A process job's explicit cancellation is delivered by its worker control
-/// plane; it must not be synthesized from a disconnected SQL client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatisticsExecutionPolicy {
     mode: StatisticsExecutionMode,
@@ -119,92 +112,105 @@ impl StatisticsExecutionPolicy {
     }
 }
 
-/// A Core-owned compilation input. Connector-specific instructions remain in
-/// the bounded opaque SPI plan; Core only owns its lifecycle and result sink.
-#[derive(Clone)]
+/// Move-only execution contract retained by the FE coordinator until Root EOF
+/// and every required execution terminal have both been observed.
 pub struct StatisticsCollectionProgram {
-    plan: StatisticsCollectionPlan,
+    table: novarocks_spi::connector::ConnectorTableHandle,
+    data_version: StatisticsDataVersion,
+    read_version_ordinal: i64,
+    required: Vec<StatisticsRequiredAggregation>,
     policy: StatisticsExecutionPolicy,
 }
 
 impl StatisticsCollectionProgram {
     pub fn try_new(
-        plan: StatisticsCollectionPlan,
+        table: novarocks_spi::connector::ConnectorTableHandle,
+        data_version: StatisticsDataVersion,
+        read_version_ordinal: Option<i64>,
+        required: Vec<StatisticsRequiredAggregation>,
         policy: StatisticsExecutionPolicy,
     ) -> Result<Self, DistributedQueryError> {
-        if plan.data_version.as_bytes().is_empty() {
+        if required.is_empty() {
             return Err(contract_violation(
-                "statistics collection plan has an empty data-version token",
+                "empty statistics requirements must bypass distributed execution",
             ));
         }
-        if plan.evidence_revision().as_bytes().is_empty() {
+        let read_version_ordinal = read_version_ordinal.ok_or_else(|| {
+            contract_violation("statistics execution has no exact read version ordinal")
+        })?;
+        let identities = required
+            .iter()
+            .map(|requirement| requirement.artifact().clone())
+            .collect::<BTreeSet<_>>();
+        if identities.len() != required.len() {
             return Err(contract_violation(
-                "statistics collection plan has an empty evidence-revision token",
+                "statistics requirements contain duplicate artifact identities",
             ));
         }
-        let distinct_metrics = plan.metrics.metrics().iter().collect::<BTreeSet<_>>();
-        if distinct_metrics.len() != plan.metrics.metrics().len() {
-            return Err(contract_violation(
-                "statistics collection plan contains duplicate metrics",
-            ));
+        let mut inputs = BTreeMap::<usize, (&str, &DataType, bool)>::new();
+        for requirement in &required {
+            let input = requirement.input();
+            if let Some((name, data_type, nullable)) = inputs.insert(
+                input.ordinal(),
+                (input.name(), input.data_type(), input.nullable()),
+            ) && (name != input.name()
+                || data_type != input.data_type()
+                || nullable != input.nullable())
+            {
+                return Err(contract_violation(
+                    "statistics requirements disagree on a scan column ordinal",
+                ));
+            }
         }
-        Ok(Self { plan, policy })
-    }
-
-    pub fn plan(&self) -> &StatisticsCollectionPlan {
-        &self.plan
+        Ok(Self {
+            table,
+            data_version,
+            read_version_ordinal,
+            required,
+            policy,
+        })
     }
 
     pub const fn policy(&self) -> StatisticsExecutionPolicy {
         self.policy
     }
 
-    pub fn result_sink(&self) -> StatisticsResultSink {
-        StatisticsResultSink {
-            data_version: self.plan.data_version.clone(),
-            metrics: self.plan.metrics.clone(),
-            result: None,
-        }
+    pub fn table(&self) -> &novarocks_spi::connector::ConnectorTableHandle {
+        &self.table
     }
 
-    /// Finalize the non-empty native fragment reports received by the
-    /// coordinator. Empty reports are permitted for non-root fragments in an
-    /// exchange-shaped collection, but a successful collection without any
-    /// bounded partial is always rejected rather than treated as zero rows.
-    pub fn finish_fragment_payloads<T>(
-        &self,
-        payloads: impl IntoIterator<Item = T>,
-    ) -> Result<StatisticsCollectionResult, DistributedQueryError>
-    where
-        T: AsRef<[u8]>,
-    {
-        let partials = payloads
-            .into_iter()
-            .filter_map(|payload| {
-                (!payload.as_ref().is_empty()).then(|| {
-                    StatisticsCollectionFinalizer::try_from_fragment_payload(payload.as_ref())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if partials.is_empty() {
-            return Err(contract_violation(
-                "statistics collection completed without a fragment partial",
-            ));
-        }
-        StatisticsCollectionFinalizer::try_merge(partials)?.finish_visible_row(
-            self.plan.data_version.clone(),
-            self.plan.evidence_revision().clone(),
-            &self.plan.metrics,
+    pub fn data_version(&self) -> &StatisticsDataVersion {
+        &self.data_version
+    }
+
+    pub const fn read_version_ordinal(&self) -> i64 {
+        self.read_version_ordinal
+    }
+
+    pub fn required_aggregations(&self) -> &[StatisticsRequiredAggregation] {
+        &self.required
+    }
+
+    pub fn scan_columns(&self) -> Vec<novarocks_spi::connector::StatisticsScanColumn> {
+        let mut columns = self
+            .required
+            .iter()
+            .map(|requirement| requirement.input().clone())
+            .collect::<Vec<_>>();
+        columns.sort_by_key(|column| column.ordinal());
+        columns.dedup_by_key(|column| column.ordinal());
+        columns
+    }
+
+    pub fn result_decoder(&self) -> StatisticsRootResultDecoder {
+        StatisticsRootResultDecoder::new(
+            self.required
+                .iter()
+                .map(|requirement| requirement.artifact().clone()),
         )
     }
 }
 
-/// Immutable naming of the relation one statistics collection measures.
-///
-/// A collection is not a query: no SQL text named this table, so preparation is
-/// handed the same three names the attempt itself was created from. `catalog`
-/// is the connector instance that owns the relation, which is what the typed
-/// scan stack checks the planning lease against.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsRelationIdentity {
     catalog: String,
@@ -237,52 +243,6 @@ impl StatisticsRelationIdentity {
     }
 }
 
-/// The exact version a statistics collection must read.
-///
-/// The plan's `data_version` is an opaque provider token: it can be compared,
-/// but a relation cannot be read at it. The provider therefore also states the
-/// same pin as a neutral ordinal, and that ordinal is what freezes the scan.
-/// Without it there is no version to name, and reading the catalog's current
-/// version instead would measure rows the published evidence does not describe
-/// -- so this fails closed rather than defaulting.
-fn statistics_version_ordinal(
-    identity: &StatisticsRelationIdentity,
-    program: &StatisticsCollectionProgram,
-) -> Result<i64, DistributedQueryError> {
-    program.plan().base_version_ordinal().ok_or_else(|| {
-        contract_violation(format!(
-            "statistics collection of `{}` has no provider-signed base version ordinal; \
-             measuring its current version instead would publish statistics for a version \
-             nobody asked about",
-            identity.fqn()
-        ))
-    })
-}
-
-/// A collection is distributed work, so it needs somewhere to run.
-///
-/// This is checked before any provider work starts, and it is deliberately
-/// its own check rather than a side effect of building scan options: the
-/// shared option builder admits a single-backend fallback under `cfg(test)`,
-/// and a collection must never quietly run against one.
-fn statistics_target_parallelism(
-    topology: &BackendTopologySnapshot,
-) -> Result<NonZeroUsize, DistributedQueryError> {
-    NonZeroUsize::new(topology.targets().len()).ok_or_else(|| {
-        DistributedQueryError::new(
-            DistributedQueryErrorKind::Rejected,
-            "statistics collection requires at least one live backend",
-        )
-    })
-}
-
-/// Prepared, one-shot statistics request assembly.
-///
-/// This is the statistics counterpart to the normal query assembly: provider
-/// planning and fragment preparation happen once, then the caller receives a
-/// borrow-only native encoding view.  `finish` accepts only the attachment
-/// sealed by that exact view, so it cannot substitute a later provider read,
-/// topology snapshot, cancellation view, or statistics program.
 pub struct PreparedStatisticsCollectionRequest {
     encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput,
     program: StatisticsCollectionProgram,
@@ -290,17 +250,12 @@ pub struct PreparedStatisticsCollectionRequest {
 }
 
 impl PreparedStatisticsCollectionRequest {
-    /// Immutable facts consumed by the native encoder.  This has no acquire
-    /// path: connector leases and read sessions remain sealed in preparation.
     pub fn encoding_view(
         &self,
     ) -> crate::query_execution::native_fragment::NativeFragmentEncodingView<'_> {
         self.encoding.encoding_view()
     }
 
-    /// Consume the matching native attachment into the sole statistics
-    /// distributed request.  Keeping the typed program here prevents a
-    /// statistics attempt from degrading into a generic result request.
     pub fn finish(
         self,
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
@@ -321,30 +276,48 @@ impl PreparedStatisticsCollectionRequest {
     }
 }
 
-/// Prepare an already-pinned connector statistics program for native
-/// distributed execution.
-///
-/// The collection reads one named relation at one exact version: the ordinal
-/// the provider signed beside its pinned data version. Preparation cannot
-/// reopen the provider catalog or reinterpret that version -- it admits a
-/// request-local binding pinned to it and then lowers through the ordinary
-/// typed connector scan stack, so BE execution has no statistics-only
-/// connector identity or reader path.
+/// Frontend planning authorities used to turn one provider-frozen statistics
+/// program into an ordinary distributed query.
+pub struct StatisticsPlanningServices<'a> {
+    controls: &'a dyn ConnectorControlResolver,
+    typed_connector_control: &'a Arc<crate::connector::ConnectorControlHost>,
+    functions: &'a dyn novarocks_sql::compiler::SqlFunctionCatalog,
+}
+
+impl<'a> StatisticsPlanningServices<'a> {
+    pub fn new(
+        controls: &'a dyn ConnectorControlResolver,
+        typed_connector_control: &'a Arc<crate::connector::ConnectorControlHost>,
+        functions: &'a dyn novarocks_sql::compiler::SqlFunctionCatalog,
+    ) -> Self {
+        Self {
+            controls,
+            typed_connector_control,
+            functions,
+        }
+    }
+}
+
 pub fn prepare_statistics_collection_request(
-    controls: &dyn ConnectorControlResolver,
-    typed_connector_control: &Arc<crate::connector::ConnectorControlHost>,
+    services: StatisticsPlanningServices<'_>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     context: ConnectorRequestContext,
     identity: &StatisticsRelationIdentity,
     program: StatisticsCollectionProgram,
     planning_lease: ConnectorControlPlanningLease,
 ) -> Result<PreparedStatisticsCollectionRequest, DistributedQueryError> {
-    statistics_target_parallelism(execution.topology())?;
-    let version_ordinal = statistics_version_ordinal(identity, &program)?;
-    // The lease that resolved the table handle is the only generation allowed
-    // to plan the read of it. A handle from one generation planned through
-    // another is a different table.
-    if planning_lease.binding().descriptor().instance_id != *program.plan().table().owner() {
+    let StatisticsPlanningServices {
+        controls,
+        typed_connector_control,
+        functions,
+    } = services;
+    if execution.topology().targets().is_empty() {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::Rejected,
+            "statistics collection requires at least one live backend",
+        ));
+    }
+    if planning_lease.binding().descriptor().instance_id != *program.table().owner() {
         return Err(contract_violation(
             "statistics collection planning lease does not own its resolved table handle",
         ));
@@ -360,23 +333,19 @@ pub fn prepare_statistics_collection_request(
         crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
             .map_err(contract_violation)?,
     );
-    let source_binding = admit_statistics_scan_binding(
-        table_bindings.as_ref(),
-        identity,
-        &program,
-        version_ordinal,
-        planning_lease,
-    )?;
+    let source_binding =
+        admit_statistics_scan_binding(table_bindings.as_ref(), identity, &program, planning_lease)?;
     let distributed = novarocks_sql::planning::dml::build_statistics_connector_plan(
         novarocks_sql::planning::dml::StatisticsConnectorScan {
             binding: source_binding,
             catalog: identity.catalog.clone(),
             namespace: identity.namespace.clone(),
             table: identity.table.clone(),
-            version_ordinal,
-            columns: statistics_scan_column_defs(&program),
+            version_ordinal: program.read_version_ordinal(),
+            columns: program.scan_columns(),
         },
-        program.plan.metrics.clone(),
+        program.required_aggregations(),
+        functions,
         execution.optimizer_settings(),
     )
     .map_err(contract_violation)?;
@@ -386,10 +355,6 @@ pub fn prepare_statistics_collection_request(
         &context,
         Some(table_bindings.as_ref()),
         None,
-        // The same options a statement's own scans are prepared under. A
-        // collection is an ordinary typed read of a real relation, so it
-        // resolves through the one installed control registry rather than a
-        // statistics-only planning path.
         crate::query_execution::compiler::scan_preparation_options(
             typed_connector_control,
             execution.optimizer_settings(),
@@ -408,50 +373,17 @@ pub fn prepare_statistics_collection_request(
     })
 }
 
-/// The provider-resolved physical columns this collection reads, in the
-/// provider's own ordinal order.
-fn statistics_scan_column_defs(
-    program: &StatisticsCollectionProgram,
-) -> Vec<novarocks_types::schema::ColumnDef> {
-    program
-        .plan
-        .scan_columns()
-        .iter()
-        .map(|column| novarocks_types::schema::ColumnDef {
-            name: column.name().to_string(),
-            data_type: column.data_type().clone(),
-            nullable: column.nullable(),
-            write_default: None,
-            logical_type: None,
-        })
-        .collect()
-}
-
-/// Admit the one request-local binding this collection scans through.
-///
-/// It names the real relation at the version the provider signed, and carries
-/// the exact lease and table handle that resolved it. Preparation recovers all
-/// of that from the token alone, so the scan can never fall back to a fresh
-/// catalog acquire or to the relation's current version.
 fn admit_statistics_scan_binding(
     bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     identity: &StatisticsRelationIdentity,
     program: &StatisticsCollectionProgram,
-    version_ordinal: i64,
     planning_lease: ConnectorControlPlanningLease,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, DistributedQueryError> {
-    let input_schema: arrow::datatypes::SchemaRef = Arc::new(arrow::datatypes::Schema::new(
+    let input_schema = Arc::new(Schema::new(
         program
-            .plan
             .scan_columns()
             .iter()
-            .map(|column| {
-                arrow::datatypes::Field::new(
-                    column.name(),
-                    column.data_type().clone(),
-                    column.nullable(),
-                )
-            })
+            .map(|column| Field::new(column.name(), column.data_type().clone(), column.nullable()))
             .collect::<Vec<_>>(),
     ));
     let scan_identity =
@@ -461,6 +393,7 @@ fn admit_statistics_scan_binding(
             identity.table.as_str(),
         )
         .map_err(contract_violation)?;
+    let version_ordinal = program.read_version_ordinal();
     let key = crate::catalog_application::query_bindings::QueryTableBindingKey::snapshot(
         &identity.catalog,
         &identity.namespace,
@@ -469,1377 +402,193 @@ fn admit_statistics_scan_binding(
     );
     bindings
         .resolve_or_insert_with_id(key, |binding| {
-            Ok(
-                crate::catalog_application::query_bindings::QueryTableBinding {
-                    resolved:
-                        novarocks_sql::planning::query_execution::pinned_version_resolved_analyzer_table(
-                            &scan_identity,
-                            input_schema.clone(),
-                            binding,
-                            version_ordinal,
-                        ),
-                    statistics_pin: None,
-                    admission:
-                        crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
-                            planning_lease.clone(),
-                        ),
-                    scan_materialization: Some(
-                        crate::catalog_application::query_bindings::QueryScanMaterialization {
-                            table: program.plan().table().clone(),
-                            catalog_handle: planning_lease
-                                .binding()
-                                .catalog_handle()
-                                .map_err(|error| error.to_string())?
-                                .clone(),
-                            schema: input_schema.clone(),
-                            selector: ConnectorReadSelector::SnapshotId(version_ordinal),
-                            statistics_pin: None,
-                            planning_lease: planning_lease.clone(),
-                        },
-                    ),
-                    mv_target_read: None,
-                    write_target_admission: None,
-                    frozen_snapshot_materializations: BTreeMap::new(),
-                    admitted_change_scans: BTreeMap::new(),
-                },
-            )
+            Ok(crate::catalog_application::query_bindings::QueryTableBinding {
+                resolved: novarocks_sql::planning::query_execution::pinned_version_resolved_analyzer_table(
+                    &scan_identity,
+                    input_schema.clone(),
+                    binding,
+                    version_ordinal,
+                ),
+                statistics_pin: None,
+                admission: crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
+                    planning_lease.clone(),
+                ),
+                scan_materialization: Some(
+                    crate::catalog_application::query_bindings::QueryScanMaterialization {
+                        table: program.table().clone(),
+                        catalog_handle: planning_lease
+                            .binding()
+                            .catalog_handle()
+                            .map_err(|error| error.to_string())?
+                            .clone(),
+                        schema: input_schema.clone(),
+                        selector: ConnectorReadSelector::SnapshotId(version_ordinal),
+                        statistics_pin: None,
+                        planning_lease: planning_lease.clone(),
+                    },
+                ),
+                mv_target_read: None,
+                write_target_admission: None,
+                frozen_snapshot_materializations: BTreeMap::new(),
+                admitted_change_scans: BTreeMap::new(),
+            })
         })
         .map_err(contract_violation)
 }
 
-/// A one-result bounded sink for an internal statistics execution. It rejects
-/// version drift and metric-set expansion before a result can reach a
-/// connector publisher.
-pub struct StatisticsResultSink {
-    data_version: novarocks_spi::connector::StatisticsDataVersion,
-    metrics: StatisticsMetricRequest,
-    result: Option<StatisticsCollectionResult>,
+/// Streaming decoder for the ordinary Root Result relation.
+///
+/// Identity and body are data-plane values. Properties are intentionally empty
+/// for ANALYZE; the provider session validates the compact body and derives
+/// provider metadata while consuming `finish`.
+pub struct StatisticsRootResultDecoder {
+    expected: BTreeSet<StatisticsArtifactIdentity>,
+    observed: BTreeMap<StatisticsArtifactIdentity, StatisticsArtifactDraft>,
+    body_bytes: usize,
+    root_eof: bool,
+    execution_succeeded: bool,
 }
 
-impl StatisticsResultSink {
-    pub fn accept(
+impl StatisticsRootResultDecoder {
+    fn new(expected: impl IntoIterator<Item = StatisticsArtifactIdentity>) -> Self {
+        Self {
+            expected: expected.into_iter().collect(),
+            observed: BTreeMap::new(),
+            body_bytes: 0,
+            root_eof: false,
+            execution_succeeded: false,
+        }
+    }
+
+    pub fn apply_chunk(
         &mut self,
-        result: StatisticsCollectionResult,
-    ) -> Result<(), DistributedQueryError> {
-        if self.result.is_some() {
-            return Err(contract_violation(
-                "statistics result sink received more than one collection result",
+        chunk: &novarocks_execution::exec::chunk::Chunk,
+    ) -> Result<(), String> {
+        if self.root_eof {
+            return Err("statistics Root emitted a trailing batch after EOF".into());
+        }
+        let batch = &chunk.batch;
+        let schema = batch.schema();
+        let expected_schema = Schema::new(vec![
+            Field::new("input_fields", artifact_input_fields_type(), false),
+            Field::new("blob_type", DataType::Utf8, false),
+            Field::new("body", DataType::Binary, true),
+            Field::new("properties", artifact_properties_type(), false),
+        ]);
+        if schema.as_ref() != &expected_schema {
+            return Err(format!(
+                "statistics Root schema mismatch: expected {expected_schema:?}, received {schema:?}"
             ));
         }
-        let evidence = &result.evidence;
-        if *evidence.data_version() != self.data_version {
-            return Err(contract_violation(
-                "statistics collection result does not match its pinned data version",
-            ));
-        }
-        let expected = self.metrics.metrics().iter().collect::<BTreeSet<_>>();
-        let actual = evidence.metrics().keys().collect::<BTreeSet<_>>();
-        if actual != expected {
-            return Err(contract_violation(
-                "statistics collection result does not match its requested metric set",
-            ));
-        }
-        self.result = Some(result);
-        Ok(())
-    }
-
-    pub fn finish(self) -> Result<StatisticsCollectionResult, DistributedQueryError> {
-        self.result.ok_or_else(|| {
-            contract_violation("statistics result sink completed without a collection result")
-        })
-    }
-}
-
-/// A mergeable, Core-internal Theta partial. It never exposes a user SQL
-/// aggregate and is used only by the statistics collector.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ThetaSketchPartial {
-    lg_k: u8,
-    compact_body: Vec<u8>,
-}
-
-/// Finalized Theta output suitable for a typed statistics metric value.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ThetaSketchFinal {
-    estimate: f64,
-}
-
-/// Mergeable scalar partial for row/null/min/max/size collection. Bounds keep
-/// their physical scalar type until the provider-owned artifact boundary;
-/// they must never be coerced through strings or lossy floating-point values.
-#[derive(Clone, Debug, PartialEq)]
-pub struct StatisticsScalarPartial {
-    row_count: u64,
-    null_count: u64,
-    total_size: u64,
-    minimum: Option<StatisticsScalarBound>,
-    maximum: Option<StatisticsScalarBound>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum StatisticsScalarBound {
-    F64(f64),
-    LargeInt(i128),
-}
-
-/// Per-fragment Arrow collector used by the native statistics sink.  It is
-/// schema-bound at construction time, so logical metric names can never be
-/// rebound to a different scan projection after the connector's table pin
-/// has been resolved.
-pub struct StatisticsBatchCollector {
-    schema: SchemaRef,
-    metrics: StatisticsMetricRequest,
-    column_indexes: BTreeMap<std::sync::Arc<str>, usize>,
-    table_rows: u64,
-    columns: BTreeMap<std::sync::Arc<str>, StatisticsScalarAccumulator>,
-    theta: BTreeMap<std::sync::Arc<str>, StatisticsThetaAccumulator>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct StatisticsScalarAccumulator {
-    row_count: u64,
-    null_count: u64,
-    total_size: u64,
-    minimum: Option<StatisticsScalarBound>,
-    maximum: Option<StatisticsScalarBound>,
-}
-
-/// Keeps one bounded Theta sketch per requested column.  Batch input may be
-/// arbitrarily large over the lifetime of a fragment, so retaining every
-/// hashed value until `finish` would turn an approximate metric into an
-/// unbounded memory sink.
-#[derive(Debug)]
-struct StatisticsThetaAccumulator {
-    sketch: ThetaSketch,
-}
-
-impl StatisticsScalarPartial {
-    pub fn try_new(
-        row_count: u64,
-        null_count: u64,
-        total_size: u64,
-        minimum: Option<f64>,
-        maximum: Option<f64>,
-    ) -> Result<Self, DistributedQueryError> {
-        Self::try_new_bounds(
-            row_count,
-            null_count,
-            total_size,
-            minimum.map(StatisticsScalarBound::F64),
-            maximum.map(StatisticsScalarBound::F64),
-        )
-    }
-
-    fn try_new_bounds(
-        row_count: u64,
-        null_count: u64,
-        total_size: u64,
-        minimum: Option<StatisticsScalarBound>,
-        maximum: Option<StatisticsScalarBound>,
-    ) -> Result<Self, DistributedQueryError> {
-        if null_count > row_count {
-            return Err(contract_violation(
-                "statistics null count exceeds row count",
-            ));
-        }
-        if minimum.as_ref().is_some_and(|value| !value.is_valid())
-            || maximum.as_ref().is_some_and(|value| !value.is_valid())
-            || matches!((&minimum, &maximum), (Some(minimum), Some(maximum)) if minimum.compare(maximum).is_none_or(|order| order.is_gt()))
+        if self
+            .observed
+            .len()
+            .checked_add(batch.num_rows())
+            .is_none_or(|rows| rows > MAX_STATISTICS_ROOT_ROWS)
         {
-            return Err(contract_violation(
-                "statistics scalar bounds must be finite, equally typed, and ordered",
-            ));
+            return Err("statistics Root row budget exceeded".into());
         }
-        Ok(Self {
-            row_count,
-            null_count,
-            total_size,
-            minimum,
-            maximum,
-        })
-    }
-
-    pub fn try_merge(
-        partials: impl IntoIterator<Item = Self>,
-    ) -> Result<Self, DistributedQueryError> {
-        let mut merged = Self::try_new_bounds(0, 0, 0, None, None)?;
-        for partial in partials {
-            merged.row_count = merged
-                .row_count
-                .checked_add(partial.row_count)
-                .ok_or_else(|| resource_exhausted("statistics row count overflow"))?;
-            merged.null_count = merged
-                .null_count
-                .checked_add(partial.null_count)
-                .ok_or_else(|| resource_exhausted("statistics null count overflow"))?;
-            merged.total_size = merged
-                .total_size
-                .checked_add(partial.total_size)
-                .ok_or_else(|| resource_exhausted("statistics total size overflow"))?;
-            merged.minimum = merge_scalar_bounds(merged.minimum, partial.minimum, true)?;
-            merged.maximum = merge_scalar_bounds(merged.maximum, partial.maximum, false)?;
-        }
-        Self::try_new_bounds(
-            merged.row_count,
-            merged.null_count,
-            merged.total_size,
-            merged.minimum,
-            merged.maximum,
-        )
-    }
-
-    pub fn metric_values(
-        &self,
-        metrics: impl IntoIterator<Item = StatisticsMetric>,
-    ) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricValue>, DistributedQueryError> {
-        let mut output = BTreeMap::new();
-        for metric in metrics {
-            let value = match &metric {
-                StatisticsMetric::RowCount => StatisticsMetricValue::U64(self.row_count),
-                StatisticsMetric::NullCount { .. } => StatisticsMetricValue::U64(self.null_count),
-                StatisticsMetric::AverageSize { .. } => {
-                    StatisticsMetricValue::F64(if self.row_count != 0 {
-                        self.total_size as f64 / self.row_count as f64
-                    } else {
-                        0.0
-                    })
-                }
-                StatisticsMetric::Minimum { .. } => self
-                    .minimum
-                    .as_ref()
-                    .ok_or_else(|| contract_violation("statistics minimum is unavailable"))?
-                    .metric_value(),
-                StatisticsMetric::Maximum { .. } => self
-                    .maximum
-                    .as_ref()
-                    .ok_or_else(|| contract_violation("statistics maximum is unavailable"))?
-                    .metric_value(),
-                StatisticsMetric::ThetaNdv { .. } => continue,
-            };
-            output.insert(metric, value);
-        }
-        Ok(output)
-    }
-}
-
-impl StatisticsBatchCollector {
-    pub fn try_new(
-        schema: SchemaRef,
-        metrics: StatisticsMetricRequest,
-    ) -> Result<Self, DistributedQueryError> {
-        let mut column_indexes = BTreeMap::new();
-        for metric in metrics.metrics() {
-            let Some(column) = statistics_metric_column(metric) else {
-                continue;
-            };
-            let index = schema
-                .fields()
-                .iter()
-                .position(|field| field.name().eq_ignore_ascii_case(column))
-                .ok_or_else(|| {
-                    contract_violation(format!(
-                        "statistics scan schema does not contain requested column `{column}`"
-                    ))
-                })?;
-            column_indexes.insert(column.clone(), index);
-        }
-        let scalar_columns = metrics
-            .metrics()
-            .iter()
-            .filter_map(|metric| match metric {
-                StatisticsMetric::NullCount { column }
-                | StatisticsMetric::Minimum { column }
-                | StatisticsMetric::Maximum { column }
-                | StatisticsMetric::AverageSize { column } => Some(column.clone()),
-                StatisticsMetric::RowCount | StatisticsMetric::ThetaNdv { .. } => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let theta_columns = metrics
-            .metrics()
-            .iter()
-            .filter_map(|metric| match metric {
-                StatisticsMetric::ThetaNdv { column } => Some(column.clone()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        Ok(Self {
-            schema,
-            metrics,
-            column_indexes,
-            table_rows: 0,
-            columns: scalar_columns
-                .into_iter()
-                .map(|column| (column, StatisticsScalarAccumulator::default()))
-                .collect(),
-            theta: theta_columns
-                .into_iter()
-                .map(|column| {
-                    StatisticsThetaAccumulator::try_new(12).map(|accumulator| (column, accumulator))
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?,
-        })
-    }
-
-    pub fn push_batch(&mut self, batch: &RecordBatch) -> Result<(), DistributedQueryError> {
-        if batch.schema().as_ref() != self.schema.as_ref() {
-            return Err(contract_violation(
-                "statistics batch schema differs from the pinned scan schema",
-            ));
-        }
-        let rows = u64::try_from(batch.num_rows())
-            .map_err(|_| resource_exhausted("statistics batch row count exceeds u64"))?;
-        self.table_rows = self
-            .table_rows
-            .checked_add(rows)
-            .ok_or_else(|| resource_exhausted("statistics row count overflow"))?;
-        for (column, index) in &self.column_indexes {
-            let array = batch.column(*index);
-            if let Some(accumulator) = self.columns.get_mut(column) {
-                accumulator.push(array, rows)?;
+        let input_fields = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| "statistics Root input_fields is not List<Int32>".to_string())?;
+        let blob_types = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| "statistics Root blob_type is not Utf8".to_string())?;
+        let bodies = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| "statistics Root body is not Binary".to_string())?;
+        let properties = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "statistics Root properties is not Map<Utf8, Utf8>".to_string())?;
+        for row in 0..batch.num_rows() {
+            if input_fields.is_null(row)
+                || blob_types.is_null(row)
+                || bodies.is_null(row)
+                || properties.is_null(row)
+            {
+                return Err("statistics Root artifact row contains a null value".into());
             }
-            if let Some(accumulator) = self.theta.get_mut(column) {
-                accumulator.push(array)?;
+            let fields = input_fields.value(row);
+            let fields = fields
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "statistics Root input_fields item is not Int32".to_string())?;
+            if fields.null_count() != 0 {
+                return Err("statistics Root input_fields contains a null item".into());
             }
-        }
-        Ok(())
-    }
-
-    pub fn finish(self) -> Result<StatisticsCollectionFinalizer, DistributedQueryError> {
-        let table = StatisticsScalarPartial::try_new(self.table_rows, 0, 0, None, None)?;
-        let mut finalizer = StatisticsCollectionFinalizer::default().with_table(table);
-        for (column, accumulator) in self.columns {
-            finalizer = finalizer.with_column(column, accumulator.finish()?);
-        }
-        for (column, accumulator) in self.theta {
-            finalizer = finalizer.with_theta(column, accumulator.finish()?);
-        }
-        // Keep the requested metric set in the collector state so accidental
-        // construction with an empty or replaced selection remains visible to
-        // the compiler and does not silently widen collection behavior.
-        debug_assert!(!self.metrics.metrics().is_empty());
-        Ok(finalizer)
-    }
-
-    /// Finish one fragment's collection into the bounded terminal-report
-    /// payload. The coordinator is the only component that may merge these
-    /// payloads into provider-facing evidence.
-    pub fn finish_fragment_payload(self) -> Result<Bytes, DistributedQueryError> {
-        self.finish()?.try_to_fragment_payload()
-    }
-}
-
-impl StatisticsScalarAccumulator {
-    fn push(&mut self, array: &ArrayRef, rows: u64) -> Result<(), DistributedQueryError> {
-        self.row_count = self
-            .row_count
-            .checked_add(rows)
-            .ok_or_else(|| resource_exhausted("statistics row count overflow"))?;
-        self.null_count = self
-            .null_count
-            .checked_add(
-                u64::try_from(array.null_count())
-                    .map_err(|_| resource_exhausted("statistics null count exceeds u64"))?,
-            )
-            .ok_or_else(|| resource_exhausted("statistics null count overflow"))?;
-        self.total_size = self
-            .total_size
-            .checked_add(estimated_value_bytes(array)?)
-            .ok_or_else(|| resource_exhausted("statistics total size overflow"))?;
-        for value in array_scalar_bounds(array)? {
-            self.minimum = merge_scalar_bounds(self.minimum.take(), Some(value.clone()), true)?;
-            self.maximum = merge_scalar_bounds(self.maximum.take(), Some(value), false)?;
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> Result<StatisticsScalarPartial, DistributedQueryError> {
-        StatisticsScalarPartial::try_new_bounds(
-            self.row_count,
-            self.null_count,
-            self.total_size,
-            self.minimum,
-            self.maximum,
-        )
-    }
-}
-
-impl StatisticsThetaAccumulator {
-    fn try_new(lg_k: u8) -> Result<Self, DistributedQueryError> {
-        Ok(Self {
-            sketch: build_theta_sketch(lg_k)?,
-        })
-    }
-
-    fn push(&mut self, array: &ArrayRef) -> Result<(), DistributedQueryError> {
-        for hash in array_hashes(array)? {
-            // `ThetaSketch` performs bounded sampling internally. The SHA-256
-            // value keeps the Arrow representation out of the sketch's public
-            // hash domain and makes every supported scalar type deterministic.
-            self.sketch.update(hash as i64);
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> Result<ThetaSketchPartial, DistributedQueryError> {
-        ThetaSketchPartial::try_from_sketch(self.sketch)
-    }
-}
-
-fn statistics_metric_column(metric: &StatisticsMetric) -> Option<&std::sync::Arc<str>> {
-    match metric {
-        StatisticsMetric::RowCount => None,
-        StatisticsMetric::NullCount { column }
-        | StatisticsMetric::Minimum { column }
-        | StatisticsMetric::Maximum { column }
-        | StatisticsMetric::AverageSize { column }
-        | StatisticsMetric::ThetaNdv { column } => Some(column),
-    }
-}
-
-fn estimated_value_bytes(array: &ArrayRef) -> Result<u64, DistributedQueryError> {
-    let bytes = if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        array
-            .iter()
-            .flatten()
-            .map(|value| value.len() as u64)
-            .try_fold(0_u64, |total, value| total.checked_add(value).ok_or(()))
-            .map_err(|_| resource_exhausted("statistics string size overflow"))?
-    } else if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
-        array
-            .iter()
-            .flatten()
-            .map(|value| value.len() as u64)
-            .try_fold(0_u64, |total, value| total.checked_add(value).ok_or(()))
-            .map_err(|_| resource_exhausted("statistics string size overflow"))?
-    } else {
-        u64::try_from(array.get_array_memory_size())
-            .map_err(|_| resource_exhausted("statistics value size exceeds u64"))?
-    };
-    Ok(bytes)
-}
-
-impl StatisticsScalarBound {
-    fn is_valid(&self) -> bool {
-        !matches!(self, Self::F64(value) if !value.is_finite())
-    }
-
-    fn compare(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Self::F64(left), Self::F64(right)) => left.partial_cmp(right),
-            (Self::LargeInt(left), Self::LargeInt(right)) => Some(left.cmp(right)),
-            _ => None,
-        }
-    }
-
-    fn metric_value(&self) -> StatisticsMetricValue {
-        match self {
-            Self::F64(value) => StatisticsMetricValue::F64(*value),
-            Self::LargeInt(value) => {
-                StatisticsMetricValue::Bytes(Bytes::copy_from_slice(&value.to_be_bytes()))
+            let field_ids = fields.values().to_vec();
+            if field_ids.iter().collect::<BTreeSet<_>>().len() != field_ids.len() {
+                return Err("statistics Root input_fields contains a duplicate field ID".into());
             }
-        }
-    }
-}
-
-fn merge_scalar_bounds(
-    left: Option<StatisticsScalarBound>,
-    right: Option<StatisticsScalarBound>,
-    minimum: bool,
-) -> Result<Option<StatisticsScalarBound>, DistributedQueryError> {
-    match (left, right) {
-        (Some(left), Some(right)) => {
-            let ordering = left.compare(&right).ok_or_else(|| {
-                contract_violation("statistics scalar bounds use incompatible physical types")
-            })?;
-            Ok(Some(
-                if (minimum && ordering.is_gt()) || (!minimum && ordering.is_lt()) {
-                    right
-                } else {
-                    left
-                },
-            ))
-        }
-        (value @ Some(_), None) | (None, value @ Some(_)) => Ok(value),
-        (None, None) => Ok(None),
-    }
-}
-
-fn array_scalar_bounds(
-    array: &ArrayRef,
-) -> Result<Vec<StatisticsScalarBound>, DistributedQueryError> {
-    macro_rules! values {
-        ($array:expr) => {
-            return Ok($array
-                .iter()
-                .flatten()
-                .map(|value| StatisticsScalarBound::F64(value as f64))
-                .collect())
-        };
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Int8Array>() {
-        values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Int16Array>() {
-        values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
-        values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
-        values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<UInt8Array>() {
-        values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<UInt16Array>() {
-        values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<UInt32Array>() {
-        values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
-        return Ok(array
-            .iter()
-            .flatten()
-            .map(|value| StatisticsScalarBound::F64(value as f64))
-            .collect());
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
-        return array
-            .iter()
-            .flatten()
-            .map(|value| {
-                let value = value as f64;
-                value
-                    .is_finite()
-                    .then_some(StatisticsScalarBound::F64(value))
-                    .ok_or_else(|| contract_violation("statistics numeric value is not finite"))
-            })
-            .collect();
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
-        return array
-            .iter()
-            .flatten()
-            .map(|value| {
-                value
-                    .is_finite()
-                    .then_some(StatisticsScalarBound::F64(value))
-                    .ok_or_else(|| contract_violation("statistics numeric value is not finite"))
-            })
-            .collect();
-    }
-    if let Some(array) = array.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-        if array.value_length() != novarocks_types::largeint::LARGEINT_BYTE_WIDTH {
-            return Ok(Vec::new());
-        }
-        return array
-            .iter()
-            .flatten()
-            .map(|value| {
-                novarocks_types::largeint::i128_from_be_bytes(value)
-                    .map(StatisticsScalarBound::LargeInt)
-                    .map_err(|error| {
-                        contract_violation(format!("statistics LARGEINT value: {error}"))
-                    })
-            })
-            .collect();
-    }
-    Ok(Vec::new())
-}
-
-fn array_hashes(array: &ArrayRef) -> Result<Vec<u64>, DistributedQueryError> {
-    let mut values = Vec::new();
-    macro_rules! hash_values {
-        ($array:expr) => {
-            for value in $array.iter().flatten() {
-                values.push(statistics_value_hash(&value.to_be_bytes()));
+            let property_offsets = properties.value_offsets();
+            let property_count = usize::try_from(property_offsets[row + 1] - property_offsets[row])
+                .map_err(|_| "statistics Root properties offset is invalid".to_string())?;
+            if property_count != 0 {
+                return Err("ANALYZE statistics Root properties must be empty".into());
             }
-            return Ok(values);
-        };
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Int8Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Int16Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<UInt8Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<UInt16Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<UInt32Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
-        hash_values!(array);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        for value in array.iter().flatten() {
-            values.push(statistics_value_hash(value.as_bytes()));
-        }
-        return Ok(values);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
-        for value in array.iter().flatten() {
-            values.push(statistics_value_hash(value.as_bytes()));
-        }
-        return Ok(values);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<FixedSizeBinaryArray>() {
-        for value in array.iter().flatten() {
-            values.push(statistics_value_hash(value));
-        }
-        return Ok(values);
-    }
-    Err(contract_violation(
-        "statistics Theta collection does not support the requested Arrow type",
-    ))
-}
-
-fn statistics_value_hash(bytes: &[u8]) -> u64 {
-    let digest = Sha256::digest(bytes);
-    u64::from_be_bytes(
-        digest[..8]
-            .try_into()
-            .expect("SHA-256 digest has at least eight bytes"),
-    )
-}
-
-/// Typed finalization input for a visible-row collection. The table scalar is
-/// used only for ROW_COUNT; every column owns an independent scalar partial.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct StatisticsCollectionFinalizer {
-    table: Option<StatisticsScalarPartial>,
-    columns: BTreeMap<std::sync::Arc<str>, StatisticsScalarPartial>,
-    theta: BTreeMap<std::sync::Arc<str>, ThetaSketchPartial>,
-}
-
-impl StatisticsCollectionFinalizer {
-    pub fn with_table(mut self, partial: StatisticsScalarPartial) -> Self {
-        self.table = Some(partial);
-        self
-    }
-
-    pub fn with_column(
-        mut self,
-        column: impl Into<std::sync::Arc<str>>,
-        partial: StatisticsScalarPartial,
-    ) -> Self {
-        self.columns.insert(column.into(), partial);
-        self
-    }
-
-    pub fn with_theta(
-        mut self,
-        column: impl Into<std::sync::Arc<str>>,
-        partial: ThetaSketchPartial,
-    ) -> Self {
-        self.theta.insert(column.into(), partial);
-        self
-    }
-
-    /// Merge independently collected fragment partials before constructing
-    /// connector evidence.  The frontend never sees Arrow rows: it receives
-    /// only this bounded associative state through final execution reports.
-    pub fn try_merge(
-        partials: impl IntoIterator<Item = Self>,
-    ) -> Result<Self, DistributedQueryError> {
-        let partials = partials.into_iter().collect::<Vec<_>>();
-        let table = StatisticsScalarPartial::try_merge(
-            partials.iter().filter_map(|partial| partial.table.clone()),
-        )?;
-        let has_table = partials.iter().any(|partial| partial.table.is_some());
-        let mut column_partials =
-            BTreeMap::<std::sync::Arc<str>, Vec<StatisticsScalarPartial>>::new();
-        let mut theta_partials = BTreeMap::<std::sync::Arc<str>, Vec<ThetaSketchPartial>>::new();
-        for partial in partials {
-            for (column, scalar) in partial.columns {
-                column_partials.entry(column).or_default().push(scalar);
-            }
-            for (column, theta) in partial.theta {
-                theta_partials.entry(column).or_default().push(theta);
-            }
-        }
-        let columns = column_partials
-            .into_iter()
-            .map(|(column, partials)| {
-                StatisticsScalarPartial::try_merge(partials).map(|value| (column, value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let theta = theta_partials
-            .into_iter()
-            .map(|(column, partials)| {
-                ThetaSketchPartial::try_union(partials).map(|value| (column, value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        Ok(Self {
-            table: has_table.then_some(table),
-            columns,
-            theta,
-        })
-    }
-
-    /// Encode a bounded fragment report payload for `ExecStatusReport`.
-    /// The payload contains no evidence revision, operation ID, credentials,
-    /// or client result rows; those remain frontend/control-plane concerns.
-    pub fn try_to_fragment_payload(&self) -> Result<Bytes, DistributedQueryError> {
-        let mut bytes = Vec::new();
-        bytes.push(STATISTICS_FRAGMENT_PAYLOAD_VERSION);
-        match &self.table {
-            Some(table) => {
-                bytes.push(1);
-                encode_scalar_partial(&mut bytes, table);
-            }
-            None => bytes.push(0),
-        }
-        encode_scalar_partials(&mut bytes, &self.columns)?;
-        encode_theta_partials(&mut bytes, &self.theta)?;
-        if bytes.len() > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
-            return Err(resource_exhausted(
-                "statistics fragment report exceeds the SPI payload limit",
-            ));
-        }
-        Ok(Bytes::from(bytes))
-    }
-
-    /// Decode a native final-report payload, applying every structural and
-    /// payload bound before it can enter coordinator state.
-    pub fn try_from_fragment_payload(bytes: &[u8]) -> Result<Self, DistributedQueryError> {
-        if bytes.len() > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
-            return Err(resource_exhausted(
-                "statistics fragment report exceeds the SPI payload limit",
-            ));
-        }
-        let mut cursor = 0usize;
-        let version = take_bytes(bytes, &mut cursor, 1)?[0];
-        if version != STATISTICS_FRAGMENT_PAYLOAD_VERSION {
-            return Err(contract_violation(
-                "statistics fragment report has an unsupported version",
-            ));
-        }
-        let table = match take_bytes(bytes, &mut cursor, 1)?[0] {
-            0 => None,
-            1 => Some(decode_scalar_partial(bytes, &mut cursor)?),
-            _ => {
-                return Err(contract_violation(
-                    "statistics fragment report has an invalid table flag",
+            let identity = StatisticsArtifactIdentity::try_new(field_ids, blob_types.value(row))
+                .map_err(|error| error.to_string())?;
+            if !self.expected.contains(&identity) {
+                return Err(format!(
+                    "statistics Root emitted unexpected artifact identity {identity:?}"
                 ));
             }
-        };
-        let columns = decode_scalar_partials(bytes, &mut cursor)?;
-        let theta = decode_theta_partials(bytes, &mut cursor)?;
-        if cursor != bytes.len() {
-            return Err(contract_violation(
-                "statistics fragment report has trailing bytes",
-            ));
-        }
-        Ok(Self {
-            table,
-            columns,
-            theta,
-        })
-    }
-
-    /// Labels each collected value with the per-metric facts of a visible-row
-    /// scan: the scan measured `data_version` itself, so every value's basis is
-    /// the queried version. Only the numeric nature varies — a Theta sketch
-    /// estimates in both directions no matter how completely it was fed.
-    pub fn metric_states(
-        &self,
-        metrics: &StatisticsMetricRequest,
-        data_version: &StatisticsDataVersion,
-    ) -> Result<BTreeMap<StatisticsMetric, StatisticsMetricState>, DistributedQueryError> {
-        let mut states = BTreeMap::new();
-        for metric in metrics.metrics() {
-            let observed = match metric {
-                StatisticsMetric::RowCount => self.table.as_ref().and_then(|partial| {
-                    partial.metric_values([metric.clone()]).ok()?.remove(metric)
-                }),
-                StatisticsMetric::NullCount { column }
-                | StatisticsMetric::Minimum { column }
-                | StatisticsMetric::Maximum { column }
-                | StatisticsMetric::AverageSize { column } => {
-                    self.columns.get(column).and_then(|partial| {
-                        partial.metric_values([metric.clone()]).ok()?.remove(metric)
-                    })
-                }
-                StatisticsMetric::ThetaNdv { column } => match self.theta.get(column) {
-                    Some(partial) => {
-                        Some(StatisticsMetricValue::F64(partial.finalize()?.estimate()))
-                    }
-                    None => None,
-                },
-            };
-            let state = observed
-                .map(|value| {
-                    StatisticsMetricState::Available(StatisticsMetricObservation::new(
-                        value,
-                        data_version.clone(),
-                        StatisticsMetricSource::VisibleRowScan,
-                        visible_row_numeric_nature(metric),
-                        StatisticsBasisRelation::Identical,
-                    ))
-                })
-                .unwrap_or_else(|| not_collected(metric));
-            states.insert(metric.clone(), state);
-        }
-        Ok(states)
-    }
-
-    /// Encode the exact, mergeable NDV states which an external statistics
-    /// publisher needs in addition to the user-visible scalar evidence.  This
-    /// is a versioned Core artifact, not an Iceberg payload: providers may
-    /// validate and consume it only after they have checked the same pinned
-    /// data version used by the scan.
-    pub fn try_visible_row_artifact(
-        &self,
-        data_version: &StatisticsDataVersion,
-    ) -> Result<Bytes, DistributedQueryError> {
-        let version = data_version.as_bytes();
-        let version_len = u16::try_from(version.len())
-            .map_err(|_| resource_exhausted("statistics data version is too large"))?;
-        let count = u16::try_from(self.theta.len())
-            .map_err(|_| resource_exhausted("statistics artifact has too many Theta columns"))?;
-        let mut bytes = Vec::with_capacity(1 + 2 + version.len() + 2);
-        bytes.push(VISIBLE_ROW_ARTIFACT_VERSION);
-        bytes.extend_from_slice(&version_len.to_be_bytes());
-        bytes.extend_from_slice(version);
-        bytes.extend_from_slice(&count.to_be_bytes());
-        for (column, partial) in &self.theta {
-            let column = column.as_bytes();
-            let column_len = u16::try_from(column.len())
-                .map_err(|_| resource_exhausted("statistics artifact column name is too large"))?;
-            let theta = partial.to_wire_bytes();
-            let theta_len = u32::try_from(theta.len())
-                .map_err(|_| resource_exhausted("statistics Theta artifact is too large"))?;
-            bytes.extend_from_slice(&column_len.to_be_bytes());
-            bytes.extend_from_slice(column);
-            bytes.extend_from_slice(&theta_len.to_be_bytes());
-            bytes.extend_from_slice(&theta);
-        }
-        if bytes.len() > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
-            return Err(resource_exhausted(
-                "statistics visible-row artifact exceeds the SPI payload limit",
-            ));
-        }
-        Ok(Bytes::from(bytes))
-    }
-
-    /// Finalize one visible-row collection into the exact typed result handed
-    /// to a connector publisher.  The method owns the relationship between
-    /// evidence and artifact so a distributed executor cannot accidentally
-    /// publish a sketch under another data-version or metric selection.
-    pub fn finish_visible_row(
-        &self,
-        data_version: StatisticsDataVersion,
-        evidence_revision: StatisticsEvidenceRevision,
-        metrics: &StatisticsMetricRequest,
-    ) -> Result<StatisticsCollectionResult, DistributedQueryError> {
-        let metric_states = self.metric_states(metrics, &data_version)?;
-        if metric_states
-            .values()
-            .any(|state| !matches!(state, StatisticsMetricState::Available(_)))
-        {
-            return Err(contract_violation(
-                "visible-row statistics collection did not produce every requested metric",
-            ));
-        }
-        let artifact = self.try_visible_row_artifact(&data_version)?;
-        // The scan read every visible row, which is what makes this
-        // publishable. It is not a claim that every number is exact: the Theta
-        // sketch above never is.
-        let evidence = StatisticsEvidence::try_new(
-            data_version,
-            evidence_revision,
-            StatisticsRowCoverage::AllVisibleRows,
-            metric_states,
-        )
-        .map_err(|error| {
-            contract_violation(format!("assemble statistics collection evidence: {error}"))
-        })?;
-        StatisticsCollectionResult::try_new(evidence, artifact).map_err(|error| {
-            contract_violation(format!("encode statistics collection result: {error}"))
-        })
-    }
-}
-
-/// A visible-row scan reads every live row, so its counts and bounds are exact
-/// on the version it measured. A Theta sketch is a two-sided estimate no matter
-/// how complete its input was.
-fn visible_row_numeric_nature(metric: &StatisticsMetric) -> StatisticsNumericNature {
-    match metric {
-        StatisticsMetric::ThetaNdv { .. } => StatisticsNumericNature::TwoSidedApproximate,
-        StatisticsMetric::RowCount
-        | StatisticsMetric::NullCount { .. }
-        | StatisticsMetric::Minimum { .. }
-        | StatisticsMetric::Maximum { .. }
-        | StatisticsMetric::AverageSize { .. } => StatisticsNumericNature::Exact,
-    }
-}
-
-/// Decode the provider-neutral visible-row artifact.  It is public within the
-/// Core crate because the Iceberg provider is still hosted here until SPI-5;
-/// it deliberately is not exposed as a connector-specific wire type.
-#[allow(
-    dead_code,
-    reason = "Retained for visible-row artifact contract regression coverage."
-)]
-pub(crate) fn decode_visible_row_artifact(
-    bytes: &[u8],
-) -> Result<
-    (
-        StatisticsDataVersion,
-        BTreeMap<std::sync::Arc<str>, ThetaSketchPartial>,
-    ),
-    DistributedQueryError,
-> {
-    let mut cursor = 0usize;
-    let version = take_bytes(bytes, &mut cursor, 1)?[0];
-    if version != VISIBLE_ROW_ARTIFACT_VERSION {
-        return Err(contract_violation(
-            "statistics visible-row artifact has an unsupported version",
-        ));
-    }
-    let data_version_len = u16::from_be_bytes(
-        take_bytes(bytes, &mut cursor, 2)?
-            .try_into()
-            .expect("fixed artifact field width"),
-    ) as usize;
-    let data_version = StatisticsDataVersion::try_new(Bytes::copy_from_slice(take_bytes(
-        bytes,
-        &mut cursor,
-        data_version_len,
-    )?))
-    .map_err(|error| contract_violation(format!("decode statistics data version: {error}")))?;
-    let count = u16::from_be_bytes(
-        take_bytes(bytes, &mut cursor, 2)?
-            .try_into()
-            .expect("fixed artifact field width"),
-    ) as usize;
-    let mut theta = BTreeMap::new();
-    for _ in 0..count {
-        let column_len = u16::from_be_bytes(
-            take_bytes(bytes, &mut cursor, 2)?
-                .try_into()
-                .expect("fixed artifact field width"),
-        ) as usize;
-        let column = std::str::from_utf8(take_bytes(bytes, &mut cursor, column_len)?)
-            .map_err(|_| contract_violation("statistics artifact column is not UTF-8"))?;
-        if column.is_empty() {
-            return Err(contract_violation(
-                "statistics artifact has an empty column name",
-            ));
-        }
-        let theta_len = u32::from_be_bytes(
-            take_bytes(bytes, &mut cursor, 4)?
-                .try_into()
-                .expect("fixed artifact field width"),
-        ) as usize;
-        let partial =
-            ThetaSketchPartial::try_from_wire_bytes(take_bytes(bytes, &mut cursor, theta_len)?)?;
-        if theta
-            .insert(std::sync::Arc::from(column), partial)
-            .is_some()
-        {
-            return Err(contract_violation(
-                "statistics artifact contains duplicate Theta column",
-            ));
-        }
-    }
-    if cursor != bytes.len() {
-        return Err(contract_violation(
-            "statistics visible-row artifact has trailing bytes",
-        ));
-    }
-    Ok((data_version, theta))
-}
-
-fn take_bytes<'a>(
-    bytes: &'a [u8],
-    cursor: &mut usize,
-    count: usize,
-) -> Result<&'a [u8], DistributedQueryError> {
-    let end = cursor
-        .checked_add(count)
-        .ok_or_else(|| contract_violation("statistics artifact length overflow"))?;
-    let output = bytes
-        .get(*cursor..end)
-        .ok_or_else(|| contract_violation("statistics visible-row artifact is truncated"))?;
-    *cursor = end;
-    Ok(output)
-}
-
-fn encode_scalar_partial(bytes: &mut Vec<u8>, partial: &StatisticsScalarPartial) {
-    bytes.extend_from_slice(&partial.row_count.to_be_bytes());
-    bytes.extend_from_slice(&partial.null_count.to_be_bytes());
-    bytes.extend_from_slice(&partial.total_size.to_be_bytes());
-    for value in [&partial.minimum, &partial.maximum] {
-        match value {
-            Some(StatisticsScalarBound::F64(value)) => {
-                bytes.push(1);
-                bytes.extend_from_slice(&value.to_bits().to_be_bytes());
+            if self.observed.contains_key(&identity) {
+                return Err(format!(
+                    "statistics Root emitted duplicate artifact identity {identity:?}"
+                ));
             }
-            Some(StatisticsScalarBound::LargeInt(value)) => {
-                bytes.push(2);
-                bytes.extend_from_slice(&value.to_be_bytes());
-            }
-            None => bytes.push(0),
+            self.body_bytes =
+                charge_statistics_body_bytes(self.body_bytes, bodies.value(row).len())?;
+            let draft = StatisticsArtifactDraft::try_new(
+                identity.input_fields().to_vec(),
+                identity.blob_type(),
+                bytes::Bytes::copy_from_slice(bodies.value(row)),
+                BTreeMap::new(),
+            )
+            .map_err(|error| error.to_string())?;
+            self.observed.insert(identity, draft);
         }
+        Ok(())
     }
-}
 
-fn decode_scalar_partial(
-    bytes: &[u8],
-    cursor: &mut usize,
-) -> Result<StatisticsScalarPartial, DistributedQueryError> {
-    let read_u64 = |cursor: &mut usize| -> Result<u64, DistributedQueryError> {
-        Ok(u64::from_be_bytes(
-            take_bytes(bytes, cursor, 8)?
-                .try_into()
-                .expect("fixed scalar field width"),
-        ))
-    };
-    let row_count = read_u64(cursor)?;
-    let null_count = read_u64(cursor)?;
-    let total_size = read_u64(cursor)?;
-    let read_bound =
-        |cursor: &mut usize| -> Result<Option<StatisticsScalarBound>, DistributedQueryError> {
-            match take_bytes(bytes, cursor, 1)?[0] {
-                0 => Ok(None),
-                1 => Ok(Some(StatisticsScalarBound::F64(f64::from_bits(
-                    u64::from_be_bytes(
-                        take_bytes(bytes, cursor, 8)?
-                            .try_into()
-                            .expect("fixed scalar field width"),
-                    ),
-                )))),
-                2 => Ok(Some(StatisticsScalarBound::LargeInt(i128::from_be_bytes(
-                    take_bytes(bytes, cursor, 16)?
-                        .try_into()
-                        .expect("fixed LARGEINT scalar field width"),
-                )))),
-                _ => Err(contract_violation(
-                    "statistics scalar partial has an invalid bound flag",
-                )),
-            }
-        };
-    StatisticsScalarPartial::try_new_bounds(
-        row_count,
-        null_count,
-        total_size,
-        read_bound(cursor)?,
-        read_bound(cursor)?,
-    )
-}
-
-fn encode_scalar_partials(
-    bytes: &mut Vec<u8>,
-    partials: &BTreeMap<std::sync::Arc<str>, StatisticsScalarPartial>,
-) -> Result<(), DistributedQueryError> {
-    let count = u16::try_from(partials.len()).map_err(|_| {
-        resource_exhausted("statistics fragment report has too many scalar columns")
-    })?;
-    bytes.extend_from_slice(&count.to_be_bytes());
-    for (column, partial) in partials {
-        encode_fragment_column(bytes, column)?;
-        encode_scalar_partial(bytes, partial);
+    pub fn observe_root_eof(&mut self) -> Result<(), String> {
+        if std::mem::replace(&mut self.root_eof, true) {
+            return Err("statistics Root emitted duplicate EOF".into());
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-fn decode_scalar_partials(
-    bytes: &[u8],
-    cursor: &mut usize,
-) -> Result<BTreeMap<std::sync::Arc<str>, StatisticsScalarPartial>, DistributedQueryError> {
-    let count = u16::from_be_bytes(
-        take_bytes(bytes, cursor, 2)?
-            .try_into()
-            .expect("fixed count width"),
-    ) as usize;
-    let mut partials = BTreeMap::new();
-    for _ in 0..count {
-        let column = decode_fragment_column(bytes, cursor)?;
-        let value = decode_scalar_partial(bytes, cursor)?;
-        if partials.insert(column, value).is_some() {
-            return Err(contract_violation(
-                "statistics fragment report has duplicate scalar columns",
+    pub fn observe_execution_success(&mut self) -> Result<(), String> {
+        if std::mem::replace(&mut self.execution_succeeded, true) {
+            return Err("statistics execution success was observed twice".into());
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Vec<StatisticsArtifactDraft>, String> {
+        if !self.root_eof {
+            return Err("statistics Root EOF was not observed".into());
+        }
+        if !self.execution_succeeded {
+            return Err("statistics execution did not reach all-success".into());
+        }
+        let observed = self.observed.keys().cloned().collect::<BTreeSet<_>>();
+        if observed != self.expected {
+            let missing = self.expected.difference(&observed).collect::<Vec<_>>();
+            return Err(format!(
+                "statistics Root artifact membership is incomplete; missing {missing:?}"
             ));
         }
-    }
-    Ok(partials)
-}
-
-fn encode_theta_partials(
-    bytes: &mut Vec<u8>,
-    partials: &BTreeMap<std::sync::Arc<str>, ThetaSketchPartial>,
-) -> Result<(), DistributedQueryError> {
-    let count = u16::try_from(partials.len())
-        .map_err(|_| resource_exhausted("statistics fragment report has too many Theta columns"))?;
-    bytes.extend_from_slice(&count.to_be_bytes());
-    for (column, partial) in partials {
-        encode_fragment_column(bytes, column)?;
-        let theta = partial.to_wire_bytes();
-        let theta_len = u32::try_from(theta.len())
-            .map_err(|_| resource_exhausted("statistics fragment Theta state is too large"))?;
-        bytes.extend_from_slice(&theta_len.to_be_bytes());
-        bytes.extend_from_slice(&theta);
-    }
-    Ok(())
-}
-
-fn decode_theta_partials(
-    bytes: &[u8],
-    cursor: &mut usize,
-) -> Result<BTreeMap<std::sync::Arc<str>, ThetaSketchPartial>, DistributedQueryError> {
-    let count = u16::from_be_bytes(
-        take_bytes(bytes, cursor, 2)?
-            .try_into()
-            .expect("fixed count width"),
-    ) as usize;
-    let mut partials = BTreeMap::new();
-    for _ in 0..count {
-        let column = decode_fragment_column(bytes, cursor)?;
-        let theta_len = u32::from_be_bytes(
-            take_bytes(bytes, cursor, 4)?
-                .try_into()
-                .expect("fixed length width"),
-        ) as usize;
-        let value = ThetaSketchPartial::try_from_wire_bytes(take_bytes(bytes, cursor, theta_len)?)?;
-        if partials.insert(column, value).is_some() {
-            return Err(contract_violation(
-                "statistics fragment report has duplicate Theta columns",
-            ));
-        }
-    }
-    Ok(partials)
-}
-
-fn encode_fragment_column(
-    bytes: &mut Vec<u8>,
-    column: &std::sync::Arc<str>,
-) -> Result<(), DistributedQueryError> {
-    let column = column.as_bytes();
-    let length = u16::try_from(column.len())
-        .map_err(|_| resource_exhausted("statistics fragment report column name is too large"))?;
-    bytes.extend_from_slice(&length.to_be_bytes());
-    bytes.extend_from_slice(column);
-    Ok(())
-}
-
-fn decode_fragment_column(
-    bytes: &[u8],
-    cursor: &mut usize,
-) -> Result<std::sync::Arc<str>, DistributedQueryError> {
-    let length = u16::from_be_bytes(
-        take_bytes(bytes, cursor, 2)?
-            .try_into()
-            .expect("fixed length width"),
-    ) as usize;
-    let column = std::str::from_utf8(take_bytes(bytes, cursor, length)?)
-        .map_err(|_| contract_violation("statistics fragment report column is not UTF-8"))?;
-    if column.is_empty() {
-        return Err(contract_violation(
-            "statistics fragment report has an empty column name",
-        ));
-    }
-    Ok(std::sync::Arc::from(column))
-}
-
-fn not_collected(metric: &StatisticsMetric) -> StatisticsMetricState {
-    StatisticsMetricState::Missing(StatisticsMissing {
-        kind: StatisticsMissingKind::NotCollected,
-        message: format!("visible-row collection did not produce metric {metric:?}").into(),
-    })
-}
-
-impl ThetaSketchPartial {
-    /// Build a scalar partial from signed integer values. Collection compilers
-    /// use typed Arrow kernels for other input types; this small constructor is
-    /// intentionally testable without exposing a SQL function.
-    pub fn try_from_i64_values(
-        lg_k: u8,
-        values: impl IntoIterator<Item = i64>,
-    ) -> Result<Self, DistributedQueryError> {
-        let mut sketch = build_theta_sketch(lg_k)?;
-        for value in values {
-            sketch.update(value);
-        }
-        Self::try_from_sketch(sketch)
-    }
-
-    /// Build a Theta partial from canonical value hashes emitted by the
-    /// Arrow statistics collector. Hashes remain internal; no SQL aggregate
-    /// surface exposes this representation.
-    pub fn try_from_hashes(
-        lg_k: u8,
-        hashes: impl IntoIterator<Item = u64>,
-    ) -> Result<Self, DistributedQueryError> {
-        let mut sketch = build_theta_sketch(lg_k)?;
-        for hash in hashes {
-            sketch.update(hash as i64);
-        }
-        Self::try_from_sketch(sketch)
-    }
-
-    fn try_from_sketch(mut sketch: ThetaSketch) -> Result<Self, DistributedQueryError> {
-        sketch.trim();
-        let lg_k = sketch.lg_k();
-        Self::try_from_compact(lg_k, sketch.compact(true))
-    }
-
-    fn try_from_compact(
-        lg_k: u8,
-        compact: CompactThetaSketch,
-    ) -> Result<Self, DistributedQueryError> {
-        if !compact.is_ordered() {
-            return Err(contract_violation(
-                "statistics Theta compact body must be ordered",
-            ));
-        }
-        if compact.num_retained() > MAX_STATISTICS_THETA_RETAINED_HASHES {
-            return Err(resource_exhausted(
-                "statistics Theta partial exceeds the retained-hash limit",
-            ));
-        }
-        let compact_body = compact.serialize();
-        let wire_len = THETA_PARTIAL_WIRE_HEADER_BYTES
-            .checked_add(compact_body.len())
-            .ok_or_else(|| resource_exhausted("statistics Theta wire state length overflow"))?;
-        if wire_len > MAX_STATISTICS_THETA_WIRE_BYTES {
-            return Err(resource_exhausted(
-                "statistics Theta wire state exceeds the size limit",
-            ));
-        }
-        Ok(Self { lg_k, compact_body })
-    }
-
-    fn decode_compact(&self) -> Result<CompactThetaSketch, DistributedQueryError> {
-        let compact = CompactThetaSketch::deserialize(&self.compact_body).map_err(|error| {
-            contract_violation(format!("statistics Theta compact body is invalid: {error}"))
-        })?;
-        if !compact.is_ordered() {
-            return Err(contract_violation(
-                "statistics Theta compact body must be ordered",
-            ));
-        }
-        if compact.num_retained() > MAX_STATISTICS_THETA_RETAINED_HASHES {
-            return Err(resource_exhausted(
-                "statistics Theta wire state exceeds the retained-hash limit",
-            ));
-        }
-        Ok(compact)
-    }
-
-    /// Union partials from all distributed fragments. The output remains a
-    /// partial so a tree-shaped exchange can merge it again before finalizing.
-    pub fn try_union(
-        partials: impl IntoIterator<Item = Self>,
-    ) -> Result<Self, DistributedQueryError> {
-        let partials = partials.into_iter().collect::<Vec<_>>();
-        let lg_k = partials.first().map_or(12, |partial| partial.lg_k);
-        if partials.iter().any(|partial| partial.lg_k != lg_k) {
-            return Err(contract_violation(
-                "statistics Theta partials use incompatible lg_k values",
-            ));
-        }
-        let mut union = ThetaUnionBuilder::default()
-            .lg_k(lg_k)
-            .build()
-            .map_err(|error| {
-                contract_violation(format!("statistics Theta union builder failed: {error}"))
-            })?;
-        for partial in partials {
-            let compact = partial.decode_compact()?;
-            union.update(&compact).map_err(|error| {
-                contract_violation(format!("statistics Theta union update failed: {error}"))
-            })?;
-        }
-        Self::try_from_compact(lg_k, union.to_sketch(true))
-    }
-
-    pub fn finalize(&self) -> Result<ThetaSketchFinal, DistributedQueryError> {
-        Ok(ThetaSketchFinal {
-            estimate: self.decode_compact()?.estimate(),
-        })
-    }
-
-    /// Encode a bounded, deterministic internal wire value for transport from
-    /// distributed collection to a connector's opaque publish payload. This is
-    /// intentionally not a SQL-visible aggregate representation.
-    pub fn to_wire_bytes(&self) -> Vec<u8> {
-        let mut bytes =
-            Vec::with_capacity(THETA_PARTIAL_WIRE_HEADER_BYTES + self.compact_body.len());
-        bytes.push(THETA_PARTIAL_WIRE_VERSION);
-        bytes.push(self.lg_k);
-        bytes.extend_from_slice(&self.compact_body);
-        bytes
-    }
-
-    /// Decode `to_wire_bytes` and re-apply every collection bound. A corrupt
-    /// provider payload must be rejected before it can reach publication.
-    pub fn try_from_wire_bytes(bytes: &[u8]) -> Result<Self, DistributedQueryError> {
-        if bytes.len() < THETA_PARTIAL_WIRE_HEADER_BYTES {
-            return Err(contract_violation(
-                "statistics Theta wire state is truncated",
-            ));
-        }
-        if bytes.len() > MAX_STATISTICS_THETA_WIRE_BYTES {
-            return Err(resource_exhausted(
-                "statistics Theta wire state exceeds the size limit",
-            ));
-        }
-        if bytes[0] != THETA_PARTIAL_WIRE_VERSION {
-            return Err(contract_violation(
-                "statistics Theta wire state has an unsupported version",
-            ));
-        }
-        let lg_k = bytes[1];
-        if !(5..=12).contains(&lg_k) {
-            return Err(contract_violation(
-                "statistics Theta wire state has an invalid lg_k",
-            ));
-        }
-        let partial = Self {
-            lg_k,
-            compact_body: bytes[THETA_PARTIAL_WIRE_HEADER_BYTES..].to_vec(),
-        };
-        partial.decode_compact()?;
-        Ok(partial)
-    }
-}
-
-fn build_theta_sketch(lg_k: u8) -> Result<ThetaSketch, DistributedQueryError> {
-    if lg_k > 12 {
-        return Err(contract_violation(
-            "statistics Theta lg_k must be between 5 and 12",
-        ));
-    }
-    ThetaSketchBuilder::default()
-        .lg_k(lg_k)
-        .build()
-        .map_err(|error| {
-            contract_violation(format!("statistics Theta sketch builder failed: {error}"))
-        })
-}
-
-impl ThetaSketchFinal {
-    pub const fn estimate(self) -> f64 {
-        self.estimate
+        Ok(self.observed.into_values().collect())
     }
 }
 
@@ -1847,800 +596,234 @@ fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
 
-fn resource_exhausted(message: impl Into<String>) -> DistributedQueryError {
-    DistributedQueryError::new(DistributedQueryErrorKind::Rejected, message)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
-    use arrow::array::{FixedSizeBinaryBuilder, Int64Array};
+    use arrow::array::{ArrayRef, BinaryArray, Int32Builder, ListBuilder, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use bytes::Bytes;
-    use novarocks_spi::connector::{
-        ConnectorInstanceId, ConnectorTableHandle, StatisticsCollectionPlan,
-    };
-    use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
+    use novarocks_execution::exec::chunk::Chunk;
+    use novarocks_spi::connector::StatisticsArtifactIdentity;
+    use novarocks_types::SlotId;
 
-    use super::*;
+    use super::{StatisticsRootResultDecoder, charge_statistics_body_bytes};
 
-    /// Stand-in basis for collector tests that only assert on values. The
-    /// collector labels every metric with the version it was handed, so any
-    /// stable token works here; the labelling itself is asserted separately.
-    fn test_data_version() -> StatisticsDataVersion {
-        StatisticsDataVersion::try_new(Bytes::from_static(b"collector-data-v1"))
-            .expect("data version")
+    fn identity(field_id: i32, blob_type: &str) -> StatisticsArtifactIdentity {
+        StatisticsArtifactIdentity::try_new(vec![field_id], Arc::<str>::from(blob_type))
+            .expect("identity")
     }
 
-    fn state_value(state: Option<&StatisticsMetricState>) -> Option<&StatisticsMetricValue> {
-        match state {
-            Some(StatisticsMetricState::Available(observation)) => Some(observation.value()),
-            _ => None,
-        }
-    }
-
-    /// Same program shape, minus the provider's version ordinal.
-    fn program_without_version_ordinal() -> StatisticsCollectionProgram {
-        let table = ConnectorTableHandle::try_new(
-            ConnectorInstanceId::parse("statistics-test").expect("instance id"),
-            Bytes::from_static(b"pinned-table"),
-        )
-        .expect("table handle");
-        let plan = StatisticsCollectionPlan::try_new(
-            table,
-            StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-1"))
-                .expect("data version"),
-            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"collection-1"))
-                .expect("evidence revision"),
-            None,
-            StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount]).expect("metrics"),
-            Vec::new(),
-            Bytes::from_static(b"provider-plan"),
-        )
-        .expect("collection plan");
-        StatisticsCollectionProgram::try_new(
-            plan,
-            StatisticsExecutionPolicy::try_new(
-                StatisticsExecutionMode::ProcessJobAttempt,
-                Duration::from_secs(60),
-            )
-            .expect("policy"),
-        )
-        .expect("program")
-    }
-
-    fn relation_for_test() -> StatisticsRelationIdentity {
-        StatisticsRelationIdentity::try_new("statistics-test", "analytics", "orders")
-            .expect("relation identity")
-    }
-
-    /// The pinned data version is an opaque token; only the ordinal beside it
-    /// can pin a scan. Without one there is no version to read at, and reading
-    /// the current one would measure rows the published evidence does not
-    /// describe -- so preparation refuses instead of defaulting.
-    #[test]
-    fn a_collection_without_a_version_ordinal_is_refused() {
-        let error =
-            statistics_version_ordinal(&relation_for_test(), &program_without_version_ordinal())
-                .expect_err("a collection with no version ordinal must not be prepared");
-        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
-        assert!(
-            error.to_string().contains("base version ordinal"),
-            "{error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("statistics-test.analytics.orders"),
-            "{error}"
-        );
-    }
-
-    /// The ordinal the provider signed is the one the scan is pinned to.
-    #[test]
-    fn a_collection_reads_the_version_the_provider_signed() {
-        assert_eq!(
-            statistics_version_ordinal(&relation_for_test(), &program_for_preparation())
-                .expect("version ordinal"),
-            1
-        );
-    }
-
-    fn program_for_preparation() -> StatisticsCollectionProgram {
-        let table = ConnectorTableHandle::try_new(
-            ConnectorInstanceId::parse("statistics-test").expect("instance id"),
-            Bytes::from_static(b"pinned-table"),
-        )
-        .expect("table handle");
-        let data_version = StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-1"))
-            .expect("data version");
-        let evidence_revision =
-            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"collection-1"))
-                .expect("evidence revision");
-        let metrics =
-            StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount]).expect("metrics");
-        let plan = StatisticsCollectionPlan::try_new(
-            table,
-            data_version,
-            evidence_revision,
-            Some(1),
-            metrics,
-            Vec::new(),
-            Bytes::from_static(b"provider-plan"),
-        )
-        .expect("collection plan");
-        StatisticsCollectionProgram::try_new(
-            plan,
-            StatisticsExecutionPolicy::try_new(
-                StatisticsExecutionMode::ProcessJobAttempt,
-                Duration::from_secs(60),
-            )
-            .expect("policy"),
-        )
-        .expect("program")
-    }
-
-    fn prepared_collection_request_for_test() -> PreparedStatisticsCollectionRequest {
-        let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
-            .expect("sealed native plan");
-        let prepared =
-            crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(
-                &plan,
-            )
-            .expect("prepared native facts");
-        let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
-            novarocks_types::ClusterRole::Fe,
-            BackendTopologySnapshot::empty(17),
-            Some(Instant::now() + Duration::from_secs(60)),
-            crate::common::query_cancellation::QueryCancellationSource::new().view(),
-            novarocks_sql::compiler::SessionOptimizerSettings::default(),
-        );
-        PreparedStatisticsCollectionRequest {
-            encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput::new(
-                plan, prepared,
-            ),
-            program: program_for_preparation(),
-            execution,
-        }
-    }
-
-    fn seal_collection_attachment(
-        view: crate::query_execution::native_fragment::NativeFragmentEncodingView<'_>,
-    ) -> crate::query_execution::native_fragment::NativeFragmentAttachment {
-        let fragments = view.distributed_plan().fragments().iter().map(|fragment| {
-            novarocks_proto_models::plan::PlanFragment {
-                fragment_id: fragment.fragment_id,
-                ..Default::default()
-            }
-        });
-        view.seal(fragments)
-            .expect("sealed statistics attachment for Core finish contract")
-    }
-
-    #[test]
-    fn prepared_statistics_request_preserves_typed_program_and_execution_intent() {
-        let prepared = prepared_collection_request_for_test();
-        let native_attachment = seal_collection_attachment(prepared.encoding_view());
-        let request = prepared
-            .finish(native_attachment)
-            .expect("matching attachment completes statistics request");
-
-        assert_eq!(
-            request.intent(),
-            crate::query_execution::contract::DistributedQueryIntent::Statistics
-        );
-        let program = request
-            .statistics_program()
-            .expect("statistics request retains typed program");
-        assert_eq!(
-            program.plan().data_version,
-            StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-1"))
-                .expect("expected data version")
-        );
-        assert_eq!(request.topology().revision(), 17);
-        assert!(request.deadline().is_some());
-    }
-
-    #[test]
-    fn prepared_statistics_request_rejects_cross_provenance_attachment() {
-        let prepared = prepared_collection_request_for_test();
-        let other = prepared_collection_request_for_test();
-        let attachment = seal_collection_attachment(other.encoding_view());
-
-        let error = match prepared.finish(attachment) {
-            Ok(_) => panic!("attachment from a different preparation must fail"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
-        assert_eq!(
-            error.message(),
-            "native fragment bundle does not match the sealed statistics encoding input"
-        );
-    }
-
-    #[test]
-    fn connector_preparation_rejects_empty_topology_without_local_fallback() {
-        let error = match statistics_target_parallelism(&BackendTopologySnapshot::empty(7)) {
-            Ok(_) => panic!("statistics collection cannot run without a live backend"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), DistributedQueryErrorKind::Rejected);
-        assert!(error.message().contains("at least one live backend"));
-    }
-
-    #[test]
-    fn spi5b_theta_hashes_fixed_size_binary_values() {
-        let mut builder = FixedSizeBinaryBuilder::with_capacity(3, 16);
-        builder.append_value([0_u8; 16]).expect("first fixed value");
-        builder
-            .append_value([1_u8; 16])
-            .expect("second fixed value");
-        builder.append_null();
-        let hashes = array_hashes(&(Arc::new(builder.finish()) as ArrayRef))
-            .expect("fixed-size binary values are hashable");
-
-        assert_eq!(hashes.len(), 2);
-        assert_ne!(hashes[0], hashes[1]);
-    }
-
-    #[test]
-    fn statistics_theta_wire_is_v2_lg_k_plus_opaque_standard_body() {
-        let partial =
-            ThetaSketchPartial::try_from_i64_values(12, 0_i64..10_000).expect("build partial");
-        let wire = partial.to_wire_bytes();
-        assert_eq!(&wire[..THETA_PARTIAL_WIRE_HEADER_BYTES], &[2, 12]);
-        let compact = CompactThetaSketch::deserialize(&wire[THETA_PARTIAL_WIRE_HEADER_BYTES..])
-            .expect("standard compact body");
-        assert!(compact.is_ordered());
-        assert!(compact.num_retained() <= MAX_STATISTICS_THETA_RETAINED_HASHES);
-        assert_eq!(
-            wire.len(),
-            THETA_PARTIAL_WIRE_HEADER_BYTES + compact.serialize().len()
-        );
-
-        let restored =
-            ThetaSketchPartial::try_from_wire_bytes(&wire).expect("decode canonical wire state");
-        assert_eq!(restored, partial);
-        assert_eq!(
-            restored.finalize().expect("finalize restored"),
-            partial.finalize().expect("finalize original")
-        );
-    }
-
-    #[test]
-    fn statistics_theta_wire_accepts_shared_tck_ordered_v3_body_byte_exact() {
-        let body = include_bytes!(
-            "../../../../tests/datasketches-tck/fixtures/theta/rust_quickselect_n1000_ordered_v3.sk"
-        );
-        let mut wire = vec![THETA_PARTIAL_WIRE_VERSION, 12];
-        wire.extend_from_slice(body);
-
-        assert_eq!(
-            ThetaSketchPartial::try_from_wire_bytes(&wire)
-                .expect("decode shared TCK carrier")
-                .to_wire_bytes(),
-            wire
-        );
-    }
-
-    #[test]
-    fn statistics_theta_wire_rejects_shared_tck_unordered_body() {
-        let body = include_bytes!(
-            "../../../../tests/datasketches-tck/fixtures/theta/java62_quickselect_n1000_unordered_v3.sk"
-        );
-        let mut wire = vec![THETA_PARTIAL_WIRE_VERSION, 12];
-        wire.extend_from_slice(body);
-
-        let error = ThetaSketchPartial::try_from_wire_bytes(&wire)
-            .expect_err("unordered compact body must fail");
-        assert!(error.message().contains("must be ordered"));
-    }
-
-    #[test]
-    fn statistics_theta_union_is_exact_and_does_not_mutate_inputs() {
-        let left = ThetaSketchPartial::try_from_i64_values(12, [1, 2]).expect("left");
-        let right = ThetaSketchPartial::try_from_i64_values(12, [2, 3]).expect("right");
-        let left_before = left.to_wire_bytes();
-        let right_before = right.to_wire_bytes();
-        let merged = ThetaSketchPartial::try_union([left.clone(), right.clone()]).expect("union");
-
-        assert_eq!(merged.finalize().expect("estimate").estimate(), 3.0);
-        assert_eq!(left.to_wire_bytes(), left_before);
-        assert_eq!(right.to_wire_bytes(), right_before);
-    }
-
-    #[test]
-    fn statistics_theta_tree_union_preserves_estimation_semantics() {
-        let partials = (0_i64..4)
-            .map(|partition| {
-                ThetaSketchPartial::try_from_i64_values(
-                    5,
-                    (partition * 5_000)..((partition + 1) * 5_000),
-                )
-                .expect("partition")
-            })
-            .collect::<Vec<_>>();
-        let flat = ThetaSketchPartial::try_union(partials.clone()).expect("flat union");
-        let left = ThetaSketchPartial::try_union(partials[..2].iter().cloned()).expect("left");
-        let right = ThetaSketchPartial::try_union(partials[2..].iter().cloned()).expect("right");
-        let tree = ThetaSketchPartial::try_union([left, right]).expect("tree union");
-        let flat_estimate = flat.finalize().expect("flat estimate").estimate();
-        let tree_estimate = tree.finalize().expect("tree estimate").estimate();
-
-        assert!((15_000.0..=25_000.0).contains(&flat_estimate));
-        assert!((15_000.0..=25_000.0).contains(&tree_estimate));
-        assert!((flat_estimate - tree_estimate).abs() / flat_estimate <= 0.05);
-    }
-
-    #[test]
-    fn statistics_theta_empty_union_uses_standard_ordered_compact() {
-        let empty = ThetaSketchPartial::try_union(std::iter::empty()).expect("empty union");
-        let wire = empty.to_wire_bytes();
-        let compact = CompactThetaSketch::deserialize(&wire[THETA_PARTIAL_WIRE_HEADER_BYTES..])
-            .expect("empty compact");
-
-        assert!(compact.is_empty());
-        assert!(compact.is_ordered());
-        assert_eq!(empty.finalize().expect("empty estimate").estimate(), 0.0);
-    }
-
-    #[test]
-    fn statistics_theta_union_rejects_lg_k_mismatch_before_decode() {
-        let left = ThetaSketchPartial::try_from_i64_values(5, [1]).expect("left");
-        let right = ThetaSketchPartial::try_from_i64_values(12, [2]).expect("right");
-        let error = ThetaSketchPartial::try_union([left, right]).expect_err("lg_k mismatch");
-        assert!(error.message().contains("incompatible lg_k"));
-    }
-
-    #[test]
-    fn statistics_theta_builder_error_maps_to_distributed_query_error() {
-        let error = ThetaSketchPartial::try_from_i64_values(4, std::iter::empty())
-            .expect_err("invalid builder configuration must fail");
-        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
-        assert!(error.message().contains("sketch builder failed"));
-    }
-
-    #[test]
-    fn statistics_theta_wire_rejects_seed_mismatch_and_truncation() {
-        let mut custom_seed = ThetaSketchBuilder::default()
-            .lg_k(12)
-            .seed(123_456_789)
-            .build()
-            .expect("custom-seed sketch");
-        custom_seed.update(7_i64);
-        let mut seed_mismatch = vec![THETA_PARTIAL_WIRE_VERSION, 12];
-        seed_mismatch.extend_from_slice(&custom_seed.compact(true).serialize());
-        let error = ThetaSketchPartial::try_from_wire_bytes(&seed_mismatch)
-            .expect_err("default-seed decoder must reject custom seed");
-        assert!(error.message().contains("compact body is invalid"));
-
-        let mut truncated = ThetaSketchPartial::try_from_i64_values(12, 0_i64..100)
-            .expect("partial")
-            .to_wire_bytes();
-        truncated.pop();
-        assert!(ThetaSketchPartial::try_from_wire_bytes(&truncated).is_err());
-    }
-
-    #[test]
-    fn statistics_theta_wire_rejects_oversized_body_before_standard_decode() {
-        let oversized = vec![0; MAX_STATISTICS_THETA_WIRE_BYTES + 1];
-        let error = ThetaSketchPartial::try_from_wire_bytes(&oversized)
-            .expect_err("oversized carrier must fail closed");
-        assert_eq!(error.kind(), DistributedQueryErrorKind::Rejected);
-        assert!(error.message().contains("size limit"));
-    }
-
-    #[test]
-    fn scalar_partials_merge_row_null_bounds_and_size() {
-        let merged = StatisticsScalarPartial::try_merge([
-            StatisticsScalarPartial::try_new(3, 1, 30, Some(4.0), Some(9.0))
-                .expect("first partial"),
-            StatisticsScalarPartial::try_new(2, 0, 10, Some(1.0), Some(7.0))
-                .expect("second partial"),
-        ])
-        .expect("merge partials");
-        let values = merged
-            .metric_values([
-                StatisticsMetric::RowCount,
-                StatisticsMetric::NullCount { column: "v".into() },
-                StatisticsMetric::Minimum { column: "v".into() },
-                StatisticsMetric::Maximum { column: "v".into() },
-                StatisticsMetric::AverageSize { column: "v".into() },
-            ])
-            .expect("metric values");
-        assert_eq!(
-            values.get(&StatisticsMetric::RowCount),
-            Some(&StatisticsMetricValue::U64(5))
-        );
-        assert_eq!(
-            values.get(&StatisticsMetric::Minimum { column: "v".into() }),
-            Some(&StatisticsMetricValue::F64(1.0))
-        );
-        assert_eq!(
-            values.get(&StatisticsMetric::Maximum { column: "v".into() }),
-            Some(&StatisticsMetricValue::F64(9.0))
-        );
-    }
-
-    #[test]
-    fn fragment_payload_roundtrip_and_merge_preserve_exact_partials() {
-        let first = StatisticsCollectionFinalizer::default()
-            .with_table(
-                StatisticsScalarPartial::try_new(2, 0, 20, None, None).expect("table partial"),
-            )
-            .with_column(
-                "v",
-                StatisticsScalarPartial::try_new(2, 1, 8, Some(3.0), Some(7.0))
-                    .expect("column partial"),
-            )
-            .with_theta(
-                "v",
-                ThetaSketchPartial::try_from_i64_values(12, [1, 2]).expect("theta partial"),
-            );
-        let second = StatisticsCollectionFinalizer::default()
-            .with_table(
-                StatisticsScalarPartial::try_new(1, 0, 10, None, None).expect("table partial"),
-            )
-            .with_column(
-                "v",
-                StatisticsScalarPartial::try_new(1, 0, 4, Some(1.0), Some(5.0))
-                    .expect("column partial"),
-            )
-            .with_theta(
-                "v",
-                ThetaSketchPartial::try_from_i64_values(12, [2, 3]).expect("theta partial"),
-            );
-        let first = StatisticsCollectionFinalizer::try_from_fragment_payload(
-            &first
-                .try_to_fragment_payload()
-                .expect("encode first fragment"),
-        )
-        .expect("decode first fragment");
-        let second = StatisticsCollectionFinalizer::try_from_fragment_payload(
-            &second
-                .try_to_fragment_payload()
-                .expect("encode second fragment"),
-        )
-        .expect("decode second fragment");
-        let merged = StatisticsCollectionFinalizer::try_merge([first, second])
-            .expect("merge fragment partials");
-        let metrics = StatisticsMetricRequest::try_new(vec![
-            StatisticsMetric::RowCount,
-            StatisticsMetric::NullCount { column: "v".into() },
-            StatisticsMetric::Minimum { column: "v".into() },
-            StatisticsMetric::Maximum { column: "v".into() },
-            StatisticsMetric::AverageSize { column: "v".into() },
-            StatisticsMetric::ThetaNdv { column: "v".into() },
-        ])
-        .expect("metrics");
-        let states = merged
-            .metric_states(&metrics, &test_data_version())
-            .expect("finalize merged metrics");
-        assert_eq!(
-            state_value(states.get(&StatisticsMetric::RowCount)),
-            Some(&StatisticsMetricValue::U64(3))
-        );
-        assert_eq!(
-            state_value(states.get(&StatisticsMetric::Minimum { column: "v".into() })),
-            Some(&StatisticsMetricValue::F64(1.0))
-        );
-        assert!(matches!(
-            state_value(states.get(&StatisticsMetric::ThetaNdv { column: "v".into() })),
-            Some(StatisticsMetricValue::F64(value)) if *value >= 3.0
-        ));
-    }
-
-    #[test]
-    fn fragment_payload_rejects_trailing_bytes() {
-        let payload = StatisticsCollectionFinalizer::default()
-            .try_to_fragment_payload()
-            .expect("encode empty fragment");
-        let mut corrupt = payload.to_vec();
-        corrupt.push(0);
-        assert!(StatisticsCollectionFinalizer::try_from_fragment_payload(&corrupt).is_err());
-    }
-
-    #[test]
-    fn program_finalizes_fragment_payloads_with_provider_revision() {
-        let program = program_for_preparation();
-        let payload = StatisticsCollectionFinalizer::default()
-            .with_table(
-                StatisticsScalarPartial::try_new(4, 0, 32, None, None).expect("table partial"),
-            )
-            .try_to_fragment_payload()
-            .expect("fragment payload");
-        let result = program
-            .finish_fragment_payloads([payload])
-            .expect("final collection result");
-        assert_eq!(*result.evidence.data_version(), program.plan().data_version);
-        assert_eq!(
-            *result.evidence.evidence_revision(),
-            *program.plan().evidence_revision()
-        );
-        assert_eq!(
-            state_value(result.evidence.metrics().get(&StatisticsMetric::RowCount)),
-            Some(&StatisticsMetricValue::U64(4))
-        );
-    }
-
-    #[test]
-    fn program_rejects_completion_without_fragment_payload() {
-        let error = program_for_preparation()
-            .finish_fragment_payloads([Bytes::new()])
-            .expect_err("missing partial must fail closed");
-        assert!(error.message().contains("without a fragment partial"));
-    }
-
-    #[test]
-    fn batch_collector_accumulates_typed_scalar_and_theta_metrics() {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
-        let metrics = StatisticsMetricRequest::try_new(vec![
-            StatisticsMetric::RowCount,
-            StatisticsMetric::NullCount { column: "v".into() },
-            StatisticsMetric::Minimum { column: "v".into() },
-            StatisticsMetric::Maximum { column: "v".into() },
-            StatisticsMetric::AverageSize { column: "v".into() },
-            StatisticsMetric::ThetaNdv { column: "v".into() },
-        ])
-        .expect("metrics");
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![Some(3), None, Some(1)]))],
-        )
-        .expect("batch");
-        let mut collector =
-            StatisticsBatchCollector::try_new(schema, metrics.clone()).expect("collector");
-        collector.push_batch(&batch).expect("collect batch");
-        let states = collector
-            .finish()
-            .expect("finish collector")
-            .metric_states(&metrics, &test_data_version())
-            .expect("finalize collected metrics");
-        assert_eq!(
-            state_value(states.get(&StatisticsMetric::RowCount)),
-            Some(&StatisticsMetricValue::U64(3))
-        );
-        assert_eq!(
-            state_value(states.get(&StatisticsMetric::NullCount { column: "v".into() })),
-            Some(&StatisticsMetricValue::U64(1))
-        );
-        assert_eq!(
-            state_value(states.get(&StatisticsMetric::Minimum { column: "v".into() })),
-            Some(&StatisticsMetricValue::F64(1.0))
-        );
-        assert_eq!(
-            state_value(states.get(&StatisticsMetric::Maximum { column: "v".into() })),
-            Some(&StatisticsMetricValue::F64(3.0))
-        );
-        assert!(matches!(
-            state_value(states.get(&StatisticsMetric::AverageSize { column: "v".into() })),
-            Some(StatisticsMetricValue::F64(value)) if *value > 0.0
-        ));
-        assert!(matches!(
-            state_value(states.get(&StatisticsMetric::ThetaNdv { column: "v".into() })),
-            Some(StatisticsMetricValue::F64(value)) if *value >= 2.0
-        ));
-
-        // Same scan, same basis, different numeric nature: a counted value is
-        // exact while the sketch beside it is not.
-        let nature = |metric: StatisticsMetric| match states.get(&metric) {
-            Some(StatisticsMetricState::Available(observation)) => observation.numeric_nature(),
-            other => panic!("expected an available metric, got {other:?}"),
-        };
-        assert_eq!(
-            nature(StatisticsMetric::RowCount),
-            StatisticsNumericNature::Exact
-        );
-        assert_eq!(
-            nature(StatisticsMetric::ThetaNdv { column: "v".into() }),
-            StatisticsNumericNature::TwoSidedApproximate
-        );
-    }
-
-    #[test]
-    fn spi5b_batch_collector_preserves_largeint_bounds_through_fragment_wire() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "k",
-            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH),
+    fn chunk(rows: &[(&[i32], &str, &[u8], &[(&str, &str)])]) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("input_fields", super::artifact_input_fields_type(), false),
+            Field::new("blob_type", DataType::Utf8, false),
+            Field::new("body", DataType::Binary, true),
+            Field::new("properties", super::artifact_properties_type(), false),
+        ]));
+        let mut fields = ListBuilder::new(Int32Builder::new()).with_field(Arc::new(Field::new(
+            "item",
+            DataType::Int32,
             false,
-        )]));
-        let metrics = StatisticsMetricRequest::try_new(vec![
-            StatisticsMetric::Minimum { column: "k".into() },
-            StatisticsMetric::Maximum { column: "k".into() },
-            StatisticsMetric::ThetaNdv { column: "k".into() },
-        ])
-        .expect("metrics");
-        let mut values = FixedSizeBinaryBuilder::with_capacity(
-            3,
-            novarocks_types::largeint::LARGEINT_BYTE_WIDTH,
-        );
-        values
-            .append_value(i128::MIN.to_be_bytes())
-            .expect("minimum LARGEINT");
-        values
-            .append_value(0_i128.to_be_bytes())
-            .expect("zero LARGEINT");
-        values
-            .append_value(i128::MAX.to_be_bytes())
-            .expect("maximum LARGEINT");
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values.finish())])
-            .expect("batch");
-        let mut collector =
-            StatisticsBatchCollector::try_new(schema, metrics.clone()).expect("collector");
-        collector.push_batch(&batch).expect("collect batch");
-        let finalizer = collector.finish().expect("finish collector");
-        let payload = finalizer
-            .try_to_fragment_payload()
-            .expect("encode LARGEINT fragment");
-        let restored = StatisticsCollectionFinalizer::try_from_fragment_payload(&payload)
-            .expect("decode LARGEINT fragment");
-        let states = restored
-            .metric_states(&metrics, &test_data_version())
-            .expect("finalize restored metrics");
-
-        assert_eq!(
-            state_value(states.get(&StatisticsMetric::Minimum { column: "k".into() })),
-            Some(&StatisticsMetricValue::Bytes(Bytes::copy_from_slice(
-                &i128::MIN.to_be_bytes()
-            )))
-        );
-        assert_eq!(
-            state_value(states.get(&StatisticsMetric::Maximum { column: "k".into() })),
-            Some(&StatisticsMetricValue::Bytes(Bytes::copy_from_slice(
-                &i128::MAX.to_be_bytes()
-            )))
-        );
-    }
-
-    #[test]
-    fn batch_collector_rejects_metric_column_absent_from_pinned_schema() {
-        let schema = Arc::new(Schema::empty());
-        let metrics = StatisticsMetricRequest::try_new(vec![StatisticsMetric::ThetaNdv {
-            column: "missing".into(),
-        }])
-        .expect("metrics");
-        let error = match StatisticsBatchCollector::try_new(schema, metrics) {
-            Ok(_) => panic!("missing projection must fail closed"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .message()
-                .contains("does not contain requested column")
-        );
-    }
-
-    #[test]
-    fn batch_collector_keeps_theta_state_bounded_across_many_batches() {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let metrics = StatisticsMetricRequest::try_new(vec![StatisticsMetric::ThetaNdv {
-            column: "v".into(),
-        }])
-        .expect("metrics");
-        let mut collector =
-            StatisticsBatchCollector::try_new(schema.clone(), metrics.clone()).expect("collector");
-        for start in (0_i64..10_000).step_by(100) {
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(
-                    (start..start + 100).map(Some).collect::<Vec<_>>(),
-                ))],
-            )
-            .expect("batch");
-            collector.push_batch(&batch).expect("collect batch");
+        )));
+        for (field_ids, _, _, _) in rows {
+            for field_id in *field_ids {
+                fields.values().append_value(*field_id);
+            }
+            fields.append(true);
         }
-        let states = collector
-            .finish()
-            .expect("finish collector")
-            .metric_states(&metrics, &test_data_version())
-            .expect("finalize collected metrics");
-        assert!(matches!(
-            state_value(states.get(&StatisticsMetric::ThetaNdv { column: "v".into() })),
-            Some(StatisticsMetricValue::F64(value)) if *value > 9_000.0
-        ));
-    }
-
-    #[test]
-    fn finalizer_preserves_missing_metrics_instead_of_fabricating_values() {
-        let metrics = StatisticsMetricRequest::try_new(vec![
-            StatisticsMetric::RowCount,
-            StatisticsMetric::ThetaNdv {
-                column: "missing".into(),
-            },
-        ])
-        .expect("metrics");
-        let states = StatisticsCollectionFinalizer::default()
-            .with_table(StatisticsScalarPartial::try_new(3, 0, 12, None, None).expect("scalar"))
-            .metric_states(&metrics, &test_data_version())
-            .expect("finalize available metrics");
-        assert!(matches!(
-            state_value(states.get(&StatisticsMetric::RowCount)),
-            Some(StatisticsMetricValue::U64(3))
-        ));
-        assert!(matches!(
-            states.get(&StatisticsMetric::ThetaNdv {
-                column: "missing".into()
+        let fields = Arc::new(fields.finish()) as ArrayRef;
+        let types = Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|(_, blob_type, _, _)| *blob_type),
+        )) as ArrayRef;
+        let bodies = Arc::new(BinaryArray::from_iter_values(
+            rows.iter().map(|(_, _, body, _)| *body),
+        )) as ArrayRef;
+        let mut properties = arrow::array::MapBuilder::new(
+            Some(arrow::array::MapFieldNames {
+                entry: "entries".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
             }),
-            Some(StatisticsMetricState::Missing(StatisticsMissing {
-                kind: StatisticsMissingKind::NotCollected,
-                ..
-            }))
-        ));
-    }
-
-    #[test]
-    fn visible_row_artifact_round_trips_the_pinned_version_and_theta_state() {
-        let data_version =
-            StatisticsDataVersion::try_new(Bytes::from_static(b"table/v1")).expect("version");
-        let partial =
-            ThetaSketchPartial::try_from_i64_values(12, 0_i64..1_000).expect("theta partial");
-        let artifact = StatisticsCollectionFinalizer::default()
-            .with_theta("customer_id", partial.clone())
-            .try_visible_row_artifact(&data_version)
-            .expect("encode artifact");
-        let (decoded_version, theta) = decode_visible_row_artifact(&artifact).expect("decode");
-        assert_eq!(decoded_version, data_version);
-        assert_eq!(theta.get("customer_id"), Some(&partial));
-    }
-
-    #[test]
-    fn visible_row_artifact_rejects_trailing_bytes() {
-        let data_version =
-            StatisticsDataVersion::try_new(Bytes::from_static(b"table/v1")).expect("version");
-        let mut artifact = StatisticsCollectionFinalizer::default()
-            .try_visible_row_artifact(&data_version)
-            .expect("encode artifact")
-            .to_vec();
-        artifact.push(1);
-        assert!(decode_visible_row_artifact(&artifact).is_err());
-    }
-
-    #[test]
-    fn finalizer_binds_visible_row_evidence_to_the_artifact_version() {
-        let data_version =
-            StatisticsDataVersion::try_new(Bytes::from_static(b"table/v1")).expect("version");
-        let revision =
-            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"run/v1")).expect("revision");
-        let metrics = StatisticsMetricRequest::try_new(vec![StatisticsMetric::ThetaNdv {
-            column: "customer_id".into(),
-        }])
-        .expect("metrics");
-        let result = StatisticsCollectionFinalizer::default()
-            .with_theta(
-                "customer_id",
-                ThetaSketchPartial::try_from_i64_values(12, 0_i64..100).expect("theta"),
+            arrow::array::StringBuilder::new(),
+            arrow::array::StringBuilder::new(),
+        )
+        .with_keys_field(Arc::new(Field::new("key", DataType::Utf8, false)))
+        .with_values_field(Arc::new(Field::new("value", DataType::Utf8, false)));
+        for (_, _, _, row_properties) in rows {
+            for (key, value) in *row_properties {
+                properties.keys().append_value(*key);
+                properties.values().append_value(*value);
+            }
+            properties.append(true).expect("empty properties row");
+        }
+        let properties = Arc::new(properties.finish()) as ArrayRef;
+        let slot_ids = [
+            SlotId::new(1),
+            SlotId::new(2),
+            SlotId::new(3),
+            SlotId::new(4),
+        ];
+        let chunk_schema =
+            novarocks_execution::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                schema.as_ref(),
+                &slot_ids,
             )
-            .finish_visible_row(data_version.clone(), revision.clone(), &metrics)
-            .expect("finalize");
-        assert_eq!(*result.evidence.data_version(), data_version);
-        assert_eq!(*result.evidence.evidence_revision(), revision);
-        assert_eq!(
-            result.evidence.row_coverage(),
-            StatisticsRowCoverage::AllVisibleRows
+            .expect("chunk schema");
+        Chunk::try_new_with_chunk_schema(
+            RecordBatch::try_new(schema, vec![fields, types, bodies, properties]).expect("batch"),
+            chunk_schema,
+        )
+        .expect("chunk")
+    }
+
+    #[test]
+    fn statistics_root_decoder_requires_eof_success_and_exact_membership() {
+        let mut decoder = StatisticsRootResultDecoder::new([
+            identity(1, "apache-datasketches-theta-v1"),
+            identity(2, "apache-datasketches-theta-v1"),
+        ]);
+        decoder
+            .apply_chunk(&chunk(&[(
+                &[1],
+                "apache-datasketches-theta-v1",
+                b"one",
+                &[],
+            )]))
+            .expect("first batch");
+        decoder
+            .apply_chunk(&chunk(&[(
+                &[2],
+                "apache-datasketches-theta-v1",
+                b"two",
+                &[],
+            )]))
+            .expect("second batch");
+        assert!(decoder.finish().unwrap_err().contains("EOF"));
+
+        let mut decoder = StatisticsRootResultDecoder::new([
+            identity(1, "apache-datasketches-theta-v1"),
+            identity(2, "apache-datasketches-theta-v1"),
+        ]);
+        decoder
+            .apply_chunk(&chunk(&[
+                (&[1], "apache-datasketches-theta-v1", b"one", &[]),
+                (&[2], "apache-datasketches-theta-v1", b"two", &[]),
+            ]))
+            .expect("batch");
+        decoder.observe_root_eof().expect("EOF");
+        assert!(decoder.finish().unwrap_err().contains("all-success"));
+
+        let mut decoder = StatisticsRootResultDecoder::new([
+            identity(1, "apache-datasketches-theta-v1"),
+            identity(2, "apache-datasketches-theta-v1"),
+        ]);
+        decoder
+            .apply_chunk(&chunk(&[
+                (&[1], "apache-datasketches-theta-v1", b"one", &[]),
+                (&[2], "apache-datasketches-theta-v1", b"two", &[]),
+            ]))
+            .expect("batch");
+        decoder.observe_root_eof().expect("EOF");
+        decoder.observe_execution_success().expect("all-success");
+        assert_eq!(decoder.finish().expect("complete").len(), 2);
+    }
+
+    #[test]
+    fn statistics_root_decoder_rejects_unknown_duplicate_missing_and_trailing() {
+        let expected = identity(1, "apache-datasketches-theta-v1");
+
+        let mut unknown = StatisticsRootResultDecoder::new([expected.clone()]);
+        assert!(
+            unknown
+                .apply_chunk(&chunk(&[(
+                    &[2],
+                    "apache-datasketches-theta-v1",
+                    b"body",
+                    &[]
+                )]))
+                .unwrap_err()
+                .contains("unexpected")
         );
-        // The scan saw every visible row, but its Theta sketch is still an
-        // estimate. Coverage and numeric nature must be able to say both.
-        let ndv = match result.evidence.metrics().get(&StatisticsMetric::ThetaNdv {
-            column: "customer_id".into(),
-        }) {
-            Some(StatisticsMetricState::Available(observation)) => observation.clone(),
-            other => panic!("expected an available NDV, got {other:?}"),
-        };
-        assert_eq!(*ndv.source(), StatisticsMetricSource::VisibleRowScan);
-        assert_eq!(
-            ndv.numeric_nature(),
-            StatisticsNumericNature::TwoSidedApproximate
+
+        let mut duplicate = StatisticsRootResultDecoder::new([expected.clone()]);
+        duplicate
+            .apply_chunk(&chunk(&[(
+                &[1],
+                "apache-datasketches-theta-v1",
+                b"body",
+                &[],
+            )]))
+            .expect("first");
+        assert!(
+            duplicate
+                .apply_chunk(&chunk(&[(
+                    &[1],
+                    "apache-datasketches-theta-v1",
+                    b"body",
+                    &[]
+                )]))
+                .unwrap_err()
+                .contains("duplicate")
         );
-        assert_eq!(ndv.basis_relation(), StatisticsBasisRelation::Identical);
-        assert_eq!(*ndv.basis_version(), data_version);
+
+        let mut missing = StatisticsRootResultDecoder::new([expected.clone()]);
+        missing.observe_root_eof().expect("EOF");
+        missing.observe_execution_success().expect("all-success");
+        assert!(missing.finish().unwrap_err().contains("incomplete"));
+
+        let mut trailing = StatisticsRootResultDecoder::new([expected]);
+        trailing.observe_root_eof().expect("EOF");
+        assert!(
+            trailing
+                .apply_chunk(&chunk(&[]))
+                .unwrap_err()
+                .contains("trailing")
+        );
+    }
+
+    #[test]
+    fn statistics_root_decoder_preserves_composite_identity_and_rejects_properties() {
+        let composite = StatisticsArtifactIdentity::try_new(
+            vec![7, 9],
+            Arc::<str>::from("future-composite-v1"),
+        )
+        .expect("composite identity");
+        let mut decoder = StatisticsRootResultDecoder::new([composite]);
+        decoder
+            .apply_chunk(&chunk(&[(&[7, 9], "future-composite-v1", b"body", &[])]))
+            .expect("composite artifact");
+        decoder.observe_root_eof().expect("EOF");
+        decoder.observe_execution_success().expect("all-success");
+        let drafts = decoder.finish().expect("complete");
+        assert_eq!(drafts[0].identity().input_fields(), &[7, 9]);
+
+        let mut decoder =
+            StatisticsRootResultDecoder::new([identity(1, "apache-datasketches-theta-v1")]);
+        assert!(
+            decoder
+                .apply_chunk(&chunk(&[(
+                    &[1],
+                    "apache-datasketches-theta-v1",
+                    b"body",
+                    &[("ndv", "1")],
+                )]))
+                .unwrap_err()
+                .contains("properties must be empty")
+        );
+    }
+
+    #[test]
+    fn statistics_root_body_budget_admits_every_maximal_theta_requirement() {
+        const MAX_COMPACT_THETA_BYTES: usize = 65_560;
+        let mut charged = 0;
+        for _ in 0..novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_METRICS {
+            charged = charge_statistics_body_bytes(charged, MAX_COMPACT_THETA_BYTES)
+                .expect("all maximal Theta bodies fit the result budget");
+        }
         assert_eq!(
-            decode_visible_row_artifact(result.provider_payload())
-                .expect("decode artifact")
-                .0,
-            *result.evidence.data_version()
+            charged,
+            novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_METRICS * MAX_COMPACT_THETA_BYTES
         );
     }
 }

@@ -389,6 +389,11 @@ fn prepare_pipeline_execution_inner(
         lookup_client,
         runtime_state
             .execution_runtime()
+            .ok_or_else(|| "native pipeline execution requires an execution runtime".to_string())?
+            .function_set()
+            .clone(),
+        runtime_state
+            .execution_runtime()
             .map(|runtime| runtime.config().operator_buffer_chunks)
             .unwrap_or(1),
         runtime_state
@@ -540,7 +545,7 @@ fn execute_plan_with_pipeline(
 mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, OnceLock, mpsc};
     use std::time::{Duration, Instant};
 
     use arrow::array::{Array, Int32Array, Int64Array};
@@ -551,8 +556,8 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
     use crate::exec::node::analytic::{
-        AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
-        WindowFunctionSpec, WindowType,
+        AnalyticNode, AnalyticOutputColumn, WindowAggregateBinding, WindowBoundary, WindowFrame,
+        WindowFunctionKind, WindowFunctionSpec, WindowType,
     };
     use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinType};
     use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
@@ -577,31 +582,52 @@ mod tests {
     };
 
     fn test_execution_runtime() -> Arc<ExecutionRuntime> {
-        Arc::new(
-            ExecutionRuntime::new(ExecutionRuntimeConfig {
-                driver_threads: 1,
-                scan_threads: 1,
-                scan_queue_capacity: 8,
-                spill_io_threads: 1,
-                spill_io_queue_capacity: 8,
-                spill_storage: ExecutionSpillStorageConfig::default(),
-                exchange_wait_ms: 120_000,
-                exchange_io_threads: 1,
-                exchange_io_max_inflight_bytes: 1024,
-                exchange_max_transmit_batched_bytes: 1024,
-                operator_buffer_chunks: 1,
-                local_exchange_buffer_mem_limit_per_driver: 1024,
-                local_exchange_max_buffered_rows: 1024,
-                connector_io_tasks_per_scan_operator: 1,
-                scan_submit_fail_max: 1,
-                scan_submit_fail_timeout_ms: 1,
-                runtime_filter_scan_wait_time_ms_override: None,
-                runtime_filter_wait_timeout_ms_override: None,
-                sink_io_worker_threads: 1,
-                sink_io_max_blocking_threads: 1,
-            })
-            .expect("test execution runtime"),
-        )
+        static RUNTIME: OnceLock<Arc<ExecutionRuntime>> = OnceLock::new();
+        Arc::clone(RUNTIME.get_or_init(|| {
+            Arc::new(
+                ExecutionRuntime::new(
+                    ExecutionRuntimeConfig {
+                        driver_threads: 1,
+                        scan_threads: 1,
+                        scan_queue_capacity: 8,
+                        spill_io_threads: 1,
+                        spill_io_queue_capacity: 8,
+                        spill_storage: ExecutionSpillStorageConfig::default(),
+                        exchange_wait_ms: 120_000,
+                        exchange_io_threads: 1,
+                        exchange_io_max_inflight_bytes: 1024,
+                        exchange_max_transmit_batched_bytes: 1024,
+                        operator_buffer_chunks: 1,
+                        local_exchange_buffer_mem_limit_per_driver: 1024,
+                        local_exchange_max_buffered_rows: 1024,
+                        connector_io_tasks_per_scan_operator: 1,
+                        scan_submit_fail_max: 1,
+                        scan_submit_fail_timeout_ms: 1,
+                        runtime_filter_scan_wait_time_ms_override: None,
+                        runtime_filter_wait_timeout_ms_override: None,
+                        sink_io_worker_threads: 1,
+                        sink_io_max_blocking_threads: 1,
+                    },
+                    crate::runtime::execution_runtime::test_execution_function_set(),
+                )
+                .expect("test execution runtime"),
+            )
+        }))
+    }
+
+    fn test_runtime_state() -> Arc<RuntimeState> {
+        Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(test_execution_runtime()),
+            None,
+        ))
     }
 
     struct ParkedSourceOperator {
@@ -763,7 +789,7 @@ mod tests {
             None,
             None,
             1,
-            Arc::new(RuntimeState::default()),
+            test_runtime_state(),
             None,
             None,
             None,
@@ -791,7 +817,7 @@ mod tests {
 
     #[test]
     fn running_pipeline_cancel_wakes_local_driver_and_drains() {
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         let observable = Arc::new(Observable::new());
         let ready = Arc::new(AtomicBool::new(false));
         let cancel_calls = Arc::new(AtomicUsize::new(0));
@@ -989,6 +1015,12 @@ mod tests {
                         }),
                         ..Default::default()
                     }],
+                    resolved_aggregates: vec![
+                        crate::exec::expr::agg::test_builtin_execution_function_set()
+                            .catalog()
+                            .resolve_aggregate_trusted("sum", &[DataType::Int32])
+                            .expect("resolved builtin aggregate"),
+                    ],
                     need_finalize: true,
                     input_is_intermediate: false,
                     output_chunk_schema: chunk_schema_of(
@@ -1007,7 +1039,7 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -1129,7 +1161,7 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -1247,7 +1279,7 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -1371,7 +1403,7 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -1524,7 +1556,7 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -1701,7 +1733,7 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -1862,7 +1894,7 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -1983,16 +2015,26 @@ mod tests {
                             kind: WindowFunctionKind::RowNumber,
                             args: vec![],
                             return_type: DataType::Int64,
+                            aggregate_binding: None,
                         },
                         WindowFunctionSpec {
                             kind: WindowFunctionKind::Rank,
                             args: vec![],
                             return_type: DataType::Int64,
+                            aggregate_binding: None,
                         },
                         WindowFunctionSpec {
                             kind: WindowFunctionKind::Sum,
                             args: vec![v_expr],
                             return_type: DataType::Int64,
+                            aggregate_binding: Some(WindowAggregateBinding {
+                                function_name: "sum".to_string(),
+                                resolved:
+                                    crate::exec::expr::agg::test_builtin_execution_function_set()
+                                        .catalog()
+                                        .resolve_aggregate_trusted("sum", &[DataType::Int32])
+                                        .expect("resolved sum window aggregate"),
+                            }),
                         },
                     ],
                     window: Some(WindowFrame {
@@ -2014,7 +2056,7 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         execute_native_plan_with_pipeline(
             plan,
             false,
@@ -2126,6 +2168,16 @@ mod tests {
                             ..Default::default()
                         },
                     ],
+                    resolved_aggregates: vec![
+                        crate::exec::expr::agg::test_builtin_execution_function_set()
+                            .catalog()
+                            .resolve_aggregate_trusted("count", &[DataType::Int32])
+                            .expect("resolved builtin aggregate"),
+                        crate::exec::expr::agg::test_builtin_execution_function_set()
+                            .catalog()
+                            .resolve_aggregate_trusted("sum", &[DataType::Int32])
+                            .expect("resolved builtin aggregate"),
+                    ],
                     need_finalize: true,
                     input_is_intermediate: false,
                     output_chunk_schema: chunk_schema_of(
@@ -2144,7 +2196,7 @@ mod tests {
         };
 
         let handle = ResultSinkHandle::new();
-        let runtime_state = Arc::new(RuntimeState::default());
+        let runtime_state = test_runtime_state();
         execute_native_plan_with_pipeline(
             plan,
             false,

@@ -22,20 +22,22 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
+use super::aggregate::decode_resolved_aggregate_signature;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use crate::fragment::decode::plan::layout::Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
 use novarocks_execution::exec::node::analytic::{
-    AnalyticNode, AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind,
-    WindowFunctionSpec, WindowType,
+    AnalyticNode, AnalyticOutputColumn, WindowAggregateBinding, WindowBoundary, WindowFrame,
+    WindowFunctionKind, WindowFunctionSpec, WindowType,
 };
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{expr, plan};
 use novarocks_types::SlotId;
+use novarocks_types::aggregate::mangle_distinct_aggregate_name;
 
 #[expect(
     clippy::too_many_arguments,
@@ -429,9 +431,14 @@ fn lower_window_function(
     ctx: &NativePlanDecodeContext,
 ) -> Result<WindowFunctionSpec, NativeFragmentDecodeError> {
     let name = expr.name.to_ascii_lowercase();
+    let function_order = expr
+        .function_order_by
+        .iter()
+        .map(|item| (item.asc, item.nulls_first))
+        .collect::<Vec<_>>();
     let kind = NativeFragmentDecodeError::map_invalid(
         path.clone().field("name"),
-        window_function_kind(&name, expr.distinct, expr.ignore_nulls),
+        window_function_kind(&name, expr.distinct, expr.ignore_nulls, &function_order),
     )?;
     let return_type = expr.result_type.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
@@ -443,7 +450,7 @@ fn lower_window_function(
         path.clone().field("result_type"),
         crate::fragment::decode::type_decode::decode_type(return_type),
     )?;
-    let mut args = expr
+    let logical_args = expr
         .args
         .iter()
         .enumerate()
@@ -456,13 +463,105 @@ fn lower_window_function(
             )
         })
         .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
+    let aggregate_binding = if is_aggregate_window_kind(&kind) {
+        let executable_name = mangle_distinct_aggregate_name(&name, expr.distinct);
+        let planned = decode_resolved_aggregate_signature(
+            expr.aggregate_binding.as_ref(),
+            &executable_name,
+            path.clone().field("aggregate_binding"),
+        )?;
+        let logical_argument_types = logical_args
+            .iter()
+            .map(|arg| {
+                arena.data_type(*arg).cloned().ok_or_else(|| {
+                    NativeFragmentDecodeError::missing(
+                        path.clone().field("args"),
+                        format!("window aggregate {name} argument type missing"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if logical_argument_types != planned.argument_types {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                path.clone()
+                    .field("aggregate_binding")
+                    .field("argument_types"),
+                format!(
+                    "window aggregate {name} argument type drift: expressions={logical_argument_types:?} planned={:?}",
+                    planned.argument_types
+                ),
+            ));
+        }
+        let function_catalog = ctx.function_catalog().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("aggregate_binding"),
+                format!("window aggregate {name} requires the process engine function catalog"),
+            )
+        })?;
+        let selected = function_catalog
+            .resolve_aggregate_trusted(&executable_name, &planned.argument_types)
+            .map_err(|error| {
+                NativeFragmentDecodeError::invalid_value(
+                    path.clone().field("aggregate_binding"),
+                    format!("window aggregate {name} resolution: {error}"),
+                )
+            })?;
+        if selected != planned {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                path.clone().field("aggregate_binding"),
+                format!(
+                    "window aggregate {name} resolved signature drift: planned={planned:?} catalog={selected:?}"
+                ),
+            ));
+        }
+        if return_type != selected.output_type {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                path.clone().field("result_type"),
+                format!(
+                    "window aggregate {name} result type drift: wire={return_type:?} expected={:?}",
+                    selected.output_type
+                ),
+            ));
+        }
+        Some(WindowAggregateBinding {
+            function_name: executable_name,
+            resolved: selected,
+        })
+    } else {
+        if expr.aggregate_binding.is_some() {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                path.clone().field("aggregate_binding"),
+                format!("window-only function {name} must not carry an aggregate binding"),
+            ));
+        }
+        None
+    };
+
+    if !expr.function_order_by.is_empty() && !matches!(kind, WindowFunctionKind::ArrayAgg { .. }) {
+        return Err(NativeFragmentDecodeError::unsupported(
+            path.clone().field("function_order_by"),
+            format!("window function {name} does not support function ORDER BY"),
+        ));
+    }
+    let mut args = logical_args;
+    for (idx, item) in expr.function_order_by.iter().enumerate() {
+        let item_path = path.clone().field("function_order_by").index(idx);
+        let order_expr = item.expr.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                item_path.clone().field("expr"),
+                format!("window aggregate {name} function_order_by[{idx}] expr missing"),
+            )
+        })?;
+        args.push(ctx.decode_expression(
+            order_expr,
+            item_path.field("expr"),
+            arena,
+            input_layout,
+        )?);
+    }
     if matches!(
         kind,
-        WindowFunctionKind::ArrayAgg { .. }
-            | WindowFunctionKind::MaxBy
-            | WindowFunctionKind::MaxByV2
-            | WindowFunctionKind::MinBy
-            | WindowFunctionKind::MinByV2
+        WindowFunctionKind::ArrayAgg { .. } | WindowFunctionKind::MaxBy | WindowFunctionKind::MinBy
     ) {
         args = NativeFragmentDecodeError::map_invalid(
             path.clone().field("args"),
@@ -477,6 +576,7 @@ fn lower_window_function(
         kind,
         args,
         return_type,
+        aggregate_binding,
     })
 }
 
@@ -484,6 +584,7 @@ fn window_function_kind(
     name: &str,
     distinct: bool,
     ignore_nulls: bool,
+    function_order: &[(bool, bool)],
 ) -> Result<WindowFunctionKind, String> {
     let base = name.split('|').next().unwrap_or(name);
     match base {
@@ -507,9 +608,7 @@ fn window_function_kind(
         "bitmap_union" => Ok(WindowFunctionKind::BitmapUnion),
         "bitmap_union_count" => Ok(WindowFunctionKind::BitmapUnionCount),
         "max_by" => Ok(WindowFunctionKind::MaxBy),
-        "max_by_v2" => Ok(WindowFunctionKind::MaxByV2),
         "min_by" => Ok(WindowFunctionKind::MinBy),
-        "min_by_v2" => Ok(WindowFunctionKind::MinByV2),
         "var_samp" | "variance_samp" => Ok(WindowFunctionKind::VarianceSamp),
         "stddev_samp" => Ok(WindowFunctionKind::StddevSamp),
         "bool_or" | "boolor_agg" => Ok(WindowFunctionKind::BoolOr),
@@ -519,13 +618,34 @@ fn window_function_kind(
         "array_agg" | "array_agg_distinct" | "array_unique_agg" => {
             Ok(WindowFunctionKind::ArrayAgg {
                 is_distinct: distinct || matches!(base, "array_agg_distinct" | "array_unique_agg"),
-                is_asc_order: Vec::new(),
-                nulls_first: Vec::new(),
+                is_asc_order: function_order.iter().map(|(asc, _)| *asc).collect(),
+                nulls_first: function_order
+                    .iter()
+                    .map(|(_, nulls_first)| *nulls_first)
+                    .collect(),
             })
         }
         "approx_top_k" => Ok(WindowFunctionKind::ApproxTopK),
         other => Err(format!("unsupported window function: {other}")),
     }
+}
+
+fn is_aggregate_window_kind(kind: &WindowFunctionKind) -> bool {
+    !matches!(
+        kind,
+        WindowFunctionKind::RowNumber
+            | WindowFunctionKind::Rank
+            | WindowFunctionKind::DenseRank
+            | WindowFunctionKind::CumeDist
+            | WindowFunctionKind::PercentRank
+            | WindowFunctionKind::Ntile
+            | WindowFunctionKind::FirstValue { .. }
+            | WindowFunctionKind::FirstValueRewrite { .. }
+            | WindowFunctionKind::LastValue { .. }
+            | WindowFunctionKind::Lead { .. }
+            | WindowFunctionKind::Lag { .. }
+            | WindowFunctionKind::SessionNumber
+    )
 }
 
 fn lower_window_frame(
@@ -645,12 +765,15 @@ fn validate_window_frame(
 )]
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::datatypes::DataType;
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::exec::node::analytic::WindowFunctionKind;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
@@ -678,6 +801,41 @@ mod tests {
                 }),
             })),
         }
+    }
+
+    fn string_literal(value: &str) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Utf8)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(common::LiteralValue {
+                    value: Some(common::literal_value::Value::StringValue(value.to_string())),
+                }),
+            })),
+        }
+    }
+
+    fn function_catalog() -> Arc<novarocks_functions::EngineFunctionCatalog> {
+        Arc::new(
+            novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin function catalog"),
+        )
+    }
+
+    fn aggregate_binding(
+        name: &str,
+        argument_types: &[DataType],
+    ) -> Option<plan::ResolvedAggregateSignature> {
+        let selected = function_catalog()
+            .resolve_aggregate_trusted(name, argument_types)
+            .expect("resolved aggregate binding");
+        Some(plan::ResolvedAggregateSignature {
+            overload_identity: selected.overload.as_str().to_string(),
+            argument_types: selected.argument_types.iter().map(type_desc).collect(),
+            intermediate_type: Some(type_desc(&selected.intermediate_type)),
+            output_type: Some(type_desc(&selected.output_type)),
+            state_format_identity: selected.state_format.as_str().to_string(),
+        })
     }
 
     fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
@@ -736,9 +894,75 @@ mod tests {
         )
     }
 
+    fn value_key_values_node(node_id: i32) -> plan::DistributedNode {
+        let columns = vec![
+            output_column(1, "value", DataType::Utf8),
+            output_column(2, "key", DataType::Int64),
+        ];
+        physical_node(
+            node_id,
+            plan::plan_node::Kind::Values(plan::ValuesNode {
+                rows: vec![plan::ExprList {
+                    values: vec![string_literal("v"), int_literal(1)],
+                }],
+                columns: columns.clone(),
+            }),
+            columns,
+            Vec::new(),
+        )
+    }
+
     fn lower(node: &plan::DistributedNode) -> super::super::DecodedNode {
         let mut arena = ExprArena::default();
         decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
+    }
+
+    fn lower_aggregate_window(
+        node: &plan::DistributedNode,
+    ) -> Result<(super::super::DecodedNode, ExprArena), String> {
+        let mut arena = ExprArena::default();
+        decode_node(
+            node,
+            &mut arena,
+            &NativePlanDecodeContext::default().with_function_catalog(function_catalog()),
+        )
+        .map(|decoded| (decoded, arena))
+        .map_err(|error| error.to_string())
+    }
+
+    fn aggregate_window_node(
+        name: &str,
+        args: Vec<expr::Expr>,
+        result_type: DataType,
+        binding: Option<plan::ResolvedAggregateSignature>,
+    ) -> plan::DistributedNode {
+        let output_columns = vec![
+            output_column(1, "value", DataType::Utf8),
+            output_column(2, "key", DataType::Int64),
+            output_column(3, "window_value", result_type.clone()),
+        ];
+        physical_node(
+            90,
+            plan::plan_node::Kind::Window(plan::WindowNode {
+                window_exprs: vec![plan::WindowExpr {
+                    name: name.to_string(),
+                    args,
+                    distinct: false,
+                    function_order_by: Vec::new(),
+                    aggregate_binding: binding,
+                    partition_by: Vec::new(),
+                    order_by: Vec::new(),
+                    window_frame: None,
+                    result_type: Some(type_desc(&result_type)),
+                    output_name: "window_value".to_string(),
+                    output_column_id: 3,
+                    ignore_nulls: false,
+                }],
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![value_key_values_node(89)],
+        )
     }
 
     #[test]
@@ -754,6 +978,8 @@ mod tests {
                     name: "row_number".to_string(),
                     args: Vec::new(),
                     distinct: false,
+                    function_order_by: Vec::new(),
+                    aggregate_binding: None,
                     partition_by: Vec::new(),
                     order_by: vec![sort_item(1)],
                     window_frame: Some(expr::WindowFrame {
@@ -811,6 +1037,8 @@ mod tests {
                         name: "row_number".to_string(),
                         args: Vec::new(),
                         distinct: false,
+                        function_order_by: Vec::new(),
+                        aggregate_binding: None,
                         partition_by: Vec::new(),
                         order_by: vec![sort_item(1)],
                         window_frame: Some(expr::WindowFrame {
@@ -831,6 +1059,8 @@ mod tests {
                         name: "rank".to_string(),
                         args: Vec::new(),
                         distinct: false,
+                        function_order_by: Vec::new(),
+                        aggregate_binding: None,
                         partition_by: Vec::new(),
                         order_by: vec![descending_id],
                         window_frame: Some(expr::WindowFrame {
@@ -893,6 +1123,180 @@ mod tests {
             lowered.layout.order(),
             &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
         );
+    }
+
+    #[test]
+    fn aggregate_window_requires_exact_binding_and_window_only_rejects_one() {
+        let missing = aggregate_window_node(
+            "max_by",
+            vec![
+                column_ref(1, DataType::Utf8),
+                column_ref(2, DataType::Int64),
+            ],
+            DataType::Utf8,
+            None,
+        );
+        let error = lower_aggregate_window(&missing).expect_err("binding must be mandatory");
+        assert!(
+            error.contains("exact resolved signature missing"),
+            "{error}"
+        );
+
+        let extra = aggregate_window_node(
+            "row_number",
+            Vec::new(),
+            DataType::Int64,
+            aggregate_binding("count", &[]),
+        );
+        let error = lower_aggregate_window(&extra)
+            .expect_err("window-only function must reject aggregate binding");
+        assert!(
+            error.contains("must not carry an aggregate binding"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn aggregate_window_rejects_expression_signature_drift_and_unregistered_v2() {
+        let drift = aggregate_window_node(
+            "sum",
+            vec![column_ref(2, DataType::Int64)],
+            DataType::Int64,
+            aggregate_binding("sum", &[DataType::Int32]),
+        );
+        let error = lower_aggregate_window(&drift).expect_err("logical arg drift must fail");
+        assert!(error.contains("argument type drift"), "{error}");
+
+        let mut forged_binding = aggregate_binding("sum", &[DataType::Int64]);
+        forged_binding
+            .as_mut()
+            .expect("sum binding")
+            .state_format_identity = "forged/window-state/v99".to_string();
+        let forged = aggregate_window_node(
+            "sum",
+            vec![column_ref(2, DataType::Int64)],
+            DataType::Int64,
+            forged_binding,
+        );
+        let error = lower_aggregate_window(&forged).expect_err("catalog drift must fail");
+        assert!(error.contains("resolved signature drift"), "{error}");
+
+        let v2 = aggregate_window_node(
+            "max_by_v2",
+            vec![
+                column_ref(1, DataType::Utf8),
+                column_ref(2, DataType::Int64),
+            ],
+            DataType::Utf8,
+            None,
+        );
+        let error = lower_aggregate_window(&v2).expect_err("v2 is not registered");
+        assert!(
+            error.contains("unsupported window function: max_by_v2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn max_min_by_keep_logical_two_arg_binding_and_packed_struct_input() {
+        for name in ["max_by", "min_by"] {
+            let node = aggregate_window_node(
+                name,
+                vec![
+                    column_ref(1, DataType::Utf8),
+                    column_ref(2, DataType::Int64),
+                ],
+                DataType::Utf8,
+                aggregate_binding(name, &[DataType::Utf8, DataType::Int64]),
+            );
+
+            let (decoded, arena) = lower_aggregate_window(&node).expect("lower max/min_by");
+            let ExecNodeKind::Analytic(analytic) = decoded.node.kind else {
+                panic!("expected analytic node");
+            };
+            let function = &analytic.functions[0];
+            let binding = function
+                .aggregate_binding
+                .as_ref()
+                .expect("aggregate binding");
+            assert_eq!(binding.function_name, name);
+            assert_eq!(
+                binding.resolved.argument_types,
+                [DataType::Utf8, DataType::Int64]
+            );
+            let [physical] = function.args.as_slice() else {
+                panic!("expected one packed physical argument");
+            };
+            let Some(DataType::Struct(fields)) = arena.data_type(*physical) else {
+                panic!("expected packed Struct physical input");
+            };
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].data_type(), &DataType::Utf8);
+            assert_eq!(fields[1].data_type(), &DataType::Int64);
+        }
+    }
+
+    #[test]
+    fn array_agg_function_order_is_separate_from_over_order() {
+        let list_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )));
+        let output_columns = vec![
+            output_column(1, "value", DataType::Utf8),
+            output_column(2, "key", DataType::Int64),
+            output_column(3, "window_value", list_type.clone()),
+        ];
+        let mut function_order = sort_item(2);
+        function_order.asc = false;
+        function_order.nulls_first = true;
+        let node = physical_node(
+            92,
+            plan::plan_node::Kind::Window(plan::WindowNode {
+                window_exprs: vec![plan::WindowExpr {
+                    name: "array_agg".to_string(),
+                    args: vec![column_ref(1, DataType::Utf8)],
+                    distinct: false,
+                    function_order_by: vec![function_order],
+                    aggregate_binding: aggregate_binding("array_agg", &[DataType::Utf8]),
+                    partition_by: Vec::new(),
+                    order_by: vec![sort_item(2)],
+                    window_frame: None,
+                    result_type: Some(type_desc(&list_type)),
+                    output_name: "window_value".to_string(),
+                    output_column_id: 3,
+                    ignore_nulls: false,
+                }],
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![value_key_values_node(91)],
+        );
+
+        let (decoded, arena) = lower_aggregate_window(&node).expect("lower ordered array_agg");
+        let ExecNodeKind::Analytic(analytic) = decoded.node.kind else {
+            panic!("expected analytic node");
+        };
+        assert_eq!(analytic.order_by_exprs.len(), 1);
+        let function = &analytic.functions[0];
+        let WindowFunctionKind::ArrayAgg {
+            is_asc_order,
+            nulls_first,
+            ..
+        } = &function.kind
+        else {
+            panic!("expected array_agg");
+        };
+        assert_eq!(is_asc_order, &[false]);
+        assert_eq!(nulls_first, &[true]);
+        let [physical] = function.args.as_slice() else {
+            panic!("expected packed value and function-order input");
+        };
+        let Some(DataType::Struct(fields)) = arena.data_type(*physical) else {
+            panic!("expected packed Struct input");
+        };
+        assert_eq!(fields.len(), 2);
     }
 }
 
@@ -1011,15 +1415,9 @@ fn validate_window_function_signature(
                 return Err("bitmap_union/bitmap_union_count expects 1 argument".to_string());
             }
         }
-        WindowFunctionKind::MaxBy
-        | WindowFunctionKind::MaxByV2
-        | WindowFunctionKind::MinBy
-        | WindowFunctionKind::MinByV2 => {
+        WindowFunctionKind::MaxBy | WindowFunctionKind::MinBy => {
             if args.len() != 1 {
-                return Err(
-                    "max_by/max_by_v2/min_by/min_by_v2 expects 1 packed struct argument"
-                        .to_string(),
-                );
+                return Err("max_by/min_by expects 1 packed struct argument".to_string());
             }
         }
         WindowFunctionKind::Sum

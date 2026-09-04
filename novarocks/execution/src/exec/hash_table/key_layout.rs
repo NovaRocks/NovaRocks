@@ -17,21 +17,22 @@
 use arrow::array::Array;
 use arrow::datatypes::DataType;
 
-use crate::exec::expr::agg::IntArrayView;
+use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, IntArrayView};
 
 use super::key_builder::GroupKeyArrayView;
 use super::key_strategy::is_compressible_key_type;
 
-pub struct CompressedKeyContext {
-    pub bases: Vec<i128>,
-    pub used_bits: Vec<u8>,
-    pub null_offsets: Vec<u16>,
-    pub value_offsets: Vec<u16>,
+pub(crate) struct CompressedKeyContext {
+    pub(crate) bases: AggregateVec<i128>,
+    pub(crate) used_bits: AggregateVec<u8>,
+    pub(crate) null_offsets: AggregateVec<u16>,
+    pub(crate) value_offsets: AggregateVec<u16>,
 }
 
-pub fn build_compressed_key_context(
+pub(crate) fn build_compressed_key_context(
     views: &[GroupKeyArrayView<'_>],
     types: &[DataType],
+    allocator: AggregateAllocator,
 ) -> Result<CompressedKeyContext, String> {
     if views.len() != types.len() {
         return Err("compressed key type length mismatch".to_string());
@@ -41,8 +42,14 @@ pub fn build_compressed_key_context(
             return Err(format!("compressed key unsupported type: {:?}", data_type));
         }
     }
-    let mut bases = Vec::with_capacity(types.len());
-    let mut used_bits = Vec::with_capacity(types.len());
+    let mut bases = AggregateVec::new_in(allocator.clone());
+    bases
+        .try_reserve_exact(types.len())
+        .map_err(|_| allocator.allocation_error("reserve compressed-key bases"))?;
+    let mut used_bits = AggregateVec::new_in(allocator.clone());
+    used_bits
+        .try_reserve_exact(types.len())
+        .map_err(|_| allocator.allocation_error("reserve compressed-key bit widths"))?;
     for view in views {
         let range = min_max_i128(view)?;
         let (base, max_value) = match range {
@@ -55,8 +62,14 @@ pub fn build_compressed_key_context(
         used_bits.push(bits);
     }
 
-    let mut null_offsets = Vec::with_capacity(types.len());
-    let mut value_offsets = Vec::with_capacity(types.len());
+    let mut null_offsets = AggregateVec::new_in(allocator.clone());
+    null_offsets
+        .try_reserve_exact(types.len())
+        .map_err(|_| allocator.allocation_error("reserve compressed-key null offsets"))?;
+    let mut value_offsets = AggregateVec::new_in(allocator.clone());
+    value_offsets
+        .try_reserve_exact(types.len())
+        .map_err(|_| allocator.allocation_error("reserve compressed-key value offsets"))?;
     let mut total_bits: usize = 0;
     for bits in &used_bits {
         null_offsets.push(
@@ -84,7 +97,7 @@ pub fn build_compressed_key_context(
     })
 }
 
-pub fn compressed_key_is_valid(
+pub(crate) fn compressed_key_is_valid(
     ctx: &CompressedKeyContext,
     views: &[GroupKeyArrayView<'_>],
     row: usize,

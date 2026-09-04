@@ -2,9 +2,9 @@
 id: ADR-0022
 title: "Connector statistics capability"
 domain: [provider-spi]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0135
 date: 2026-07-31
 provenance:
   - "discussion: unified statistics architecture"

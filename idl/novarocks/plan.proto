@@ -105,6 +105,219 @@ message TableWriterNode {
   uint32 writer_ordinal = 5;                            // physical-context component.
   repeated novarocks.expr.Expr output_exprs = 6;        // sealed write output expressions.
   repeated novarocks.common.OutputColumn target_schema = 7;  // sealed write target schema.
+  WriterMultiplexSchema writer_multiplex_schema = 8;          // exact per-plan output relation.
+  WriterPartialAggregatePlan partial_aggregate_plan = 9;      // resolved ordinary partial aggregates.
+}
+
+// Versioned, exact schema of the per-plan writer multiplex relation. `columns`
+// contains the fixed prefix followed by the complete typed auxiliary tail.
+message WriterMultiplexSchema {
+  uint32 contract_version = 1;
+  repeated ArrowPhysicalColumn columns = 2;
+  repeated ArrowFieldMetadataEntry schema_metadata = 3;
+}
+
+// Versioned, exact schema of the fixed Root write-result relation.
+message RootWriteResultSchema {
+  uint32 contract_version = 1;
+  repeated ArrowPhysicalColumn columns = 2;
+  repeated ArrowFieldMetadataEntry schema_metadata = 3;
+}
+
+// Lossless Arrow schema for an internal execution relation. The enclosing
+// operator owns the semantic contract; this carrier preserves its exact
+// physical fields and slot identities without routing them through SQL
+// TypeDesc normalization.
+message ArrowPhysicalSchema {
+  repeated ArrowPhysicalColumn columns = 1;
+  repeated ArrowFieldMetadataEntry schema_metadata = 2;
+}
+
+message WriterPartialAggregatePlan {
+  repeated WriterPartialAggregateCall calls = 1;
+}
+
+message WriterPartialAggregateCall {
+  uint32 input_slot_id = 1;
+  string function_name = 2;
+  ResolvedAggregateSignature resolved_signature = 3;
+  uint32 intermediate_slot_id = 4;
+}
+
+message WriterFinalAggregatePlan {
+  repeated WriterFinalAggregateCall calls = 1;
+  WriterGroupedUnpivotPlan unpivot = 2;
+}
+
+message WriterFinalAggregateCall {
+  string function_name = 1;
+  ResolvedAggregateSignature resolved_signature = 2;
+  uint32 intermediate_input_slot_id = 3;
+  uint32 final_output_slot_id = 4;
+}
+
+// Generic grouped Unpivot facts used after final aggregation. A mapping is
+// selected by its ordinary grouping key and contains no provider descriptor.
+message WriterGroupedUnpivotPlan {
+  uint32 grouping_input_slot_id = 1;
+  uint32 grouping_output_slot_id = 2;
+  uint32 passthrough_output_slot_id = 3;
+  uint32 value_output_slot_id = 4;
+  repeated uint32 literal_output_slot_ids = 5;
+  repeated WriterGroupedUnpivotMapping mappings = 6;
+  uint64 max_output_rows = 7;
+  uint64 max_output_bytes = 8;
+}
+
+message WriterGroupedUnpivotMapping {
+  uint32 grouping_key = 1;
+  uint32 input_value_slot_id = 2;
+  repeated UnpivotConstant constants = 3;
+}
+
+// A slot-bound Arrow field used by internal execution relations. Unlike the
+// SQL TypeDesc carrier, this descriptor preserves the exact Arrow physical
+// representation and every field-level contract bit.
+message ArrowPhysicalColumn {
+  uint32 slot_id = 1;
+  ArrowPhysicalField field = 2;
+  bool is_internal = 3;
+}
+
+message ArrowPhysicalField {
+  string name = 1;
+  bool nullable = 2;
+  ArrowPhysicalType type = 3;
+  repeated ArrowFieldMetadataEntry metadata = 4;
+  optional int64 dictionary_id = 5;
+  optional bool dictionary_is_ordered = 6;
+}
+
+// Metadata is encoded as a sorted repeated entry rather than a protobuf map so
+// duplicate keys and non-canonical ordering can be rejected at ingress.
+message ArrowFieldMetadataEntry {
+  string key = 1;
+  string value = 2;
+}
+
+message ArrowPhysicalType {
+  oneof kind {
+    ArrowPrimitiveType primitive = 1;
+    ArrowTimestampType timestamp = 2;
+    ArrowTimeType time32 = 3;
+    ArrowTimeType time64 = 4;
+    ArrowTimeType duration = 5;
+    ArrowIntervalUnit interval = 6;
+    int32 fixed_size_binary = 7;
+    ArrowDecimalType decimal32 = 8;
+    ArrowDecimalType decimal64 = 9;
+    ArrowDecimalType decimal128 = 10;
+    ArrowDecimalType decimal256 = 11;
+    ArrowPhysicalField list = 12;
+    ArrowPhysicalField list_view = 13;
+    ArrowFixedSizeListType fixed_size_list = 14;
+    ArrowPhysicalField large_list = 15;
+    ArrowPhysicalField large_list_view = 16;
+    ArrowStructType struct_type = 17;
+    ArrowUnionType union_type = 18;
+    ArrowDictionaryType dictionary = 19;
+    ArrowMapType map = 20;
+    ArrowRunEndEncodedType run_end_encoded = 21;
+  }
+}
+
+enum ArrowPrimitiveType {
+  ARROW_PRIMITIVE_TYPE_UNSPECIFIED = 0;
+  ARROW_PRIMITIVE_TYPE_NULL = 1;
+  ARROW_PRIMITIVE_TYPE_BOOLEAN = 2;
+  ARROW_PRIMITIVE_TYPE_INT8 = 3;
+  ARROW_PRIMITIVE_TYPE_INT16 = 4;
+  ARROW_PRIMITIVE_TYPE_INT32 = 5;
+  ARROW_PRIMITIVE_TYPE_INT64 = 6;
+  ARROW_PRIMITIVE_TYPE_UINT8 = 7;
+  ARROW_PRIMITIVE_TYPE_UINT16 = 8;
+  ARROW_PRIMITIVE_TYPE_UINT32 = 9;
+  ARROW_PRIMITIVE_TYPE_UINT64 = 10;
+  ARROW_PRIMITIVE_TYPE_FLOAT16 = 11;
+  ARROW_PRIMITIVE_TYPE_FLOAT32 = 12;
+  ARROW_PRIMITIVE_TYPE_FLOAT64 = 13;
+  ARROW_PRIMITIVE_TYPE_DATE32 = 14;
+  ARROW_PRIMITIVE_TYPE_DATE64 = 15;
+  ARROW_PRIMITIVE_TYPE_BINARY = 16;
+  ARROW_PRIMITIVE_TYPE_BINARY_VIEW = 17;
+  ARROW_PRIMITIVE_TYPE_LARGE_BINARY = 18;
+  ARROW_PRIMITIVE_TYPE_UTF8 = 19;
+  ARROW_PRIMITIVE_TYPE_UTF8_VIEW = 20;
+  ARROW_PRIMITIVE_TYPE_LARGE_UTF8 = 21;
+}
+
+enum ArrowTimeUnit {
+  ARROW_TIME_UNIT_UNSPECIFIED = 0;
+  ARROW_TIME_UNIT_SECOND = 1;
+  ARROW_TIME_UNIT_MILLISECOND = 2;
+  ARROW_TIME_UNIT_MICROSECOND = 3;
+  ARROW_TIME_UNIT_NANOSECOND = 4;
+}
+
+enum ArrowIntervalUnit {
+  ARROW_INTERVAL_UNIT_UNSPECIFIED = 0;
+  ARROW_INTERVAL_UNIT_YEAR_MONTH = 1;
+  ARROW_INTERVAL_UNIT_DAY_TIME = 2;
+  ARROW_INTERVAL_UNIT_MONTH_DAY_NANO = 3;
+}
+
+enum ArrowUnionMode {
+  ARROW_UNION_MODE_UNSPECIFIED = 0;
+  ARROW_UNION_MODE_SPARSE = 1;
+  ARROW_UNION_MODE_DENSE = 2;
+}
+
+message ArrowTimestampType {
+  ArrowTimeUnit unit = 1;
+  optional string timezone = 2;
+}
+
+message ArrowTimeType {
+  ArrowTimeUnit unit = 1;
+}
+
+message ArrowDecimalType {
+  uint32 precision = 1;
+  int32 scale = 2;
+}
+
+message ArrowFixedSizeListType {
+  ArrowPhysicalField item = 1;
+  int32 length = 2;
+}
+
+message ArrowStructType {
+  repeated ArrowPhysicalField fields = 1;
+}
+
+message ArrowUnionField {
+  int32 type_id = 1;
+  ArrowPhysicalField field = 2;
+}
+
+message ArrowUnionType {
+  ArrowUnionMode mode = 1;
+  repeated ArrowUnionField fields = 2;
+}
+
+message ArrowDictionaryType {
+  ArrowPhysicalType key = 1;
+  ArrowPhysicalType value = 2;
+}
+
+message ArrowMapType {
+  ArrowPhysicalField entries = 1;
+  bool ordered = 2;
+}
+
+message ArrowRunEndEncodedType {
+  ArrowPhysicalField run_ends = 1;
+  ArrowPhysicalField values = 2;
 }
 
 // The single per-query write finish node.
@@ -118,6 +331,9 @@ message TableWriterNode {
 // decode layer.
 message TableFinishNode {
   repeated uint32 expected_target_ordinals = 1;  // dense 0..n legal target set.
+  WriterMultiplexSchema writer_multiplex_schema = 2;  // exact gathered input relation.
+  RootWriteResultSchema root_result_schema = 3;       // exact Root output relation.
+  WriterFinalAggregatePlan final_aggregate_plan = 4;  // resolved final aggregates plus generic Unpivot.
 }
 
 // Exchange receiver node payload.
@@ -485,28 +701,11 @@ message DataSink {
     ChangeStreamRouterSink change_stream_router = 4; // Iceberg change-stream router sink.
     DataStreamSink data_stream = 5;                       // Exchange stream sink.
     MultiCastDataStreamSink multi_cast_data_stream = 6;   // CTE-style multicast stream sink.
-    StatisticsSink statistics = 8;                        // Internal typed statistics partial sink.
   }
   reserved 7;
+  reserved 8;
   reserved "connector_write"; // former opaque staged connector-writer sink.
-}
-
-// Core-internal statistics collection sink. This carries only the stable
-// logical metric selection; fragment terminal reports carry the bounded,
-// opaque partial and never materialize user result rows.
-message StatisticsSink {
-  repeated StatisticsMetric metrics = 1;
-}
-
-message StatisticsMetric {
-  oneof kind {
-    bool row_count = 1;
-    string null_count_column = 2;
-    string minimum_column = 3;
-    string maximum_column = 4;
-    string average_size_column = 5;
-    string theta_ndv_column = 6;
-  }
+  reserved "statistics";      // former dedicated statistics fragment sink.
 }
 
 // Exchange stream sink payload.
@@ -698,10 +897,11 @@ message ProjectItem {
 // Each input row is expanded once for every value mapping. Passthrough columns
 // are copied to every expanded row, the selected input value is written to the
 // common value output, and the mapping's literals populate the literal output
-// columns. Column descriptors and their exact Arrow types/nullability live in
-// PlanNode.output_columns; this payload carries identities and bounded batching
-// only. Output row order is not contractual; consumers must not depend on
-// input-major or mapping-major iteration.
+// columns. The exact Arrow output relation lives only in `output_schema`;
+// PlanNode.output_columns must be empty because SQL TypeDesc normalization is
+// not a lossless carrier for nested field nullability. Output row order is not
+// contractual; consumers must not depend on input-major or mapping-major
+// iteration.
 message UnpivotNode {
   repeated UnpivotPassthroughColumn passthrough_columns = 1;
   uint32 value_output_column_id = 2;
@@ -709,6 +909,7 @@ message UnpivotNode {
   repeated UnpivotValueMapping value_mappings = 4;
   uint64 max_output_rows = 5;
   uint64 max_output_bytes = 6;
+  ArrowPhysicalSchema output_schema = 7;
 }
 
 // One input column copied to one output column for every expanded row.
@@ -717,11 +918,35 @@ message UnpivotPassthroughColumn {
   uint32 output_column_id = 2;
 }
 
-// One source value column and the literal tags attached to its expanded rows.
-// `literals` is positional with UnpivotNode.literal_output_column_ids.
+// One source value column and the typed constants attached to its expanded rows.
+// `constants` is positional with UnpivotNode.literal_output_column_ids.
 message UnpivotValueMapping {
   uint32 input_value_column_id = 1;
-  repeated novarocks.expr.Expr literals = 2;
+  repeated UnpivotConstant constants = 2;
+}
+
+// A typed constant repeated for each row selected by one mapping. Scalar NULL
+// remains available through the ordinary scalar literal expression carrier.
+// This is ordinary Unpivot machinery and carries no provider semantics.
+message UnpivotConstant {
+  oneof value {
+    novarocks.expr.Expr scalar_literal = 1;
+    Int32List int32_list = 2;
+    Utf8Map utf8_map = 3;
+  }
+}
+
+message Int32List {
+  repeated int32 values = 1;
+}
+
+message Utf8Map {
+  repeated Utf8MapEntry entries = 1;
+}
+
+message Utf8MapEntry {
+  string key = 1;
+  string value = 2;
 }
 
 // Sort physical node.
@@ -868,6 +1093,8 @@ message WindowExpr {
   string output_name = 8;                           // output display name.
   uint32 output_column_id = 9;                      // output ColumnId.
   bool ignore_nulls = 10;                           // true when IGNORE NULLS is requested.
+  repeated novarocks.expr.SortItem function_order_by = 11; // ORDER BY owned by the aggregate call, not OVER.
+  ResolvedAggregateSignature aggregate_binding = 12; // exact ordinary aggregate overload; absent for window-only functions.
 }
 
 // Generate-series physical node.
@@ -949,6 +1176,18 @@ message PlanAggregateCall {
   novarocks.common.TypeDesc result_type = 4;    // aggregate result SQL type.
   repeated novarocks.expr.SortItem order_by = 5; // order-by items for order-sensitive aggregates.
   uint32 output_column_id = 6;                  // output ColumnId for this aggregate.
+  ResolvedAggregateSignature resolved_signature = 7; // exact overload frozen by FE planning.
+}
+
+// Exact ordinary aggregate identity selected from the immutable process
+// function catalog. This is deliberately engine-global: it contains no
+// Connector/provider identity or per-query ABI version.
+message ResolvedAggregateSignature {
+  string overload_identity = 1;
+  repeated novarocks.common.TypeDesc argument_types = 2;
+  novarocks.common.TypeDesc intermediate_type = 3;
+  novarocks.common.TypeDesc output_type = 4;
+  string state_format_identity = 5;
 }
 
 // Aggregate output layout.

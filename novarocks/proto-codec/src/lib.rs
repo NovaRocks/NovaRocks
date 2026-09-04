@@ -8,6 +8,9 @@
 pub mod error;
 pub use error::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 
+/// Exact, lossless Arrow physical schema carrier used by internal relations.
+pub mod arrow_physical;
+
 /// Validated catalog identity, materialization, and reachability carriers.
 pub mod catalog;
 

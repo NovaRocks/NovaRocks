@@ -13,12 +13,20 @@ second large text copy.
 - Jar SHA-256: `1b55103e1f7564150a0867eca4ce3bca13cd5935a32c199a5e738f8c5c24901a`
 - Memory dependency: `datasketches-memory:3.0.2`, SHA-256
   `a3dbdec4de16bf2b0a4c9b1b253bd4064d587675fc76063f8972cdfa104c66cb`
-- Generator: `generate/java/src/GenerateFixtures.java`; `generate/java/pom.xml` pins the released
-  artifact and `generate/java/generate.sh` verifies both jar digests before execution.
+- Iceberg value-conversion oracle: `org.apache.iceberg:iceberg-api:1.10.0`, jar SHA-256
+  `627061d401dba9d1a8cada2da6394640c2e803102bb676fb34e5f65503cf2c51`
+- Generators: `generate/java/src/GenerateFixtures.java` and
+  `generate/java/src/GenerateIcebergThetaVectors.java`; `generate/java/pom.xml` pins the released
+  artifacts and `generate/java/generate.sh` verifies all jar digests before execution.
 
 The Java corpus deliberately labels QuickSelect and Alpha separately. Rust only checks that the
 Alpha compact is readable and participates in standard set operations; no row claims Alpha
 producer equivalence or provenance encoded in the wire image.
+
+`theta/iceberg_java62_single_value_vectors.tsv` records Iceberg's canonical primitive bytes and
+the resulting default-seed, lg_k=12, ordered QuickSelect compact image. It includes decimal,
+floating-point payload, time, UTF-8, binary, fixed, and UUID cases used by the lightweight Iceberg
+function bundle. The TSV is oracle evidence and is intentionally not a sketch-manifest row.
 
 ## C++ fixtures
 

@@ -134,10 +134,6 @@ fn sole_publication_write_target(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Binding a first-refresh dataflow needs each independently frozen catalog, target, and session fact."
-)]
 fn bind_first_refresh_write_dataflow(
     query_kernel: &QueryPreparationKernel,
     ports: &IcebergMvCorePorts,
@@ -226,6 +222,9 @@ fn bind_first_refresh_write_dataflow(
             let distributed_plan = compile_mv_first_refresh_connector_write_dataflow(
                 analyzed,
                 &statistics,
+                write_session
+                    .statistics_requirements(write_target_ordinal)
+                    .map_err(|error| error.to_string())?,
                 write_target_ordinal,
             )?;
             prepare_sealed_iceberg_write_native_assembly(
@@ -327,6 +326,9 @@ fn bind_first_refresh_write_dataflow(
             let distributed_plan = compile_join_first_refresh_connector_write_dataflow(
                 analyzed,
                 &statistics,
+                write_session
+                    .statistics_requirements(write_target_ordinal)
+                    .map_err(|error| error.to_string())?,
                 write_target_ordinal,
             )?;
             prepare_sealed_iceberg_write_native_assembly(

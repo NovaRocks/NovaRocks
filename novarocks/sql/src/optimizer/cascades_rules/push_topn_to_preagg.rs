@@ -346,6 +346,7 @@ mod tests {
             args: vec![sales],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         }
     }
 

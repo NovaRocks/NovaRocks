@@ -426,10 +426,6 @@ fn participant_attempt_ref(
     .map_err(protocol_contract_error)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The sealed terminal-fragment carrier has one parameter per required protocol field."
-)]
 fn terminal_fragment_snapshot(
     fragment_instance_id: UniqueId,
     backend_num: i32,
@@ -438,7 +434,6 @@ fn terminal_fragment_snapshot(
     error_detail: String,
     sink: SinkCommitReportSnapshot,
     profile: Option<RuntimeProfileTree>,
-    statistics_payload: Vec<u8>,
 ) -> Result<FragmentTerminalSnapshot, QueryLifecycleError> {
     use novarocks_proto_codec::lifecycle::terminal::FragmentTerminalSnapshot as ProtocolFragment;
     use novarocks_proto_models::novarocks as wire;
@@ -481,7 +476,6 @@ fn terminal_fragment_snapshot(
             filtered_rows: sink.load_stats.filtered_rows,
         }),
         profile: Some(profile),
-        statistics_payload,
     })
     .map_err(protocol_contract_error)
 }
@@ -1069,7 +1063,6 @@ fn fragment_snapshot_from_outcome(
         detail,
         SinkCommitReportSnapshot::default(),
         None,
-        Vec::new(),
     )
 }
 
@@ -3286,7 +3279,6 @@ impl QueryLifecycleRegistry {
             detail,
             sink,
             fact.profile().cloned(),
-            fact.statistics_payload().to_vec(),
         ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -3467,7 +3459,6 @@ impl QueryLifecycleRegistry {
                         detail,
                         SinkCommitReportSnapshot::default(),
                         None,
-                        Vec::new(),
                     ) {
                         Ok(snapshot) => snapshot,
                         Err(error) => {
@@ -5033,6 +5024,12 @@ impl Drop for StageBuildPermit {
 }
 
 impl FragmentAdmissionPermit {
+    pub(crate) fn query_mem_limit(&self) -> Option<i64> {
+        let options = validated(self.entry.manifest.query_options());
+        let limit = options.as_proto().query_mem_limit;
+        (limit > 0).then_some(limit)
+    }
+
     #[cfg(test)]
     pub(crate) fn entry_for_test(&self) -> Arc<QueryLifecycleEntry> {
         Arc::clone(&self.entry)

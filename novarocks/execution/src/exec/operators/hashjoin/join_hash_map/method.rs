@@ -192,15 +192,29 @@ struct DirectIntStats {
     reason = "Alternate hash-map construction and lookup paths are retained for join integration coverage."
 )]
 impl JoinHashMap {
+    #[cfg(test)]
     pub(crate) fn new_chained(
         key_types: Vec<DataType>,
         null_safe_eq: Vec<bool>,
     ) -> Result<Self, String> {
+        let tracker = MemTracker::new_child(
+            "JoinHashMapTest",
+            &crate::runtime::mem_tracker::process_mem_tracker(),
+        );
+        Self::new_chained_with_tracker(key_types, null_safe_eq, tracker)
+    }
+
+    pub(crate) fn new_chained_with_tracker(
+        key_types: Vec<DataType>,
+        null_safe_eq: Vec<bool>,
+        tracker: Arc<MemTracker>,
+    ) -> Result<Self, String> {
         Ok(Self::Chained(ChainedJoinHashMap {
-            table: JoinHashTable::new(key_types, null_safe_eq)?,
+            table: JoinHashTable::new_with_tracker(key_types, null_safe_eq, tracker)?,
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn build_from_key_batches(
         key_types: Vec<DataType>,
         null_safe_eq: Vec<bool>,
@@ -235,10 +249,21 @@ impl JoinHashMap {
         )? {
             return Ok(Self::DirectInt(direct));
         }
-        let mut chained = Self::new_chained(key_types, null_safe_eq)?;
-        if let Some(tracker) = tracker {
-            chained.set_mem_tracker(tracker);
-        }
+        let tracker = match tracker {
+            Some(tracker) => tracker,
+            #[cfg(test)]
+            None => MemTracker::new_child(
+                "JoinHashMapTest",
+                &crate::runtime::mem_tracker::process_mem_tracker(),
+            ),
+            #[cfg(not(test))]
+            None => {
+                return Err(
+                    "join hash table memory tracker must be bound before construction".to_string(),
+                );
+            }
+        };
+        let mut chained = Self::new_chained_with_tracker(key_types, null_safe_eq, tracker)?;
         for batch in batches {
             chained.add_build_rows(batch.arrays(), batch.num_rows())?;
         }
@@ -1113,8 +1138,12 @@ fn direct_bucket(value: i64, min: i64, max: i64, len: usize) -> Option<usize> {
 }
 
 fn fallback_hash_seed(key_types: &[DataType], null_safe_eq: &[bool]) -> Result<u64, String> {
-    let table = JoinHashTable::new(key_types.to_vec(), null_safe_eq.to_vec())?;
-    Ok(table.hash_seed())
+    if key_types.is_empty() || key_types.len() != null_safe_eq.len() {
+        return Err("join hash seed requires matching non-empty key metadata".to_string());
+    }
+    Ok(crate::exec::hash_table::hash::seed_from_hasher(
+        &hashbrown::hash_map::DefaultHashBuilder::default(),
+    ))
 }
 
 fn eval_single_probe_int_key(

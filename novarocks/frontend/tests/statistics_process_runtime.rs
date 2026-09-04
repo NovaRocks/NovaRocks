@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use novarocks_frontend::FrontendServingLifecycle;
 use novarocks_frontend::statistics_jobs::application::StatisticsColumnIntent;
 use novarocks_frontend::statistics_jobs::model::{
@@ -33,7 +31,6 @@ use novarocks_frontend::statistics_jobs::repository::{
 };
 use novarocks_frontend::statistics_jobs::worker::{
     StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
-    StatisticsCollectedAttempt,
 };
 
 fn create(at_ms: i64) -> StatisticsJobCreate {
@@ -50,58 +47,37 @@ fn create(at_ms: i64) -> StatisticsJobCreate {
     }
 }
 
-struct UnitCollected;
-
-impl StatisticsCollectedAttempt for UnitCollected {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn basis_data_version(&self) -> &[u8] {
-        b"test"
-    }
-}
-
 struct CommitUnknownExecutor {
     publishes: AtomicUsize,
 }
 
+struct CancelAwareExecutor {
+    started: AtomicBool,
+    finishes: AtomicUsize,
+}
+
+impl StatisticsAttemptExecutor for CancelAwareExecutor {
+    fn execute(
+        &self,
+        _job: &StatisticsJob,
+        cancellation: novarocks_frontend::common::query_cancellation::QueryCancellationView,
+    ) -> Result<(), StatisticsAttemptError> {
+        self.started.store(true, Ordering::Release);
+        while !cancellation.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Err(StatisticsAttemptError::permanent(
+            StatisticsJobErrorKind::Cancelled,
+            "cancelled before provider finish",
+        ))
+    }
+}
+
 impl StatisticsAttemptExecutor for CommitUnknownExecutor {
-    fn collect(
+    fn execute(
         &self,
         _job: &StatisticsJob,
-    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError> {
-        Ok(Box::new(UnitCollected))
-    }
-
-    fn prepare_publish(
-        &self,
-        _job: &StatisticsJob,
-        _collected: &dyn StatisticsCollectedAttempt,
-    ) -> Result<novarocks_spi::connector::ExternalMutationEvidence, StatisticsAttemptError> {
-        novarocks_spi::connector::ExternalMutationEvidence::try_new(
-            1,
-            novarocks_spi::connector::ConnectorInstanceDescriptor {
-                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                    .unwrap(),
-                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("iceberg")
-                    .unwrap(),
-            },
-            novarocks_spi::connector::ProviderBindingEpoch::from_bytes([1; 16]),
-            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes([2; 16]),
-            "statistics",
-            Bytes::from_static(b"test-evidence"),
-        )
-        .map_err(|error| {
-            StatisticsAttemptError::permanent(StatisticsJobErrorKind::Internal, error.to_string())
-        })
-    }
-
-    fn publish(
-        &self,
-        _job: &StatisticsJob,
-        _collected: &dyn StatisticsCollectedAttempt,
-        _evidence: &novarocks_spi::connector::ExternalMutationEvidence,
+        _cancellation: novarocks_frontend::common::query_cancellation::QueryCancellationView,
     ) -> Result<(), StatisticsAttemptError> {
         self.publishes.fetch_add(1, Ordering::SeqCst);
         Err(StatisticsAttemptError::publication(
@@ -215,6 +191,41 @@ async fn commit_unknown_is_terminal_and_never_dispatches_another_mutation() {
     assert_eq!(executor.publishes.load(Ordering::SeqCst), 1);
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(executor.publishes.load(Ordering::SeqCst), 1);
+    worker.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_cancel_reaches_the_attempt_and_blocks_provider_finish() {
+    let repository = StatisticsJobRepository::new();
+    let executor = Arc::new(CancelAwareExecutor {
+        started: AtomicBool::new(false),
+        finishes: AtomicUsize::new(0),
+    });
+    let lifecycle = FrontendServingLifecycle::new();
+    lifecycle.mark_ready().expect("mark frontend ready");
+    let mut worker = StatisticsAnalyzeWorker::start(
+        &tokio::runtime::Handle::current(),
+        repository.clone(),
+        executor.clone(),
+        lifecycle,
+    )
+    .await
+    .unwrap();
+    let job = repository.create(create(now_ms())).await.unwrap();
+    for _ in 0..200 {
+        if executor.started.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(executor.started.load(Ordering::Acquire));
+    repository
+        .request_cancel(job.job_id, now_ms())
+        .await
+        .unwrap();
+    let terminal = wait_terminal(&repository, job.job_id).await;
+    assert_eq!(terminal.state, StatisticsJobState::Cancelled);
+    assert_eq!(executor.finishes.load(Ordering::SeqCst), 0);
     worker.shutdown().unwrap();
 }
 

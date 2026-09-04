@@ -549,6 +549,7 @@ fn substitute_aggregate(
             .collect(),
         distinct: call.distinct,
         order_by: vec![],
+        resolved: call.resolved.clone(),
     })
 }
 
@@ -874,6 +875,7 @@ pub(crate) fn substitute_scalar(
             args,
             distinct,
             order_by,
+            resolved,
         } => ScalarNode::AggregateCall {
             name,
             args: args
@@ -885,6 +887,7 @@ pub(crate) fn substitute_scalar(
                 .iter()
                 .map(|key| substitute_sort_key(arena, key, defs))
                 .collect(),
+            resolved,
         },
         ScalarNode::Cast { child, target } => ScalarNode::Cast {
             child: substitute_scalar(arena, child, defs),
@@ -957,6 +960,8 @@ pub(crate) fn substitute_scalar(
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -968,6 +973,11 @@ pub(crate) fn substitute_scalar(
                 .map(|arg| substitute_scalar(arena, arg, defs))
                 .collect(),
             distinct,
+            function_order_by: function_order_by
+                .iter()
+                .map(|key| substitute_sort_key(arena, key, defs))
+                .collect(),
+            aggregate_binding,
             partition_by: partition_by
                 .into_iter()
                 .map(|item| substitute_scalar(arena, item, defs))
@@ -1541,6 +1551,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: vec![],
                     output_column_id: sum_out.column_id,
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![col(1, "a"), sum_out.clone()],
                 already_pushed: false,
@@ -1724,6 +1739,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: vec![],
                     output_column_id: sum_out.column_id,
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![col(1, "a"), sum_out.clone()],
                 already_pushed: false,
@@ -1776,6 +1796,11 @@ mod tests {
                 result_type: DataType::Int64,
                 order_by: vec![],
                 output_column_id: sum_out.column_id,
+                resolved: crate::functions::test_resolved_aggregate(
+                    "sum",
+                    &[DataType::Int64],
+                    false,
+                ),
             }],
         );
         let output_columns = vec![col(1, "a"), sum_out.clone()];

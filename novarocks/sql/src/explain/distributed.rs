@@ -2768,6 +2768,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
+            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
         }];
         physical_node_with_scalars(
             Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -2838,6 +2839,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: ColumnId::new_for_test(4),
+            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
         }];
         physical_node_with_scalars(
             Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {

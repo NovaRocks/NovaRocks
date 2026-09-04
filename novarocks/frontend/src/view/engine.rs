@@ -186,6 +186,7 @@ impl ViewService for EmptyViewService {
 /// This deliberately stays narrower than either a session or an application
 /// aggregate, so frontend composition can pass its typed view kernel directly.
 trait ViewExecutionContext: CatalogServiceSource + Send + Sync {
+    fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog;
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry;
     fn catalog_application(
         &self,
@@ -193,6 +194,10 @@ trait ViewExecutionContext: CatalogServiceSource + Send + Sync {
 }
 
 impl ViewExecutionContext for ViewExecutionKernel {
+    fn function_catalog(&self) -> &novarocks_functions::EngineFunctionCatalog {
+        self.function_catalog().as_ref()
+    }
+
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry {
         self.connector_control().as_ref()
     }
@@ -440,17 +445,21 @@ where
                 novarocks_sql::planning::catalog::TableLookupMode::SchemaOnly,
                 self.catalog_application(),
             );
-        let columns =
-            novarocks_sql::planning::catalog::analyze_view_query(query, &provider, database)?
-                .into_iter()
-                .map(|column| {
-                    Ok(ViewColumnDefinition {
-                        name: column.name,
-                        data_type: view_type_name(&column.data_type)?,
-                        nullable: column.nullable,
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
+        let columns = novarocks_sql::planning::catalog::analyze_view_query(
+            query,
+            &provider,
+            database,
+            self.function_catalog(),
+        )?
+        .into_iter()
+        .map(|column| {
+            Ok(ViewColumnDefinition {
+                name: column.name,
+                data_type: view_type_name(&column.data_type)?,
+                nullable: column.nullable,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
         if columns.is_empty() {
             return Err("CREATE VIEW: SELECT produced no output columns".to_string());
         }

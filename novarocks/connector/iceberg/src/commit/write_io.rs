@@ -18,7 +18,7 @@
 //! Provider-owned physical Iceberg writer I/O.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -34,14 +34,12 @@ use parquet::file::statistics::{Statistics, ValueStatistics};
 
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::report::IcebergColumnStats;
-use crate::theta_sketch::{ThetaSketchHandle, compute_theta_sketches_for_batch};
 
 /// Parquet facts returned to the provider's writer report adapter.
 pub struct ParquetWriteResult {
     pub file_size: u64,
     pub split_offsets: Option<Vec<i64>>,
     pub column_stats: Option<IcebergColumnStats>,
-    pub theta_sketches: Option<HashMap<i32, ThetaSketchHandle>>,
 }
 
 /// Return the sole referenced data file when every position-delete row names
@@ -126,7 +124,7 @@ pub async fn write_parquet_file(
         .map_err(|error| format!("close parquet writer failed: {error}"))?;
     let metadata =
         fs::metadata(&path_buf).map_err(|error| format!("stat parquet file failed: {error}"))?;
-    build_parquet_write_result(metadata.len(), &parquet_metadata, Some(batch))
+    build_parquet_write_result(metadata.len(), &parquet_metadata)
 }
 
 fn normalize_path(path: &str) -> Result<String, String> {
@@ -158,24 +156,18 @@ fn write_parquet_to_bytes(
             .close()
             .map_err(|error| format!("close parquet writer failed: {error}"))?;
     }
-    let write_result =
-        build_parquet_write_result(buffer.len() as u64, &parquet_metadata, Some(batch))?;
+    let write_result = build_parquet_write_result(buffer.len() as u64, &parquet_metadata)?;
     Ok((buffer, write_result))
 }
 
 fn build_parquet_write_result(
     file_size: u64,
     metadata: &ParquetMetaData,
-    batch: Option<&RecordBatch>,
 ) -> Result<ParquetWriteResult, String> {
     Ok(ParquetWriteResult {
         file_size,
         split_offsets: collect_split_offsets(metadata),
         column_stats: collect_iceberg_column_stats(metadata),
-        theta_sketches: batch
-            .map(compute_theta_sketches_for_batch)
-            .transpose()?
-            .flatten(),
     })
 }
 
@@ -453,11 +445,5 @@ mod tests {
         let stats = result.column_stats.expect("column stats");
         assert_eq!(stats.value_counts.get(&3), Some(&3));
         assert_eq!(stats.null_value_counts.get(&3), Some(&1));
-        assert!(
-            result
-                .theta_sketches
-                .expect("theta sketch")
-                .contains_key(&3)
-        );
     }
 }

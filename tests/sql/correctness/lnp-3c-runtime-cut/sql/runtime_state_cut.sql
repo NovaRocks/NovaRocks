@@ -42,7 +42,7 @@ INSERT INTO lnp_3c_${suite_uuid0}.ns_${uuid0}.orders VALUES (3, 30);
 
 -- query 5
 -- @restart_fe_after_step=true
--- @be_log_be_count_at_least=NOVAROCKS_STATISTICS_FRAGMENT_COLLECTED,3
+-- @be_log_be_count_at_least=NOVAROCKS_QUERY_FRAGMENT_ACCEPTED,3
 -- @skip_result_check=true
 ANALYZE TABLE lnp_3c_${suite_uuid0}.ns_${uuid0}.orders;
 

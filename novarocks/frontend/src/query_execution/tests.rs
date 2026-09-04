@@ -35,11 +35,8 @@ use crate::query_execution::lifecycle_plan::{
 };
 use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::service::QueryExecutionService;
-use crate::query_execution::statistics::{
-    StatisticsExecutionMode, StatisticsExecutionPolicy, ThetaSketchPartial,
-};
+use crate::query_execution::statistics::{StatisticsExecutionMode, StatisticsExecutionPolicy};
 use crate::query_execution::terminal_set::QueryTerminalSet;
-use bytes::Bytes;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_proto_codec::membership::BackendProcessDescriptor;
@@ -396,192 +393,6 @@ fn outcome_factory_rejects_intent_mismatch() {
     );
 }
 
-fn statistics_program() -> crate::query_execution::statistics::StatisticsCollectionProgram {
-    let table = novarocks_spi::connector::ConnectorTableHandle::try_new(
-        novarocks_spi::connector::ConnectorInstanceId::parse("statistics-test")
-            .expect("instance ID"),
-        Bytes::from_static(b"pinned-table"),
-    )
-    .expect("table handle");
-    let data_version = novarocks_spi::connector::StatisticsDataVersion::try_new(
-        Bytes::from_static(b"snapshot-42"),
-    )
-    .expect("data version");
-    let evidence_revision = novarocks_spi::connector::StatisticsEvidenceRevision::try_new(
-        Bytes::from_static(b"collection-42"),
-    )
-    .expect("evidence revision");
-    let metrics = novarocks_spi::connector::StatisticsMetricRequest::try_new(vec![
-        novarocks_spi::connector::StatisticsMetric::RowCount,
-    ])
-    .expect("metrics");
-    let plan = novarocks_spi::connector::StatisticsCollectionPlan::try_new(
-        table,
-        data_version,
-        evidence_revision,
-        Some(42),
-        metrics,
-        Vec::new(),
-        Bytes::from_static(b"provider-plan"),
-    )
-    .expect("plan");
-    crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
-        plan,
-        StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::ProcessJobAttempt,
-            std::time::Duration::from_secs(60),
-        )
-        .expect("policy"),
-    )
-    .expect("program")
-}
-
-fn statistics_result(
-    program: &crate::query_execution::statistics::StatisticsCollectionProgram,
-    data_version: novarocks_spi::connector::StatisticsDataVersion,
-    metrics: std::collections::BTreeMap<
-        novarocks_spi::connector::StatisticsMetric,
-        novarocks_spi::connector::StatisticsMetricState,
-    >,
-) -> novarocks_spi::connector::StatisticsCollectionResult {
-    novarocks_spi::connector::StatisticsCollectionResult::try_new(
-        novarocks_spi::connector::StatisticsEvidence::try_new(
-            data_version,
-            novarocks_spi::connector::StatisticsEvidenceRevision::try_new(Bytes::from_static(
-                b"evidence-1",
-            ))
-            .expect("revision"),
-            novarocks_spi::connector::StatisticsRowCoverage::AllVisibleRows,
-            metrics,
-        )
-        .expect("evidence"),
-        program.plan().provider_payload().clone(),
-    )
-    .expect("result")
-}
-
-/// One value produced by a visible-row scan of `data_version` itself. A Theta
-/// sketch stays approximate; anything else a full scan counts is exact.
-fn scanned(
-    data_version: &novarocks_spi::connector::StatisticsDataVersion,
-    metric: &novarocks_spi::connector::StatisticsMetric,
-    value: novarocks_spi::connector::StatisticsMetricValue,
-) -> novarocks_spi::connector::StatisticsMetricState {
-    let nature = match metric {
-        novarocks_spi::connector::StatisticsMetric::ThetaNdv { .. } => {
-            novarocks_spi::connector::StatisticsNumericNature::TwoSidedApproximate
-        }
-        _ => novarocks_spi::connector::StatisticsNumericNature::Exact,
-    };
-    novarocks_spi::connector::StatisticsMetricState::Available(
-        novarocks_spi::connector::StatisticsMetricObservation::new(
-            value,
-            data_version.clone(),
-            novarocks_spi::connector::StatisticsMetricSource::VisibleRowScan,
-            nature,
-            novarocks_spi::connector::StatisticsBasisRelation::Identical,
-        ),
-    )
-}
-
-#[test]
-fn statistics_outcome_is_typed_and_never_carries_query_rows() {
-    let program = statistics_program();
-    let metric = novarocks_spi::connector::StatisticsMetric::RowCount;
-    let result = statistics_result(
-        &program,
-        program.plan().data_version.clone(),
-        std::collections::BTreeMap::from([(
-            metric.clone(),
-            scanned(
-                &program.plan().data_version,
-                &metric,
-                novarocks_spi::connector::StatisticsMetricValue::U64(7),
-            ),
-        )]),
-    );
-
-    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Statistics)
-        .statistics(&program, result)
-        .expect("statistics completion");
-    let collection = outcome
-        .into_statistics()
-        .expect("statistics outcome variant")
-        .into_collection_result();
-    let observation = match collection.evidence.metrics().get(&metric) {
-        Some(novarocks_spi::connector::StatisticsMetricState::Available(observation)) => {
-            observation
-        }
-        other => panic!("expected an available row count, got {other:?}"),
-    };
-    assert_eq!(
-        observation.value(),
-        &novarocks_spi::connector::StatisticsMetricValue::U64(7)
-    );
-}
-
-#[test]
-fn statistics_sink_rejects_version_drift_and_metric_expansion() {
-    let program = statistics_program();
-    let mut sink = program.result_sink();
-    let drifted_version = novarocks_spi::connector::StatisticsDataVersion::try_new(
-        Bytes::from_static(b"snapshot-43"),
-    )
-    .expect("drifted data version");
-    let drifted_basis = drifted_version.clone();
-    let drifted = statistics_result(
-        &program,
-        drifted_version,
-        std::collections::BTreeMap::from([(
-            novarocks_spi::connector::StatisticsMetric::RowCount,
-            scanned(
-                &drifted_basis,
-                &novarocks_spi::connector::StatisticsMetric::RowCount,
-                novarocks_spi::connector::StatisticsMetricValue::U64(7),
-            ),
-        )]),
-    );
-    assert_eq!(
-        sink.accept(drifted)
-            .expect_err("version drift must fail")
-            .kind(),
-        DistributedQueryErrorKind::ContractViolation
-    );
-
-    let expanded = statistics_result(
-        &program,
-        program.plan().data_version.clone(),
-        std::collections::BTreeMap::from([
-            (
-                novarocks_spi::connector::StatisticsMetric::RowCount,
-                scanned(
-                    &program.plan().data_version,
-                    &novarocks_spi::connector::StatisticsMetric::RowCount,
-                    novarocks_spi::connector::StatisticsMetricValue::U64(7),
-                ),
-            ),
-            (
-                novarocks_spi::connector::StatisticsMetric::ThetaNdv {
-                    column: Arc::from("id"),
-                },
-                scanned(
-                    &program.plan().data_version,
-                    &novarocks_spi::connector::StatisticsMetric::ThetaNdv {
-                        column: Arc::from("id"),
-                    },
-                    novarocks_spi::connector::StatisticsMetricValue::U64(7),
-                ),
-            ),
-        ]),
-    );
-    assert_eq!(
-        sink.accept(expanded)
-            .expect_err("metric expansion must fail")
-            .kind(),
-        DistributedQueryErrorKind::ContractViolation
-    );
-}
-
 #[test]
 fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     let policy = StatisticsExecutionPolicy::try_new(
@@ -610,14 +421,6 @@ fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
         .is_err()
     );
     assert!(StatisticsExecutionMode::SynchronousWait.statement_cancellation_terminates_execution());
-}
-
-#[test]
-fn statistics_theta_partials_union_without_exposing_a_sql_aggregate() {
-    let left = ThetaSketchPartial::try_from_i64_values(12, [1, 2]).expect("left partial");
-    let right = ThetaSketchPartial::try_from_i64_values(12, [2, 3]).expect("right partial");
-    let merged = ThetaSketchPartial::try_union([left, right]).expect("two-phase union");
-    assert_eq!(merged.finalize().expect("finalize union").estimate(), 3.0);
 }
 
 #[test]

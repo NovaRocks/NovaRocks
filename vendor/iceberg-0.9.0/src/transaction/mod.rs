@@ -75,7 +75,6 @@ use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
 
 /// Table transaction.
-#[derive(Clone)]
 pub struct Transaction {
     base_table: Table,
     table: Table,
@@ -133,6 +132,16 @@ impl Transaction {
         Ok(())
     }
 
+    /// Eagerly stage an already assembled action commit.
+    ///
+    /// Connector-owned composite mutations use this to place provider updates
+    /// ahead of a snapshot action while retaining transaction-local
+    /// requirement evaluation and one exported catalog payload.
+    pub fn stage_action_commit(mut self, action_commit: ActionCommit) -> Result<Self> {
+        self.stage_commit(action_commit)?;
+        Ok(self)
+    }
+
     /// Converts a stage-local precondition into the equivalent external OCC
     /// requirement against the table state at transaction start.
     fn requirement_against_base(&self, requirement: &TableRequirement) -> TableRequirement {
@@ -176,7 +185,12 @@ impl Transaction {
         }
     }
 
-    pub(crate) async fn stage_action(mut self, action: Arc<dyn TransactionAction>) -> Result<Self> {
+    /// Eagerly evaluates a custom transaction action against the current
+    /// transaction-local table and accumulates its commit payload.
+    ///
+    /// This is public for connector-owned actions that need to compose with
+    /// built-in actions before one external catalog dispatch.
+    pub async fn stage_action(mut self, action: Arc<dyn TransactionAction>) -> Result<Self> {
         let action_commit = action.commit(&self.table).await?;
         self.stage_commit(action_commit)?;
         Ok(self)
@@ -596,11 +610,9 @@ mod test_row_lineage {
         let second_snapshot_id = tx.staged_snapshot().unwrap().snapshot_id();
         assert_ne!(first_snapshot_id, second_snapshot_id);
 
-        let exported = tx.clone().into_table_commit();
-        let mut exported = exported;
-        let ref_requirements: Vec<_> = exported
-            .take_requirements()
-            .into_iter()
+        let ref_requirements: Vec<_> = tx
+            .external_requirements
+            .iter()
             .filter(|requirement| {
                 matches!(
                     requirement,

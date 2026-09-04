@@ -40,5 +40,6 @@ novarocks-secret = { path = "../../novarocks/secret" }
 novarocks-types = { path = "../../novarocks/types" }
 novarocks-version = { path = "../../novarocks/version" }
 prost = "0.13"
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tonic = { version = "0.12", features = ["transport"] }

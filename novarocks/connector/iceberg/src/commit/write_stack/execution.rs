@@ -311,7 +311,7 @@ impl IcebergDataStackWriter {
                 file.partition_spec_id,
                 descriptor,
             )?;
-            let (report, _) = staged_data_file_to_writer_report(
+            let report = staged_data_file_to_writer_report(
                 &file,
                 IcebergPartitionReport {
                     partition_path,

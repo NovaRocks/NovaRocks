@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use allocator_api2::alloc::{Allocator, Global};
+use allocator_api2::vec::Vec as AllocVec;
 use serde::{Deserialize, Serialize};
 
 const PERCENTILE_STATE_MAGIC: u8 = 0xA2;
@@ -28,17 +30,22 @@ const QUANTILE_TOLERANCE: f64 = 1e-12;
 pub const MIN_COMPRESSION: f64 = 2048.0;
 pub const MAX_COMPRESSION: f64 = 10000.0;
 pub const DEFAULT_COMPRESSION_FACTOR: usize = 10000;
+pub const MAX_QUANTILE_COUNT: usize = 4096;
+const MAX_DECODED_PROCESSED: usize = 40_000;
+const MAX_DECODED_UNPROCESSED: usize = 160_000;
+const MAX_DECODED_CUMULATIVE: usize = MAX_DECODED_PROCESSED + 1;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum QuantileSpec {
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuantileSpec<A: Allocator + Clone = Global> {
     Scalar(f64),
-    Array(Vec<f64>),
+    Array(AllocVec<f64, A>),
 }
 
 #[derive(Clone, Debug)]
-pub struct PercentileState {
-    pub digest: TDigest,
-    pub quantiles: Option<QuantileSpec>,
+pub struct PercentileState<A: Allocator + Clone = Global> {
+    allocator: A,
+    pub digest: TDigest<A>,
+    pub quantiles: Option<QuantileSpec<A>>,
     pub compression: usize,
 }
 
@@ -79,7 +86,8 @@ struct SerializableTDigest {
 }
 
 #[derive(Clone, Debug)]
-pub struct TDigest {
+pub struct TDigest<A: Allocator + Clone = Global> {
+    allocator: A,
     compression: f32,
     min: f32,
     max: f32,
@@ -87,14 +95,15 @@ pub struct TDigest {
     max_unprocessed: usize,
     processed_weight: f32,
     unprocessed_weight: f32,
-    processed: Vec<Centroid>,
-    unprocessed: Vec<Centroid>,
-    cumulative: Vec<f32>,
+    processed: AllocVec<Centroid, A>,
+    unprocessed: AllocVec<Centroid, A>,
+    cumulative: AllocVec<f32, A>,
 }
 
-impl TDigest {
-    fn new(compression: f32) -> Self {
+impl<A: Allocator + Clone> TDigest<A> {
+    fn new_in(compression: f32, allocator: A) -> Self {
         Self {
+            allocator: allocator.clone(),
             compression,
             min: f32::MAX,
             max: f32::MIN,
@@ -102,9 +111,9 @@ impl TDigest {
             max_unprocessed: (8.0 * compression.ceil()) as usize,
             processed_weight: 0.0,
             unprocessed_weight: 0.0,
-            processed: Vec::new(),
-            unprocessed: Vec::new(),
-            cumulative: Vec::new(),
+            processed: AllocVec::new_in(allocator.clone()),
+            unprocessed: AllocVec::new_in(allocator.clone()),
+            cumulative: AllocVec::new_in(allocator),
         }
     }
 
@@ -116,26 +125,58 @@ impl TDigest {
         self.processed_weight + self.unprocessed_weight
     }
 
+    fn try_clone(&self) -> Result<Self, String> {
+        Ok(Self {
+            allocator: self.allocator.clone(),
+            compression: self.compression,
+            min: self.min,
+            max: self.max,
+            max_processed: self.max_processed,
+            max_unprocessed: self.max_unprocessed,
+            processed_weight: self.processed_weight,
+            unprocessed_weight: self.unprocessed_weight,
+            processed: try_copy_slice_in(
+                &self.processed,
+                self.allocator.clone(),
+                "TDigest processed centroids",
+            )?,
+            unprocessed: try_copy_slice_in(
+                &self.unprocessed,
+                self.allocator.clone(),
+                "TDigest unprocessed centroids",
+            )?,
+            cumulative: try_copy_slice_in(
+                &self.cumulative,
+                self.allocator.clone(),
+                "TDigest cumulative weights",
+            )?,
+        })
+    }
+
     pub fn count(&self) -> f32 {
         self.total_weight()
     }
 
-    fn add(&mut self, value: f32, weight: f32) {
+    fn add(&mut self, value: f32, weight: f32) -> Result<(), String> {
         if value.is_nan() || weight <= 0.0 {
-            return;
+            return Ok(());
         }
+        self.unprocessed
+            .try_reserve(1)
+            .map_err(|_| "ResourceExhausted: reserve TDigest centroid".to_string())?;
         self.unprocessed.push(Centroid::new(value, weight));
         self.unprocessed_weight += weight;
-        self.process_if_necessary();
+        self.process_if_necessary()
     }
 
-    fn merge(&mut self, other: &TDigest) {
+    fn merge(&mut self, other: &TDigest<A>) -> Result<(), String> {
         if other.is_empty() {
-            return;
+            return Ok(());
         }
         if !other.processed.is_empty() {
             self.processed_weight += other.processed_weight;
-            self.processed = merge_sorted_centroids(&self.processed, &other.processed);
+            self.processed =
+                merge_sorted_centroids(&self.processed, &other.processed, self.allocator.clone())?;
             if let Some(first) = self.processed.first() {
                 self.min = self.min.min(first.mean);
             }
@@ -144,72 +185,62 @@ impl TDigest {
             }
         }
         if !other.unprocessed.is_empty() {
-            self.unprocessed.reserve(other.unprocessed.len());
+            self.unprocessed
+                .try_reserve(other.unprocessed.len())
+                .map_err(|_| "ResourceExhausted: reserve merged TDigest centroids".to_string())?;
             self.unprocessed.extend_from_slice(&other.unprocessed);
             self.unprocessed_weight += other.unprocessed_weight;
         }
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
-        self.process_if_necessary();
-        self.update_cumulative();
+        self.process_if_necessary()?;
+        self.update_cumulative()
     }
 
-    fn quantile(&mut self, q: f32) -> Option<f32> {
+    fn quantile(&mut self, q: f32) -> Result<Option<f32>, String> {
         if !(0.0..=1.0).contains(&q) {
-            return None;
+            return Ok(None);
         }
         if self.have_unprocessed() || self.is_dirty() {
-            self.process();
+            self.process()?;
         }
-        self.quantile_processed(q)
+        Ok(self.quantile_processed(q))
     }
 
     fn serialize_binary(&self) -> Vec<u8> {
-        let payload = SerializableTDigest {
-            compression: self.compression,
-            min: self.min,
-            max: self.max,
-            max_processed: self.max_processed,
-            max_unprocessed: self.max_unprocessed,
-            processed_weight: self.processed_weight,
-            unprocessed_weight: self.unprocessed_weight,
-            processed: self.processed.clone(),
-            unprocessed: self.unprocessed.clone(),
-            cumulative: self.cumulative.clone(),
-        };
         let mut out = Vec::with_capacity(
             4 * std::mem::size_of::<f32>()
                 + 2 * std::mem::size_of::<u64>()
                 + 3 * std::mem::size_of::<u32>()
-                + payload.processed.len() * 2 * std::mem::size_of::<f32>()
-                + payload.unprocessed.len() * 2 * std::mem::size_of::<f32>()
-                + payload.cumulative.len() * std::mem::size_of::<f32>(),
+                + self.processed.len() * 2 * std::mem::size_of::<f32>()
+                + self.unprocessed.len() * 2 * std::mem::size_of::<f32>()
+                + self.cumulative.len() * std::mem::size_of::<f32>(),
         );
-        out.extend_from_slice(&payload.compression.to_le_bytes());
-        out.extend_from_slice(&payload.min.to_le_bytes());
-        out.extend_from_slice(&payload.max.to_le_bytes());
-        out.extend_from_slice(&(payload.max_processed as u64).to_le_bytes());
-        out.extend_from_slice(&(payload.max_unprocessed as u64).to_le_bytes());
-        out.extend_from_slice(&payload.processed_weight.to_le_bytes());
-        out.extend_from_slice(&payload.unprocessed_weight.to_le_bytes());
-        out.extend_from_slice(&(payload.processed.len() as u32).to_le_bytes());
-        for centroid in &payload.processed {
+        out.extend_from_slice(&self.compression.to_le_bytes());
+        out.extend_from_slice(&self.min.to_le_bytes());
+        out.extend_from_slice(&self.max.to_le_bytes());
+        out.extend_from_slice(&(self.max_processed as u64).to_le_bytes());
+        out.extend_from_slice(&(self.max_unprocessed as u64).to_le_bytes());
+        out.extend_from_slice(&self.processed_weight.to_le_bytes());
+        out.extend_from_slice(&self.unprocessed_weight.to_le_bytes());
+        out.extend_from_slice(&(self.processed.len() as u32).to_le_bytes());
+        for centroid in &self.processed {
             out.extend_from_slice(&centroid.mean.to_le_bytes());
             out.extend_from_slice(&centroid.weight.to_le_bytes());
         }
-        out.extend_from_slice(&(payload.unprocessed.len() as u32).to_le_bytes());
-        for centroid in &payload.unprocessed {
+        out.extend_from_slice(&(self.unprocessed.len() as u32).to_le_bytes());
+        for centroid in &self.unprocessed {
             out.extend_from_slice(&centroid.mean.to_le_bytes());
             out.extend_from_slice(&centroid.weight.to_le_bytes());
         }
-        out.extend_from_slice(&(payload.cumulative.len() as u32).to_le_bytes());
-        for value in &payload.cumulative {
+        out.extend_from_slice(&(self.cumulative.len() as u32).to_le_bytes());
+        for value in &self.cumulative {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out
     }
 
-    fn deserialize_binary(payload: &[u8]) -> Result<Self, String> {
+    fn deserialize_binary_in(payload: &[u8], allocator: A) -> Result<Self, String> {
         let mut offset = 0usize;
         let compression = read_f32(payload, &mut offset, "tdigest compression")?;
         let min = read_f32(payload, &mut offset, "tdigest min")?;
@@ -219,8 +250,30 @@ impl TDigest {
         let processed_weight = read_f32(payload, &mut offset, "tdigest processed_weight")?;
         let unprocessed_weight = read_f32(payload, &mut offset, "tdigest unprocessed_weight")?;
 
+        if !compression.is_finite() || compression <= 0.0 || compression > MAX_COMPRESSION as f32 {
+            return Err(format!("tdigest compression out of bounds: {compression}"));
+        }
+        if max_processed > MAX_DECODED_PROCESSED {
+            return Err(format!(
+                "tdigest max_processed {max_processed} exceeds {MAX_DECODED_PROCESSED}"
+            ));
+        }
+        if max_unprocessed > MAX_DECODED_UNPROCESSED {
+            return Err(format!(
+                "tdigest max_unprocessed {max_unprocessed} exceeds {MAX_DECODED_UNPROCESSED}"
+            ));
+        }
+
         let processed_len = read_u32(payload, &mut offset, "tdigest processed len")? as usize;
-        let mut processed = Vec::with_capacity(processed_len);
+        if processed_len > MAX_DECODED_PROCESSED {
+            return Err(format!(
+                "tdigest processed length {processed_len} exceeds {MAX_DECODED_PROCESSED}"
+            ));
+        }
+        let mut processed = AllocVec::new_in(allocator.clone());
+        processed.try_reserve_exact(processed_len).map_err(|_| {
+            "ResourceExhausted: reserve decoded TDigest processed centroids".to_string()
+        })?;
         for _ in 0..processed_len {
             processed.push(Centroid::new(
                 read_f32(payload, &mut offset, "tdigest processed mean")?,
@@ -229,7 +282,17 @@ impl TDigest {
         }
 
         let unprocessed_len = read_u32(payload, &mut offset, "tdigest unprocessed len")? as usize;
-        let mut unprocessed = Vec::with_capacity(unprocessed_len);
+        if unprocessed_len > MAX_DECODED_UNPROCESSED {
+            return Err(format!(
+                "tdigest unprocessed length {unprocessed_len} exceeds {MAX_DECODED_UNPROCESSED}"
+            ));
+        }
+        let mut unprocessed = AllocVec::new_in(allocator.clone());
+        unprocessed
+            .try_reserve_exact(unprocessed_len)
+            .map_err(|_| {
+                "ResourceExhausted: reserve decoded TDigest unprocessed centroids".to_string()
+            })?;
         for _ in 0..unprocessed_len {
             unprocessed.push(Centroid::new(
                 read_f32(payload, &mut offset, "tdigest unprocessed mean")?,
@@ -238,7 +301,15 @@ impl TDigest {
         }
 
         let cumulative_len = read_u32(payload, &mut offset, "tdigest cumulative len")? as usize;
-        let mut cumulative = Vec::with_capacity(cumulative_len);
+        if cumulative_len > MAX_DECODED_CUMULATIVE {
+            return Err(format!(
+                "tdigest cumulative length {cumulative_len} exceeds {MAX_DECODED_CUMULATIVE}"
+            ));
+        }
+        let mut cumulative = AllocVec::new_in(allocator.clone());
+        cumulative.try_reserve_exact(cumulative_len).map_err(|_| {
+            "ResourceExhausted: reserve decoded TDigest cumulative weights".to_string()
+        })?;
         for _ in 0..cumulative_len {
             cumulative.push(read_f32(payload, &mut offset, "tdigest cumulative value")?);
         }
@@ -250,6 +321,7 @@ impl TDigest {
             ));
         }
         Ok(Self {
+            allocator,
             compression,
             min,
             max,
@@ -271,15 +343,16 @@ impl TDigest {
         self.processed.len() > self.max_processed || self.unprocessed.len() > self.max_unprocessed
     }
 
-    fn process_if_necessary(&mut self) {
+    fn process_if_necessary(&mut self) -> Result<(), String> {
         if self.is_dirty() {
-            self.process();
+            self.process()?;
         }
+        Ok(())
     }
 
-    fn process(&mut self) {
+    fn process(&mut self) -> Result<(), String> {
         if self.unprocessed.is_empty() && self.processed.is_empty() {
-            return;
+            return Ok(());
         }
 
         self.unprocessed.sort_by(|left, right| {
@@ -287,9 +360,20 @@ impl TDigest {
                 .partial_cmp(&right.mean)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let processed = std::mem::take(&mut self.processed);
+        let processed = std::mem::replace(
+            &mut self.processed,
+            AllocVec::new_in(self.allocator.clone()),
+        );
         if !processed.is_empty() {
-            let mut merged = Vec::with_capacity(self.unprocessed.len() + processed.len());
+            let merged_capacity = self
+                .unprocessed
+                .len()
+                .checked_add(processed.len())
+                .ok_or_else(|| "TDigest merged centroid length overflow".to_string())?;
+            let mut merged = AllocVec::new_in(self.allocator.clone());
+            merged
+                .try_reserve_exact(merged_capacity)
+                .map_err(|_| "ResourceExhausted: reserve sorted TDigest merge".to_string())?;
             let mut left_idx = 0usize;
             let mut right_idx = 0usize;
             while left_idx < self.unprocessed.len() && right_idx < processed.len() {
@@ -310,9 +394,13 @@ impl TDigest {
         self.unprocessed_weight = 0.0;
 
         let Some(first) = self.unprocessed.first().copied() else {
-            return;
+            return Ok(());
         };
-        self.processed = Vec::with_capacity(self.max_processed.max(1));
+        let mut processed = AllocVec::new_in(self.allocator.clone());
+        processed
+            .try_reserve_exact(self.max_processed.max(1))
+            .map_err(|_| "ResourceExhausted: reserve processed TDigest centroids".to_string())?;
+        self.processed = processed;
         self.processed.push(first);
         let mut w_so_far = first.weight;
         let mut w_limit = self.processed_weight * self.integrated_q(1.0);
@@ -329,6 +417,9 @@ impl TDigest {
                 let k1 = self.integrated_location(w_so_far / self.processed_weight);
                 w_limit = self.processed_weight * self.integrated_q(k1 + 1.0);
                 w_so_far += centroid.weight;
+                self.processed.try_reserve(1).map_err(|_| {
+                    "ResourceExhausted: grow processed TDigest centroids".to_string()
+                })?;
                 self.processed.push(centroid);
             }
         }
@@ -340,7 +431,7 @@ impl TDigest {
         self.max = self
             .max
             .max(self.processed.last().map(|c| c.mean).unwrap_or(self.max));
-        self.update_cumulative();
+        self.update_cumulative()
     }
 
     fn quantile_processed(&self, q: f32) -> Option<f32> {
@@ -377,9 +468,11 @@ impl TDigest {
         Some(Self::weighted_average(self.mean(n - 1), z1, self.max, z2))
     }
 
-    fn update_cumulative(&mut self) {
+    fn update_cumulative(&mut self) -> Result<(), String> {
         self.cumulative.clear();
-        self.cumulative.reserve(self.processed.len() + 1);
+        self.cumulative
+            .try_reserve(self.processed.len() + 1)
+            .map_err(|_| "ResourceExhausted: reserve TDigest cumulative weights".to_string())?;
         let mut previous = 0.0;
         for centroid in &self.processed {
             let half_current = centroid.weight / 2.0;
@@ -387,6 +480,7 @@ impl TDigest {
             previous += centroid.weight;
         }
         self.cumulative.push(previous);
+        Ok(())
     }
 
     fn mean(&self, idx: usize) -> f32 {
@@ -422,21 +516,70 @@ impl TDigest {
         let x = (x1 * w1 + x2 * w2) / (w1 + w2);
         x.max(x1).min(x2)
     }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.processed
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Centroid>())
+            .saturating_add(
+                self.unprocessed
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Centroid>()),
+            )
+            .saturating_add(
+                self.cumulative
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<f32>()),
+            )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PercentileStateMeta {
-    quantiles: Option<QuantileSpec>,
+    quantiles: Option<SerializableQuantileSpec>,
     compression: usize,
 }
 
-impl Default for PercentileState {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum SerializableQuantileSpec {
+    Scalar(f64),
+    Array(Vec<f64>),
+}
+
+impl Default for PercentileState<Global> {
     fn default() -> Self {
+        Self::new_in(DEFAULT_COMPRESSION_FACTOR, Global)
+    }
+}
+
+impl<A: Allocator + Clone> PercentileState<A> {
+    pub fn new_in(compression: usize, allocator: A) -> Self {
         Self {
-            digest: TDigest::new(DEFAULT_COMPRESSION_FACTOR as f32),
+            allocator: allocator.clone(),
+            digest: TDigest::new_in(compression as f32, allocator),
             quantiles: None,
-            compression: DEFAULT_COMPRESSION_FACTOR,
+            compression,
         }
+    }
+
+    pub fn allocator(&self) -> A {
+        self.allocator.clone()
+    }
+
+    /// Heap bytes owned by containers in this state. The state body itself is
+    /// charged by its aggregate arena (or by its ordinary owner on scalar paths).
+    #[cfg(test)]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let quantile_bytes = match &self.quantiles {
+            Some(QuantileSpec::Array(values)) => {
+                values.capacity().saturating_mul(std::mem::size_of::<f64>())
+            }
+            _ => 0,
+        };
+        std::mem::size_of::<Self>()
+            .saturating_add(self.digest.retained_bytes())
+            .saturating_add(quantile_bytes)
     }
 }
 
@@ -459,12 +602,16 @@ pub fn normalize_compression(compression: Option<f64>) -> Result<usize, String> 
     Ok(value.round() as usize)
 }
 
-pub fn add_value(state: &mut PercentileState, value: f64) {
-    state.digest.add(value as f32, 1.0);
+pub fn add_value<A: Allocator + Clone>(
+    state: &mut PercentileState<A>,
+    value: f64,
+) -> Result<(), String> {
+    state.digest.add(value as f32, 1.0)?;
+    validate_state(state)
 }
 
-pub fn add_weighted_value(
-    state: &mut PercentileState,
+pub fn add_weighted_value<A: Allocator + Clone>(
+    state: &mut PercentileState<A>,
     value: f64,
     weight: i64,
 ) -> Result<(), String> {
@@ -477,11 +624,14 @@ pub fn add_weighted_value(
     if weight == 0 {
         return Ok(());
     }
-    state.digest.add(value as f32, weight as f32);
-    Ok(())
+    state.digest.add(value as f32, weight as f32)?;
+    validate_state(state)
 }
 
-pub fn set_quantile(state: &mut PercentileState, quantile: f64) -> Result<(), String> {
+pub fn set_quantile<A: Allocator + Clone>(
+    state: &mut PercentileState<A>,
+    quantile: f64,
+) -> Result<(), String> {
     validate_quantile(quantile)?;
     match &state.quantiles {
         Some(QuantileSpec::Scalar(existing)) => {
@@ -505,11 +655,21 @@ pub fn set_quantile(state: &mut PercentileState, quantile: f64) -> Result<(), St
     Ok(())
 }
 
-pub fn set_quantiles(state: &mut PercentileState, quantiles: Vec<f64>) -> Result<(), String> {
+pub fn set_quantiles<A: Allocator + Clone>(
+    state: &mut PercentileState<A>,
+    quantiles: &[f64],
+) -> Result<(), String> {
     if quantiles.is_empty() {
         return Err("percentile array cannot be empty".to_string());
     }
-    for &quantile in &quantiles {
+    if quantiles.len() > MAX_QUANTILE_COUNT {
+        return Err(format!(
+            "percentile quantile count {} exceeds {}",
+            quantiles.len(),
+            MAX_QUANTILE_COUNT
+        ));
+    }
+    for &quantile in quantiles {
         validate_quantile(quantile)?;
     }
     match &state.quantiles {
@@ -522,39 +682,51 @@ pub fn set_quantiles(state: &mut PercentileState, quantiles: Vec<f64>) -> Result
             }
         }
         Some(QuantileSpec::Array(existing)) => {
-            if !same_quantile_vec(existing, &quantiles) {
+            if !same_quantile_vec(existing, quantiles) {
                 return Err("percentile quantile array mismatch while merging states".to_string());
             }
         }
-        None => state.quantiles = Some(QuantileSpec::Array(quantiles)),
+        None => {
+            state.quantiles = Some(QuantileSpec::Array(try_copy_slice_in(
+                quantiles,
+                state.allocator.clone(),
+                "percentile quantile array",
+            )?))
+        }
     }
     Ok(())
 }
 
-pub fn set_compression(state: &mut PercentileState, compression: f64) -> Result<(), String> {
+pub fn set_compression<A: Allocator + Clone>(
+    state: &mut PercentileState<A>,
+    compression: f64,
+) -> Result<(), String> {
     let normalized = normalize_compression(Some(compression))?;
     state.compression = normalized;
     if state.digest.is_empty() {
-        state.digest = TDigest::new(normalized as f32);
+        state.digest = TDigest::new_in(normalized as f32, state.allocator.clone());
     }
     Ok(())
 }
 
-pub fn merge_state(target: &mut PercentileState, incoming: &PercentileState) -> Result<(), String> {
+pub fn merge_state<A: Allocator + Clone>(
+    target: &mut PercentileState<A>,
+    incoming: &PercentileState<A>,
+) -> Result<(), String> {
     if let Some(quantiles) = &incoming.quantiles {
         match quantiles {
             QuantileSpec::Scalar(q) => set_quantile(target, *q)?,
-            QuantileSpec::Array(qs) => set_quantiles(target, qs.clone())?,
+            QuantileSpec::Array(qs) => set_quantiles(target, qs)?,
         }
     }
     if target.digest.is_empty() {
         target.compression = incoming.compression;
-        target.digest = incoming.digest.clone();
-        return Ok(());
+        target.digest = incoming.digest.try_clone()?;
+        return validate_state(target);
     }
     target.compression = target.compression.max(incoming.compression);
-    target.digest.merge(&incoming.digest);
-    Ok(())
+    target.digest.merge(&incoming.digest)?;
+    validate_state(target)
 }
 
 pub fn merge_serialized_state_into(
@@ -565,17 +737,35 @@ pub fn merge_serialized_state_into(
     merge_state(target, &decoded)
 }
 
+/// Aggregate execution accepts only the current bounded binary format. Legacy
+/// JSON v3 decoding remains available to scalar compatibility readers, but it
+/// has no allocation bound and therefore cannot enter a hard-limited aggregate
+/// state.
+pub fn merge_bounded_serialized_state_into(
+    target: &mut PercentileState<impl Allocator + Clone>,
+    payload: &[u8],
+) -> Result<(), String> {
+    if payload.get(1).copied() != Some(PERCENTILE_STATE_VERSION) {
+        return Err(format!(
+            "bounded percentile aggregate requires state version {PERCENTILE_STATE_VERSION}"
+        ));
+    }
+    let decoded = decode_state_v4_in(payload, target.allocator())?;
+    merge_state(target, &decoded)?;
+    validate_state(target)
+}
+
 pub fn encode_empty_state() -> Vec<u8> {
     encode_state(&PercentileState::default())
 }
 
 pub fn encode_single_value(value: f64) -> Vec<u8> {
     let mut state = PercentileState::default();
-    add_value(&mut state, value);
+    add_value(&mut state, value).expect("single percentile value must fit bounded TDigest");
     encode_state(&state)
 }
 
-pub fn encode_state(state: &PercentileState) -> Vec<u8> {
+pub fn encode_state<A: Allocator + Clone>(state: &PercentileState<A>) -> Vec<u8> {
     let (quantile_kind, quantiles) = match &state.quantiles {
         Some(QuantileSpec::Scalar(q)) => (QUANTILE_KIND_SCALAR, std::slice::from_ref(q)),
         Some(QuantileSpec::Array(values)) => (QUANTILE_KIND_ARRAY, values.as_slice()),
@@ -627,39 +817,61 @@ pub fn decode_state(payload: &[u8]) -> Result<PercentileState, String> {
     }
 }
 
-pub fn quantile_value(state: &PercentileState, quantile: f64) -> Option<f64> {
+pub fn quantile_value<A: Allocator + Clone>(
+    state: &PercentileState<A>,
+    quantile: f64,
+) -> Result<Option<f64>, String> {
     let mut digest = state.digest.clone();
-    digest.quantile(quantile as f32).map(|value| value as f64)
+    Ok(digest.quantile(quantile as f32)?.map(|value| value as f64))
 }
 
-pub fn quantile_from_state(state: &PercentileState, quantile: Option<f64>) -> Option<f64> {
+pub fn quantile_from_state<A: Allocator + Clone>(
+    state: &PercentileState<A>,
+    quantile: Option<f64>,
+) -> Result<Option<f64>, String> {
     let q = match quantile {
         Some(q) => q,
         None => match &state.quantiles {
             Some(QuantileSpec::Scalar(q)) => *q,
             Some(QuantileSpec::Array(values)) if values.len() == 1 => values[0],
-            _ => return None,
+            _ => return Ok(None),
         },
     };
     quantile_value(state, q)
 }
 
-pub fn quantiles_from_state(state: &PercentileState) -> Option<Vec<f64>> {
+pub fn quantiles_from_state<A: Allocator + Clone>(
+    state: &PercentileState<A>,
+) -> Result<Option<Vec<f64>>, String> {
     let quantiles = match &state.quantiles {
         Some(QuantileSpec::Scalar(q)) => vec![*q],
-        Some(QuantileSpec::Array(values)) => values.clone(),
-        None => return None,
+        Some(QuantileSpec::Array(values)) => values.iter().copied().collect(),
+        None => return Ok(None),
     };
     if state.digest.is_empty() {
-        return Some(vec![f64::NAN; quantiles.len()]);
+        return Ok(Some(vec![f64::NAN; quantiles.len()]));
     }
     let mut digest = state.digest.clone();
-    Some(
+    Ok(Some(
         quantiles
             .into_iter()
-            .map(|q| digest.quantile(q as f32).unwrap_or(f32::NAN) as f64)
-            .collect(),
-    )
+            .map(|q| Ok(digest.quantile(q as f32)?.unwrap_or(f32::NAN) as f64))
+            .collect::<Result<Vec<_>, String>>()?,
+    ))
+}
+
+pub fn validate_state<A: Allocator + Clone>(state: &PercentileState<A>) -> Result<(), String> {
+    let quantile_count = match &state.quantiles {
+        Some(QuantileSpec::Array(values)) => values.len(),
+        Some(QuantileSpec::Scalar(_)) => 1,
+        None => 0,
+    };
+    if quantile_count > MAX_QUANTILE_COUNT {
+        return Err(format!(
+            "percentile quantile count {quantile_count} exceeds {MAX_QUANTILE_COUNT}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_quantile(quantile: f64) -> Result<(), String> {
@@ -683,14 +895,25 @@ fn same_quantile_vec(left: &[f64], right: &[f64]) -> bool {
             .all(|(l, r)| (*l - *r).abs() <= QUANTILE_TOLERANCE)
 }
 
-fn merge_sorted_centroids(left: &[Centroid], right: &[Centroid]) -> Vec<Centroid> {
+fn merge_sorted_centroids<A: Allocator + Clone>(
+    left: &[Centroid],
+    right: &[Centroid],
+    allocator: A,
+) -> Result<AllocVec<Centroid, A>, String> {
     if left.is_empty() {
-        return right.to_vec();
+        return try_copy_slice_in(right, allocator, "TDigest right centroids");
     }
     if right.is_empty() {
-        return left.to_vec();
+        return try_copy_slice_in(left, allocator, "TDigest left centroids");
     }
-    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let capacity = left
+        .len()
+        .checked_add(right.len())
+        .ok_or_else(|| "TDigest merge length overflow".to_string())?;
+    let mut merged = AllocVec::new_in(allocator);
+    merged
+        .try_reserve_exact(capacity)
+        .map_err(|_| "ResourceExhausted: reserve TDigest merge".to_string())?;
     let mut left_idx = 0usize;
     let mut right_idx = 0usize;
     while left_idx < left.len() && right_idx < right.len() {
@@ -704,10 +927,17 @@ fn merge_sorted_centroids(left: &[Centroid], right: &[Centroid]) -> Vec<Centroid
     }
     merged.extend_from_slice(&left[left_idx..]);
     merged.extend_from_slice(&right[right_idx..]);
-    merged
+    Ok(merged)
 }
 
 fn decode_state_v4(payload: &[u8]) -> Result<PercentileState, String> {
+    decode_state_v4_in(payload, Global)
+}
+
+fn decode_state_v4_in<A: Allocator + Clone>(
+    payload: &[u8],
+    allocator: A,
+) -> Result<PercentileState<A>, String> {
     if payload.len() < HEADER_LEN {
         return Err("percentile state payload too short".to_string());
     }
@@ -722,6 +952,16 @@ fn decode_state_v4(payload: &[u8]) -> Result<PercentileState, String> {
             .try_into()
             .map_err(|_| "percentile state quantile count decode failed".to_string())?,
     ) as usize;
+    if quantile_count > MAX_QUANTILE_COUNT {
+        return Err(format!(
+            "percentile state quantile count {quantile_count} exceeds {MAX_QUANTILE_COUNT}"
+        ));
+    }
+    if compression == 0 || compression > MAX_COMPRESSION as usize {
+        return Err(format!(
+            "percentile state compression {compression} exceeds bounded range"
+        ));
+    }
     let quantile_bytes = quantile_count
         .checked_mul(std::mem::size_of::<f64>())
         .ok_or_else(|| "percentile state quantile bytes overflow".to_string())?;
@@ -732,7 +972,10 @@ fn decode_state_v4(payload: &[u8]) -> Result<PercentileState, String> {
         return Err("percentile state quantile payload truncated".to_string());
     }
 
-    let mut quantiles = Vec::with_capacity(quantile_count);
+    let mut quantiles = AllocVec::new_in(allocator.clone());
+    quantiles
+        .try_reserve_exact(quantile_count)
+        .map_err(|_| "ResourceExhausted: reserve decoded percentile quantiles".to_string())?;
     let mut offset = HEADER_LEN;
     for _ in 0..quantile_count {
         quantiles.push(read_f64(payload, &mut offset, "percentile state quantile")?);
@@ -751,15 +994,31 @@ fn decode_state_v4(payload: &[u8]) -> Result<PercentileState, String> {
     };
 
     let digest = if payload.len() == quantile_end {
-        TDigest::new(compression as f32)
+        TDigest::new_in(compression as f32, allocator.clone())
     } else {
-        TDigest::deserialize_binary(&payload[quantile_end..])?
+        TDigest::deserialize_binary_in(&payload[quantile_end..], allocator.clone())?
     };
-    Ok(PercentileState {
+    let state = PercentileState {
+        allocator,
         digest,
         quantiles,
         compression,
-    })
+    };
+    validate_state(&state)?;
+    Ok(state)
+}
+
+fn try_copy_slice_in<T: Copy, A: Allocator + Clone>(
+    values: &[T],
+    allocator: A,
+    label: &str,
+) -> Result<AllocVec<T, A>, String> {
+    let mut copied = AllocVec::new_in(allocator);
+    copied
+        .try_reserve_exact(values.len())
+        .map_err(|_| format!("ResourceExhausted: reserve {label}"))?;
+    copied.extend_from_slice(values);
+    Ok(copied)
 }
 
 fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, String> {
@@ -774,11 +1033,12 @@ fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, String> {
     let meta: PercentileStateMeta =
         serde_json::from_slice(&payload[6..6 + meta_len]).map_err(|e| e.to_string())?;
     let digest = if payload.len() == 6 + meta_len {
-        TDigest::new(meta.compression as f32)
+        TDigest::new_in(meta.compression as f32, Global)
     } else {
         let decoded: SerializableTDigest =
             serde_json::from_slice(&payload[6 + meta_len..]).map_err(|e| e.to_string())?;
         TDigest {
+            allocator: Global,
             compression: decoded.compression,
             min: decoded.min,
             max: decoded.max,
@@ -786,14 +1046,20 @@ fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, String> {
             max_unprocessed: decoded.max_unprocessed,
             processed_weight: decoded.processed_weight,
             unprocessed_weight: decoded.unprocessed_weight,
-            processed: decoded.processed,
-            unprocessed: decoded.unprocessed,
-            cumulative: decoded.cumulative,
+            processed: decoded.processed.into_iter().collect(),
+            unprocessed: decoded.unprocessed.into_iter().collect(),
+            cumulative: decoded.cumulative.into_iter().collect(),
         }
     };
     Ok(PercentileState {
+        allocator: Global,
         digest,
-        quantiles: meta.quantiles,
+        quantiles: meta.quantiles.map(|quantiles| match quantiles {
+            SerializableQuantileSpec::Scalar(value) => QuantileSpec::Scalar(value),
+            SerializableQuantileSpec::Array(values) => {
+                QuantileSpec::Array(values.into_iter().collect())
+            }
+        }),
         compression: meta.compression,
     })
 }
@@ -841,9 +1107,9 @@ mod tests {
     #[test]
     fn tdigest_round_trip_preserves_weight() {
         let mut state = PercentileState::default();
-        add_value(&mut state, 1.0);
-        add_value(&mut state, 2.0);
-        add_value(&mut state, 3.0);
+        add_value(&mut state, 1.0).unwrap();
+        add_value(&mut state, 2.0).unwrap();
+        add_value(&mut state, 3.0).unwrap();
         let encoded = encode_state(&state);
         let decoded = decode_state(&encoded).expect("decode");
         assert_eq!(decoded.digest.total_weight() as i64, 3);
@@ -852,10 +1118,10 @@ mod tests {
     #[test]
     fn merge_serialized_state_into_empty_target_preserves_compression() {
         let mut source = PercentileState::default();
-        set_quantiles(&mut source, vec![0.5, 0.9]).expect("set quantiles");
+        set_quantiles(&mut source, &[0.5, 0.9]).expect("set quantiles");
         set_compression(&mut source, 5000.0).expect("set compression");
         for value in 1..=50_000 {
-            add_value(&mut source, value as f64);
+            add_value(&mut source, value as f64).unwrap();
         }
 
         let payload = encode_state(&source);
@@ -868,5 +1134,51 @@ mod tests {
 
         assert_eq!(merged.compression, 5000);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn retained_bytes_tracks_quantiles_digest_growth_and_merge() {
+        let mut source = PercentileState::default();
+        let empty = source.retained_bytes();
+        set_quantiles(&mut source, &Vec::with_capacity(8)).expect_err("empty quantiles");
+        assert_eq!(source.retained_bytes(), empty);
+
+        let mut quantiles = Vec::with_capacity(8);
+        quantiles.extend([0.1, 0.5, 0.9]);
+        set_quantiles(&mut source, &quantiles).expect("set quantiles");
+        let with_quantiles = source.retained_bytes();
+        let retained_quantile_bytes = match &source.quantiles {
+            Some(QuantileSpec::Array(values)) => values.capacity() * std::mem::size_of::<f64>(),
+            _ => panic!("array quantiles must remain an array"),
+        };
+        assert_eq!(with_quantiles, empty + retained_quantile_bytes);
+
+        for value in 0..1024 {
+            add_value(&mut source, value as f64).unwrap();
+        }
+        let with_digest = source.retained_bytes();
+        assert!(with_digest > with_quantiles);
+
+        let mut merged = PercentileState::default();
+        merge_state(&mut merged, &source).expect("merge state");
+        let expected_quantiles = match &merged.quantiles {
+            Some(QuantileSpec::Array(values)) => values.capacity() * std::mem::size_of::<f64>(),
+            _ => 0,
+        };
+        assert_eq!(
+            merged.retained_bytes(),
+            std::mem::size_of::<PercentileState>()
+                + merged.digest.retained_bytes()
+                + expected_quantiles
+        );
+        assert!(merged.retained_bytes() > empty);
+    }
+
+    #[test]
+    fn failed_weighted_update_does_not_change_retained_bytes() {
+        let mut state = PercentileState::default();
+        let before = state.retained_bytes();
+        assert!(add_weighted_value(&mut state, 1.0, -1).is_err());
+        assert_eq!(state.retained_bytes(), before);
     }
 }

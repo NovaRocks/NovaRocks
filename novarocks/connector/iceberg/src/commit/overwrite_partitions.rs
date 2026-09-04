@@ -47,7 +47,6 @@ use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::data_file::clone_data_file_with_first_row_id;
-use super::fast_append::register_puffin_stats;
 use super::helpers::{
     OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary, submit_occ_action,
@@ -79,7 +78,6 @@ fn partition_match_in_touched(
 }
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
-use crate::stats_assembler::CommitType;
 
 pub struct OverwritePartitionsCommit;
 
@@ -136,7 +134,6 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
             snapshot_properties: ctx.snapshot_properties.clone(),
         });
 
-        let sketch_sets = ctx.collector.take_sketch_sets();
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
         let written_manifest_paths = || {
             manifest_paths_out
@@ -156,18 +153,6 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
                     Err(_) if prev_snapshot_id.is_none() => 0,
                     Err(err) => return Err(err),
                 };
-                let new_sequence_number = table_after.metadata().last_sequence_number();
-                register_puffin_stats(
-                    &table_after,
-                    ctx.catalog,
-                    ctx.file_io,
-                    CommitType::Overwrite,
-                    sketch_sets,
-                    new_snapshot_id,
-                    new_sequence_number,
-                    prev_snapshot_id,
-                )
-                .await;
                 Ok(CommitOutcome {
                     new_snapshot_id,
                     written_manifest_paths: written_manifest_paths(),

@@ -36,6 +36,7 @@ use arrow::array::ArrayRef;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_table::KeyTable;
+use crate::runtime::mem_tracker::MemTracker;
 
 use super::set_op_stage::SetOpStageController;
 
@@ -92,7 +93,11 @@ impl<S: DistinctSetSemantics> DistinctSetSharedState<S> {
         Arc::clone(&self.output_chunk_schema)
     }
 
-    pub(crate) fn ingest_build(&self, chunk: &Chunk) -> Result<(), String> {
+    pub(crate) fn ingest_build(
+        &self,
+        chunk: &Chunk,
+        tracker: Arc<MemTracker>,
+    ) -> Result<(), String> {
         if chunk.is_empty() {
             return Ok(());
         }
@@ -109,17 +114,24 @@ impl<S: DistinctSetSemantics> DistinctSetSharedState<S> {
                 .iter()
                 .map(|a| a.data_type().clone())
                 .collect::<Vec<_>>();
-            guard.key_table = Some(KeyTable::new(key_types, false)?);
+            guard.key_table = Some(KeyTable::new_with_tracker(
+                key_types,
+                false,
+                MemTracker::new_child("DistinctSetKeyTable", &tracker),
+            )?);
         }
         let (rows, hashes) = {
             let table = guard.key_table.as_mut().expect("key table");
-            let rows = table.build_rows(&arrays)?;
+            let rows = table.build_rows_fallback(&arrays)?;
             let hashes = table.build_group_hashes(&key_views, num_rows)?;
             (rows, hashes)
         };
 
         for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
-            let row_bytes = rows.row(row).data();
+            let row_bytes = rows
+                .get(row)
+                .map(|row| row.as_slice())
+                .ok_or_else(|| "distinct set serialized build row missing".to_string())?;
             let lookup = {
                 let table = guard.key_table.as_mut().expect("key table");
                 table.find_or_insert_from_row(&key_views, row, row_bytes, hash)?
@@ -151,13 +163,16 @@ impl<S: DistinctSetSemantics> DistinctSetSharedState<S> {
         };
         let (rows, hashes) = {
             let table = guard.key_table.as_ref().expect("key table");
-            let rows = table.build_rows(&arrays)?;
+            let rows = table.build_rows_fallback(&arrays)?;
             let hashes = table.build_group_hashes(&key_views, num_rows)?;
             (rows, hashes)
         };
 
         for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
-            let row_bytes = rows.row(row).data();
+            let row_bytes = rows
+                .get(row)
+                .map(|row| row.as_slice())
+                .ok_or_else(|| "distinct set serialized probe row missing".to_string())?;
             let group_id_opt = {
                 let table = guard.key_table.as_ref().expect("key table");
                 table.lookup_serialized(row_bytes, hash)?

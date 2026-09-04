@@ -15,24 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, MapArray, NullArray};
 use arrow::datatypes::DataType;
 
+use crate::exec::expr::agg::{
+    AggregateAllocator, AggregateHashMap, AggregateVec, aggregate_hash_map,
+};
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{AggScalarValue, build_scalar_array, compare_scalar_values, scalar_from_array};
+use super::common::{
+    AggScalarValue, TrackedAggScalarValue, build_scalar_array, compare_scalar_values,
+    tracked_optional_key_fingerprint, tracked_scalar_from_array, tracked_scalar_to_output,
+};
 
 pub(super) struct SumMapAgg;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 struct SumMapState {
+    allocator: AggregateAllocator,
     saw_non_null_map: bool,
-    indexes: HashMap<Vec<u8>, usize>,
-    entries: Vec<(Option<AggScalarValue>, AggScalarValue)>,
+    indexes: AggregateHashMap<AggregateVec<u8>, usize>,
+    entries: AggregateVec<(Option<TrackedAggScalarValue>, TrackedAggScalarValue)>,
+}
+
+impl SumMapState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            indexes: aggregate_hash_map(allocator.clone()),
+            entries: AggregateVec::new_in(allocator.clone()),
+            allocator,
+            saw_non_null_map: false,
+        }
+    }
 }
 
 impl AggregateFunction for SumMapAgg {
@@ -115,14 +135,37 @@ impl AggregateFunction for SumMapAgg {
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
-            std::ptr::write(ptr as *mut SumMapState, SumMapState::default());
+            std::ptr::write(
+                ptr as *mut SumMapState,
+                SumMapState::new(process_mem_tracker()),
+            );
         }
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker
+            .ok_or_else(|| "allocation-tracked sum_map requires a memory tracker".to_string())?;
+        unsafe { ptr.cast::<SumMapState>().write(SumMapState::new(tracker)) };
+        Ok(())
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             std::ptr::drop_in_place(ptr as *mut SumMapState);
         }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -179,8 +222,13 @@ impl AggregateFunction for SumMapAgg {
             let mut entries = state
                 .entries
                 .iter()
-                .map(|(k, v)| (k.clone(), Some(v.clone())))
-                .collect::<Vec<_>>();
+                .map(|(key, value)| {
+                    Ok((
+                        key.as_ref().map(tracked_scalar_to_output).transpose()?,
+                        Some(tracked_scalar_to_output(value)?),
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             entries.sort_by(compare_map_entry_keys);
             out.push(Some(AggScalarValue::Map(entries)));
         }
@@ -206,15 +254,24 @@ fn merge_map_array(
         let start = offsets[row] as usize;
         let end = offsets[row + 1] as usize;
         for idx in start..end {
-            let Some(value) = scalar_from_array(&values, idx)? else {
+            let Some(value) = tracked_scalar_from_array(&values, idx, &state.allocator)? else {
                 continue;
             };
-            let key = scalar_from_array(&keys, idx)?;
-            let fp = fingerprint_optional_scalar(&key);
+            let key = tracked_scalar_from_array(&keys, idx, &state.allocator)?;
+            let fp = tracked_optional_key_fingerprint(&key, &state.allocator)?;
             if let Some(existing_idx) = state.indexes.get(&fp).copied() {
                 sum_scalar_in_place(&mut state.entries[existing_idx].1, &value)?;
             } else {
                 let insert_idx = state.entries.len();
+                state.indexes.try_reserve(1).map_err(|_| {
+                    state
+                        .allocator
+                        .allocation_error("reserve sum_map key index")
+                })?;
+                state
+                    .entries
+                    .try_reserve(1)
+                    .map_err(|_| state.allocator.allocation_error("reserve sum_map entries"))?;
                 state.indexes.insert(fp, insert_idx);
                 state.entries.push((key, value));
             }
@@ -243,136 +300,32 @@ fn compare_optional_scalars(
 }
 
 fn sum_scalar_in_place(
-    target: &mut AggScalarValue,
-    incoming: &AggScalarValue,
+    target: &mut TrackedAggScalarValue,
+    incoming: &TrackedAggScalarValue,
 ) -> Result<(), String> {
     match (target, incoming) {
-        (AggScalarValue::Int64(left), AggScalarValue::Int64(right)) => {
+        (TrackedAggScalarValue::Int64(left), TrackedAggScalarValue::Int64(right)) => {
             *left = left
                 .checked_add(*right)
                 .ok_or_else(|| "sum_map int64 overflow".to_string())?;
             Ok(())
         }
-        (AggScalarValue::Float64(left), AggScalarValue::Float64(right)) => {
+        (TrackedAggScalarValue::Float64(left), TrackedAggScalarValue::Float64(right)) => {
             *left += *right;
             Ok(())
         }
-        (AggScalarValue::Decimal128(left), AggScalarValue::Decimal128(right)) => {
+        (TrackedAggScalarValue::Decimal128(left), TrackedAggScalarValue::Decimal128(right)) => {
             *left = left
                 .checked_add(*right)
                 .ok_or_else(|| "sum_map decimal128 overflow".to_string())?;
             Ok(())
         }
-        (AggScalarValue::Decimal256(left), AggScalarValue::Decimal256(right)) => {
+        (TrackedAggScalarValue::Decimal256(left), TrackedAggScalarValue::Decimal256(right)) => {
             *left = left
                 .checked_add(*right)
                 .ok_or_else(|| "sum_map decimal256 overflow".to_string())?;
             Ok(())
         }
         _ => Err("sum_map value type mismatch".to_string()),
-    }
-}
-
-fn fingerprint_optional_scalar(value: &Option<AggScalarValue>) -> Vec<u8> {
-    let mut out = Vec::new();
-    match value {
-        None => out.push(0),
-        Some(value) => {
-            out.push(1);
-            encode_scalar(&mut out, value);
-        }
-    }
-    out
-}
-
-fn encode_scalar(out: &mut Vec<u8>, value: &AggScalarValue) {
-    match value {
-        AggScalarValue::Bool(v) => {
-            out.push(1);
-            out.push(if *v { 1 } else { 0 });
-        }
-        AggScalarValue::Int64(v) => {
-            out.push(2);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        AggScalarValue::Float64(v) => {
-            out.push(3);
-            out.extend_from_slice(&v.to_bits().to_le_bytes());
-        }
-        AggScalarValue::Utf8(v) => {
-            out.push(4);
-            let len = v.len() as u32;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(v.as_bytes());
-        }
-        AggScalarValue::Date32(v) => {
-            out.push(5);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        AggScalarValue::Timestamp(v) => {
-            out.push(6);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        AggScalarValue::Decimal128(v) => {
-            out.push(7);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        AggScalarValue::Struct(items) => {
-            out.push(8);
-            out.extend_from_slice(&(items.len() as u32).to_le_bytes());
-            for item in items {
-                match item {
-                    Some(value) => {
-                        out.push(1);
-                        encode_scalar(out, value);
-                    }
-                    None => out.push(0),
-                }
-            }
-        }
-        AggScalarValue::Map(items) => {
-            out.push(9);
-            out.extend_from_slice(&(items.len() as u32).to_le_bytes());
-            for (key, value) in items {
-                match key {
-                    Some(value) => {
-                        out.push(1);
-                        encode_scalar(out, value);
-                    }
-                    None => out.push(0),
-                }
-                match value {
-                    Some(value) => {
-                        out.push(1);
-                        encode_scalar(out, value);
-                    }
-                    None => out.push(0),
-                }
-            }
-        }
-        AggScalarValue::List(items) => {
-            out.push(10);
-            out.extend_from_slice(&(items.len() as u32).to_le_bytes());
-            for item in items {
-                match item {
-                    Some(value) => {
-                        out.push(1);
-                        encode_scalar(out, value);
-                    }
-                    None => out.push(0),
-                }
-            }
-        }
-        AggScalarValue::Decimal256(v) => {
-            out.push(11);
-            let text = v.to_string();
-            out.extend_from_slice(&(text.len() as u32).to_le_bytes());
-            out.extend_from_slice(text.as_bytes());
-        }
-        AggScalarValue::Binary(v) => {
-            out.push(12);
-            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
-            out.extend_from_slice(v);
-        }
     }
 }

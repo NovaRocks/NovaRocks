@@ -694,9 +694,9 @@ impl HllHandle {
 }
 
 /*
- * `DsHllAgg` currently stores only a pointer in AggStateArena. Its DataSketches heap is not wired
- * to the generic query memory tracker; that wiring belongs to the later NCP-8 aggregate-memory
- * work. Callers without such an admission owner use the explicitly named unreserved methods.
+ * Aggregate callers preflight and reserve each operation, then reconcile the actual retained
+ * allocation reported by the handle before releasing headroom. Callers without such an admission
+ * owner use the explicitly named unreserved methods.
  */
 
 #[cfg(test)]

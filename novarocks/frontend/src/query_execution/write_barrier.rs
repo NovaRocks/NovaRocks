@@ -24,10 +24,10 @@
 //!   finished, every sender reached EOS, the finish node emitted, and the
 //!   frontend received all of it. It says nothing about whether some other
 //!   participant failed.
-//! * **Execution succeeded.** Proved by the lifecycle terminal set. It says
-//!   every participant of this exact attempt terminated successfully. Since
-//!   the lifecycle no longer carries staged artifacts, it says nothing about
-//!   whether the frontend actually received the write data.
+//! * **Execution succeeded.** Proved by the task substrate's verdict over the
+//!   frozen writer set and root finish task. It refuses a writer that stood
+//!   down or a task that published undeclared writer facts, while saying
+//!   nothing about whether the frontend received the complete write data.
 //!
 //! Before this split, one signal stood for both, and a query could reach a
 //! commit on the strength of half the evidence. Keeping them separate is the
@@ -48,16 +48,12 @@ pub(crate) enum WriteCommitBlocked {
     PreparedWriteSetIncomplete,
     /// At least one participant of this attempt did not succeed.
     ExecutionDidNotSucceed,
-    /// The statement was cancelled or its deadline expired before commit.
+    /// The statement was cancelled before commit.
     Cancelled,
     /// The task substrate answered with something other than a completion.
     TaskExecutionIncomplete,
-    /// Both authorities were consulted for one attempt.
-    ///
-    /// One attempt is judged by exactly one authority. Accepting whichever
-    /// arrived last, or either one that said yes, would let the weaker rule
-    /// decide a commit whenever both were wired up.
-    ConflictingExecutionEvidence,
+    /// The statement deadline expired before the external effect began.
+    DeadlineExpired,
 }
 
 impl WriteCommitBlocked {
@@ -73,38 +69,18 @@ impl WriteCommitBlocked {
             Self::TaskExecutionIncomplete => {
                 "connector write execution did not complete on the task substrate"
             }
-            Self::ConflictingExecutionEvidence => {
-                "connector write execution was judged by two authorities at once"
-            }
+            Self::DeadlineExpired => "connector write deadline expired before its external commit",
         }
     }
-}
-
-/// Which authority proved that execution succeeded.
-///
-/// The task substrate's verdict is strictly stronger than the lifecycle
-/// terminal set: beyond "every participant terminated successfully" it also
-/// refuses a writer that stood down normally and a task that reported writer
-/// facts without being declared a writer. Both are ways a partial write looks
-/// like a whole one to a rule that only counts terminals.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ExecutionEvidence {
-    #[default]
-    None,
-    /// The old lifecycle terminal set, removed with the old stack.
-    LifecycleTerminals(bool),
-    /// The task substrate's verdict over the frozen writer set.
-    TaskVerdict(WriteVerdict),
 }
 
 /// Accumulates the independent facts and answers one question.
 #[derive(Debug, Default)]
 pub(crate) struct WriteCommitBarrier {
     prepared: Option<DecodedPreparedWriteSet>,
-    execution: ExecutionEvidence,
-    /// Set once both authorities have spoken for this attempt.
-    conflicting: bool,
+    execution: Option<WriteVerdict>,
     cancelled: bool,
+    deadline_expired: bool,
 }
 
 impl WriteCommitBarrier {
@@ -121,17 +97,6 @@ impl WriteCommitBarrier {
         self.prepared = Some(prepared);
     }
 
-    /// Record whether every participant of the exact attempt succeeded.
-    pub(crate) const fn observe_execution_terminals(&mut self, succeeded: bool) {
-        self.execution = match self.execution {
-            ExecutionEvidence::None | ExecutionEvidence::LifecycleTerminals(_) => {
-                ExecutionEvidence::LifecycleTerminals(succeeded)
-            }
-            ExecutionEvidence::TaskVerdict(_) => ExecutionEvidence::None,
-        };
-        self.conflicting |= matches!(self.execution, ExecutionEvidence::None);
-    }
-
     /// Record the task substrate's verdict over this write's frozen writer
     /// set.
     ///
@@ -140,17 +105,27 @@ impl WriteCommitBarrier {
     /// commit has to survive the trip to this gate, or the gate can only say
     /// "no" without saying what to look at.
     pub(crate) const fn observe_task_execution(&mut self, verdict: WriteVerdict) {
-        self.execution = match self.execution {
-            ExecutionEvidence::None | ExecutionEvidence::TaskVerdict(_) => {
-                ExecutionEvidence::TaskVerdict(verdict)
-            }
-            ExecutionEvidence::LifecycleTerminals(_) => ExecutionEvidence::None,
-        };
-        self.conflicting |= matches!(self.execution, ExecutionEvidence::None);
+        self.execution = Some(verdict);
+    }
+
+    /// Unit-level compatibility for statement-flow tests that exercise the
+    /// barrier without constructing a task graph. Production code has one
+    /// completion authority and cannot call this helper.
+    #[cfg(test)]
+    pub(crate) const fn observe_execution_terminals(&mut self, succeeded: bool) {
+        self.execution = Some(if succeeded {
+            WriteVerdict::Complete
+        } else {
+            WriteVerdict::AttemptFailed
+        });
     }
 
     pub(crate) const fn observe_cancelled(&mut self) {
         self.cancelled = true;
+    }
+
+    pub(crate) const fn observe_deadline_expired(&mut self) {
+        self.deadline_expired = true;
     }
 
     /// Consume the barrier, yielding the set only when every fact holds.
@@ -161,17 +136,17 @@ impl WriteCommitBarrier {
         if self.cancelled {
             return Err(WriteCommitBlocked::Cancelled);
         }
-        if self.conflicting {
-            return Err(WriteCommitBlocked::ConflictingExecutionEvidence);
+        if self.deadline_expired {
+            return Err(WriteCommitBlocked::DeadlineExpired);
         }
         match self.execution {
-            ExecutionEvidence::None | ExecutionEvidence::LifecycleTerminals(false) => {
+            None | Some(WriteVerdict::AttemptFailed) => {
                 return Err(WriteCommitBlocked::ExecutionDidNotSucceed);
             }
-            ExecutionEvidence::TaskVerdict(verdict) if !verdict.is_complete() => {
+            Some(verdict) if !verdict.is_complete() => {
                 return Err(WriteCommitBlocked::TaskExecutionIncomplete);
             }
-            ExecutionEvidence::LifecycleTerminals(true) | ExecutionEvidence::TaskVerdict(_) => {}
+            Some(WriteVerdict::Complete) => {}
         }
         self.prepared
             .ok_or(WriteCommitBlocked::PreparedWriteSetIncomplete)
@@ -228,9 +203,9 @@ mod tests {
 
     #[test]
     fn a_successful_execution_does_not_stand_in_for_a_complete_set() {
-        // Every participant terminated successfully, but the frontend never
-        // read the root result to end of stream. The lifecycle no longer
-        // carries the artifacts, so success alone proves nothing about them.
+        // The task set succeeded, but the frontend never read the root result
+        // to end of stream. Task status carries no artifacts, so success alone
+        // proves nothing about the prepared write set.
         let mut barrier = WriteCommitBarrier::new();
         barrier.observe_execution_terminals(true);
         assert_eq!(
@@ -302,35 +277,15 @@ mod tests {
     }
 
     #[test]
-    fn two_authorities_for_one_attempt_close_the_gate_rather_than_race() {
-        // While both are wired, accepting whichever arrived last -- or either
-        // one that said yes -- would let the weaker rule decide a commit. The
-        // order they arrive in must not change the answer either.
+    fn deadline_vetoes_a_write_that_otherwise_had_both_facts() {
         let mut barrier = WriteCommitBarrier::new();
         barrier.observe_prepared_write_set(complete_set());
-        barrier.observe_execution_terminals(true);
         barrier.observe_task_execution(WriteVerdict::Complete);
+        barrier.observe_deadline_expired();
         assert_eq!(
             barrier.into_committable().expect_err("must not commit"),
-            WriteCommitBlocked::ConflictingExecutionEvidence
+            WriteCommitBlocked::DeadlineExpired
         );
-
-        let mut barrier = WriteCommitBarrier::new();
-        barrier.observe_prepared_write_set(complete_set());
-        barrier.observe_task_execution(WriteVerdict::Complete);
-        barrier.observe_execution_terminals(true);
-        assert_eq!(
-            barrier.into_committable().expect_err("must not commit"),
-            WriteCommitBlocked::ConflictingExecutionEvidence
-        );
-
-        // Repeating one authority is not a conflict: a barrier may learn the
-        // same fact twice.
-        let mut barrier = WriteCommitBarrier::new();
-        barrier.observe_prepared_write_set(complete_set());
-        barrier.observe_task_execution(WriteVerdict::Complete);
-        barrier.observe_task_execution(WriteVerdict::Complete);
-        assert!(barrier.into_committable().is_ok());
     }
 
     #[test]

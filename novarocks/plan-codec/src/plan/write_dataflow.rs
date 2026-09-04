@@ -32,11 +32,13 @@
 use std::collections::BTreeMap;
 
 use novarocks_proto_codec::catalog::encode_catalog_handle;
+use novarocks_proto_codec::{FieldPath, arrow_physical};
 use novarocks_proto_models::{connector_write as write_dto, plan};
 use novarocks_spi::connector::CatalogHandle;
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_sql::plan_read::{TableFinishNode, TableWriterNode};
 
+use super::relational::{encode_resolved_aggregate_signature, encode_unpivot_constant};
 use super::type_mapping::encode_type;
 use super::write::encode_connector_write_input_binding;
 use super::{NativePlanEncodeContext, encode_exprs, required_context_ref};
@@ -130,21 +132,146 @@ pub(super) fn encode_table_writer_node<F>(
         writer_ordinal: 0,
         output_exprs: encode_exprs(src.output_exprs())?,
         target_schema,
+        writer_multiplex_schema: Some(encode_writer_multiplex_schema(
+            src.writer_multiplex_schema(),
+        )?),
+        partial_aggregate_plan: Some(encode_writer_partial_aggregate_plan(
+            src.partial_aggregate_plan(),
+        )?),
     })
 }
 
-pub(super) fn encode_table_finish_node(src: &TableFinishNode) -> plan::TableFinishNode {
-    plan::TableFinishNode {
+fn encode_writer_partial_aggregate_plan(
+    src: &novarocks_sql::plan_read::WriterPartialAggregatePlan,
+) -> Result<plan::WriterPartialAggregatePlan, String> {
+    Ok(plan::WriterPartialAggregatePlan {
+        calls: src
+            .calls()
+            .iter()
+            .map(|call| {
+                Ok(plan::WriterPartialAggregateCall {
+                    input_slot_id: call.input_slot_id(),
+                    function_name: call.function_name().to_string(),
+                    resolved_signature: Some(encode_resolved_aggregate_signature(call.resolved())?),
+                    intermediate_slot_id: call.intermediate_slot_id(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    })
+}
+
+fn encode_writer_final_aggregate_plan(
+    src: &novarocks_sql::plan_read::WriterFinalAggregatePlan,
+) -> Result<plan::WriterFinalAggregatePlan, String> {
+    let calls = src
+        .calls()
+        .iter()
+        .map(|call| {
+            Ok(plan::WriterFinalAggregateCall {
+                function_name: call.function_name().to_string(),
+                resolved_signature: Some(encode_resolved_aggregate_signature(call.resolved())?),
+                intermediate_input_slot_id: call.intermediate_input_slot_id(),
+                final_output_slot_id: call.final_output_slot_id(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let unpivot = src
+        .unpivot()
+        .map(|unpivot| {
+            Ok::<plan::WriterGroupedUnpivotPlan, String>(plan::WriterGroupedUnpivotPlan {
+                grouping_input_slot_id: unpivot.grouping_input_slot_id(),
+                grouping_output_slot_id: unpivot.grouping_output_slot_id(),
+                passthrough_output_slot_id: unpivot.passthrough_output_slot_id(),
+                value_output_slot_id: unpivot.value_output_slot_id(),
+                literal_output_slot_ids: unpivot.literal_output_slot_ids().to_vec(),
+                mappings: unpivot
+                    .mappings()
+                    .iter()
+                    .map(|mapping| {
+                        Ok(plan::WriterGroupedUnpivotMapping {
+                            grouping_key: mapping.target().get(),
+                            input_value_slot_id: mapping.input_value_slot_id(),
+                            constants: mapping
+                                .constants()
+                                .iter()
+                                .map(encode_unpivot_constant)
+                                .collect::<Result<Vec<_>, _>>()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                max_output_rows: u64::try_from(unpivot.max_output_rows())
+                    .map_err(|_| "writer Unpivot row budget exceeds u64".to_string())?,
+                max_output_bytes: u64::try_from(unpivot.max_output_bytes())
+                    .map_err(|_| "writer Unpivot byte budget exceeds u64".to_string())?,
+            })
+        })
+        .transpose()?;
+    Ok(plan::WriterFinalAggregatePlan { calls, unpivot })
+}
+
+fn encode_writer_multiplex_schema(
+    schema: &novarocks_spi::connector::write_stack::WriterMultiplexSchema,
+) -> Result<plan::WriterMultiplexSchema, String> {
+    let slot_ids = schema.slot_ids();
+    let (columns, schema_metadata) = arrow_physical::encode_schema(
+        schema.arrow_schema().as_ref(),
+        &slot_ids,
+        true,
+        FieldPath::root("writer_multiplex_schema"),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(plan::WriterMultiplexSchema {
+        contract_version: schema.contract_version(),
+        columns,
+        schema_metadata,
+    })
+}
+
+fn encode_root_result_schema(
+    schema: &novarocks_spi::connector::write_stack::RootWriteResultSchema,
+) -> Result<plan::RootWriteResultSchema, String> {
+    let slot_ids = schema.slot_ids();
+    let arrow_schema = schema.arrow_schema();
+    let (columns, schema_metadata) = arrow_physical::encode_schema(
+        arrow_schema.as_ref(),
+        &slot_ids,
+        true,
+        FieldPath::root("root_result_schema"),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(plan::RootWriteResultSchema {
+        contract_version: schema.contract_version(),
+        columns,
+        schema_metadata,
+    })
+}
+
+pub(super) fn encode_table_finish_node(
+    src: &TableFinishNode,
+) -> Result<plan::TableFinishNode, String> {
+    Ok(plan::TableFinishNode {
         expected_target_ordinals: src
             .expected_target_ordinals()
             .iter()
             .map(|target| target.get())
             .collect(),
-    }
+        writer_multiplex_schema: Some(encode_writer_multiplex_schema(
+            src.writer_multiplex_schema(),
+        )?),
+        root_result_schema: Some(encode_root_result_schema(src.root_result_schema())?),
+        final_aggregate_plan: Some(encode_writer_final_aggregate_plan(
+            src.final_aggregate_plan(),
+        )?),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Fields};
+    use novarocks_spi::connector::write_stack::{WriterAuxiliaryChannel, WriterMultiplexSchema};
     use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId};
     use novarocks_sql::plan_read::DistributedNodeKind;
     use novarocks_sql::test_support::{NativeWriteDataflowFixture, native_write_dataflow_plan};
@@ -241,6 +368,13 @@ mod tests {
             !writers[0].target_schema.is_empty(),
             "the sealed write target schema must reach the backend"
         );
+        let relation = writers[0]
+            .writer_multiplex_schema
+            .as_ref()
+            .expect("writer relation contract");
+        assert_eq!(relation.contract_version, 1);
+        assert_eq!(relation.columns.len(), 4);
+        assert!(relation.columns.iter().all(|column| column.is_internal));
     }
 
     #[test]
@@ -306,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn the_finish_node_carries_the_dense_target_set_and_nothing_else() {
+    fn the_finish_node_carries_target_and_exact_relation_contracts() {
         let sealed_plan =
             native_write_dataflow_plan(NativeWriteDataflowFixture::ChangeStreamTwoWriters)
                 .expect("sealed dataflow write plan");
@@ -318,8 +452,55 @@ mod tests {
                 _ => None,
             })
             .expect("one finish node");
-        let encoded = encode_table_finish_node(finish);
+        let encoded = encode_table_finish_node(finish).expect("encode finish");
         assert_eq!(encoded.expected_target_ordinals, vec![0, 1]);
+        let writer = encoded.writer_multiplex_schema.expect("writer relation");
+        assert_eq!(writer.contract_version, 1);
+        assert_eq!(writer.columns.len(), 4);
+        let root = encoded.root_result_schema.expect("root relation");
+        assert_eq!(root.contract_version, 1);
+        assert_eq!(root.columns.len(), 8);
+    }
+
+    #[test]
+    fn relation_encoder_preserves_exact_arrow_physical_fields() {
+        let item = Arc::new(
+            Field::new("item64", DataType::LargeUtf8, false)
+                .with_metadata(HashMap::from([("logical".to_string(), "tag".to_string())])),
+        );
+        let entries = Arc::new(Field::new(
+            "entries_exact",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key_exact", DataType::Utf8, false),
+                Field::new("value_exact", DataType::LargeBinary, false),
+            ])),
+            false,
+        ));
+        let contract = WriterMultiplexSchema::try_new(vec![
+            WriterAuxiliaryChannel::try_new(10, "list64", DataType::LargeList(item))
+                .expect("list channel"),
+            WriterAuxiliaryChannel::try_new(11, "map", DataType::Map(entries, true))
+                .expect("map channel"),
+            WriterAuxiliaryChannel::try_new(
+                12,
+                "fixed",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("fixed_item", DataType::Binary, false)),
+                    3,
+                ),
+            )
+            .expect("fixed channel"),
+        ])
+        .expect("writer schema");
+        let encoded = encode_writer_multiplex_schema(&contract).expect("encode relation");
+        let decoded = arrow_physical::decode_schema(
+            &encoded.columns,
+            &encoded.schema_metadata,
+            FieldPath::root("writer_multiplex_schema"),
+        )
+        .expect("decode relation");
+        assert_eq!(decoded.schema().as_ref(), contract.arrow_schema().as_ref());
+        assert_eq!(decoded.slot_ids(), contract.slot_ids());
     }
 
     #[test]

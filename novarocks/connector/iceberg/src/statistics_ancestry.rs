@@ -37,9 +37,7 @@ use crate::stats_loader::StatsLoader;
 
 /// How far back the walk looks before giving up.
 ///
-/// Deliberately far smaller than the metadata-only lineage bound in
-/// `statistics_basis`: every ancestor that carries a statistics file costs an
-/// object-store read, so this bounds I/O, not pointer chasing.
+/// Deliberately bounded even though the walk is metadata-only.
 const MAX_STATISTICS_ANCESTRY_STEPS: usize = 64;
 
 /// One column's NDV together with the snapshot it was measured on.
@@ -53,12 +51,11 @@ pub struct AncestorNdv {
 ///
 /// Field ids with no sketch anywhere in the walked ancestry are simply absent
 /// from the result: an unanalyzed column is missing a statistic, not an error.
-/// The walk also stops — rather than failing — at an ancestor whose statistics
-/// file cannot be read, since expiring old snapshots and their Puffins is
-/// routine table maintenance.
+/// Corrupt metadata stops the walk conservatively. The ordinary optimizer path
+/// never opens a Puffin body; `ndv` is read from registered blob metadata.
 pub async fn resolve_ancestor_ndv(
     metadata: &TableMetadata,
-    file_io: &FileIO,
+    _file_io: &FileIO,
     queried_snapshot: i64,
     wanted: &BTreeSet<i32>,
 ) -> HashMap<i32, AncestorNdv> {
@@ -74,9 +71,7 @@ pub async fn resolve_ancestor_ndv(
             break;
         };
         if let Some(statistics) = metadata.statistics_for_snapshot(snapshot_id) {
-            match StatsLoader::load_ndv_from_file(statistics.statistics_path.as_str(), file_io)
-                .await
-            {
+            match StatsLoader::load_ndv_from_metadata(statistics) {
                 Ok(by_field) => {
                     // Each field id is satisfied by the first ancestor that has
                     // it, independently of the others.
@@ -106,9 +101,8 @@ pub async fn resolve_ancestor_ndv(
                 Err(error) => {
                     tracing::debug!(
                         snapshot_id,
-                        puffin_path = %statistics.statistics_path,
                         error = %error,
-                        "iceberg statistics file unreadable; stopping ancestor walk",
+                        "iceberg statistics metadata is corrupt; stopping ancestor walk",
                     );
                     break;
                 }
@@ -143,8 +137,7 @@ mod tests {
             Arc::new(TokioFileTaskSpawner::new(runtime)),
         )
     }
-    use crate::stats_assembler::{StatisticsCoverageMark, write_puffin_with_provider_statistics};
-    use crate::theta_sketch::ThetaSketchHandle;
+    use crate::stats_assembler::write_puffin_artifacts;
 
     use super::*;
 
@@ -193,14 +186,6 @@ mod tests {
         builder.build().expect("metadata").metadata
     }
 
-    fn sketch_of(distinct: i64) -> ThetaSketchHandle {
-        let mut sketch = ThetaSketchHandle::new(12).expect("theta sketch");
-        for value in 0..distinct {
-            sketch.update(value).expect("theta update");
-        }
-        sketch
-    }
-
     /// Writes a real Puffin holding a Theta sketch for each given field id.
     async fn statistics_file(
         dir: &std::path::Path,
@@ -212,22 +197,25 @@ mod tests {
             dir.join(format!("s{snapshot_id}.puffin")).display()
         );
         let file_io = crate::fs_io::build_file_io_for_location(&path, local_test_binding());
-        let sketches: HashMap<i32, ThetaSketchHandle> = fields
+        let artifacts = fields
             .iter()
-            .map(|(field_id, distinct)| (*field_id, sketch_of(*distinct)))
-            .collect();
-        write_puffin_with_provider_statistics(
-            &file_io,
-            &path,
-            snapshot_id,
-            snapshot_id,
-            &sketches,
-            None,
-            StatisticsCoverageMark::AllVisibleRows,
-        )
-        .await
-        .expect("write puffin")
-        .expect("statistics file")
+            .map(|(field_id, distinct)| {
+                novarocks_spi::connector::StatisticsArtifactDraft::try_new(
+                    vec![*field_id],
+                    crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1,
+                    bytes::Bytes::from_static(&[1, 3, 3, 0, 0, 0x1e, 0, 0]),
+                    std::collections::BTreeMap::from([(
+                        crate::stats_loader::NDV_PROPERTY.to_string(),
+                        distinct.to_string(),
+                    )]),
+                )
+                .expect("artifact")
+            })
+            .collect::<Vec<_>>();
+        write_puffin_artifacts(&file_io, &path, snapshot_id, snapshot_id, &artifacts)
+            .await
+            .expect("write puffin")
+            .expect("statistics file")
     }
 
     #[tokio::test]
@@ -303,10 +291,11 @@ mod tests {
         );
     }
 
-    /// Expiring old snapshots takes their Puffins with them. Reaching one is
-    /// the end of the walk, not a failure.
+    /// Ordinary optimizer ancestry consumes the standard `ndv` property from
+    /// Iceberg metadata. The Puffin body may already have been moved or deleted
+    /// without turning a metadata-only planning lookup into object I/O.
     #[tokio::test]
-    async fn an_unreadable_ancestor_stops_the_walk_without_failing() {
+    async fn an_unreadable_body_is_not_opened_by_optimizer_ancestry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let reachable = statistics_file(dir.path(), 3, &[(7, 100)]).await;
         let mut vanished = statistics_file(dir.path(), 1, &[(5, 400)]).await;
@@ -318,11 +307,16 @@ mod tests {
             local_test_binding(),
         );
 
+        StatsLoader::reset_theta_body_reads_for_test();
         let resolved = resolve_ancestor_ndv(&metadata, &file_io, 3, &BTreeSet::from([5, 7])).await;
         assert!(
             resolved.contains_key(&7),
-            "what was readable still resolves"
+            "current metadata resolves without opening its body"
         );
-        assert!(!resolved.contains_key(&5));
+        assert!(
+            resolved.contains_key(&5),
+            "ancestor metadata resolves even when its body path is unreadable"
+        );
+        assert_eq!(StatsLoader::theta_body_reads(), 0);
     }
 }

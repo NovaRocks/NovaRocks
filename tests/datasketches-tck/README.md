@@ -5,6 +5,9 @@ fixtures from Apache DataSketches Java 6.2.0, Apache DataSketches C++, and the e
 `datasketches 0.5.0-rc.1` package. Normal `cargo test` is offline-capable after Cargo dependencies
 have been fetched: it does not start Java or C++, run a generator, or access the network.
 
+The Java generator also pins Apache Iceberg 1.10.0 and emits the primitive-to-Theta oracle consumed
+by `novarocks-connector-iceberg-functions`.
+
 ## Daily test
 
 ```shell

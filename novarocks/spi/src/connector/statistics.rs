@@ -16,7 +16,7 @@
 // under the License.
 
 //! FE-only provider-neutral statistics contract.
-//! Design: ADR-0022 (docs/adr/ADR-0022-connector-statistics-capability.md)
+//! Design: ADR-0135 (docs/adr/ADR-0135-ordinary-aggregate-statistics-dataflow.md)
 //! Design: ADR-0080 (docs/adr/ADR-0080-statistics-evidence-four-dimension-model.md)
 
 use std::collections::BTreeMap;
@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use super::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
-    ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
+    ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
 /// Maximum size of one provider-owned data-version, evidence-revision, plan,
@@ -40,6 +40,28 @@ pub const MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Maximum number of independently requested metrics in one provider call.
 pub const MAX_CONNECTOR_STATISTICS_METRICS: usize = 1024;
+
+/// Maximum number of provider artifacts produced by one statistics session.
+pub const MAX_CONNECTOR_STATISTICS_ARTIFACTS: usize = 4096;
+
+/// One artifact body must fit an ordinary native result packet.
+pub const MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Output budget for one Arrow batch carrying statistics artifact rows.
+///
+/// This must remain larger than one maximum-sized artifact plus its bounded
+/// identity, properties, Arrow offsets, and IPC framing. Otherwise a valid
+/// artifact could never make progress: Unpivot can split between rows, but it
+/// cannot split one artifact body across batches.
+pub const MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum retained artifact body bytes accumulated by one FE result decoder.
+///
+/// The current 1,024-column ANALYZE ceiling can legitimately produce 1,024
+/// saturated default-lg-k Theta compact sketches (65,560 bytes each), which is
+/// slightly larger than 64 MiB. Keep a finite headroom while ensuring the
+/// declared column limit is actually executable.
+pub const MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 /// Opaque provider token that pins a table's data state. It is deliberately
 /// distinct from `ConnectorTableMetadata::version`, whose current providers
@@ -132,6 +154,319 @@ impl StatisticsMetricRequest {
     pub fn metrics(&self) -> &[StatisticsMetric] {
         &self.metrics
     }
+}
+
+/// Column selection supplied to a provider-owned collection session.
+///
+/// Default selection silently omits unsupported columns. Explicit selection
+/// must reject an unsupported column before distributed work or object writes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatisticsColumnSelection {
+    Default,
+    Explicit(Vec<Arc<str>>),
+}
+
+impl StatisticsColumnSelection {
+    pub fn explicit(columns: Vec<Arc<str>>) -> Result<Self, ConnectorError> {
+        if columns.len() > MAX_CONNECTOR_STATISTICS_METRICS {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "statistics column selection exceeds the metric limit",
+            ));
+        }
+        let mut normalized = std::collections::BTreeSet::new();
+        for column in &columns {
+            if column.is_empty() || column.len() > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "statistics column name is empty or exceeds the payload limit",
+                ));
+            }
+            if !normalized.insert(column.to_ascii_lowercase()) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "statistics column selection contains a duplicate column",
+                ));
+            }
+        }
+        Ok(Self::Explicit(columns))
+    }
+}
+
+/// Provider-neutral identity of one artifact expected from ordinary execution.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StatisticsArtifactIdentity {
+    input_fields: Vec<i32>,
+    blob_type: Arc<str>,
+}
+
+impl StatisticsArtifactIdentity {
+    pub fn try_new(
+        input_fields: Vec<i32>,
+        blob_type: impl Into<Arc<str>>,
+    ) -> Result<Self, ConnectorError> {
+        let blob_type = blob_type.into();
+        if input_fields.is_empty()
+            || input_fields.len() > MAX_CONNECTOR_STATISTICS_METRICS
+            || input_fields.iter().any(|field_id| *field_id <= 0)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics artifact input fields must be non-empty positive field IDs",
+            ));
+        }
+        if input_fields
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != input_fields.len()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics artifact input fields must not repeat a field ID",
+            ));
+        }
+        if blob_type.is_empty() || blob_type.len() > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics artifact blob type is empty or exceeds the payload limit",
+            ));
+        }
+        Ok(Self {
+            input_fields,
+            blob_type,
+        })
+    }
+
+    pub fn input_fields(&self) -> &[i32] {
+        &self.input_fields
+    }
+
+    pub fn blob_type(&self) -> &str {
+        &self.blob_type
+    }
+}
+
+/// Generic long-form artifact row produced after an ordinary aggregate and
+/// Unpivot. This carrier contains no provider session or catalog authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsArtifactDraft {
+    identity: StatisticsArtifactIdentity,
+    body: Bytes,
+    properties: BTreeMap<String, String>,
+}
+
+impl StatisticsArtifactDraft {
+    pub fn try_new(
+        input_fields: Vec<i32>,
+        blob_type: impl Into<Arc<str>>,
+        body: Bytes,
+        properties: BTreeMap<String, String>,
+    ) -> Result<Self, ConnectorError> {
+        if body.len() > MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "statistics artifact body exceeds the packet limit",
+            ));
+        }
+        let property_bytes = properties.iter().try_fold(0usize, |total, (key, value)| {
+            total
+                .checked_add(key.len())
+                .and_then(|value_total| value_total.checked_add(value.len()))
+        });
+        if property_bytes.is_none_or(|bytes| bytes > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "statistics artifact properties exceed the payload limit",
+            ));
+        }
+        if properties.keys().any(|key| key.is_empty()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics artifact property name must not be empty",
+            ));
+        }
+        Ok(Self {
+            identity: StatisticsArtifactIdentity::try_new(input_fields, blob_type)?,
+            body,
+            properties,
+        })
+    }
+
+    pub fn identity(&self) -> &StatisticsArtifactIdentity {
+        &self.identity
+    }
+
+    pub fn body(&self) -> &Bytes {
+        &self.body
+    }
+
+    pub fn properties(&self) -> &BTreeMap<String, String> {
+        &self.properties
+    }
+
+    pub fn into_parts(self) -> (StatisticsArtifactIdentity, Bytes, BTreeMap<String, String>) {
+        (self.identity, self.body, self.properties)
+    }
+}
+
+/// One ordinary global aggregate selected by the provider for a pinned field.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatisticsRequiredAggregation {
+    input: StatisticsScanColumn,
+    function_name: Arc<str>,
+    artifact: StatisticsArtifactIdentity,
+}
+
+impl StatisticsRequiredAggregation {
+    pub fn try_new(
+        input: StatisticsScanColumn,
+        function_name: impl Into<Arc<str>>,
+        artifact: StatisticsArtifactIdentity,
+    ) -> Result<Self, ConnectorError> {
+        let function_name = function_name.into();
+        if function_name.is_empty() || function_name.len() > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics aggregate function name is empty or exceeds the payload limit",
+            ));
+        }
+        Ok(Self {
+            input,
+            function_name,
+            artifact,
+        })
+    }
+
+    pub fn input(&self) -> &StatisticsScanColumn {
+        &self.input
+    }
+
+    pub fn function_name(&self) -> &str {
+        &self.function_name
+    }
+
+    pub fn artifact(&self) -> &StatisticsArtifactIdentity {
+        &self.artifact
+    }
+}
+
+#[derive(Clone)]
+pub struct StatisticsCollectionStartRequest {
+    pub operation_id: ConnectorMutationOperationId,
+    pub table: ConnectorTableHandle,
+    pub data_version: StatisticsDataVersion,
+    pub selection: StatisticsColumnSelection,
+    pub context: ConnectorRequestContext,
+}
+
+/// Provider planning facts separated from the FE-local publication authority.
+/// The type is intentionally not cloneable or serializable.
+pub struct StatisticsCollectionStart {
+    table: ConnectorTableHandle,
+    data_version: StatisticsDataVersion,
+    read_version_ordinal: Option<i64>,
+    required_aggregations: Vec<StatisticsRequiredAggregation>,
+    session: Box<dyn StatisticsCollectionSession>,
+}
+
+impl StatisticsCollectionStart {
+    pub fn try_new(
+        table: ConnectorTableHandle,
+        data_version: StatisticsDataVersion,
+        read_version_ordinal: Option<i64>,
+        required_aggregations: Vec<StatisticsRequiredAggregation>,
+        session: Box<dyn StatisticsCollectionSession>,
+    ) -> Result<Self, ConnectorError> {
+        if required_aggregations.len() > MAX_CONNECTOR_STATISTICS_METRICS {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "statistics aggregation requirement count exceeds the metric limit",
+            ));
+        }
+        let identities = required_aggregations
+            .iter()
+            .map(|requirement| requirement.artifact().clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if identities.len() != required_aggregations.len() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics aggregation requirements contain duplicate artifact identities",
+            ));
+        }
+        if !required_aggregations.is_empty() && read_version_ordinal.is_none() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics aggregation requirements need an exact read version ordinal",
+            ));
+        }
+        let planned = required_aggregations
+            .iter()
+            .map(|requirement| requirement.artifact())
+            .collect::<Vec<_>>();
+        let expected = session.expectations().iter().collect::<Vec<_>>();
+        if planned != expected {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "statistics aggregation requirements do not exactly match the session expectations",
+            ));
+        }
+        Ok(Self {
+            table,
+            data_version,
+            read_version_ordinal,
+            required_aggregations,
+            session,
+        })
+    }
+
+    pub fn table(&self) -> &ConnectorTableHandle {
+        &self.table
+    }
+
+    pub fn data_version(&self) -> &StatisticsDataVersion {
+        &self.data_version
+    }
+
+    pub const fn read_version_ordinal(&self) -> Option<i64> {
+        self.read_version_ordinal
+    }
+
+    pub fn required_aggregations(&self) -> &[StatisticsRequiredAggregation] {
+        &self.required_aggregations
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ConnectorTableHandle,
+        StatisticsDataVersion,
+        Option<i64>,
+        Vec<StatisticsRequiredAggregation>,
+        Box<dyn StatisticsCollectionSession>,
+    ) {
+        (
+            self.table,
+            self.data_version,
+            self.read_version_ordinal,
+            self.required_aggregations,
+            self.session,
+        )
+    }
+}
+
+/// FE-local, single-use publication authority. It has no serialization or
+/// cloning surface, and `finish` consumes the authority even on failure.
+pub trait StatisticsCollectionSession: Send {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor;
+    fn incarnation(&self) -> ProviderBindingEpoch;
+    fn operation_id(&self) -> ConnectorMutationOperationId;
+    fn expectations(&self) -> &[StatisticsArtifactIdentity];
+    fn finish(
+        self: Box<Self>,
+        artifacts: Vec<StatisticsArtifactDraft>,
+    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError>;
 }
 
 /// Collection-level fact: whether this measurement observed every visible row
@@ -416,15 +751,6 @@ pub struct StatisticsReadRequest {
     pub context: ConnectorRequestContext,
 }
 
-#[derive(Clone)]
-pub struct StatisticsCollectionRequest {
-    pub operation_id: ConnectorMutationOperationId,
-    pub table: ConnectorTableHandle,
-    pub data_version: StatisticsDataVersion,
-    pub metrics: StatisticsMetricRequest,
-    pub context: ConnectorRequestContext,
-}
-
 /// One provider-resolved physical input column for a statistics collection.
 ///
 /// A durable ANALYZE job owns only an opaque table handle and data-version.
@@ -478,152 +804,6 @@ impl StatisticsScanColumn {
     pub const fn nullable(&self) -> bool {
         self.nullable
     }
-}
-
-/// Provider-neutral collection preparation result. `table` is the exact
-/// already-resolved table handle pinned by `data_version`; Core must compile
-/// ordinary distributed work from this handle and must never resolve latest
-/// metadata a second time. `scan_columns` is resolved against that same
-/// pinned schema.  It is intentionally a compact physical layout rather than
-/// a Core-owned catalog lookup: providers own their handle/schema codecs while
-/// Core owns only normal connector scan scheduling. The provider payload
-/// remains opaque to the FE and Core.
-#[derive(Clone)]
-pub struct StatisticsCollectionPlan {
-    table: ConnectorTableHandle,
-    pub data_version: StatisticsDataVersion,
-    evidence_revision: StatisticsEvidenceRevision,
-    base_version_ordinal: Option<i64>,
-    pub metrics: StatisticsMetricRequest,
-    scan_columns: Vec<StatisticsScanColumn>,
-    provider_payload: Bytes,
-}
-
-impl StatisticsCollectionPlan {
-    pub fn try_new(
-        table: ConnectorTableHandle,
-        data_version: StatisticsDataVersion,
-        evidence_revision: StatisticsEvidenceRevision,
-        base_version_ordinal: Option<i64>,
-        metrics: StatisticsMetricRequest,
-        scan_columns: Vec<StatisticsScanColumn>,
-        provider_payload: Bytes,
-    ) -> Result<Self, ConnectorError> {
-        if scan_columns.len() > MAX_CONNECTOR_STATISTICS_METRICS {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "statistics collection scan layout exceeds the metric limit",
-            ));
-        }
-        if scan_columns
-            .windows(2)
-            .any(|pair| pair[0].ordinal() >= pair[1].ordinal())
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "statistics collection scan layout ordinals must be sorted and unique",
-            ));
-        }
-        Ok(Self {
-            table,
-            data_version,
-            evidence_revision,
-            base_version_ordinal,
-            metrics,
-            scan_columns,
-            provider_payload: bounded_payload(provider_payload, "statistics collection plan")?,
-        })
-    }
-
-    pub fn table(&self) -> &ConnectorTableHandle {
-        &self.table
-    }
-
-    /// Provider-owned revision fixed at collection preparation.  Core carries
-    /// it unchanged to the final evidence and must never synthesize a token.
-    pub fn evidence_revision(&self) -> &StatisticsEvidenceRevision {
-        &self.evidence_revision
-    }
-
-    /// The provider's own version ordinal for the pin `data_version` names,
-    /// stated in the neutral vocabulary the engine can act on.
-    ///
-    /// `data_version` is an opaque token: Core can compare two of them but
-    /// cannot ask a relation to be read at one. This ordinal is the same pin
-    /// expressed as something a typed scan can name, so the collection
-    /// measures exactly the version its evidence is stamped with rather than
-    /// whatever the catalog's current version has become. It is the
-    /// read-side counterpart of
-    /// [`ConnectorRowMutationPreparation::base_version_ordinal`].
-    ///
-    /// `None` means the provider has no version ordinal at all. Core must then
-    /// refuse the collection: measuring the current version instead would
-    /// publish statistics for data nobody asked about.
-    ///
-    /// [`ConnectorRowMutationPreparation::base_version_ordinal`]: crate::connector::ConnectorRowMutationPreparation::base_version_ordinal
-    pub const fn base_version_ordinal(&self) -> Option<i64> {
-        self.base_version_ordinal
-    }
-
-    /// Provider-resolved compact schema for the normal connector scan. An
-    /// empty layout is valid for a row-count-only collection; the provider's
-    /// scan implementation decides how to represent it.
-    pub fn scan_columns(&self) -> &[StatisticsScanColumn] {
-        &self.scan_columns
-    }
-
-    pub fn scan_projection(&self) -> Vec<usize> {
-        self.scan_columns
-            .iter()
-            .map(StatisticsScanColumn::ordinal)
-            .collect()
-    }
-
-    pub fn provider_payload(&self) -> &Bytes {
-        &self.provider_payload
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StatisticsCollectionResult {
-    pub evidence: StatisticsEvidence,
-    provider_payload: Bytes,
-}
-
-impl StatisticsCollectionResult {
-    pub fn try_new(
-        evidence: StatisticsEvidence,
-        provider_payload: Bytes,
-    ) -> Result<Self, ConnectorError> {
-        Ok(Self {
-            evidence,
-            provider_payload: bounded_payload(provider_payload, "statistics collection result")?,
-        })
-    }
-
-    pub fn provider_payload(&self) -> &Bytes {
-        &self.provider_payload
-    }
-}
-
-#[derive(Clone)]
-pub struct StatisticsPublishRequest {
-    pub operation_id: ConnectorMutationOperationId,
-    pub table: ConnectorTableHandle,
-    pub result: StatisticsCollectionResult,
-    pub context: ConnectorRequestContext,
-    /// Evidence prepared before the durable caller enters PUBLISHING.  The
-    /// provider must use exactly this operation-specific evidence if commit
-    /// status becomes uncertain.
-    pub evidence: ExternalMutationEvidence,
-}
-
-#[derive(Clone)]
-pub struct StatisticsPublishPreparationRequest {
-    pub operation_id: ConnectorMutationOperationId,
-    pub table: ConnectorTableHandle,
-    pub result: StatisticsCollectionResult,
-    pub context: ConnectorRequestContext,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -704,21 +884,10 @@ pub trait StatisticsReader: Send + Sync {
 pub trait StatisticsCollection: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
-    fn prepare_collection(
+    fn begin_collection(
         &self,
-        request: StatisticsCollectionRequest,
-    ) -> Result<StatisticsCollectionPlan, ConnectorError>;
-    /// Computes deterministic reconciliation evidence before the caller makes
-    /// the PUBLISHING state durable. This method must not perform an external
-    /// catalog write.
-    fn prepare_publish(
-        &self,
-        request: StatisticsPublishPreparationRequest,
-    ) -> Result<ExternalMutationEvidence, ConnectorError>;
-    fn publish_statistics(
-        &self,
-        request: StatisticsPublishRequest,
-    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError>;
+        request: StatisticsCollectionStartRequest,
+    ) -> Result<StatisticsCollectionStart, ConnectorError>;
 }
 
 /// Aggregate FE-only statistics capability. Its optional collection half is
@@ -793,66 +962,49 @@ impl ConnectorStatisticsLease {
         }
         Ok(evidence)
     }
-    pub fn prepare_collection(
-        &self,
-        request: StatisticsCollectionRequest,
-    ) -> Result<StatisticsCollectionPlan, ConnectorError> {
+    pub fn begin_collection(
+        self,
+        request: StatisticsCollectionStartRequest,
+    ) -> Result<StatisticsCollectionStart, ConnectorError> {
         self.validate_table(&request.table)?;
         let expected_table = request.table.clone();
         let expected_data_version = request.data_version.clone();
-        let expected_metrics = request.metrics.clone();
-        let collection = self.statistics.collection().ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "connector statistics capability does not support collection",
-            )
-        })?;
-        let plan = collection.prepare_collection(request)?;
-        if plan.table() != &expected_table
-            || plan.data_version != expected_data_version
-            || plan.evidence_revision.as_bytes().is_empty()
-            || plan.metrics != expected_metrics
+        let expected_operation_id = request.operation_id;
+        let collection = self.collection()?;
+        let start = collection.begin_collection(request)?;
+        if start.table() != &expected_table || start.data_version() != &expected_data_version {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector statistics session did not preserve its resolved table pin",
+            ));
+        }
+        if start.session.descriptor() != &self.descriptor
+            || start.session.incarnation() != self.incarnation
+            || start.session.operation_id() != expected_operation_id
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
-                "connector statistics collection plan does not preserve its resolved table pin",
+                "connector statistics session does not match its lease generation or operation",
             ));
         }
-        Ok(plan)
-    }
-    pub fn publish(
-        &self,
-        request: StatisticsPublishRequest,
-    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
-        self.validate_table(&request.table)?;
-        let operation_id = request.operation_id;
-        self.validate_evidence(&request.evidence)?;
-        if request.evidence.operation_id() != operation_id {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "statistics publication evidence operation ID does not match request",
-            ));
-        }
-        let collection = self.collection()?;
-        let outcome = collection.publish_statistics(request)?;
-        self.validate_outcome(operation_id, &outcome)?;
-        Ok(outcome)
-    }
-    pub fn prepare_publish(
-        &self,
-        request: StatisticsPublishPreparationRequest,
-    ) -> Result<ExternalMutationEvidence, ConnectorError> {
-        self.validate_table(&request.table)?;
-        let operation_id = request.operation_id;
-        let evidence = self.collection()?.prepare_publish(request)?;
-        self.validate_evidence(&evidence)?;
-        if evidence.operation_id() != operation_id {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "connector statistics publication evidence changed the operation ID",
-            ));
-        }
-        Ok(evidence)
+        let StatisticsCollectionStart {
+            table,
+            data_version,
+            read_version_ordinal,
+            required_aggregations,
+            session,
+        } = start;
+        let session = Box::new(LeaseBoundStatisticsSession {
+            inner: session,
+            _lease: self,
+        });
+        StatisticsCollectionStart::try_new(
+            table,
+            data_version,
+            read_version_ordinal,
+            required_aggregations,
+            session,
+        )
     }
     fn collection(&self) -> Result<&dyn StatisticsCollection, ConnectorError> {
         self.statistics.collection().ok_or_else(|| {
@@ -872,46 +1024,36 @@ impl ConnectorStatisticsLease {
         }
         Ok(())
     }
+}
 
-    fn validate_evidence(&self, evidence: &ExternalMutationEvidence) -> Result<(), ConnectorError> {
-        if evidence.descriptor() != &self.descriptor || evidence.incarnation() != self.incarnation {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "statistics reconcile evidence does not match its lease generation",
-            ));
-        }
-        Ok(())
+struct LeaseBoundStatisticsSession {
+    inner: Box<dyn StatisticsCollectionSession>,
+    _lease: ConnectorStatisticsLease,
+}
+
+impl StatisticsCollectionSession for LeaseBoundStatisticsSession {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        self.inner.descriptor()
     }
 
-    fn validate_outcome(
-        &self,
-        operation_id: ConnectorMutationOperationId,
-        outcome: &ExternalMutationOutcome<StatisticsReceipt>,
-    ) -> Result<(), ConnectorError> {
-        match outcome {
-            ExternalMutationOutcome::KnownCommitted { receipt, .. } => {
-                if receipt.descriptor() != &self.descriptor
-                    || receipt.incarnation() != self.incarnation
-                    || receipt.operation_id() != operation_id
-                {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "statistics receipt does not match its lease or operation",
-                    ));
-                }
-            }
-            ExternalMutationOutcome::CommitUnknown { evidence, .. } => {
-                self.validate_evidence(evidence)?;
-                if evidence.operation_id() != operation_id {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "statistics commit evidence does not match its operation",
-                    ));
-                }
-            }
-            ExternalMutationOutcome::KnownUncommitted { .. } => {}
-        }
-        Ok(())
+    fn incarnation(&self) -> ProviderBindingEpoch {
+        self.inner.incarnation()
+    }
+
+    fn operation_id(&self) -> ConnectorMutationOperationId {
+        self.inner.operation_id()
+    }
+
+    fn expectations(&self) -> &[StatisticsArtifactIdentity] {
+        self.inner.expectations()
+    }
+
+    fn finish(
+        self: Box<Self>,
+        artifacts: Vec<StatisticsArtifactDraft>,
+    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
+        let Self { inner, _lease } = *self;
+        inner.finish(artifacts)
     }
 }
 
@@ -986,6 +1128,128 @@ fn redacted_debug(
 mod tests {
     use super::*;
 
+    struct NeverCancelled;
+
+    impl crate::connector::ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct TestSession {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+        operation_id: ConnectorMutationOperationId,
+        expectations: Vec<StatisticsArtifactIdentity>,
+    }
+
+    impl StatisticsCollectionSession for TestSession {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.incarnation
+        }
+
+        fn operation_id(&self) -> ConnectorMutationOperationId {
+            self.operation_id
+        }
+
+        fn expectations(&self) -> &[StatisticsArtifactIdentity] {
+            &self.expectations
+        }
+
+        fn finish(
+            self: Box<Self>,
+            _artifacts: Vec<StatisticsArtifactDraft>,
+        ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
+            unreachable!("contract construction tests never finish the session")
+        }
+    }
+
+    fn test_descriptor() -> ConnectorInstanceDescriptor {
+        ConnectorInstanceDescriptor {
+            provider_id: crate::connector::ConnectorProviderId::parse("test").unwrap(),
+            instance_id: ConnectorInstanceId::parse("test.instance").unwrap(),
+        }
+    }
+
+    fn requirement(field_id: i32, ordinal: usize) -> StatisticsRequiredAggregation {
+        StatisticsRequiredAggregation::try_new(
+            StatisticsScanColumn::try_new(ordinal, format!("c{field_id}"), DataType::Int64, true)
+                .unwrap(),
+            "$test_stat",
+            StatisticsArtifactIdentity::try_new(vec![field_id], "test/blob").unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn test_session(expectations: Vec<StatisticsArtifactIdentity>) -> Box<TestSession> {
+        Box::new(TestSession {
+            descriptor: test_descriptor(),
+            incarnation: ProviderBindingEpoch::new(),
+            operation_id: ConnectorMutationOperationId::new(),
+            expectations,
+        })
+    }
+
+    struct WrongOperationStatistics {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+    }
+
+    impl StatisticsReader for WrongOperationStatistics {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.incarnation
+        }
+
+        fn read_statistics(
+            &self,
+            _request: StatisticsReadRequest,
+        ) -> Result<StatisticsEvidence, ConnectorError> {
+            unreachable!("not used")
+        }
+    }
+
+    impl StatisticsCollection for WrongOperationStatistics {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.incarnation
+        }
+
+        fn begin_collection(
+            &self,
+            request: StatisticsCollectionStartRequest,
+        ) -> Result<StatisticsCollectionStart, ConnectorError> {
+            StatisticsCollectionStart::try_new(
+                request.table,
+                request.data_version,
+                None,
+                Vec::new(),
+                Box::new(TestSession {
+                    descriptor: self.descriptor.clone(),
+                    incarnation: self.incarnation,
+                    operation_id: ConnectorMutationOperationId::new(),
+                    expectations: Vec::new(),
+                }),
+            )
+        }
+    }
+
+    impl ConnectorStatistics for WrongOperationStatistics {
+        fn collection(&self) -> Option<&dyn StatisticsCollection> {
+            Some(self)
+        }
+    }
+
     fn data_version(token: &'static [u8]) -> StatisticsDataVersion {
         StatisticsDataVersion::try_new(Bytes::from_static(token)).expect("data version")
     }
@@ -1023,6 +1287,115 @@ mod tests {
             StatisticsRowCoverage::AllVisibleRows,
             metrics,
         )
+    }
+
+    #[test]
+    fn collection_start_requires_exact_ordered_session_expectations() {
+        let requirements = vec![requirement(1, 0), requirement(2, 1)];
+        let reversed = requirements
+            .iter()
+            .rev()
+            .map(|requirement| requirement.artifact().clone())
+            .collect();
+        let error = match StatisticsCollectionStart::try_new(
+            ConnectorTableHandle::try_new(
+                test_descriptor().instance_id,
+                Bytes::from_static(b"table"),
+            )
+            .unwrap(),
+            data_version(b"data-v1"),
+            Some(7),
+            requirements,
+            test_session(reversed),
+        ) {
+            Ok(_) => panic!("planner order and session expectation order must be identical"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn artifact_identity_preserves_order_but_rejects_duplicate_fields() {
+        let identity = StatisticsArtifactIdentity::try_new(vec![2, 1], "test/blob")
+            .expect("ordered composite identity");
+        assert_eq!(identity.input_fields(), &[2, 1]);
+
+        let error = StatisticsArtifactIdentity::try_new(vec![1, 1], "test/blob")
+            .expect_err("duplicate field identity must fail closed");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn collection_start_rejects_duplicate_requirements_and_missing_read_pin() {
+        let duplicate = vec![requirement(1, 0), requirement(1, 1)];
+        let expectations = duplicate
+            .iter()
+            .map(|requirement| requirement.artifact().clone())
+            .collect();
+        let table = ConnectorTableHandle::try_new(
+            test_descriptor().instance_id,
+            Bytes::from_static(b"table"),
+        )
+        .unwrap();
+        assert!(
+            StatisticsCollectionStart::try_new(
+                table.clone(),
+                data_version(b"data-v1"),
+                Some(7),
+                duplicate,
+                test_session(expectations),
+            )
+            .is_err()
+        );
+
+        let one = requirement(1, 0);
+        let expectation = one.artifact().clone();
+        assert!(
+            StatisticsCollectionStart::try_new(
+                table,
+                data_version(b"data-v1"),
+                None,
+                vec![one],
+                test_session(vec![expectation]),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn lease_rejects_a_session_for_a_different_operation_before_execution() {
+        let descriptor = test_descriptor();
+        let incarnation = ProviderBindingEpoch::new();
+        let table = ConnectorTableHandle::try_new(
+            descriptor.instance_id.clone(),
+            Bytes::from_static(b"table"),
+        )
+        .unwrap();
+        let lease = ConnectorStatisticsLease::new(
+            descriptor.clone(),
+            incarnation,
+            Arc::new(WrongOperationStatistics {
+                descriptor,
+                incarnation,
+            }),
+            || {},
+        )
+        .expect("lease");
+        let context = ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            1024,
+        )
+        .expect("context");
+        let result = lease.begin_collection(StatisticsCollectionStartRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            table,
+            data_version: data_version(b"data-v1"),
+            selection: StatisticsColumnSelection::Default,
+            context,
+        });
+        assert!(matches!(result, Err(error) if error.kind() == ConnectorErrorKind::CorruptData));
     }
 
     #[test]

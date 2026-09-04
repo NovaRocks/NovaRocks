@@ -29,9 +29,10 @@
 
 use std::sync::Arc;
 
-use super::driver::PipelineDriver;
+use super::driver::{PipelineDriver, PipelineDriverBindings};
 use super::fragment_context::FragmentContext;
 use super::operator_factory::OperatorFactory;
+use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use tracing::debug;
 
@@ -70,6 +71,8 @@ impl Pipeline {
         for i in 0..self.dop {
             let mut operators = Vec::with_capacity(self.op_factories.len());
             let mut operator_profiles = Vec::new();
+            let mem_root = ctx.runtime_state().mem_tracker();
+            let mut operator_mem_trackers = Vec::with_capacity(self.op_factories.len());
             let mut source_idx = None;
             let mut sink_idx = None;
             let driver_id = ctx.next_driver_id();
@@ -106,6 +109,13 @@ impl Pipeline {
                     sink_idx = Some(idx);
                 }
                 let mut op = factory.create(self.dop, i);
+                let operator_mem_tracker = mem_root.as_ref().map(|root| {
+                    MemTracker::new_child(format!("operator {}: {}", idx, op.name()), root)
+                });
+                if let Some(tracker) = operator_mem_tracker.as_ref() {
+                    op.set_mem_tracker(Arc::clone(tracker));
+                }
+                operator_mem_trackers.push(operator_mem_tracker);
                 if let Some(driver_profiler) = driver_profiler.as_ref() {
                     let op_profile = driver_profiler.child(op.name().to_string());
                     let profiles = OperatorProfiles::new(op_profile);
@@ -136,7 +146,7 @@ impl Pipeline {
                 operator_profiles,
                 std::sync::Arc::clone(ctx.runtime_state()),
                 ctx.fragment_instance_id(),
-                ctx.event_sink(),
+                PipelineDriverBindings::new(ctx.event_sink(), Some(operator_mem_trackers)),
             ));
         }
         Ok(drivers)

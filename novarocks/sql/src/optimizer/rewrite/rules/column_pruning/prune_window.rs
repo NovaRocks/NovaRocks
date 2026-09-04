@@ -228,6 +228,8 @@ mod tests {
             name: name.to_string(),
             args: vec![],
             distinct: false,
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![],
             order_by: vec![],
             window_frame: None,

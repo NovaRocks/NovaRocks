@@ -2301,6 +2301,15 @@ name = "novarocks-failpoint"
 version = "0.1.0"
 
 [[package]]
+name = "novarocks-functions"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "sha2",
+]
+
+[[package]]
 name = "novarocks-native-trust"
 version = "0.1.0"
 dependencies = [
@@ -2360,6 +2369,7 @@ dependencies = [
  "chrono",
  "hex",
  "md-5",
+ "novarocks-functions",
  "novarocks-parser",
  "novarocks-spi",
  "novarocks-types",

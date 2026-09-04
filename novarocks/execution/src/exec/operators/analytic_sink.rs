@@ -103,8 +103,7 @@ impl ProcessorOperator for AnalyticSinkOperator {
         if self.finished {
             return Ok(());
         }
-        self.state.push_input(state, chunk);
-        Ok(())
+        self.state.push_input(state, chunk)
     }
 
     fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {

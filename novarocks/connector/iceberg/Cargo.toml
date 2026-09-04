@@ -35,7 +35,6 @@ async-trait = "0.1"
 bytes = "1"
 chrono = "0.4"
 crc32fast = "1"
-datasketches = { workspace = true, features = ["theta"] }
 futures = "0.3"
 ordered-float = "4"
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
@@ -51,6 +50,7 @@ url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 novarocks-fs = { path = "../../fs" }
 novarocks-connector-binding = { path = "../../connector-binding" }
+novarocks-connector-iceberg-functions = { path = "../iceberg-functions" }
 novarocks-proto-codec = { path = "../../proto-codec" }
 novarocks-proto-models = { path = "../../proto-models" }
 novarocks-spi = { path = "../../spi" }

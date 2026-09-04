@@ -54,6 +54,7 @@ pub(crate) fn decode_native_query_execution_id(
     reason = "Retained for target-specific native integration and regression coverage."
 )]
 impl NativeFragmentRequest {
+    #[cfg(test)]
     pub(crate) fn try_decode(
         execution_id: QueryExecutionId,
         fragment: plan::PlanFragment,
@@ -67,6 +68,10 @@ impl NativeFragmentRequest {
             Arc::new(NeverCancelled),
             exchange_wait,
             None,
+            Arc::new(
+                novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                    .expect("builtin function catalog"),
+            ),
         )
     }
 
@@ -77,6 +82,7 @@ impl NativeFragmentRequest {
         connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
         exchange_wait: std::time::Duration,
         typed_scan_runtime: Option<crate::fragment::decode::plan::context::TypedScanRuntime>,
+        function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     ) -> Result<Self, NativeFragmentIngressError> {
         let instance = decode_instance_params(&instance_params)?;
         let decoded = decode_fragment_submission(
@@ -86,6 +92,7 @@ impl NativeFragmentRequest {
             connector_cancellation,
             exchange_wait,
             typed_scan_runtime,
+            function_catalog,
         )
         .map_err(NativeFragmentIngressError::new)?;
         let (submission, backend_num) = decoded.into_parts();
@@ -126,6 +133,9 @@ impl NativeFragmentRequest {
             self.query_options(),
         ))
     }
+    pub(crate) fn exec_mem_limit(&self) -> Option<i64> {
+        self.query_options().exec_mem_limit()
+    }
     pub(crate) fn has_runtime_filter_bindings(&self) -> bool {
         self.submission.program().runtime_filters().has_bindings()
     }
@@ -149,10 +159,6 @@ impl NativeFragmentRequest {
     dead_code,
     reason = "Retained for target-specific native integration and regression coverage."
 )]
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
 struct NeverCancelled;
 
 impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
@@ -163,7 +169,6 @@ impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};

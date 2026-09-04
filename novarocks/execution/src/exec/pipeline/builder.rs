@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use crate::runtime_filter as execution;
 
+use crate::exec::expr::agg::SealedExecutionFunctionSet;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::aggregate::{
     AggregateNode, AggregateRuntimeFilterSpec, AggregateTopNRuntimeFilterProducerBinding,
@@ -61,7 +62,9 @@ use crate::exec::operators::hashjoin::partitioned_join_shared::PartitionedJoinSh
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
-use crate::runtime::fragment::io::{FragmentLookupClient, UnavailableFragmentLookupClient};
+use crate::runtime::fragment::io::FragmentLookupClient;
+#[cfg(test)]
+use crate::runtime::fragment::io::UnavailableFragmentLookupClient;
 
 use super::operator_factory::OperatorFactory;
 use crate::exec::operators::AssertNumRowsProcessorFactory;
@@ -108,6 +111,7 @@ struct PipelineBuildResult {
 
 struct PipelineBuildContext {
     arena: Arc<ExprArena>,
+    function_set: Arc<SealedExecutionFunctionSet>,
     dep_manager: DependencyManager,
     runtime_filter_execution: PipelineRuntimeFilterExecution,
     exchange_bindings: ExchangeBindings,
@@ -133,6 +137,7 @@ impl PipelineBuildContext {
 }
 
 #[allow(dead_code)]
+#[cfg(test)]
 /// Build a pipeline graph from an execution plan using the default degree of parallelism.
 pub(crate) fn build_native_pipeline_graph_for_exec_plan(
     plan: &ExecPlan,
@@ -155,6 +160,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan(
 }
 
 /// Build a pipeline graph from an execution plan with an explicit degree of parallelism.
+#[cfg(test)]
 pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
     plan: &ExecPlan,
     _debug: bool,
@@ -175,6 +181,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
         None,
         PipelineRuntimeFilterExecution { session: None },
         Arc::new(UnavailableFragmentLookupClient),
+        crate::exec::expr::agg::test_builtin_execution_function_set(),
         1,
         1,
         i64::MAX,
@@ -189,6 +196,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
     dead_code,
     reason = "Retained as a stable compatibility pipeline assembly entrypoint."
 )]
+#[cfg(test)]
 pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
     plan: &ExecPlan,
     debug: bool,
@@ -220,6 +228,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop(
     dead_code,
     reason = "Retained as a stable compatibility pipeline assembly entrypoint."
 )]
+#[cfg(test)]
 pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session(
     plan: &ExecPlan,
     debug: bool,
@@ -249,6 +258,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
     clippy::too_many_arguments,
     reason = "The pipeline assembly boundary receives every independently-owned runtime service."
 )]
+#[cfg(test)]
 pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session_and_lookup_client(
     plan: &ExecPlan,
     debug: bool,
@@ -272,6 +282,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
         root_sink_dop,
         PipelineRuntimeFilterExecution { session },
         lookup_client,
+        crate::exec::expr::agg::test_builtin_execution_function_set(),
         1,
         1,
         i64::MAX,
@@ -294,6 +305,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
     root_sink_dop: Option<i32>,
     session: Option<execution::RuntimeFilterSessionRef>,
     lookup_client: Arc<dyn FragmentLookupClient>,
+    function_set: Arc<SealedExecutionFunctionSet>,
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
@@ -309,6 +321,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
         root_sink_dop,
         PipelineRuntimeFilterExecution { session },
         lookup_client,
+        function_set,
         operator_buffer_chunks.max(1),
         local_exchange_buffer_mem_limit_per_driver.max(1),
         local_exchange_max_buffered_rows,
@@ -319,6 +332,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
     clippy::too_many_arguments,
     reason = "The compatibility entrypoint exposes the established pipeline assembly contract."
 )]
+#[cfg(test)]
 #[allow(
     dead_code,
     reason = "Retained as a stable compatibility pipeline assembly entrypoint."
@@ -344,6 +358,7 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_sess
         None,
         PipelineRuntimeFilterExecution { session },
         Arc::new(UnavailableFragmentLookupClient),
+        crate::exec::expr::agg::test_builtin_execution_function_set(),
         1,
         1,
         i64::MAX,
@@ -365,6 +380,7 @@ fn build_pipeline_graph_in_mode(
     root_sink_dop: Option<i32>,
     runtime_filter_execution: PipelineRuntimeFilterExecution,
     lookup_client: Arc<dyn FragmentLookupClient>,
+    function_set: Arc<SealedExecutionFunctionSet>,
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
     local_exchange_max_buffered_rows: i64,
@@ -372,6 +388,7 @@ fn build_pipeline_graph_in_mode(
     let arena = Arc::new(plan.arena.clone());
     let mut ctx = PipelineBuildContext {
         arena,
+        function_set,
         dep_manager,
         runtime_filter_execution,
         exchange_bindings,
@@ -653,11 +670,11 @@ pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chun
         }
         ExecNodeKind::Analytic(analytic) => Some(Arc::clone(&analytic.output_chunk_schema)),
         ExecNodeKind::SetOp(set_op) => Some(Arc::clone(&set_op.output_chunk_schema)),
-        ExecNodeKind::TableWriter(_) => {
-            Some(crate::exec::node::table_write_relation::writer_relation_chunk_schema())
+        ExecNodeKind::TableWriter(node) => {
+            Some(Arc::clone(node.writer_multiplex_schema().chunk_schema()))
         }
-        ExecNodeKind::TableFinish(_) => {
-            Some(crate::exec::node::table_write_relation::root_relation_chunk_schema())
+        ExecNodeKind::TableFinish(node) => {
+            Some(Arc::clone(node.root_result_schema().chunk_schema()))
         }
     }
 }
@@ -1248,9 +1265,10 @@ fn build_pipeline_for_node(
                 window.clone(),
                 output_columns.clone(),
                 Arc::clone(output_chunk_schema),
+                Arc::clone(&ctx.function_set),
                 *node_id,
                 ctx.operator_buffer_chunks,
-            );
+            )?;
 
             build
                 .pipeline
@@ -1275,6 +1293,7 @@ fn build_pipeline_for_node(
             node_id,
             group_by,
             functions,
+            resolved_aggregates,
             need_finalize,
             input_is_intermediate: _input_is_intermediate,
             output_chunk_schema,
@@ -1345,6 +1364,8 @@ fn build_pipeline_for_node(
                         Arc::clone(&ctx.arena),
                         group_by.clone(),
                         partial_functions,
+                        Arc::clone(&ctx.function_set),
+                        resolved_aggregates.clone(),
                         true,
                         false,
                         output_chunk_schema.clone(),
@@ -1395,6 +1416,8 @@ fn build_pipeline_for_node(
                         Arc::clone(&ctx.arena),
                         group_by.clone(),
                         merge_functions,
+                        Arc::clone(&ctx.function_set),
+                        resolved_aggregates.clone(),
                         false,
                         true,
                         output_chunk_schema.clone(),
@@ -1417,6 +1440,8 @@ fn build_pipeline_for_node(
                         Arc::clone(&ctx.arena),
                         group_by.clone(),
                         partial_functions,
+                        Arc::clone(&ctx.function_set),
+                        resolved_aggregates.clone(),
                         true,
                         false,
                         output_chunk_schema.clone(),
@@ -1465,6 +1490,8 @@ fn build_pipeline_for_node(
                         Arc::clone(&ctx.arena),
                         group_by.clone(),
                         merge_functions,
+                        Arc::clone(&ctx.function_set),
+                        resolved_aggregates.clone(),
                         false,
                         true,
                         output_chunk_schema.clone(),
@@ -1525,6 +1552,8 @@ fn build_pipeline_for_node(
                         Arc::clone(&ctx.arena),
                         group_by.clone(),
                         functions.clone(),
+                        Arc::clone(&ctx.function_set),
+                        resolved_aggregates.clone(),
                         !*need_finalize,
                         output_chunk_schema.clone(),
                         streaming_state.clone(),
@@ -1573,6 +1602,8 @@ fn build_pipeline_for_node(
                     Arc::clone(&ctx.arena),
                     group_by.clone(),
                     functions.clone(),
+                    Arc::clone(&ctx.function_set),
+                    resolved_aggregates.clone(),
                     !*need_finalize,
                     false,
                     output_chunk_schema.clone(),
@@ -2033,7 +2064,10 @@ fn build_pipeline_for_node(
             build
                 .pipeline
                 .factories
-                .push(Box::new(TableWriterOperatorFactory::new(node)));
+                .push(Box::new(TableWriterOperatorFactory::try_new(
+                    node,
+                    Arc::clone(&ctx.function_set),
+                )?));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
@@ -2075,7 +2109,10 @@ fn build_pipeline_for_node(
             let mut pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             pipeline
                 .factories
-                .push(Box::new(TableFinishOperatorFactory::new(node)));
+                .push(Box::new(TableFinishOperatorFactory::new_with_arena(
+                    node,
+                    Arc::clone(&ctx.arena),
+                )));
             Ok(PipelineBuildResult {
                 pipeline,
                 extra_pipelines,
@@ -2165,6 +2202,7 @@ mod tests {
         build_native_pipeline_graph_for_exec_plan_with_root_sink_dop,
     };
     use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+    use crate::exec::expr::agg::test_builtin_execution_function_set;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{
         AggFunction, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
@@ -2179,6 +2217,16 @@ mod tests {
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
             .expect("chunk schema")
+    }
+
+    fn resolved_aggregate(
+        name: &str,
+        argument_types: &[DataType],
+    ) -> novarocks_functions::ResolvedAggregateSignature {
+        test_builtin_execution_function_set()
+            .catalog()
+            .resolve_aggregate_trusted(name, argument_types)
+            .expect("resolved builtin aggregate")
     }
 
     #[allow(
@@ -2243,6 +2291,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }],
+                resolved_aggregates: vec![resolved_aggregate("sum", &[DataType::Int32])],
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
@@ -2269,6 +2318,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }],
+                resolved_aggregates: vec![resolved_aggregate("sum", &[DataType::Int32])],
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
@@ -2518,6 +2568,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }],
+                resolved_aggregates: vec![resolved_aggregate("sum", &[DataType::Int32])],
                 // "merge serialize" style node: outputs intermediate, but still groups by keys.
                 need_finalize: false,
                 input_is_intermediate: true,
@@ -2602,6 +2653,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }],
+                resolved_aggregates: vec![resolved_aggregate("sum", &[DataType::Int32])],
                 // Outputs intermediate states to be merged/finalized downstream.
                 need_finalize: false,
                 input_is_intermediate: false,
@@ -2723,6 +2775,80 @@ mod tests {
             .filter(|factory| factory.name().starts_with("UnionAllSink"))
             .count();
         assert_eq!(convergence_sinks, 3);
+    }
+
+    #[test]
+    fn table_write_pipeline_uses_each_nodes_frozen_relation_and_function_set() {
+        use crate::exec::chunk::Chunk;
+        use crate::exec::node::table_finish::TableFinishNode;
+        use crate::exec::node::table_write_relation::ConnectorCommitFragmentCarrierValidator;
+        use crate::exec::node::values::ValuesNode;
+        use crate::exec::operators::table_writer::tests::{
+            TestWriteExecution, WriteExecutionStats, writer_node_with_count_partials,
+        };
+        use novarocks_spi::connector::ConnectorError;
+        use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+
+        struct AcceptAll;
+        impl ConnectorCommitFragmentCarrierValidator for AcceptAll {
+            fn validate(
+                &self,
+                _target: WriteTargetOrdinal,
+                _encoded: &[u8],
+            ) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+        }
+
+        let execution = Arc::new(TestWriteExecution::new(Arc::new(
+            WriteExecutionStats::default(),
+        )));
+        let (writer, _) = writer_node_with_count_partials(execution, 1);
+        let expected_writer_schema = Arc::clone(writer.writer_multiplex_schema().chunk_schema());
+        let writer_plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::TableWriter(writer),
+            },
+        };
+        assert_eq!(
+            super::output_chunk_schema_for_node(&writer_plan.root),
+            Some(expected_writer_schema)
+        );
+        build_native_pipeline_graph_for_exec_plan_with_dop(
+            &writer_plan,
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            2,
+        )
+        .expect("the builder supplies the exact execution function set");
+
+        let finish = TableFinishNode::try_new(
+            vec![ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk: Chunk::default(),
+                    node_id: 7,
+                }),
+            }],
+            8,
+            vec![WriteTargetOrdinal::try_new(0).expect("target")],
+            Arc::new(AcceptAll),
+        )
+        .expect("table finish node");
+        let expected_root_schema = Arc::clone(finish.root_result_schema().chunk_schema());
+        let finish_plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::TableFinish(finish),
+            },
+        };
+        assert_eq!(
+            super::output_chunk_schema_for_node(&finish_plan.root),
+            Some(expected_root_schema)
+        );
     }
 
     /// Build one table-writer plan over an exchange receiver and report the

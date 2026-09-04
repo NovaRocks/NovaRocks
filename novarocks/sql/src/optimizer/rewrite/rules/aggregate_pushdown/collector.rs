@@ -500,6 +500,7 @@ mod tests {
             args: vec![intern_typed(arena, &arg)],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         }
     }
 
@@ -655,6 +656,7 @@ mod tests {
             args: vec![],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
         };
         let agg = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -675,6 +677,7 @@ mod tests {
             args: vec![avg_arg],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("avg", &[DataType::Int64], false),
         };
         let agg = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -705,6 +708,7 @@ mod tests {
             args: vec![arg_id],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         };
         let agg = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -735,6 +739,7 @@ mod tests {
             args: vec![arg_id],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Float64], false),
         };
         let agg = make_agg(
             vec![col_ref_typed("k", DataType::Int64)],
@@ -920,6 +925,11 @@ mod tests {
                 args: vec![sum_arg],
                 distinct: false,
                 order_by: vec![],
+                resolved: crate::functions::test_resolved_aggregate(
+                    "sum",
+                    &[DataType::Int64],
+                    false,
+                ),
             }],
             &mut arena,
         );
@@ -1115,6 +1125,7 @@ mod tests {
             args: vec![count_arg],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
         };
 
         let agg = agg_opt(

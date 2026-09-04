@@ -46,7 +46,8 @@ use novarocks_spi::connector::write_stack::session::{
     ConnectorWriteTargetPlan,
 };
 use novarocks_spi::connector::write_stack::{
-    ConnectorManagedPublicationShape, ConnectorPreparedWriteSet, WriteTargetOrdinal,
+    ConnectorManagedPublicationShape, ConnectorPreparedWriteSet, WriteStatisticsContract,
+    WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
@@ -56,11 +57,15 @@ use novarocks_spi::connector::{
     ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
     ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, ProviderBindingEpoch,
+    ExternalMutationOutcome, ProviderBindingEpoch, StatisticsArtifactIdentity,
+    StatisticsRequiredAggregation, StatisticsScanColumn,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::catalog::CatalogTransactionStart;
+use crate::catalog::error::CatalogOutcome;
+use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
 use crate::commit::write_stack::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCommitHandle,
     IcebergContentRange, IcebergDataBranchRecipe, IcebergEmptyWriteDecision,
@@ -83,6 +88,7 @@ use crate::commit::{
     IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
 };
 use crate::iceberg::spec::{DataContentType, DataFileFormat, TableMetadata};
+use crate::iceberg::transaction::ApplyTransactionAction;
 use crate::metadata_context::IcebergMetadataContext;
 use crate::write_descriptor::decode_partition_descriptor;
 
@@ -129,6 +135,7 @@ struct IcebergWriteSessionEvidenceV1 {
 }
 
 /// The frontend-only Iceberg write authority of one exact catalog generation.
+// Design: ADR-0135 (docs/adr/ADR-0135-ordinary-aggregate-statistics-dataflow.md)
 pub struct IcebergWriteSessionControl {
     key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
@@ -318,6 +325,277 @@ pub(crate) fn validate_merged_old_references(
         }
     }
     Ok(())
+}
+
+fn validate_statistics_artifacts(
+    handle: &IcebergCommitHandle,
+    artifacts: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
+) -> Result<Vec<novarocks_spi::connector::StatisticsArtifactDraft>, ConnectorError> {
+    let expected = handle.statistics_expectations();
+    let expected_pairs = expected
+        .iter()
+        .flat_map(|(target, identities)| {
+            identities
+                .iter()
+                .cloned()
+                .map(|identity| (*target, identity))
+        })
+        .collect::<BTreeSet<_>>();
+    if artifacts.len() != expected_pairs.len() {
+        return Err(invalid(
+            "Iceberg write statistics artifact count does not match the sealed expectation set",
+        ));
+    }
+
+    let mut observed = BTreeSet::new();
+    let mut by_identity: BTreeMap<StatisticsArtifactIdentity, Vec<Bytes>> = BTreeMap::new();
+    for artifact in artifacts {
+        let (target, draft) = artifact.into_parts();
+        let key = (target, draft.identity().clone());
+        if !expected_pairs.contains(&key) || !observed.insert(key) {
+            return Err(invalid(
+                "Iceberg write statistics artifacts contain an unknown or duplicate target identity",
+            ));
+        }
+        if draft.identity().blob_type() != crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1 {
+            return Err(invalid(
+                "Iceberg write statistics contract produced an unsupported blob type",
+            ));
+        }
+        novarocks_connector_iceberg_functions::validate_compact_theta(draft.body())
+            .map_err(|error| corrupt(error.to_string()))?;
+        let estimate = novarocks_connector_iceberg_functions::estimate_compact_theta(draft.body())
+            .map_err(|error| corrupt(error.to_string()))?;
+        validate_theta_properties(draft.properties(), estimate)?;
+        by_identity
+            .entry(draft.identity().clone())
+            .or_default()
+            .push(draft.body().clone());
+    }
+    if observed != expected_pairs {
+        return Err(invalid(
+            "Iceberg write statistics artifacts do not exactly match the sealed expectation set",
+        ));
+    }
+
+    by_identity
+        .into_iter()
+        .map(|(identity, bodies)| {
+            let body = novarocks_connector_iceberg_functions::union_compact_theta(
+                bodies.iter().map(Bytes::as_ref),
+            )
+            .map_err(|error| corrupt(error.to_string()))?;
+            normalized_theta_artifact(identity, Bytes::from(body))
+        })
+        .collect()
+}
+
+fn validate_theta_properties(
+    properties: &BTreeMap<String, String>,
+    estimate: f64,
+) -> Result<(), ConnectorError> {
+    if properties
+        .keys()
+        .any(|property| property != crate::stats_loader::NDV_PROPERTY)
+    {
+        return Err(invalid(
+            "Iceberg Theta write statistics contain an unsupported property",
+        ));
+    }
+    if let Some(rendered) = properties.get(crate::stats_loader::NDV_PROPERTY) {
+        let supplied = rendered
+            .parse::<f64>()
+            .map_err(|_| invalid("Iceberg Theta write statistics ndv property is not numeric"))?;
+        if !supplied.is_finite() || supplied < 0.0 || supplied.to_bits() != estimate.to_bits() {
+            return Err(invalid(
+                "Iceberg Theta write statistics ndv property does not match its body",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_theta_artifact(
+    identity: StatisticsArtifactIdentity,
+    body: Bytes,
+) -> Result<novarocks_spi::connector::StatisticsArtifactDraft, ConnectorError> {
+    let estimate = novarocks_connector_iceberg_functions::estimate_compact_theta(&body)
+        .map_err(|error| corrupt(error.to_string()))?;
+    novarocks_spi::connector::StatisticsArtifactDraft::try_new(
+        identity.input_fields().to_vec(),
+        identity.blob_type(),
+        body,
+        BTreeMap::from([(
+            crate::stats_loader::NDV_PROPERTY.to_string(),
+            estimate.to_string(),
+        )]),
+    )
+}
+
+fn cleanup_eager_logs(
+    runtime: &IcebergMetadataContext,
+    fs: crate::opendal::Operator,
+    mapper: crate::commit::CleanupPathMapper,
+    logs: Vec<Arc<crate::commit::abort::AbortLog>>,
+) {
+    let _ = runtime.resources().catalog_runtime().block_on(async move {
+        for log in logs {
+            for error in log
+                .cleanup_with_path_mapper(&fs, |path| mapper(path))
+                .await
+            {
+                tracing::warn!(path = %error.path, source = ?error.source, "eager Iceberg cleanup failed");
+            }
+        }
+    });
+}
+
+pub(crate) fn eager_conflict_backoff(
+    runtime: &IcebergMetadataContext,
+    context: &ConnectorRequestContext,
+    next_attempt: usize,
+) -> Result<(), ConnectorError> {
+    validate_context(context)?;
+    let delay = std::time::Duration::from_millis(
+        crate::commit::retry::COMMIT_RETRY_BACKOFF_MS[next_attempt - 1],
+    );
+    if context
+        .deadline()
+        .saturating_duration_since(std::time::Instant::now())
+        <= delay
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::DeadlineExceeded,
+            "Iceberg write deadline does not permit another conflict attempt",
+        ));
+    }
+    let end = std::time::Instant::now() + delay;
+    while std::time::Instant::now() < end {
+        validate_context(context)?;
+        let step = end
+            .saturating_duration_since(std::time::Instant::now())
+            .min(std::time::Duration::from_millis(5));
+        runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { tokio::time::sleep(step).await })
+            .map_err(unavailable)?;
+    }
+    validate_context(context)
+}
+
+fn commit_proof_matches_eager_snapshot(
+    proof: &crate::catalog::transaction::CommitProof,
+    snapshot_id: i64,
+    table_uuid: &str,
+) -> bool {
+    proof.snapshot_id == Some(snapshot_id)
+        && proof
+            .table_uuid
+            .as_deref()
+            .is_none_or(|observed| observed == table_uuid)
+}
+
+fn eager_proof_finalization(
+    proof: &crate::catalog::transaction::CommitProof,
+    snapshot_id: i64,
+    table_uuid: &str,
+) -> Option<ExternalMutationFinalization> {
+    (!commit_proof_matches_eager_snapshot(proof, snapshot_id, table_uuid)).then(|| {
+        ExternalMutationFinalization::Failed(failure(
+            ConnectorMutationFailureKind::Internal,
+            "Iceberg catalog commit proof does not match the eagerly staged snapshot",
+        ))
+    })
+}
+
+async fn artifacts_for_staged_snapshot(
+    base: &crate::iceberg::table::Table,
+    staged_metadata: &TableMetadata,
+    target_ref: &str,
+    op_kind: CommitOpKind,
+    current: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+) -> Result<Vec<novarocks_spi::connector::StatisticsArtifactDraft>, ConnectorError> {
+    if current.is_empty() || op_kind == CommitOpKind::Overwrite {
+        return Ok(current);
+    }
+    let parent_id =
+        crate::ref_snapshot::resolve_branch_head_snapshot_id(base.metadata(), target_ref)
+            .map_err(invalid)?;
+    let Some(parent_id) = parent_id else {
+        return Ok(current);
+    };
+    let parent_is_empty = base
+        .metadata()
+        .snapshot_by_id(parent_id)
+        .and_then(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .get("total-records")
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+        == Some(0);
+    if parent_is_empty {
+        return Ok(current);
+    }
+    let Some(parent_statistics) = base.metadata().statistics_for_snapshot(parent_id) else {
+        // A non-empty parent without an artifact for a field cannot prove
+        // whole-table coverage for that field after append.
+        return Ok(Vec::new());
+    };
+    let parent_bodies = crate::stats_loader::StatsLoader::load_theta_bodies_from_file(
+        &parent_statistics.statistics_path,
+        base.file_io(),
+    )
+    .await
+    .map_err(corrupt)?;
+    let parent_snapshot = base
+        .metadata()
+        .snapshot_by_id(parent_id)
+        .ok_or_else(|| corrupt(format!("Iceberg parent snapshot {parent_id} is absent")))?;
+    let current_snapshot = staged_metadata
+        .snapshot_by_id(
+            crate::ref_snapshot::resolve_branch_head_snapshot_id(staged_metadata, target_ref)
+                .map_err(corrupt)?
+                .ok_or_else(|| corrupt("staged Iceberg snapshot is absent"))?,
+        )
+        .ok_or_else(|| corrupt("staged Iceberg snapshot is absent"))?;
+    let parent_schema = parent_snapshot
+        .schema(base.metadata())
+        .map_err(|error| corrupt(format!("resolve Iceberg parent statistics schema: {error}")))?;
+    let current_schema = current_snapshot
+        .schema(staged_metadata)
+        .map_err(|error| corrupt(format!("resolve staged Iceberg statistics schema: {error}")))?;
+
+    let mut merged = Vec::new();
+    for artifact in current {
+        let [field_id] = artifact.identity().input_fields() else {
+            return Err(corrupt(
+                "Iceberg Theta write artifact must identify exactly one field",
+            ));
+        };
+        let compatible = match (
+            parent_schema.field_by_id(*field_id),
+            current_schema.field_by_id(*field_id),
+        ) {
+            (Some(parent), Some(current)) => parent.field_type == current.field_type,
+            _ => false,
+        };
+        let Some(parent_body) = compatible.then(|| parent_bodies.get(field_id)).flatten() else {
+            continue;
+        };
+        let body = novarocks_connector_iceberg_functions::union_compact_theta([
+            parent_body.as_slice(),
+            artifact.body().as_ref(),
+        ])
+        .map_err(|error| corrupt(error.to_string()))?;
+        merged.push(normalized_theta_artifact(
+            artifact.identity().clone(),
+            Bytes::from(body),
+        )?);
+    }
+    Ok(merged)
 }
 
 /// Turn one validated fragment into the provider's physical commit input.
@@ -625,6 +903,7 @@ impl IcebergWriteSessionControl {
         &self,
         handle: &IcebergCommitHandle,
         prepared: &ConnectorPreparedWriteSet,
+        statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
@@ -639,7 +918,15 @@ impl IcebergWriteSessionControl {
         }
 
         handle.begin_commit()?;
-        let outcome = self.dispatch_commit(handle, &validated, context);
+        let outcome = if matches!(
+            handle.commit_op_kind(),
+            CommitOpKind::FastAppend | CommitOpKind::Overwrite
+        ) {
+            self.dispatch_eager_commit(handle, &validated, statistics, context)
+        } else {
+            debug_assert!(statistics.is_empty());
+            self.dispatch_commit(handle, &validated, context)
+        };
         match &outcome {
             Ok(ExternalMutationOutcome::KnownCommitted { receipt, .. }) => {
                 let snapshot_id = receipt
@@ -967,6 +1254,447 @@ impl IcebergWriteSessionControl {
                 }),
             },
         }
+    }
+
+    fn dispatch_eager_commit(
+        &self,
+        handle: &IcebergCommitHandle,
+        validated: &[ValidatedFragment<'_>],
+        statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+        context: &ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        let facts = handle.table();
+        let session_abort = Arc::new(crate::commit::abort::AbortLog::new());
+        for entry in validated {
+            session_abort.record_data_file(entry.fragment.path().to_string());
+        }
+        let binding = self
+            .runtime
+            .resources()
+            .planning_binding()
+            .for_request(context.clone());
+        let cleanup_access = binding.resolve_access(facts.table_location())?;
+        let cleanup_fs = cleanup_access.operator();
+        let cleanup_mapper: crate::commit::CleanupPathMapper = Arc::new(move |path: &str| {
+            cleanup_access
+                .bind_location(path, novarocks_fs::FileIdentity::new(path, 0, None))
+                .map(|file| file.operator_relative_path().to_string())
+                .unwrap_or_else(|_| path.to_string())
+        });
+        let cleanup_session = || {
+            cleanup_eager_logs(
+                self.runtime.as_ref(),
+                cleanup_fs.clone(),
+                Arc::clone(&cleanup_mapper),
+                vec![Arc::clone(&session_abort)],
+            );
+        };
+        let initial = match self.runtime.load_table_for_request(
+            facts.namespace(),
+            facts.table_name(),
+            context,
+        ) {
+            Ok(table) => table.into_table(),
+            Err(error) => {
+                cleanup_session();
+                return Err(unavailable(error.to_string()));
+            }
+        };
+        if initial.metadata().uuid().to_string() != facts.table_uuid()
+            || initial.metadata().current_schema_id() != facts.schema_id()
+        {
+            cleanup_session();
+            return Err(invalid(
+                "Iceberg write target no longer matches its sealed table generation/schema",
+            ));
+        }
+        let observed_head = crate::ref_snapshot::resolve_branch_head_snapshot_id(
+            initial.metadata(),
+            facts.target_ref(),
+        )
+        .map_err(invalid)?;
+        if handle.repartition().is_some()
+            && (observed_head != facts.base_snapshot_id()
+                || initial.metadata().default_partition_spec_id()
+                    != facts.default_partition_spec_id())
+        {
+            cleanup_session();
+            return Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure: failure(
+                    ConnectorMutationFailureKind::Conflict,
+                    "atomic partition replacement cannot rebase its frozen metadata updates",
+                ),
+            });
+        }
+        let commit_metadata = handle.repartition().map_or(initial.metadata(), |prepared| {
+            prepared.prospective_metadata()
+        });
+        let files = match validated
+            .iter()
+            .map(|entry| written_file_from_fragment(entry.fragment, commit_metadata))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(files) => files,
+            Err(error) => {
+                cleanup_session();
+                return Err(error);
+            }
+        };
+        let staged_data_rows = files
+            .iter()
+            .filter(|file| file.content == DataContentType::Data)
+            .fold(0u64, |total, file| total.saturating_add(file.record_count));
+        let snapshot_properties = match session_snapshot_properties(handle, staged_data_rows) {
+            Ok(properties) => properties,
+            Err(error) => {
+                cleanup_session();
+                return Err(error);
+            }
+        };
+        let table_ident =
+            match crate::iceberg::TableIdent::from_strs([facts.namespace(), facts.table_name()]) {
+                Ok(ident) => ident,
+                Err(error) => {
+                    cleanup_session();
+                    return Err(invalid(error.to_string()));
+                }
+            };
+        let expected_uuid = initial.metadata().uuid();
+        let expected_uuid_rendered = expected_uuid.to_string();
+        let mut current = initial;
+        const MAX_ATTEMPTS: usize = 3;
+        for attempt in 0..MAX_ATTEMPTS {
+            if let Err(error) = validate_context(context) {
+                cleanup_session();
+                return Err(error);
+            }
+            if attempt > 0 {
+                self.runtime
+                    .control_state()
+                    .invalidate_table_cache(facts.namespace(), facts.table_name());
+                current = match self.runtime.load_table_for_request(
+                    facts.namespace(),
+                    facts.table_name(),
+                    context,
+                ) {
+                    Ok(table) => table.into_table(),
+                    Err(error) => {
+                        cleanup_session();
+                        return Err(unavailable(error.to_string()));
+                    }
+                };
+                if current.metadata().uuid() != expected_uuid
+                    || current.metadata().current_schema_id() != facts.schema_id()
+                {
+                    cleanup_session();
+                    return Ok(ExternalMutationOutcome::KnownUncommitted {
+                        failure: failure(
+                            ConnectorMutationFailureKind::Conflict,
+                            "Iceberg write conflict retry resolved a different table generation or schema",
+                        ),
+                    });
+                }
+            }
+
+            let attempt_metadata = handle.repartition().map_or(current.metadata(), |prepared| {
+                prepared.prospective_metadata()
+            });
+            let attempt_partition_spec = if handle.repartition().is_some() {
+                attempt_metadata.default_partition_spec().clone()
+            } else {
+                match current
+                    .metadata()
+                    .partition_spec_by_id(facts.default_partition_spec_id())
+                    .cloned()
+                {
+                    Some(spec) => spec,
+                    None => {
+                        cleanup_session();
+                        return Err(invalid(
+                            "Iceberg write conflict retry lost the sealed partition spec",
+                        ));
+                    }
+                }
+            };
+            let attempt_base_snapshot = match crate::ref_snapshot::resolve_branch_head_snapshot_id(
+                current.metadata(),
+                facts.target_ref(),
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    cleanup_session();
+                    return Err(invalid(error));
+                }
+            };
+            let collector = Arc::new(
+                IcebergCommitCollector::new(
+                    handle.commit_op_kind(),
+                    table_ident.clone(),
+                    attempt_base_snapshot,
+                    current.metadata().last_sequence_number(),
+                    attempt_metadata.current_schema().clone(),
+                    attempt_partition_spec,
+                    handle.staging_dir(),
+                )
+                .with_table_metadata(attempt_metadata.clone()),
+            );
+            collector.inject_reusable_written_files(files.clone());
+            let commit_uuid = uuid::Uuid::new_v4();
+            collector.set_manifest_cleanup_token(commit_uuid.to_string());
+            let abort_handle = Arc::clone(&collector.abort_log);
+            let vendored = self.runtime.novarocks_catalog().vendored_client();
+            let provider_catalog = Arc::clone(self.runtime.novarocks_catalog());
+            let table = current.clone();
+            let file_io = table.file_io().clone();
+            let target_ref = facts.target_ref().to_string();
+            let snapshot_properties = snapshot_properties.clone();
+            let current_artifacts = statistics.clone();
+            let initial_updates = handle
+                .repartition()
+                .map_or_else(Vec::new, |prepared| prepared.metadata_updates().to_vec());
+            let mut identity = handle.session_id().to_bytes();
+            identity[15] ^= attempt as u8;
+            let target =
+                crate::catalog::CatalogTableName::new(facts.namespace(), facts.table_name());
+            let target_ref_for_request = Arc::<str>::from(facts.target_ref());
+            let expected_uuid_string = Arc::<str>::from(expected_uuid_rendered.as_str());
+            let marker = Some((
+                Arc::<str>::from(ICEBERG_WRITE_SESSION_MARKER_PROPERTY),
+                Arc::<str>::from(handle.session_id().to_string()),
+            ));
+            let operation = handle.commit_op_kind();
+            let bridge_collector = Arc::clone(&collector);
+            let attempt_result = self
+                .runtime
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    let ctx = crate::commit::action::CommitCtx {
+                        collector: &collector,
+                        table: &table,
+                        catalog: vendored.as_ref(),
+                        file_io: &file_io,
+                        commit_uuid,
+                        abort_handle,
+                        target_ref: &target_ref,
+                        snapshot_properties: &snapshot_properties,
+                    };
+                    let (mut transaction, data_outcome) = match operation {
+                        CommitOpKind::FastAppend => {
+                            crate::commit::fast_append::stage_eager_fast_append(ctx).await?
+                        }
+                        CommitOpKind::Overwrite => {
+                            crate::commit::overwrite::stage_eager_overwrite(ctx, initial_updates)
+                                .await?
+                        }
+                        _ => unreachable!("eager write path only accepts append/overwrite"),
+                    };
+                    let staged_metadata = transaction.staged_table().metadata().clone();
+                    let sequence_number = staged_metadata.last_sequence_number();
+                    let merged = artifacts_for_staged_snapshot(
+                        &table,
+                        &staged_metadata,
+                        &target_ref,
+                        operation,
+                        current_artifacts,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    if !merged.is_empty() {
+                        let path = crate::stats_assembler::puffin_path_for_statistics_operation(
+                            &staged_metadata,
+                            data_outcome.new_snapshot_id,
+                            identity,
+                        );
+                        collector.abort_log.record_manifest(path.clone());
+                        let statistics_file = crate::stats_assembler::write_puffin_artifacts(
+                            &file_io,
+                            &path,
+                            data_outcome.new_snapshot_id,
+                            sequence_number,
+                            &merged,
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            "non-empty write statistics produced no Puffin file".to_string()
+                        })?;
+                        transaction = transaction
+                            .update_statistics()
+                            .set_statistics(statistics_file)
+                            .apply(transaction)
+                            .await
+                            .map_err(|error| {
+                                format!("stage Iceberg write SetStatistics: {error}")
+                            })?;
+                    }
+                    let mut staged = transaction.into_table_commit();
+                    staged.add_requirement(crate::iceberg::TableRequirement::UuidMatch {
+                        uuid: expected_uuid,
+                    });
+                    let request = TransactionRequest {
+                        identity: TransactionIdentity::new("write-attempt", identity),
+                        target,
+                        target_ref: target_ref_for_request,
+                        base_snapshot_id: crate::ref_snapshot::resolve_branch_head_snapshot_id(
+                            table.metadata(),
+                            &target_ref,
+                        )
+                        .map_err(|error| error.to_string())?,
+                        expected_table_uuid: Some(expected_uuid_string),
+                        marker,
+                    };
+                    let mut frontier = match provider_catalog.new_transaction(request).await {
+                        CatalogTransactionStart::Ready(frontier) => frontier,
+                        CatalogTransactionStart::KnownUncommitted { failure } => {
+                            return Ok((
+                                CatalogOutcome::KnownUncommitted { failure },
+                                data_outcome,
+                                collector,
+                            ));
+                        }
+                        CatalogTransactionStart::Unsupported(error) => {
+                            return Err(error.to_string());
+                        }
+                        CatalogTransactionStart::CommitUnknown { failure, evidence } => {
+                            return Ok((
+                                CatalogOutcome::CommitUnknown { failure, evidence },
+                                data_outcome,
+                                collector,
+                            ));
+                        }
+                    };
+                    frontier.stage(staged).map_err(|error| error.to_string())?;
+                    let outcome = frontier.commit().await;
+                    Ok((outcome, data_outcome, collector))
+                });
+            let (catalog_outcome, data_outcome, collector) = match attempt_result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    cleanup_eager_logs(
+                        self.runtime.as_ref(),
+                        cleanup_fs.clone(),
+                        Arc::clone(&cleanup_mapper),
+                        vec![
+                            Arc::clone(&bridge_collector.abort_log),
+                            Arc::clone(&session_abort),
+                        ],
+                    );
+                    return Ok(ExternalMutationOutcome::KnownUncommitted {
+                        failure: failure(
+                            ConnectorMutationFailureKind::InvalidRequest,
+                            format!("Iceberg eager staging failed before dispatch: {error}"),
+                        ),
+                    });
+                }
+                Err(bridge) => {
+                    let evidence =
+                        crate::commit::service::RecoveryEvidence::from_collector(&bridge_collector);
+                    return Ok(ExternalMutationOutcome::CommitUnknown {
+                        failure: failure(
+                            ConnectorMutationFailureKind::Unavailable,
+                            format!("Iceberg eager commit runtime bridge: {bridge}"),
+                        ),
+                        evidence: self.encode_evidence(handle, &evidence)?,
+                    });
+                }
+            };
+            match catalog_outcome {
+                CatalogOutcome::KnownCommitted {
+                    effect,
+                    receipt: proof,
+                    ..
+                } => {
+                    collector.mark_committed();
+                    let proof_finalization = eager_proof_finalization(
+                        &proof,
+                        data_outcome.new_snapshot_id,
+                        &expected_uuid_rendered,
+                    );
+                    let (resulting_row_count, finalization) =
+                        if let Some(finalization) = proof_finalization {
+                            (None, finalization)
+                        } else {
+                            match self.publication_row_count(
+                                handle,
+                                data_outcome.new_snapshot_id,
+                                context,
+                            ) {
+                                Ok(rows) => (rows, ExternalMutationFinalization::Complete),
+                                Err(error) => (
+                                    None,
+                                    ExternalMutationFinalization::Failed(failure(
+                                        ConnectorMutationFailureKind::Internal,
+                                        error.message().to_string(),
+                                    )),
+                                ),
+                            }
+                        };
+                    let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
+                        data_outcome.new_snapshot_id,
+                        resulting_row_count,
+                        handle
+                            .repartition()
+                            .map(|prepared| prepared.committed().clone()),
+                    )
+                    .map_err(invalid)?;
+                    return Ok(ExternalMutationOutcome::KnownCommitted {
+                        effect,
+                        receipt,
+                        finalization,
+                    });
+                }
+                CatalogOutcome::KnownUncommitted { failure: rejected }
+                    if rejected.kind() == ConnectorMutationFailureKind::Conflict
+                        && attempt + 1 < MAX_ATTEMPTS
+                        && handle.repartition().is_none() =>
+                {
+                    cleanup_eager_logs(
+                        self.runtime.as_ref(),
+                        cleanup_fs.clone(),
+                        Arc::clone(&cleanup_mapper),
+                        vec![Arc::clone(&collector.abort_log)],
+                    );
+                    if let Err(error) =
+                        eager_conflict_backoff(self.runtime.as_ref(), context, attempt + 1)
+                    {
+                        cleanup_eager_logs(
+                            self.runtime.as_ref(),
+                            cleanup_fs.clone(),
+                            Arc::clone(&cleanup_mapper),
+                            vec![Arc::clone(&session_abort)],
+                        );
+                        return Err(error);
+                    }
+                }
+                CatalogOutcome::KnownUncommitted { failure } => {
+                    cleanup_eager_logs(
+                        self.runtime.as_ref(),
+                        cleanup_fs.clone(),
+                        Arc::clone(&cleanup_mapper),
+                        vec![Arc::clone(&collector.abort_log), Arc::clone(&session_abort)],
+                    );
+                    return Ok(ExternalMutationOutcome::KnownUncommitted { failure });
+                }
+                CatalogOutcome::CommitUnknown { failure, .. } => {
+                    let evidence =
+                        crate::commit::service::RecoveryEvidence::from_collector(&collector);
+                    return Ok(ExternalMutationOutcome::CommitUnknown {
+                        failure,
+                        evidence: self.encode_evidence(handle, &evidence)?,
+                    });
+                }
+                CatalogOutcome::Unsupported(error) => {
+                    cleanup_eager_logs(
+                        self.runtime.as_ref(),
+                        cleanup_fs.clone(),
+                        Arc::clone(&cleanup_mapper),
+                        vec![Arc::clone(&collector.abort_log), Arc::clone(&session_abort)],
+                    );
+                    return Err(invalid(error.to_string()));
+                }
+            }
+        }
+        unreachable!("bounded eager write attempt loop always returns")
     }
 
     /// Project the committed snapshot's row count onto a publication's receipt.
@@ -1355,27 +2083,185 @@ impl IcebergWriteSessionControl {
 /// route facts are what SQL needs to decide which branch a row belongs to.
 pub(crate) fn session_plan_from_targets(
     adapter: &IcebergWriteAdapter,
-    handle: IcebergCommitHandle,
+    mut handle: IcebergCommitHandle,
     targets: Vec<crate::commit::write_stack::planning::IcebergWriteTargetPlan>,
+    statistics_metadata: Option<&TableMetadata>,
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
-    let commit = adapter.wrap_commit_handle(handle);
+    let statistics_enabled = statistics_metadata.is_some_and(collect_on_write_enabled);
+    let statistics_eligible = matches!(
+        handle.commit_op_kind(),
+        CommitOpKind::FastAppend | CommitOpKind::Overwrite
+    ) && handle.flavor() != IcebergWriteFlavor::StagedCreate;
+    let mut expectations = BTreeMap::new();
     let plans = targets
         .into_iter()
         .map(|target| {
             let (ordinal, writer, input, route, rewrite_source) = target.into_parts();
+            let statistics = write_statistics_contract(
+                &writer,
+                &input,
+                statistics_metadata,
+                statistics_enabled && statistics_eligible,
+            )?;
+            if !statistics.is_empty() {
+                expectations.insert(
+                    ordinal,
+                    statistics
+                        .requirements()
+                        .iter()
+                        .map(|requirement| requirement.artifact().clone())
+                        .collect(),
+                );
+            }
             let plan =
-                ConnectorWriteTargetPlan::new(ordinal, adapter.wrap_writer_handle(writer), input);
+                ConnectorWriteTargetPlan::new(ordinal, adapter.wrap_writer_handle(writer), input)
+                    .with_statistics_contract(statistics)?;
             let plan = match route {
                 Some(route) => plan.with_route(route),
                 None => plan,
             };
-            match rewrite_source {
+            let plan = match rewrite_source {
                 Some(source) => plan.with_rewrite_source(source),
                 None => plan,
-            }
+            };
+            Ok(plan)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    handle = handle.with_statistics_expectations(expectations)?;
+    let commit = adapter.wrap_commit_handle(handle);
     ConnectorWriteSessionPlan::try_new(commit, plans)
+}
+
+fn collect_on_write_enabled(metadata: &TableMetadata) -> bool {
+    metadata
+        .properties()
+        .get(crate::stats_assembler::COLLECT_ON_WRITE_PROPERTY)
+        .is_none_or(|value| !value.eq_ignore_ascii_case("false"))
+}
+
+fn write_statistics_contract(
+    writer: &crate::commit::write_stack::domain::IcebergWriterHandle,
+    input: &novarocks_spi::connector::ConnectorWriteInputShape,
+    metadata: Option<&TableMetadata>,
+    enabled: bool,
+) -> Result<WriteStatisticsContract, ConnectorError> {
+    let Some(data_recipe) = writer.data() else {
+        return WriteStatisticsContract::try_new(input, Vec::new());
+    };
+    if !enabled {
+        return WriteStatisticsContract::try_new(input, Vec::new());
+    }
+    let metadata = metadata
+        .ok_or_else(|| invalid("Iceberg collect-on-write requires authoritative table metadata"))?;
+    let iceberg_schema = metadata.current_schema();
+    let arrow_schema =
+        crate::iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|error| {
+            invalid(format!(
+                "convert Iceberg statistics schema to Arrow: {error}"
+            ))
+        })?;
+    let mut requirements = Vec::new();
+    for (ordinal, binding) in input.fields().into_iter().enumerate() {
+        let field = binding.field();
+        let Some(field_id) = resolve_statistics_field(
+            iceberg_schema,
+            &arrow_schema,
+            field,
+            data_recipe.row_lineage(),
+        )?
+        else {
+            continue;
+        };
+        if !novarocks_connector_iceberg_functions::supports_theta_input_type(field.data_type()) {
+            continue;
+        }
+        let input = StatisticsScanColumn::try_new(
+            ordinal,
+            Arc::<str>::from(field.name().as_str()),
+            field.data_type().clone(),
+            field.is_nullable(),
+        )?;
+        let artifact = StatisticsArtifactIdentity::try_new(
+            vec![field_id],
+            crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1,
+        )?;
+        requirements.push(StatisticsRequiredAggregation::try_new(
+            input,
+            novarocks_connector_iceberg_functions::ICEBERG_THETA_AGGREGATE_NAME,
+            artifact,
+        )?);
+    }
+    WriteStatisticsContract::try_new(input, requirements)
+}
+
+fn resolve_statistics_field(
+    iceberg_schema: &crate::iceberg::spec::Schema,
+    arrow_schema: &arrow::datatypes::Schema,
+    field: &arrow::datatypes::Field,
+    row_lineage: bool,
+) -> Result<Option<i32>, ConnectorError> {
+    let candidates = iceberg_schema
+        .as_struct()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.name.eq_ignore_ascii_case(field.name()))
+        .collect::<Vec<_>>();
+    let (schema_ordinal, iceberg_field) = match candidates.as_slice() {
+        [] if row_lineage
+            && matches!(
+                field.name().as_str(),
+                crate::row_lineage_synth::ICEBERG_ROW_ID_COL
+                    | crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL
+            ) =>
+        {
+            return Ok(None);
+        }
+        [] => {
+            return Err(invalid(format!(
+                "Iceberg statistics input column `{}` is absent from the authoritative table schema",
+                field.name()
+            )));
+        }
+        [candidate] => *candidate,
+        _ => {
+            return Err(invalid(format!(
+                "Iceberg statistics input column `{}` is ambiguous under case-insensitive resolution",
+                field.name()
+            )));
+        }
+    };
+    let expected_arrow = arrow_type_for_write_field(
+        arrow_schema.field(schema_ordinal).data_type(),
+        iceberg_field.field_type.as_ref(),
+    );
+    if field.data_type() != &expected_arrow || field.is_nullable() == iceberg_field.required {
+        return Err(invalid(format!(
+            "Iceberg statistics input column `{}` does not match the authoritative table field type/nullability",
+            field.name()
+        )));
+    }
+    Ok(Some(iceberg_field.id))
+}
+
+fn arrow_type_for_write_field(
+    converted: &arrow::datatypes::DataType,
+    iceberg: &crate::iceberg::spec::Type,
+) -> arrow::datatypes::DataType {
+    use crate::iceberg::spec::{PrimitiveType, Type};
+    use arrow::datatypes::{DataType, TimeUnit};
+
+    match iceberg {
+        Type::Primitive(PrimitiveType::Variant) => DataType::LargeBinary,
+        Type::Primitive(PrimitiveType::Binary) => DataType::Binary,
+        Type::Primitive(PrimitiveType::Timestamptz) => {
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        }
+        Type::Primitive(PrimitiveType::TimestamptzNs) => {
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        }
+        _ => converted.clone(),
+    }
 }
 
 impl IcebergWriteSessionControl {
@@ -1400,6 +2286,7 @@ impl IcebergWriteSessionControl {
         (
             IcebergCommitHandle,
             Vec<crate::commit::write_stack::planning::IcebergWriteTargetPlan>,
+            TableMetadata,
         ),
         ConnectorError,
     > {
@@ -1536,6 +2423,7 @@ impl IcebergWriteSessionControl {
                 format_version_number(writer_metadata),
             )?),
         };
+        let statistics_metadata = writer_metadata.clone();
         let signed = sign_input_shape(&facts, &request.input)?;
         let material = IcebergSessionMaterial {
             data_output: IcebergWriterOutput::try_new(
@@ -1641,7 +2529,7 @@ impl IcebergWriteSessionControl {
             copy_on_write,
             branches,
         } = plan;
-        plan_branch_session(
+        let (handle, targets) = plan_branch_session(
             IcebergWriteSessionId::new(),
             IcebergBranchSessionPlanInput {
                 flavor,
@@ -1656,7 +2544,8 @@ impl IcebergWriteSessionControl {
                 writer_table: writer_facts,
                 branches,
             },
-        )
+        )?;
+        Ok((handle, targets, statistics_metadata))
     }
 
     /// Every live data file of one frozen base snapshot.
@@ -2278,11 +3167,12 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         request: ConnectorWriteBeginRequest,
     ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
         validate_context(&request.context)?;
-        let (handle, targets) = self.admit(&request)?;
+        let (handle, targets, statistics_metadata) = self.admit(&request)?;
         // The frozen old-delete map is derived from the same writer handles the
         // plan carries, so `finish_write` can re-derive it without a second
         // source of truth.
-        let plan = session_plan_from_targets(&self.adapter, handle, targets)?;
+        let plan =
+            session_plan_from_targets(&self.adapter, handle, targets, Some(&statistics_metadata))?;
         Ok(plan)
     }
 
@@ -2291,6 +3181,7 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         request: ConnectorWriteFinishRequest<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let handle = self.adapter.commit_handle(request.commit)?;
+        let statistics = validate_statistics_artifacts(handle, request.statistics)?;
         let frozen = self.frozen_references_of(handle);
         // A staged create is the one flavor that finishes without committing:
         // its single external effect belongs to the publication that owns the
@@ -2304,7 +3195,13 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
                 &request.context,
             );
         }
-        self.commit_prepared_set(handle, &request.prepared, &frozen, &request.context)
+        self.commit_prepared_set(
+            handle,
+            &request.prepared,
+            statistics,
+            &frozen,
+            &request.context,
+        )
     }
 
     fn abort_write(
@@ -2321,5 +3218,102 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let handle = self.adapter.commit_handle(request.commit)?;
         self.adjudicate_session(handle, &request.evidence, &request.context)
+    }
+}
+
+#[cfg(test)]
+mod statistics_contract_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field};
+
+    use super::{eager_proof_finalization, resolve_statistics_field, validate_theta_properties};
+    use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    fn schema(fields: Vec<Arc<NestedField>>) -> Schema {
+        Schema::builder()
+            .with_fields(fields)
+            .build()
+            .expect("schema")
+    }
+
+    #[test]
+    fn ambiguous_case_insensitive_statistics_field_is_rejected() {
+        let iceberg = schema(vec![
+            Arc::new(NestedField::required(
+                1,
+                "Foo",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::required(
+                2,
+                "foo",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+        ]);
+        let arrow = crate::iceberg::arrow::schema_to_arrow_schema(&iceberg).expect("arrow");
+        assert!(
+            resolve_statistics_field(
+                &iceberg,
+                &arrow,
+                &Field::new("FOO", DataType::Int64, false),
+                false,
+            )
+            .expect_err("ambiguous casing")
+            .message()
+            .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn statistics_field_type_and_nullability_must_match_catalog_schema() {
+        let iceberg = schema(vec![Arc::new(NestedField::required(
+            1,
+            "v",
+            Type::Primitive(PrimitiveType::Long),
+        ))]);
+        let arrow = crate::iceberg::arrow::schema_to_arrow_schema(&iceberg).expect("arrow");
+        for field in [
+            Field::new("v", DataType::Int32, false),
+            Field::new("v", DataType::Int64, true),
+        ] {
+            assert!(resolve_statistics_field(&iceberg, &arrow, &field, false).is_err());
+        }
+    }
+
+    #[test]
+    fn mismatched_commit_proof_is_a_committed_finalization_failure() {
+        let wrong_snapshot =
+            crate::catalog::transaction::CommitProof::applied(Some(8)).with_table_uuid("table-a");
+        assert!(matches!(
+            eager_proof_finalization(&wrong_snapshot, 7, "table-a"),
+            Some(novarocks_spi::connector::ExternalMutationFinalization::Failed(_))
+        ));
+        let wrong_uuid =
+            crate::catalog::transaction::CommitProof::applied(Some(7)).with_table_uuid("table-b");
+        assert!(matches!(
+            eager_proof_finalization(&wrong_uuid, 7, "table-a"),
+            Some(novarocks_spi::connector::ExternalMutationFinalization::Failed(_))
+        ));
+        let exact =
+            crate::catalog::transaction::CommitProof::applied(Some(7)).with_table_uuid("table-a");
+        assert!(eager_proof_finalization(&exact, 7, "table-a").is_none());
+    }
+
+    #[test]
+    fn supplied_ndv_property_must_match_theta_body_estimate() {
+        let exact = BTreeMap::from([(crate::stats_loader::NDV_PROPERTY.to_string(), "7".into())]);
+        validate_theta_properties(&exact, 7.0).expect("exact NDV");
+
+        let mismatched =
+            BTreeMap::from([(crate::stats_loader::NDV_PROPERTY.to_string(), "8".into())]);
+        assert!(validate_theta_properties(&mismatched, 7.0).is_err());
+
+        let non_numeric = BTreeMap::from([(
+            crate::stats_loader::NDV_PROPERTY.to_string(),
+            "seven".into(),
+        )]);
+        assert!(validate_theta_properties(&non_numeric, 7.0).is_err());
     }
 }

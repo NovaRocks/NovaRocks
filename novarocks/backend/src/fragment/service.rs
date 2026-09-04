@@ -90,6 +90,19 @@ fn split_queue_rejection(
 }
 
 #[cfg(test)]
+fn test_execution_function_set()
+-> Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet> {
+    let mut builder = novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
+    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+        .expect("builtin function metadata");
+    novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+        &mut builder,
+    )
+    .expect("builtin aggregate implementations");
+    Arc::new(builder.seal().expect("builtin execution function set"))
+}
+
+#[cfg(test)]
 fn test_execution_runtime() -> Arc<ExecutionRuntime> {
     Arc::new(
         ExecutionRuntime::new(ExecutionRuntimeConfig {
@@ -113,7 +126,7 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
             runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,
             sink_io_max_blocking_threads: 1,
-        })
+        }, test_execution_function_set())
         .expect("test execution runtime"),
     )
 }
@@ -553,6 +566,7 @@ impl NativeFragmentService {
                     .connector_cancellation_for_execution(execution_id),
                 std::time::Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
                 Some(typed_runtime),
+                Arc::clone(self.execution_runtime.function_catalog()),
             );
             let request = match request {
                 Ok(request) => request,
@@ -577,6 +591,14 @@ impl NativeFragmentService {
             .lifecycle
             .admit_fragment(execution_id, fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
+        let manifest_exec_mem_limit = lifecycle_permit.query_mem_limit();
+        if request.exec_mem_limit() != manifest_exec_mem_limit {
+            return Err(NativeFragmentIngressError::new(format!(
+                "native fragment query memory limit does not match participant manifest: fragment={:?}, manifest={:?}",
+                request.exec_mem_limit(),
+                manifest_exec_mem_limit
+            )));
+        }
         let runtime_filter = self
             .lifecycle
             .runtime_filter_session_for_fragment(
@@ -588,6 +610,7 @@ impl NativeFragmentService {
         let backend_num = request.backend_num();
         let enable_profile = request.enable_profile();
         let (delivery_expire, query_expire) = request.query_expire_durations();
+        let exec_mem_limit = manifest_exec_mem_limit;
         let profiler =
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
@@ -597,6 +620,7 @@ impl NativeFragmentService {
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
+                exec_mem_limit,
                 runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
@@ -740,6 +764,14 @@ impl NativeFragmentService {
             .lifecycle
             .admit_fragment(execution_id, fragment_instance_id)
             .map_err(NativeFragmentIngressError::new)?;
+        let manifest_exec_mem_limit = lifecycle_permit.query_mem_limit();
+        if request.exec_mem_limit() != manifest_exec_mem_limit {
+            return Err(NativeFragmentIngressError::new(format!(
+                "native fragment query memory limit does not match participant manifest: fragment={:?}, manifest={:?}",
+                request.exec_mem_limit(),
+                manifest_exec_mem_limit
+            )));
+        }
         let runtime_filter = self
             .lifecycle
             .runtime_filter_session_for_fragment(
@@ -755,6 +787,7 @@ impl NativeFragmentService {
         let backend_num = request.backend_num();
         let enable_profile = request.enable_profile();
         let (delivery_expire, query_expire) = request.query_expire_durations();
+        let exec_mem_limit = manifest_exec_mem_limit;
         let profiler =
             enable_profile.then(|| profiler_for_native_fragment(request.root_plan_node_id()));
         let admission = self
@@ -764,6 +797,7 @@ impl NativeFragmentService {
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
+                exec_mem_limit,
                 runtime_filter,
             )
             .map_err(NativeFragmentIngressError::new)?;
@@ -1432,6 +1466,7 @@ mod tests {
                 fragment_instance_id,
                 delivery_expire,
                 query_expire,
+                request.exec_mem_limit(),
                 None,
             )
             .expect("native fragment admission");
@@ -2023,6 +2058,10 @@ mod tests {
                 fragment_instance_id,
                 execution,
             )),
+            Arc::new(
+                novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                    .expect("builtin function catalog"),
+            ),
         )
         .expect("valid native write dataflow request")
     }

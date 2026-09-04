@@ -14,25 +14,27 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::ops::Deref;
 use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Array,
     Int32Builder, Int64Builder, ListArray, StringArray, StringBuilder, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt32Array,
-    new_null_array,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow::compute::{concat, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::expr::agg::AggKernelEntry;
+use crate::exec::expr::agg::{AggKernelEntry, AggregateAllocator, AggregateVec, aggregate_bytes};
+#[cfg(test)]
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 use novarocks_types::largeint;
 
 use super::key_builder::{
-    GroupKeyArrayView, encode_group_key_row, list_int32_row_value, list_utf8_row_value,
+    GroupKeyArrayView, canonical_group_key_equals, decode_group_key_rows,
+    encode_group_key_row_tracked,
 };
 
 fn float32_key_equal(left: f32, right: f32) -> bool {
@@ -43,85 +45,222 @@ fn float64_key_equal(left: f64, right: f64) -> bool {
     (left.is_nan() && right.is_nan()) || left == right
 }
 
+/// A vector whose nested, exclusively-owned payload is cached at mutation time.
+///
+/// The vector backing allocation is derived from `capacity()` in O(1). Callers
+/// supply the retained bytes below each inserted element, which keeps the whole
+/// aggregate key-state query O(1) even for nested list and Arrow values.
 #[derive(Clone, Debug)]
-pub enum KeyColumn {
+pub struct RetainedVec<T> {
+    values: AggregateVec<T>,
+    nested_retained_bytes: usize,
+}
+
+impl<T> RetainedVec<T> {
+    fn new_in(allocator: AggregateAllocator) -> Self {
+        Self {
+            values: AggregateVec::new_in(allocator),
+            nested_retained_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, value: T, nested_retained_bytes: usize) {
+        self.values.push(value);
+        self.nested_retained_bytes = self
+            .nested_retained_bytes
+            .saturating_add(nested_retained_bytes);
+    }
+
+    fn try_reserve_one(&mut self, operation: &str) -> Result<(), String> {
+        reserve_one(&mut self.values, operation)
+    }
+
+    fn allocator(&self) -> AggregateAllocator {
+        self.values.allocator().clone()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<T>())
+            .saturating_add(self.nested_retained_bytes)
+    }
+}
+
+impl<T> Deref for RetainedVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl<'a, T> IntoIterator for &'a RetainedVec<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum KeyColumn {
     Int8 {
-        values: Vec<i8>,
-        nulls: Vec<u8>,
+        values: AggregateVec<i8>,
+        nulls: AggregateVec<u8>,
     },
     Int16 {
-        values: Vec<i16>,
-        nulls: Vec<u8>,
+        values: AggregateVec<i16>,
+        nulls: AggregateVec<u8>,
     },
     Int32 {
-        values: Vec<i32>,
-        nulls: Vec<u8>,
+        values: AggregateVec<i32>,
+        nulls: AggregateVec<u8>,
     },
     Int64 {
-        values: Vec<i64>,
-        nulls: Vec<u8>,
+        values: AggregateVec<i64>,
+        nulls: AggregateVec<u8>,
     },
     Float32 {
-        values: Vec<f32>,
-        nulls: Vec<u8>,
+        values: AggregateVec<f32>,
+        nulls: AggregateVec<u8>,
     },
     Float64 {
-        values: Vec<f64>,
-        nulls: Vec<u8>,
+        values: AggregateVec<f64>,
+        nulls: AggregateVec<u8>,
     },
     Boolean {
-        values: Vec<u8>,
-        nulls: Vec<u8>,
+        values: AggregateVec<u8>,
+        nulls: AggregateVec<u8>,
     },
     Utf8 {
-        offsets: Vec<usize>,
-        data: Vec<u8>,
-        nulls: Vec<u8>,
+        offsets: AggregateVec<usize>,
+        data: AggregateVec<u8>,
+        nulls: AggregateVec<u8>,
     },
     Date32 {
-        values: Vec<i32>,
-        nulls: Vec<u8>,
+        values: AggregateVec<i32>,
+        nulls: AggregateVec<u8>,
     },
     Timestamp {
-        values: Vec<i64>,
-        nulls: Vec<u8>,
+        values: AggregateVec<i64>,
+        nulls: AggregateVec<u8>,
         unit: TimeUnit,
-        tz: Option<String>,
+        tz: Option<Arc<str>>,
     },
     Decimal128 {
-        values: Vec<i128>,
-        nulls: Vec<u8>,
+        values: AggregateVec<i128>,
+        nulls: AggregateVec<u8>,
         precision: u8,
         scale: i8,
     },
     Decimal256 {
-        values: Vec<i256>,
-        nulls: Vec<u8>,
+        values: AggregateVec<i256>,
+        nulls: AggregateVec<u8>,
         precision: u8,
         scale: i8,
     },
     LargeIntBinary {
-        values: Vec<i128>,
-        nulls: Vec<u8>,
+        values: AggregateVec<i128>,
+        nulls: AggregateVec<u8>,
     },
     ListUtf8 {
-        values: Vec<Option<Vec<Option<String>>>>,
+        values: RetainedVec<Option<AggregateVec<Option<AggregateVec<u8>>>>>,
     },
     ListInt32 {
-        values: Vec<Option<Vec<Option<i32>>>>,
+        values: RetainedVec<Option<AggregateVec<Option<i32>>>>,
     },
     Complex {
         data_type: DataType,
-        keys: Vec<Vec<u8>>,
-        nulls: Vec<u8>,
-        values: Vec<ArrayRef>,
+        keys: RetainedVec<Option<AggregateVec<u8>>>,
     },
 }
 
 impl KeyColumn {
+    #[cfg(test)]
+    pub(crate) fn int8_for_test(values: Vec<i8>, nulls: Vec<u8>) -> Self {
+        let allocator = test_allocator();
+        Self::Int8 {
+            values: tracked_test_vec(values, allocator.clone()),
+            nulls: tracked_test_vec(nulls, allocator),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn int64_for_test(values: Vec<i64>, nulls: Vec<u8>) -> Self {
+        let allocator = test_allocator();
+        Self::Int64 {
+            values: tracked_test_vec(values, allocator.clone()),
+            nulls: tracked_test_vec(nulls, allocator),
+        }
+    }
+
+    pub(crate) fn try_reserve_value_from_view(
+        &mut self,
+        view: &GroupKeyArrayView<'_>,
+        row: usize,
+    ) -> Result<(), String> {
+        match self {
+            KeyColumn::Int8 { values, nulls } => reserve_value_and_null(values, nulls, "int8"),
+            KeyColumn::Int16 { values, nulls } => reserve_value_and_null(values, nulls, "int16"),
+            KeyColumn::Int32 { values, nulls } => reserve_value_and_null(values, nulls, "int32"),
+            KeyColumn::Int64 { values, nulls } => reserve_value_and_null(values, nulls, "int64"),
+            KeyColumn::Float32 { values, nulls } => {
+                reserve_value_and_null(values, nulls, "float32")
+            }
+            KeyColumn::Float64 { values, nulls } => {
+                reserve_value_and_null(values, nulls, "float64")
+            }
+            KeyColumn::Boolean { values, nulls } => {
+                reserve_value_and_null(values, nulls, "boolean")
+            }
+            KeyColumn::Utf8 {
+                offsets,
+                data,
+                nulls,
+            } => {
+                reserve_one(offsets, "reserve utf8 group-key offsets")?;
+                reserve_one(nulls, "reserve utf8 group-key nulls")?;
+                let value_len = match view {
+                    GroupKeyArrayView::Utf8(array) if !array.is_null(row) => array.value(row).len(),
+                    GroupKeyArrayView::Dictionary(dict) => dict
+                        .code_at(row)?
+                        .map(|code| dict.value_bytes_for_code(code).map(<[u8]>::len))
+                        .transpose()?
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                reserve_additional(data, value_len, "reserve utf8 group-key bytes")
+            }
+            KeyColumn::Date32 { values, nulls } => reserve_value_and_null(values, nulls, "date32"),
+            KeyColumn::Timestamp { values, nulls, .. } => {
+                reserve_value_and_null(values, nulls, "timestamp")
+            }
+            KeyColumn::Decimal128 { values, nulls, .. } => {
+                reserve_value_and_null(values, nulls, "decimal128")
+            }
+            KeyColumn::Decimal256 { values, nulls, .. } => {
+                reserve_value_and_null(values, nulls, "decimal256")
+            }
+            KeyColumn::LargeIntBinary { values, nulls } => {
+                reserve_value_and_null(values, nulls, "largeint")
+            }
+            KeyColumn::ListUtf8 { values } => {
+                values.try_reserve_one("reserve list-utf8 group-key values")
+            }
+            KeyColumn::ListInt32 { values } => {
+                values.try_reserve_one("reserve list-int32 group-key values")
+            }
+            KeyColumn::Complex { keys, .. } => {
+                keys.try_reserve_one("reserve complex group-key encoded values")
+            }
+        }
+    }
+
     fn push_int_value<T>(
-        values: &mut Vec<T>,
-        nulls: &mut Vec<u8>,
+        values: &mut AggregateVec<T>,
+        nulls: &mut AggregateVec<u8>,
         value: Option<i64>,
         type_name: &str,
     ) -> Result<(), String>
@@ -360,41 +499,72 @@ impl KeyColumn {
                 KeyColumn::ListUtf8 { values: stored },
                 GroupKeyArrayView::ListUtf8 { list, values },
             ) => {
-                stored.push(list_utf8_row_value(list, values, row));
+                if list.is_null(row) {
+                    stored.push(None, 0);
+                    return Ok(());
+                }
+                let offsets = list.value_offsets();
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                let allocator = stored.allocator();
+                let mut items = AggregateVec::new_in(allocator.clone());
+                items
+                    .try_reserve_exact(end.saturating_sub(start))
+                    .map_err(|_| allocator.allocation_error("reserve list-utf8 group-key items"))?;
+                for index in start..end {
+                    if values.is_null(index) {
+                        items.push(None);
+                    } else {
+                        items.push(Some(aggregate_bytes(
+                            allocator.clone(),
+                            values.value(index).as_bytes(),
+                        )?));
+                    }
+                }
+                let nested_retained_bytes = items
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<AggregateVec<u8>>>())
+                    .saturating_add(
+                        items
+                            .iter()
+                            .flatten()
+                            .map(|bytes| bytes.capacity())
+                            .sum::<usize>(),
+                    );
+                stored.push(Some(items), nested_retained_bytes);
                 Ok(())
             }
             (
                 KeyColumn::ListInt32 { values: stored },
                 GroupKeyArrayView::ListInt32 { list, values },
             ) => {
-                stored.push(list_int32_row_value(list, values, row));
-                Ok(())
-            }
-            (
-                KeyColumn::Complex {
-                    keys,
-                    nulls,
-                    values,
-                    ..
-                },
-                GroupKeyArrayView::Complex(array),
-            ) => {
-                if array.is_null(row) {
-                    keys.push(Vec::new());
-                    nulls.push(0);
-                    values.push(new_null_array(array.data_type(), 1));
+                if list.is_null(row) {
+                    stored.push(None, 0);
                     return Ok(());
                 }
-                let encoded = encode_group_key_row(array, row)?
-                    .ok_or_else(|| "complex group key encoded unexpectedly null".to_string())?;
-                let row_u32 = u32::try_from(row)
-                    .map_err(|_| format!("group key row index overflow: {}", row))?;
-                let row_index = UInt32Array::from(vec![row_u32]);
-                let single = take(array.as_ref(), &row_index, None)
-                    .map_err(|e| format!("take complex group key row failed: {}", e))?;
-                keys.push(encoded);
-                nulls.push(1);
-                values.push(single);
+                let offsets = list.value_offsets();
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                let allocator = stored.allocator();
+                let mut items = AggregateVec::new_in(allocator.clone());
+                items
+                    .try_reserve_exact(end.saturating_sub(start))
+                    .map_err(|_| {
+                        allocator.allocation_error("reserve list-int32 group-key items")
+                    })?;
+                for index in start..end {
+                    items.push((!values.is_null(index)).then(|| values.value(index)));
+                }
+                let nested_retained_bytes = items
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<i32>>());
+                stored.push(Some(items), nested_retained_bytes);
+                Ok(())
+            }
+            (KeyColumn::Complex { keys, .. }, GroupKeyArrayView::Complex(array)) => {
+                let encoded = encode_group_key_row_tracked(array, row, keys.allocator())?;
+                let retained_bytes = encoded.as_ref().map_or(0, |bytes| bytes.capacity());
+                keys.push(encoded, retained_bytes);
                 Ok(())
             }
             _ => Err("group by key type mismatch".to_string()),
@@ -651,8 +821,28 @@ impl KeyColumn {
                 let saved = stored
                     .get(group_id)
                     .ok_or_else(|| "group key index out of bounds".to_string())?;
-                let current = list_utf8_row_value(list, values, row);
-                Ok(saved == &current)
+                if list.is_null(row) {
+                    return Ok(saved.is_none());
+                }
+                let Some(saved) = saved else {
+                    return Ok(false);
+                };
+                let offsets = list.value_offsets();
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                if saved.len() != end.saturating_sub(start) {
+                    return Ok(false);
+                }
+                Ok(saved
+                    .iter()
+                    .zip(start..end)
+                    .all(|(saved, index)| match saved {
+                        None => values.is_null(index),
+                        Some(saved) => {
+                            !values.is_null(index)
+                                && saved.as_slice() == values.value(index).as_bytes()
+                        }
+                    }))
             }
             (
                 KeyColumn::ListInt32 { values: stored },
@@ -661,26 +851,35 @@ impl KeyColumn {
                 let saved = stored
                     .get(group_id)
                     .ok_or_else(|| "group key index out of bounds".to_string())?;
-                let current = list_int32_row_value(list, values, row);
-                Ok(saved == &current)
-            }
-            (KeyColumn::Complex { keys, nulls, .. }, GroupKeyArrayView::Complex(array)) => {
-                let valid = *nulls
-                    .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
-                    != 0;
-                if array.is_null(row) {
-                    return Ok(!valid);
+                if list.is_null(row) {
+                    return Ok(saved.is_none());
                 }
-                if !valid {
+                let Some(saved) = saved else {
+                    return Ok(false);
+                };
+                let offsets = list.value_offsets();
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                if saved.len() != end.saturating_sub(start) {
                     return Ok(false);
                 }
+                Ok(saved
+                    .iter()
+                    .zip(start..end)
+                    .all(|(saved, index)| match saved {
+                        None => values.is_null(index),
+                        Some(saved) => !values.is_null(index) && *saved == values.value(index),
+                    }))
+            }
+            (KeyColumn::Complex { keys, .. }, GroupKeyArrayView::Complex(array)) => {
                 let saved = keys
                     .get(group_id)
                     .ok_or_else(|| "group key index out of bounds".to_string())?;
-                let current = encode_group_key_row(array, row)?
-                    .ok_or_else(|| "complex group key encoded unexpectedly null".to_string())?;
-                Ok(saved == &current)
+                match (saved, array.is_null(row)) {
+                    (None, true) => Ok(true),
+                    (None, false) | (Some(_), true) => Ok(false),
+                    (Some(saved), false) => canonical_group_key_equals(array, row, saved),
+                }
             }
             _ => Err("group by key type mismatch".to_string()),
         }
@@ -918,7 +1117,19 @@ impl KeyColumn {
                             if current > i32::MAX as i64 {
                                 return Err("group key list offset overflow".to_string());
                             }
-                            flat.extend(items.iter().cloned());
+                            for item in items {
+                                flat.push(
+                                    item.as_ref()
+                                        .map(|bytes| {
+                                            String::from_utf8(bytes.to_vec()).map_err(|error| {
+                                                format!(
+                                                    "stored list-utf8 group key is invalid: {error}"
+                                                )
+                                            })
+                                        })
+                                        .transpose()?,
+                                );
+                            }
                             nulls.append_non_null();
                             offsets.push(current as i32);
                         }
@@ -969,14 +1180,12 @@ impl KeyColumn {
                 );
                 Ok(Arc::new(array))
             }
-            KeyColumn::Complex {
-                data_type, values, ..
-            } => {
-                if values.is_empty() {
-                    return Ok(new_null_array(data_type, 0));
-                }
-                let refs: Vec<&dyn Array> = values.iter().map(|v| v.as_ref()).collect();
-                concat(&refs).map_err(|e| format!("concat complex group key failed: {}", e))
+            KeyColumn::Complex { data_type, keys } => {
+                let rows = keys
+                    .iter()
+                    .map(|row| row.as_ref().map(|bytes| bytes.as_slice()))
+                    .collect::<Vec<_>>();
+                decode_group_key_rows(data_type, &rows)
             }
         }
     }
@@ -1029,103 +1238,192 @@ impl KeyColumn {
             | KeyColumn::Timestamp { nulls, .. }
             | KeyColumn::Decimal128 { nulls, .. }
             | KeyColumn::Decimal256 { nulls, .. }
-            | KeyColumn::LargeIntBinary { nulls, .. }
-            | KeyColumn::Complex { nulls, .. } => nulls.contains(&0),
+            | KeyColumn::LargeIntBinary { nulls, .. } => nulls.contains(&0),
             KeyColumn::ListUtf8 { values } => values.iter().any(|value| value.is_none()),
             KeyColumn::ListInt32 { values } => values.iter().any(|value| value.is_none()),
+            KeyColumn::Complex { keys, .. } => keys.iter().any(|value| value.is_none()),
+        }
+    }
+
+    /// Returns heap memory retained exclusively by this column in O(1).
+    ///
+    /// Inline enum storage is part of `KeyTable::key_columns` and is therefore
+    /// not repeated here. Complex values retain only canonical encoded bytes.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        fn vec_bytes<T>(values: &AggregateVec<T>) -> usize {
+            values.capacity().saturating_mul(std::mem::size_of::<T>())
+        }
+
+        match self {
+            KeyColumn::Int8 { values, nulls } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Int16 { values, nulls } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Int32 { values, nulls } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Int64 { values, nulls } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Float32 { values, nulls } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Float64 { values, nulls } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Boolean { values, nulls } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Utf8 {
+                offsets,
+                data,
+                nulls,
+            } => vec_bytes(offsets) + vec_bytes(data) + vec_bytes(nulls),
+            KeyColumn::Date32 { values, nulls } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Timestamp { values, nulls, .. } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Decimal128 { values, nulls, .. } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::Decimal256 { values, nulls, .. } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::LargeIntBinary { values, nulls } => vec_bytes(values) + vec_bytes(nulls),
+            KeyColumn::ListUtf8 { values } => values.retained_bytes(),
+            KeyColumn::ListInt32 { values } => values.retained_bytes(),
+            KeyColumn::Complex { keys, .. } => keys.retained_bytes(),
         }
     }
 }
 
-#[allow(dead_code)]
-pub fn key_column_from_array(array: &ArrayRef) -> Result<KeyColumn, String> {
-    key_column_from_type(array.data_type())
+fn reserve_one<T>(values: &mut AggregateVec<T>, operation: &str) -> Result<(), String> {
+    reserve_additional(values, 1, operation)
 }
 
-//FIXME:
-pub fn key_column_from_type(data_type: &DataType) -> Result<KeyColumn, String> {
+fn reserve_additional<T>(
+    values: &mut AggregateVec<T>,
+    additional: usize,
+    operation: &str,
+) -> Result<(), String> {
+    let allocator = values.allocator().clone();
+    values
+        .try_reserve(additional)
+        .map_err(|_| allocator.allocation_error(operation))
+}
+
+fn reserve_value_and_null<T>(
+    values: &mut AggregateVec<T>,
+    nulls: &mut AggregateVec<u8>,
+    type_name: &str,
+) -> Result<(), String> {
+    reserve_one(values, &format!("reserve {type_name} group-key values"))?;
+    reserve_one(nulls, &format!("reserve {type_name} group-key nulls"))
+}
+
+#[cfg(test)]
+fn test_allocator() -> AggregateAllocator {
+    AggregateAllocator::new(MemTracker::new_child(
+        "KeyColumnTest",
+        &process_mem_tracker(),
+    ))
+}
+
+#[cfg(test)]
+fn tracked_test_vec<T>(values: Vec<T>, allocator: AggregateAllocator) -> AggregateVec<T> {
+    let mut tracked = AggregateVec::new_in(allocator);
+    tracked
+        .try_reserve_exact(values.len())
+        .expect("reserve test key-column values");
+    tracked.extend(values);
+    tracked
+}
+
+#[cfg(test)]
+pub(crate) fn key_column_from_type(data_type: &DataType) -> Result<KeyColumn, String> {
+    key_column_from_type_in(
+        data_type,
+        AggregateAllocator::new(MemTracker::new_child(
+            "KeyColumnUnbounded",
+            &process_mem_tracker(),
+        )),
+    )
+}
+
+pub(crate) fn key_column_from_type_in(
+    data_type: &DataType,
+    allocator: AggregateAllocator,
+) -> Result<KeyColumn, String> {
     match data_type {
         DataType::Int8 => Ok(KeyColumn::Int8 {
-            values: Vec::new(),
-            nulls: Vec::new(),
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
         }),
         DataType::Int16 => Ok(KeyColumn::Int16 {
-            values: Vec::new(),
-            nulls: Vec::new(),
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
         }),
         DataType::Int32 => Ok(KeyColumn::Int32 {
-            values: Vec::new(),
-            nulls: Vec::new(),
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
         }),
         DataType::Int64 => Ok(KeyColumn::Int64 {
-            values: Vec::new(),
-            nulls: Vec::new(),
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
         }),
         DataType::Float32 => Ok(KeyColumn::Float32 {
-            values: Vec::new(),
-            nulls: Vec::new(),
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
         }),
         DataType::Float64 => Ok(KeyColumn::Float64 {
-            values: Vec::new(),
-            nulls: Vec::new(),
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
         }),
         DataType::Boolean => Ok(KeyColumn::Boolean {
-            values: Vec::new(),
-            nulls: Vec::new(),
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
         }),
-        DataType::Utf8 => Ok(KeyColumn::Utf8 {
-            offsets: vec![0],
-            data: Vec::new(),
-            nulls: Vec::new(),
-        }),
-        DataType::Date32 => Ok(KeyColumn::Date32 {
-            values: Vec::new(),
-            nulls: Vec::new(),
-        }),
-        DataType::Timestamp(unit, tz) => {
-            let tz_string = tz.as_deref().map(|s| s.to_string());
-            Ok(KeyColumn::Timestamp {
-                values: Vec::new(),
-                nulls: Vec::new(),
-                unit: *unit,
-                tz: tz_string,
+        DataType::Utf8 => {
+            let mut offsets = AggregateVec::new_in(allocator.clone());
+            offsets
+                .try_reserve_exact(1)
+                .map_err(|_| allocator.allocation_error("initialize group-key offsets"))?;
+            offsets.push(0);
+            Ok(KeyColumn::Utf8 {
+                offsets,
+                data: AggregateVec::new_in(allocator.clone()),
+                nulls: AggregateVec::new_in(allocator.clone()),
             })
         }
+        DataType::Date32 => Ok(KeyColumn::Date32 {
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
+        }),
+        DataType::Timestamp(unit, tz) => Ok(KeyColumn::Timestamp {
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
+            unit: *unit,
+            tz: tz.clone(),
+        }),
         DataType::Decimal128(precision, scale) => Ok(KeyColumn::Decimal128 {
-            values: Vec::new(),
-            nulls: Vec::new(),
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
             precision: *precision,
             scale: *scale,
         }),
         DataType::Decimal256(precision, scale) => Ok(KeyColumn::Decimal256 {
-            values: Vec::new(),
-            nulls: Vec::new(),
+            values: AggregateVec::new_in(allocator.clone()),
+            nulls: AggregateVec::new_in(allocator.clone()),
             precision: *precision,
             scale: *scale,
         }),
         DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
             Ok(KeyColumn::LargeIntBinary {
-                values: Vec::new(),
-                nulls: Vec::new(),
+                values: AggregateVec::new_in(allocator.clone()),
+                nulls: AggregateVec::new_in(allocator.clone()),
             })
         }
         DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
-            Ok(KeyColumn::ListUtf8 { values: Vec::new() })
+            Ok(KeyColumn::ListUtf8 {
+                values: RetainedVec::new_in(allocator.clone()),
+            })
         }
         DataType::List(field) if matches!(field.data_type(), DataType::Int32) => {
-            Ok(KeyColumn::ListInt32 { values: Vec::new() })
+            Ok(KeyColumn::ListInt32 {
+                values: RetainedVec::new_in(allocator.clone()),
+            })
         }
         DataType::Null => Err("group by type is null".to_string()),
         other => Ok(KeyColumn::Complex {
             data_type: other.clone(),
-            keys: Vec::new(),
-            nulls: Vec::new(),
-            values: Vec::new(),
+            keys: RetainedVec::new_in(allocator),
         }),
     }
 }
 
-pub fn build_output_schema_from_kernels(
+pub(crate) fn build_output_schema_from_kernels(
     key_columns: &[KeyColumn],
     kernels: &[AggKernelEntry],
     output_intermediate: bool,
@@ -1208,7 +1506,10 @@ pub fn build_output_schema_from_kernels(
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyColumn, build_output_schema_from_kernels};
+    use super::{
+        KeyColumn, RetainedVec, build_output_schema_from_kernels, key_column_from_type,
+        test_allocator,
+    };
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type};
@@ -1217,10 +1518,7 @@ mod tests {
 
     #[test]
     fn build_output_schema_marks_nullable_group_keys_when_runtime_keys_contain_nulls() {
-        let key_columns = vec![KeyColumn::Int8 {
-            values: vec![0, 1],
-            nulls: vec![0, 1],
-        }];
+        let key_columns = vec![KeyColumn::int8_for_test(vec![0, 1], vec![0, 1])];
         let output_chunk_schema = Arc::new(
             ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(13),
@@ -1250,13 +1548,15 @@ mod tests {
         let arrays = [dict];
         let views = build_group_key_views(&arrays).expect("views");
         let view = &views[0];
-        let mut col = KeyColumn::Utf8 {
-            offsets: vec![0],
-            data: Vec::new(),
-            nulls: Vec::new(),
-        };
+        let mut col = key_column_from_type(&DataType::Utf8).expect("utf8 key column");
+        col.try_reserve_value_from_view(view, 0)
+            .expect("reserve paid");
         col.push_value_from_view(view, 0).expect("push paid");
+        col.try_reserve_value_from_view(view, 1)
+            .expect("reserve null");
         col.push_value_from_view(view, 1).expect("push null");
+        col.try_reserve_value_from_view(view, 2)
+            .expect("reserve new");
         col.push_value_from_view(view, 2).expect("push new");
 
         let out = col.to_array().expect("array");
@@ -1281,5 +1581,28 @@ mod tests {
         let GroupKeyArrayView::Dictionary(_) = view else {
             panic!("expected dictionary view");
         };
+    }
+
+    #[test]
+    fn retained_vec_caches_nested_owned_payload_without_rescanning() {
+        let mut retained = RetainedVec::new_in(test_allocator());
+        let mut text = String::with_capacity(37);
+        text.push_str("value");
+        let mut row = Vec::with_capacity(5);
+        row.push(Some(text));
+        let nested = row
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<String>>())
+            .saturating_add(row[0].as_ref().expect("text").capacity());
+        retained.push(Some(row), nested);
+
+        assert_eq!(
+            retained.retained_bytes(),
+            retained
+                .values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Option<Vec<Option<String>>>>())
+                .saturating_add(nested)
+        );
     }
 }

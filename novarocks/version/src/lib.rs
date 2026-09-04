@@ -27,7 +27,7 @@ const NATIVE_BUILD_IDENTITY: &str = env!("NOVAROCKS_NATIVE_BUILD_IDENTITY");
 
 // Design: ADR-0121 (docs/adr/ADR-0121-native-compatibility-islands-and-ingress-admission.md)
 /// Domain separator for the immutable Native compatibility identity encoding.
-pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v2\0";
+pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v3\0";
 
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
@@ -88,6 +88,7 @@ pub struct NativeCompatibilityMaterial {
     id: NativeCompatibilityId,
     descriptor_digest: [u8; 32],
     function_catalog_digest: [u8; 32],
+    execution_implementation_manifest_digest: [u8; 32],
     epoch: u64,
     carriers: Box<[NativeCarrierDeclaration]>,
 }
@@ -103,6 +104,10 @@ impl NativeCompatibilityMaterial {
 
     pub const fn function_catalog_digest(&self) -> [u8; 32] {
         self.function_catalog_digest
+    }
+
+    pub const fn execution_implementation_manifest_digest(&self) -> [u8; 32] {
+        self.execution_implementation_manifest_digest
     }
 
     pub const fn epoch(&self) -> u64 {
@@ -182,6 +187,7 @@ pub fn derive_native_compatibility_material(
     descriptor_set: &[u8],
     carriers: impl IntoIterator<Item = NativeCarrierDeclaration>,
     function_catalog_digest: [u8; 32],
+    execution_implementation_manifest_digest: [u8; 32],
     epoch: u64,
 ) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
     if descriptor_set.is_empty() {
@@ -210,6 +216,7 @@ pub fn derive_native_compatibility_material(
     hasher.update(NATIVE_COMPATIBILITY_DOMAIN);
     hasher.update(descriptor_digest);
     hasher.update(function_catalog_digest);
+    hasher.update(execution_implementation_manifest_digest);
     hasher.update(
         u32::try_from(carriers.len())
             .expect("carrier count was checked against u32")
@@ -231,6 +238,7 @@ pub fn derive_native_compatibility_material(
         id: NativeCompatibilityId::new(hasher.finalize().into()),
         descriptor_digest,
         function_catalog_digest,
+        execution_implementation_manifest_digest,
         epoch,
         carriers: carriers.into_boxed_slice(),
     })
@@ -240,11 +248,13 @@ pub fn derive_native_compatibility_material(
 pub fn derive_repository_native_compatibility_material(
     carriers: impl IntoIterator<Item = NativeCarrierDeclaration>,
     function_catalog_digest: [u8; 32],
+    execution_implementation_manifest_digest: [u8; 32],
 ) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
     derive_native_compatibility_material(
         FILE_DESCRIPTOR_SET,
         carriers,
         function_catalog_digest,
+        execution_implementation_manifest_digest,
         NATIVE_COMPAT_EPOCH,
     )
 }
@@ -301,15 +311,20 @@ mod tests {
             b"descriptor-v1",
             carriers(),
             [0x31; 32],
+            [0x41; 32],
             1,
         )
-            .expect("valid material");
+        .expect("valid material");
 
         assert_eq!(
             material.id().to_string(),
-            "cd96606b877721985a246384b1526d14fe54a3cf46812f68a79d439b1a0dee4e"
+            "1cfda438a3098656c9db5560d2864f20c9be7077806e1057b85c39fef97c01fd"
         );
         assert_eq!(material.function_catalog_digest(), [0x31; 32]);
+        assert_eq!(
+            material.execution_implementation_manifest_digest(),
+            [0x41; 32]
+        );
         assert_eq!(material.epoch(), 1);
         assert_eq!(material.carriers().len(), 2);
     }
@@ -320,16 +335,18 @@ mod tests {
             b"descriptor-v1",
             carriers(),
             [0x31; 32],
+            [0x41; 32],
             1,
         )
-            .expect("original material");
+        .expect("original material");
         let descriptor = derive_native_compatibility_material(
             b"descriptor-v2",
             carriers(),
             [0x31; 32],
+            [0x41; 32],
             1,
         )
-            .expect("descriptor material");
+        .expect("descriptor material");
         let provider_revision = derive_native_compatibility_material(
             b"descriptor-v1",
             [
@@ -337,27 +354,39 @@ mod tests {
                 NativeCarrierDeclaration::try_new("starrocks", 1).expect("starrocks declaration"),
             ],
             [0x31; 32],
+            [0x41; 32],
             1,
         )
         .expect("provider revision material");
-        let functions = derive_native_compatibility_material(
+        let catalog_only = derive_native_compatibility_material(
             b"descriptor-v1",
             carriers(),
             [0x32; 32],
+            [0x41; 32],
             1,
         )
-        .expect("function material");
+        .expect("catalog-only material");
+        let implementation_only = derive_native_compatibility_material(
+            b"descriptor-v1",
+            carriers(),
+            [0x31; 32],
+            [0x42; 32],
+            1,
+        )
+        .expect("implementation-only material");
         let epoch = derive_native_compatibility_material(
             b"descriptor-v1",
             carriers(),
             [0x31; 32],
+            [0x41; 32],
             2,
         )
-            .expect("epoch material");
+        .expect("epoch material");
 
         assert_ne!(original.id(), descriptor.id());
         assert_ne!(original.id(), provider_revision.id());
-        assert_ne!(original.id(), functions.id());
+        assert_ne!(original.id(), catalog_only.id());
+        assert_ne!(original.id(), implementation_only.id());
         assert_ne!(original.id(), epoch.id());
     }
 
@@ -368,6 +397,7 @@ mod tests {
             b"descriptor-v1",
             [duplicate.clone(), duplicate],
             [0x31; 32],
+            [0x41; 32],
             1,
         )
         .expect_err("duplicate provider ids must fail");
@@ -383,6 +413,7 @@ mod tests {
                 NativeCarrierDeclaration::try_new("iceberg", 1).expect("iceberg declaration"),
             ],
             [0x31; 32],
+            [0x41; 32],
             1,
         )
         .expect_err("reordered provider ids must fail");

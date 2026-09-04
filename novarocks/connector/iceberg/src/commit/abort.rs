@@ -149,6 +149,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conflict_cleanup_removes_only_attempt_derivatives() {
+        let fs = local_op();
+        fs.write("data.parquet", b"data".to_vec()).await.unwrap();
+        fs.write("attempt-manifest.avro", b"manifest".to_vec())
+            .await
+            .unwrap();
+        fs.write("attempt-statistics.puffin", b"stats".to_vec())
+            .await
+            .unwrap();
+        let session = AbortLog::new();
+        session.record_data_file("data.parquet".into());
+        let attempt = AbortLog::new();
+        attempt.record_manifest("attempt-manifest.avro".into());
+        attempt.record_manifest("attempt-statistics.puffin".into());
+
+        assert!(attempt.cleanup(&fs).await.is_empty());
+        assert!(fs.stat("data.parquet").await.is_ok(), "data is reusable");
+        assert!(fs.stat("attempt-manifest.avro").await.is_err());
+        assert!(fs.stat("attempt-statistics.puffin").await.is_err());
+
+        assert!(session.cleanup(&fs).await.is_empty());
+        assert!(fs.stat("data.parquet").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn commit_unknown_performs_no_cleanup() {
+        let fs = local_op();
+        fs.write("data.parquet", b"data".to_vec()).await.unwrap();
+        fs.write("attempt-manifest.avro", b"manifest".to_vec())
+            .await
+            .unwrap();
+        let session = AbortLog::new();
+        session.record_data_file("data.parquet".into());
+        let attempt = AbortLog::new();
+        attempt.record_manifest("attempt-manifest.avro".into());
+
+        // Unknown deliberately drops neither ownership log into cleanup.
+        assert!(fs.stat("data.parquet").await.is_ok());
+        assert!(fs.stat("attempt-manifest.avro").await.is_ok());
+        assert_eq!(session.drain_data_files(), vec!["data.parquet"]);
+        assert_eq!(attempt.drain_manifests(), vec!["attempt-manifest.avro"]);
+    }
+
+    #[tokio::test]
     async fn cleanup_maps_absolute_iceberg_locations_to_operator_paths() {
         let fs = local_op();
         fs.write("warehouse/ns/t/data/file.parquet", b"x".to_vec())

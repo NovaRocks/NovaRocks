@@ -214,7 +214,6 @@ fn decode_sink_kind(
     Ok(match kind {
         plan::data_sink::Kind::Result(_) => FragmentSinkKind::Result,
         plan::data_sink::Kind::Noop(_) => FragmentSinkKind::Noop,
-        plan::data_sink::Kind::Statistics(_) => FragmentSinkKind::Statistics,
         plan::data_sink::Kind::DataStream(_) => FragmentSinkKind::DataStream,
         plan::data_sink::Kind::MultiCastDataStream(_) => FragmentSinkKind::MultiCastDataStream,
         plan::data_sink::Kind::ChangeStreamRouter(_) => FragmentSinkKind::SplitDataStream,

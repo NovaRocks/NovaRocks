@@ -1759,6 +1759,11 @@ pub struct IcebergCommitHandle {
     /// ahead of its snapshot. Present only on a managed publication that was
     /// admitted with one.
     repartition: Option<crate::commit::write_stack::repartition::IcebergPreparedRepartition>,
+    /// Exact collect-on-write artifact identities frozen for each logical
+    /// target. These remain provider-private session facts; only the cloneable
+    /// aggregate requirements are exposed to FE planning.
+    statistics_expectations:
+        BTreeMap<WriteTargetOrdinal, Vec<novarocks_spi::connector::StatisticsArtifactIdentity>>,
     state: std::sync::Mutex<IcebergWriteSessionState>,
 }
 
@@ -1983,8 +1988,38 @@ impl IcebergCommitHandle {
             rewrite_inputs,
             copy_on_write,
             repartition,
+            statistics_expectations: BTreeMap::new(),
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
+    }
+
+    pub(crate) fn with_statistics_expectations(
+        mut self,
+        expectations: BTreeMap<
+            WriteTargetOrdinal,
+            Vec<novarocks_spi::connector::StatisticsArtifactIdentity>,
+        >,
+    ) -> Result<Self, ConnectorError> {
+        let targets = self
+            .targets
+            .iter()
+            .map(IcebergSealedWriteTarget::ordinal)
+            .collect::<BTreeSet<_>>();
+        for (target, identities) in &expectations {
+            if !targets.contains(target) {
+                return Err(invalid(
+                    "Iceberg write statistics expectation names an unsealed target",
+                ));
+            }
+            let unique = identities.iter().collect::<BTreeSet<_>>();
+            if unique.len() != identities.len() {
+                return Err(invalid(
+                    "Iceberg write statistics expectation repeats an artifact identity",
+                ));
+            }
+        }
+        self.statistics_expectations = expectations;
+        Ok(self)
     }
 
     /// The frozen input files this session's commit replaces, unioned across
@@ -2143,6 +2178,13 @@ impl IcebergCommitHandle {
             .iter()
             .map(IcebergSealedWriteTarget::ordinal)
             .collect()
+    }
+
+    pub(crate) const fn statistics_expectations(
+        &self,
+    ) -> &BTreeMap<WriteTargetOrdinal, Vec<novarocks_spi::connector::StatisticsArtifactIdentity>>
+    {
+        &self.statistics_expectations
     }
 
     pub fn branch_of(&self, ordinal: WriteTargetOrdinal) -> Option<IcebergWriteBranch> {

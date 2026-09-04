@@ -385,12 +385,13 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
     let aggregate = LogicalAggregateNode {
         group_by: vec![col(1, "k"), col(2, "region")],
         aggregates: vec![AggregateCall {
-            name: "sum".to_string(),
+            name: "count".to_string(),
             args: Vec::new(),
             distinct: false,
             result_type: DataType::Int64,
             order_by: Vec::new(),
             output_column_id: ColumnId(30),
+            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
         }],
         output_columns: vec![output(30, "sum(v)"), output(1, "k"), output(2, "region")],
         already_pushed: false,

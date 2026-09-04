@@ -1410,6 +1410,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
         let name = match original_name.as_str() {
             "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
+            "every" => "bool_and".to_string(),
             other => other.to_string(),
         };
         // Route explicit `element_at(container, key)` calls to the right typed
@@ -1916,9 +1917,60 @@ impl<'a> super::AnalyzerContext<'a> {
 
         // Check for window function: func(...) OVER (...)
         if let Some(ref window_type) = func.over {
-            if name == "any_value" {
+            if is_analyzer_aggregate_macro(&original_name) {
                 return Err(AnalyzeError::unsupported_expression(
-                    "any_value not supported with OVER clause",
+                    format!("{original_name} is not supported with OVER clause"),
+                    func.span,
+                ));
+            }
+            let window_only = is_window_only_function(&name);
+            let aggregate_binding = if window_only {
+                None
+            } else {
+                let executable_name =
+                    novarocks_types::aggregate::mangle_distinct_aggregate_name(&name, is_distinct);
+                match self
+                    .function_catalog
+                    .resolve_aggregate_signature(&executable_name, &arg_types)
+                {
+                    Ok(binding) => Some(binding),
+                    Err(crate::functions::ResolveError::UnknownFunction) => {
+                        if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
+                            return Err(AnalyzeError::unknown_function(
+                                format!("Unknown function: {name}"),
+                                func.span,
+                            ));
+                        }
+                        return Err(AnalyzeError::unsupported_expression(
+                            format!("function {name} is not supported with OVER clause"),
+                            func.span,
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(aggregate_resolution_error(
+                            &executable_name,
+                            &arg_types,
+                            func.span,
+                            error,
+                        ));
+                    }
+                }
+            };
+            if is_distinct && (window_only || !aggregate_window_supports_distinct(&name)) {
+                return Err(AnalyzeError::unsupported_expression(
+                    format!("{name} DISTINCT is not supported with OVER clause"),
+                    func.span,
+                ));
+            }
+            if !func_order_by.is_empty() && !aggregate_window_supports_function_order_by(&name) {
+                return Err(AnalyzeError::unsupported_expression(
+                    format!("{name} ORDER BY is not supported with OVER clause"),
+                    func.span,
+                ));
+            }
+            if aggregate_binding.is_some() && !is_supported_aggregate_window_function(&name) {
+                return Err(AnalyzeError::unsupported_expression(
+                    format!("aggregate function {name} is not supported with OVER clause"),
                     func.span,
                 ));
             }
@@ -1939,26 +1991,10 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 }
             }
-            if !is_window_only_function(&name)
-                && !is_aggregate_function(&name)
-                && scalar_function_is_unknown(self.function_catalog, &name, &arg_types)
-            {
-                return Err(AnalyzeError::unknown_function(
-                    format!("Unknown function: {name}"),
-                    func.span,
-                ));
-            }
-            let return_type = if is_window_only_function(&name) {
-                infer_window_return_type(&name, &arg_types)
-            } else if is_aggregate_function(&name) {
-                if is_count_star {
-                    DataType::Int64
-                } else {
-                    infer_agg_return_type(&name, &arg_types)
-                }
-            } else {
-                infer_scalar_return_type_with_catalog(self.function_catalog, &name, &arg_types)
-            };
+            let return_type = aggregate_binding.as_ref().map_or_else(
+                || infer_window_return_type(&name, &arg_types),
+                |binding| binding.output_type.clone(),
+            );
             let (partition_by, order_by, window_frame) =
                 self.analyze_window_spec(window_type, scope)?;
             let ignore_nulls = matches!(func.null_treatment, Some(ast::NullTreatment::IgnoreNulls));
@@ -1967,6 +2003,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     name,
                     args: args_typed,
                     distinct: is_distinct,
+                    function_order_by: func_order_by,
+                    aggregate_binding,
                     partition_by,
                     order_by,
                     window_frame,
@@ -2060,16 +2098,35 @@ impl<'a> super::AnalyzerContext<'a> {
             };
         }
 
-        if is_aggregate_function(&name) && apply_implicit_aggregate_casts(&name, &mut args_typed) {
+        if is_aggregate_function(self.function_catalog, &name)
+            && apply_implicit_aggregate_casts(&name, &mut args_typed)
+        {
             arg_types = args_typed.iter().map(|a| a.data_type.clone()).collect();
+        }
+
+        let aggregate_macro = is_analyzer_aggregate_macro(&original_name);
+        if aggregate_macro && is_distinct {
+            return Err(AnalyzeError::unsupported_expression(
+                format!("{original_name} does not support DISTINCT"),
+                func.span,
+            ));
         }
 
         let mut bound_scalar = None;
         self.validate_percentile_arguments(&name, &args_typed, func.span)?;
-        if is_aggregate_function(&name) {
+        let mut bound_aggregate = None;
+        if is_aggregate_function(self.function_catalog, &name) {
             validate_aggregate_function_call(&name, &arg_types)
                 .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
-        } else {
+            let executable_name =
+                novarocks_types::aggregate::mangle_distinct_aggregate_name(&name, is_distinct);
+            bound_aggregate = Some(resolve_aggregate_function_call(
+                self.function_catalog,
+                &executable_name,
+                &arg_types,
+                func.span,
+            )?);
+        } else if !aggregate_macro {
             if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
                 return Err(AnalyzeError::unknown_function(
                     format!("Unknown function: {name}"),
@@ -2086,16 +2143,29 @@ impl<'a> super::AnalyzerContext<'a> {
 
         match original_name.as_str() {
             "ds_hll_accumulate" => {
+                let bound_state = bind_scalar_function_call_with_catalog(
+                    self.function_catalog,
+                    "ds_hll_count_distinct_state",
+                    args_typed,
+                )
+                .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
+                let state_type = bound_state.return_type.clone();
+                let aggregate_signature = resolve_aggregate_function_call(
+                    self.function_catalog,
+                    "ds_hll_count_distinct_union",
+                    std::slice::from_ref(&state_type),
+                    func.span,
+                )?;
                 let state_expr = TypedExpr {
                     kind: ExprKind::FunctionCall {
                         volatility: self
                             .function_catalog
                             .volatility("ds_hll_count_distinct_state"),
                         name: "ds_hll_count_distinct_state".to_string(),
-                        args: args_typed,
+                        args: bound_state.args,
                         distinct: false,
                     },
-                    data_type: DataType::Binary,
+                    data_type: state_type,
                     nullable: true,
                 };
                 return Ok(TypedExpr {
@@ -2104,8 +2174,9 @@ impl<'a> super::AnalyzerContext<'a> {
                         args: vec![state_expr],
                         distinct: false,
                         order_by: func_order_by,
+                        resolved: aggregate_signature.clone(),
                     },
-                    data_type: DataType::Binary,
+                    data_type: aggregate_signature.output_type,
                     nullable: true,
                 });
             }
@@ -2115,14 +2186,24 @@ impl<'a> super::AnalyzerContext<'a> {
                     args_typed.first(),
                     func.span,
                 )?;
+                let aggregate_signature = resolve_aggregate_function_call(
+                    self.function_catalog,
+                    "ds_hll_count_distinct_union",
+                    &args_typed
+                        .iter()
+                        .map(|arg| arg.data_type.clone())
+                        .collect::<Vec<_>>(),
+                    func.span,
+                )?;
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "ds_hll_count_distinct_union".to_string(),
                         args: args_typed,
                         distinct: false,
                         order_by: func_order_by,
+                        resolved: aggregate_signature.clone(),
                     },
-                    data_type: DataType::Binary,
+                    data_type: aggregate_signature.output_type,
                     nullable: true,
                 });
             }
@@ -2132,33 +2213,41 @@ impl<'a> super::AnalyzerContext<'a> {
                     args_typed.first(),
                     func.span,
                 )?;
+                let aggregate_signature = resolve_aggregate_function_call(
+                    self.function_catalog,
+                    "ds_hll_count_distinct_merge",
+                    &args_typed
+                        .iter()
+                        .map(|arg| arg.data_type.clone())
+                        .collect::<Vec<_>>(),
+                    func.span,
+                )?;
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "ds_hll_count_distinct_merge".to_string(),
                         args: args_typed,
                         distinct: false,
                         order_by: func_order_by,
+                        resolved: aggregate_signature.clone(),
                     },
-                    data_type: DataType::Int64,
+                    data_type: aggregate_signature.output_type,
                     nullable: true,
                 });
             }
             _ => {}
         }
 
-        if is_aggregate_function(&name) {
+        if is_aggregate_function(self.function_catalog, &name) {
             // Aggregate function
-            let return_type = if is_count_star {
-                DataType::Int64
-            } else {
-                infer_agg_return_type(&name, &arg_types)
-            };
+            let signature = bound_aggregate.expect("catalog-classified aggregate must be resolved");
+            let return_type = signature.output_type.clone();
             Ok(TypedExpr {
                 kind: ExprKind::AggregateCall {
                     name,
                     args: args_typed,
                     distinct: is_distinct,
                     order_by: func_order_by,
+                    resolved: signature,
                 },
                 data_type: return_type,
                 nullable: true,
@@ -3338,7 +3427,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 if f.over.is_some() {
                     return false;
                 }
-                if is_aggregate_function(&print_object_name(&f.name).to_ascii_lowercase()) {
+                let name = print_object_name(&f.name).to_ascii_lowercase();
+                if is_aggregate_function(self.function_catalog, &name)
+                    || is_analyzer_aggregate_syntax(&name)
+                {
                     return true;
                 }
                 f.arguments
@@ -3806,10 +3898,7 @@ fn narrowing_integer_cast_can_return_null(source: &DataType, target: &DataType) 
     )
 }
 
-#[allow(
-    dead_code,
-    reason = "Retained for staged SQL planner migration consumers and test helpers."
-)]
+#[cfg(test)]
 fn bind_scalar_function_call(name: &str, args: Vec<TypedExpr>) -> Result<BoundScalarCall, String> {
     bind_scalar_function_call_with_catalog(
         crate::functions::builtin_sql_function_catalog(),
@@ -3888,6 +3977,51 @@ fn bind_scalar_function_call_with_catalog(
             })
         }
     }
+}
+
+pub(super) fn resolve_aggregate_function_call(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    arg_types: &[DataType],
+    span: Span,
+) -> Result<novarocks_functions::ResolvedAggregateSignature, AnalyzeError> {
+    function_catalog
+        .resolve_aggregate_signature(name, arg_types)
+        .map_err(|error| aggregate_resolution_error(name, arg_types, span, error))
+}
+
+fn aggregate_resolution_error(
+    name: &str,
+    arg_types: &[DataType],
+    span: Span,
+    error: crate::functions::ResolveError,
+) -> AnalyzeError {
+    match error {
+        crate::functions::ResolveError::UnknownFunction => {
+            AnalyzeError::unknown_function(format!("Unknown function: {name}"), span)
+        }
+        crate::functions::ResolveError::HiddenFunction => AnalyzeError::unknown_function(
+            format!("function `{name}` is not available to user SQL"),
+            span,
+        ),
+        crate::functions::ResolveError::NoMatchingSignature { .. } => {
+            AnalyzeError::type_mismatch(no_matching_signature(name, arg_types), span)
+        }
+        crate::functions::ResolveError::BadSignature(message) => {
+            AnalyzeError::type_mismatch(message, span)
+        }
+    }
+}
+
+fn is_analyzer_aggregate_macro(name: &str) -> bool {
+    matches!(
+        name,
+        "ds_hll_accumulate" | "ds_hll_combine" | "ds_hll_estimate"
+    )
+}
+
+fn is_analyzer_aggregate_syntax(name: &str) -> bool {
+    name == "every" || is_analyzer_aggregate_macro(name)
 }
 
 fn aggregate_arg_cast_type(name: &str, input_type: &DataType) -> Option<DataType> {
@@ -5246,12 +5380,27 @@ mod tests {
     }
 
     fn analyze_projection_expr(sql: &str) -> Result<crate::analysis::TypedExpr, String> {
+        analyze_projection_expr_with_function_catalog(
+            sql,
+            crate::functions::builtin_sql_function_catalog(),
+        )
+    }
+
+    fn analyze_projection_expr_with_function_catalog(
+        sql: &str,
+        function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    ) -> Result<crate::analysis::TypedExpr, String> {
         let statements = novarocks_parser::parse(sql).map_err(|error| error.to_string())?;
         let [ast::Statement::Query(query)] = statements.as_slice() else {
             return Err("expected query".to_string());
         };
-        let (resolved, _registry, _factory) =
-            analyze(query, &EmptyCatalog, "default").map_err(|error| error.to_string())?;
+        let (resolved, _registry, _factory) = super::super::analyze_with_function_catalog(
+            query,
+            &EmptyCatalog,
+            "default",
+            function_catalog,
+        )
+        .map_err(|error| error.to_string())?;
         let QueryBody::Select(select) = resolved.body else {
             return Err("expected select".to_string());
         };
@@ -5261,6 +5410,96 @@ mod tests {
             .next()
             .map(|item| item.expr)
             .ok_or_else(|| "expected projection".to_string())
+    }
+
+    #[test]
+    fn hidden_aggregate_window_uses_user_visibility_error_before_capability_check() {
+        let mut builder = novarocks_functions::EngineFunctionCatalogBuilder::new();
+        let overload = novarocks_functions::AggregateOverloadMetadata::try_new(
+            "iceberg/theta-stat/int64/v1",
+            [DataType::Int64],
+            DataType::Binary,
+            DataType::Binary,
+            "iceberg/theta-compact/v1",
+        )
+        .expect("hidden aggregate overload should be valid");
+        let definition = novarocks_functions::FunctionDefinition::try_new_exact_aggregate(
+            "$iceberg_theta_stat",
+            novarocks_functions::FunctionVisibility::Hidden,
+            novarocks_functions::FunctionVolatility::Immutable,
+            [overload],
+        )
+        .expect("hidden aggregate definition should be valid");
+        builder
+            .register(definition)
+            .expect("hidden aggregate should register");
+        let catalog = builder.seal().expect("test catalog should seal");
+
+        let error = analyze_projection_expr_with_function_catalog(
+            "select $iceberg_theta_stat(1) over ()",
+            &catalog,
+        )
+        .expect_err("hidden aggregate must not be admitted as a window function");
+
+        assert!(error.contains("function `$iceberg_theta_stat` is not available to user SQL"));
+        assert!(!error.contains("aggregate function"));
+    }
+
+    #[test]
+    fn scalar_and_unknown_over_errors_remain_distinct() {
+        let scalar = analyze_projection_expr("select abs(1) over ()")
+            .expect_err("known scalar OVER must be rejected");
+        assert!(scalar.contains("function abs is not supported with OVER clause"));
+
+        let unknown = analyze_projection_expr("select sqlp8_unknown(1) over ()")
+            .expect_err("unknown function OVER must remain unknown");
+        assert!(unknown.contains("Unknown function: sqlp8_unknown"));
+    }
+
+    #[test]
+    fn every_normalizes_to_the_executable_bool_and_aggregate() {
+        let expr = analyze_projection_expr("select every(true)").expect("EVERY should analyze");
+        let crate::analysis::ExprKind::AggregateCall { name, .. } = expr.kind else {
+            panic!("expected aggregate call, got {:?}", expr.kind);
+        };
+        assert_eq!(name, "bool_and");
+        assert_eq!(expr.data_type, DataType::Boolean);
+    }
+
+    #[test]
+    fn ds_hll_macros_resolve_only_their_executable_expansion() {
+        let accumulate =
+            analyze_projection_expr("select ds_hll_accumulate(1)").expect("macro should analyze");
+        let crate::analysis::ExprKind::AggregateCall {
+            name,
+            args,
+            distinct,
+            ..
+        } = accumulate.kind
+        else {
+            panic!("expected aggregate call, got {:?}", accumulate.kind);
+        };
+        assert_eq!(name, "ds_hll_count_distinct_union");
+        assert!(!distinct);
+        let [state] = args.as_slice() else {
+            panic!("expected one scalar state argument");
+        };
+        assert!(matches!(
+            &state.kind,
+            crate::analysis::ExprKind::FunctionCall { name, .. }
+                if name == "ds_hll_count_distinct_state"
+        ));
+        assert_eq!(state.data_type, DataType::Binary);
+        assert_eq!(accumulate.data_type, DataType::Binary);
+
+        let estimate =
+            analyze_projection_expr("select ds_hll_estimate(ds_hll_count_distinct_state(1))")
+                .expect("estimate macro should analyze");
+        let crate::analysis::ExprKind::AggregateCall { name, .. } = estimate.kind else {
+            panic!("expected aggregate call, got {:?}", estimate.kind);
+        };
+        assert_eq!(name, "ds_hll_count_distinct_merge");
+        assert_eq!(estimate.data_type, DataType::Int64);
     }
 
     #[test]

@@ -134,6 +134,7 @@ pub(crate) fn intern_aggregate_call(
         args: intern_exprs(arena, &call.args),
         distinct: call.distinct,
         order_by: intern_sort_items(arena, &call.order_by),
+        resolved: call.resolved.clone(),
     }
 }
 
@@ -187,6 +188,7 @@ pub(crate) fn materialize_aggregate_call(
         result_type: output_column.data_type.clone(),
         order_by: materialize_sort_keys(arena, &call.order_by),
         output_column_id: call.output_column_id,
+        resolved: call.resolved.clone(),
     }
 }
 
@@ -220,6 +222,8 @@ pub(crate) fn intern_window_expr(arena: &mut ScalarArena, expr: &WindowExpr) -> 
         name: expr.name.clone(),
         args: intern_exprs(arena, &expr.args),
         distinct: expr.distinct,
+        function_order_by: intern_sort_items(arena, &expr.function_order_by),
+        aggregate_binding: expr.aggregate_binding.clone(),
         partition_by: intern_exprs(arena, &expr.partition_by),
         order_by: intern_sort_items(arena, &expr.order_by),
         window_frame: expr.window_frame.clone(),
@@ -273,6 +277,8 @@ pub(crate) fn materialize_window_expr(
         name: expr.name.clone(),
         args: materialize_exprs(arena, &expr.args),
         distinct: expr.distinct,
+        function_order_by: materialize_sort_keys(arena, &expr.function_order_by),
+        aggregate_binding: expr.aggregate_binding.clone(),
         partition_by: materialize_exprs(arena, &expr.partition_by),
         order_by: materialize_sort_keys(arena, &expr.order_by),
         window_frame: expr.window_frame.clone(),
@@ -341,6 +347,8 @@ mod tests {
             name: "row_number".to_string(),
             args: vec![],
             distinct: false,
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![],
             order_by: vec![],
             window_frame: None,
@@ -358,6 +366,15 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate(
+                name,
+                if name == "count" {
+                    &[]
+                } else {
+                    &[DataType::Int64]
+                },
+                false,
+            ),
             output_column_id,
         }
     }
@@ -369,6 +386,15 @@ mod tests {
             args: vec![],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate(
+                name,
+                if name == "count" {
+                    &[]
+                } else {
+                    &[DataType::Int64]
+                },
+                false,
+            ),
         }
     }
 
@@ -398,6 +424,8 @@ mod tests {
             name: name.to_string(),
             args: vec![],
             distinct: false,
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![],
             order_by: vec![],
             window_frame: None,
@@ -522,6 +550,59 @@ mod tests {
         let spec = intern_window_expr(&mut arena, &window_expr(output_id, "rn"));
 
         assert_eq!(spec.output_column_id, output_id);
+    }
+
+    #[test]
+    fn window_bridge_preserves_function_order_and_aggregate_binding() {
+        let output_id = ColumnId::new_for_test(702);
+        let argument = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(7),
+                qualifier: None,
+                column: "value".to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        let aggregate_binding =
+            crate::functions::test_resolved_aggregate("array_agg", &[DataType::Int64], false);
+        let source = WindowExpr {
+            name: "array_agg".to_string(),
+            args: vec![argument.clone()],
+            distinct: false,
+            function_order_by: vec![SortItem {
+                expr: argument,
+                asc: false,
+                nulls_first: true,
+            }],
+            aggregate_binding: Some(aggregate_binding.clone()),
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+            result_type: aggregate_binding.output_type.clone(),
+            output_name: "ordered_values".to_string(),
+            output_column_id: output_id,
+            ignore_nulls: false,
+        };
+        let mut arena = ScalarArena::new();
+
+        let spec = intern_window_expr(&mut arena, &source);
+        assert_eq!(spec.aggregate_binding.as_ref(), Some(&aggregate_binding));
+        assert_eq!(spec.function_order_by.len(), 1);
+        let materialized = materialize_window_expr(
+            &arena,
+            &spec,
+            &[output_column(
+                output_id,
+                "ordered_values",
+                aggregate_binding.output_type.clone(),
+            )],
+        );
+
+        assert_eq!(materialized.aggregate_binding, Some(aggregate_binding));
+        assert_eq!(materialized.function_order_by.len(), 1);
+        assert!(!materialized.function_order_by[0].asc);
+        assert!(materialized.function_order_by[0].nulls_first);
     }
 
     #[test]
@@ -688,6 +769,7 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             args,
             distinct,
             order_by,
+            resolved,
         } => ScalarNode::AggregateCall {
             name: name.clone(),
             args: args.iter().map(|a| intern_typed(arena, a)).collect(),
@@ -696,6 +778,7 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
                 .iter()
                 .map(|item| intern_sort_item(arena, item))
                 .collect(),
+            resolved: resolved.clone(),
         },
         ExprKind::Cast { expr, target } => ScalarNode::Cast {
             child: intern_typed(arena, expr),
@@ -760,6 +843,8 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -768,6 +853,11 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
             name: name.clone(),
             args: args.iter().map(|a| intern_typed(arena, a)).collect(),
             distinct: *distinct,
+            function_order_by: function_order_by
+                .iter()
+                .map(|item| intern_sort_item(arena, item))
+                .collect(),
+            aggregate_binding: aggregate_binding.clone(),
             partition_by: partition_by
                 .iter()
                 .map(|expr| intern_typed(arena, expr))
@@ -837,6 +927,7 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             args,
             distinct,
             order_by,
+            resolved,
         } => ExprKind::AggregateCall {
             name: name.clone(),
             args: args.iter().map(|a| materialize(arena, *a)).collect(),
@@ -845,6 +936,7 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
                 .iter()
                 .map(|key| materialize_sort_key(arena, key))
                 .collect(),
+            resolved: resolved.clone(),
         },
         ScalarNode::Cast { child, target } => ExprKind::Cast {
             expr: Box::new(materialize(arena, *child)),
@@ -909,6 +1001,8 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -917,6 +1011,11 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             name: name.clone(),
             args: args.iter().map(|a| materialize(arena, *a)).collect(),
             distinct: *distinct,
+            function_order_by: function_order_by
+                .iter()
+                .map(|key| materialize_sort_key(arena, key))
+                .collect(),
+            aggregate_binding: aggregate_binding.clone(),
             partition_by: partition_by
                 .iter()
                 .map(|expr| materialize(arena, *expr))

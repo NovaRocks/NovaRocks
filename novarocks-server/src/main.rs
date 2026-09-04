@@ -17,7 +17,12 @@
 
 use std::env;
 use std::process;
+use std::sync::Arc;
 
+use novarocks_execution::exec::expr::agg::{
+    ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
+    contribute_builtin_aggregate_implementations,
+};
 use novarocks_server::app_config::NovaRocksConfig;
 use novarocks_server::{composition, launch, logging, native_compatibility};
 use novarocks_types::NativeCompatibilityId;
@@ -74,6 +79,24 @@ fn init_process(config: &NovaRocksConfig) -> anyhow::Result<tokio::runtime::Runt
         .map_err(|error| anyhow::anyhow!("build data Tokio runtime: {error}"))
 }
 
+fn compose_process_function_set() -> anyhow::Result<Arc<SealedExecutionFunctionSet>> {
+    let mut builder = ExecutionFunctionSetBuilder::new();
+    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+        .map_err(|error| anyhow::anyhow!("contribute builtin function metadata: {error}"))?;
+    contribute_builtin_aggregate_implementations(&mut builder).map_err(|error| {
+        anyhow::anyhow!("contribute builtin aggregate implementations: {error}")
+    })?;
+    builder
+        .register_typed_aggregate(
+            novarocks_connector_iceberg_functions::iceberg_theta_registration()
+                .map_err(|error| anyhow::anyhow!("build Iceberg function bundle: {error}"))?,
+        )
+        .map_err(|error| anyhow::anyhow!("contribute Iceberg function bundle: {error}"))?;
+    Ok(Arc::new(builder.seal().map_err(|error| {
+        anyhow::anyhow!("seal process engine function set: {error}")
+    })?))
+}
+
 /// SIGTERM is the production authority for the one-way FE drain. SIGINT uses
 /// the same path for local operation; neither signal is interpreted as an
 /// immediate process-wide connection cancellation.
@@ -121,7 +144,7 @@ fn run_frontend(
 fn run_backend(
     role: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
-    function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
+    function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&role.config);
@@ -129,7 +152,7 @@ fn run_backend(
         &role.config,
         &role.native_trust,
         native_compatibility_id,
-        function_catalog,
+        function_set,
         runtime.handle().clone(),
     )?;
     let data_runtime = novarocks_backend::BackendDataRuntime::new(
@@ -158,7 +181,7 @@ async fn run_all_in_one(
     fe: launch::RoleConfig,
     be: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
-    function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
+    function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&be.config);
@@ -167,14 +190,14 @@ async fn run_all_in_one(
         &fe.native_trust,
         None,
         native_compatibility_id,
-        std::sync::Arc::clone(&function_catalog),
+        std::sync::Arc::clone(function_set.catalog()),
         runtime.clone(),
     )?;
     let backend = composition::compose_backend_server_config(
         &be.config,
         &be.native_trust,
         native_compatibility_id,
-        function_catalog,
+        function_set,
         runtime.clone(),
     )?;
     let backend_runtime = novarocks_backend::BackendDataRuntime::new(
@@ -242,15 +265,16 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         launch::ResolvedServerLaunch::AllInOne { fe, .. } => &fe.config,
     };
     let runtime = init_process(process_config)?;
-    let functions = std::sync::Arc::new(
-        novarocks_sql::compiler::build_builtin_engine_function_catalog()
-            .map_err(|error| anyhow::anyhow!("seal process engine function catalog: {error}"))?,
-    );
-    let native_compatibility =
-        native_compatibility::resolve_native_compatibility_material(functions.digest())?;
+    let function_set = compose_process_function_set()?;
+    let functions = std::sync::Arc::clone(function_set.catalog());
+    let native_compatibility = native_compatibility::resolve_native_compatibility_material(
+        functions.digest(),
+        function_set.implementation_manifest_digest(),
+    )?;
     tracing::info!(
         native_compatibility_id = %native_compatibility.id(),
         function_catalog_digest = %hex::encode(functions.digest()),
+        execution_implementation_manifest_digest = %hex::encode(function_set.implementation_manifest_digest()),
         build_identity = novarocks_version::native_build_identity(),
         "resolved native compatibility material"
     );
@@ -259,15 +283,37 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
             run_frontend(role, native_compatibility.id(), functions, &runtime)
         }
         launch::ResolvedServerLaunch::Be(role) => {
-            run_backend(role, native_compatibility.id(), functions, &runtime)
+            run_backend(role, native_compatibility.id(), function_set, &runtime)
         }
         launch::ResolvedServerLaunch::AllInOne { fe, be } => runtime.block_on(run_all_in_one(
             fe,
             be,
             native_compatibility.id(),
-            functions,
+            function_set,
             runtime.handle().clone(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_process_function_set;
+    use novarocks_functions::{FunctionKind, FunctionVisibility};
+
+    #[test]
+    fn native_compatibility_uses_one_sealed_process_function_set() {
+        let function_set = compose_process_function_set().expect("sealed process function set");
+        let catalog = function_set.catalog();
+        let definition = catalog
+            .definition(
+                novarocks_connector_iceberg_functions::ICEBERG_THETA_AGGREGATE_NAME,
+                FunctionKind::Aggregate,
+            )
+            .expect("Iceberg hidden aggregate metadata");
+
+        assert_eq!(definition.visibility(), FunctionVisibility::Hidden);
+        assert_ne!(catalog.digest(), [0; 32]);
+        assert_ne!(function_set.implementation_manifest_digest(), [0; 32]);
     }
 }
 

@@ -51,7 +51,106 @@ use crate::connector::{
     ConnectorWriteReceipt, ConnectorWriteRouteId, ConnectorWriteTargetRef,
 };
 use crate::connector::{ConnectorMutationRouteInput, ConnectorWriteFieldToken};
-use crate::connector::{ExternalMutationEvidence, ExternalMutationOutcome};
+use crate::connector::{
+    ExternalMutationEvidence, ExternalMutationOutcome, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
+    StatisticsArtifactDraft, StatisticsRequiredAggregation,
+};
+
+/// Cloneable FE planning facts for collect-on-write statistics on one logical
+/// write target.
+///
+/// This value carries no publication or commit authority and is never encoded
+/// into a writer handle. The frontend lowers its ordinary aggregate
+/// requirements into the plan; only the resulting resolved generic plan facts
+/// cross the native boundary.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WriteStatisticsContract {
+    requirements: Vec<StatisticsRequiredAggregation>,
+}
+
+impl WriteStatisticsContract {
+    /// Freeze requirements against the exact input shape accepted by this
+    /// target. An aggregate input is positional, so every descriptive fact is
+    /// checked here before planning rather than trusted independently later.
+    pub fn try_new(
+        input: &ConnectorWriteInputShape,
+        requirements: Vec<StatisticsRequiredAggregation>,
+    ) -> Result<Self, ConnectorError> {
+        if requirements.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "write statistics requirement count exceeds the artifact limit",
+            ));
+        }
+        let fields = input.fields();
+        let mut identities = std::collections::BTreeSet::new();
+        for requirement in &requirements {
+            let declared = requirement.input();
+            let actual = fields.get(declared.ordinal()).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "write statistics aggregate input ordinal is outside the target input",
+                )
+            })?;
+            let actual = actual.field();
+            if declared.name() != actual.name()
+                || declared.data_type() != actual.data_type()
+                || declared.nullable() != actual.is_nullable()
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "write statistics aggregate input does not exactly match the target field",
+                ));
+            }
+            if !identities.insert(requirement.artifact().clone()) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "write statistics requirements contain a duplicate artifact identity",
+                ));
+            }
+        }
+        Ok(Self { requirements })
+    }
+
+    pub fn requirements(&self) -> &[StatisticsRequiredAggregation] {
+        &self.requirements
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.requirements.is_empty()
+    }
+
+    fn validate_against(&self, input: &ConnectorWriteInputShape) -> Result<(), ConnectorError> {
+        Self::try_new(input, self.requirements.clone()).map(|_| ())
+    }
+}
+
+/// One generic statistics artifact produced for one exact logical write
+/// target. Target membership is explicit because several physical targets may
+/// contribute the same artifact identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriteStatisticsArtifact {
+    target: WriteTargetOrdinal,
+    draft: StatisticsArtifactDraft,
+}
+
+impl WriteStatisticsArtifact {
+    pub const fn new(target: WriteTargetOrdinal, draft: StatisticsArtifactDraft) -> Self {
+        Self { target, draft }
+    }
+
+    pub const fn target(&self) -> WriteTargetOrdinal {
+        self.target
+    }
+
+    pub const fn draft(&self) -> &StatisticsArtifactDraft {
+        &self.draft
+    }
+
+    pub fn into_parts(self) -> (WriteTargetOrdinal, StatisticsArtifactDraft) {
+        (self.target, self.draft)
+    }
+}
 
 /// The frozen intent a frontend hands to `begin_write`.
 ///
@@ -180,6 +279,7 @@ pub struct ConnectorWriteTargetPlan {
     ordinal: WriteTargetOrdinal,
     handle: ConnectorWriterHandle,
     input: ConnectorWriteInputShape,
+    statistics: WriteStatisticsContract,
     route: Option<ConnectorWriteRouteFacts>,
     rewrite_source: Option<ConnectorWriteRewriteSource>,
 }
@@ -322,9 +422,21 @@ impl ConnectorWriteTargetPlan {
             ordinal,
             handle,
             input,
+            statistics: WriteStatisticsContract {
+                requirements: Vec::new(),
+            },
             route: None,
             rewrite_source: None,
         }
+    }
+
+    pub fn with_statistics_contract(
+        mut self,
+        statistics: WriteStatisticsContract,
+    ) -> Result<Self, ConnectorError> {
+        statistics.validate_against(&self.input)?;
+        self.statistics = statistics;
+        Ok(self)
     }
 
     /// Attach the routing facts of a row-mutation branch.
@@ -359,6 +471,10 @@ impl ConnectorWriteTargetPlan {
 
     pub const fn input(&self) -> &ConnectorWriteInputShape {
         &self.input
+    }
+
+    pub const fn statistics(&self) -> &WriteStatisticsContract {
+        &self.statistics
     }
 }
 
@@ -411,6 +527,7 @@ impl ConnectorWriteSessionPlan {
         // ambiguous, and the loser's rows would vanish.
         let mut seen = std::collections::BTreeSet::new();
         for target in &targets {
+            target.statistics.validate_against(&target.input)?;
             if let Some(route) = target.route()
                 && !seen.insert(route.route_id())
             {
@@ -456,6 +573,7 @@ impl ConnectorWriteSessionPlan {
 pub struct ConnectorWriteFinishRequest<'a> {
     pub commit: &'a ConnectorWriteCommitHandle,
     pub prepared: ConnectorPreparedWriteSet,
+    pub statistics: Vec<WriteStatisticsArtifact>,
     pub context: ConnectorRequestContext,
 }
 
@@ -578,6 +696,72 @@ mod tests {
             adapter.wrap_writer_handle(Value(ordinal)),
             input_shape(),
         )
+    }
+
+    fn statistics_requirement(
+        ordinal: usize,
+        name: &str,
+        data_type: arrow::datatypes::DataType,
+        nullable: bool,
+        field_id: i32,
+    ) -> StatisticsRequiredAggregation {
+        StatisticsRequiredAggregation::try_new(
+            crate::connector::StatisticsScanColumn::try_new(
+                ordinal,
+                Arc::<str>::from(name),
+                data_type,
+                nullable,
+            )
+            .expect("scan column"),
+            "$test_stat",
+            crate::connector::StatisticsArtifactIdentity::try_new(vec![field_id], "test/blob")
+                .expect("identity"),
+        )
+        .expect("requirement")
+    }
+
+    #[test]
+    fn statistics_contract_binds_the_exact_target_field() {
+        let input = input_shape();
+        let contract = WriteStatisticsContract::try_new(
+            &input,
+            vec![statistics_requirement(
+                0,
+                "v",
+                arrow::datatypes::DataType::Int64,
+                true,
+                1,
+            )],
+        )
+        .expect("contract");
+        assert_eq!(contract.requirements().len(), 1);
+
+        for mismatch in [
+            statistics_requirement(0, "V", arrow::datatypes::DataType::Int64, true, 1),
+            statistics_requirement(0, "v", arrow::datatypes::DataType::Int32, true, 1),
+            statistics_requirement(0, "v", arrow::datatypes::DataType::Int64, false, 1),
+            statistics_requirement(1, "v", arrow::datatypes::DataType::Int64, true, 1),
+        ] {
+            assert_eq!(
+                WriteStatisticsContract::try_new(&input, vec![mismatch])
+                    .expect_err("mismatched field")
+                    .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
+    }
+
+    #[test]
+    fn statistics_contract_rejects_duplicate_artifact_identity() {
+        let input = input_shape();
+        let requirement =
+            statistics_requirement(0, "v", arrow::datatypes::DataType::Int64, true, 1);
+        assert_eq!(
+            WriteStatisticsContract::try_new(&input, vec![requirement.clone(), requirement])
+                .expect_err("duplicate identity")
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
     }
 
     #[test]

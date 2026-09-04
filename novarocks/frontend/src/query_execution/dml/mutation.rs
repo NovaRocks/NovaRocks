@@ -766,11 +766,13 @@ mod tests {
         let connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> =
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default());
         crate::query_execution::kernels::DmlExecutionKernel::new(
-            Arc::new(
-                novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                    .expect("builtin function catalog"),
+            crate::query_execution::kernels::DmlPlanningServices::new(
+                Arc::new(
+                    novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                        .expect("builtin function catalog"),
+                ),
+                Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             ),
-            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
             std::sync::Arc::new(crate::connector::ConnectorControlHost::new()),

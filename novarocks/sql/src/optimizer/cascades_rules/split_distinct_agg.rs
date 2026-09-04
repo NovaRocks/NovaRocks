@@ -752,6 +752,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: test_col_id(&format!("count_distinct_{arg_name}")),
+            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], true),
         }
     }
 
@@ -767,6 +768,11 @@ mod tests {
             ))),
             order_by: vec![],
             output_column_id: test_col_id(&format!("array_agg_distinct_{arg_name}")),
+            resolved: crate::functions::test_resolved_aggregate(
+                "array_agg",
+                &[DataType::Int64],
+                true,
+            ),
         }
     }
 
@@ -778,6 +784,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: test_col_id(&format!("sum_{arg_name}")),
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
         }
     }
 
@@ -916,23 +923,14 @@ mod tests {
 
     #[test]
     fn apply_skips_multi_arg_distinct() {
-        let mut memo = Memo::new();
-        let sg = scan_group(&mut memo);
-        let two_arg = AggregateCall {
-            name: "count".into(),
-            args: vec![col("a"), col("b")],
-            distinct: true,
-            result_type: DataType::Int64,
-            order_by: vec![],
-            output_column_id: fallback_output_id(0),
-        };
-        let id = memo.next_expr_id();
-        let mexpr = MExpr {
-            id,
-            op: Operator::LogicalAggregate(single_agg(&mut memo, vec![], vec![two_arg], vec![])),
-            children: vec![sg],
-        };
-        assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
+        assert!(
+            crate::functions::builtin_sql_function_catalog()
+                .resolve_aggregate_trusted(
+                    "multi_distinct_count",
+                    &[DataType::Int64, DataType::Int64],
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -979,6 +977,11 @@ mod tests {
                             nulls_first: true,
                         }],
                         output_column_id: fallback_output_id(1),
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "array_agg",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                     count_distinct("name"),
                 ],
@@ -1008,6 +1011,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: fallback_output_id(1),
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "ds_hll_count_distinct",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                 ],
                 vec![],
@@ -1042,6 +1050,11 @@ mod tests {
                         nulls_first: true,
                     }],
                     output_column_id: fallback_output_id(1),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "array_agg",
+                        &[DataType::Int64],
+                        true,
+                    ),
                 }],
                 vec![],
             )),
@@ -1060,6 +1073,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: fallback_output_id(1),
+            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], true),
         };
         let mut memo = Memo::new();
         let calls =
@@ -1258,6 +1272,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: count_output.column_id,
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            true,
+                        ),
                     },
                     AggregateCall {
                         name: "sum".into(),
@@ -1266,6 +1285,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: sum_output.column_id,
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "sum",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                 ],
                 vec![
@@ -1325,6 +1349,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: ColumnId::new_for_test(7),
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            true,
+                        ),
                     },
                     AggregateCall {
                         name: "sum".into(),
@@ -1333,6 +1362,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: ColumnId::new_for_test(8),
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "sum",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                 ],
                 vec![
@@ -1539,6 +1573,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: count_output.column_id,
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            true,
+                        ),
                     },
                     AggregateCall {
                         name: "sum".into(),
@@ -1547,6 +1586,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: sum_output.column_id,
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "sum",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                 ],
                 vec![count_output.clone(), sum_output.clone()],
@@ -1598,6 +1642,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: sum_output,
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "sum",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                     AggregateCall {
                         name: "count".into(),
@@ -1606,6 +1655,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: count_output,
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                     AggregateCall {
                         name: "count".into(),
@@ -1614,6 +1668,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: distinct_output,
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            true,
+                        ),
                     },
                 ],
                 vec![
@@ -1721,6 +1780,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: vec![],
                     output_column_id: ColumnId::new_for_test(8),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "count",
+                        &[DataType::Int64],
+                        true,
+                    ),
                 }],
                 vec![OutputColumn {
                     column_id: ColumnId::new_for_test(8),
@@ -1785,6 +1849,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: ColumnId::new_for_test(8),
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            true,
+                        ),
                     },
                     AggregateCall {
                         name: "sum".into(),
@@ -1793,6 +1862,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: ColumnId::new_for_test(9),
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "sum",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                     AggregateCall {
                         name: "count".into(),
@@ -1801,6 +1875,11 @@ mod tests {
                         result_type: DataType::Int64,
                         order_by: vec![],
                         output_column_id: ColumnId::new_for_test(10),
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "count",
+                            &[DataType::Int64],
+                            true,
+                        ),
                     },
                 ],
                 vec![

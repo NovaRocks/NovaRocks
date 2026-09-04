@@ -403,7 +403,7 @@ pub fn compose_backend_server_config(
     config: &NovaRocksConfig,
     native_trust: &NativeTrustSnapshot,
     native_compatibility_id: NativeCompatibilityId,
-    function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
+    function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<BackendServerConfig> {
     let runtime_config = &config.runtime;
@@ -425,7 +425,7 @@ pub fn compose_backend_server_config(
         advertise_endpoint,
         native_trust: std::sync::Arc::clone(native_trust.trust()),
         native_compatibility_id,
-        function_catalog,
+        function_set,
         native_transport: backend_native_transport(native_trust.transport()),
         frontend_endpoint,
         announce_interval: Duration::from_millis(config.cluster.backend_announce_interval_ms()),
@@ -516,8 +516,8 @@ pub fn compose_frontend_server_config(
         native_trust.advertised_endpoint().port(),
         runtime_filter_worker_count,
         native_compatibility_id,
+        function_catalog,
     )
-    .with_function_catalog(function_catalog)
     .with_catalog_desired_state_source(catalog_source)
     .with_catalog_prune_config(
         CatalogPruneConfig::try_new(

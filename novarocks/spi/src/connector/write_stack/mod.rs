@@ -68,12 +68,29 @@ pub use limits::{
 };
 pub use prepared::{ConnectorPreparedWriteSet, PreparedWriteSetLedger, WriteRowCountAccumulator};
 pub use relation::{
-    RootRowKind, WRITE_RELATION_COLUMN_COUNT, WRITE_RELATION_FIRST_COLUMN_ID,
-    WRITE_RELATION_FRAGMENT_COLUMN, WRITE_RELATION_FRAGMENT_INDEX, WRITE_RELATION_KIND_COLUMN,
-    WRITE_RELATION_KIND_INDEX, WRITE_RELATION_ROW_COUNT_COLUMN, WRITE_RELATION_ROW_COUNT_INDEX,
-    WRITE_RELATION_TARGET_COLUMN, WRITE_RELATION_TARGET_INDEX, WriterRowKind, root_output_schema,
+    MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, MAX_WRITE_RELATION_FIELD_NAME_BYTES,
+    MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD, MAX_WRITE_RELATION_METADATA_KEY_BYTES,
+    MAX_WRITE_RELATION_METADATA_VALUE_BYTES, MAX_WRITE_RELATION_TYPE_DEPTH,
+    MAX_WRITER_AUXILIARY_CHANNELS, ROOT_WRITE_RESULT_BLOB_TYPE_COLUMN,
+    ROOT_WRITE_RESULT_BLOB_TYPE_INDEX, ROOT_WRITE_RESULT_BODY_COLUMN, ROOT_WRITE_RESULT_BODY_INDEX,
+    ROOT_WRITE_RESULT_COLUMN_COUNT, ROOT_WRITE_RESULT_FIRST_COLUMN_ID,
+    ROOT_WRITE_RESULT_FRAGMENT_COLUMN, ROOT_WRITE_RESULT_FRAGMENT_INDEX,
+    ROOT_WRITE_RESULT_INPUT_FIELDS_COLUMN, ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX,
+    ROOT_WRITE_RESULT_KIND_COLUMN, ROOT_WRITE_RESULT_KIND_INDEX,
+    ROOT_WRITE_RESULT_PROPERTIES_COLUMN, ROOT_WRITE_RESULT_PROPERTIES_INDEX,
+    ROOT_WRITE_RESULT_ROW_COUNT_COLUMN, ROOT_WRITE_RESULT_ROW_COUNT_INDEX,
+    ROOT_WRITE_RESULT_SCHEMA_VERSION, ROOT_WRITE_RESULT_TARGET_COLUMN,
+    ROOT_WRITE_RESULT_TARGET_INDEX, RootRowKind, RootWriteResultMembershipValidator,
+    RootWriteResultRowShape, RootWriteResultSchema, WRITE_RELATION_COLUMN_COUNT,
+    WRITE_RELATION_FIRST_COLUMN_ID, WRITE_RELATION_FRAGMENT_COLUMN, WRITE_RELATION_FRAGMENT_INDEX,
+    WRITE_RELATION_KIND_COLUMN, WRITE_RELATION_KIND_INDEX, WRITE_RELATION_ROW_COUNT_COLUMN,
+    WRITE_RELATION_ROW_COUNT_INDEX, WRITE_RELATION_TARGET_COLUMN, WRITE_RELATION_TARGET_INDEX,
+    WRITER_MULTIPLEX_SCHEMA_VERSION, WriterAuxiliaryChannel, WriterMultiplexSchema, WriterRowKind,
+    arrow_schemas_exact, root_output_schema, root_write_result_column_id, root_write_result_schema,
     row_count_from_wire, row_count_to_wire, target_ordinal_from_wire, target_ordinal_to_wire,
-    validate_root_row, validate_writer_row, write_relation_column_id, writer_output_schema,
+    validate_artifact_draft_nested_values, validate_root_row, validate_root_write_result_row,
+    validate_writer_multiplex_row, validate_writer_row, write_relation_column_id,
+    writer_output_schema,
 };
 pub use runtime::{
     ConnectorCommitFragment, ConnectorWriteBinding, ConnectorWriteCommitHandle,
@@ -83,7 +100,8 @@ pub use session::{
     ConnectorManagedPublicationShape, ConnectorWriteBeginRequest, ConnectorWriteControl,
     ConnectorWriteFinishRequest, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
     ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
-    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
+    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, WriteStatisticsArtifact,
+    WriteStatisticsContract,
 };
 pub use target::{
     WriteTargetOrdinal, validate_dense_target_ordinals, validate_query_target_ordinals,
