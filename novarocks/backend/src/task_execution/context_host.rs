@@ -56,6 +56,7 @@ use novarocks_connector_binding::ConnectorMaterializationErrorClass;
 use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution::task_execution::operation::QueryContextDomainUpdate;
 use novarocks_execution::task_execution::status::TaskFailureCategory;
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_codec::lifecycle::{QueryTerminationReason, RuntimeFilterContribution};
 use novarocks_proto_codec::task_execution::domain::WireCredential;
 use novarocks_proto_models::novarocks as proto;
@@ -65,7 +66,7 @@ use tracing::error;
 
 use super::credential_slot::QueryContextCredentialSlot;
 use super::feedback::TaskRuntimeFilterFeedbackEgress;
-use super::host::{HostRejection, QueryContextHost, SharedFactsRequest};
+use super::host::{HostRejection, QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
 use super::shared_facts::{catalog_bindings, credential_material, runtime_filter_install};
 use super::status::TaskStatusReporter;
 use crate::BackendDataRuntime;
@@ -80,6 +81,9 @@ use crate::runtime_filter::install_decode::{
 };
 use crate::runtime_filter::participant::{
     RuntimeFilterParticipant, RuntimeFilterParticipantFactory,
+};
+use crate::runtime_filter::terminal_contribution::{
+    RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_terminal_profile_contribution,
 };
 
 /// The mutable half of one context's installed facts.
@@ -399,7 +403,11 @@ impl NativeQueryContextHost {
     /// make it, then the participant is closed, then the catalog leases are
     /// dropped. None of them depend on each other, and by the time a release
     /// runs the owner has already stood every task down.
-    fn tear_down(&self, context: QueryContextRef, installed: &InstalledContext) {
+    fn tear_down(
+        &self,
+        context: QueryContextRef,
+        installed: &InstalledContext,
+    ) -> ReleasedContextEvidence {
         let participant = {
             let mut facts = installed
                 .facts
@@ -413,13 +421,19 @@ impl NativeQueryContextHost {
             facts.participant.take()
         };
         installed.credentials.clear();
-        if let Some(participant) = participant {
-            close_participant(context, &participant);
-        }
+        let evidence = match participant {
+            Some(participant) => {
+                let evidence = seal_runtime_filter_evidence(context, &participant);
+                close_participant(context, &participant);
+                evidence
+            }
+            None => ReleasedContextEvidence::none(),
+        };
         // Unconditional: a lease may have been taken by an install that is
         // still unwinding, and releasing a query that holds none is a no-op.
         self.catalog_manager
             .release_query(context.query_execution_id());
+        evidence
     }
 
     /// Refuses to keep installing into a context that was retired under us.
@@ -620,7 +634,12 @@ impl QueryContextHost for NativeQueryContextHost {
                 // `release` after a failed materialize, but a host that leaves
                 // a half-installed context behind when it says "no" would be
                 // relying on that, and the trait does not promise it.
-                self.tear_down(context, &installed);
+                //
+                // The evidence this seals is dropped on purpose: a materialize
+                // that failed has no release acknowledgement to report it on,
+                // and an establish that never completed has no observation
+                // worth publishing.
+                drop(self.tear_down(context, &installed));
                 self.contexts
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -630,7 +649,7 @@ impl QueryContextHost for NativeQueryContextHost {
         }
     }
 
-    fn release(&self, context: QueryContextRef) {
+    fn release(&self, context: QueryContextRef) -> ReleasedContextEvidence {
         let installed = {
             let mut contexts = self
                 .contexts
@@ -655,11 +674,11 @@ impl QueryContextHost for NativeQueryContextHost {
                     contexts.insert_released_marker(context);
                     self.catalog_manager
                         .release_query(context.query_execution_id());
-                    return;
+                    return ReleasedContextEvidence::none();
                 }
             }
         };
-        self.tear_down(context, &installed);
+        self.tear_down(context, &installed)
     }
 
     fn advance_shared_domain(
@@ -762,6 +781,77 @@ fn decoded_contribution(
 /// only a test hook can fail. If a hook that can genuinely fail is ever
 /// installed, the fix is to give the host contract a place to report it, not to
 /// retry blindly here.
+/// Seals this participant's runtime-filter observation for the release that is
+/// taking it down.
+///
+/// `QueryTerminationCoordinatorFinalize` is the honest reason here and the
+/// only one this boundary can state: the frontend has declared that no legal
+/// create can follow, and the registry does not hand a context to this
+/// tear-down until every task it knows is a terminal record. A channel still
+/// open at that point closed without publishing, which is a fact to report --
+/// cancelling it first would overwrite the observation with a cause the
+/// release does not have.
+fn seal_runtime_filter_evidence(
+    context: QueryContextRef,
+    participant: &Arc<RuntimeFilterParticipant>,
+) -> ReleasedContextEvidence {
+    let snapshot = participant
+        .prepare_terminal_capture(QueryTerminationReason::QueryTerminationCoordinatorFinalize);
+    match capture_terminal_profile_contribution(Some(snapshot), true) {
+        Ok(telemetry) => match QueryTerminalProfileContributionTelemetry::parse(telemetry) {
+            Ok(telemetry) => ReleasedContextEvidence::with_runtime_filter(telemetry),
+            Err(error) => {
+                // The projection produced a value this process cannot vouch
+                // for. Reporting it anyway would make the frontend the first
+                // owner to discover it is malformed.
+                error!(
+                    target: "novarocks::task_execution",
+                    query_context = %context,
+                    error = %error,
+                    "sealed runtime filter contribution does not satisfy the terminal contract; \
+                     the release reports it as unavailable"
+                );
+                ReleasedContextEvidence::with_runtime_filter(runtime_filter_unavailable(
+                    "CONTRIBUTION_INVALID",
+                ))
+            }
+        },
+        Err(error) => {
+            // A correctness failure in the observation itself. The query has
+            // already produced its answer, so this is reported as unavailable
+            // telemetry rather than turned into a release failure.
+            error!(
+                target: "novarocks::task_execution",
+                query_context = %context,
+                error = %error,
+                "runtime filter observation failed its correctness check at release"
+            );
+            ReleasedContextEvidence::with_runtime_filter(runtime_filter_unavailable(
+                "OBSERVATION_CORRECTNESS_FAILURE",
+            ))
+        }
+    }
+}
+
+/// The unavailable telemetry a release reports when it held a participant but
+/// could not publish its contribution. Never an empty contribution: that would
+/// say the participant observed nothing.
+fn runtime_filter_unavailable(code: &str) -> QueryTerminalProfileContributionTelemetry {
+    QueryTerminalProfileContributionTelemetry::parse(
+        proto::QueryTerminalProfileContributionTelemetry {
+            telemetry: Some(
+                proto::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
+                    proto::TerminalTelemetryUnavailable {
+                        stage: RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE.to_owned(),
+                        code: code.to_owned(),
+                    },
+                ),
+            ),
+        },
+    )
+    .expect("a stage-and-code unavailable reason satisfies the terminal contract")
+}
+
 fn close_participant(context: QueryContextRef, participant: &Arc<RuntimeFilterParticipant>) {
     // The task protocol's release is deliberately cause-free: the owner
     // publishes the termination cause on the context and on every task, and
@@ -1303,6 +1393,61 @@ mod tests {
             "a second release must not close the participant again"
         );
         assert_eq!(fixture.query_leases(), 0);
+    }
+
+    /// The release is what seals the participant's terminal observation, and
+    /// it is the only message that carries it.
+    ///
+    /// The defect this catches: a task-protocol release that closes the
+    /// participant without ever sealing it. Every part of the projection is
+    /// individually correct and unit-tested through the retired lifecycle, so
+    /// nothing else fails -- the frontend simply never receives a
+    /// contribution, and every runtime-filter convergence fact reads as
+    /// absent. This drives the production `release`, not a helper.
+    #[test]
+    fn a_release_seals_the_runtime_filter_observation_and_reports_it() {
+        let fixture = Fixture::new();
+        let context = context(1);
+        fixture
+            .establish(
+                context,
+                vec![catalog_properties()],
+                participant_contribution(1),
+                &credential(1, SECRET_SENTINEL, live_until()),
+            )
+            .expect("a complete establish");
+
+        let evidence = fixture.host.release(context);
+        let telemetry = evidence
+            .runtime_filter()
+            .expect("a release that held a participant reports its observation");
+        assert!(
+            telemetry.available().is_some(),
+            "a sealed participant reports an available contribution, not an \
+             unavailable reason: {telemetry:?}"
+        );
+    }
+
+    /// A backend that installed no participant reports no contribution, which
+    /// is a different fact from an empty one.
+    #[test]
+    fn a_release_without_a_participant_reports_no_contribution() {
+        let fixture = Fixture::new();
+        let context = context(1);
+        fixture
+            .establish(
+                context,
+                vec![catalog_properties()],
+                no_contribution(),
+                &credential(1, SECRET_SENTINEL, live_until()),
+            )
+            .expect("a complete establish");
+
+        assert!(
+            fixture.host.release(context).runtime_filter().is_none(),
+            "a query with no runtime filter on this backend must not report an \
+             empty contribution"
+        );
     }
 
     /// A failure in the last install step must not strand the earlier ones.

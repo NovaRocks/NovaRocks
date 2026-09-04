@@ -60,6 +60,7 @@ pub const ESTABLISH_CATALOG_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.catalog_binding.v1";
 pub const ESTABLISH_FILTER_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.initial_runtime_filter.v1";
+use crate::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use crate::task_execution::identity::{
     decode_query_context_ref, decode_task_operation_id, encode_query_context_ref,
     encode_task_operation_id,
@@ -1035,17 +1036,43 @@ pub fn encode_credential_receipt(
 }
 
 /// Encodes a release acknowledgement.
+///
+/// `runtime_filter` is the releasing backend's own sealed runtime-filter
+/// observation. It is passed already-validated rather than assembled here:
+/// the projection belongs to the participant's owner, and this codec's job is
+/// to carry the value it produced without inventing an empty one for a
+/// release that had nothing to seal.
 pub fn encode_release_ack(
     context: QueryContextRef,
     outcome: ReleaseOutcome,
     state: QueryContextState,
+    runtime_filter: Option<&QueryTerminalProfileContributionTelemetry>,
 ) -> Option<novarocks::ReleaseQueryContextAck> {
     Some(novarocks::ReleaseQueryContextAck {
         query_context: Some(encode_query_context_ref(context)),
         outcome: encode_release_outcome(outcome),
         state: encode_context_state(state)?,
         termination_cause: None,
+        runtime_filter: runtime_filter.map(|value| value.as_proto().clone()),
     })
+}
+
+/// Everything one release acknowledgement states.
+///
+/// A struct rather than a tuple because each field answers a different
+/// question and two of them are optional: a positional read would let a caller
+/// silently swap the termination cause for the sealed contribution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedReleaseAck {
+    pub context: QueryContextRef,
+    pub outcome: ReleaseOutcome,
+    pub state: QueryContextState,
+    /// Why the context was terminated, when a release answered on one that was
+    /// terminated instead of released.
+    pub termination_cause: Option<novarocks_execution::task_execution::status::AbortCause>,
+    /// The backend's sealed runtime-filter observation. Absent means the
+    /// release held no participant to seal.
+    pub runtime_filter: Option<QueryTerminalProfileContributionTelemetry>,
 }
 
 /// Decodes a release acknowledgement, returning the termination cause the
@@ -1056,15 +1083,7 @@ pub fn encode_release_ack(
 pub fn decode_release_ack(
     src: &novarocks::ReleaseQueryContextAck,
     path: FieldPath,
-) -> Result<
-    (
-        QueryContextRef,
-        ReleaseOutcome,
-        QueryContextState,
-        Option<novarocks_execution::task_execution::status::AbortCause>,
-    ),
-    ProtocolError,
-> {
+) -> Result<DecodedReleaseAck, ProtocolError> {
     let context = src.query_context.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("query_context"),
@@ -1076,9 +1095,34 @@ pub fn decode_release_ack(
     let state = decode_context_state(src.state, path.clone().field("state"))?;
     let cause = src
         .termination_cause
-        .map(|cause| decode_abort_cause(cause, path.field("termination_cause")))
+        .map(|cause| decode_abort_cause(cause, path.clone().field("termination_cause")))
         .transpose()?;
-    Ok((context, outcome, state, cause))
+    // Validated here rather than accepted verbatim: a contribution that does
+    // not satisfy the terminal contract is a protocol error on the release
+    // that carried it, not a profile the frontend discovers is malformed
+    // several hops later.
+    let runtime_filter = src
+        .runtime_filter
+        .as_ref()
+        .map(|telemetry| {
+            QueryTerminalProfileContributionTelemetry::parse(telemetry.clone()).map_err(|error| {
+                invalid(
+                    path.clone().field("runtime_filter"),
+                    format!(
+                        "a release acknowledgement carries an invalid runtime-filter \
+                         contribution: {error}"
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+    Ok(DecodedReleaseAck {
+        context,
+        outcome,
+        state,
+        termination_cause: cause,
+        runtime_filter,
+    })
 }
 
 /// Encodes a cancel reason back onto the wire, for a receipt or a status.

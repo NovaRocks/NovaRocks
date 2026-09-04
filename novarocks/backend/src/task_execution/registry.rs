@@ -85,7 +85,9 @@ use super::entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
     estimate_retained_bytes,
 };
-use super::host::{QueryContextHost, RunnableTask, SharedFactsRequest, TaskExecutionHost};
+use super::host::{
+    QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
+};
 use super::marker;
 use super::observation::TaskStatusSource;
 use super::receipt::{
@@ -332,6 +334,23 @@ impl TaskExecutionRegistry {
             .contexts
             .get(&context)
             .and_then(ContextEntry::termination_cause)
+    }
+
+    /// The terminal evidence this backend sealed when it released one query
+    /// context's shared facts.
+    ///
+    /// Empty until the completion pass has actually handed the facts back:
+    /// a release that answered `NOT_READY` has sealed nothing, and reporting
+    /// a contribution then would state a terminal fact about a context that is
+    /// still draining.
+    pub fn released_context_evidence(&self, context: QueryContextRef) -> ReleasedContextEvidence {
+        self.state
+            .lock()
+            .expect(REGISTRY_LOCK)
+            .contexts
+            .get(&context)
+            .map(|entry| entry.released_evidence.clone())
+            .unwrap_or_else(ReleasedContextEvidence::none)
     }
 
     /// How many operations and reads this owner is currently running for one
@@ -1434,7 +1453,11 @@ impl TaskExecutionRegistry {
         request: &ReleaseQueryContext,
     ) -> ReleaseQueryContextOutcome {
         let receipt = self.apply_release_query_context(request);
-        marker::release_query_context(request.context(), &receipt);
+        marker::release_query_context(
+            request.context(),
+            &receipt,
+            &self.released_context_evidence(request.context()),
+        );
         receipt
     }
 
@@ -2060,7 +2083,10 @@ impl TaskExecutionRegistry {
                 entry.lease = None;
                 entry.facts_visible = false;
                 if !entry.facts_released {
-                    self.context_host.release(context);
+                    // Retained on the entry: this is the only point at which
+                    // the host seals it, and the release acknowledgement that
+                    // reports it is encoded from the retired entry afterwards.
+                    entry.released_evidence = self.context_host.release(context);
                     entry.facts_released = true;
                 }
                 entry.credential_material = None;

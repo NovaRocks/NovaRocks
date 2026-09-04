@@ -25,9 +25,11 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::terminal_codec::decode_runtime_profile_tree;
 use novarocks_execution::task_execution::FinalTaskInfo;
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_codec::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
 use novarocks_proto_models::novarocks;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
+use novarocks_types::{BackendProcessId, QueryExecutionId};
 
 /// The counters a task's operator statistics are rendered as.
 ///
@@ -38,6 +40,13 @@ const TASK_OPERATOR_OUTPUT_ROWS: &str = "PullRowNum";
 const TASK_OPERATOR_TOTAL_TIME: &str = "OperatorTotalTime";
 /// Set when a task had more operators than its final info could carry.
 const OPERATOR_STATISTICS_TRUNCATED: &str = "OperatorStatisticsTruncated";
+/// Where one operator's own named counters are rebuilt.
+///
+/// A node of its own, because on the backend these live in the operator's
+/// private profile structure rather than in the shared `CommonMetrics` child.
+const OPERATOR_COUNTERS: &str = "OperatorCounters";
+/// Set when an operator's subtree carried more counters than fitted.
+const OPERATOR_COUNTERS_TRUNCATED: &str = "OperatorCountersTruncated";
 
 /// Counters are signed; a value past the positive range is clamped rather than
 /// wrapped, because a wrapped count reads as a negative row count.
@@ -154,10 +163,65 @@ impl ProfileTerminalBuilder {
             .checked_merged(participant_totals)?;
         execution_totals.validate_profile_range()?;
 
+        let process_id = snapshot
+            .participant()
+            .backend_process_id()
+            .map_err(|error| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    error.to_string(),
+                )
+            })?;
         // One participant's runtime-filter totals span every fragment it ran,
         // so this tree belongs to no single fragment and names none.
         self.profiles.push(FragmentProfileTree::unattributed(
-            runtime_filter_profile_tree(snapshot, &contribution, participant_totals)?,
+            runtime_filter_profile_tree(
+                snapshot.execution_id(),
+                process_id,
+                &contribution,
+                participant_totals,
+            )?,
+        ));
+        self.runtime_filter_totals = execution_totals;
+        Ok(())
+    }
+
+    /// Applies one backend's runtime-filter contribution as the task protocol
+    /// reported it on its release acknowledgement.
+    ///
+    /// The same projection the lifecycle carrier feeds, from the same message.
+    /// It is a separate entry point only because the two carriers name the
+    /// participant differently: a terminal report carries a participant
+    /// reference, and a release acknowledgement is already addressed to one
+    /// backend's query context.
+    pub(crate) fn apply_runtime_filter_contribution(
+        &mut self,
+        execution_id: QueryExecutionId,
+        process_id: BackendProcessId,
+        telemetry: &QueryTerminalProfileContributionTelemetry,
+    ) -> Result<(), DistributedQueryError> {
+        let Some(contribution) = telemetry.available() else {
+            return Ok(());
+        };
+        if contribution.as_proto().channels.is_empty()
+            && contribution.as_proto().producer_streams.is_empty()
+            && contribution.as_proto().transport_routes.is_empty()
+            && contribution.as_proto().consumers.is_empty()
+        {
+            return Ok(());
+        }
+        let participant_totals = RuntimeFilterProfileTotals::from_contribution(&contribution)?;
+        let execution_totals = self
+            .runtime_filter_totals
+            .checked_merged(participant_totals)?;
+        execution_totals.validate_profile_range()?;
+        self.profiles.push(FragmentProfileTree::unattributed(
+            runtime_filter_profile_tree(
+                execution_id,
+                process_id,
+                &contribution,
+                participant_totals,
+            )?,
         ));
         self.runtime_filter_totals = execution_totals;
         Ok(())
@@ -262,6 +326,23 @@ impl ProfileTerminalBuilder {
                     ProfileUnit::TimeNs,
                     clamp_counter(wall_time.as_nanos().min(u128::from(u64::MAX)) as u64),
                 );
+            }
+            // The operator's own counters go under a node of their own rather
+            // than into `CommonMetrics`: on the backend they live in the
+            // operator's private profile structure, and folding them into the
+            // shared child would say every operator reports them.
+            if !statistics.counters().is_empty() || statistics.counters_truncated() {
+                let counters = operator.child(OPERATOR_COUNTERS);
+                for counter in statistics.counters() {
+                    counters.counter_set(
+                        counter.name().as_str(),
+                        ProfileUnit::Unit,
+                        counter.value(),
+                    );
+                }
+                if statistics.counters_truncated() {
+                    counters.counter_set(OPERATOR_COUNTERS_TRUNCATED, ProfileUnit::Unit, 1);
+                }
             }
         }
         self.profiles.push(FragmentProfileTree::for_fragment(
@@ -540,20 +621,11 @@ impl RuntimeFilterProfileTotals {
 }
 
 fn runtime_filter_profile_tree(
-    snapshot: &QueryTerminalSnapshot,
+    execution_id: QueryExecutionId,
+    process_id: BackendProcessId,
     contribution: &QueryTerminalProfileContributionV1,
     totals: RuntimeFilterProfileTotals,
 ) -> Result<RuntimeProfileTree, DistributedQueryError> {
-    let execution_id = snapshot.execution_id();
-    let process_id = snapshot
-        .participant()
-        .backend_process_id()
-        .map_err(|error| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                error.to_string(),
-            )
-        })?;
     let participant = RuntimeProfile::new(format!(
         "RuntimeFilterParticipant (process_id={process_id})"
     ));
@@ -1292,6 +1364,16 @@ mod tests {
         ];
         value[15] = participant_seed as u8;
         novarocks::BackendProcessId { value }
+    }
+
+    /// The same process id `test_backend_process_id` encodes, as the typed
+    /// value the task protocol's carrier is addressed by.
+    fn test_backend_process_id_value(participant_seed: u64) -> BackendProcessId {
+        let bytes: [u8; 16] = test_backend_process_id(participant_seed)
+            .value
+            .try_into()
+            .expect("the fixture process id is sixteen bytes");
+        BackendProcessId::try_from_bytes(bytes).expect("the fixture process id is a legal UUIDv7")
     }
 
     fn runtime_filter_snapshot(
@@ -2223,6 +2305,104 @@ mod tests {
         )
         .expect("a legal terminal snapshot");
         FinalTaskInfo::try_new(identity, status, operators, false).expect("a matching final info")
+    }
+
+    /// The task protocol's own carrier produces the same runtime-filter
+    /// profile the lifecycle carrier produced.
+    ///
+    /// The defect this catches: the `RuntimeFilterApply` line has exactly one
+    /// producer, and its only input used to be a lifecycle terminal report. On
+    /// the task protocol nothing reached it, so the line silently stopped
+    /// existing -- `Option::None` renders as no line at all, not as an error.
+    /// This drives the task-protocol entry point and then asks this
+    /// frontend's own reader for the rendered line.
+    #[test]
+    fn a_release_carried_contribution_produces_the_runtime_filter_apply_line() {
+        let execution_id =
+            QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
+                .expect("execution id");
+        let telemetry = novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
+            runtime_filter_snapshot(1, 11, 6_000, 20)
+                .as_proto()
+                .profile_contribution
+                .clone()
+                .expect("the fixture snapshot carries a contribution"),
+        )
+        .expect("the fixture contribution is valid");
+
+        let mut builder = ProfileTerminalBuilder::new();
+        builder
+            .apply_runtime_filter_contribution(
+                execution_id,
+                test_backend_process_id_value(1),
+                &telemetry,
+            )
+            .expect("a release-carried contribution applies");
+
+        let trees = builder
+            .finish()
+            .into_profiles()
+            .into_iter()
+            .map(super::FragmentProfileTree::into_tree)
+            .collect::<Vec<_>>();
+        let apply = super::collect_native_runtime_filter_apply_from_profile_trees(&trees)
+            .expect("the carried contribution renders an apply line");
+        assert_eq!(
+            apply.to_string(),
+            "RuntimeFilterApply: input_rows=6000 output_rows=20"
+        );
+    }
+
+    /// An operator's carried counters land where this frontend's own readers
+    /// look for them.
+    ///
+    /// The defect this catches: a rebuilt task tree that keeps the rows and
+    /// the time and drops everything else. The producer stays correct, the
+    /// projection stays correct, the wire stays correct -- and every
+    /// name-keyed counter reader in `completion.rs` still reports zero,
+    /// because the names never made it into a tree. This drives the real
+    /// projection this frontend consumes and then asks this frontend's own
+    /// formatter, rather than asserting on the tree shape.
+    #[test]
+    fn an_operators_carried_counters_reach_this_frontends_counter_readers() {
+        use novarocks_execution::task_execution::status::OperatorCounter;
+
+        let mut builder = ProfileTerminalBuilder::new();
+        builder
+            .apply_task_operator_statistics(
+                &finished_task_info(
+                    2,
+                    4,
+                    vec![
+                        OperatorStatistics::new(
+                            3,
+                            SafeDetail::new("TypedConnectorScan").expect("detail"),
+                        )
+                        .with_rows(0, 6)
+                        .with_counters(vec![OperatorCounter::new(
+                            SafeDetail::new("TypedConnectorPageSourcesOpened").expect("detail"),
+                            2,
+                        )]),
+                    ],
+                ),
+                7,
+            )
+            .expect("task operator statistics");
+
+        let trees = builder
+            .finish()
+            .into_profiles()
+            .into_iter()
+            .map(super::FragmentProfileTree::into_tree)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            super::format_counter_sums_from_profile_trees(
+                &trees,
+                &["TypedConnectorPageSourcesOpened"],
+                "TypedConnectorMetrics",
+            ),
+            Some("TypedConnectorMetrics: TypedConnectorPageSourcesOpened=2".to_owned()),
+        );
     }
 
     /// On the task protocol a profile tree's root names a task, not a plan

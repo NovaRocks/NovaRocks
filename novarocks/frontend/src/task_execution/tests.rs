@@ -222,6 +222,41 @@ impl TaskOperationSink for RecordingSink {
 // Fixtures
 // ---------------------------------------------------------------------------
 
+/// One available runtime-filter contribution, shaped as a backend's release
+/// acknowledgement carries it.
+fn fixture_runtime_filter_contribution()
+-> novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry {
+    use novarocks_proto_models::novarocks as wire;
+    novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
+        wire::QueryTerminalProfileContributionTelemetry {
+            telemetry: Some(
+                wire::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                    wire::QueryTerminalProfileContributionV1 {
+                        version: novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+                        channels: vec![wire::QueryTerminalRuntimeFilterChannelV1 {
+                            channel_binding_id: 1,
+                            channel_id: 7,
+                            install_state:
+                                wire::QueryTerminalRuntimeFilterChannelInstallStateV1::Installed
+                                    as i32,
+                            terminal_state:
+                                wire::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed
+                                    as i32,
+                            latest_published_logical_version: Some(3),
+                            published_count: 1,
+                            completed_count: 1,
+                            unavailable_count: 0,
+                            cancelled_count: 0,
+                        }],
+                        ..Default::default()
+                    },
+                ),
+            ),
+        },
+    )
+    .expect("the fixture contribution satisfies the terminal contract")
+}
+
 fn execution_id() -> QueryExecutionId {
     QueryExecutionId::new(
         QueryId::new(0x1234, 0x5678),
@@ -1341,6 +1376,9 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
         AckPayload::Release {
             receipt: QueryContextReceipt::new(context, QueryContextState::Active),
             outcome: ReleaseOutcome::NotReady,
+            // A backend that answers NOT_READY has sealed nothing: it is
+            // still draining, so there is no terminal observation to carry.
+            runtime_filter: Some(fixture_runtime_filter_contribution()),
         },
     );
     assert_eq!(
@@ -1348,6 +1386,11 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
             .on_release_ack(&not_ready)
             .expect("a not-ready answer settles"),
         ReleaseSettlement::NotReadyKeepRenewing
+    );
+    assert!(
+        owner.runtime_filter_contribution().is_none(),
+        "a backend that is still draining has sealed nothing, so a NOT_READY \
+         answer must not leave a terminal observation behind"
     );
     assert!(
         owner.must_keep_renewing(),
@@ -1373,11 +1416,25 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
             AckPayload::Release {
                 receipt: QueryContextReceipt::new(context, QueryContextState::TerminalRetained),
                 outcome: ReleaseOutcome::Released,
+                runtime_filter: Some(fixture_runtime_filter_contribution()),
             },
         ))
         .expect("a released answer settles");
     assert!(!owner.must_keep_renewing());
     assert!(owner.is_released());
+    // The defect this catches: a settle that reads the release outcome and
+    // drops the rest of the payload. The acknowledgement is the only message
+    // that carries this backend's terminal runtime-filter observation, so a
+    // settle that discards it makes every downstream convergence fact absent
+    // while every part of the carrier stays individually correct.
+    assert!(
+        owner
+            .runtime_filter_contribution()
+            .expect("a released answer carries the backend's observation")
+            .available()
+            .is_some(),
+        "the retained contribution must be the available one the backend sent"
+    );
 }
 
 #[test]

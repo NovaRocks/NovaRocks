@@ -12,6 +12,7 @@ pub(crate) mod observation;
 pub(crate) mod participant;
 pub(crate) mod reliable_transport;
 pub(crate) mod rpc;
+pub(crate) mod terminal_contribution;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod transport;

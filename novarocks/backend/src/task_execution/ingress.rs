@@ -184,9 +184,17 @@ impl RegistryTaskExecutionIngress {
             }
             DecodedOperation::ReleaseQueryContext(request) => {
                 let receipt = self.registry.release_query_context(request);
+                // Read after the release settled: the completion pass inside
+                // it is what hands the shared facts back to the host and seals
+                // this evidence.
+                let evidence = self.registry.released_context_evidence(request.context());
                 encode_item(&receipt, |ack| {
-                    let mut encoded =
-                        encode_release_ack(ack.context(), ack.release(), ack.state())?;
+                    let mut encoded = encode_release_ack(
+                        ack.context(),
+                        ack.release(),
+                        ack.state(),
+                        evidence.runtime_filter(),
+                    )?;
                     encoded.termination_cause =
                         ack.termination_cause().map(encode_abort_cause_field);
                     Some(ReceiptAck::ReleaseQueryContext(encoded))
@@ -459,7 +467,8 @@ mod tests {
 
     use super::super::clock::{BackendMonotonicClock, ManualClock};
     use super::super::host::{
-        HostRejection, QueryContextHost, RunnableTask, SharedFactsRequest, TaskExecutionHost,
+        HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
+        TaskExecutionHost,
     };
     use super::super::registry::TaskExecutionRegistryConfig;
     use super::super::status::TaskStatusReporter;
@@ -474,7 +483,9 @@ mod tests {
             Ok(())
         }
 
-        fn release(&self, _context: QueryContextRef) {}
+        fn release(&self, _context: QueryContextRef) -> ReleasedContextEvidence {
+            ReleasedContextEvidence::none()
+        }
 
         fn advance_shared_domain(
             &self,

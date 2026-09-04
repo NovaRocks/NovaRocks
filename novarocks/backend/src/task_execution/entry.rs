@@ -41,7 +41,7 @@ use novarocks_execution::task_execution::status::{
 use novarocks_execution::task_execution::transition::{QueryContextState, TerminationLatch};
 
 use super::domains::{InitialDomainKey, TaskDomains};
-use super::host::RunnableTask;
+use super::host::{ReleasedContextEvidence, RunnableTask};
 use super::observation::TaskStatusSource;
 use super::status::TaskStatusOwner;
 
@@ -246,6 +246,14 @@ pub(super) struct ContextEntry {
     /// Set once the shared facts have been handed back to the host, so a
     /// rollback and a normal release cannot both release them.
     pub(super) facts_released: bool,
+    /// What the host's tear-down sealed when it took the shared facts back.
+    ///
+    /// Retained on the entry rather than reported from the tear-down call
+    /// itself because the two are not on the same stack: the host is released
+    /// by the completion pass, and the release acknowledgement that reports
+    /// this is encoded afterwards from the retired entry. It lives exactly as
+    /// long as the retained context record.
+    pub(super) released_evidence: ReleasedContextEvidence,
 }
 
 impl ContextEntry {
@@ -266,6 +274,7 @@ impl ContextEntry {
             terminating_since: None,
             last_retire_revision: None,
             facts_released: false,
+            released_evidence: ReleasedContextEvidence::none(),
         }
     }
 

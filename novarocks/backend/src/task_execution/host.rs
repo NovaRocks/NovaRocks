@@ -38,6 +38,7 @@ use novarocks_execution::task_execution::operation::{
 use novarocks_execution::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory,
 };
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 
 use super::status::TaskStatusReporter;
 
@@ -148,12 +149,50 @@ impl<'a> SharedFactsRequest<'a> {
 /// lock and already racing the sequence-zero lease. Whatever it installs must
 /// be undone by `release`, because an establish that loses that race rolls
 /// back rather than reaching `Active` late.
+/// What a query context's tear-down sealed, for the release that reports it.
+///
+/// A release that installed no participant carries `None`. That is a
+/// different statement from an empty contribution, and the two must not be
+/// collapsed: the frontend distinguishes "this query had no runtime filter on
+/// this backend" from "this backend observed no runtime-filter activity".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReleasedContextEvidence {
+    runtime_filter: Option<QueryTerminalProfileContributionTelemetry>,
+}
+
+impl ReleasedContextEvidence {
+    /// Evidence from a tear-down that found no participant to seal.
+    pub const fn none() -> Self {
+        Self {
+            runtime_filter: None,
+        }
+    }
+
+    pub const fn with_runtime_filter(
+        runtime_filter: QueryTerminalProfileContributionTelemetry,
+    ) -> Self {
+        Self {
+            runtime_filter: Some(runtime_filter),
+        }
+    }
+
+    pub const fn runtime_filter(&self) -> Option<&QueryTerminalProfileContributionTelemetry> {
+        self.runtime_filter.as_ref()
+    }
+}
+
 pub trait QueryContextHost: Send + Sync {
     fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection>;
 
     /// Undoes everything `materialize` installed. Called for a rollback and
     /// for a normal release, so it must be idempotent.
-    fn release(&self, context: QueryContextRef);
+    ///
+    /// Returns the terminal evidence the tear-down sealed. A release is the
+    /// only point at which the runtime-filter observation is a complete fact
+    /// -- every local task is a terminal record and nothing further will be
+    /// observed -- so the seal happens here and its result is handed back
+    /// rather than left inside the host for a later reader to go looking for.
+    fn release(&self, context: QueryContextRef) -> ReleasedContextEvidence;
 
     /// Applies a shared-domain advance the owner already classified as
     /// applicable.

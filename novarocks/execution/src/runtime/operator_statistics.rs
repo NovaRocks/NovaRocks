@@ -28,8 +28,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::runtime::profile::{ProfileNode, RuntimeProfileTree};
-use crate::task_execution::status::{OperatorStatistics, SafeDetail};
+use crate::runtime::profile::{ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree};
+use crate::task_execution::status::{OperatorCounter, OperatorStatistics, SafeDetail};
 
 /// The child profile that carries every operator's shared counters.
 ///
@@ -50,6 +50,12 @@ const OUTPUT_ROWS_COUNTER: &str = "PullRowNum";
 /// This is the only per-operator time the pipeline records, and it is the one
 /// the frontend's profile reader already treats as the operator's time.
 const WALL_TIME_COUNTER: &str = "OperatorTotalTime";
+
+/// The three counters that already have their own projected field.
+///
+/// Named once so the open counter set cannot report them a second time under
+/// a different merge rule.
+const PROJECTED_COUNTERS: &[&str] = &[INPUT_ROWS_COUNTER, OUTPUT_ROWS_COUNTER, WALL_TIME_COUNTER];
 
 /// Operator statistics projected from one profile tree, with what the tree
 /// could not attribute.
@@ -121,9 +127,65 @@ struct MergedOperator {
     input_rows: Option<u64>,
     output_rows: Option<u64>,
     wall_time_nanos: Option<u64>,
+    /// Every other counter this operator's own subtree carried, summed by
+    /// name across parallel drivers.
+    ///
+    /// A `BTreeMap` so the projection is ordered: two backends running the
+    /// same plan publish the same counters in the same order, which is what
+    /// makes a rendered profile comparable between runs.
+    counters: BTreeMap<String, i64>,
 }
 
 impl MergedOperator {
+    /// Sums the counting counters an operator's own subtree carries, including
+    /// the ones in `CommonMetrics` that the three projected fields do not
+    /// take.
+    ///
+    /// Only counters the producer declared as counts are carried. Parallel
+    /// drivers each run their own copy of the operator over a disjoint slice
+    /// of the input, so their counts add up -- but their *times* and *sizes*
+    /// do not: those drivers run concurrently, and the honest merge is a
+    /// maximum, an average, or a distribution depending on the counter. Every
+    /// such counter that matters gets its own projected field with its own
+    /// stated merge, the way `OperatorTotalTime` does; folding them in here
+    /// under one rule would invent a number no driver observed.
+    ///
+    /// Bounded by the traversal itself: it stops at the next operator node, so
+    /// a parent operator never absorbs a child operator's counters.
+    fn absorb_subtree_counters(&mut self, node: &ProfileNode) {
+        for child in &node.children {
+            if child.name == COMMON_METRICS {
+                // `absorb` already took this child, including its extras.
+                // Taking it again here would double every count in it.
+                continue;
+            }
+            if child
+                .children
+                .iter()
+                .any(|grandchild| grandchild.name == COMMON_METRICS)
+            {
+                // A nested operator. Its counters are its own entry's.
+                continue;
+            }
+            for counter in &child.counters {
+                self.absorb_counting_counter(counter);
+            }
+            self.absorb_subtree_counters(child);
+        }
+    }
+
+    /// Absorbs one counter if it is a count this projection can merge.
+    fn absorb_counting_counter(&mut self, counter: &ProfileCounter) {
+        if PROJECTED_COUNTERS.contains(&counter.name.as_str()) {
+            return;
+        }
+        if !matches!(counter.unit, ProfileUnit::Unit | ProfileUnit::None) {
+            return;
+        }
+        let total = self.counters.entry(counter.name.clone()).or_default();
+        *total = total.saturating_add(counter.value);
+    }
+
     fn absorb(&mut self, common: &ProfileNode) {
         // Parallel drivers each run their own copy of the operator over a
         // disjoint slice of the input, so their row counts add up.
@@ -141,6 +203,12 @@ impl MergedOperator {
             &mut self.wall_time_nanos,
             counter_max(common, WALL_TIME_COUNTER),
         );
+        // Everything else `CommonMetrics` carries. A scan's conjunct rows live
+        // here beside the three projected counters, and dropping them made
+        // every reader of those names report zero.
+        for counter in &common.counters {
+            self.absorb_counting_counter(counter);
+        }
     }
 
     fn finish(self, key: OperatorKey) -> OperatorStatistics {
@@ -159,6 +227,14 @@ impl MergedOperator {
         }
         if let Some(nanos) = self.wall_time_nanos {
             statistics = statistics.with_wall_time(Duration::from_nanos(nanos));
+        }
+        if !self.counters.is_empty() {
+            statistics = statistics.with_counters(
+                self.counters
+                    .into_iter()
+                    .map(|(name, value)| OperatorCounter::new(SafeDetail::truncating(&name), value))
+                    .collect(),
+            );
         }
         statistics
     }
@@ -180,7 +256,14 @@ fn visit(
                     plan_node_id,
                     operator: operator_label(&node.name),
                 };
-                merged.entry(key).or_default().absorb(common);
+                let entry = merged.entry(key).or_default();
+                entry.absorb(common);
+                // The operator node's own counters, then the private structure
+                // beneath it.
+                for counter in &node.counters {
+                    entry.absorb_counting_counter(counter);
+                }
+                entry.absorb_subtree_counters(node);
             }
             // Refused rather than folded: no neighbouring plan node owns this
             // operator's rows, and reporting it under node zero would invent a
@@ -323,6 +406,83 @@ mod tests {
         assert_eq!(entries[0].input_rows(), Some(0));
         assert_eq!(entries[0].output_rows(), Some(500));
         assert_eq!(entries[0].wall_time(), Some(Duration::from_nanos(7_000)));
+    }
+
+    /// An operator's own counters reach the projection, from both halves of
+    /// the shape `OperatorProfiles` builds.
+    ///
+    /// The defect this catches: a projection that keeps only the three row and
+    /// time counters. Every producer of a diagnostic counter stays correct and
+    /// its own tests keep passing; the counter simply stops existing after the
+    /// projection, and every frontend reader of its name then reports zero --
+    /// which reads as "it did not happen" rather than "it was not carried".
+    /// `TypedConnectorPageSourcesOpened` lives under `UniqueMetrics` and the
+    /// scan's conjunct rows live in `CommonMetrics` beside the projected
+    /// three, so both halves are asserted here.
+    #[test]
+    fn an_operators_own_counters_survive_the_projection() {
+        let fragment = RuntimeProfile::new("execute_fragment_native (plan_node_id=3)");
+        let driver = fragment
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        let operator = driver.child("TypedConnectorScan (plan_node_id=2)");
+        let common = operator.child(super::COMMON_METRICS);
+        common.counter_set(OUTPUT_ROWS_COUNTER, ProfileUnit::Unit, 500);
+        common.counter_set("ScanConjunctInputRows", ProfileUnit::Unit, 6_000);
+        common.counter_set("ScanConjunctOutputRows", ProfileUnit::Unit, 500);
+        let unique = operator.child("UniqueMetrics");
+        unique.counter_set("TypedConnectorPageSourcesOpened", ProfileUnit::Unit, 2);
+
+        let projection = project_operator_statistics(&fragment.to_native_tree());
+        let entries = projection.statistics();
+        assert_eq!(entries.len(), 1);
+        let carried = entries[0]
+            .counters()
+            .iter()
+            .map(|counter| (counter.name().as_str().to_owned(), counter.value()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            carried.get("TypedConnectorPageSourcesOpened").copied(),
+            Some(2)
+        );
+        assert_eq!(carried.get("ScanConjunctInputRows").copied(), Some(6_000));
+        assert_eq!(carried.get("ScanConjunctOutputRows").copied(), Some(500));
+        // The three projected counters have their own fields and must not be
+        // reported a second time under a different merge rule.
+        assert!(
+            !carried.contains_key(OUTPUT_ROWS_COUNTER),
+            "a projected counter must not also appear in the open set: {carried:?}"
+        );
+        assert!(!entries[0].counters_truncated());
+    }
+
+    /// A time or size counter has no cross-driver sum, so it is not carried by
+    /// the open counter set.
+    ///
+    /// Parallel drivers run concurrently; adding their elapsed times or peak
+    /// reservations would report a number no driver observed. Each such
+    /// counter needs its own projected field with its own stated merge, the way
+    /// `OperatorTotalTime` has.
+    #[test]
+    fn time_and_size_counters_are_not_folded_into_the_open_counter_set() {
+        let fragment = RuntimeProfile::new("execute_fragment_native (plan_node_id=3)");
+        let driver = fragment
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        let operator = driver.child("HASH_JOIN (id=2)");
+        let common = operator.child(super::COMMON_METRICS);
+        common.counter_set(OUTPUT_ROWS_COUNTER, ProfileUnit::Unit, 1);
+        common.counter_set("BuildHashTableTime", ProfileUnit::TimeNs, 4_000);
+        common.counter_set("OperatorPeakMemoryUsage", ProfileUnit::Bytes, 8_192);
+
+        let projection = project_operator_statistics(&fragment.to_native_tree());
+        let entries = projection.statistics();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].counters().is_empty(),
+            "only counts are carried: {:?}",
+            entries[0].counters()
+        );
     }
 
     /// Catches a producer that treats a missing counter as zero. An operator

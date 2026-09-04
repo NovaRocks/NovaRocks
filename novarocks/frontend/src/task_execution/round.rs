@@ -39,9 +39,7 @@ use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
 use super::intent::OperationAcknowledgement;
 use super::remote_task::RemoteTaskState;
-use crate::native::task_transport::{
-    SubscriptionState, TaskAckIntake, TaskStatusSubscriber,
-};
+use crate::native::task_transport::{SubscriptionState, TaskAckIntake, TaskStatusSubscriber};
 
 /// Something that must see every acknowledgement this runner settles.
 ///

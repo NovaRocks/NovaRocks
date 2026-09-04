@@ -23,9 +23,10 @@ use novarocks_execution::task_execution::domain::DomainVersion;
 use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::status::{
     AbortCause, CancelReason, DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS,
-    FinalTaskInfo, OperatorStatistics, SAFE_DETAIL_MAX_BYTES, SafeDetail, TaskFailure,
-    TaskFailureCategory, TaskOutputFacts, TaskResourceFacts, TaskState, TaskStatus,
-    TaskStatusCursor, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
+    FinalTaskInfo, OPERATOR_COUNTER_BUDGET, OperatorCounter, OperatorStatistics,
+    SAFE_DETAIL_MAX_BYTES, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
+    TaskResourceFacts, TaskState, TaskStatus, TaskStatusCursor, TaskStatusVersion, TaskWriterFacts,
+    TerminationDetail,
 };
 use novarocks_proto_models::novarocks;
 
@@ -409,6 +410,28 @@ pub fn decode_final_task_info(
         if let Some(millis) = entry.wall_time_millis {
             stats = stats.with_wall_time(Duration::from_millis(millis));
         }
+        if entry.counters.len() > OPERATOR_COUNTER_BUDGET {
+            return Err(out_of_range(
+                entry_path.field("counters"),
+                "operator counter count exceeds the hard limit",
+            ));
+        }
+        if !entry.counters.is_empty() {
+            let mut counters = Vec::with_capacity(entry.counters.len());
+            for (counter_index, counter) in entry.counters.iter().enumerate() {
+                let counter_path = entry_path.clone().field("counters").index(counter_index);
+                let name = decode_safe_detail(&counter.name, counter_path.field("name"))?;
+                counters.push(OperatorCounter::new(name, counter.value));
+            }
+            stats = stats.with_counters(counters);
+        }
+        // Preserved rather than recomputed: the producer is the only owner
+        // that knows whether its subtree had more counters than fitted, and a
+        // set that arrives exactly at the budget is indistinguishable from one
+        // that was cut to it.
+        if entry.counters_truncated {
+            stats = stats.with_counters_truncated();
+        }
         statistics.push(stats);
     }
     FinalTaskInfo::try_new(
@@ -432,6 +455,15 @@ pub fn encode_final_task_info(value: &FinalTaskInfo) -> novarocks::FinalTaskInfo
                 input_rows: entry.input_rows(),
                 output_rows: entry.output_rows(),
                 wall_time_millis: entry.wall_time().map(|value| value.as_millis() as u64),
+                counters: entry
+                    .counters()
+                    .iter()
+                    .map(|counter| novarocks::TaskOperatorCounter {
+                        name: counter.name().as_str().to_owned(),
+                        value: counter.value(),
+                    })
+                    .collect(),
+                counters_truncated: entry.counters_truncated(),
             })
             .collect(),
         operator_statistics_truncated: value.operator_statistics_truncated(),

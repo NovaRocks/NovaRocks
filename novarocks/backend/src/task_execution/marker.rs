@@ -41,6 +41,7 @@ use novarocks_execution::task_execution::lease::LeaseSequence;
 use novarocks_execution::task_execution::operation::{OperationOutcome, ReleaseOutcome};
 use novarocks_execution::task_execution::status::{TaskState, TerminationDetail};
 
+use super::host::ReleasedContextEvidence;
 use super::receipt::{CreateTaskOutcome, QueryContextOutcome, ReleaseQueryContextOutcome};
 
 /// Whether this process emits task-protocol operation evidence.
@@ -55,9 +56,15 @@ fn enabled() -> bool {
 /// One context-scoped line. The backend process id is part of the identity so
 /// a per-backend count still means something when logs are merged.
 fn emit_context(name: &str, context: QueryContextRef) {
+    emit_context_with(name, context, "");
+}
+
+/// One context-scoped line with extra `key=value` words appended.
+fn emit_context_with(name: &str, context: QueryContextRef, extra: &str) {
     let execution = context.query_execution_id();
+    let separator = if extra.is_empty() { "" } else { " " };
     println!(
-        "{name} execution_id={}:{}:{} frontend={} backend={}",
+        "{name} execution_id={}:{}:{} frontend={} backend={}{separator}{extra}",
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -152,6 +159,7 @@ pub(super) fn create_task(identity: TaskIdentity, receipt: &CreateTaskOutcome) {
 pub(super) fn release_query_context(
     context: QueryContextRef,
     receipt: &ReleaseQueryContextOutcome,
+    evidence: &ReleasedContextEvidence,
 ) {
     if !enabled() || receipt.outcome() != OperationOutcome::Accepted {
         return;
@@ -159,7 +167,21 @@ pub(super) fn release_query_context(
     if receipt.acknowledgement().map(|ack| ack.release()) != Some(ReleaseOutcome::Released) {
         return;
     }
-    emit_context("NOVAROCKS_TASK_RELEASE_APPLIED", context);
+    // The runtime-filter word is the observable supply point of the seal this
+    // release performs. A cluster run can otherwise only see that a release
+    // happened, not whether it carried the observation the frontend's whole
+    // runtime-filter convergence evidence depends on -- and an unsupplied seal
+    // looks exactly like a query that ran no runtime filter.
+    let runtime_filter = match evidence.runtime_filter() {
+        None => "absent",
+        Some(telemetry) if telemetry.available().is_some() => "available",
+        Some(_) => "unavailable",
+    };
+    emit_context_with(
+        "NOVAROCKS_TASK_RELEASE_APPLIED",
+        context,
+        &format!("runtime_filter={runtime_filter}"),
+    );
 }
 
 /// One context whose query execution lease ran out.

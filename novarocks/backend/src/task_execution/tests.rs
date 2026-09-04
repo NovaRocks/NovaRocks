@@ -57,7 +57,8 @@ use novarocks_types::identity::{
 
 use super::clock::ManualClock;
 use super::host::{
-    HostRejection, QueryContextHost, RunnableTask, SharedFactsRequest, TaskExecutionHost,
+    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
+    TaskExecutionHost,
 };
 use super::observation::{CursorObservation, TaskStatusEvent, TaskStatusSource};
 use super::receipt::OperationReceipt;
@@ -271,6 +272,45 @@ impl FakeContextHost {
     }
 }
 
+/// One available runtime-filter contribution, standing in for what the real
+/// query context host seals at release.
+///
+/// A single completed channel is enough: these cases are about the registry
+/// retaining and reporting whatever the host handed back, and a host that
+/// always returned nothing would let that hop pass while carrying nothing.
+fn fixture_runtime_filter_contribution()
+-> novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry {
+    use novarocks_proto_models::novarocks as wire;
+    novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
+        wire::QueryTerminalProfileContributionTelemetry {
+            telemetry: Some(
+                wire::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                    wire::QueryTerminalProfileContributionV1 {
+                        version: novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+                        channels: vec![wire::QueryTerminalRuntimeFilterChannelV1 {
+                            channel_binding_id: 1,
+                            channel_id: 7,
+                            install_state:
+                                wire::QueryTerminalRuntimeFilterChannelInstallStateV1::Installed
+                                    as i32,
+                            terminal_state:
+                                wire::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed
+                                    as i32,
+                            latest_published_logical_version: Some(3),
+                            published_count: 1,
+                            completed_count: 1,
+                            unavailable_count: 0,
+                            cancelled_count: 0,
+                        }],
+                        ..Default::default()
+                    },
+                ),
+            ),
+        },
+    )
+    .expect("the fixture contribution satisfies the terminal contract")
+}
+
 impl QueryContextHost for FakeContextHost {
     fn materialize(&self, _request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
         let advance = *self
@@ -292,8 +332,13 @@ impl QueryContextHost for FakeContextHost {
         Ok(())
     }
 
-    fn release(&self, _context: QueryContextRef) {
+    fn release(&self, _context: QueryContextRef) -> ReleasedContextEvidence {
         self.ledger.facts_released.fetch_add(1, Ordering::SeqCst);
+        // A stand-in for what the real host seals. The registry's job is to
+        // retain whatever the host handed back and report it on the release
+        // acknowledgement, and a host that always returned nothing would let
+        // that hop pass while carrying nothing.
+        ReleasedContextEvidence::with_runtime_filter(fixture_runtime_filter_contribution())
     }
 
     fn advance_shared_domain(
@@ -1370,6 +1415,46 @@ fn abort_then_release_reports_the_abort() {
     assert_eq!(ack.release(), ReleaseOutcome::AlreadyTerminal);
     assert_eq!(ack.termination_cause(), Some(AbortCause::QueryFailed));
     assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 1);
+}
+
+/// The registry retains what the host sealed and reports it on the release.
+///
+/// The defect this catches: a release that hands the shared facts back and
+/// discards the evidence the host produced. The host's seal stays correct and
+/// its own test keeps passing; the acknowledgement simply carries nothing, and
+/// the frontend has no runtime-filter evidence for the query at all.
+#[test]
+fn a_release_reports_the_evidence_the_host_sealed() {
+    let fixture = Fixture::new();
+    let context = fixture.establish(1);
+
+    assert!(
+        fixture
+            .registry
+            .released_context_evidence(context)
+            .runtime_filter()
+            .is_none(),
+        "an active context has sealed nothing"
+    );
+
+    let release = fixture
+        .registry
+        .release_query_context(&ReleaseQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    assert_eq!(release.outcome(), OperationOutcome::Accepted);
+    assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 1);
+    assert!(
+        fixture
+            .registry
+            .released_context_evidence(context)
+            .runtime_filter()
+            .expect("the release reports what the host sealed")
+            .available()
+            .is_some(),
+        "the retained evidence must be the contribution the host handed back"
+    );
 }
 
 #[test]

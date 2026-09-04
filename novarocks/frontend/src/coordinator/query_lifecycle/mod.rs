@@ -17,6 +17,7 @@
 
 mod barrier;
 mod lease;
+pub(super) use lease::FrontendLifecycleMetrics;
 mod manifest;
 
 #[cfg(test)]

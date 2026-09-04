@@ -348,8 +348,10 @@ fn decode_ack(
             proto::task_operation_receipt::Ack::ReleaseQueryContext(ack),
             AckAddress::Context(context),
         ) => {
-            let (acked, outcome, state, cause) =
+            let decoded =
                 codec::decode_release_ack(ack, path()).map_err(|error| error.to_string())?;
+            let acked = decoded.context;
+            let cause = decoded.termination_cause;
             if acked != context {
                 return Err(
                     "a release acknowledgement names a different context than the request"
@@ -365,8 +367,9 @@ fn decode_ack(
                 );
             }
             Ok(AckPayload::Release {
-                receipt: QueryContextReceipt::new(acked, state),
-                outcome,
+                receipt: QueryContextReceipt::new(acked, decoded.state),
+                outcome: decoded.outcome,
+                runtime_filter: decoded.runtime_filter,
             })
         }
         (kind, _, _) => Err(format!(

@@ -69,8 +69,8 @@ pub use execution_host::{
     TaskQueryContextFacts,
 };
 pub use host::{
-    HostRejection, QueryContextHost, RunnableTask, SharedFactsRequest, TaskDynamicFilterRead,
-    TaskExecutionHost,
+    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
+    TaskDynamicFilterRead, TaskExecutionHost,
 };
 pub(crate) use ingress::RegistryTaskExecutionIngress;
 pub use observation::{

@@ -66,7 +66,9 @@ pub use context_owner::{
 pub use credential::{CredentialRefreshOwner, RefreshRefusal, RefreshTiming, refresh_timing};
 pub use dispatch::{ExpiredOperation, OperationDispatcher};
 pub use error::{CapacityBound, TaskExecutionError};
-pub use execution::{PumpReport, QueryTaskExecution, StatusReport};
+pub use execution::{
+    PumpReport, QueryTaskExecution, ReleasedRuntimeFilterContributions, StatusReport,
+};
 pub use graph::{
     FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, build_task_graph,
 };

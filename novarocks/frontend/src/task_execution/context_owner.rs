@@ -36,6 +36,8 @@ use novarocks_execution::task_execution::{
     RenewSchedule, TaskOperationId, UpdateQueryContext, classify_context_transition,
 };
 
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
+
 use super::error::TaskExecutionError;
 use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
 
@@ -128,6 +130,14 @@ pub struct QueryContextOwner {
     released: bool,
     abort: Option<AbortQueryContext>,
     progress: u64,
+    /// The sealed runtime-filter observation this backend reported on the
+    /// release that took its shared facts down.
+    ///
+    /// This owner is the only frontend holder of it: the release
+    /// acknowledgement is the only message that carries it, and it is settled
+    /// here. `None` after a release means the backend installed no
+    /// participant for this query.
+    runtime_filter_contribution: Option<QueryTerminalProfileContributionTelemetry>,
 }
 
 impl QueryContextOwner {
@@ -153,6 +163,7 @@ impl QueryContextOwner {
             released: false,
             abort: None,
             progress: 0,
+            runtime_filter_contribution: None,
         }
     }
 
@@ -170,6 +181,19 @@ impl QueryContextOwner {
 
     pub const fn renew_schedule(&self) -> Option<RenewSchedule> {
         self.renew_schedule
+    }
+
+    /// The sealed runtime-filter observation this backend reported, once its
+    /// release settled.
+    ///
+    /// Read by the attempt after the drain: it is the only production reader
+    /// of the release acknowledgement's contribution, and a query whose
+    /// backends never released has nothing here rather than an empty
+    /// contribution.
+    pub const fn runtime_filter_contribution(
+        &self,
+    ) -> Option<&QueryTerminalProfileContributionTelemetry> {
+        self.runtime_filter_contribution.as_ref()
     }
 
     pub const fn is_released(&self) -> bool {
@@ -459,10 +483,14 @@ impl QueryContextOwner {
         }
         self.release_in_flight = false;
         if ack.is_applied() {
-            let outcome = match ack.payload() {
-                AckPayload::Release { receipt, outcome } => {
+            let (outcome, runtime_filter) = match ack.payload() {
+                AckPayload::Release {
+                    receipt,
+                    outcome,
+                    runtime_filter,
+                } => {
                     self.context.verify_matches(receipt.context())?;
-                    *outcome
+                    (*outcome, runtime_filter.clone())
                 }
                 _ => {
                     return Err(TaskExecutionError::MissingReceipt(
@@ -474,6 +502,10 @@ impl QueryContextOwner {
                 ReleaseOutcome::Released | ReleaseOutcome::AlreadyTerminal => {
                     self.state = QueryContextState::TerminalRetained;
                     self.released = true;
+                    // Kept only on the answer that actually released the
+                    // shared facts. A `NOT_READY` answer sealed nothing, and
+                    // the identical request is resent.
+                    self.runtime_filter_contribution = runtime_filter;
                     ReleaseSettlement::Released
                 }
                 ReleaseOutcome::NotReady => {

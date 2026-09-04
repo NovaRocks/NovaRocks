@@ -32,6 +32,7 @@ use novarocks_execution::task_execution::{
     TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
     status::SafeDetail,
 };
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_types::identity::BackendProcessId;
 
 /// What one queued operation costs in queue bytes on top of its payload.
@@ -154,7 +155,11 @@ fn context_domain_bytes(domain: &QueryContextDomainUpdate) -> usize {
 }
 
 /// The receipt an acknowledgement carries.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Not `Eq`: a release carries the backend's sealed runtime-filter
+/// contribution, and the generated wire model of those counters is only
+/// `PartialEq`.
+#[derive(Clone, Debug, PartialEq)]
 pub enum AckPayload {
     /// The outcome carries no receipt, either because the operation kind has
     /// none or because it failed closed.
@@ -165,11 +170,17 @@ pub enum AckPayload {
     Release {
         receipt: QueryContextReceipt,
         outcome: ReleaseOutcome,
+        /// The releasing backend's sealed runtime-filter observation.
+        ///
+        /// `None` means this backend installed no participant for the query.
+        /// An unavailable variant means it held one and could not publish its
+        /// contribution; neither is an empty contribution.
+        runtime_filter: Option<QueryTerminalProfileContributionTelemetry>,
     },
 }
 
 /// One settled operation, as the transport reports it back.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OperationAcknowledgement {
     operation_id: TaskOperationId,
     kind: OperationKind,

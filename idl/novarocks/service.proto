@@ -1565,6 +1565,20 @@ message ReleaseQueryContextAck {
   ReleaseQueryContextOutcome outcome = 2;
   QueryContextState state = 3;
   optional QueryContextAbortCause termination_cause = 4;
+  // This backend's terminal runtime-filter observation for this query
+  // context, sealed by the release that took the participant down.
+  //
+  // The release is the only point at which this is a complete fact: it is the
+  // backend's own statement that every local task is a terminal record and
+  // nothing further will be observed. It is carried here rather than on a
+  // task's final info because the participant is the context's, not any one
+  // task's, and it is the same message the query terminal report carries so
+  // one shape of these facts exists on the wire.
+  //
+  // Absent means this release installed no participant to seal -- a release
+  // that found one and could not seal it reports the unavailable variant with
+  // its stage and code, never an empty contribution.
+  optional QueryTerminalProfileContributionTelemetry runtime_filter = 5;
 }
 
 // The receipt of exactly one operation from a batch.
@@ -1699,6 +1713,14 @@ message TaskStatusStreamEvent {
   }
 }
 
+// One named counter an operator's own profile subtree carried.
+//
+// The name is an engine constant, never anything a statement supplied.
+message TaskOperatorCounter {
+  string name = 1;  // <= 512 bytes
+  int64 value = 2;
+}
+
 // Bounded operator statistics of one final info entry.
 message TaskOperatorStatistics {
   int32 plan_node_id = 1;
@@ -1706,6 +1728,13 @@ message TaskOperatorStatistics {
   optional uint64 input_rows = 3;
   optional uint64 output_rows = 4;
   optional uint64 wall_time_millis = 5;
+  // Every counter the operator's subtree carried beyond the three above:
+  // a connector page source opened, a conjunct applied, a row group pruned.
+  // Rows and time are separate fields because every operator has them; this
+  // set is open, and an operator that reports nothing here reported nothing,
+  // which is a different fact from a counter that did not fit.
+  repeated TaskOperatorCounter counters = 6;  // <= 64
+  bool counters_truncated = 7;
 }
 
 // The bounded, redacted final observation of one terminal task. It is frozen

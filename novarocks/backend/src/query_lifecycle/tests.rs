@@ -47,7 +47,7 @@ use prost::Message;
 use super::entry::QueryLifecyclePhase;
 use super::registry::{
     MonotonicClock, QueryLifecycleLocalRuntime, QueryLifecycleMetricsSink, QueryLifecycleRegistry,
-    QueryLifecycleRegistryConfig, StageBuildDecision, capture_terminal_profile_contribution,
+    QueryLifecycleRegistryConfig, StageBuildDecision,
 };
 use super::{
     CatalogPruneOutcome, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
@@ -60,6 +60,7 @@ use crate::runtime_filter::observation::RuntimeFilterObservationSnapshot;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
 };
+use crate::runtime_filter::terminal_contribution::capture_terminal_profile_contribution;
 use novarocks_failpoint::QueryLifecycleFaultKind;
 
 const ATTEMPT_1: u64 = 1;

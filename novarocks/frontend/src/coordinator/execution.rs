@@ -61,6 +61,7 @@ use novarocks_types::{
     QueryIdAttribution, QueryProcessNamespace,
 };
 
+use super::query_lifecycle::FrontendLifecycleMetrics;
 use super::query_lifecycle::{
     FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, QueryLifecycleTransport,
 };
@@ -68,7 +69,10 @@ use super::query_lifecycle::{
 use super::query_lifecycle::{
     QueryControlSession, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
 };
-use super::query_registry::{FrontendQueryRegistry, QueryLifecycleConvergenceReader};
+use super::query_registry::{
+    FrontendQueryRegistry, QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot,
+    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
+};
 use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::split_assignment_round::{
@@ -88,6 +92,7 @@ use crate::native::task_transport::AttemptWireFacts;
 use crate::native::transport::{
     GrpcTaskUpdateTransport, new_fragment_dispatcher, new_query_lifecycle_transport,
 };
+use crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions;
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
@@ -95,6 +100,7 @@ use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 use crate::task_execution::completion::{WriteCompletionTracker, accept_final_info};
 use crate::task_execution::error::TaskExecutionError;
+use crate::task_execution::execution::ReleasedRuntimeFilterContributions;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::graph::TaskNode;
 use crate::task_execution::remote_task::RemoteTaskState;
@@ -2082,6 +2088,15 @@ impl FrontendDistributedQueryCoordinator {
             &mut final_task_info,
         );
 
+        // Read once the drain has ended: a release acknowledgement is the only
+        // message that carries a backend's sealed runtime-filter observation,
+        // and the drain is what waits for every one of them. Read before the
+        // intent match so the same set feeds the convergence evidence and the
+        // profile -- two reads could disagree, and they are the same fact.
+        let runtime_filter_contributions =
+            round.execution().released_runtime_filter_contributions();
+        self.publish_task_round_convergence(execution_id, &runtime_filter_contributions);
+
         // The split worker blocks on acknowledgements the drain above settles,
         // so joining it is safe only now that it has stopped. A worker still
         // waiting is woken with an unknown outcome, and the guard's own stop
@@ -2217,6 +2232,18 @@ impl FrontendDistributedQueryCoordinator {
                         })?;
                     builder.apply_task_operator_statistics(info, root_node_id)?;
                 }
+                // The runtime-filter half of the profile comes from the
+                // participants' own terminal observations, not from any task's
+                // operator statistics: the row effects a filter applies are
+                // folded by the query context's participant, and a task's
+                // projection never carried them.
+                for (process_id, telemetry) in runtime_filter_contributions.contributions() {
+                    builder.apply_runtime_filter_contribution(
+                        execution_id,
+                        *process_id,
+                        telemetry,
+                    )?;
+                }
                 builder.apply_split_assignment_profile(split_assignment_profile);
                 completion.profile(result, builder.finish())
             }
@@ -2248,6 +2275,59 @@ impl FrontendDistributedQueryCoordinator {
     /// marked as needing a topology observation, and the membership owner --
     /// not this failure's text -- decides whether an exact captured process
     /// was replaced. Nothing is latched in that case, because a replanned
+    /// Publishes this task-protocol attempt's immutable convergence evidence.
+    ///
+    /// Called once, after the drain, because that is the point at which every
+    /// participant's contribution is either in hand or will never arrive.
+    ///
+    /// What this attempt genuinely does not have is not invented here. The
+    /// task protocol produces no `ParticipantTerminalOutcome`: a task's
+    /// terminal is its own status, and there is no per-participant proof or
+    /// attestation to report -- so the outcome list is empty rather than
+    /// populated with proofs this protocol never minted. `error_source` and
+    /// `primary_error` are likewise absent: this path is reached only after
+    /// the attempt's answer is already linearized as a success, and a failed
+    /// attempt aborts its contexts instead of releasing them, so it has no
+    /// sealed contribution to publish at all.
+    ///
+    /// `metrics` carries the process-wide lifecycle counters, which is the
+    /// same set the lifecycle attempt publishes -- neither protocol keeps an
+    /// attempt-scoped copy of them.
+    fn publish_task_round_convergence(
+        &self,
+        execution_id: QueryExecutionId,
+        contributions: &ReleasedRuntimeFilterContributions,
+    ) {
+        // A context whose release never answered may still have observed
+        // runtime-filter activity this frontend has not seen, so the rollup is
+        // refused rather than summed over the backends that did answer.
+        let runtime_filter = if contributions.is_complete() {
+            RuntimeFilterTerminalRollupSnapshot::Available(rollup_from_release_contributions(
+                contributions.contributions(),
+            ))
+        } else {
+            RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+            )
+        };
+        tracing::debug!(
+            execution_id = ?execution_id,
+            contributions = contributions.contributions().len(),
+            contexts = contributions.contexts(),
+            complete = contributions.is_complete(),
+            "task protocol attempt published its runtime filter convergence evidence"
+        );
+        self.registry
+            .publish_task_round_convergence(QueryLifecycleConvergenceSnapshot {
+                execution_id,
+                error_source: None,
+                primary_error: None,
+                participant_outcomes: Vec::new(),
+                runtime_filter,
+                metrics: FrontendLifecycleMetrics::process_shared().snapshot(),
+            });
+    }
+
     /// round registers its own attempt and the failure belongs to the one
     /// being abandoned.
     fn fail_task_round(

@@ -45,8 +45,8 @@ use crate::task_execution::{
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
 use crate::task_execution::{
-    HostRejection, QueryContextHost, RunnableTask, SharedFactsRequest, TaskExecutionHost,
-    TaskStatusReporter,
+    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
+    TaskExecutionHost, TaskStatusReporter,
 };
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 #[cfg(test)]
@@ -350,7 +350,9 @@ impl QueryContextHost for UnroutedQueryContextHost {
         ))
     }
 
-    fn release(&self, _context: QueryContextRef) {}
+    fn release(&self, _context: QueryContextRef) -> ReleasedContextEvidence {
+        ReleasedContextEvidence::none()
+    }
 
     fn advance_shared_domain(
         &self,

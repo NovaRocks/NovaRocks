@@ -890,6 +890,39 @@ pub fn classify_gone(held: Option<&TaskStatus>) -> GoneObservation {
     }
 }
 
+/// One named counter an operator's own profile subtree carried.
+///
+/// The name is an engine constant, never anything a statement supplied, so
+/// this is a bounded diagnostic value rather than redacted content. The value
+/// is signed because the profile model's counters are.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperatorCounter {
+    name: SafeDetail,
+    value: i64,
+}
+
+impl OperatorCounter {
+    pub const fn new(name: SafeDetail, value: i64) -> Self {
+        Self { name, value }
+    }
+
+    pub const fn name(&self) -> &SafeDetail {
+        &self.name
+    }
+
+    pub const fn value(&self) -> i64 {
+        self.value
+    }
+}
+
+/// Largest number of named counters one operator entry may carry.
+///
+/// The three projected row and time counters are separate fields and do not
+/// count against this. The bound exists because a profile subtree's counter
+/// set is open: an operator that grows a new counter must not be able to grow
+/// this channel without a decision.
+pub const OPERATOR_COUNTER_BUDGET: usize = 64;
+
 /// Bounded operator statistics of one final task info entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperatorStatistics {
@@ -898,6 +931,21 @@ pub struct OperatorStatistics {
     input_rows: Option<u64>,
     output_rows: Option<u64>,
     wall_time: Option<Duration>,
+    /// Every other counter this operator's own profile subtree carried, up to
+    /// `OPERATOR_COUNTER_BUDGET`.
+    ///
+    /// Carried rather than dropped because an operator's diagnostic counters
+    /// are the operator's only statement about what it did beyond rows and
+    /// time: a connector page source opened, a conjunct applied, a row group
+    /// pruned. Dropping them made every reader of those names find nothing and
+    /// report zero, which reads as "it did not happen".
+    counters: Vec<OperatorCounter>,
+    /// Set when the subtree carried more than the budget allows.
+    ///
+    /// Explicit for the same reason the operator-entry truncation is: a
+    /// counter that did not fit and a counter that stayed at zero must not read
+    /// the same way.
+    counters_truncated: bool,
 }
 
 impl OperatorStatistics {
@@ -908,7 +956,18 @@ impl OperatorStatistics {
             input_rows: None,
             output_rows: None,
             wall_time: None,
+            counters: Vec::new(),
+            counters_truncated: false,
         }
+    }
+
+    /// Records the operator's remaining named counters, truncating at the
+    /// budget and saying so.
+    pub fn with_counters(mut self, counters: Vec<OperatorCounter>) -> Self {
+        self.counters_truncated = counters.len() > OPERATOR_COUNTER_BUDGET;
+        self.counters = counters;
+        self.counters.truncate(OPERATOR_COUNTER_BUDGET);
+        self
     }
 
     pub const fn with_rows(mut self, input: u64, output: u64) -> Self {
@@ -957,6 +1016,25 @@ impl OperatorStatistics {
 
     pub const fn wall_time(&self) -> Option<Duration> {
         self.wall_time
+    }
+
+    /// Marks the counter set as cut by the producer's own budget.
+    ///
+    /// Separate from `with_counters` because the decoder carries the
+    /// producer's statement across the wire rather than re-deriving it: a set
+    /// that arrives exactly at the budget cannot be told apart from one that
+    /// was cut to it.
+    pub const fn with_counters_truncated(mut self) -> Self {
+        self.counters_truncated = true;
+        self
+    }
+
+    pub fn counters(&self) -> &[OperatorCounter] {
+        &self.counters
+    }
+
+    pub const fn counters_truncated(&self) -> bool {
+        self.counters_truncated
     }
 }
 

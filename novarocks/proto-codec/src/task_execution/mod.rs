@@ -1876,13 +1876,81 @@ mod tests {
             ctx,
             ReleaseOutcome::AlreadyTerminal,
             QueryContextState::TerminalRetained,
+            None,
         )
         .expect("a terminally retained release encodes");
         release.termination_cause = Some(super::operation::encode_abort_cause_field(
             AbortCause::LeaseExpired,
         ));
-        let (acked, outcome, state, cause) =
-            decode_release_ack(&release, FieldPath::root("ack")).expect("decodes");
+        let decoded = decode_release_ack(&release, FieldPath::root("ack")).expect("decodes");
+        let (acked, outcome, state, cause) = (
+            decoded.context,
+            decoded.outcome,
+            decoded.state,
+            decoded.termination_cause,
+        );
+        assert!(
+            decoded.runtime_filter.is_none(),
+            "a release that sealed no participant carries no contribution"
+        );
+
+        // The release acknowledgement is the only message that carries a
+        // backend's terminal runtime-filter observation. A codec that dropped
+        // it would leave every part of the carrier correct and the frontend
+        // with nothing.
+        let sealed = crate::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
+            novarocks::QueryTerminalProfileContributionTelemetry {
+                telemetry: Some(
+                    novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                        novarocks::QueryTerminalProfileContributionV1 {
+                            version: crate::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+                            channels: vec![novarocks::QueryTerminalRuntimeFilterChannelV1 {
+                                channel_binding_id: 1,
+                                channel_id: 7,
+                                install_state:
+                                    novarocks::QueryTerminalRuntimeFilterChannelInstallStateV1::Installed
+                                        as i32,
+                                terminal_state:
+                                    novarocks::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed
+                                        as i32,
+                                latest_published_logical_version: Some(3),
+                                published_count: 1,
+                                completed_count: 1,
+                                unavailable_count: 0,
+                                cancelled_count: 0,
+                            }],
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            },
+        )
+        .expect("the sealed contribution satisfies the terminal contract");
+        let carried = encode_release_ack(
+            ctx,
+            ReleaseOutcome::Released,
+            QueryContextState::TerminalRetained,
+            Some(&sealed),
+        )
+        .expect("a release carrying a contribution encodes");
+        assert_eq!(
+            decode_release_ack(&carried, FieldPath::root("ack"))
+                .expect("decodes")
+                .runtime_filter
+                .expect("the contribution survives the round trip"),
+            sealed
+        );
+
+        // A contribution that does not satisfy the terminal contract is
+        // refused on the release that carried it, not discovered several hops
+        // later.
+        let mut malformed = carried.clone();
+        malformed.runtime_filter =
+            Some(novarocks::QueryTerminalProfileContributionTelemetry { telemetry: None });
+        assert!(
+            decode_release_ack(&malformed, FieldPath::root("ack")).is_err(),
+            "an empty telemetry oneof is neither available nor unavailable"
+        );
         assert_eq!(acked, ctx);
         assert_eq!(outcome, ReleaseOutcome::AlreadyTerminal);
         assert_eq!(state, QueryContextState::TerminalRetained);

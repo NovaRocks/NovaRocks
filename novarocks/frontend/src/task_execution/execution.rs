@@ -37,6 +37,9 @@ use novarocks_types::identity::{StageId, TaskId};
 
 use super::clock::TaskProtocolClock;
 use super::completion::{ReadCompletionTracker, ReadVerdict};
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
+use novarocks_types::identity::BackendProcessId;
+
 use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
 use super::dispatch::{ExpiredOperation, OperationDispatcher};
 use super::error::TaskExecutionError;
@@ -84,6 +87,37 @@ pub struct StatusReport {
     pub terminal: Vec<TaskTerminalReport>,
     /// The status transport must be resubscribed with the per-task cursors.
     pub resubscribe: bool,
+}
+
+/// The release-carried runtime-filter contributions of one attempt.
+///
+/// The observable supply point of this loop: `contributions().len()` against
+/// `contexts()` says whether the carrier is being fed at all. A query that ran
+/// runtime filters and reports zero contributions over three contexts is a
+/// carrier that is not wired, which no per-part test can show.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReleasedRuntimeFilterContributions {
+    contributions: Vec<(BackendProcessId, QueryTerminalProfileContributionTelemetry)>,
+    complete: bool,
+    contexts: usize,
+}
+
+impl ReleasedRuntimeFilterContributions {
+    pub fn contributions(
+        &self,
+    ) -> &[(BackendProcessId, QueryTerminalProfileContributionTelemetry)] {
+        &self.contributions
+    }
+
+    /// Whether every context this attempt placed has answered its release.
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// How many query contexts this attempt placed.
+    pub const fn contexts(&self) -> usize {
+        self.contexts
+    }
 }
 
 /// The task protocol of one query execution attempt.
@@ -193,6 +227,33 @@ impl QueryTaskExecution {
 
     pub fn owner(&self, context: QueryContextRef) -> Option<&QueryContextOwner> {
         self.owners.get(&context)
+    }
+
+    /// Every backend's sealed runtime-filter observation, as its release
+    /// reported it, with whether the set is complete.
+    ///
+    /// A context contributes an entry only if its release settled *and*
+    /// carried a contribution. The two reasons an entry is missing are not the
+    /// same fact and are not collapsed here: a context that released without
+    /// one installed no participant on that backend, which is an ordinary
+    /// query with no runtime filter there; a context that never released has
+    /// an answer still outstanding. `is_complete` is the second question, and
+    /// it is what stops an outstanding release from reading as an absent
+    /// filter.
+    pub fn released_runtime_filter_contributions(&self) -> ReleasedRuntimeFilterContributions {
+        ReleasedRuntimeFilterContributions {
+            contributions: self
+                .owners
+                .iter()
+                .filter_map(|(context, owner)| {
+                    owner
+                        .runtime_filter_contribution()
+                        .map(|telemetry| (context.backend_process_id(), telemetry.clone()))
+                })
+                .collect(),
+            complete: self.owners.values().all(QueryContextOwner::is_released),
+            contexts: self.owners.len(),
+        }
     }
 
     pub fn task(&self, task_id: TaskId) -> Option<&RemoteTask> {
