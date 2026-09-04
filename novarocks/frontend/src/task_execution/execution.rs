@@ -76,6 +76,17 @@ enum OperationTarget {
 pub struct PumpReport {
     pub batches: usize,
     pub operations: usize,
+    /// Operations the dispatcher dropped for outliving their queue residence
+    /// bound.
+    ///
+    /// Deliberately observational, and deliberately without a consumer that
+    /// decides anything. It reads like an unread verdict -- it is not: the
+    /// owner that minted the operation is still waiting for its outcome and
+    /// re-mints it on its own retry, so dropping the queued copy is what gives
+    /// that retry a clean slot. Failing the attempt here instead was measured
+    /// as `distributed-resilience` 16/16 -> 4/16, because an acknowledgement
+    /// deliberately dropped by a fault is exactly the case whose recovery is a
+    /// replay of a queued operation.
     pub expired: Vec<ExpiredOperation>,
 }
 

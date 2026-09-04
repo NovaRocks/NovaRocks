@@ -239,8 +239,4 @@ impl EdgeOpenTracker {
             .get(&edge_id)
             .map_or(&[], |producers| producers.as_slice())
     }
-
-    pub fn is_decided(&self, edge_id: ExchangeEdgeId) -> bool {
-        self.decided.contains(&edge_id)
-    }
 }

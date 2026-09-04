@@ -1778,6 +1778,13 @@ fn a_queued_byte_bound_fails_closed_instead_of_being_exceeded() {
     );
 }
 
+/// Not a defect: this expiry is observational on purpose.
+///
+/// Refusing here instead -- on the reasoning that a dropped queue entry is
+/// unrecoverable -- was measured as `distributed-resilience` 16/16 -> 4/16.
+/// The owner that minted the operation is still waiting for its outcome and
+/// re-mints it on its own retry, and a fault that deliberately drops an
+/// acknowledgement is exactly the case whose recovery is that replay.
 #[test]
 fn an_operation_that_outlives_the_queue_residence_bound_is_reported_not_sent_late() {
     let leaves = (0..64).map(|_| 0_usize).collect::<Vec<_>>();
@@ -1793,7 +1800,7 @@ fn an_operation_that_outlives_the_queue_residence_bound_is_reported_not_sent_lat
     let report = harness
         .execution
         .pump(&FakeEstablish)
-        .expect("pumping reports expiry");
+        .expect("an expired queue entry is reported, not a failure of the attempt");
     assert!(
         !report.expired.is_empty(),
         "a queue-resident operation is reported rather than sent late"

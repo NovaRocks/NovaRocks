@@ -47,12 +47,6 @@ pub enum DomainProgression {
     Conflict(DomainConflict),
 }
 
-impl DomainProgression {
-    pub const fn is_conflict(self) -> bool {
-        matches!(self, Self::Conflict(_))
-    }
-}
-
 /// Why a domain operation is a fatal protocol conflict.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DomainConflict {

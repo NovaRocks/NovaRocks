@@ -93,7 +93,6 @@ pub struct TaskNode {
     backend_idx: usize,
     fragment_instance_id: UniqueId,
     split_plan_nodes: Vec<PlanNodeId>,
-    is_root: bool,
 }
 
 impl TaskNode {
@@ -134,11 +133,6 @@ impl TaskNode {
     /// The plan nodes of this task that accept split assignments.
     pub fn split_plan_nodes(&self) -> &[PlanNodeId] {
         &self.split_plan_nodes
-    }
-
-    /// Whether this task produces the query's client-visible result.
-    pub const fn is_root(&self) -> bool {
-        self.is_root
     }
 }
 
@@ -455,7 +449,6 @@ pub fn build_task_graph(
                     backend_idx: placement.backend_idx,
                     fragment_instance_id: placement.finst_id,
                     split_plan_nodes,
-                    is_root: false,
                 },
             );
             stage_tasks.entry(stage_id).or_default().push(task_id);
@@ -470,11 +463,6 @@ pub fn build_task_graph(
                 inputs.root_fragment_id
             ))
         })?;
-    tasks
-        .get_mut(&root_task)
-        .expect("the root task was just minted")
-        .is_root = true;
-
     let sender_sets = build_sender_sets(&inputs, &stage_of_fragment, &task_of_instance)?;
     let (edges, outbound, inbound) = build_topologies(
         &inputs,
