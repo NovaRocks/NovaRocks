@@ -590,6 +590,14 @@ impl ProcessorOperator for TableWriterOperator {
         }
     }
 
+    fn has_passive_ready_work(&self) -> bool {
+        // This is the scheduler-safe subset of `has_output`: every consulted
+        // output, error, or completion fact is already resident in the
+        // composite writer or its in-process partial aggregate. It never
+        // starts provider work or waits for it.
+        self.has_output()
+    }
+
     fn push_chunk(&mut self, state: &RuntimeState, mut chunk: Chunk) -> Result<(), String> {
         let result = (|| {
             if !self.need_input() {

@@ -159,6 +159,18 @@ pub trait ProcessorOperator: Operator {
 
     fn has_output(&self) -> bool;
 
+    /// Returns a passive snapshot of retained output, terminal completion, or
+    /// an error that the driver can consume without starting new work.
+    ///
+    /// The event scheduler can call this outside a driver worker while it
+    /// discovers readiness observables. Implementations must therefore remain
+    /// non-blocking and must not start I/O, wait for dependencies, or advance
+    /// operator state. Processors that cannot become runnable off-worker while
+    /// exerting input backpressure should keep the default.
+    fn has_passive_ready_work(&self) -> bool {
+        false
+    }
+
     fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String>;
 
     fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String>;

@@ -774,17 +774,17 @@ impl PipelineDriver {
     fn internal_blocked_sink_observable(&self) -> Option<Arc<Observable>> {
         let end = self.operators.len().saturating_sub(1);
         for op in self.operators[..end].iter().rev() {
-            if op.is_finished() {
-                continue;
-            }
             let Some(processor) = op.as_processor_ref() else {
                 continue;
             };
-            // A processor with buffered output can make downstream progress
+            if op.is_finished() {
+                continue;
+            }
+            // A processor with passive ready work can make downstream progress
             // even when it cannot accept another input page. Treating it as
             // OutputFull would park on its input-capacity observable and lose
-            // a terminal-output transition that has already happened.
-            if processor.has_output() {
+            // an output, completion, or error transition that already happened.
+            if processor.has_passive_ready_work() {
                 return None;
             }
             if processor.need_input() {
@@ -814,7 +814,7 @@ impl PipelineDriver {
                     .operators
                     .get(edge)
                     .and_then(|operator| operator.as_processor_ref())
-                    .is_some_and(ProcessorOperator::has_output)
+                    .is_some_and(ProcessorOperator::has_passive_ready_work)
         })
     }
 
@@ -1697,6 +1697,50 @@ mod terminal_signal_tests {
         observable: Arc<Observable>,
     }
 
+    struct DriverPolledSource {
+        observable: Arc<Observable>,
+    }
+
+    impl Operator for DriverPolledSource {
+        fn name(&self) -> &str {
+            "DRIVER_POLLED_SOURCE"
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for DriverPolledSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            panic!("active source polling must remain on a driver worker")
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn source_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
     impl Operator for ControlledReadinessOperator {
         fn name(&self) -> &str {
             self.name
@@ -1717,6 +1761,10 @@ mod terminal_signal_tests {
         }
 
         fn has_output(&self) -> bool {
+            self.has_output
+        }
+
+        fn has_passive_ready_work(&self) -> bool {
             self.has_output
         }
 
@@ -1818,6 +1866,40 @@ mod terminal_signal_tests {
             driver.has_runnable_dataflow(),
             "downstream output can move even while an earlier processor cannot accept input"
         );
+    }
+
+    #[test]
+    fn scheduler_readiness_discovery_never_polls_an_active_source() {
+        let source_observable = Arc::new(Observable::new());
+        let internal_observable = Arc::new(Observable::new());
+        let terminal_observable = Arc::new(Observable::new());
+        let driver = PipelineDriver::new(
+            2,
+            vec![
+                Box::new(DriverPolledSource {
+                    observable: source_observable,
+                }),
+                Box::new(ControlledReadinessOperator {
+                    name: "INTERNAL_READY",
+                    need_input: true,
+                    has_output: false,
+                    observable: internal_observable,
+                }),
+                Box::new(ControlledReadinessOperator {
+                    name: "TERMINAL_READY",
+                    need_input: true,
+                    has_output: false,
+                    observable: terminal_observable,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        assert!(driver.internal_blocked_sink_observable().is_none());
+        assert!(!driver.has_runnable_dataflow());
     }
 
     #[test]

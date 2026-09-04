@@ -722,6 +722,20 @@ impl TableFinishOperator {
         self.final_aggregate_blocked_time.observe(false);
     }
 
+    fn passive_ready_work_available(&self) -> bool {
+        let aggregate_ready = self.aggregate.as_ref().is_some_and(|aggregate| {
+            aggregate.is_finished()
+                || aggregate
+                    .as_processor_ref()
+                    .is_some_and(ProcessorOperator::has_passive_ready_work)
+        });
+        self.runtime_error().is_some()
+            || (self.phase == FinishPhase::Producing
+                && (self.prefix_output.is_some()
+                    || self.grouped_unpivot.is_some()
+                    || aggregate_ready))
+    }
+
     fn sync_metrics(&self) {
         let Some(profiles) = self.profiles.as_ref() else {
             return;
@@ -1261,25 +1275,23 @@ impl ProcessorOperator for TableFinishOperator {
 
     /// Nothing is available before every sender reached EOS.
     fn has_output(&self) -> bool {
-        let aggregate_ready = self.aggregate.as_ref().is_some_and(|aggregate| {
-            aggregate.is_finished()
-                || aggregate
-                    .as_processor_ref()
-                    .is_some_and(ProcessorOperator::has_output)
-        });
         let producing = self.phase == FinishPhase::Producing;
         let other_output = self.prefix_output.is_some() || self.grouped_unpivot.is_some();
         if producing {
             self.final_aggregate_blocked_time.observe(
                 !other_output
                     && self.aggregate.is_some()
-                    && !aggregate_ready
+                    && !self.passive_ready_work_available()
                     && self.runtime_error().is_none(),
             );
         } else if self.phase != FinishPhase::Consuming {
             self.finish_final_aggregate_blocked_interval();
         }
-        self.runtime_error().is_some() || (producing && (other_output || aggregate_ready))
+        self.passive_ready_work_available()
+    }
+
+    fn has_passive_ready_work(&self) -> bool {
+        self.passive_ready_work_available()
     }
 
     fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {

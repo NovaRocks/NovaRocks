@@ -338,18 +338,22 @@ impl GlobalDriverExecutor {
             return;
         }
 
+        // Operator and scheduler callbacks must never run while the global
+        // worker queue is locked. Registration is contractually passive, but
+        // keeping it outside the critical section also prevents one faulty
+        // operator from stalling unrelated, already-admitted driver work.
+        for task in &tasks {
+            let scheduler = task.fragment_ctx().event_scheduler();
+            scheduler.attach_executor(Arc::clone(&self.shared));
+            scheduler.register_driver(task);
+            task.driver.print_pipeline_structure();
+        }
         let mut queue = self
             .shared
             .queue
             .lock()
             .expect("global executor queue lock");
-        for task in tasks {
-            let scheduler = task.fragment_ctx().event_scheduler();
-            scheduler.attach_executor(Arc::clone(&self.shared));
-            scheduler.register_driver(&task);
-            task.driver.print_pipeline_structure();
-            queue.push_back(task);
-        }
+        queue.extend(tasks);
         self.shared.cv.notify_all();
     }
 }

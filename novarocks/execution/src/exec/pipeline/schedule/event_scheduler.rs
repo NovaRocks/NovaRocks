@@ -545,6 +545,10 @@ mod tests {
             self.has_output.load(Ordering::Acquire)
         }
 
+        fn has_passive_ready_work(&self) -> bool {
+            self.has_output.load(Ordering::Acquire)
+        }
+
         fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
             Ok(())
         }
