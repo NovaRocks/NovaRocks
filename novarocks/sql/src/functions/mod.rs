@@ -165,6 +165,12 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
                 binding_enforced: true,
             });
         }
+        if !builtin_aggregate_logical_arguments_match(declaration.name, argument_types) {
+            return Err(FunctionResolutionError::NoMatchingSignature {
+                candidates: 1,
+                binding_enforced: true,
+            });
+        }
         self.resolve_update_signature(&builtin_overload_identity(declaration)?, argument_types)
     }
 
@@ -191,6 +197,12 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
         {
             return Err(FunctionResolutionError::BadSignature(format!(
                 "builtin aggregate `{}` does not support additional update channels",
+                declaration.name
+            )));
+        }
+        if !builtin_aggregate_logical_arguments_match(declaration.name, update_argument_types) {
+            return Err(FunctionResolutionError::BadSignature(format!(
+                "builtin aggregate `{}` update arguments do not match its logical type contract",
                 declaration.name
             )));
         }
@@ -226,6 +238,22 @@ fn builtin_supports_ordered_update_channels(name: &str) -> bool {
         name,
         "array_agg" | "array_agg_distinct" | "array_unique_agg" | "group_concat" | "string_agg"
     )
+}
+
+fn builtin_aggregate_logical_arguments_match(name: &str, argument_types: &[DataType]) -> bool {
+    if name != "dict_merge" {
+        return true;
+    }
+    let [value_type, threshold_type] = argument_types else {
+        return false;
+    };
+    let value_matches = matches!(value_type, DataType::Utf8)
+        || matches!(value_type, DataType::List(item) if matches!(item.data_type(), DataType::Utf8));
+    let threshold_matches = matches!(
+        threshold_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    );
+    value_matches && threshold_matches
 }
 
 fn builtin_overload_identity(
@@ -330,7 +358,7 @@ fn builtin_aggregate_declarations() -> Vec<AggregateDeclaration> {
     declarations.extend([
         AggregateDeclaration::ranged("count", 0, 1, "()->i64 | (any)->i64"),
         AggregateDeclaration::ranged("multi_distinct_count", 1, usize::MAX, "(any...)->i64"),
-        AggregateDeclaration::exact("dict_merge", 2, "(utf8|list<utf8>,i64)->utf8"),
+        AggregateDeclaration::exact("dict_merge", 2, "(utf8|list<utf8>,i8|i16|i32|i64)->utf8"),
         AggregateDeclaration::ranged("group_concat", 2, usize::MAX, "(any,utf8...)->utf8"),
         AggregateDeclaration::ranged("string_agg", 2, usize::MAX, "(any,utf8...)->utf8"),
         AggregateDeclaration::exact("map_agg", 2, "(any,any)->map"),
@@ -637,8 +665,53 @@ mod tests {
             .resolve_aggregate_user("dict_merge", &[DataType::Utf8, DataType::Int64])
             .expect("dict_merge logical value and threshold arguments resolve");
         assert_eq!(dict.argument_types, [DataType::Utf8, DataType::Int64]);
+        assert!(
+            catalog
+                .resolve_selected_aggregate_update_trusted(
+                    "dict_merge",
+                    &dict.overload,
+                    &[DataType::Boolean, DataType::Float64],
+                )
+                .is_err(),
+            "selected update resolution must preserve dict_merge's logical type contract"
+        );
+        let list_utf8 = DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )));
+        for threshold_type in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            catalog
+                .resolve_aggregate_user("dict_merge", &[list_utf8.clone(), threshold_type.clone()])
+                .unwrap_or_else(|error| {
+                    panic!("dict_merge must accept {list_utf8:?}, {threshold_type:?}: {error}")
+                });
+        }
         assert!(matches!(
             catalog.resolve_aggregate_user("dict_merge", &[DataType::Utf8]),
+            Err(FunctionResolutionError::NoMatchingSignature { .. })
+        ));
+        assert!(matches!(
+            catalog.resolve_aggregate_user("dict_merge", &[DataType::Boolean, DataType::Float64]),
+            Err(FunctionResolutionError::NoMatchingSignature { .. })
+        ));
+        assert!(matches!(
+            catalog.resolve_aggregate_user(
+                "dict_merge",
+                &[
+                    DataType::List(Arc::new(arrow::datatypes::Field::new(
+                        "item",
+                        DataType::Int64,
+                        true,
+                    ))),
+                    DataType::Int64,
+                ],
+            ),
             Err(FunctionResolutionError::NoMatchingSignature { .. })
         ));
     }

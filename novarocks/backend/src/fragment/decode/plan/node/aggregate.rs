@@ -91,7 +91,7 @@ pub(super) fn lower_hash_aggregate_node(
         .field("output_layout")
         .field("aggregate_columns");
     let decoded_group_key_columns =
-        ctx.decode_output_layout(&output_layout.group_key_columns, group_key_path)?;
+        ctx.decode_output_layout(&output_layout.group_key_columns, group_key_path.clone())?;
     let decoded_aggregate_columns = ctx.decode_output_layout(
         &output_layout.aggregate_columns,
         aggregate_columns_path.clone(),
@@ -141,12 +141,29 @@ pub(super) fn lower_hash_aggregate_node(
             )
         })
         .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
-    for expr_id in &group_by {
-        if let Some(dt) = arena.data_type(*expr_id)
-            && matches!(dt, DataType::LargeBinary)
-        {
+    for (idx, expr_id) in group_by.iter().enumerate() {
+        let expression_type = arena.data_type(*expr_id).ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("group_by").index(idx),
+                format!("HashAggregateNode group key {idx} has no decoded type"),
+            )
+        })?;
+        let layout_type = decoded_group_key_columns
+            .slot_schemas()
+            .get(idx)
+            .expect("group key output arity was validated")
+            .data_type();
+        if expression_type != layout_type {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                group_key_path.clone().index(idx).field("type"),
+                format!(
+                    "HashAggregateNode group key {idx} output type drift: expression={expression_type:?} output_layout={layout_type:?}"
+                ),
+            ));
+        }
+        if matches!(expression_type, DataType::LargeBinary) {
             return Err(NativeFragmentDecodeError::unsupported(
-                path.clone().field("group_by"),
+                path.clone().field("group_by").index(idx),
                 "VARIANT is not supported in GROUP BY",
             ));
         }
@@ -649,6 +666,37 @@ mod tests {
         assert!(aggregate.functions.is_empty());
         assert_eq!(aggregate.output_chunk_schema.slot_ids(), &[SlotId::new(1)]);
         assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+    }
+
+    #[test]
+    fn hash_aggregate_rejects_group_key_output_type_drift() {
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: vec![column_ref(1, DataType::Int64)],
+                aggregates: Vec::new(),
+                is_merge: Vec::new(),
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: vec![output_column(1, "id", DataType::Utf8)],
+                    aggregate_columns: Vec::new(),
+                }),
+                output_columns: Vec::new(),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_node(
+            &aggregate,
+            &mut ExprArena::default(),
+            &aggregate_decode_context(),
+        )
+        .expect_err("group key output type drift must fail");
+        assert!(
+            error.to_string().contains("group key 0 output type drift"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -923,14 +923,34 @@ mod tests {
 
     #[test]
     fn apply_skips_multi_arg_distinct() {
-        assert!(
-            crate::functions::builtin_sql_function_catalog()
-                .resolve_aggregate_trusted(
-                    "multi_distinct_count",
-                    &[DataType::Int64, DataType::Int64],
-                )
-                .is_err()
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let resolved = crate::functions::test_resolved_aggregate(
+            "count",
+            &[DataType::Int64, DataType::Int64],
+            true,
         );
+        let aggregate = AggregateCall {
+            name: "count".to_string(),
+            args: vec![col("a"), col("b")],
+            distinct: true,
+            result_type: DataType::Int64,
+            order_by: Vec::new(),
+            output_column_id: test_col_id("multi_distinct_count_a_b"),
+            resolved,
+        };
+        let expression = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
+                Vec::new(),
+                vec![aggregate],
+                Vec::new(),
+            )),
+            children: vec![scan_group],
+        };
+
+        assert!(SplitDistinctAgg.apply(&expression, &mut memo).is_empty());
     }
 
     #[test]

@@ -39,7 +39,9 @@ cat >"$env_file" <<EOF
 export NOVA_ENV_COMPOSE_ENV="$compose_env"
 export NOVA_ENV_COMPOSE_PROJECT="ci-prepared-rest"
 export NOVA_ENV_COMPOSE_FILE="$compose_file"
+export NOVA_ENV_SHARED_DOCKER=false
 export CATALOG_WAREHOUSE_URI="s3://novarocks/ci-prepared"
+export NOVA_ENV_REST_WAREHOUSE_URI="s3://novarocks/ci-prepared"
 export AWS_S3_ENDPOINT="http://127.0.0.1:9000"
 export AWS_S3_ACCESS_KEY_ID="admin"
 export AWS_S3_SECRET_ACCESS_KEY="admin123"
@@ -119,7 +121,7 @@ grep -F 'NOVA_ENV_REST_ENV_FILE must name the generated Iceberg REST environment
   "$trino_output" >/dev/null
 
 if PATH="$fakebin:$PATH" \
-  NOVA_ENV_SHARED_DOCKER=false \
+  NOVA_ENV_SHARED_DOCKER=true \
   NOVA_ENV_REST_ENV_FILE="$env_file" \
   "$trino_helper" create-parent test_namespace test_table >"$trino_output" 2>&1; then
   echo "Trino helper unexpectedly accepted a non-shared explicit REST environment" >&2
@@ -127,6 +129,24 @@ if PATH="$fakebin:$PATH" \
 fi
 if ! grep -F 'the canonical shared Iceberg REST fixture is not active' "$trino_output" >/dev/null; then
   echo "Trino helper did not read the explicit REST environment file" >&2
+  cat "$trino_output" >&2
+  exit 1
+fi
+
+missing_secret_env="$runtime_dir/missing-secret-env.sh"
+sed \
+  -e 's/^export NOVA_ENV_SHARED_DOCKER=false$/export NOVA_ENV_SHARED_DOCKER=true/' \
+  -e '/^export AWS_S3_SECRET_ACCESS_KEY=/d' \
+  "$env_file" >"$missing_secret_env"
+if PATH="$fakebin:$PATH" \
+  AWS_S3_SECRET_ACCESS_KEY=ambient-must-not-fill \
+  NOVA_ENV_REST_ENV_FILE="$missing_secret_env" \
+  "$trino_helper" create-parent test_namespace test_table >"$trino_output" 2>&1; then
+  echo "Trino helper must reject a runtime entry with a missing S3 secret" >&2
+  exit 1
+fi
+if ! grep -F 'generated Iceberg REST environment has no S3 secret key' "$trino_output" >/dev/null; then
+  echo "Trino helper allowed ambient state to fill a missing runtime fact" >&2
   cat "$trino_output" >&2
   exit 1
 fi

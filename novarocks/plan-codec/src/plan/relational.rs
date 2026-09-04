@@ -329,7 +329,12 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
                                 name: call.name.clone(),
                                 args: encode_exprs(&call.args)?,
                                 distinct: call.distinct,
-                                result_type: Some(encode_type(&call.result_type)?),
+                                // AggregateCall.result_type follows the physical
+                                // phase layout after optimizer materialization.
+                                // The wire field is the final SQL result type;
+                                // phase carriers are sealed independently in
+                                // output_layout.aggregate_columns.
+                                result_type: Some(encode_type(&call.resolved.output_type)?),
                                 order_by: encode_sort_items(&call.order_by)?,
                                 output_column_id: call.output_column_id.0,
                                 resolved_signature: Some(encode_resolved_aggregate_signature(
@@ -561,6 +566,15 @@ fn encode_row_count_assertion(assertion: PlanRowCountAssertion) -> i32 {
 mod tests {
     use super::*;
 
+    fn find_hash_aggregate(node: &plan::DistributedNode) -> Option<&plan::HashAggregateNode> {
+        if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
+            && let Some(plan::plan_node::Kind::HashAggregate(aggregate)) = physical.kind.as_ref()
+        {
+            return Some(aggregate);
+        }
+        node.children.iter().find_map(find_hash_aggregate)
+    }
+
     #[test]
     fn encodes_complete_exact_aggregate_binding() {
         let binding = novarocks_functions::ResolvedAggregateSignature {
@@ -587,6 +601,46 @@ mod tests {
         assert!(encoded.intermediate_type.is_some());
         assert!(encoded.output_type.is_some());
         assert_eq!(encoded.state_format_identity, binding.state_format.as_str());
+    }
+
+    #[test]
+    fn local_aggregate_wire_separates_final_result_from_phase_carrier() {
+        let source = novarocks_sql::test_support::native_encoder_plan(
+            novarocks_sql::test_support::NativeEncoderPlanFixture::LocalAverageStreamEdge,
+        )
+        .expect("sealed local average fixture");
+        let encoded = super::super::encode_distributed_plan_with_context(
+            &source,
+            NativePlanEncodeContext {
+                scan_facts: None,
+                node_outputs: None,
+                fragment_edge_outputs: None,
+                write_contracts: None,
+                write_targets: None,
+            },
+        )
+        .expect("encode local average fixture");
+        let aggregate = encoded
+            .fragments
+            .iter()
+            .filter_map(|fragment| fragment.root.as_ref())
+            .find_map(find_hash_aggregate)
+            .expect("encoded local aggregate");
+        let call = aggregate.aggregates.first().expect("average call");
+        assert_eq!(
+            call.result_type,
+            Some(encode_type(&arrow::datatypes::DataType::Float64).expect("final type"))
+        );
+        let phase_column = aggregate
+            .output_layout
+            .as_ref()
+            .and_then(|layout| layout.aggregate_columns.first())
+            .and_then(|column| column.r#type.as_ref())
+            .expect("phase output type");
+        assert_eq!(
+            phase_column,
+            &encode_type(&arrow::datatypes::DataType::Utf8).expect("intermediate type")
+        );
     }
 
     #[test]

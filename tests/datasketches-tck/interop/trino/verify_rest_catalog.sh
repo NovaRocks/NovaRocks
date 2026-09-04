@@ -84,10 +84,18 @@ esac
 [[ -n "$runtime_env" ]] || \
   fail "NOVA_ENV_REST_ENV_FILE must name the generated Iceberg REST environment"
 [[ -f "$runtime_env" ]] || fail "missing generated Iceberg REST environment: $runtime_env"
+# Runtime facts must come entirely from the named generated entry. Ambient
+# values can belong to another worktree and must not fill omissions in it.
+unset NOVA_ENV_SHARED_DOCKER NOVA_ENV_COMPOSE_PROJECT NOVA_ENV_REST_WAREHOUSE_URI
+unset AWS_S3_ACCESS_KEY_ID AWS_S3_SECRET_ACCESS_KEY
 # shellcheck source=/dev/null
 source "$runtime_env"
 
 [[ "${NOVA_ENV_SHARED_DOCKER:-}" == true ]] || fail "the canonical shared Iceberg REST fixture is not active"
+[[ -n "${NOVA_ENV_COMPOSE_PROJECT:-}" ]] || fail "generated Iceberg REST environment has no compose project"
+[[ -n "${NOVA_ENV_REST_WAREHOUSE_URI:-}" ]] || fail "generated Iceberg REST environment has no warehouse URI"
+[[ -n "${AWS_S3_ACCESS_KEY_ID:-}" ]] || fail "generated Iceberg REST environment has no S3 access key"
+[[ -n "${AWS_S3_SECRET_ACCESS_KEY:-}" ]] || fail "generated Iceberg REST environment has no S3 secret key"
 network="${NOVA_ENV_COMPOSE_PROJECT}_iceberg_net"
 docker network inspect "$network" >/dev/null 2>&1 || fail "missing Docker network $network; run docker/iceberg-rest/up.sh"
 
