@@ -63,7 +63,6 @@ pub(crate) fn validate_record_source(
 pub(crate) struct BeLogSnapshot {
     counts: HashMap<(usize, String), usize>,
     log_lengths: Vec<usize>,
-    lifecycle_token: Option<(usize, &'static str, String)>,
     evidence_deadline: Option<Instant>,
 }
 
@@ -98,9 +97,9 @@ pub(crate) fn step_evidence_deadline(meta: &QueryMeta) -> Option<Instant> {
 }
 
 fn is_query_lifecycle_step(meta: &QueryMeta) -> bool {
-    // Every directive here names the retired Init/Stage/Start protocol, and
-    // the evidence this gates on -- NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,
-    // _CLEANUP and a reason= field -- exists only on that protocol.
+    // A step named here gets the long query-lifecycle evidence budget rather
+    // than the short BE-log one, because the facts it waits for are published
+    // by the coordinator's own lifecycle rather than by the statement.
     //
     // `kill_query_after_be_log_contains` is deliberately NOT in the list. It
     // waits for whatever marker the case names, which makes it
@@ -108,13 +107,7 @@ fn is_query_lifecycle_step(meta: &QueryMeta) -> bool {
     // evidence and asserts task-protocol evidence would otherwise be held to
     // terminal facts that no longer have producers, and would fail for a
     // reason unrelated to whether cancellation worked.
-    meta.drop_next_init_ack_be_index.is_some()
-        || meta.stop_query_control_heartbeat_be_index.is_some()
-        || meta.kill_fe_after_control_ready_count.is_some()
-        || meta.drop_next_terminal_ack_be_index.is_some()
-        || meta.kill_query_after_control_ready_count.is_some()
-        || meta.query_control_fragment_backend_limit.is_some()
-        || meta.query_lifecycle_fault.is_some()
+    meta.query_control_fragment_backend_limit.is_some() || meta.query_lifecycle_fault.is_some()
 }
 
 pub(crate) fn snapshot_with_deadline(
@@ -159,29 +152,20 @@ pub(crate) fn snapshot_with_deadline(
             );
         }
     }
-    let lifecycle_fault = meta
-        .drop_next_init_ack_be_index
-        .map(|index| (index, "init-ack-drop"))
-        .or_else(|| {
-            meta.stop_query_control_heartbeat_be_index
-                .map(|index| (index, "heartbeat-stop"))
-        })
-        .or_else(|| {
-            meta.query_lifecycle_fault
-                .map(|fault| (fault.be_index, fault.kind.as_str()))
-        });
-    let lifecycle_token = lifecycle_fault
-        .map(|(index, kind)| {
-            server_handle
-                .armed_query_lifecycle_fault_token(index, kind)?
-                .map(|token| (index, kind, token))
-                .with_context(|| format!("BE[{index}] has no armed {kind} token"))
-        })
-        .transpose()?;
+    // A configured owner-local lifecycle fault must already have reached its
+    // arm file before the step runs. The token itself is not read here; the
+    // point is to fail the step now rather than to wait out an evidence
+    // deadline for a fault that was never armed.
+    if let Some(fault) = meta.query_lifecycle_fault {
+        let index = fault.be_index;
+        let kind = fault.kind.as_str();
+        server_handle
+            .armed_query_lifecycle_fault_token(index, kind)?
+            .with_context(|| format!("BE[{index}] has no armed {kind} token"))?;
+    }
     Ok(BeLogSnapshot {
         counts,
         log_lengths,
-        lifecycle_token,
         evidence_deadline,
     })
 }
@@ -264,8 +248,7 @@ fn lifecycle_evidence(
     snapshot: &BeLogSnapshot,
     endpoint_count: usize,
 ) -> Result<Option<LogEvidenceCheck>> {
-    let lifecycle_step = is_query_lifecycle_step(&step.meta);
-    if !lifecycle_step {
+    if !is_query_lifecycle_step(&step.meta) {
         return Ok(None);
     }
     // T4 deliberately creates the arm/bind/token contract before T5/T7/T9
@@ -275,188 +258,75 @@ fn lifecycle_evidence(
     if step.meta.query_lifecycle_fault.is_some() {
         return Ok(None);
     }
+    // The fragment backend limit is the only remaining lifecycle step that
+    // owns log-derived evidence.
+    let Some(limit) = step.meta.query_control_fragment_backend_limit else {
+        return Ok(None);
+    };
     if endpoint_count != 3 {
         bail!("query lifecycle evidence requires exactly 3 BEs, found {endpoint_count}");
     }
     let logs = lifecycle_log_deltas(snapshot, server_handle, endpoint_count)?;
 
-    if let Some(limit) = step.meta.query_control_fragment_backend_limit {
-        if limit > endpoint_count {
-            bail!(
-                "query-control fragment backend limit {limit} exceeds available BE count {endpoint_count}"
-            );
-        }
-        let marker = "NOVAROCKS_QUERY_CONTROL_READY";
-        let mut by_execution = BTreeMap::<String, Vec<(usize, usize)>>::new();
-        for (index, log) in logs.iter().enumerate() {
-            for line in log.lines() {
-                let Some(execution) = execution_field(line, marker)? else {
-                    continue;
-                };
-                let fields = marker_fields(marker_payload(line, marker).unwrap(), marker)?;
-                let expected = fields
-                    .get("expected_fragments")
-                    .context("ControlReady missing expected_fragments")?
-                    .parse::<usize>()?;
-                by_execution
-                    .entry(execution)
-                    .or_default()
-                    .push((index, expected));
-            }
-        }
-        for (execution, participants) in by_execution {
-            let participant_bes = participants
-                .iter()
-                .map(|(be, _)| *be)
-                .collect::<HashSet<_>>();
-            if participant_bes.len() != 3 {
+    if limit > endpoint_count {
+        bail!(
+            "query-control fragment backend limit {limit} exceeds available BE count {endpoint_count}"
+        );
+    }
+    let marker = "NOVAROCKS_QUERY_CONTROL_READY";
+    let mut by_execution = BTreeMap::<String, Vec<(usize, usize)>>::new();
+    for (index, log) in logs.iter().enumerate() {
+        for line in log.lines() {
+            let Some(execution) = execution_field(line, marker)? else {
                 continue;
-            }
-            let services = participants
-                .iter()
-                .filter_map(|(be, expected)| (*expected == 0).then_some(*be))
-                .collect::<HashSet<_>>();
-            let executors = distinct_backends_for_execution(
-                &logs,
-                "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
-                &execution,
-            )?;
-            let expected_service_only = endpoint_count.saturating_sub(limit);
-            if services.len() == expected_service_only
-                && executors.len() == limit
-                && services.is_disjoint(&executors)
-            {
-                let kind = if expected_service_only == 0 {
-                    "all-executors"
-                } else {
-                    "service-only"
-                };
-                return Ok(Some(LogEvidenceCheck::Satisfied(vec![format!(
-                    "    query_lifecycle_evidence PASS kind={kind} execution_id={execution} participants={endpoint_count} executors={limit} service_only={expected_service_only}",
-                )])));
-            }
+            };
+            let fields = marker_fields(marker_payload(line, marker).unwrap(), marker)?;
+            let expected = fields
+                .get("expected_fragments")
+                .context("ControlReady missing expected_fragments")?
+                .parse::<usize>()?;
+            by_execution
+                .entry(execution)
+                .or_default()
+                .push((index, expected));
         }
-        return Ok(Some(LogEvidenceCheck::Pending(format!(
-            "no single execution proves {endpoint_count} participants, {} service-only participants, and {limit} fragment executors",
-            endpoint_count.saturating_sub(limit)
-        ))));
     }
-
-    let anchor = if let Some((index, _, token)) = &snapshot.lifecycle_token {
-        let marker = if step.meta.drop_next_init_ack_be_index.is_some() {
-            "NOVAROCKS_QUERY_INIT_ACK_DROPPED"
-        } else {
-            "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED"
-        };
-        logs[*index]
-            .lines()
-            .find(|line| line.contains(marker) && line.contains(&format!("token={token}")))
-            .and_then(|line| execution_field(line, marker).transpose())
-            .transpose()?
-    } else {
-        None
-    };
-
-    if step.meta.drop_next_init_ack_be_index.is_some() {
-        let Some(execution) = anchor else {
-            return Ok(Some(LogEvidenceCheck::Pending(
-                "token-scoped InitAck drop marker missing".to_string(),
-            )));
-        };
-        let applied =
-            distinct_backends_for_execution(&logs, "NOVAROCKS_QUERY_INIT_APPLIED", &execution)?;
-        let idempotent =
-            distinct_backends_for_execution(&logs, "NOVAROCKS_QUERY_INIT_IDEMPOTENT", &execution)?;
-        let target_index = snapshot
-            .lifecycle_token
-            .as_ref()
-            .map(|(index, _, _)| *index)
-            .context("InitAck loss evidence has no target backend")?;
-        return Ok(Some(
-            if applied.len() == 3 && idempotent.contains(&target_index) {
-                LogEvidenceCheck::Satisfied(vec![format!(
-                    "    query_lifecycle_evidence PASS kind=init-ack-loss execution_id={execution} applied_backends=3 idempotent_backends={}",
-                    idempotent.len()
-                )])
-            } else {
-                LogEvidenceCheck::Pending(format!(
-                    "InitAck execution {execution} applied_backends={} idempotent_backends={}",
-                    applied.len(),
-                    idempotent.len()
-                ))
-            },
-        ));
-    }
-
-    let (anchor_marker, required_anchor_backends, required_reason, required_reason_backends) =
-        if step.meta.stop_query_control_heartbeat_be_index.is_some() {
-            (
-                "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED",
-                1,
-                Some("CoordinatorHeartbeatTimeout"),
-                1,
-            )
-        } else if step.meta.kill_fe_after_control_ready_count.is_some() {
-            (
-                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST",
-                3,
-                Some("CoordinatorStreamLost"),
-                3,
-            )
-        } else {
-            (
-                "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED",
-                3,
-                Some("CoordinatorAbort"),
-                3,
-            )
-        };
-    let candidates = if let Some(anchor) = anchor {
-        vec![anchor]
-    } else {
-        logs.iter()
-            .flat_map(|log| log.lines())
-            .filter_map(|line| execution_field(line, anchor_marker).transpose())
-            .collect::<Result<Vec<_>>>()?
-    };
-    for execution in candidates {
-        let terminated = distinct_backends_for_execution(
+    for (execution, participants) in by_execution {
+        let participant_bes = participants
+            .iter()
+            .map(|(be, _)| *be)
+            .collect::<HashSet<_>>();
+        if participant_bes.len() != 3 {
+            continue;
+        }
+        let services = participants
+            .iter()
+            .filter_map(|(be, expected)| (*expected == 0).then_some(*be))
+            .collect::<HashSet<_>>();
+        let executors = distinct_backends_for_execution(
             &logs,
-            "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
             &execution,
         )?;
-        let anchor_bes = distinct_backends_for_execution(&logs, anchor_marker, &execution)?;
-        let cleanup = distinct_backends_for_execution(
-            &logs,
-            "NOVAROCKS_QUERY_LIFECYCLE_CLEANUP",
-            &execution,
-        )?;
-        let reason_backends = required_reason.map_or(required_reason_backends, |reason| {
-            logs.iter()
-                .filter(|log| {
-                    log.lines().any(|line| {
-                        line.contains("NOVAROCKS_QUERY_LIFECYCLE_TERMINATED")
-                            && line.contains(&format!("execution_id={execution}"))
-                            && line.contains(&format!("reason={reason}"))
-                    })
-                })
-                .count()
-        });
-        if terminated.len() == 3
-            && anchor_bes.len() == required_anchor_backends
-            && reason_backends >= required_reason_backends
-            && cleanup.len() == 3
+        let expected_service_only = endpoint_count.saturating_sub(limit);
+        if services.len() == expected_service_only
+            && executors.len() == limit
+            && services.is_disjoint(&executors)
         {
+            let kind = if expected_service_only == 0 {
+                "all-executors"
+            } else {
+                "service-only"
+            };
             return Ok(Some(LogEvidenceCheck::Satisfied(vec![format!(
-                "    query_lifecycle_evidence PASS execution_id={execution} terminated_backends=3 cleanup_backends={}",
-                cleanup.len()
+                "    query_lifecycle_evidence PASS kind={kind} execution_id={execution} participants={endpoint_count} executors={limit} service_only={expected_service_only}",
             )])));
         }
     }
-    Ok(Some(LogEvidenceCheck::Pending(
-        "no single execution correlates the lifecycle fault and terminal facts across all 3 BEs"
-            .to_string(),
-    )))
+    Ok(Some(LogEvidenceCheck::Pending(format!(
+        "no single execution proves {endpoint_count} participants, {} service-only participants, and {limit} fragment executors",
+        endpoint_count.saturating_sub(limit)
+    ))))
 }
 
 fn marker_payload<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
@@ -890,23 +760,14 @@ mod tests {
     fn every_query_lifecycle_hook_receives_one_shared_deadline() {
         for meta in [
             QueryMeta {
-                drop_next_init_ack_be_index: Some(0),
-                ..QueryMeta::default()
-            },
-            QueryMeta {
-                stop_query_control_heartbeat_be_index: Some(0),
-                ..QueryMeta::default()
-            },
-            QueryMeta {
-                kill_fe_after_control_ready_count: Some(1),
-                ..QueryMeta::default()
-            },
-            QueryMeta {
-                kill_query_after_control_ready_count: Some(1),
-                ..QueryMeta::default()
-            },
-            QueryMeta {
                 query_control_fragment_backend_limit: Some(1),
+                ..QueryMeta::default()
+            },
+            QueryMeta {
+                query_lifecycle_fault: Some(crate::types::QueryLifecycleFaultDirective {
+                    kind: crate::types::QueryLifecycleFaultKind::TerminalOutcomeSuppress,
+                    be_index: 0,
+                }),
                 ..QueryMeta::default()
             },
         ] {
@@ -979,97 +840,5 @@ mod tests {
             .expect("lifecycle check");
 
         assert!(matches!(check, LogEvidenceCheck::Satisfied(_)));
-    }
-
-    #[test]
-    fn heartbeat_evidence_requires_token_anchor_terminal_and_cleanup_on_same_execution() {
-        let execution = "10:20:1";
-        let terminal = format!(
-            "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc reason=CoordinatorHeartbeatTimeout expected_fragments=1\nNOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc active=false tombstone=true reason=CoordinatorHeartbeatTimeout\n"
-        );
-        let be1 = format!(
-            "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED execution_id={execution} backend_index=1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd token=step-token\n{}",
-            terminal.replace(
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd"
-            )
-        );
-        let be2 = terminal.replace(
-            "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
-            "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe",
-        );
-        let handle = FakeBeLogHandle::new(vec![&terminal, &be1, &be2]);
-        let step = step(QueryMeta {
-            stop_query_control_heartbeat_be_index: Some(1),
-            ..QueryMeta::default()
-        });
-        let snapshot = BeLogSnapshot {
-            lifecycle_token: Some((1, "heartbeat-stop", "step-token".to_string())),
-            ..BeLogSnapshot::default()
-        };
-
-        let check = lifecycle_evidence(&step, &handle, &snapshot, 3)
-            .expect("evaluate evidence")
-            .expect("lifecycle check");
-
-        assert!(matches!(check, LogEvidenceCheck::Satisfied(_)));
-    }
-
-    #[test]
-    fn fe_crash_evidence_rejects_terminal_without_cleanup_on_every_backend() {
-        let execution = "10:20:1";
-        let terminal = format!(
-            "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc reason=CoordinatorStreamLost\nNOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc reason=CoordinatorStreamLost expected_fragments=1\n"
-        );
-        let handle = FakeBeLogHandle::new(vec![
-            &terminal,
-            &terminal.replace(
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd",
-            ),
-            &terminal.replace(
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe",
-            ),
-        ]);
-        let step = step(QueryMeta {
-            kill_fe_after_control_ready_count: Some(3),
-            ..QueryMeta::default()
-        });
-
-        let check = lifecycle_evidence(&step, &handle, &BeLogSnapshot::default(), 3)
-            .expect("evaluate evidence")
-            .expect("lifecycle check");
-
-        assert!(matches!(check, LogEvidenceCheck::Pending(_)));
-    }
-
-    #[test]
-    fn kill_query_evidence_rejects_terminal_without_cleanup_on_every_backend() {
-        let execution = "10:20:1";
-        let terminal = format!(
-            "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc reason=CoordinatorAbort expected_fragments=1\n"
-        );
-        let handle = FakeBeLogHandle::new(vec![
-            &terminal,
-            &terminal.replace(
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd",
-            ),
-            &terminal.replace(
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
-                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe",
-            ),
-        ]);
-        let step = step(QueryMeta {
-            kill_query_after_control_ready_count: Some(3),
-            ..QueryMeta::default()
-        });
-
-        let check = lifecycle_evidence(&step, &handle, &BeLogSnapshot::default(), 3)
-            .expect("evaluate evidence")
-            .expect("lifecycle check");
-
-        assert!(matches!(check, LogEvidenceCheck::Pending(_)));
     }
 }

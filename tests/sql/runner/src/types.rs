@@ -304,7 +304,6 @@ pub struct QueryMeta {
     pub retry_count: Option<usize>,
     pub retry_interval_ms: Option<u64>,
     pub kill_be_index: Option<usize>,
-    pub network_partition_be: Option<usize>,
     pub heartbeat_delay_ms: Option<u64>,
     pub restart_be_delay_ms: Option<u64>,
     /// Restart the runner-owned frontend after this statement has succeeded.
@@ -316,17 +315,12 @@ pub struct QueryMeta {
     /// One bounded runner-owned fault for the next matching standard Iceberg
     /// REST publication request. The SQL case never names an operation id.
     pub publication_catalog_fault: Option<PublicationCatalogFaultDirective>,
-    pub drop_next_init_ack_be_index: Option<usize>,
-    pub stop_query_control_heartbeat_be_index: Option<usize>,
-    pub kill_fe_after_control_ready_count: Option<usize>,
     /// Kill and restart FE after an MV lake publication is known committed but
     /// before the Accelerator projector can CAS its local projection.
     pub kill_fe_after_mv_known_committed_before_projector_cas: bool,
     /// Replace one BE process after its task-protocol `EstablishQueryContext`
     /// has been applied.
     pub restart_be_after_establish_context_index: Option<usize>,
-    /// Execute KILL QUERY from a separate client after this query's Nth ControlReady.
-    pub kill_query_after_control_ready_count: Option<usize>,
     /// Execute KILL QUERY after a new matching line is observed in a runner-owned BE log.
     pub kill_query_after_be_log_contains: Option<String>,
     /// Kill one BE after a new matching line is observed in a runner-owned BE
@@ -340,17 +334,6 @@ pub struct QueryMeta {
     /// the coordinator to die at, instead of a phase whose marker belongs to
     /// one protocol.
     pub kill_fe_after_be_log_contains: Option<String>,
-    /// Fail the local StageFragments build at this one-based fragment ordinal.
-    pub fail_stage_prepare_ordinal: Option<usize>,
-    pub drop_next_stage_ack_be_index: Option<usize>,
-    pub drop_next_start_ack_be_index: Option<usize>,
-    pub suppress_start_ack_be_index: Option<usize>,
-    /// Store the immutable terminal snapshot but deliberately omit the stream
-    /// ACK for this participant, requiring BE unary fallback delivery.
-    pub drop_next_terminal_ack_be_index: Option<usize>,
-    /// Close one BE's control stream immediately before TerminalSnapshot so
-    /// the immutable payload can only reach FE through unary fallback.
-    pub drop_terminal_snapshot_stream_be_index: Option<usize>,
     /// Inject a second valid-but-different participant snapshot at FE ingress
     /// before ACK, proving same-identity conflicts fail closed.
     pub terminal_snapshot_conflict_be_index: Option<usize>,
@@ -368,8 +351,6 @@ pub struct QueryMeta {
     /// Kill one BE only after FE has retained an immutable participant outcome
     /// for the requested lifecycle phase.
     pub kill_be_at_lifecycle_phase: Option<KillBeAtLifecyclePhaseDirective>,
-    pub stop_query_control_heartbeat_after_stage_be_index: Option<usize>,
-    pub hold_start_until_early_ingress: bool,
     pub query_control_fragment_backend_limit: Option<usize>,
     /// Before this step, resolve a REST-catalog table and write one real,
     /// deliberately unreferenced MinIO object below its data directory.

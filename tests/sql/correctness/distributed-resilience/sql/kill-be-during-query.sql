@@ -62,8 +62,14 @@ SELECT generate_series FROM TABLE(generate_series(666667, 1000000));
 -- asserting it would make this case pass or fail on where the scheduler put
 -- the root.
 -- @expect_error=is no longer observable
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
--- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,2
+-- Neither count is the cluster size. A context exists only where a task is
+-- placed, and which backends get the table's splits is the scheduler's
+-- business -- a backend restart earlier in the suite is enough to co-locate
+-- two of three. Aborts are then participants minus the one whose process is
+-- gone. What the case is about survives that: more than one backend ran a
+-- task, and the loss of one was fanned out to a peer.
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,2
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,1
 SELECT COUNT(*) FROM ${case_db}.resilience_series;
 
 -- query 3

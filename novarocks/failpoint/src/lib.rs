@@ -39,14 +39,9 @@ pub const MV_KNOWN_COMMITTED_BEFORE_PROJECTOR_CAS_MARKER: &str =
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum QueryLifecycleFaultKind {
     InitAckDrop,
-    StageAckDrop,
-    StartAckDrop,
     StartAckSuppress,
-    HeartbeatStop,
-    HeartbeatStopAfterStage,
     RestartAfterInitAck,
     TerminalAckDrop,
-    TerminalSnapshotStreamDrop,
     TerminalSnapshotConflict,
     ObservationP2AssemblyFailure,
     ObservationP2BudgetPressure,
@@ -68,9 +63,9 @@ pub enum QueryLifecycleFaultKind {
     /// idempotent replay exists to survive.
     EstablishContextAckDrop,
     /// Drops the acknowledgement of one `CreateTask` after the task is
-    /// admitted and running. It is the successor of both `StageAckDrop` and
-    /// `StartAckDrop`, because `CreateTask` is the protocol's single admission
-    /// point rather than two phases.
+    /// admitted and running. It is the successor of the retired protocol's
+    /// separate Stage and Start acknowledgements, because `CreateTask` is the
+    /// task protocol's single admission point rather than two phases.
     CreateTaskAckDrop,
     /// Drops one `SubscribeTaskStatus` stream after the subscription is
     /// established. Cursors are unconsumed, so the observation is recovered by
@@ -117,16 +112,11 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 32] = [
         Self::InitAckDrop,
-        Self::StageAckDrop,
-        Self::StartAckDrop,
         Self::StartAckSuppress,
-        Self::HeartbeatStop,
-        Self::HeartbeatStopAfterStage,
         Self::RestartAfterInitAck,
         Self::TerminalAckDrop,
-        Self::TerminalSnapshotStreamDrop,
         Self::TerminalSnapshotConflict,
         Self::ObservationP2AssemblyFailure,
         Self::ObservationP2BudgetPressure,
@@ -160,14 +150,9 @@ impl QueryLifecycleFaultKind {
     pub const fn file_stem(self) -> &'static str {
         match self {
             Self::InitAckDrop => "init-ack-drop",
-            Self::StageAckDrop => "stage-ack-drop",
-            Self::StartAckDrop => "start-ack-drop",
             Self::StartAckSuppress => "start-ack-suppress",
-            Self::HeartbeatStop => "heartbeat-stop",
-            Self::HeartbeatStopAfterStage => "heartbeat-stop-after-stage",
             Self::RestartAfterInitAck => "restart-after-init-ack",
             Self::TerminalAckDrop => "terminal-ack-drop",
-            Self::TerminalSnapshotStreamDrop => "terminal-snapshot-stream-drop",
             Self::TerminalSnapshotConflict => "terminal-snapshot-conflict",
             Self::ObservationP2AssemblyFailure => "observation-p2-assembly-failure",
             Self::ObservationP2BudgetPressure => "observation-p2-budget-pressure",
@@ -395,40 +380,6 @@ mod typed {
         pub execution_id: QueryExecutionId,
         pub backend_index: usize,
         pub process_id: BackendProcessId,
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct StagePrepareFailure {
-        pub token: String,
-        pub ordinal: usize,
-    }
-
-    pub fn claim_stage_prepare_failure(
-        root: &Path,
-        available_fragments: usize,
-    ) -> Result<Option<StagePrepareFailure>, String> {
-        let path = root.join("stage-prepare-fail.trigger");
-        let contents = match fs::read_to_string(&path) {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("read {}: {error}", path.display())),
-        };
-        let fields = parse_fields(&contents)?;
-        let failure = StagePrepareFailure {
-            token: required_token(&fields)?,
-            ordinal: required_usize(&fields, "ordinal")?,
-        };
-        if failure.ordinal == 0 {
-            return Err("stage prepare fault ordinal must be at least one".to_string());
-        }
-        if failure.ordinal > available_fragments {
-            return Ok(None);
-        }
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(Some(failure)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("consume {}: {error}", path.display())),
-        }
     }
 
     pub fn bind_armed_fault(
@@ -731,7 +682,7 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 37);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 32);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
