@@ -108,4 +108,27 @@ if [[ "$(grep -F -- "--env-file $compose_env" "$DOCKER_CALLS" | wc -l | tr -d ' 
   exit 1
 fi
 
+trino_helper="$REPO_ROOT/tests/datasketches-tck/interop/trino/verify_rest_catalog.sh"
+trino_output="$tmpdir/trino.out"
+if NOVA_ENV_REST_ENV_FILE= \
+  "$trino_helper" create-parent test_namespace test_table >"$trino_output" 2>&1; then
+  echo "Trino helper must reject an absent explicit REST environment file" >&2
+  exit 1
+fi
+grep -F 'NOVA_ENV_REST_ENV_FILE must name the generated Iceberg REST environment' \
+  "$trino_output" >/dev/null
+
+if PATH="$fakebin:$PATH" \
+  NOVA_ENV_SHARED_DOCKER=false \
+  NOVA_ENV_REST_ENV_FILE="$env_file" \
+  "$trino_helper" create-parent test_namespace test_table >"$trino_output" 2>&1; then
+  echo "Trino helper unexpectedly accepted a non-shared explicit REST environment" >&2
+  exit 1
+fi
+if ! grep -F 'the canonical shared Iceberg REST fixture is not active' "$trino_output" >/dev/null; then
+  echo "Trino helper did not read the explicit REST environment file" >&2
+  cat "$trino_output" >&2
+  exit 1
+fi
+
 echo "sql-helper-env-file-test: PASS"

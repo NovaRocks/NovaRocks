@@ -19,8 +19,7 @@
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(cd "$script_dir/../../../.." && pwd)
-runtime_env="$repo_root/docker/iceberg-rest/runtime/current/env.sh"
+runtime_env="${NOVA_ENV_REST_ENV_FILE:-}"
 readonly trino_release=483
 readonly trino_manifest_digest=sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534
 readonly default_trino_image="trinodb/trino@${trino_manifest_digest}"
@@ -82,6 +81,8 @@ case "$action" in
     ;;
 esac
 
+[[ -n "$runtime_env" ]] || \
+  fail "NOVA_ENV_REST_ENV_FILE must name the generated Iceberg REST environment"
 [[ -f "$runtime_env" ]] || fail "missing generated Iceberg REST environment: $runtime_env"
 # shellcheck source=/dev/null
 source "$runtime_env"

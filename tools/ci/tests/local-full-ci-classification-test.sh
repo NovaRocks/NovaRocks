@@ -236,7 +236,7 @@ launcher_capture="$tmpdir/sql-runner-launcher.args"
   mkdir -p "$CI_RUN_DIR/sql"
 
   resolve_suites() {
-    SUITES=(filter)
+    SUITES=(iceberg-dml)
   }
   ci_run_logged() {
     printf '%s\n' "$@" >"$launcher_capture"
@@ -255,6 +255,71 @@ fi
 
 if ! grep -Fx "NOVA_ENV_REST_ENV_FILE=$tmpdir/runtime/env.sh" "$launcher_capture" >/dev/null; then
   echo "SQL runner must receive the exact prepared Iceberg REST environment" >&2
+  exit 1
+fi
+
+if grep -Fx -- "--query-timeout" "$launcher_capture" >/dev/null; then
+  echo "iceberg-dml must use the SQL runner's suite timeout when CI has no explicit override" >&2
+  exit 1
+fi
+
+native_launcher_capture="$tmpdir/native-sql-runner-launcher.args"
+(
+  REPO_ROOT="$tmpdir/current-worktree"
+  CI_RUN_DIR="$tmpdir/native-sql-runner-launcher"
+  NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
+  NOVA_ENV_RUNTIME_DIR="$tmpdir/runtime"
+  SQL_CLUSTER_MODE="cross-process"
+  NOVA_CI_NATIVE_CROSS_PROCESS_FULL="1"
+
+  ci_native_cross_process_suites() {
+    printf '%s\n' iceberg-dml
+  }
+  ci_suite_exists() { return 0; }
+  ci_run_logged() {
+    printf '%s\n' "$@" >"$native_launcher_capture"
+    return 0
+  }
+  ci_record_sql_suite() { :; }
+  ci_render_summary() { :; }
+
+  run_native_cross_process_sql_suites
+)
+
+if grep -Fx -- "--query-timeout" "$native_launcher_capture" >/dev/null; then
+  echo "native iceberg-dml must use the SQL runner's suite timeout when CI has no explicit override" >&2
+  exit 1
+fi
+
+override_capture="$tmpdir/sql-runner-timeout-override.args"
+(
+  REPO_ROOT="$tmpdir/current-worktree"
+  CI_RUN_DIR="$tmpdir/sql-runner-timeout-override"
+  NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
+  NOVA_ENV_RUNTIME_DIR="$tmpdir/runtime"
+  RUN_MODE="explicit"
+  SQL_QUERY_TIMEOUT_SECONDS="75"
+  mkdir -p "$CI_RUN_DIR/sql"
+
+  resolve_suites() {
+    SUITES=(iceberg-dml)
+  }
+  ci_run_logged() {
+    printf '%s\n' "$@" >"$override_capture"
+    return 0
+  }
+  ci_record_sql_suite() { :; }
+  ci_render_summary() { :; }
+
+  run_sql_suites
+)
+
+if ! awk '
+  previous == "--query-timeout" && $0 == "75" { found = 1 }
+  { previous = $0 }
+  END { exit(found ? 0 : 1) }
+' "$override_capture"; then
+  echo "SQL_QUERY_TIMEOUT_SECONDS must override the iceberg-dml suite timeout" >&2
   exit 1
 fi
 

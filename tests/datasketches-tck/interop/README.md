@@ -70,6 +70,7 @@ Run it against the canonical REST fixture and native `1FE+3BE` topology:
 ```shell
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
+export NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_RUNTIME_DIR/env.sh"
 export NOVA_TRINO_IMAGE='trinodb/trino@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534'
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \

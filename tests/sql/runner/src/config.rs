@@ -567,6 +567,11 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn iceberg_dml_default_timeout_covers_expensive_boundary_cases() {
+        assert_eq!(suite_default_query_timeout("iceberg-dml"), 120);
+    }
+
+    #[test]
     fn suite_discovery_is_scoped_to_the_selected_physical_lane() {
         let temp = tempdir().expect("temporary repository root");
         let correctness_sql = temp.path().join("tests/sql/correctness/filter/sql");
