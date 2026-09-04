@@ -579,6 +579,7 @@ fn start_update_table_transaction(
     let dispatch = Arc::new(dispatch::UpdateTableDispatch::new(
         Arc::clone(delegate.client()),
         ident,
+        Arc::clone(&request.target_ref),
         request.marker.clone(),
     ));
     CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(

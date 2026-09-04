@@ -92,6 +92,15 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
         self.resolve_aggregate_user(name, arg_types)
     }
 
+    fn resolve_aggregate_update_signature(
+        &self,
+        name: &str,
+        logical_arg_types: &[DataType],
+        update_arg_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        self.resolve_aggregate_update_user(name, logical_arg_types, update_arg_types)
+    }
+
     fn resolve_aggregate_trusted(
         &self,
         name: &str,
@@ -156,10 +165,39 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
                 binding_enforced: true,
             });
         }
+        self.resolve_update_signature(&builtin_overload_identity(declaration)?, argument_types)
+    }
+
+    fn supports_ordered_update_channels(&self) -> bool {
+        builtin_supports_ordered_update_channels(self.declaration.name)
+    }
+
+    fn resolve_update_signature(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+        update_argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let declaration = self.declaration;
+        let overload = builtin_overload_identity(declaration)?;
+        if selected_overload != &overload {
+            return Err(FunctionResolutionError::BadSignature(format!(
+                "builtin aggregate `{}` has no selected overload `{}`",
+                declaration.name,
+                selected_overload.as_str()
+            )));
+        }
+        if !builtin_supports_ordered_update_channels(declaration.name)
+            && !(declaration.min_args..=declaration.max_args).contains(&update_argument_types.len())
+        {
+            return Err(FunctionResolutionError::BadSignature(format!(
+                "builtin aggregate `{}` does not support additional update channels",
+                declaration.name
+            )));
+        }
         let (output_type, intermediate_type) =
             novarocks_types::aggregate::infer_agg_function_types(
                 declaration.name,
-                argument_types,
+                update_argument_types,
                 false,
             )
             .map_err(FunctionResolutionError::BadSignature)?;
@@ -170,12 +208,8 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
             ))
         })?;
         Ok(ResolvedAggregateSignature {
-            overload: AggregateOverloadIdentity::try_new(format!(
-                "builtin/{}/v1",
-                declaration.name
-            ))
-            .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
-            argument_types: argument_types.to_vec(),
+            overload,
+            argument_types: update_argument_types.to_vec(),
             intermediate_type,
             output_type,
             state_format: AggregateStateFormatIdentity::try_new(format!(
@@ -185,6 +219,20 @@ impl AggregateSignatureResolver for BuiltinAggregateResolver {
             .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?,
         })
     }
+}
+
+fn builtin_supports_ordered_update_channels(name: &str) -> bool {
+    matches!(
+        name,
+        "array_agg" | "array_agg_distinct" | "array_unique_agg" | "group_concat" | "string_agg"
+    )
+}
+
+fn builtin_overload_identity(
+    declaration: AggregateDeclaration,
+) -> Result<AggregateOverloadIdentity, FunctionResolutionError> {
+    AggregateOverloadIdentity::try_new(format!("builtin/{}/v1", declaration.name))
+        .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))
 }
 
 const ONE_ARG_AGGREGATES: &[&str] = &[
@@ -531,6 +579,39 @@ mod tests {
         assert_eq!(std_user.intermediate_type, DataType::Binary);
         assert_eq!(std_user.output_type, DataType::Float64);
         assert_eq!(std_user.state_format.as_str(), "novarocks/std/state-v1");
+    }
+
+    #[test]
+    fn ordered_update_resolution_does_not_widen_logical_overloads() {
+        let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
+        assert!(matches!(
+            catalog.resolve_aggregate_user("array_agg", &[DataType::Utf8, DataType::Int64]),
+            Err(FunctionResolutionError::NoMatchingSignature { .. })
+        ));
+
+        let resolved = catalog
+            .resolve_aggregate_update_user(
+                "array_agg",
+                &[DataType::Utf8],
+                &[DataType::Utf8, DataType::Int64],
+            )
+            .expect("selected array_agg overload accepts one physical ORDER BY channel");
+        assert_eq!(resolved.overload.as_str(), "builtin/array_agg/v1");
+        assert_eq!(resolved.argument_types, [DataType::Utf8, DataType::Int64]);
+        let DataType::Struct(fields) = resolved.intermediate_type else {
+            panic!("ordered array_agg must expose a Struct intermediate");
+        };
+        assert_eq!(fields.len(), 2);
+
+        assert!(matches!(
+            catalog.resolve_aggregate_update_user(
+                "sum",
+                &[DataType::Int64],
+                &[DataType::Int64, DataType::Utf8],
+            ),
+            Err(FunctionResolutionError::BadSignature(message))
+                if message.contains("does not support function ORDER BY update channels")
+        ));
     }
 
     #[test]

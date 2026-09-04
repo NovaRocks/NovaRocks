@@ -5214,7 +5214,7 @@ mod tests {
     #[test]
     fn p1_grouping_marker_replaced_in_aggregate_order_by() {
         let resolved = parse_and_analyze(
-            "SELECT sum(v1 ORDER BY grouping(k1)) AS g \
+            "SELECT array_agg(v1 ORDER BY grouping(k1) + 0) AS g \
              FROM t1 GROUP BY ROLLUP(k1)",
         )
         .expect("GROUPING in aggregate ORDER BY should work");

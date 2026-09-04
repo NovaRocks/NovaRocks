@@ -1929,10 +1929,12 @@ impl<'a> super::AnalyzerContext<'a> {
             } else {
                 let executable_name =
                     novarocks_types::aggregate::mangle_distinct_aggregate_name(&name, is_distinct);
-                match self
-                    .function_catalog
-                    .resolve_aggregate_signature(&executable_name, &arg_types)
-                {
+                let update_arg_types = aggregate_update_argument_types(&arg_types, &func_order_by);
+                match self.function_catalog.resolve_aggregate_update_signature(
+                    &executable_name,
+                    &arg_types,
+                    &update_arg_types,
+                ) {
                     Ok(binding) => Some(binding),
                     Err(crate::functions::ResolveError::UnknownFunction) => {
                         if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
@@ -1949,7 +1951,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     Err(error) => {
                         return Err(aggregate_resolution_error(
                             &executable_name,
-                            &arg_types,
+                            &update_arg_types,
                             func.span,
                             error,
                         ));
@@ -2120,12 +2122,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
             let executable_name =
                 novarocks_types::aggregate::mangle_distinct_aggregate_name(&name, is_distinct);
-            bound_aggregate = Some(resolve_aggregate_function_call(
-                self.function_catalog,
-                &executable_name,
-                &arg_types,
-                func.span,
-            )?);
+            let update_arg_types = aggregate_update_argument_types(&arg_types, &func_order_by);
+            bound_aggregate = Some(
+                self.function_catalog
+                    .resolve_aggregate_update_signature(
+                        &executable_name,
+                        &arg_types,
+                        &update_arg_types,
+                    )
+                    .map_err(|error| {
+                        aggregate_resolution_error(&executable_name, &arg_types, func.span, error)
+                    })?,
+            );
         } else if !aggregate_macro {
             if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
                 return Err(AnalyzeError::unknown_function(
@@ -3990,6 +3998,27 @@ pub(super) fn resolve_aggregate_function_call(
         .map_err(|error| aggregate_resolution_error(name, arg_types, span, error))
 }
 
+/// Concrete argument types consumed by the executable aggregate update ABI.
+///
+/// Function ORDER BY expressions are physical aggregate inputs: ordered
+/// aggregates retain them in their intermediate state and must therefore
+/// freeze their types into the exact signature shared by FE and BE. Logical
+/// SQL arity/type validation is deliberately performed before this expansion.
+fn aggregate_update_argument_types(
+    logical_argument_types: &[DataType],
+    function_order_by: &[SortItem],
+) -> Vec<DataType> {
+    logical_argument_types
+        .iter()
+        .cloned()
+        .chain(
+            function_order_by
+                .iter()
+                .map(|item| item.expr.data_type.clone()),
+        )
+        .collect()
+}
+
 fn aggregate_resolution_error(
     name: &str,
     arg_types: &[DataType],
@@ -5846,6 +5875,44 @@ mod tests {
                         ..
                     }
             )));
+        }
+    }
+
+    #[test]
+    fn ordered_aggregate_binding_freezes_every_update_channel() {
+        let expr = analyze_projection_expr(
+            "select group_concat('v' order by 1, cast(7 as bigint) separator '|')",
+        )
+        .expect("ordered group_concat should analyze");
+        let crate::analysis::ExprKind::AggregateCall {
+            args,
+            order_by,
+            resolved,
+            ..
+        } = expr.kind
+        else {
+            panic!("expected AggregateCall, got {:?}", expr.kind);
+        };
+        assert_eq!(args.len(), 2, "value and separator remain logical args");
+        assert_eq!(order_by.len(), 2);
+        assert_eq!(
+            resolved.argument_types,
+            [
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Int64,
+            ]
+        );
+        let DataType::Struct(fields) = resolved.intermediate_type else {
+            panic!("expected Struct intermediate for ordered group_concat");
+        };
+        assert_eq!(fields.len(), 4);
+        for (field, input_type) in fields.iter().zip(resolved.argument_types.iter()) {
+            let DataType::List(item) = field.data_type() else {
+                panic!("expected List field in group_concat intermediate");
+            };
+            assert_eq!(item.data_type(), input_type);
         }
     }
 

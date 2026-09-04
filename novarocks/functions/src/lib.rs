@@ -220,6 +220,9 @@ impl AggregateOverloadMetadata {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ResolvedAggregateSignature {
     pub overload: AggregateOverloadIdentity,
+    /// Unpacked channels consumed by the executable update kernel. For an
+    /// ordered aggregate this is the logical SQL arguments followed by the
+    /// function ORDER BY expressions.
     pub argument_types: Vec<DataType>,
     pub intermediate_type: DataType,
     pub output_type: DataType,
@@ -265,6 +268,31 @@ pub trait AggregateSignatureResolver: Send + Sync {
         &self,
         argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError>;
+
+    /// Whether this aggregate family explicitly accepts function ORDER BY
+    /// expressions as additional executable update channels.
+    fn supports_ordered_update_channels(&self) -> bool {
+        false
+    }
+
+    /// Materialize the exact execution signature for an already-selected
+    /// logical overload. The default admits no extra update channels; ordered
+    /// aggregate families must opt in explicitly.
+    fn resolve_update_signature(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+        update_argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let resolved = self.resolve_aggregate(update_argument_types)?;
+        if &resolved.overload != selected_overload {
+            return Err(FunctionResolutionError::BadSignature(format!(
+                "aggregate update resolver selected overload `{}` instead of `{}`",
+                resolved.overload.as_str(),
+                selected_overload.as_str()
+            )));
+        }
+        Ok(resolved)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -547,6 +575,26 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
         argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError>;
 
+    fn supports_ordered_update_channels(&self) -> bool {
+        false
+    }
+
+    fn resolve_update_signature(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+        update_argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let resolved = self.resolve_signature(update_argument_types)?;
+        if &resolved.overload != selected_overload {
+            return Err(FunctionResolutionError::BadSignature(format!(
+                "aggregate update resolver selected overload `{}` instead of `{}`",
+                resolved.overload.as_str(),
+                selected_overload.as_str()
+            )));
+        }
+        Ok(resolved)
+    }
+
     fn prepare(
         &self,
         selected: &ResolvedAggregateSignature,
@@ -615,6 +663,19 @@ impl<F: TypedAggregateFamily> AggregateSignatureResolver for TypedFamilySignatur
         argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
         self.family.resolve_signature(argument_types)
+    }
+
+    fn supports_ordered_update_channels(&self) -> bool {
+        self.family.supports_ordered_update_channels()
+    }
+
+    fn resolve_update_signature(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+        update_argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        self.family
+            .resolve_update_signature(selected_overload, update_argument_types)
     }
 }
 
@@ -1177,6 +1238,25 @@ impl EngineFunctionCatalog {
         resolve_exact_aggregate(definition, argument_types)
     }
 
+    /// Resolve a logical SQL overload first, then materialize its exact
+    /// executable update signature. Function ORDER BY channels belong only to
+    /// `update_argument_types` and can never make an invalid logical call
+    /// match a declared overload.
+    pub fn resolve_aggregate_update_user(
+        &self,
+        name: &str,
+        logical_argument_types: &[DataType],
+        update_argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let definition = self
+            .definition(name, FunctionKind::Aggregate)
+            .ok_or(FunctionResolutionError::UnknownFunction)?;
+        if definition.visibility == FunctionVisibility::Hidden {
+            return Err(FunctionResolutionError::HiddenFunction);
+        }
+        resolve_aggregate_update(definition, logical_argument_types, update_argument_types)
+    }
+
     pub fn resolve_aggregate_trusted(
         &self,
         name: &str,
@@ -1186,6 +1266,33 @@ impl EngineFunctionCatalog {
             .definition(name, FunctionKind::Aggregate)
             .ok_or(FunctionResolutionError::UnknownFunction)?;
         resolve_exact_aggregate(definition, argument_types)
+    }
+
+    pub fn resolve_aggregate_update_trusted(
+        &self,
+        name: &str,
+        logical_argument_types: &[DataType],
+        update_argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let definition = self
+            .definition(name, FunctionKind::Aggregate)
+            .ok_or(FunctionResolutionError::UnknownFunction)?;
+        resolve_aggregate_update(definition, logical_argument_types, update_argument_types)
+    }
+
+    /// Re-materialize a previously selected execution signature without
+    /// reinterpreting update channels as a logical SQL call. Used by Execution
+    /// after FE/BE plan decoding already performed the two-stage validation.
+    pub fn resolve_selected_aggregate_update_trusted(
+        &self,
+        name: &str,
+        selected_overload: &AggregateOverloadIdentity,
+        update_argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let definition = self
+            .definition(name, FunctionKind::Aggregate)
+            .ok_or(FunctionResolutionError::UnknownFunction)?;
+        resolve_selected_aggregate_update(definition, selected_overload, update_argument_types)
     }
 }
 
@@ -1199,6 +1306,70 @@ fn resolve_exact_aggregate(
         )
     })?;
     let resolved = resolver.resolve_aggregate(argument_types)?;
+    validate_resolved_aggregate(definition, resolved, argument_types)
+}
+
+fn resolve_aggregate_update(
+    definition: &FunctionDefinition,
+    logical_argument_types: &[DataType],
+    update_argument_types: &[DataType],
+) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+    if !update_argument_types.starts_with(logical_argument_types) {
+        return Err(FunctionResolutionError::BadSignature(
+            "aggregate update arguments must begin with the logical arguments".into(),
+        ));
+    }
+    let resolver = definition.aggregate_resolver.as_ref().ok_or_else(|| {
+        FunctionResolutionError::BadSignature(
+            "aggregate has no safe typed signature contract".into(),
+        )
+    })?;
+    if update_argument_types != logical_argument_types
+        && !resolver.supports_ordered_update_channels()
+    {
+        return Err(FunctionResolutionError::BadSignature(format!(
+            "aggregate `{}` does not support function ORDER BY update channels",
+            definition.canonical_name()
+        )));
+    }
+    let logical = resolve_exact_aggregate(definition, logical_argument_types)?;
+    let update =
+        resolve_selected_aggregate_update(definition, &logical.overload, update_argument_types)?;
+    if update.output_type != logical.output_type || update.state_format != logical.state_format {
+        return Err(FunctionResolutionError::BadSignature(format!(
+            "aggregate overload `{}` update signature changed its logical output or state format",
+            logical.overload.as_str()
+        )));
+    }
+    Ok(update)
+}
+
+fn resolve_selected_aggregate_update(
+    definition: &FunctionDefinition,
+    selected_overload: &AggregateOverloadIdentity,
+    update_argument_types: &[DataType],
+) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+    let resolver = definition.aggregate_resolver.as_ref().ok_or_else(|| {
+        FunctionResolutionError::BadSignature(
+            "aggregate has no safe typed signature contract".into(),
+        )
+    })?;
+    let resolved = resolver.resolve_update_signature(selected_overload, update_argument_types)?;
+    if &resolved.overload != selected_overload {
+        return Err(FunctionResolutionError::BadSignature(format!(
+            "aggregate update resolver selected overload `{}` instead of `{}`",
+            resolved.overload.as_str(),
+            selected_overload.as_str()
+        )));
+    }
+    validate_resolved_aggregate(definition, resolved, update_argument_types)
+}
+
+fn validate_resolved_aggregate(
+    definition: &FunctionDefinition,
+    resolved: ResolvedAggregateSignature,
+    argument_types: &[DataType],
+) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
     if resolved.argument_types != argument_types {
         return Err(FunctionResolutionError::BadSignature(
             "aggregate resolver returned argument types different from the bound input".into(),

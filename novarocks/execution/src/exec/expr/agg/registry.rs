@@ -498,7 +498,11 @@ impl SealedExecutionFunctionSet {
         let selected = context.selected;
         let local = self
             .catalog
-            .resolve_aggregate_trusted(canonical_name, &selected.argument_types)
+            .resolve_selected_aggregate_update_trusted(
+                canonical_name,
+                &selected.overload,
+                &selected.argument_types,
+            )
             .map_err(|error| ExecutionFunctionSetError::PrepareAggregate {
                 canonical_name: canonical_name.into(),
                 overload: selected.overload.clone(),

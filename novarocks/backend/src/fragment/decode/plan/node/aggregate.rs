@@ -200,15 +200,16 @@ pub(super) fn lower_hash_aggregate_node(
             &call.name,
             call_path.clone().field("resolved_signature"),
         )?;
-        let expression_arg_types = aggregate_signature_arg_types(call, call_path.clone())?;
-        if !is_merge && expression_arg_types != planned.argument_types {
+        let logical_arg_types = aggregate_logical_arg_types(call, call_path.clone())?;
+        let update_arg_types = aggregate_signature_arg_types(call, call_path.clone())?;
+        if !is_merge && update_arg_types != planned.argument_types {
             return Err(NativeFragmentDecodeError::invalid_value(
                 call_path
                     .clone()
                     .field("resolved_signature")
                     .field("argument_types"),
                 format!(
-                    "HashAggregateNode aggregate {idx} argument type drift: expressions={expression_arg_types:?} planned={:?}",
+                    "HashAggregateNode aggregate {idx} update argument type drift: expressions={update_arg_types:?} planned={:?}",
                     planned.argument_types
                 ),
             ));
@@ -219,14 +220,25 @@ pub(super) fn lower_hash_aggregate_node(
                 "HashAggregateNode requires the process engine function catalog",
             )
         })?;
-        let selected = function_catalog
-            .resolve_aggregate_trusted(&function_name, &planned.argument_types)
-            .map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(
-                    call_path.clone(),
-                    format!("HashAggregateNode aggregate {idx} resolution: {error}"),
-                )
-            })?;
+        let selected = if is_merge {
+            function_catalog.resolve_selected_aggregate_update_trusted(
+                &function_name,
+                &planned.overload,
+                &planned.argument_types,
+            )
+        } else {
+            function_catalog.resolve_aggregate_update_trusted(
+                &function_name,
+                &logical_arg_types,
+                &update_arg_types,
+            )
+        }
+        .map_err(|error| {
+            NativeFragmentDecodeError::invalid_value(
+                call_path.clone(),
+                format!("HashAggregateNode aggregate {idx} resolution: {error}"),
+            )
+        })?;
         if selected != planned {
             return Err(NativeFragmentDecodeError::invalid_value(
                 call_path.clone().field("resolved_signature"),
@@ -413,6 +425,56 @@ fn aggregate_signature_arg_types(
     call: &plan::PlanAggregateCall,
     path: FieldPath,
 ) -> Result<Vec<DataType>, NativeFragmentDecodeError> {
+    let mut types = call
+        .args
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            let ty = expr.r#type.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    path.clone().field("args").index(idx).field("type"),
+                    format!("aggregate {} argument {idx} type missing", call.name),
+                )
+            })?;
+            NativeFragmentDecodeError::map_invalid(
+                path.clone().field("args").index(idx).field("type"),
+                crate::fragment::decode::type_decode::decode_type(ty),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (idx, item) in call.order_by.iter().enumerate() {
+        let expr = item.expr.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("order_by").index(idx).field("expr"),
+                format!("aggregate {} order_by[{idx}] expr missing", call.name),
+            )
+        })?;
+        let data_type = expr.r#type.as_ref().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone()
+                    .field("order_by")
+                    .index(idx)
+                    .field("expr")
+                    .field("type"),
+                format!("aggregate {} order_by[{idx}] type missing", call.name),
+            )
+        })?;
+        types.push(NativeFragmentDecodeError::map_invalid(
+            path.clone()
+                .field("order_by")
+                .index(idx)
+                .field("expr")
+                .field("type"),
+            crate::fragment::decode::type_decode::decode_type(data_type),
+        )?);
+    }
+    Ok(types)
+}
+
+fn aggregate_logical_arg_types(
+    call: &plan::PlanAggregateCall,
+    path: FieldPath,
+) -> Result<Vec<DataType>, NativeFragmentDecodeError> {
     call.args
         .iter()
         .enumerate()
@@ -428,7 +490,7 @@ fn aggregate_signature_arg_types(
                 crate::fragment::decode::type_decode::decode_type(ty),
             )
         })
-        .collect::<Result<Vec<_>, _>>()
+        .collect()
 }
 
 fn lower_aggregate_update_inputs(
@@ -802,9 +864,58 @@ mod tests {
     }
 
     #[test]
+    fn hash_aggregate_merge_reuses_the_frozen_update_signature() {
+        let output_columns = vec![output_column(3, "avg_id", DataType::Float64)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Global as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_ref(2, DataType::Utf8)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Float64)),
+                    order_by: Vec::new(),
+                    output_column_id: 3,
+                    resolved_signature: resolved_aggregate_signature("avg", &[DataType::Int64]),
+                }],
+                is_merge: vec![true],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![values_node(10)],
+        );
+
+        let lowered = lower(&aggregate);
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(
+            aggregate.resolved_aggregates[0].argument_types,
+            [DataType::Int64]
+        );
+        assert_eq!(
+            aggregate.functions[0]
+                .types
+                .as_ref()
+                .expect("aggregate type signature")
+                .input_arg_type,
+            Some(DataType::Int64)
+        );
+    }
+
+    #[test]
     fn hash_aggregate_ordered_inputs_pack_order_by_exprs() {
-        let resolved_signature =
-            resolved_aggregate_signature("group_concat", &[DataType::Utf8, DataType::Utf8]);
+        let resolved_signature = resolved_aggregate_update_signature(
+            "group_concat",
+            &[DataType::Utf8, DataType::Utf8],
+            &[DataType::Utf8, DataType::Utf8, DataType::Int64],
+        );
         let intermediate_type = crate::fragment::decode::type_decode::decode_type(
             resolved_signature
                 .as_ref()
@@ -859,6 +970,16 @@ mod tests {
         assert_eq!(aggregate.functions[0].order.is_asc_order, vec![true]);
         assert_eq!(aggregate.functions[0].order.nulls_first, vec![false]);
         assert!(aggregate.functions[0].order.is_distinct);
+        assert_eq!(
+            aggregate.resolved_aggregates[0].argument_types,
+            [DataType::Utf8, DataType::Utf8, DataType::Int64]
+        );
+        let DataType::Struct(intermediate_fields) =
+            &aggregate.resolved_aggregates[0].intermediate_type
+        else {
+            panic!("expected group_concat Struct intermediate");
+        };
+        assert_eq!(intermediate_fields.len(), 3);
     }
 
     #[test]

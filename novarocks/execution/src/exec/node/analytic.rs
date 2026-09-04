@@ -96,13 +96,13 @@ pub struct WindowFunctionSpec {
     pub kind: WindowFunctionKind,
     /// Physical expressions evaluated by the analytic operator. These may be
     /// packed (for example max_by(value, key) becomes one Struct expression)
-    /// and therefore are deliberately distinct from the logical argument
-    /// types frozen in `aggregate_binding`.
+    /// while the exact binding freezes the unpacked executable update channel
+    /// types, including function ORDER BY keys.
     pub args: Vec<ExprId>,
     pub return_type: DataType,
     /// Exact ordinary aggregate identity selected by FE analysis. Window-only
     /// functions carry `None`; every aggregate-as-window function carries the
-    /// executable canonical name plus its logical signature.
+    /// executable canonical name plus its exact update signature.
     pub aggregate_binding: Option<WindowAggregateBinding>,
 }
 

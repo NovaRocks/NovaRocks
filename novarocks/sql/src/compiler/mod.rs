@@ -218,6 +218,26 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         novarocks_functions::FunctionResolutionError,
     >;
 
+    /// Resolve the declared logical overload, then materialize the exact
+    /// executable update signature. The latter may append function ORDER BY
+    /// channels without changing logical SQL arity.
+    fn resolve_aggregate_update_signature(
+        &self,
+        name: &str,
+        logical_arg_types: &[arrow::datatypes::DataType],
+        update_arg_types: &[arrow::datatypes::DataType],
+    ) -> Result<
+        novarocks_functions::ResolvedAggregateSignature,
+        novarocks_functions::FunctionResolutionError,
+    > {
+        if logical_arg_types != update_arg_types {
+            return Err(novarocks_functions::FunctionResolutionError::BadSignature(
+                "function catalog does not support ordered aggregate update signatures".into(),
+            ));
+        }
+        self.resolve_aggregate_signature(name, logical_arg_types)
+    }
+
     fn resolve_aggregate_trusted(
         &self,
         name: &str,

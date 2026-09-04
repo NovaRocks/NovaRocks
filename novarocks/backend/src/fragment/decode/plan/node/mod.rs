@@ -1773,6 +1773,29 @@ mod tests {
         })
     }
 
+    pub(super) fn resolved_aggregate_update_signature(
+        name: &str,
+        logical_argument_types: &[DataType],
+        update_argument_types: &[DataType],
+    ) -> Option<plan::ResolvedAggregateSignature> {
+        let selected = test_function_catalog()
+            .resolve_aggregate_update_trusted(name, logical_argument_types, update_argument_types)
+            .expect("resolved builtin aggregate update signature");
+        Some(plan::ResolvedAggregateSignature {
+            overload_identity: selected.overload.as_str().to_string(),
+            argument_types: selected
+                .argument_types
+                .iter()
+                .map(|data_type| encode_type(data_type).expect("encoded argument type"))
+                .collect(),
+            intermediate_type: Some(
+                encode_type(&selected.intermediate_type).expect("encoded intermediate type"),
+            ),
+            output_type: Some(encode_type(&selected.output_type).expect("encoded output type")),
+            state_format_identity: selected.state_format.as_str().to_string(),
+        })
+    }
+
     #[allow(
         dead_code,
         reason = "Retained for target-specific native integration and regression coverage."

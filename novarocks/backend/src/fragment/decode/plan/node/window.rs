@@ -463,6 +463,27 @@ fn lower_window_function(
             )
         })
         .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
+    if !expr.function_order_by.is_empty() && !matches!(kind, WindowFunctionKind::ArrayAgg { .. }) {
+        return Err(NativeFragmentDecodeError::unsupported(
+            path.clone().field("function_order_by"),
+            format!("window function {name} does not support function ORDER BY"),
+        ));
+    }
+    let function_order_args = expr
+        .function_order_by
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let item_path = path.clone().field("function_order_by").index(idx);
+            let order_expr = item.expr.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    item_path.clone().field("expr"),
+                    format!("window aggregate {name} function_order_by[{idx}] expr missing"),
+                )
+            })?;
+            ctx.decode_expression(order_expr, item_path.field("expr"), arena, input_layout)
+        })
+        .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
     let aggregate_binding = if is_aggregate_window_kind(&kind) {
         let executable_name = mangle_distinct_aggregate_name(&name, expr.distinct);
         let planned = decode_resolved_aggregate_signature(
@@ -481,13 +502,22 @@ fn lower_window_function(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if logical_argument_types != planned.argument_types {
+        let mut update_argument_types = logical_argument_types.clone();
+        for arg in &function_order_args {
+            update_argument_types.push(arena.data_type(*arg).cloned().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    path.clone().field("function_order_by"),
+                    format!("window aggregate {name} ORDER BY argument type missing"),
+                )
+            })?);
+        }
+        if update_argument_types != planned.argument_types {
             return Err(NativeFragmentDecodeError::invalid_value(
                 path.clone()
                     .field("aggregate_binding")
                     .field("argument_types"),
                 format!(
-                    "window aggregate {name} argument type drift: expressions={logical_argument_types:?} planned={:?}",
+                    "window aggregate {name} update argument type drift: expressions={update_argument_types:?} planned={:?}",
                     planned.argument_types
                 ),
             ));
@@ -499,7 +529,11 @@ fn lower_window_function(
             )
         })?;
         let selected = function_catalog
-            .resolve_aggregate_trusted(&executable_name, &planned.argument_types)
+            .resolve_aggregate_update_trusted(
+                &executable_name,
+                &logical_argument_types,
+                &update_argument_types,
+            )
             .map_err(|error| {
                 NativeFragmentDecodeError::invalid_value(
                     path.clone().field("aggregate_binding"),
@@ -537,28 +571,8 @@ fn lower_window_function(
         None
     };
 
-    if !expr.function_order_by.is_empty() && !matches!(kind, WindowFunctionKind::ArrayAgg { .. }) {
-        return Err(NativeFragmentDecodeError::unsupported(
-            path.clone().field("function_order_by"),
-            format!("window function {name} does not support function ORDER BY"),
-        ));
-    }
     let mut args = logical_args;
-    for (idx, item) in expr.function_order_by.iter().enumerate() {
-        let item_path = path.clone().field("function_order_by").index(idx);
-        let order_expr = item.expr.as_ref().ok_or_else(|| {
-            NativeFragmentDecodeError::missing(
-                item_path.clone().field("expr"),
-                format!("window aggregate {name} function_order_by[{idx}] expr missing"),
-            )
-        })?;
-        args.push(ctx.decode_expression(
-            order_expr,
-            item_path.field("expr"),
-            arena,
-            input_layout,
-        )?);
-    }
+    args.extend(function_order_args);
     if matches!(
         kind,
         WindowFunctionKind::ArrayAgg { .. } | WindowFunctionKind::MaxBy | WindowFunctionKind::MinBy
@@ -829,6 +843,23 @@ mod tests {
         let selected = function_catalog()
             .resolve_aggregate_trusted(name, argument_types)
             .expect("resolved aggregate binding");
+        Some(plan::ResolvedAggregateSignature {
+            overload_identity: selected.overload.as_str().to_string(),
+            argument_types: selected.argument_types.iter().map(type_desc).collect(),
+            intermediate_type: Some(type_desc(&selected.intermediate_type)),
+            output_type: Some(type_desc(&selected.output_type)),
+            state_format_identity: selected.state_format.as_str().to_string(),
+        })
+    }
+
+    fn aggregate_update_binding(
+        name: &str,
+        logical_argument_types: &[DataType],
+        update_argument_types: &[DataType],
+    ) -> Option<plan::ResolvedAggregateSignature> {
+        let selected = function_catalog()
+            .resolve_aggregate_update_trusted(name, logical_argument_types, update_argument_types)
+            .expect("resolved aggregate update binding");
         Some(plan::ResolvedAggregateSignature {
             overload_identity: selected.overload.as_str().to_string(),
             argument_types: selected.argument_types.iter().map(type_desc).collect(),
@@ -1259,7 +1290,11 @@ mod tests {
                     args: vec![column_ref(1, DataType::Utf8)],
                     distinct: false,
                     function_order_by: vec![function_order],
-                    aggregate_binding: aggregate_binding("array_agg", &[DataType::Utf8]),
+                    aggregate_binding: aggregate_update_binding(
+                        "array_agg",
+                        &[DataType::Utf8],
+                        &[DataType::Utf8, DataType::Int64],
+                    ),
                     partition_by: Vec::new(),
                     order_by: vec![sort_item(2)],
                     window_frame: None,
@@ -1290,6 +1325,15 @@ mod tests {
         };
         assert_eq!(is_asc_order, &[false]);
         assert_eq!(nulls_first, &[true]);
+        assert_eq!(
+            function
+                .aggregate_binding
+                .as_ref()
+                .expect("array_agg aggregate binding")
+                .resolved
+                .argument_types,
+            [DataType::Utf8, DataType::Int64]
+        );
         let [physical] = function.args.as_slice() else {
             panic!("expected packed value and function-order input");
         };
