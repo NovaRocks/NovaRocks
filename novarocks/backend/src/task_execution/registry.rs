@@ -1769,6 +1769,7 @@ impl TaskExecutionRegistry {
                 now,
             ) {
                 self.counters.lease_expiries.fetch_add(1, Ordering::Relaxed);
+                marker::query_execution_lease_expired(context);
                 count += 1;
             }
         }
@@ -1933,7 +1934,7 @@ impl TaskExecutionRegistry {
             if let Some(entry) = state.contexts.get_mut(&context) {
                 entry.last_retire_revision = Some(entry.source.revision());
             }
-            let retirements: Vec<(TaskIdentity, usize)> = {
+            let retirements: Vec<(TaskIdentity, usize, TaskState)> = {
                 let Some(entry) = state.contexts.get_mut(&context) else {
                     continue;
                 };
@@ -1968,6 +1969,7 @@ impl TaskExecutionRegistry {
                     let final_info = live.status.final_info();
                     let bytes =
                         estimate_retained_bytes(&live.receipt, &status, final_info.as_ref());
+                    let terminal_state = status.state();
                     entry.tasks.insert(
                         identity,
                         TaskEntry::Retired(Box::new(RetiredTask {
@@ -1980,15 +1982,16 @@ impl TaskExecutionRegistry {
                             bytes,
                         })),
                     );
-                    retirements.push((identity, bytes));
+                    retirements.push((identity, bytes, terminal_state));
                 }
                 retirements
             };
-            for (identity, bytes) in retirements {
+            for (identity, bytes, terminal_state) in retirements {
                 state.active_tasks = state.active_tasks.saturating_sub(1);
                 state.retained_tasks = state.retained_tasks.saturating_add(1);
                 state.retained_bytes = state.retained_bytes.saturating_add(bytes);
                 state.retired_task_order.push_back((context, identity));
+                marker::task_terminal_retained(identity, terminal_state, bytes);
                 retired += 1;
             }
         }
@@ -2061,6 +2064,13 @@ impl TaskExecutionRegistry {
                     entry.facts_released = true;
                 }
                 entry.credential_material = None;
+                if event == QueryContextEvent::AbortCompleted {
+                    marker::context_termination_completed(
+                        context,
+                        entry.latch.cause(),
+                        entry.tasks.len(),
+                    );
+                }
             }
             state.retired_context_order.push_back(context);
         }

@@ -150,6 +150,11 @@ impl RegistryTaskExecutionIngress {
                 let receipt = self.registry.update_query_context(&neutral);
                 match &neutral {
                     UpdateQueryContext::Establish(_) => {
+                        // The rendezvous comes first: it holds an applied
+                        // establish open so the harness can replace this exact
+                        // process, and an answer dropped afterwards would
+                        // belong to a process that no longer exists.
+                        fault::restart_after_establish_context(context, receipt.outcome())?;
                         fault::establish_context_ack_dropped(context, receipt.outcome())?;
                     }
                     UpdateQueryContext::RenewLease(_) => {

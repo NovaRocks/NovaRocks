@@ -86,6 +86,23 @@ pub enum QueryLifecycleFaultKind {
     /// protocol's heartbeat-loss case asserted, which a single dropped
     /// acknowledgement cannot reach because the frontend simply resends it.
     LeaseRenewalStop,
+    /// Fails one task's local execution after the task started.
+    ///
+    /// It is deliberately not an acknowledgement drop: the subject is a task
+    /// that was admitted, published RUNNING, and then failed on its own, which
+    /// is the only way to observe the attempt-wide stand-down a single
+    /// participant's failure must cause. It never fabricates a success and
+    /// never skips the create it follows.
+    TaskExecutionFailure,
+    /// Holds one applied `EstablishQueryContext` open so the harness can
+    /// replace that exact backend process.
+    ///
+    /// The successor of `RestartAfterInitAck`: the establish is the task
+    /// protocol's first per-backend admission point, so it is where a process
+    /// replacement can still be observed against a context the backend really
+    /// installed. It perturbs nothing on its own -- it publishes a
+    /// token-scoped marker and waits to be killed.
+    RestartAfterEstablishContext,
     StageConflictAfterApply,
     StartDigestCorrupt,
     ObservationForeignParticipant,
@@ -100,7 +117,7 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 37] = [
         Self::InitAckDrop,
         Self::StageAckDrop,
         Self::StartAckDrop,
@@ -130,6 +147,8 @@ impl QueryLifecycleFaultKind {
         Self::TaskStatusSubscriptionDrop,
         Self::LeaseRenewalAckDrop,
         Self::LeaseRenewalStop,
+        Self::TaskExecutionFailure,
+        Self::RestartAfterEstablishContext,
         Self::StageConflictAfterApply,
         Self::StartDigestCorrupt,
         Self::ObservationForeignParticipant,
@@ -171,6 +190,8 @@ impl QueryLifecycleFaultKind {
             Self::TaskStatusSubscriptionDrop => "task-status-subscription-drop",
             Self::LeaseRenewalAckDrop => "lease-renewal-ack-drop",
             Self::LeaseRenewalStop => "lease-renewal-stop",
+            Self::TaskExecutionFailure => "task-execution-failure",
+            Self::RestartAfterEstablishContext => "restart-after-establish-context",
             Self::StageConflictAfterApply => "stage-conflict-after-apply",
             Self::StartDigestCorrupt => "start-digest-corrupt",
             Self::ObservationForeignParticipant => "observation-foreign-participant",
@@ -198,7 +219,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 25] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 27] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -222,6 +243,13 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 25] = [
     QueryLifecycleFaultKind::TaskStatusSubscriptionDrop,
     QueryLifecycleFaultKind::LeaseRenewalAckDrop,
     QueryLifecycleFaultKind::LeaseRenewalStop,
+    // The task protocol's two non-acknowledgement faults. One fails a task
+    // that really started; the other holds an applied establish open so the
+    // harness can replace that exact backend process. Neither can be written
+    // as an acknowledgement drop, because in both cases the answer arriving
+    // is not what the case is about.
+    QueryLifecycleFaultKind::TaskExecutionFailure,
+    QueryLifecycleFaultKind::RestartAfterEstablishContext,
     QueryLifecycleFaultKind::StageConflictAfterApply,
     QueryLifecycleFaultKind::StartDigestCorrupt,
     QueryLifecycleFaultKind::ObservationForeignParticipant,
@@ -703,14 +731,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 35);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 37);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 25);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 27);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)
@@ -738,6 +766,14 @@ mod tests {
         assert_eq!(
             parse_runner_rfo_kind("lease-renewal-ack-drop"),
             Some(QueryLifecycleFaultKind::LeaseRenewalAckDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("task-execution-failure"),
+            Some(QueryLifecycleFaultKind::TaskExecutionFailure)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("restart-after-establish-context"),
+            Some(QueryLifecycleFaultKind::RestartAfterEstablishContext)
         );
         assert_eq!(
             parse_runner_rfo_kind("connector-write-writer-failure"),

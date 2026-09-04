@@ -39,6 +39,7 @@
 use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution::task_execution::lease::LeaseSequence;
 use novarocks_execution::task_execution::operation::{OperationOutcome, ReleaseOutcome};
+use novarocks_execution::task_execution::status::{TaskState, TerminationDetail};
 
 use super::receipt::{CreateTaskOutcome, QueryContextOutcome, ReleaseQueryContextOutcome};
 
@@ -159,6 +160,91 @@ pub(super) fn release_query_context(
         return;
     }
     emit_context("NOVAROCKS_TASK_RELEASE_APPLIED", context);
+}
+
+/// One context whose query execution lease ran out.
+///
+/// This is the only backend-local evidence that a coordinator stopped
+/// renewing. The task protocol has no long-lived control stream, so a
+/// frontend that dies is indistinguishable from one that is merely slow until
+/// its lease expires -- and that expiry is what makes each backend stand its
+/// own tasks down. A case asserting "the coordinator went away and every
+/// backend released its share" has nothing else to count.
+///
+/// Emitted only where the expiry won the context's termination latch, so it
+/// counts terminations caused by lease loss rather than every context that
+/// happened to hold an expired lease when something else ended it.
+pub(super) fn query_execution_lease_expired(context: QueryContextRef) {
+    if !enabled() {
+        return;
+    }
+    emit_context("NOVAROCKS_TASK_CONTEXT_LEASE_EXPIRED", context);
+}
+
+/// One context that finished terminating and now holds only bounded records.
+///
+/// The abnormal counterpart of `NOVAROCKS_TASK_RELEASE_APPLIED`: every task
+/// this context knew is a terminal record, its shared facts are released, and
+/// its lease is cleared. It is deliberately not emitted for the release path,
+/// because a marker that meant both "the query ended normally" and "the query
+/// was torn down" could not be counted by a case asserting either.
+pub(super) fn context_termination_completed(
+    context: QueryContextRef,
+    cause: Option<&TerminationDetail>,
+    retained_tasks: usize,
+) {
+    if !enabled() {
+        return;
+    }
+    let execution = context.query_execution_id();
+    println!(
+        "NOVAROCKS_TASK_CONTEXT_TERMINATION_COMPLETED execution_id={}:{}:{} frontend={} backend={} cause={} retained_tasks={retained_tasks}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        context.frontend_process_id(),
+        context.backend_process_id(),
+        termination_cause_name(cause),
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+/// One task that became a bounded retained terminal record.
+///
+/// Retirement is the moment a task stops owning execution resources -- its
+/// inbound capability and receiver are removed here -- while its terminal
+/// answer stays readable for the request horizon. That pair is exactly what a
+/// case about retention has to observe: the resources are gone and the record
+/// is not.
+pub(super) fn task_terminal_retained(identity: TaskIdentity, state: TaskState, bytes: usize) {
+    if !enabled() {
+        return;
+    }
+    let execution = identity.query_execution_id();
+    println!(
+        "NOVAROCKS_TASK_TERMINAL_RETAINED execution_id={}:{}:{} stage={} task={} backend={} state={state} bytes={bytes}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get(),
+        identity.stage_id().get(),
+        identity.task_id().get(),
+        identity.backend_process_id(),
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+/// A stable short name for a latched termination cause.
+///
+/// The failure variant collapses to one name on purpose: a task's own detail
+/// is bounded, redacted text meant for the client, and putting it in a
+/// space-separated marker field would make the field unparseable.
+fn termination_cause_name(cause: Option<&TerminationDetail>) -> &'static str {
+    match cause {
+        Some(TerminationDetail::Canceled(reason)) => reason.as_str(),
+        Some(TerminationDetail::Aborted(cause)) => cause.as_str(),
+        Some(TerminationDetail::Failed(_)) => "TASK_FAILED",
+        None => "NONE",
+    }
 }
 
 /// One applied context abort, with the cause the frontend sent.

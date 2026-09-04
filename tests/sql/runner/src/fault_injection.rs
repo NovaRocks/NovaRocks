@@ -28,6 +28,61 @@ const POST_FRAGMENT_START_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const POST_FRAGMENT_START_TIMEOUT: Duration = Duration::from_secs(1);
 const POST_FRAGMENT_START_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// The armed kind name of the task protocol's establish rendezvous.
+///
+/// It is armed through the generic lifecycle-fault hook, which takes the kind
+/// by name, so the runner and the backend agree on this one string.
+const RESTART_AFTER_ESTABLISH_CONTEXT: &str = "restart-after-establish-context";
+/// The token-scoped marker that rendezvous publishes.
+const TASK_ESTABLISH_CONTEXT_OBSERVED: &str = "NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED";
+/// The retired lifecycle protocol's restart rendezvous marker.
+const QUERY_INIT_ACK_OBSERVED: &str = "NOVAROCKS_QUERY_INIT_ACK_OBSERVED";
+
+/// What a replaced backend process must not be found doing.
+///
+/// A restart proof is only as good as the markers it looks for: a fresh
+/// process that re-published the old attempt's admission evidence would have
+/// restored state it must never restore, and a marker family that names its
+/// process identity differently has to be read with that family's own field
+/// name. Both are protocol facts, so both are named per protocol rather than
+/// assumed.
+#[derive(Copy, Clone)]
+struct RestartNonRestoreContract {
+    kind: &'static str,
+    forbidden: &'static [&'static str],
+    family_prefix: &'static str,
+    identity_field: &'static str,
+}
+
+/// The retired Init/Stage/Start protocol's contract.
+const LIFECYCLE_RESTART_CONTRACT: RestartNonRestoreContract = RestartNonRestoreContract {
+    kind: "be-restart",
+    forbidden: &[
+        "NOVAROCKS_QUERY_CONTROL_READY",
+        "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
+        "NOVAROCKS_QUERY_INIT_APPLIED",
+    ],
+    family_prefix: "NOVAROCKS_QUERY_",
+    identity_field: "process_id",
+};
+
+/// The task protocol's contract.
+///
+/// The two forbidden markers are the protocol's only two admission points: a
+/// context this process established, and a task it admitted. Its marker family
+/// names the backend process in `backend=` rather than `process_id=`, because
+/// a task-protocol identity is a component of the operation's identity rather
+/// than a separate attribution field.
+const TASK_RESTART_CONTRACT: RestartNonRestoreContract = RestartNonRestoreContract {
+    kind: "be-restart-after-establish-context",
+    forbidden: &[
+        "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED",
+        "NOVAROCKS_TASK_CREATE_APPLIED",
+    ],
+    family_prefix: "NOVAROCKS_TASK_",
+    identity_field: "backend",
+};
+
 const QUERY_RUNNING: u8 = 0;
 const FAULT_CLAIMED: u8 = 1;
 const QUERY_DONE: u8 = 2;
@@ -138,8 +193,11 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.restart_be_after_init_ack_index.is_some()
+        || meta.restart_be_after_establish_context_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
         || meta.kill_query_after_be_log_contains.is_some()
+        || meta.kill_fe_after_be_log_contains.is_some()
+        || meta.kill_be_after_be_log_contains.is_some()
         || meta.fail_stage_prepare_ordinal.is_some()
         || meta.drop_next_stage_ack_be_index.is_some()
         || meta.drop_next_start_ack_be_index.is_some()
@@ -189,8 +247,11 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.restart_be_after_init_ack_index.is_some()
+        || meta.restart_be_after_establish_context_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
         || meta.kill_query_after_be_log_contains.is_some()
+        || meta.kill_fe_after_be_log_contains.is_some()
+        || meta.kill_be_after_be_log_contains.is_some()
         || meta.fail_stage_prepare_ordinal.is_some()
         || meta.drop_next_stage_ack_be_index.is_some()
         || meta.drop_next_start_ack_be_index.is_some()
@@ -226,6 +287,7 @@ pub(crate) fn permits_terminal_retention(meta: &QueryMeta) -> bool {
     meta.kill_fe_after_control_ready_count.is_some()
         || meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.kill_fe_at_lifecycle_phase.is_some()
+        || meta.kill_fe_after_be_log_contains.is_some()
 }
 
 pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -> Result<()> {
@@ -235,6 +297,7 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     let fragment_fault_count = [
         meta.kill_be_index.is_some(),
         meta.kill_be_after_fragment_start.is_some(),
+        meta.kill_be_after_be_log_contains.is_some(),
         meta.fail_fragment_after_start_be_index.is_some(),
     ]
     .into_iter()
@@ -242,7 +305,7 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     .count();
     if fragment_fault_count > 1 {
         bail!(
-            "a SQL step may configure at most one fragment fault directive: kill_be_index, kill_be_after_fragment_start, or fail_fragment_after_start_be_index"
+            "a SQL step may configure at most one fragment fault directive: kill_be_index, kill_be_after_fragment_start, kill_be_after_be_log_contains, or fail_fragment_after_start_be_index"
         );
     }
 
@@ -252,8 +315,10 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.kill_fe_after_control_ready_count.is_some(),
         meta.kill_fe_after_mv_known_committed_before_projector_cas,
         meta.restart_be_after_init_ack_index.is_some(),
+        meta.restart_be_after_establish_context_index.is_some(),
         meta.kill_query_after_control_ready_count.is_some(),
         meta.kill_query_after_be_log_contains.is_some(),
+        meta.kill_fe_after_be_log_contains.is_some(),
         meta.fail_stage_prepare_ordinal.is_some(),
         meta.drop_next_stage_ack_be_index.is_some(),
         meta.drop_next_start_ack_be_index.is_some(),
@@ -321,6 +386,10 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
             meta.restart_be_after_init_ack_index,
         ),
         (
+            "restart_be_after_establish_context_index",
+            meta.restart_be_after_establish_context_index,
+        ),
+        (
             "drop_next_stage_ack_be_index",
             meta.drop_next_stage_ack_be_index,
         ),
@@ -384,6 +453,14 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
             );
         }
     }
+    if let Some(fault) = &meta.kill_be_after_be_log_contains
+        && fault.be_index >= be_count
+    {
+        bail!(
+            "kill_be_after_be_log_contains BE index {} is out of bounds for {be_count} BE(s)",
+            fault.be_index
+        );
+    }
     if let Some(fault) = meta.kill_be_at_lifecycle_phase
         && fault.be_index >= be_count
     {
@@ -407,6 +484,13 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     }
     if let Some(index) = meta.restart_be_after_init_ack_index {
         server.arm_be_restart_after_init_ack(index)?;
+    }
+    if let Some(index) = meta.restart_be_after_establish_context_index {
+        // Armed through the generic lifecycle-fault hook rather than through a
+        // dedicated harness method: the arm file, its token and its cleanup
+        // are already the same for every kind, and a second bespoke method
+        // would only duplicate them under a new name.
+        server.arm_query_lifecycle_fault(index, RESTART_AFTER_ESTABLISH_CONTEXT)?;
     }
     if let Some(ordinal) = meta.fail_stage_prepare_ordinal {
         server.arm_stage_prepare_failure(ordinal)?;
@@ -487,6 +571,14 @@ where
         KillFrontendAfterControlReady(usize),
         KillFrontendAfterMvKnownCommittedBeforeProjectorCas,
         RestartBackendAfterInitAck(usize),
+        RestartBackendAfterEstablishContext(usize),
+        KillFrontendAfterBeLogContains {
+            pattern: String,
+        },
+        KillBackendAfterBeLogContains {
+            index: usize,
+            pattern: String,
+        },
         KillQueryAfterControlReady {
             ready_count: usize,
             connection_id: u32,
@@ -519,6 +611,8 @@ where
             index: usize,
             token: String,
             process_id: novarocks_types::BackendProcessId,
+            /// The token-scoped rendezvous marker of this fault's protocol.
+            marker: &'static str,
         },
         FrontendPhase {
             phase: crate::types::QueryLifecyclePhase,
@@ -531,6 +625,17 @@ where
         BeLogPattern {
             pattern: String,
             counts: Vec<usize>,
+        },
+        /// A pattern that must appear on one named backend.
+        ///
+        /// A kill aimed at one process has to wait for that process to reach
+        /// the named point. Accepting the line from any backend would let the
+        /// kill land on a backend the attempt had not reached yet, which
+        /// proves nothing about losing a running participant.
+        BeLogPatternOnBackend {
+            index: usize,
+            pattern: String,
+            count: usize,
         },
     }
 
@@ -545,6 +650,19 @@ where
             .then_some(PostQueryFault::KillFrontendAfterMvKnownCommittedBeforeProjectorCas),
         meta.restart_be_after_init_ack_index
             .map(PostQueryFault::RestartBackendAfterInitAck),
+        meta.restart_be_after_establish_context_index
+            .map(PostQueryFault::RestartBackendAfterEstablishContext),
+        meta.kill_fe_after_be_log_contains
+            .as_deref()
+            .map(|pattern| PostQueryFault::KillFrontendAfterBeLogContains {
+                pattern: pattern.to_string(),
+            }),
+        meta.kill_be_after_be_log_contains.as_ref().map(|fault| {
+            PostQueryFault::KillBackendAfterBeLogContains {
+                index: fault.be_index,
+                pattern: fault.pattern.clone(),
+            }
+        }),
         meta.kill_query_after_control_ready_count
             .map(|ready_count| {
                 query_connection_id
@@ -646,7 +764,23 @@ where
                 ready_count: server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")? as u64,
                 coordinator_lost: Vec::new(),
             },
-            PostQueryFault::KillQueryAfterBeLogContains { pattern, .. } => {
+            PostQueryFault::KillBackendAfterBeLogContains { index, .. }
+                if index >= server.be_count() =>
+            {
+                bail!(
+                    "post-query fault index {index} is out of bounds for {} BE(s)",
+                    server.be_count()
+                );
+            }
+            PostQueryFault::KillBackendAfterBeLogContains { index, pattern } => {
+                FaultBaseline::BeLogPatternOnBackend {
+                    count: server.be_log_count(index, &pattern)?,
+                    index,
+                    pattern,
+                }
+            }
+            PostQueryFault::KillQueryAfterBeLogContains { pattern, .. }
+            | PostQueryFault::KillFrontendAfterBeLogContains { pattern } => {
                 let counts = (0..server.be_count())
                     .map(|index| server.be_log_count(index, &pattern))
                     .collect::<Result<Vec<_>>>()?;
@@ -667,6 +801,23 @@ where
                     // The harness already parses it: a process identity crosses
                     // this boundary as a type, not as text to re-parse.
                     process_id: server.backend_process_id(index)?,
+                    marker: QUERY_INIT_ACK_OBSERVED,
+                }
+            }
+            PostQueryFault::RestartBackendAfterEstablishContext(index) => {
+                if index >= server.be_count() {
+                    bail!(
+                        "post-query fault index {index} is out of bounds for {} BE(s)",
+                        server.be_count()
+                    );
+                }
+                FaultBaseline::BackendInit {
+                    index,
+                    token: server
+                        .armed_query_lifecycle_fault_token(index, RESTART_AFTER_ESTABLISH_CONTEXT)?
+                        .context("restart-after-EstablishQueryContext fault has no armed token")?,
+                    process_id: server.backend_process_id(index)?,
+                    marker: TASK_ESTABLISH_CONTEXT_OBSERVED,
                 }
             }
             PostQueryFault::KillQueryAtLifecyclePhase { phase, .. }
@@ -753,12 +904,14 @@ where
                         server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")?
                             >= (*ready_count as usize).saturating_add(target)
                     }
-                    FaultBaseline::BackendInit { index, token, .. } => {
-                        server.be_log_contents(*index)?.lines().any(|line| {
-                            line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
-                                && line.contains(&format!("token={token}"))
-                        })
-                    }
+                    FaultBaseline::BackendInit {
+                        index,
+                        token,
+                        marker,
+                        ..
+                    } => server.be_log_contents(*index)?.lines().any(|line| {
+                        line.contains(marker) && line.contains(&format!("token={token}"))
+                    }),
                     FaultBaseline::FrontendPhase {
                         phase,
                         fe_crash,
@@ -771,6 +924,11 @@ where
                         server.fe_log_count("NOVAROCKS_MV_PROJECTOR_PHASE")?
                             > *marker_count as usize
                     }
+                    FaultBaseline::BeLogPatternOnBackend {
+                        index,
+                        pattern,
+                        count,
+                    } => server.be_log_count(*index, pattern)? > *count,
                     FaultBaseline::BeLogPattern { pattern, counts } => (0..server.be_count())
                         .zip(counts)
                         .map(|(index, baseline)| {
@@ -824,57 +982,34 @@ where
                         PostQueryFault::ReleaseFragmentFailure(index) => {
                             server.release_fragment_executor_failure(index)?
                         }
-                        PostQueryFault::RestartBackendAfterInitAck(index) => {
+                        PostQueryFault::RestartBackendAfterInitAck(index)
+                        | PostQueryFault::RestartBackendAfterEstablishContext(index) => {
                             let FaultBaseline::BackendInit {
-                                token, process_id, ..
+                                token,
+                                process_id,
+                                marker,
+                                ..
                             } = &baseline
                             else {
                                 unreachable!("BE restart fault has BackendInit baseline")
                             };
-                            let old_log = server.be_log_contents(index)?;
-                            let old_execution = old_log
-                                .lines()
-                                .rev()
-                                .find(|line| {
-                                    line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
-                                        && line.contains(&format!("token={token}"))
-                                })
-                                .and_then(|line| marker_field(line, "execution_id"))
-                                .context("restart marker is missing execution_id")?;
-                            let observed_process_id = old_log
-                                .lines()
-                                .rev()
-                                .find(|line| {
-                                    line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
-                                        && line.contains(&format!("token={token}"))
-                                })
-                                .and_then(|line| marker_field(line, "process_id"))
-                                .context("restart marker is missing process_id")?
-                                .parse::<novarocks_types::BackendProcessId>()
-                                .context("restart marker has invalid process_id")?;
-                            if observed_process_id != *process_id {
-                                bail!(
-                                    "restart marker process identity differs from SHOW BACKENDS: expected={process_id} observed={observed_process_id}"
-                                );
-                            }
-                            server.restart_be_until(index, deadline)?;
-                            let new_process_id = server.backend_process_id(index)?;
-                            if new_process_id == *process_id {
-                                bail!(
-                                    "BE[{index}] restart did not replace process identity: old={process_id} new={new_process_id}"
-                                );
-                            }
-                            let new_log = server.be_current_log_contents(index)?;
-                            validate_restarted_process_has_no_old_execution(
-                                &new_log,
-                                &old_execution,
+                            let contract = if matches!(
+                                fault,
+                                PostQueryFault::RestartBackendAfterEstablishContext(_)
+                            ) {
+                                TASK_RESTART_CONTRACT
+                            } else {
+                                LIFECYCLE_RESTART_CONTRACT
+                            };
+                            evidence_execution = Some(restart_backend_and_prove_no_restore(
+                                &mut **server,
+                                index,
+                                token,
                                 *process_id,
-                                new_process_id,
-                            )?;
-                            evidence_execution = Some(old_execution.clone());
-                            println!(
-                                "query lifecycle BE restart proof PASS: backend_index={index} old_process_id={process_id} new_process_id={new_process_id} token={token} old_execution={old_execution} no_old_execution_restored=true"
-                            );
+                                marker,
+                                contract,
+                                deadline,
+                            )?);
                         }
                         PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
                             server.kill_query_until(connection_id, deadline)?
@@ -892,6 +1027,20 @@ where
                         PostQueryFault::KillFrontendAtLifecyclePhase(phase) => {
                             server.kill_fe()?;
                             server.release_query_lifecycle_phase_fault(phase, true)?;
+                            server.restart_fe_until(deadline)?;
+                        }
+                        PostQueryFault::KillBackendAfterBeLogContains { index, .. } => {
+                            server.kill_be(index)?
+                        }
+                        PostQueryFault::KillFrontendAfterBeLogContains { .. } => {
+                            // The coordinator dies and nothing replaces it, so
+                            // every backend has to reach its own conclusion
+                            // from the query execution lease running out. The
+                            // step's own BE-log directives are what assert
+                            // that; this action only removes the coordinator
+                            // and puts a frontend back for the next step.
+                            server.kill_fe()?;
+                            server.clear_query_lifecycle_faults()?;
                             server.restart_fe_until(deadline)?;
                         }
                         PostQueryFault::KillFrontendAfterMvKnownCommittedBeforeProjectorCas => {
@@ -982,6 +1131,7 @@ where
                     PostQueryFault::KillFrontendAfterControlReady(_)
                         | PostQueryFault::KillQueryAfterControlReady { .. }
                         | PostQueryFault::KillQueryAfterBeLogContains { .. }
+                        | PostQueryFault::KillFrontendAfterBeLogContains { .. }
                         | PostQueryFault::KillFrontendAtLifecyclePhase(
                             crate::types::QueryLifecyclePhase::TerminalRetained
                         )
@@ -1210,22 +1360,76 @@ fn terminal_cleanup_on_all_backends(
     Ok(true)
 }
 
-fn validate_restarted_process_has_no_old_execution(
+/// Replaces one backend process at its rendezvous and proves the fresh
+/// process did not resume the attempt the old one was holding.
+///
+/// The rendezvous marker is read for both the execution identity and the
+/// process identity the backend itself reported, and that identity is checked
+/// against the membership owner's before anything is killed: a proof built on
+/// a marker from a different process would prove nothing about this one.
+/// Returns the old execution id, which the caller keeps as its evidence
+/// anchor.
+fn restart_backend_and_prove_no_restore(
+    server: &mut dyn ServerHandle,
+    index: usize,
+    token: &str,
+    process_id: novarocks_types::BackendProcessId,
+    marker: &'static str,
+    contract: RestartNonRestoreContract,
+    deadline: Instant,
+) -> Result<String> {
+    let old_log = server.be_log_contents(index)?;
+    let rendezvous = old_log
+        .lines()
+        .rev()
+        .find(|line| line.contains(marker) && line.contains(&format!("token={token}")))
+        .with_context(|| format!("{marker} for token={token} is missing from BE[{index}]"))?;
+    let old_execution = marker_field(rendezvous, "execution_id")
+        .context("restart marker is missing execution_id")?;
+    let observed_process_id = marker_field(rendezvous, "process_id")
+        .context("restart marker is missing process_id")?
+        .parse::<novarocks_types::BackendProcessId>()
+        .context("restart marker has invalid process_id")?;
+    if observed_process_id != process_id {
+        bail!(
+            "restart marker process identity differs from SHOW BACKENDS: expected={process_id} observed={observed_process_id}"
+        );
+    }
+    server.restart_be_until(index, deadline)?;
+    let new_process_id = server.backend_process_id(index)?;
+    if new_process_id == process_id {
+        bail!(
+            "BE[{index}] restart did not replace process identity: old={process_id} new={new_process_id}"
+        );
+    }
+    let new_log = server.be_current_log_contents(index)?;
+    validate_restarted_process_has_no_attempt_evidence(
+        &new_log,
+        &old_execution,
+        process_id,
+        new_process_id,
+        contract,
+    )?;
+    println!(
+        "query lifecycle BE restart proof PASS: kind={} backend_index={index} old_process_id={process_id} new_process_id={new_process_id} token={token} old_execution={old_execution} no_old_execution_restored=true",
+        contract.kind
+    );
+    Ok(old_execution)
+}
+
+fn validate_restarted_process_has_no_attempt_evidence(
     new_log: &str,
     old_execution: &str,
     old_process_id: novarocks_types::BackendProcessId,
     new_process_id: novarocks_types::BackendProcessId,
+    contract: RestartNonRestoreContract,
 ) -> Result<()> {
     if old_process_id == new_process_id {
         bail!(
             "restarted BE retained process identity {old_process_id} instead of receiving a new BackendProcessId"
         );
     }
-    for forbidden in [
-        "NOVAROCKS_QUERY_CONTROL_READY",
-        "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
-        "NOVAROCKS_QUERY_INIT_APPLIED",
-    ] {
+    for forbidden in contract.forbidden {
         if new_log.lines().any(|line| {
             line.contains(forbidden)
                 && marker_field(line, "execution_id").as_deref() == Some(old_execution)
@@ -1236,8 +1440,8 @@ fn validate_restarted_process_has_no_old_execution(
         }
     }
     if new_log.lines().any(|line| {
-        line.contains("NOVAROCKS_QUERY_")
-            && marker_field(line, "process_id").as_deref()
+        line.contains(contract.family_prefix)
+            && marker_field(line, contract.identity_field).as_deref()
                 == Some(old_process_id.to_string().as_str())
     }) {
         bail!("restarted BE emitted lifecycle evidence with retired process_id={old_process_id}");
@@ -2422,17 +2626,22 @@ mod tests {
     fn restart_nonrestore_proof_accepts_a_distinct_process_without_old_execution() {
         let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
         let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
-        validate_restarted_process_has_no_old_execution("", "10:20:1", old, new)
-            .expect("a distinct fresh process with no old execution is valid");
+        for contract in [LIFECYCLE_RESTART_CONTRACT, TASK_RESTART_CONTRACT] {
+            validate_restarted_process_has_no_attempt_evidence("", "10:20:1", old, new, contract)
+                .expect("a distinct fresh process with no old execution is valid");
+        }
     }
 
     #[test]
     fn restart_nonrestore_proof_rejects_same_process_identity() {
         let process_id = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
-        let error =
-            validate_restarted_process_has_no_old_execution("", "10:20:1", process_id, process_id)
-                .expect_err("restart must install a new BackendProcessId");
-        assert!(error.to_string().contains("retained process identity"));
+        for contract in [LIFECYCLE_RESTART_CONTRACT, TASK_RESTART_CONTRACT] {
+            let error = validate_restarted_process_has_no_attempt_evidence(
+                "", "10:20:1", process_id, process_id, contract,
+            )
+            .expect_err("restart must install a new BackendProcessId");
+            assert!(error.to_string().contains("retained process identity"));
+        }
     }
 
     #[test]
@@ -2445,8 +2654,39 @@ mod tests {
             "NOVAROCKS_QUERY_INIT_APPLIED",
         ] {
             let log = format!("{marker} execution_id=10:20:1 process_id={new}\n");
-            let error = validate_restarted_process_has_no_old_execution(&log, "10:20:1", old, new)
-                .expect_err("old execution state must fail");
+            let error = validate_restarted_process_has_no_attempt_evidence(
+                &log,
+                "10:20:1",
+                old,
+                new,
+                LIFECYCLE_RESTART_CONTRACT,
+            )
+            .expect_err("old execution state must fail");
+            assert!(error.to_string().contains(marker));
+        }
+    }
+
+    /// The task protocol names its own two admission points, and its markers
+    /// attribute a backend process in `backend=` rather than `process_id=`.
+    /// Reading the retired field name here would make every task-protocol
+    /// restart proof pass for the wrong reason.
+    #[test]
+    fn task_restart_nonrestore_proof_rejects_old_execution_admission_state() {
+        let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
+        let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
+        for marker in [
+            "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED",
+            "NOVAROCKS_TASK_CREATE_APPLIED",
+        ] {
+            let log = format!("{marker} execution_id=10:20:1 frontend=fe backend={new}\n");
+            let error = validate_restarted_process_has_no_attempt_evidence(
+                &log,
+                "10:20:1",
+                old,
+                new,
+                TASK_RESTART_CONTRACT,
+            )
+            .expect_err("old execution admission state must fail");
             assert!(error.to_string().contains(marker));
         }
     }
@@ -2456,9 +2696,103 @@ mod tests {
         let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
         let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
         let log = format!("NOVAROCKS_QUERY_CONTROL_READY execution_id=other process_id={old}\n");
-        let error = validate_restarted_process_has_no_old_execution(&log, "10:20:1", old, new)
-            .expect_err("new process must not emit retired identity");
+        let error = validate_restarted_process_has_no_attempt_evidence(
+            &log,
+            "10:20:1",
+            old,
+            new,
+            LIFECYCLE_RESTART_CONTRACT,
+        )
+        .expect_err("new process must not emit retired identity");
         assert!(error.to_string().contains("retired process_id"));
+    }
+
+    #[test]
+    fn task_restart_nonrestore_proof_rejects_retired_process_identity() {
+        let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
+        let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
+        let log = format!(
+            "NOVAROCKS_TASK_CREATE_APPLIED execution_id=other stage=1 task=2 backend={old}\n"
+        );
+        let error = validate_restarted_process_has_no_attempt_evidence(
+            &log,
+            "10:20:1",
+            old,
+            new,
+            TASK_RESTART_CONTRACT,
+        )
+        .expect_err("new process must not emit retired identity");
+        assert!(error.to_string().contains("retired process_id"));
+    }
+
+    #[test]
+    fn task_restart_directive_arms_the_generic_lifecycle_hook() {
+        let mut server = RecordingServerHandle::default();
+        let meta = QueryMeta {
+            restart_be_after_establish_context_index: Some(1),
+            ..QueryMeta::default()
+        };
+
+        apply_pre_query(&meta, &mut server).expect("arm establish-context restart");
+
+        assert_eq!(
+            server.events,
+            vec!["arm-rfo-8r2:restart-after-establish-context:1"]
+        );
+    }
+
+    #[test]
+    fn task_restart_directive_validates_its_backend_index() {
+        let mut server = RecordingServerHandle::default();
+        let meta = QueryMeta {
+            restart_be_after_establish_context_index: Some(3),
+            ..QueryMeta::default()
+        };
+
+        let error = apply_pre_query(&meta, &mut server)
+            .expect_err("an out-of-range backend index must fail before arming");
+
+        assert!(
+            error.to_string().contains(
+                "restart_be_after_establish_context_index 3 is out of bounds for 3 BE(s)"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(server.events.is_empty());
+    }
+
+    #[test]
+    fn fe_kill_after_be_log_and_task_restart_are_mutually_exclusive() {
+        let mut server = RecordingServerHandle::default();
+        let meta = QueryMeta {
+            restart_be_after_establish_context_index: Some(1),
+            kill_fe_after_be_log_contains: Some("NOVAROCKS_TASK_CREATE_APPLIED".to_string()),
+            ..QueryMeta::default()
+        };
+
+        let error = apply_pre_query(&meta, &mut server)
+            .expect_err("one step may arm only one lifecycle failure");
+
+        assert!(
+            error
+                .to_string()
+                .contains("at most one query lifecycle fault directive"),
+            "unexpected error: {error}"
+        );
+        assert!(server.events.is_empty());
+    }
+
+    /// An FE crash may leave bounded terminal delivery records behind, so a
+    /// step that kills the frontend has to be allowed to have them. Without
+    /// this the runner would compare them against a pre-fault zero and fail a
+    /// case for retention the crash itself caused.
+    #[test]
+    fn killing_the_frontend_from_a_be_marker_permits_terminal_retention() {
+        assert!(permits_terminal_retention(&QueryMeta {
+            kill_fe_after_be_log_contains: Some("NOVAROCKS_TASK_TERMINAL_RETAINED".to_string()),
+            ..QueryMeta::default()
+        }));
+        assert!(!permits_terminal_retention(&QueryMeta::default()));
     }
 }
 

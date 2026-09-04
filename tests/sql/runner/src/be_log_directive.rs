@@ -88,8 +88,14 @@ pub(crate) fn query_lifecycle_step_deadline(meta: &QueryMeta) -> Option<Instant>
 }
 
 pub(crate) fn step_evidence_deadline(meta: &QueryMeta) -> Option<Instant> {
+    // The two task-protocol process faults get the same step budget without
+    // joining `is_query_lifecycle_step`: they need the shared deadline the
+    // post-query worker runs against, but they must not be held to the
+    // retired protocol's terminal facts.
     (meta.kill_be_after_fragment_start.is_some()
         || meta.fail_fragment_after_start_be_index.is_some()
+        || meta.restart_be_after_establish_context_index.is_some()
+        || meta.kill_fe_after_be_log_contains.is_some()
         || is_query_lifecycle_step(meta))
     .then(|| Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT)
 }

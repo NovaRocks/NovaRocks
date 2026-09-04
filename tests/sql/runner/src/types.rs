@@ -38,6 +38,18 @@ pub struct KillBeAtLifecyclePhaseDirective {
     pub phase: QueryLifecyclePhase,
 }
 
+/// A runner-owned BE process kill released once a runner-owned BE log shows a
+/// new matching line.
+///
+/// Protocol-neutral by construction: the case names the execution point it
+/// wants the process to disappear at, rather than a coordinator phase whose
+/// marker belongs to one protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillBeAfterBeLogDirective {
+    pub be_index: usize,
+    pub pattern: String,
+}
+
 /// Structured fault assertions deliberately name a result category rather
 /// than matching a human-readable diagnostic. T7/T9 provide the actual
 /// snapshot producer; T4 owns this stable runner contract.
@@ -313,10 +325,25 @@ pub struct QueryMeta {
     /// before the Accelerator projector can CAS its local projection.
     pub kill_fe_after_mv_known_committed_before_projector_cas: bool,
     pub restart_be_after_init_ack_index: Option<usize>,
+    /// Replace one BE process after its task-protocol `EstablishQueryContext`
+    /// has been applied. The task-protocol successor of
+    /// `restart_be_after_init_ack_index`.
+    pub restart_be_after_establish_context_index: Option<usize>,
     /// Execute KILL QUERY from a separate client after this query's Nth ControlReady.
     pub kill_query_after_control_ready_count: Option<usize>,
     /// Execute KILL QUERY after a new matching line is observed in a runner-owned BE log.
     pub kill_query_after_be_log_contains: Option<String>,
+    /// Kill one BE after a new matching line is observed in a runner-owned BE
+    /// log.
+    pub kill_be_after_be_log_contains: Option<KillBeAfterBeLogDirective>,
+    /// Kill and restart FE after a new matching line is observed in a
+    /// runner-owned BE log.
+    ///
+    /// Protocol-neutral for the same reason as
+    /// `kill_query_after_be_log_contains`: the case names the point it wants
+    /// the coordinator to die at, instead of a phase whose marker belongs to
+    /// one protocol.
+    pub kill_fe_after_be_log_contains: Option<String>,
     /// Fail the local StageFragments build at this one-based fragment ordinal.
     pub fail_stage_prepare_ordinal: Option<usize>,
     pub drop_next_stage_ack_be_index: Option<usize>,

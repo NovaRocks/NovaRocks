@@ -198,6 +198,26 @@ fn parse_kill_be_at_lifecycle_phase(raw: &str) -> anyhow::Result<KillBeAtLifecyc
     Ok(KillBeAtLifecyclePhaseDirective { be_index, phase })
 }
 
+fn parse_kill_be_after_be_log_directive(raw: &str) -> anyhow::Result<KillBeAfterBeLogDirective> {
+    let (be_index, pattern) = raw.split_once(',').ok_or_else(|| {
+        anyhow::anyhow!(
+            "@kill_be_after_be_log_contains requires <be_index>,<pattern>; received {raw:?}"
+        )
+    })?;
+    let be_index = be_index
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("invalid kill_be_after_be_log_contains BE index {be_index:?}"))?;
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        bail!("@kill_be_after_be_log_contains pattern must not be empty");
+    }
+    Ok(KillBeAfterBeLogDirective {
+        be_index,
+        pattern: pattern.to_string(),
+    })
+}
+
 fn parse_participant_outcome_expectation(
     raw: &str,
 ) -> anyhow::Result<ParticipantOutcomeExpectation> {
@@ -516,6 +536,22 @@ fn parse_meta_with_sql_error_descriptors(
                     format!("invalid restart_be_after_init_ack_index: {raw_value}")
                 })?;
                 meta.restart_be_after_init_ack_index = Some(value);
+            }
+            "restart_be_after_establish_context_index" => {
+                let value = raw_value.parse::<usize>().with_context(|| {
+                    format!("invalid restart_be_after_establish_context_index: {raw_value}")
+                })?;
+                meta.restart_be_after_establish_context_index = Some(value);
+            }
+            "kill_be_after_be_log_contains" => {
+                meta.kill_be_after_be_log_contains =
+                    Some(parse_kill_be_after_be_log_directive(&raw_value)?);
+            }
+            "kill_fe_after_be_log_contains" => {
+                if raw_value.is_empty() {
+                    bail!("kill_fe_after_be_log_contains must not be empty");
+                }
+                meta.kill_fe_after_be_log_contains = Some(raw_value);
             }
             "kill_query_after_control_ready_count" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
@@ -920,6 +956,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         restart_be_after_init_ack_index: override_meta
             .restart_be_after_init_ack_index
             .or(base.restart_be_after_init_ack_index),
+        restart_be_after_establish_context_index: override_meta
+            .restart_be_after_establish_context_index
+            .or(base.restart_be_after_establish_context_index),
         restart_fe_after_step: override_meta.restart_fe_after_step || base.restart_fe_after_step,
         cleanup_fault: override_meta
             .cleanup_fault
@@ -935,6 +974,14 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .kill_query_after_be_log_contains
             .clone()
             .or_else(|| base.kill_query_after_be_log_contains.clone()),
+        kill_be_after_be_log_contains: override_meta
+            .kill_be_after_be_log_contains
+            .clone()
+            .or_else(|| base.kill_be_after_be_log_contains.clone()),
+        kill_fe_after_be_log_contains: override_meta
+            .kill_fe_after_be_log_contains
+            .clone()
+            .or_else(|| base.kill_fe_after_be_log_contains.clone()),
         fail_stage_prepare_ordinal: override_meta
             .fail_stage_prepare_ordinal
             .or(base.fail_stage_prepare_ordinal),

@@ -91,6 +91,7 @@ use crate::fragment::ingress::{ReceivedReadSplit, TypedReadAttemptContext};
 use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 
+use super::fault;
 use super::host::{HostRejection, RunnableTask, TaskExecutionHost};
 use super::shared_facts::fragment_plan;
 use super::status::TaskStatusReporter;
@@ -979,6 +980,13 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             debug!("task {identity} carries its query context's dynamic filter feedback");
         }
 
+        // Claimed here rather than in the worker: a malformed arming is still
+        // reportable as a typed rejection on this path, and the worker has no
+        // way to report one. The failure itself is applied after the task
+        // publishes RUNNING, so the subject is a task that started.
+        let injected_execution_failure =
+            fault::task_execution_failure_injected(identity).map_err(internal)?;
+
         let task = Arc::new(NativeRunnableTask::new(identity, kernel_key));
         let worker = Arc::clone(&task);
         let queries = self.queries.clone();
@@ -1003,7 +1011,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 // PLANNED: a task that never publishes RUNNING could not
                 // publish FINISHED either.
                 reporter.running();
-                let running = dormant.start();
+                let running = if injected_execution_failure {
+                    dormant.start_failed(fault::TASK_EXECUTION_FAILURE_DETAIL)
+                } else {
+                    dormant.start()
+                };
                 // Replays a stand-down that arrived while this task was
                 // submitted but not yet started. Without it, a cancel racing
                 // the worker's first instruction would be dropped and the
