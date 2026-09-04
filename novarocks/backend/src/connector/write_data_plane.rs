@@ -387,6 +387,7 @@ struct ObservedConnectorBatchWriter {
 #[async_trait::async_trait]
 impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        writer_append_holdpoint(self.execution_id, self.node_id, self.target).await;
         let rows = batch.num_rows() as u64;
         self.inner.append(batch).await?;
         self.rows = self.rows.saturating_add(rows);
@@ -435,6 +436,13 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
     }
 
     async fn abort(&mut self) -> Result<(), ConnectorError> {
+        let result = self.inner.abort().await;
+        let outcome = if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        crate::metrics::record_connector_write_writer_abort(outcome);
         tracing::info!(
             target: WRITE_EVENT_TARGET,
             role = "be",
@@ -446,10 +454,50 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
             writer_ordinal = self.physical.writer_ordinal(),
             driver_id = self.physical.driver_id(),
             rows = self.rows,
-            "aborted a driver-local connector writer"
+            outcome,
+            "completed a driver-local connector writer abort"
         );
-        self.inner.abort().await
+        result
     }
+}
+
+/// Hold one exact attempt inside a live writer append until cancellation drops
+/// the append future. The query-lifecycle fault token is consumed only after
+/// the writer exists and receives input, so its metric is proof that the
+/// deadline did not race ahead of writer execution.
+#[cfg(debug_assertions)]
+async fn writer_append_holdpoint(
+    execution_id: QueryExecutionId,
+    node_id: i32,
+    target: WriteTargetOrdinal,
+) {
+    let Some(token) = claim_write_fault(
+        execution_id,
+        novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold,
+    ) else {
+        return;
+    };
+    crate::metrics::record_connector_write_debug_fault("append_hold");
+    tracing::info!(
+        target: WRITE_EVENT_TARGET,
+        role = "be",
+        event = "connector_write_append_hold",
+        query_id = %execution_id.query_id(),
+        attempt_id = execution_id.attempt_id().get(),
+        node_id,
+        write_target_ordinal = target.get(),
+        token,
+        "holding a driver-local writer append until query cancellation"
+    );
+    std::future::pending::<()>().await;
+}
+
+#[cfg(not(debug_assertions))]
+async fn writer_append_holdpoint(
+    _execution_id: QueryExecutionId,
+    _node_id: i32,
+    _target: WriteTargetOrdinal,
+) {
 }
 
 /// Test-only writer fault, claimed once per armed trigger for this exact

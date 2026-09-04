@@ -66,7 +66,10 @@ use super::connector::{
 
 const WRITER_OPENS: &str = "novarocks_backend_connector_write_writer_opens_total";
 const WRITER_TOTALS: &str = "novarocks_backend_connector_write_writer_totals";
+const WRITER_ABORTS: &str = "novarocks_backend_connector_write_writer_aborts_total";
+const WRITE_DEBUG_FAULTS: &str = "novarocks_backend_connector_write_debug_faults_total";
 const ROOT_PEAK: &str = "novarocks_backend_connector_write_root_prepared_set_peak";
+const RESULT_TERMINALS: &str = "novarocks_backend_fragment_result_terminals_total";
 const WRITER_PARTIAL_TOTALS: &str = "novarocks_table_writer_partial_totals";
 
 /// `LakePublicationFamily::Write` — INSERT and INSERT OVERWRITE.
@@ -118,6 +121,11 @@ struct WriteCounters {
     opens: f64,
     rows: f64,
     commit_fragments: f64,
+    abort_succeeded: f64,
+    abort_failed: f64,
+    append_holds: f64,
+    result_finished: f64,
+    result_aborted: f64,
     root_peak_entries: f64,
 }
 
@@ -131,6 +139,36 @@ fn write_counters(context: &mut ScenarioContext, index: usize) -> Result<WriteCo
             WRITER_TOTALS,
             "unit",
             "commit_fragments",
+        )?,
+        abort_succeeded: handle.backend_connector_write_metric(
+            index,
+            WRITER_ABORTS,
+            "outcome",
+            "succeeded",
+        )?,
+        abort_failed: handle.backend_connector_write_metric(
+            index,
+            WRITER_ABORTS,
+            "outcome",
+            "failed",
+        )?,
+        append_holds: handle.backend_connector_write_metric(
+            index,
+            WRITE_DEBUG_FAULTS,
+            "kind",
+            "append_hold",
+        )?,
+        result_finished: handle.backend_connector_write_metric(
+            index,
+            RESULT_TERMINALS,
+            "terminal",
+            "finished",
+        )?,
+        result_aborted: handle.backend_connector_write_metric(
+            index,
+            RESULT_TERMINALS,
+            "terminal",
+            "aborted",
         )?,
         root_peak_entries: handle.backend_connector_write_metric(
             index,
@@ -205,6 +243,11 @@ struct WriteDelta {
     opens: Vec<f64>,
     rows: f64,
     commit_fragments: f64,
+    abort_succeeded: f64,
+    abort_failed: f64,
+    append_holds: Vec<f64>,
+    result_finished: f64,
+    result_aborted: f64,
     /// Backends whose writer-open counter moved. A row count alone cannot
     /// distinguish a distributed write from one backend doing all of it.
     writing_backends: Vec<usize>,
@@ -226,6 +269,31 @@ fn write_delta(before: &[WriteCounters], after: &[WriteCounters]) -> WriteDelta 
             .iter()
             .zip(after)
             .map(|(before, after)| after.commit_fragments - before.commit_fragments)
+            .sum(),
+        abort_succeeded: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.abort_succeeded - before.abort_succeeded)
+            .sum(),
+        abort_failed: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.abort_failed - before.abort_failed)
+            .sum(),
+        append_holds: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.append_holds - before.append_holds)
+            .collect(),
+        result_finished: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.result_finished - before.result_finished)
+            .sum(),
+        result_aborted: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.result_aborted - before.result_aborted)
             .sum(),
         writing_backends: before
             .iter()
@@ -1826,6 +1894,10 @@ enum WriteFault {
     /// The frontend's attempt is aborted while its tasks are running, so it
     /// never fetches the root's complete prepared write set.
     FetchAbort,
+    /// The session's own deadline fires after every backend has entered a live
+    /// writer append. Cancellation must abort those provider writers and must
+    /// not publish a successful Root EOF.
+    DeadlineAbort,
 }
 
 /// The backend the severed-stream case arms. Fixed so the scenario can name
@@ -1873,6 +1945,10 @@ impl WriteFault {
                 .be_log_count(index, marker)
                 .with_context(|| format!("count {marker} on BE[{index}]")),
             InjectionEvidence::EveryBackend(marker) => backend_marker_total(context, marker),
+            InjectionEvidence::AppendHolds => Ok(all_write_counters(context)?
+                .iter()
+                .map(|counters| counters.append_holds as usize)
+                .sum()),
         }
     }
 
@@ -1907,6 +1983,7 @@ impl WriteFault {
             // the alternative -- a client error with no abort behind it -- is
             // exactly what a timeout looks like.
             Self::FetchAbort => InjectionEvidence::EveryBackend(TASK_CONTEXT_ABORT_APPLIED),
+            Self::DeadlineAbort => InjectionEvidence::AppendHolds,
         }
     }
 
@@ -1929,6 +2006,7 @@ impl WriteFault {
             Self::FinalAggregateFinalize => {
                 Some("injected connector write connector-write-final-finalize-failure")
             }
+            Self::DeadlineAbort => Some("query timed out after"),
             Self::SeveredWriterStream | Self::FetchAbort => None,
         }
     }
@@ -1943,7 +2021,8 @@ impl WriteFault {
             | Self::PartialAggregateFinalize
             | Self::FinalAggregateMerge
             | Self::FinalAggregateFinalize
-            | Self::SeveredWriterStream => statements.full,
+            | Self::SeveredWriterStream
+            | Self::DeadlineAbort => statements.full,
         }
     }
 
@@ -1958,6 +2037,56 @@ impl WriteFault {
                         "{case}: writers opened on {} backend(s), so no stream into the root was \
                          severed",
                         delta.writing_backends.len()
+                    );
+                }
+                Ok(())
+            }
+            Self::DeadlineAbort => {
+                if delta.append_holds.len() != 3
+                    || delta.append_holds.iter().any(|holds| *holds != 1.0)
+                {
+                    bail!(
+                        "{case}: the query-scoped append hold must fire exactly once on each BE; \
+                         holds={:?}",
+                        delta.append_holds
+                    );
+                }
+                for (index, (opens, holds)) in
+                    delta.opens.iter().zip(&delta.append_holds).enumerate()
+                {
+                    if *opens < *holds {
+                        bail!(
+                            "{case}: BE[{index}] fired {holds} append hold(s) after opening only \
+                             {opens} writer(s)"
+                        );
+                    }
+                }
+                let held = delta.append_holds.iter().sum::<f64>();
+                if delta.abort_succeeded < held {
+                    bail!(
+                        "{case}: {held} live provider writers were held but only {} provider abort \
+                         calls completed successfully",
+                        delta.abort_succeeded
+                    );
+                }
+                if delta.abort_failed != 0.0 {
+                    bail!(
+                        "{case}: {} provider writer abort call(s) failed",
+                        delta.abort_failed
+                    );
+                }
+                if delta.result_finished != 0.0 {
+                    bail!(
+                        "{case}: the native Root result owner published {} successful EOF \
+                         terminal(s) after the deadline",
+                        delta.result_finished
+                    );
+                }
+                if delta.result_aborted != 1.0 {
+                    bail!(
+                        "{case}: the native Root result owner published {} abort terminal(s); \
+                         expected exactly one",
+                        delta.result_aborted
                     );
                 }
                 Ok(())
@@ -1982,6 +2111,7 @@ impl WriteFault {
             Self::FinalAggregateFinalize => "a root final aggregate that rejects EOS",
             Self::SeveredWriterStream => "a writer stream that never reaches the root aggregation",
             Self::FetchAbort => "an aborted attempt that never fetches the root's result",
+            Self::DeadlineAbort => "a deadline that fires after provider writers enter append",
         }
     }
 }
@@ -1995,6 +2125,8 @@ enum InjectionEvidence {
     /// Anywhere across the backends, summed, because which backends the
     /// marker reaches is a property of the plan rather than of the cluster.
     EveryBackend(&'static str),
+    /// The provider-owned append-hold counter across every backend.
+    AppendHolds,
 }
 
 /// The two write statements the fault matrix runs.
@@ -2095,6 +2227,7 @@ impl Scenario for DistributedWriterFaults {
             WriteFault::FinalAggregateFinalize,
             WriteFault::SeveredWriterStream,
             WriteFault::FetchAbort,
+            WriteFault::DeadlineAbort,
         ] {
             let case = fault.case();
             context.action(format!("inject {case} and require no snapshot"));
@@ -2119,8 +2252,16 @@ impl Scenario for DistributedWriterFaults {
             let commits = assert_commit_never_invoked(before_terminals, after_terminals, case)?;
             println!(
                 "distributed-writer-faults case={case:?} commit_invocations={commits} \
-                 writer_opens_delta={:?} commit_fragments_delta={}",
-                delta.opens, delta.commit_fragments
+                 writer_opens_delta={:?} commit_fragments_delta={} append_holds_delta={:?} \
+                 provider_abort_succeeded_delta={} provider_abort_failed_delta={} \
+                 root_result_finished_delta={} root_result_aborted_delta={}",
+                delta.opens,
+                delta.commit_fragments,
+                delta.append_holds,
+                delta.abort_succeeded,
+                delta.abort_failed,
+                delta.result_finished,
+                delta.result_aborted
             );
             let after_injections = fault.injection_marker_count(context)?;
             if after_injections <= before_injections {
@@ -2285,6 +2426,49 @@ fn run_faulted_write(
                 .map_err(|_| anyhow::anyhow!("aborted write session thread panicked"))??;
             Ok(outcome)
         }
+        WriteFault::DeadlineAbort => {
+            const QUERY_TIMEOUT_SECS: u64 = 10;
+            let writer_baseline = all_write_counters(context)?;
+            for index in 0..context.handle().be_count() {
+                context
+                    .handle()
+                    .arm_query_lifecycle_fault(index, "connector-write-append-hold")
+                    .with_context(|| format!("arm writer append hold on BE[{index}]"))?;
+            }
+            let write =
+                start_deadline_write_on_own_connection(user, port, insert, QUERY_TIMEOUT_SECS)?;
+            let _connection_id = write
+                .connection_id
+                .recv_timeout(context.remaining("await deadline write session setup")?)
+                .context("deadline write session ended before applying query_timeout")?;
+            await_append_holds(context, &writer_baseline)?;
+            match write.done.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {}
+                Ok(outcome) => {
+                    bail!(
+                        "deadline write became terminal before its three live append holds: \
+                         {outcome:?}"
+                    );
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    bail!("deadline write actor disconnected before its own deadline")
+                }
+            }
+            let outcome = write
+                .done
+                .recv_timeout(context.remaining("await the deadline write result")?)
+                .context("deadline write session did not finish")?;
+            write
+                .thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("deadline write session thread panicked"))??;
+            await_deadline_abort_terminals(context, &writer_baseline)?;
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("clear writer append hold tokens")?;
+            Ok(outcome)
+        }
     }
 }
 
@@ -2344,6 +2528,40 @@ fn start_write_on_own_connection(user: &str, port: u16, insert: &str) -> Result<
     })
 }
 
+fn start_deadline_write_on_own_connection(
+    user: &str,
+    port: u16,
+    insert: &str,
+    query_timeout_secs: u64,
+) -> Result<PendingWrite> {
+    let (id_tx, connection_id) = mpsc::sync_channel(1);
+    let (done_tx, done) = mpsc::sync_channel(1);
+    let user = user.to_string();
+    let insert = insert.to_string();
+    let thread = thread::Builder::new()
+        .name("distributed-writer-deadline".to_string())
+        .spawn(move || -> Result<()> {
+            let mut connection =
+                mysql_actor::connect_for_cancellation(&user, port, Duration::from_secs(30))?;
+            connection
+                .query_drop(format!("SET query_timeout = {query_timeout_secs}"))
+                .context("set the deadline write session query_timeout")?;
+            id_tx
+                .send(connection.connection_id())
+                .context("publish the deadline write session readiness")?;
+            let outcome = connection.query_drop(insert);
+            done_tx
+                .send(outcome)
+                .context("publish the deadline write result")
+        })
+        .context("start the deadline write session")?;
+    Ok(PendingWrite {
+        thread,
+        connection_id,
+        done,
+    })
+}
+
 /// How many times `marker` appears across every Backend log.
 ///
 /// Summed rather than counted per Backend: which Backends an attempt reaches
@@ -2375,6 +2593,63 @@ fn await_backend_marker_above(
         }
         if Instant::now() >= deadline {
             bail!("timed out waiting for {subject}: {marker} stayed at {baseline}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn await_append_holds(context: &mut ScenarioContext, baseline: &[WriteCounters]) -> Result<()> {
+    let deadline = context.deadline();
+    loop {
+        let current = all_write_counters(context)?;
+        if current.len() == baseline.len()
+            && current
+                .iter()
+                .zip(baseline)
+                .all(|(current, before)| current.append_holds > before.append_holds)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let observed = current
+                .iter()
+                .zip(baseline)
+                .map(|(current, before)| current.append_holds - before.append_holds)
+                .collect::<Vec<_>>();
+            bail!(
+                "timed out waiting for one query-scoped writer append hold on every BE; \
+                 deltas={observed:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn await_deadline_abort_terminals(
+    context: &mut ScenarioContext,
+    baseline: &[WriteCounters],
+) -> Result<()> {
+    let deadline = context.deadline();
+    loop {
+        let current = all_write_counters(context)?;
+        let abort_succeeded = current
+            .iter()
+            .zip(baseline)
+            .map(|(current, before)| current.abort_succeeded - before.abort_succeeded)
+            .sum::<f64>();
+        let result_aborted = current
+            .iter()
+            .zip(baseline)
+            .map(|(current, before)| current.result_aborted - before.result_aborted)
+            .sum::<f64>();
+        if abort_succeeded >= baseline.len() as f64 && result_aborted >= 1.0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for deadline cleanup at its real owners; \
+                 provider_abort_succeeded={abort_succeeded} root_result_aborted={result_aborted}"
+            );
         }
         thread::sleep(Duration::from_millis(20));
     }

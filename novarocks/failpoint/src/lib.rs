@@ -162,10 +162,14 @@ pub enum QueryLifecycleFaultKind {
     ConnectorWriteFinalMergeFailure,
     /// Rejects ordinary final aggregate finalization inside `TableFinish`.
     ConnectorWriteFinalFinalizeFailure,
+    /// Holds the first append reached by one writer until the owning attempt
+    /// is cancelled. This is a debug-only rendezvous used to prove that a
+    /// query deadline aborts an already-open provider writer.
+    ConnectorWriteAppendHold,
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::InitAckDrop,
         Self::StartAckSuppress,
         Self::RestartAfterInitAck,
@@ -205,6 +209,7 @@ impl QueryLifecycleFaultKind {
         Self::ConnectorWritePartialFinalizeFailure,
         Self::ConnectorWriteFinalMergeFailure,
         Self::ConnectorWriteFinalFinalizeFailure,
+        Self::ConnectorWriteAppendHold,
     ];
 
     pub const fn file_stem(self) -> &'static str {
@@ -252,6 +257,7 @@ impl QueryLifecycleFaultKind {
             }
             Self::ConnectorWriteFinalMergeFailure => "connector-write-final-merge-failure",
             Self::ConnectorWriteFinalFinalizeFailure => "connector-write-final-finalize-failure",
+            Self::ConnectorWriteAppendHold => "connector-write-append-hold",
         }
     }
 
@@ -271,7 +277,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 34] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 35] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -322,6 +328,7 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 34] = [
     QueryLifecycleFaultKind::ConnectorWritePartialFinalizeFailure,
     QueryLifecycleFaultKind::ConnectorWriteFinalMergeFailure,
     QueryLifecycleFaultKind::ConnectorWriteFinalFinalizeFailure,
+    QueryLifecycleFaultKind::ConnectorWriteAppendHold,
 ];
 
 pub fn parse_runner_rfo_kind(value: &str) -> Option<QueryLifecycleFaultKind> {
@@ -760,14 +767,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 39);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 40);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 34);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 35);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)
@@ -839,6 +846,10 @@ mod tests {
         assert_eq!(
             parse_runner_rfo_kind("connector-write-final-finalize-failure"),
             Some(QueryLifecycleFaultKind::ConnectorWriteFinalFinalizeFailure)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("connector-write-append-hold"),
+            Some(QueryLifecycleFaultKind::ConnectorWriteAppendHold)
         );
         // A generic lifecycle hook stays out of reach of a harness.
         assert_eq!(parse_runner_rfo_kind("init-ack-drop"), None);

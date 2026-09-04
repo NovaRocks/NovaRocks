@@ -40,7 +40,7 @@ pub(crate) struct BackendMetricsRegistry {
 impl BackendMetricsRegistry {
     pub(crate) fn new() -> Result<Self, String> {
         let registry = Registry::new();
-        for collector in [
+        let collectors = [
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES).clone())
                 as Box<dyn prometheus::core::Collector>,
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS).clone()),
@@ -51,12 +51,21 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_NATIVE_TLS_FAILURES).clone()),
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_OPENS).clone()),
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_TOTALS).clone()),
+            Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_ABORTS).clone()),
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK).clone()),
-        ] {
+            Box::new(Lazy::force(&BACKEND_FRAGMENT_RESULT_TERMINALS).clone()),
+        ];
+        for collector in collectors {
             registry
                 .register(collector)
                 .map_err(|error| format!("register backend metrics collector: {error}"))?;
         }
+        #[cfg(debug_assertions)]
+        registry
+            .register(Box::new(
+                Lazy::force(&BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS).clone(),
+            ))
+            .map_err(|error| format!("register backend debug metrics collector: {error}"))?;
         novarocks_execution::runtime::fragment::io::exchange_metrics::register_exchange_metrics(
             &registry,
         )?;
@@ -257,6 +266,48 @@ static BACKEND_CONNECTOR_WRITE_WRITER_TOTALS: Lazy<prometheus::IntCounterVec> = 
     .expect("construct novarocks_backend_connector_write_writer_totals")
 });
 
+/// Provider writer abort calls completed by this backend, by outcome.
+///
+/// The counter is advanced only after the provider future returns, so
+/// `succeeded` is direct evidence that cancellation crossed the adapter and
+/// settled at the provider boundary rather than merely suppressing commit.
+static BACKEND_CONNECTOR_WRITE_WRITER_ABORTS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_connector_write_writer_aborts_total",
+            "Cumulative completed connector writer abort calls on this backend, by outcome.",
+        ),
+        &["outcome"],
+    )
+    .expect("construct novarocks_backend_connector_write_writer_aborts_total")
+});
+
+/// Debug-only write faults that reached their exact execution boundary.
+#[cfg(debug_assertions)]
+static BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_connector_write_debug_faults_total",
+            "Cumulative debug-only connector write faults that reached their bound attempt.",
+        ),
+        &["kind"],
+    )
+    .expect("construct novarocks_backend_connector_write_debug_faults_total")
+});
+
+/// Native fragment result sessions that reached one accepted terminal.
+/// `finished` is the owner-side publication of successful Root EOF.
+static BACKEND_FRAGMENT_RESULT_TERMINALS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_fragment_result_terminals_total",
+            "Cumulative accepted native fragment result terminals, by terminal.",
+        ),
+        &["terminal"],
+    )
+    .expect("construct novarocks_backend_fragment_result_terminals_total")
+});
+
 /// High-water mark of the prepared write set observed by a root aggregation on
 /// this backend. Bytes and entries are the two frozen budgets the root bounds.
 static BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -315,6 +366,25 @@ pub(crate) fn record_connector_write_writer_finished(rows: u64, fragments: u64) 
     BACKEND_CONNECTOR_WRITE_WRITER_TOTALS
         .with_label_values(&["commit_fragments"])
         .inc_by(fragments);
+}
+
+pub(crate) fn record_connector_write_writer_abort(outcome: &'static str) {
+    BACKEND_CONNECTOR_WRITE_WRITER_ABORTS
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn record_connector_write_debug_fault(kind: &'static str) {
+    BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS
+        .with_label_values(&[kind])
+        .inc();
+}
+
+pub(crate) fn record_fragment_result_terminal(terminal: &'static str) {
+    BACKEND_FRAGMENT_RESULT_TERMINALS
+        .with_label_values(&[terminal])
+        .inc();
 }
 
 /// Publish the prepared write set a root aggregation has accepted so far. The
@@ -624,6 +694,14 @@ fn ensure_backend_metric_label_families() {
     }
     for resource in ["catalog_query_leases", "catalog_handle_leases"] {
         let _ = BACKEND_QUERY_EXECUTION_RESOURCES.get_metric_with_label_values(&[resource]);
+    }
+    for outcome in ["succeeded", "failed"] {
+        let _ = BACKEND_CONNECTOR_WRITE_WRITER_ABORTS.get_metric_with_label_values(&[outcome]);
+    }
+    #[cfg(debug_assertions)]
+    let _ = BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS.get_metric_with_label_values(&["append_hold"]);
+    for terminal in ["finished", "aborted"] {
+        let _ = BACKEND_FRAGMENT_RESULT_TERMINALS.get_metric_with_label_values(&[terminal]);
     }
 }
 #[cfg(test)]
