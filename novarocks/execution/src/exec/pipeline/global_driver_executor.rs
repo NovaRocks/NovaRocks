@@ -256,12 +256,12 @@ impl DriverTask {
         self.driver.schedule_state()
     }
 
-    pub(crate) fn try_mark_source_observer_registered(&self) -> bool {
-        self.driver.try_mark_source_observer_registered()
+    pub(crate) fn try_mark_source_observer_registered(&self, observable: &Arc<Observable>) -> bool {
+        self.driver.try_mark_source_observer_registered(observable)
     }
 
-    pub(crate) fn try_mark_sink_observer_registered(&self) -> bool {
-        self.driver.try_mark_sink_observer_registered()
+    pub(crate) fn try_mark_sink_observer_registered(&self, observable: &Arc<Observable>) -> bool {
+        self.driver.try_mark_sink_observer_registered(observable)
     }
 
     pub(crate) fn set_in_blocked(&self, value: bool) {
@@ -278,6 +278,11 @@ impl DriverTask {
 
     pub(crate) fn set_ready(&mut self) {
         self.driver.set_ready();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_for_test(&mut self, time_slice: Duration) -> DriverState {
+        self.driver.process(time_slice)
     }
 }
 

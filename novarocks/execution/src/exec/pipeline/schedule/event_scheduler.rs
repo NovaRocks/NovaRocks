@@ -165,7 +165,7 @@ impl EventScheduler {
                 .clone()
         };
         if let Some(observable) = task.source_observable() {
-            if task.try_mark_source_observer_registered() {
+            if task.try_mark_source_observer_registered(&observable) {
                 let observer = get_observer();
                 self.add_observer(observable, Arc::clone(&observer), ObserverKind::Source);
             }
@@ -177,7 +177,7 @@ impl EventScheduler {
             );
         }
         if let Some(observable) = task.sink_observable() {
-            if task.try_mark_sink_observer_registered() {
+            if task.try_mark_sink_observer_registered(&observable) {
                 let observer = get_observer();
                 self.add_observer(observable, observer, ObserverKind::Sink);
             }
@@ -443,6 +443,159 @@ mod tests {
         finished: Arc<AtomicBool>,
     }
 
+    struct ControlledInternalProcessor {
+        ready: Arc<AtomicBool>,
+        observable: Arc<Observable>,
+    }
+
+    struct ControlledDynamicSource {
+        ready: Arc<AtomicBool>,
+        use_second_observable: Arc<AtomicBool>,
+        first_observable: Arc<Observable>,
+        second_observable: Arc<Observable>,
+    }
+
+    impl Operator for ControlledDynamicSource {
+        fn name(&self) -> &str {
+            "CONTROLLED_DYNAMIC_SOURCE"
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for ControlledDynamicSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            self.ready.load(Ordering::Acquire)
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn source_observable(&self) -> Option<Arc<Observable>> {
+            if self.use_second_observable.load(Ordering::Acquire) {
+                Some(Arc::clone(&self.second_observable))
+            } else {
+                Some(Arc::clone(&self.first_observable))
+            }
+        }
+    }
+
+    impl Operator for ControlledInternalProcessor {
+        fn name(&self) -> &str {
+            "CONTROLLED_INTERNAL_PROCESSOR"
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for ControlledInternalProcessor {
+        fn need_input(&self) -> bool {
+            self.ready.load(Ordering::Acquire)
+        }
+
+        fn has_output(&self) -> bool {
+            true
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
+    struct ControlledTerminalSink {
+        ready: Arc<AtomicBool>,
+        observable: Arc<Observable>,
+    }
+
+    impl Operator for ControlledTerminalSink {
+        fn name(&self) -> &str {
+            "CONTROLLED_TERMINAL_SINK"
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for ControlledTerminalSink {
+        fn need_input(&self) -> bool {
+            self.ready.load(Ordering::Acquire)
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
     impl Operator for FinishTransitionSink {
         fn name(&self) -> &str {
             "FINISH_TRANSITION_SINK"
@@ -545,6 +698,229 @@ mod tests {
                 .reschedule_queue
                 .lock()
                 .expect("event scheduler queue lock")
+                .is_empty()
+        );
+        assert_eq!(
+            executor
+                .queue
+                .lock()
+                .expect("global executor queue lock")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn output_full_task_registers_a_new_dynamic_sink_observable() {
+        let internal_ready = Arc::new(AtomicBool::new(true));
+        let terminal_ready = Arc::new(AtomicBool::new(false));
+        let terminal_observable = Arc::new(Observable::new());
+        let internal_observable = Arc::new(Observable::new());
+        let runtime_state = Arc::new(RuntimeState::default());
+        let driver = PipelineDriver::new(
+            7,
+            vec![
+                Box::new(ControlledInternalProcessor {
+                    ready: Arc::clone(&internal_ready),
+                    observable: Arc::clone(&internal_observable),
+                }),
+                Box::new(ControlledTerminalSink {
+                    ready: Arc::clone(&terminal_ready),
+                    observable: Arc::clone(&terminal_observable),
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            Some((71_100, 71_101)),
+        );
+        let fragment_ctx = Arc::new(FragmentContext::new(
+            None,
+            runtime_state,
+            Some((71_100, 71_101)),
+            None,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(1);
+        let mut task = DriverTask::new(driver, completion, fragment_ctx, Duration::from_millis(10));
+        let scheduler = Arc::new(EventScheduler::new());
+        let executor = Arc::new(ExecutorShared {
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        });
+        assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
+
+        scheduler.register_driver(&task);
+        assert_eq!(terminal_observable.num_observers(), 1);
+        assert_eq!(internal_observable.num_observers(), 0);
+        scheduler.register_driver(&task);
+        assert_eq!(terminal_observable.num_observers(), 1);
+
+        internal_ready.store(false, Ordering::Release);
+        let reason = match task.process_for_test(Duration::from_millis(10)) {
+            DriverState::Blocked(reason @ BlockedReason::OutputFull) => reason,
+            state => panic!("expected output-full block, got {state:?}"),
+        };
+        assert!(
+            scheduler.add_blocked(task, reason).is_ok(),
+            "dynamic sink observable is registrable"
+        );
+        assert_eq!(internal_observable.num_observers(), 1);
+
+        let key = scheduler
+            .reschedule_queue
+            .lock()
+            .expect("event scheduler queue lock")
+            .pop_front()
+            .expect("initial readiness recheck");
+        scheduler.try_schedule_key(key);
+        assert_eq!(
+            scheduler
+                .blocked
+                .lock()
+                .expect("event scheduler blocked lock")
+                .len(),
+            1
+        );
+        assert!(
+            executor
+                .queue
+                .lock()
+                .expect("global executor queue lock")
+                .is_empty()
+        );
+
+        internal_ready.store(true, Ordering::Release);
+        terminal_ready.store(true, Ordering::Release);
+        internal_observable.notify_observers();
+        let key = scheduler
+            .reschedule_queue
+            .lock()
+            .expect("event scheduler queue lock")
+            .pop_front()
+            .expect("new sink observable must wake the blocked driver");
+        scheduler.try_schedule_key(key);
+
+        assert!(
+            scheduler
+                .blocked
+                .lock()
+                .expect("event scheduler blocked lock")
+                .is_empty()
+        );
+        assert_eq!(
+            executor
+                .queue
+                .lock()
+                .expect("global executor queue lock")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn input_empty_task_registers_a_new_dynamic_source_observable() {
+        let source_ready = Arc::new(AtomicBool::new(false));
+        let use_second_observable = Arc::new(AtomicBool::new(false));
+        let first_observable = Arc::new(Observable::new());
+        let second_observable = Arc::new(Observable::new());
+        let terminal_ready = Arc::new(AtomicBool::new(true));
+        let terminal_observable = Arc::new(Observable::new());
+        let runtime_state = Arc::new(RuntimeState::default());
+        let driver = PipelineDriver::new(
+            8,
+            vec![
+                Box::new(ControlledDynamicSource {
+                    ready: Arc::clone(&source_ready),
+                    use_second_observable: Arc::clone(&use_second_observable),
+                    first_observable: Arc::clone(&first_observable),
+                    second_observable: Arc::clone(&second_observable),
+                }),
+                Box::new(ControlledTerminalSink {
+                    ready: terminal_ready,
+                    observable: terminal_observable,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::clone(&runtime_state),
+            Some((72_100, 72_101)),
+        );
+        let fragment_ctx = Arc::new(FragmentContext::new(
+            None,
+            runtime_state,
+            Some((72_100, 72_101)),
+            None,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(1);
+        let mut task = DriverTask::new(driver, completion, fragment_ctx, Duration::from_millis(10));
+        let scheduler = Arc::new(EventScheduler::new());
+        let executor = Arc::new(ExecutorShared {
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            shutdown: AtomicBool::new(false),
+        });
+        assert!(scheduler.shared.set(Arc::clone(&executor)).is_ok());
+
+        scheduler.register_driver(&task);
+        assert_eq!(first_observable.num_observers(), 1);
+        assert_eq!(second_observable.num_observers(), 0);
+        scheduler.register_driver(&task);
+        assert_eq!(first_observable.num_observers(), 1);
+
+        use_second_observable.store(true, Ordering::Release);
+        let reason = match task.process_for_test(Duration::from_millis(10)) {
+            DriverState::Blocked(reason @ BlockedReason::InputEmpty) => reason,
+            state => panic!("expected input-empty block, got {state:?}"),
+        };
+        assert!(
+            scheduler.add_blocked(task, reason).is_ok(),
+            "dynamic source observable is registrable"
+        );
+        assert_eq!(second_observable.num_observers(), 1);
+
+        let key = scheduler
+            .reschedule_queue
+            .lock()
+            .expect("event scheduler queue lock")
+            .pop_front()
+            .expect("initial readiness recheck");
+        scheduler.try_schedule_key(key);
+        assert_eq!(
+            scheduler
+                .blocked
+                .lock()
+                .expect("event scheduler blocked lock")
+                .len(),
+            1
+        );
+        assert!(
+            executor
+                .queue
+                .lock()
+                .expect("global executor queue lock")
+                .is_empty()
+        );
+
+        source_ready.store(true, Ordering::Release);
+        second_observable.notify_observers();
+        let key = scheduler
+            .reschedule_queue
+            .lock()
+            .expect("event scheduler queue lock")
+            .pop_front()
+            .expect("new source observable must wake the blocked driver");
+        scheduler.try_schedule_key(key);
+
+        assert!(
+            scheduler
+                .blocked
+                .lock()
+                .expect("event scheduler blocked lock")
                 .is_empty()
         );
         assert_eq!(

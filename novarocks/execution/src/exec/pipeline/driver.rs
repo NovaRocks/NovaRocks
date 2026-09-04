@@ -27,8 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use super::operator::{
@@ -88,11 +88,9 @@ pub(crate) struct DriverScheduleState {
     in_blocked: AtomicBool,
     need_check_reschedule: AtomicBool,
     schedule_token: AtomicBool,
-    observer_mask: AtomicU8,
+    source_observables: Mutex<Vec<Weak<Observable>>>,
+    sink_observables: Mutex<Vec<Weak<Observable>>>,
 }
-
-const OBSERVER_SOURCE: u8 = 1;
-const OBSERVER_SINK: u8 = 1 << 1;
 
 impl DriverScheduleState {
     pub(crate) fn new() -> Self {
@@ -100,7 +98,8 @@ impl DriverScheduleState {
             in_blocked: AtomicBool::new(false),
             need_check_reschedule: AtomicBool::new(false),
             schedule_token: AtomicBool::new(false),
-            observer_mask: AtomicU8::new(0),
+            source_observables: Mutex::new(Vec::new()),
+            sink_observables: Mutex::new(Vec::new()),
         }
     }
 
@@ -121,31 +120,32 @@ impl DriverScheduleState {
         self.need_check_reschedule.store(value, Ordering::Release);
     }
 
-    pub(crate) fn try_mark_source_observer_registered(&self) -> bool {
-        self.try_mark_observer(OBSERVER_SOURCE)
+    pub(crate) fn try_mark_source_observer_registered(&self, observable: &Arc<Observable>) -> bool {
+        Self::try_mark_observer(&self.source_observables, observable)
     }
 
-    pub(crate) fn try_mark_sink_observer_registered(&self) -> bool {
-        self.try_mark_observer(OBSERVER_SINK)
+    pub(crate) fn try_mark_sink_observer_registered(&self, observable: &Arc<Observable>) -> bool {
+        Self::try_mark_observer(&self.sink_observables, observable)
     }
 
-    fn try_mark_observer(&self, mask: u8) -> bool {
-        let mut current = self.observer_mask.load(Ordering::Acquire);
-        loop {
-            if (current & mask) != 0 {
-                return false;
-            }
-            let next = current | mask;
-            match self.observer_mask.compare_exchange(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
+    fn try_mark_observer(
+        registered: &Mutex<Vec<Weak<Observable>>>,
+        observable: &Arc<Observable>,
+    ) -> bool {
+        // A driver can expose different readiness observables as internal
+        // processors enter and leave backpressure. Track each live identity,
+        // but never keep an operator-owned observable alive from the scheduler.
+        let candidate = Arc::downgrade(observable);
+        let mut registered = registered.lock().expect("driver observable registry lock");
+        registered.retain(|existing| existing.strong_count() != 0);
+        if registered
+            .iter()
+            .any(|existing| Weak::ptr_eq(existing, &candidate))
+        {
+            return false;
         }
+        registered.push(candidate);
+        true
     }
 
     pub(crate) fn acquire_schedule_token(self: &Arc<Self>) -> ScheduleToken {
@@ -504,12 +504,14 @@ impl PipelineDriver {
         Arc::clone(&self.schedule_state)
     }
 
-    pub(crate) fn try_mark_source_observer_registered(&self) -> bool {
-        self.schedule_state.try_mark_source_observer_registered()
+    pub(crate) fn try_mark_source_observer_registered(&self, observable: &Arc<Observable>) -> bool {
+        self.schedule_state
+            .try_mark_source_observer_registered(observable)
     }
 
-    pub(crate) fn try_mark_sink_observer_registered(&self) -> bool {
-        self.schedule_state.try_mark_sink_observer_registered()
+    pub(crate) fn try_mark_sink_observer_registered(&self, observable: &Arc<Observable>) -> bool {
+        self.schedule_state
+            .try_mark_sink_observer_registered(observable)
     }
 
     pub(crate) fn set_in_blocked(&self, value: bool) {
