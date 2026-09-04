@@ -675,7 +675,21 @@ fn parse_meta_with_sql_error_descriptors(
             "sequential" => {
                 // Parsed here but ignored in merge_meta; handled at case level.
             }
-            _ => {}
+            // A directive this parser does not know is refused rather than
+            // ignored.
+            //
+            // Silently dropping one is how a case comes to assert nothing: it
+            // still reads as though it arms a fault or checks evidence, the
+            // runner does neither, and the case passes on whatever the engine
+            // happened to do. That is the exact shape of the failures this
+            // suite exists to catch, so it must not be reachable through a
+            // typo or a directive whose implementation was retired out from
+            // under a case.
+            other => bail!(
+                "unknown directive @{other}: a directive the runner does not \
+                 implement would assert nothing, so it is refused rather than \
+                 ignored"
+            ),
         }
     }
     Ok(meta)
@@ -2098,6 +2112,28 @@ mod opt5_directive_tests {
             format!("{error:#}").contains("expected terminal-retained"),
             "unexpected error: {error:#}"
         );
+    }
+
+    /// The defect this catches: an unrecognised directive used to be ignored,
+    /// so a case could read as though it armed a fault or checked evidence
+    /// while the runner did neither -- and then pass on whatever the engine
+    /// happened to do. Every failure this suite exists to catch has that
+    /// shape, and a typo or a directive retired out from under a case was
+    /// enough to reach it.
+    #[test]
+    fn an_unknown_directive_is_refused_rather_than_ignored() {
+        let re = meta_re();
+        let error = parse_meta(&["-- @not_a_directive=1".to_string()], &re)
+            .expect_err("an unimplemented directive asserts nothing");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unknown directive @not_a_directive"),
+            "the refusal has to name the directive, got: {message}"
+        );
+
+        // A directive parsed here and consumed elsewhere is still known.
+        parse_meta(&["-- @sequential=true".to_string()], &re)
+            .expect("a directive handled at case level is not unknown");
     }
 
     #[test]
