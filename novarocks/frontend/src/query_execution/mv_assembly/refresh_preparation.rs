@@ -37,6 +37,7 @@ use crate::mv::domain::iceberg_refresh::{
     IcebergMvCorePorts, join_base_refs_for_schema_contract,
     plan_iceberg_mv_refresh_with_connector_context,
 };
+use crate::mv::domain::lifecycle::RefreshError;
 use crate::mv::domain::persistence::schema::{
     MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
 };
@@ -162,13 +163,12 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
     fn prepare_step(
         &self,
         request: MvRefreshPreparationRequest,
-    ) -> Result<PreparedMvRefresh, String> {
-        request.validate()?;
+    ) -> Result<PreparedMvRefresh, RefreshError> {
+        request.validate().map_err(RefreshError::user)?;
         if request.statement != self.statement.sql_refresh_statement() {
-            return Err(
-                "MV refresh preparation statement does not match the admitted SQL request"
-                    .to_string(),
-            );
+            return Err(RefreshError::user(
+                "MV refresh preparation statement does not match the admitted SQL request",
+            ));
         }
         let mut plan = plan_iceberg_mv_refresh_with_connector_context(
             self.source,
@@ -177,8 +177,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             self.statement,
             request.target.clone(),
             self.connector_context,
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         let retained_repartition_target = self
             .repartition_fields
             .map(|_| {

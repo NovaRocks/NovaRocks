@@ -37,9 +37,10 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorTableColumnRole,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTablePlanningFacts, ConnectorTableResolution,
+    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorRequestContext, ConnectorTableColumnRole, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
+    ConnectorTableResolution,
 };
 
 use novarocks_types::naming::TableIdentity;
@@ -150,9 +151,25 @@ pub(crate) fn load_mv_target_binding_with_ports(
     table: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvTargetBinding, String> {
-    let exact_lease =
-        crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
-    load_mv_target_binding_with_lease_and_ports(
+    load_mv_target_binding_with_ports_typed(
+        connector_control,
+        storage_observation,
+        table,
+        connector_context,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Typed refresh-time binding load for callers that need to retain connector
+/// availability semantics until scheduling decides whether to retry.
+pub(crate) fn load_mv_target_binding_with_ports_typed(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    table: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvTargetBinding, ConnectorError> {
+    let exact_lease = crate::connector::metadata_binding_typed(connector_control, &table.catalog)?;
+    load_mv_target_binding_with_lease_and_ports_typed(
         storage_observation,
         table,
         exact_lease,
@@ -170,15 +187,35 @@ pub fn load_mv_target_binding_with_lease_and_ports(
     exact_lease: ConnectorControlPlanningLease,
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvTargetBinding, String> {
-    let expected_instance = novarocks_spi::connector::ConnectorInstanceId::parse(&table.catalog)
-        .map_err(|error| error.to_string())?;
+    load_mv_target_binding_with_lease_and_ports_typed(
+        storage_observation,
+        table,
+        exact_lease,
+        connector_context,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Typed variant of [`load_mv_target_binding_with_lease_and_ports`].
+pub(crate) fn load_mv_target_binding_with_lease_and_ports_typed(
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    table: &TableIdentity,
+    exact_lease: ConnectorControlPlanningLease,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvTargetBinding, ConnectorError> {
+    let expected_instance = ConnectorInstanceId::parse(&table.catalog).map_err(|error| {
+        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+    })?;
     if exact_lease.binding().descriptor().instance_id != expected_instance {
-        return Err(format!(
-            "MV target lease instance does not match table catalog {}",
-            table.catalog
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            format!(
+                "MV target lease instance does not match table catalog {}",
+                table.catalog
+            ),
         ));
     }
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease_typed(
         &exact_lease,
         connector_context.clone(),
         &table.namespace,
@@ -190,13 +227,7 @@ pub fn load_mv_target_binding_with_lease_and_ports(
         &exact_lease,
         &metadata,
         connector_context.clone(),
-    )
-    .map_err(|error| {
-        format!(
-            "observe MV refresh target facts for {}: {error}",
-            table.fqn()
-        )
-    })?;
+    )?;
     Ok(MvTargetBinding::new(metadata, exact_lease, observation))
 }
 

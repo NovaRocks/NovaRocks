@@ -281,12 +281,7 @@ impl FrontendMvService {
                 target,
                 attempt: attempt.clone(),
             })
-            .map_err(|error| {
-                MvApplicationError::new(
-                    crate::mv::domain::application::MvApplicationErrorKind::InvalidRequest,
-                    error,
-                )
-            })?;
+            .map_err(preparation_application_error)?;
         if prepared.attempt != attempt {
             return Err(MvApplicationError::new(
                 crate::mv::domain::application::MvApplicationErrorKind::InvalidRequest,
@@ -352,6 +347,24 @@ impl FrontendMvService {
             publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
         }
     }
+}
+
+fn preparation_application_error(
+    error: crate::mv::domain::lifecycle::RefreshError,
+) -> MvApplicationError {
+    use crate::mv::domain::application::MvApplicationErrorKind;
+    use crate::mv::domain::lifecycle::RefreshErrorKind;
+
+    let kind = match error.kind {
+        RefreshErrorKind::PreCommitFailed => MvApplicationErrorKind::Unavailable,
+        RefreshErrorKind::UserError => MvApplicationErrorKind::InvalidRequest,
+        RefreshErrorKind::CommitFailedKnownUncommitted => MvApplicationErrorKind::TerminalFailure,
+        RefreshErrorKind::CommitFailedKnownCommitted | RefreshErrorKind::MetadataFinalizeFailed => {
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed
+        }
+        RefreshErrorKind::CommitUnknown => MvApplicationErrorKind::CommitUnknown,
+    };
+    MvApplicationError::new(kind, error.message)
 }
 
 struct FrontendMvBackgroundEngineSink {
@@ -578,6 +591,15 @@ fn run_scheduled_refreshes(
         drop(result_tx);
         for (request, disposition, _activity_lease, _workload_lease) in result_rx {
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
+            if let Some((disposition_kind, reason)) = scheduler_outcome_log_fields(&disposition) {
+                tracing::warn!(
+                    mv_id = request.definition.mv_id,
+                    target = %request.target.display_name(),
+                    disposition_kind,
+                    reason = %reason,
+                    "frontend MV scheduler refresh did not complete"
+                );
+            }
             if let Err(error) = scheduler.complete(&request, disposition, now_unix_millis()) {
                 tracing::warn!(mv_id = request.definition.mv_id, error = %error, "persist frontend MV scheduler outcome failed");
             } else if completed && let Some(wakeup_tx) = &dependencies.maintenance_wakeup_tx {
@@ -585,6 +607,31 @@ fn run_scheduled_refreshes(
             }
         }
     });
+}
+
+fn scheduler_outcome_log_fields(
+    disposition: &ScheduledRefreshDisposition,
+) -> Option<(&'static str, &str)> {
+    match disposition {
+        ScheduledRefreshDisposition::TransientUnavailable(reason) => {
+            Some(("transient_unavailable", reason))
+        }
+        ScheduledRefreshDisposition::InvalidDefinition(reason) => {
+            Some(("invalid_definition", reason))
+        }
+        ScheduledRefreshDisposition::TerminalFailure(reason) => Some(("terminal_failure", reason)),
+        ScheduledRefreshDisposition::Corruption(reason) => Some(("corruption", reason)),
+        ScheduledRefreshDisposition::InvariantViolation(reason) => {
+            Some(("invariant_violation", reason))
+        }
+        ScheduledRefreshDisposition::TargetGone => {
+            Some(("target_gone", "MV target no longer exists"))
+        }
+        ScheduledRefreshDisposition::Completed
+        | ScheduledRefreshDisposition::NoOp
+        | ScheduledRefreshDisposition::AlreadyActive
+        | ScheduledRefreshDisposition::ShutdownCancelled => None,
+    }
 }
 
 fn execute_scheduled_refresh(

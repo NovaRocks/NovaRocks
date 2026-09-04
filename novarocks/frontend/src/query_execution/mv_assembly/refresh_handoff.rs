@@ -26,6 +26,8 @@ use super::refresh_artifact::{
 };
 use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 
+use crate::mv::domain::lifecycle::RefreshError;
+
 /// Frontend-preallocated identity for one MV refresh publication.
 ///
 /// A publication ID is the sole cross-boundary identity. Provider-specific
@@ -152,7 +154,7 @@ pub trait MvRefreshPreparationService: Send + Sync {
     fn prepare_step(
         &self,
         request: MvRefreshPreparationRequest,
-    ) -> Result<PreparedMvRefresh, String>;
+    ) -> Result<PreparedMvRefresh, RefreshError>;
 }
 
 #[cfg(test)]

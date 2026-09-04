@@ -26,6 +26,7 @@ use crate::maintenance::MaintenanceTarget;
 use crate::mv::domain::dependency::model::iceberg_mv_dependency_ref;
 use crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use crate::mv::domain::lifecycle::{RefreshError, RefreshErrorKind};
 use crate::mv::domain::refresh::{
     definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
 };
@@ -184,9 +185,7 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
                 target: step.target.clone(),
                 attempt,
             })
-            .map_err(|error| {
-                MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::InvalidDefinition, error)
-            })
+            .map_err(preparation_error)
     }
 
     fn current_base_snapshots(
@@ -265,6 +264,18 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
     }
 }
 
+fn preparation_error(error: RefreshError) -> MvBackgroundEngineError {
+    let kind = match error.kind {
+        RefreshErrorKind::PreCommitFailed => MvBackgroundEngineErrorKind::TransientUnavailable,
+        RefreshErrorKind::UserError => MvBackgroundEngineErrorKind::InvalidDefinition,
+        RefreshErrorKind::CommitFailedKnownUncommitted
+        | RefreshErrorKind::CommitFailedKnownCommitted
+        | RefreshErrorKind::CommitUnknown
+        | RefreshErrorKind::MetadataFinalizeFailed => MvBackgroundEngineErrorKind::TerminalFailure,
+    };
+    MvBackgroundEngineError::new(kind, error.message)
+}
+
 fn repository_error(
     error: crate::mv::domain::repository::MvRepositoryError,
 ) -> MvBackgroundEngineError {
@@ -280,4 +291,26 @@ fn repository_error(
         }
     };
     MvBackgroundEngineError::new(kind, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preparation_error;
+    use crate::mv::background::MvBackgroundEngineErrorKind;
+    use crate::mv::domain::lifecycle::RefreshError;
+
+    #[test]
+    fn retryable_preparation_error_preserves_its_typed_disposition() {
+        let error = preparation_error(RefreshError::pre_commit("connector is starting"));
+        assert_eq!(
+            error.kind(),
+            MvBackgroundEngineErrorKind::TransientUnavailable
+        );
+    }
+
+    #[test]
+    fn definition_preparation_error_remains_blocked() {
+        let error = preparation_error(RefreshError::user("stored MV contract is incompatible"));
+        assert_eq!(error.kind(), MvBackgroundEngineErrorKind::InvalidDefinition);
+    }
 }

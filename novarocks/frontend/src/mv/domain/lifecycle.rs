@@ -234,6 +234,12 @@ impl RefreshError {
     }
 }
 
+impl From<String> for RefreshError {
+    fn from(message: String) -> Self {
+        Self::user(message)
+    }
+}
+
 impl fmt::Display for RefreshError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)

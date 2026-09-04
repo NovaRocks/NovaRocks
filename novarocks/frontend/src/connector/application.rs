@@ -22,10 +22,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorInstanceId, ConnectorListNamespacesRequest,
-    ConnectorNamespaceIdentity, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution,
+    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorListNamespacesRequest, ConnectorNamespaceIdentity, ConnectorReadReferenceFacts,
+    ConnectorReadReferenceFactsRequest, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableRequest, ConnectorTableResolution,
 };
 
 struct RequestConnectorCancellation {
@@ -221,10 +221,20 @@ fn metadata_binding(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     catalog: &str,
 ) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
-    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
-    controls
-        .acquire_current(&instance_id)
-        .map_err(|error| error.to_string())
+    metadata_binding_typed(controls, catalog).map_err(|error| error.to_string())
+}
+
+/// Acquires one exact planning lease without erasing the connector's failure
+/// category. Refresh scheduling uses this to distinguish a temporary catalog
+/// outage from a definition that cannot be refreshed.
+pub(crate) fn metadata_binding_typed(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    catalog: &str,
+) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, ConnectorError> {
+    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| {
+        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+    })?;
+    controls.acquire_current(&instance_id)
 }
 
 pub fn metadata_namespace_exists(
@@ -256,16 +266,23 @@ pub(crate) fn context_for_planning_lease(
     binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
     context: ConnectorRequestContext,
 ) -> Result<ConnectorRequestContext, String> {
+    context_for_planning_lease_typed(binding, context).map_err(|error| error.to_string())
+}
+
+/// Attaches attempt-scoped credential collection while preserving connector
+/// error classification for lifecycle callers.
+pub(crate) fn context_for_planning_lease_typed(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+) -> Result<ConnectorRequestContext, ConnectorError> {
     if context.vended_credential_lease_sink().is_some() {
         context
             .with_vended_credential_lease_collection(
-                binding
-                    .binding()
-                    .catalog_properties()
-                    .map_err(|error| error.to_string())?
-                    .clone(),
+                binding.binding().catalog_properties()?.clone(),
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
     } else {
         Ok(context)
     }
@@ -445,8 +462,23 @@ pub fn metadata_load_connector_table_with_planning_lease(
     table: &str,
     resolution: ConnectorTableResolution,
 ) -> Result<novarocks_spi::connector::ConnectorTableMetadata, String> {
+    metadata_load_connector_table_with_planning_lease_typed(
+        binding, context, namespace, table, resolution,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Typed counterpart of [`metadata_load_connector_table_with_planning_lease`]
+/// for lifecycle code that must retain retry semantics.
+pub(crate) fn metadata_load_connector_table_with_planning_lease_typed(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+    table: &str,
+    resolution: ConnectorTableResolution,
+) -> Result<novarocks_spi::connector::ConnectorTableMetadata, ConnectorError> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
-    let context = context_for_planning_lease(binding, context)?;
+    let context = context_for_planning_lease_typed(binding, context)?;
     binding
         .binding()
         .metadata()
@@ -459,7 +491,6 @@ pub fn metadata_load_connector_table_with_planning_lease(
             resolution,
             context,
         })
-        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn sql_columns_from_connector_schema(

@@ -92,8 +92,8 @@ use crate::mv::domain::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
 };
 use crate::mv::domain::refresh::target::{
-    IcebergMvTarget, load_iceberg_mv_target_binding, resolve_refresh_target,
-    validate_target_snapshot,
+    IcebergMvTarget, load_iceberg_mv_target_binding, load_iceberg_mv_target_binding_typed,
+    resolve_refresh_target, validate_target_snapshot,
 };
 use crate::mv::domain::refresh::target_apply::{
     apply_key_table_column, branch_id_table_column, ensure_base_row_lineage_contract,
@@ -115,7 +115,9 @@ use crate::runtime::statement_result::StatementResult;
 use mv_schema::MvPartitionContract;
 use novarocks_parser::{Span, ast};
 use novarocks_spi::connector::MvStorageObservationPort;
-use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorInstanceId};
+use novarocks_spi::connector::{
+    ConnectorControlRegistry, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+};
 use novarocks_sql::planning::mv::FULL_REFRESH_DISABLED_MESSAGE;
 #[cfg(test)]
 use novarocks_sql::planning::mv::MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME;
@@ -3987,6 +3989,21 @@ fn reconcile_published_lake_projection(
     load_iceberg_mv_definition_by_target(source.readiness().as_ref(), target).map(Some)
 }
 
+fn refresh_connector_preparation_error(error: ConnectorError) -> RefreshError {
+    match error.kind() {
+        ConnectorErrorKind::Unavailable
+        | ConnectorErrorKind::DeadlineExceeded
+        | ConnectorErrorKind::ResourceExhausted
+        | ConnectorErrorKind::Cancelled => RefreshError::pre_commit(error.to_string()),
+        ConnectorErrorKind::InvalidRequest
+        | ConnectorErrorKind::NotFound
+        | ConnectorErrorKind::PermissionDenied
+        | ConnectorErrorKind::Unsupported
+        | ConnectorErrorKind::CorruptData
+        | ConnectorErrorKind::Internal => RefreshError::user(error.to_string()),
+    }
+}
+
 pub fn plan_iceberg_mv_refresh_with_connector_context(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -4013,13 +4030,13 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     let mut mv_definition =
         load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &iceberg_target)
             .map_err(RefreshError::user)?;
-    let target_binding = load_iceberg_mv_target_binding(
+    let target_binding = load_iceberg_mv_target_binding_typed(
         source.connector_control(),
         source.storage_observation(),
         &iceberg_target,
         connector_context,
     )
-    .map_err(RefreshError::user)?;
+    .map_err(refresh_connector_preparation_error)?;
     if let Err(snapshot_error) =
         validate_target_snapshot(&iceberg_target, &mv_definition, &target_binding)
     {
@@ -4057,13 +4074,13 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     .map_err(RefreshError::user)?;
     let refresh_state_baseline = build_refresh_state_baseline(
         &mv_definition,
-        &load_iceberg_mv_target_binding(
+        &load_iceberg_mv_target_binding_typed(
             source.connector_control(),
             source.storage_observation(),
             &iceberg_target,
             connector_context,
         )
-        .map_err(RefreshError::user)?,
+        .map_err(refresh_connector_preparation_error)?,
         current_catalog,
         current_database,
     )

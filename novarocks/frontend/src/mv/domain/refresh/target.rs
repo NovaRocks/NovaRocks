@@ -20,11 +20,11 @@
 use crate::mv::domain::analysis::resolve_mv_name;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::refresh::target_binding::{
-    MvTargetBinding, load_mv_target_binding_with_ports,
+    MvTargetBinding, load_mv_target_binding_with_ports, load_mv_target_binding_with_ports_typed,
 };
 use crate::mv::domain::repository::MvTarget;
 use novarocks_spi::connector::MvStorageObservationPort;
-use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+use novarocks_spi::connector::{ConnectorControlResolver, ConnectorError, ConnectorRequestContext};
 use novarocks_sql::semantic::ObjectName;
 use novarocks_types::naming::{TableIdentity, normalize_identifier};
 
@@ -107,6 +107,53 @@ pub fn load_iceberg_mv_target_binding(
         },
         connector_context,
     )
+}
+
+/// Typed counterpart used by the background refresh path. A caller must map
+/// the returned connector category to its retry policy instead of inferring
+/// one from text after it has crossed the preparation boundary.
+pub(crate) fn load_iceberg_mv_target_binding_typed(
+    connector_control: &dyn ConnectorControlResolver,
+    storage_observation: &dyn MvStorageObservationPort,
+    target: &IcebergMvTarget,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvTargetBinding, ConnectorError> {
+    #[cfg(debug_assertions)]
+    if consume_scheduler_transient_preparation_fault(target) {
+        return Err(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            format!(
+                "test-injected temporary connector unavailability while preparing {}.{}.{}",
+                target.catalog, target.namespace, target.table
+            ),
+        ));
+    }
+    load_mv_target_binding_with_ports_typed(
+        connector_control,
+        storage_observation,
+        &TableIdentity {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+        },
+        connector_context,
+    )
+}
+
+/// Debug-only, one-shot cross-process seam for the scheduler recovery test.
+/// The injected provider-style error enters at the typed binding boundary, so
+/// the test proves its category survives planning and background scheduling.
+#[cfg(debug_assertions)]
+fn consume_scheduler_transient_preparation_fault(target: &IcebergMvTarget) -> bool {
+    let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR") else {
+        return false;
+    };
+    let trigger = std::path::PathBuf::from(directory).join(format!(
+        "mvx4-scheduler-transient-preparation-{}.trigger",
+        target.table
+    ));
+    let consumed = trigger.with_extension("consumed");
+    std::fs::rename(trigger, consumed).is_ok()
 }
 
 /// Validates that the persisted MV definition still names the target snapshot

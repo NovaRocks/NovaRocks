@@ -34,7 +34,6 @@ pub mod fixture;
 #[cfg(test)]
 pub mod scan_model;
 
-pub(crate) use application::context_for_planning_lease;
 pub use application::{
     acquire_metadata_planning_lease, connector_default_to_column_default,
     connector_request_context, connector_request_context_for_execution,
@@ -44,6 +43,10 @@ pub use application::{
     metadata_load_table_with_planning_lease, metadata_namespace_exists,
     metadata_read_reference_facts_with_planning_lease, metadata_table_exists_with_planning_lease,
     validate_request_context,
+};
+pub(crate) use application::{
+    context_for_planning_lease, metadata_binding_typed,
+    metadata_load_connector_table_with_planning_lease_typed,
 };
 pub use control_host::ConnectorControlHost;
 pub use unified_statistics::UnifiedStatisticsResolver;

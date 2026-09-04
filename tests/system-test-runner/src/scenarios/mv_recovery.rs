@@ -247,6 +247,11 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             "add rows while scheduler refresh is held",
             "INSERT INTO orders VALUES (4, 40)",
         )?;
+        let _transient_preparation_fault = FileTrigger::create(
+            &barrier_dir.join("mvx4-scheduler-transient-preparation-orders_mv_recovery.trigger"),
+            "inject one typed connector unavailability after FE restart\n",
+        )?;
+        context.action("armed one transient scheduler preparation fault for FE recovery");
         drop(conn);
         context.action("terminate held scheduler FE attempt for recovery");
         context
