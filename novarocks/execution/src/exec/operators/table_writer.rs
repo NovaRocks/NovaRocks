@@ -470,8 +470,7 @@ impl Operator for TableWriterOperator {
             .execution_runtime()
             .map(|runtime| runtime.config().exchange_max_transmit_batched_bytes)
             .unwrap_or(MAX_WRITER_MULTIPLEX_ROW_BYTES)
-            .min(MAX_WRITER_MULTIPLEX_ROW_BYTES)
-            .max(1);
+            .clamp(1, MAX_WRITER_MULTIPLEX_ROW_BYTES);
         if let Some(partial) = self.partial_aggregate.as_mut()
             && let Err(error) = partial.bind_runtime_state(state)
         {
