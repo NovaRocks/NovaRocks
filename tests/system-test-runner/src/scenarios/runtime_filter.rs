@@ -295,7 +295,6 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
     require_three_backends(context)?;
     let mut control = connect_control(context, "connect cancellation scenario control session")?;
     let tables = create_runtime_filter_tables(context, &mut control, "cancel")?;
-    configure_broadcast_runtime_filter(&mut control)?;
     let baseline = resource_snapshot(context)?;
     // Captured before the query under test starts, so every count below is this
     // query's own. The fixture setup above already ran distributed statements.
@@ -309,6 +308,10 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
         .arm_query_lifecycle_fault(0, TASK_UPDATE_TERMINAL_ACK_DROP)
         .context("arm terminal task-update ACK drop for the targeted backend")?;
     context.action("armed a terminal task-update ACK-drop replay fault for BE[0]");
+    arm_all_backends(context, ACK_DROP_FAULT_KIND)?;
+    context.action(
+        "armed one contribution Accepted-after-ACK-drop readiness probe for every native participant",
+    );
 
     let target = start_blocking_runtime_filter_query(
         context.mysql_user(),
@@ -321,9 +324,9 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
         .recv_timeout(context.remaining("receive Runtime Filter query connection id")?)
         .context("Runtime Filter query terminated before publishing its connection id")?;
     context.action("started an in-flight native Runtime Filter query through public MySQL");
-    await_runtime_filter_activity(context, &baseline, &created_baseline)?;
+    await_ack_drop_while_query_active(context, &baseline, &created_baseline, &target.done)?;
     context.action(
-        "observed an admitted task on more than one backend and an active native fragment through the typed resource oracle",
+        "observed a receiver-Accepted Runtime Filter contribution while the EES task query remained active",
     );
     await_total_advanced(
         context,
@@ -1006,32 +1009,6 @@ fn await_backends_advanced(
     }
 }
 
-/// Waits until the query under test is really running distributed.
-///
-/// Both halves are needed. `NOVAROCKS_TASK_CREATE_APPLIED` newly emitted on
-/// more than one backend is the task protocol's own statement that this attempt
-/// was admitted past a single process; the active-fragment gauge is the
-/// statement that work is in flight right now, which a log line -- never
-/// retracted -- cannot make. The retired protocol's `control_ready` count and
-/// its `native_runtime_filter_services` gauge are both published only by the
-/// lifecycle chain, so neither can gate anything on the task path.
-fn await_runtime_filter_activity(
-    context: &mut ScenarioContext,
-    baseline: &QueryExecutionResourceSnapshot,
-    created_baseline: &[usize],
-) -> Result<()> {
-    loop {
-        let current = resource_snapshot(context)?;
-        if task_query_activity_observed(context, baseline, &current, created_baseline)? {
-            return Ok(());
-        }
-        let remaining = context.remaining(
-            "observe an admitted task on more than one backend and an active fragment",
-        )?;
-        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
-    }
-}
-
 fn await_ack_drop_while_query_active<T: std::fmt::Debug>(
     context: &mut ScenarioContext,
     baseline: &QueryExecutionResourceSnapshot,
@@ -1163,6 +1140,8 @@ fn start_blocking_runtime_filter_query(
     let thread = thread::spawn(move || -> Result<()> {
         let mut connection = mysql_actor::connect_for_cancellation(&user, port, connect_timeout)
             .context("connect blocking Runtime Filter query actor")?;
+        configure_partitioned_runtime_filter(&mut connection)
+            .context("configure blocking Runtime Filter query actor")?;
         ready_tx
             .send(connection.connection_id())
             .context("publish blocking Runtime Filter query connection id")?;
