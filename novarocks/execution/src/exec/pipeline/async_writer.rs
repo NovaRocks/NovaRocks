@@ -166,7 +166,6 @@ impl<O> WriterShared<O> {
             .queue_usage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = QueueUsage::default();
-        self.wake();
     }
 
     fn set_error(&self, error: String, runtime_error: &RuntimeErrorState) {
@@ -183,17 +182,18 @@ impl<O> WriterShared<O> {
         self.wake();
     }
 
-    fn publish_terminal_result(&self, output: O) {
+    fn publish_terminal_success(&self, output: O) {
         let mut result = self.result.lock().expect("async writer result lock");
         debug_assert!(
             result.is_none(),
             "async writer publishes one terminal result"
         );
         *result = Some(output);
-        // This latch records the actor's irreversible production event. The
-        // result slot is consumer-owned after publication and can legitimately
-        // be empty again before the task wrapper finishes.
+        // Result and semantic completion form one monotonic terminal
+        // publication. The result slot is consumer-owned afterwards and can
+        // legitimately be empty again while `done` remains true.
         self.terminal_result_produced.store(true, Ordering::Release);
+        self.done.store(true, Ordering::Release);
         drop(result);
         self.wake();
     }
@@ -314,42 +314,41 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         let shared = Arc::clone(&self.shared);
         let config = self.config;
         self.join = Some(executor.spawn(async move {
-            let outcome = tokio::spawn(run_writer_actor(
+            // Keep the provider lifecycle and its terminal publication in one
+            // sink-I/O task. A nested task would publish its result first and
+            // require a second scheduler turn before this wrapper could release
+            // actor resources and publish `done`, which can strand the driver
+            // in PendingFinish when that wrapper turn is delayed.
+            let outcome = std::panic::AssertUnwindSafe(run_writer_actor(
                 start,
                 Arc::clone(&shared),
                 config,
                 Arc::clone(&runtime_error),
             ))
+            .catch_unwind()
             .await;
-            if let Err(join_error) = outcome {
-                let detail = if join_error.is_panic() {
-                    let payload = join_error.into_panic();
-                    if let Some(message) = payload.downcast_ref::<&str>() {
-                        (*message).to_string()
-                    } else if let Some(message) = payload.downcast_ref::<String>() {
-                        message.clone()
-                    } else {
-                        "unknown panic payload".to_string()
-                    }
-                } else {
-                    join_error.to_string()
-                };
-                shared.set_error(
-                    format!("connector writer actor panicked: {detail}"),
-                    &runtime_error,
-                );
-            }
-            // The nested actor future (including its receiver and in-flight
-            // command) has now been dropped even on panic. Clear logical
-            // admission counters after the matching TrackedBytes guards have
-            // released their retained Arrow memory.
+            // The actor future (including its provider writer, receiver, and
+            // in-flight command) has now been dropped even on panic. Clear the
+            // logical counters after the matching retained-memory guards.
             shared.clear_queue_usage();
-            shared.ensure_terminal_outcome(&runtime_error);
-            // This is the actor's lifecycle join latch: all actor-owned writer,
-            // receiver, future, and queued-memory values have been dropped by
-            // this point. `JoinHandle::is_finished` closes the final scheduler
-            // race between this store and completion of the task wrapper.
-            shared.set_done();
+            match outcome {
+                Ok(Some(output)) => shared.publish_terminal_success(output),
+                Ok(None) => {
+                    shared.ensure_terminal_outcome(&runtime_error);
+                    shared.set_done();
+                }
+                Err(payload) => {
+                    shared.set_error(
+                        format!(
+                            "connector writer actor panicked: {}",
+                            panic_message(payload)
+                        ),
+                        &runtime_error,
+                    );
+                    shared.ensure_terminal_outcome(&runtime_error);
+                    shared.set_done();
+                }
+            }
         }));
         Ok(())
     }
@@ -536,10 +535,6 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
 
     pub(crate) fn is_done(&self) -> bool {
         self.shared.done.load(Ordering::Acquire)
-            && self
-                .join
-                .as_ref()
-                .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
     pub(crate) fn has_output(&self) -> bool {
@@ -672,7 +667,7 @@ async fn run_writer_actor<O: Send + 'static>(
     shared: Arc<WriterShared<O>>,
     config: AsyncWriterQueueConfig,
     runtime_error: Arc<RuntimeErrorState>,
-) {
+) -> Option<O> {
     let WriterStart {
         execution,
         request,
@@ -683,17 +678,17 @@ async fn run_writer_actor<O: Send + 'static>(
         AwaitResult::Completed(Ok(writer)) => writer,
         AwaitResult::Completed(Err(error)) => {
             shared.set_error(format!("open connector writer: {error}"), &runtime_error);
-            return;
+            return None;
         }
         AwaitResult::Aborted => {
-            return;
+            return None;
         }
         AwaitResult::Panicked(detail) => {
             shared.set_error(
                 format!("open connector writer panicked: {detail}"),
                 &runtime_error,
             );
-            return;
+            return None;
         }
     };
     let mut finish_mapper = Some(finish_mapper);
@@ -704,7 +699,7 @@ async fn run_writer_actor<O: Send + 'static>(
             if let Err(error) = abort_writer(writer.as_mut(), config.abort_timeout).await {
                 shared.set_error(error, &runtime_error);
             }
-            return;
+            return None;
         }
         let command = tokio::select! {
             biased;
@@ -715,7 +710,7 @@ async fn run_writer_actor<O: Send + 'static>(
             if let Err(error) = abort_writer(writer.as_mut(), config.abort_timeout).await {
                 shared.set_error(error, &runtime_error);
             }
-            return;
+            return None;
         };
         match command {
             WriterCommand::Append(command) => {
@@ -738,7 +733,7 @@ async fn run_writer_actor<O: Send + 'static>(
                                     &runtime_error,
                                 )
                                 .await;
-                                return;
+                                return None;
                             }
                         };
                     }
@@ -751,7 +746,7 @@ async fn run_writer_actor<O: Send + 'static>(
                             &runtime_error,
                         )
                         .await;
-                        return;
+                        return None;
                     }
                     AwaitResult::Aborted => {
                         if let Err(error) =
@@ -759,7 +754,7 @@ async fn run_writer_actor<O: Send + 'static>(
                         {
                             shared.set_error(error, &runtime_error);
                         }
-                        return;
+                        return None;
                     }
                     AwaitResult::Panicked(detail) => {
                         fail_with_abort(
@@ -770,7 +765,7 @@ async fn run_writer_actor<O: Send + 'static>(
                             &runtime_error,
                         )
                         .await;
-                        return;
+                        return None;
                     }
                 }
             }
@@ -786,7 +781,7 @@ async fn run_writer_actor<O: Send + 'static>(
                             &runtime_error,
                         )
                         .await;
-                        return;
+                        return None;
                     }
                     AwaitResult::Aborted => {
                         if let Err(error) =
@@ -794,7 +789,7 @@ async fn run_writer_actor<O: Send + 'static>(
                         {
                             shared.set_error(error, &runtime_error);
                         }
-                        return;
+                        return None;
                     }
                     AwaitResult::Panicked(detail) => {
                         fail_with_abort(
@@ -805,16 +800,14 @@ async fn run_writer_actor<O: Send + 'static>(
                             &runtime_error,
                         )
                         .await;
-                        return;
+                        return None;
                     }
                 };
                 let mapper = finish_mapper
                     .take()
                     .expect("connector writer finish mapper is consumed exactly once");
                 match mapper(accepted_rows, fragments) {
-                    Ok(output) => {
-                        shared.publish_terminal_result(output);
-                    }
+                    Ok(output) => return Some(output),
                     Err(error) => {
                         fail_with_abort(
                             writer.as_mut(),
@@ -826,7 +819,7 @@ async fn run_writer_actor<O: Send + 'static>(
                         .await;
                     }
                 }
-                return;
+                return None;
             }
         }
     }
@@ -1000,10 +993,10 @@ mod tests {
         let shared = WriterShared::<u64>::new();
         let runtime_error = RuntimeErrorState::default();
 
-        shared.publish_terminal_result(17);
+        shared.publish_terminal_success(17);
         assert_eq!(shared.result.lock().expect("result lock").take(), Some(17));
 
-        // The task wrapper runs this check only after the nested actor exits.
+        // The sink-I/O task runs this check only after the actor future exits.
         // A consumer is allowed to have drained the result slot by then.
         shared.ensure_terminal_outcome(&runtime_error);
         assert!(runtime_error.error().is_none());
@@ -1011,6 +1004,86 @@ mod tests {
             shared.terminal_result_produced.load(Ordering::Acquire),
             "terminal production is a monotonic event, not result-slot occupancy"
         );
+    }
+
+    #[test]
+    fn successful_terminal_notification_observes_result_and_done_together() {
+        let calls = Arc::new(Calls::default());
+        let execution = Arc::new(ControlledExecution {
+            catalog_handle: catalog_handle(),
+            calls,
+            append_gate: None,
+            fail_append: false,
+            fail_abort: false,
+        });
+        let mut owner = AsyncWriterOwner::new(
+            execution,
+            request(),
+            AsyncWriterQueueConfig::default(),
+            Box::new(|rows, _| Ok(rows)),
+        );
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed_shared = Arc::clone(&owner.shared);
+        let observed_values = Arc::clone(&observations);
+        owner.observable().add_observer(Arc::new(move || {
+            let result = *observed_shared.result.lock().expect("result lock");
+            if result.is_some() {
+                observed_values
+                    .lock()
+                    .expect("terminal observations lock")
+                    .push((observed_shared.done.load(Ordering::Acquire), result));
+            }
+        }));
+
+        let runtime = runtime();
+        owner
+            .bind(
+                runtime.services().sink_io().clone(),
+                Arc::new(RuntimeErrorState::default()),
+            )
+            .expect("bind writer actor");
+        owner.request_finish().expect("request writer finish");
+        wait_until(|| owner.is_done());
+
+        assert_eq!(
+            observations.lock().expect("observations lock").as_slice(),
+            &[(true, Some(0))],
+            "the real actor path must never notify result visibility before semantic completion"
+        );
+    }
+
+    #[test]
+    fn semantic_terminal_latch_does_not_wait_for_executor_wrapper_completion() {
+        let calls = Arc::new(Calls::default());
+        let execution = Arc::new(ControlledExecution {
+            catalog_handle: catalog_handle(),
+            calls,
+            append_gate: None,
+            fail_append: false,
+            fail_abort: false,
+        });
+        let mut owner = AsyncWriterOwner::new(
+            execution,
+            request(),
+            AsyncWriterQueueConfig::default(),
+            Box::new(|rows, _| Ok(rows)),
+        );
+        let runtime = runtime();
+        owner.join = Some(runtime.services().sink_io().spawn(async {
+            std::future::pending::<()>().await;
+        }));
+
+        owner.shared.set_done();
+
+        assert!(
+            !owner.join.as_ref().expect("test join handle").is_finished(),
+            "the executor wrapper must still be pending for this regression"
+        );
+        assert!(
+            owner.is_done(),
+            "semantic writer completion must not depend on an unobservable JoinHandle transition"
+        );
+        owner.join.take().expect("test join handle").abort();
     }
 
     fn owner(

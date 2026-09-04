@@ -459,6 +459,7 @@ mod tests {
 
     struct ControlledInternalProcessor {
         ready: Arc<AtomicBool>,
+        has_output: Arc<AtomicBool>,
         observable: Arc<Observable>,
     }
 
@@ -541,7 +542,7 @@ mod tests {
         }
 
         fn has_output(&self) -> bool {
-            true
+            self.has_output.load(Ordering::Acquire)
         }
 
         fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
@@ -727,6 +728,7 @@ mod tests {
     #[test]
     fn output_full_task_registers_a_new_dynamic_sink_observable() {
         let internal_ready = Arc::new(AtomicBool::new(true));
+        let internal_has_output = Arc::new(AtomicBool::new(true));
         let terminal_ready = Arc::new(AtomicBool::new(false));
         let terminal_observable = Arc::new(Observable::new());
         let internal_observable = Arc::new(Observable::new());
@@ -736,6 +738,7 @@ mod tests {
             vec![
                 Box::new(ControlledInternalProcessor {
                     ready: Arc::clone(&internal_ready),
+                    has_output: Arc::clone(&internal_has_output),
                     observable: Arc::clone(&internal_observable),
                 }),
                 Box::new(ControlledTerminalSink {
@@ -788,6 +791,7 @@ mod tests {
             .expect("event scheduler queue lock")
             .pop_front()
             .expect("initial readiness recheck");
+        internal_has_output.store(false, Ordering::Release);
         internal_ready.store(false, Ordering::Release);
         scheduler.try_schedule_key(key);
         assert_eq!(internal_observable.num_observers(), 1);
@@ -815,7 +819,7 @@ mod tests {
             .expect("new sink observable must receive a closing readiness recheck");
         scheduler.try_schedule_key(key);
 
-        internal_ready.store(true, Ordering::Release);
+        internal_has_output.store(true, Ordering::Release);
         terminal_ready.store(true, Ordering::Release);
         internal_observable.notify_observers();
         let key = scheduler

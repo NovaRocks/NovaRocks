@@ -773,15 +773,48 @@ impl PipelineDriver {
 
     fn internal_blocked_sink_observable(&self) -> Option<Arc<Observable>> {
         let end = self.operators.len().saturating_sub(1);
-        self.operators[..end].iter().rev().find_map(|op| {
+        for op in self.operators[..end].iter().rev() {
             if op.is_finished() {
+                continue;
+            }
+            let Some(processor) = op.as_processor_ref() else {
+                continue;
+            };
+            // A processor with buffered output can make downstream progress
+            // even when it cannot accept another input page. Treating it as
+            // OutputFull would park on its input-capacity observable and lose
+            // a terminal-output transition that has already happened.
+            if processor.has_output() {
                 return None;
             }
-            let processor = op.as_processor_ref()?;
             if processor.need_input() {
-                return None;
+                continue;
             }
-            processor.sink_observable()
+            if let Some(observable) = processor.sink_observable() {
+                return Some(observable);
+            }
+        }
+        None
+    }
+
+    fn has_runnable_dataflow(&self) -> bool {
+        self.edge_chunks.iter().enumerate().any(|(edge, chunk)| {
+            let Some(downstream) = self
+                .operators
+                .get(edge + 1)
+                .and_then(|operator| operator.as_processor_ref())
+            else {
+                return false;
+            };
+            if !downstream.need_input() {
+                return false;
+            }
+            chunk.is_some()
+                || self
+                    .operators
+                    .get(edge)
+                    .and_then(|operator| operator.as_processor_ref())
+                    .is_some_and(ProcessorOperator::has_output)
         })
     }
 
@@ -792,7 +825,10 @@ impl PipelineDriver {
                     self.source_ready() || self.is_finished() || self.has_ready_finishing_work()
                 }
                 BlockedReason::OutputFull => {
-                    self.sink_ready() || self.is_finished() || self.has_ready_finishing_work()
+                    self.has_runnable_dataflow()
+                        || self.sink_ready()
+                        || self.is_finished()
+                        || self.has_ready_finishing_work()
                 }
                 BlockedReason::Dependency(dep) => dep.is_ready(),
             },
@@ -1654,6 +1690,53 @@ mod terminal_signal_tests {
 
     use super::*;
 
+    struct ControlledReadinessOperator {
+        name: &'static str,
+        need_input: bool,
+        has_output: bool,
+        observable: Arc<Observable>,
+    }
+
+    impl Operator for ControlledReadinessOperator {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for ControlledReadinessOperator {
+        fn need_input(&self) -> bool {
+            self.need_input
+        }
+
+        fn has_output(&self) -> bool {
+            self.has_output
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
     struct SignalCountingOperator {
         pending: Arc<AtomicBool>,
         cancel_count: Arc<AtomicUsize>,
@@ -1695,6 +1778,46 @@ mod terminal_signal_tests {
             Arc::new(RuntimeState::default()),
             None,
         )
+    }
+
+    #[test]
+    fn downstream_output_is_runnable_before_an_upstream_capacity_blocker() {
+        let upstream_observable = Arc::new(Observable::new());
+        let downstream_observable = Arc::new(Observable::new());
+        let terminal_observable = Arc::new(Observable::new());
+        let driver = PipelineDriver::new(
+            1,
+            vec![
+                Box::new(ControlledReadinessOperator {
+                    name: "UPSTREAM_BLOCKED",
+                    need_input: false,
+                    has_output: false,
+                    observable: upstream_observable,
+                }),
+                Box::new(ControlledReadinessOperator {
+                    name: "DOWNSTREAM_OUTPUT",
+                    need_input: false,
+                    has_output: true,
+                    observable: downstream_observable,
+                }),
+                Box::new(ControlledReadinessOperator {
+                    name: "TERMINAL_READY",
+                    need_input: true,
+                    has_output: false,
+                    observable: terminal_observable,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        assert!(driver.internal_blocked_sink_observable().is_none());
+        assert!(
+            driver.has_runnable_dataflow(),
+            "downstream output can move even while an earlier processor cannot accept input"
+        );
     }
 
     #[test]
