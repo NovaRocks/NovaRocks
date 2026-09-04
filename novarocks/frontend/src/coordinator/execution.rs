@@ -1668,6 +1668,27 @@ impl FrontendDistributedQueryCoordinator {
             BTreeSet::new()
         };
 
+        // Also read off the encoded plans before they are consumed, and only
+        // when a profile will actually be rendered. A task's own report names
+        // per-operator plan nodes and its stage; the fragment it ran is a fact
+        // of the sealed plan, and this is the last point where that plan is in
+        // hand. Without it, EXPLAIN ANALYZE has no fragment key at all -- and
+        // deriving one from a task's profile tree would name a plan node the
+        // task's facts do not belong to.
+        let fragment_root_plan_node_ids = if intent == DistributedQueryIntent::Profile {
+            submissions
+                .iter()
+                .map(|submission| {
+                    submission
+                        .fragment_root_plan_node_id()
+                        .map(|root_node_id| (submission.fragment_id(), root_node_id))
+                        .map_err(failed)
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?
+        } else {
+            BTreeMap::new()
+        };
+
         let wake = Arc::new(CondvarWake::default());
         let attempt = AttemptWireFacts {
             query_options: *prepared.init_options().query_options().as_proto(),
@@ -2130,8 +2151,32 @@ impl FrontendDistributedQueryCoordinator {
             DistributedQueryIntent::Profile => {
                 let result = expected_output.into_query_result(batches)?;
                 let mut builder = ProfileTerminalBuilder::new();
+                let graph = round.execution().graph();
                 for info in &final_task_info.collected {
-                    builder.apply_task_operator_statistics(info)?;
+                    // Stage to fragment to sealed fragment root: each hop is a
+                    // fact this attempt froze, so a task whose stage or
+                    // fragment cannot be resolved is a disagreement between the
+                    // graph and the plan, not a profile to publish partially.
+                    let stage_id = info.final_status().identity().stage_id();
+                    let fragment_id = graph
+                        .stage(stage_id)
+                        .ok_or_else(|| {
+                            failed(format!(
+                                "final task info names stage {stage_id} which this attempt's task \
+                                 graph does not contain"
+                            ))
+                        })?
+                        .fragment_id();
+                    let root_node_id = fragment_root_plan_node_ids
+                        .get(&fragment_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            failed(format!(
+                                "stage {stage_id} names fragment {fragment_id} which this \
+                                 attempt's sealed submissions do not contain"
+                            ))
+                        })?;
+                    builder.apply_task_operator_statistics(info, root_node_id)?;
                 }
                 builder.apply_split_assignment_profile(split_assignment_profile);
                 completion.profile(result, builder.finish())

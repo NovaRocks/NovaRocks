@@ -1615,6 +1615,28 @@ impl ValidatedNativeSubmission {
         self.plan.root.as_ref().is_some_and(contains_writer)
     }
 
+    /// The plan-node id of this fragment's root (output) node.
+    ///
+    /// It is the identity EXPLAIN ANALYZE keys a fragment by: the renderer
+    /// looks each `PLAN FRAGMENT` up by its sealed root node id, and the
+    /// encoder copies that id onto the wire plan unchanged, so the id read
+    /// here and the id the renderer holds are the same one.
+    ///
+    /// A plan with no root names no fragment root, and that is refused rather
+    /// than answered with a substitute id.
+    pub(crate) fn fragment_root_plan_node_id(&self) -> Result<i32, String> {
+        self.plan
+            .root
+            .as_ref()
+            .map(|root| root.node_id)
+            .ok_or_else(|| {
+                format!(
+                    "native fragment {} carries no root node",
+                    self.plan.fragment_id
+                )
+            })
+    }
+
     /// Packages this instance's plan and its own parameters for the task
     /// protocol.
     ///

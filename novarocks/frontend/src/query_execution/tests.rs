@@ -378,7 +378,10 @@ fn outcome_factory_rejects_intent_mismatch() {
             query_result: crate::runtime::query_result::QueryResult::empty(),
             write_session: None,
             fragment_profiles: vec![
-                novarocks_execution::runtime::profile::Profiler::new("fragment-1").to_native_tree(),
+                crate::query_execution::profile::FragmentProfileTree::unattributed(
+                    novarocks_execution::runtime::profile::Profiler::new("fragment-1")
+                        .to_native_tree(),
+                ),
             ],
         },
     );
@@ -619,8 +622,10 @@ fn statistics_theta_partials_union_without_exposing_a_sql_aggregate() {
 
 #[test]
 fn profile_outcome_preserves_fragment_profiles() {
-    let profile =
-        novarocks_execution::runtime::profile::Profiler::new("fragment-7").to_native_tree();
+    let profile = crate::query_execution::profile::FragmentProfileTree::for_fragment(
+        7,
+        novarocks_execution::runtime::profile::Profiler::new("fragment-7").to_native_tree(),
+    );
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::build_string_query_result(

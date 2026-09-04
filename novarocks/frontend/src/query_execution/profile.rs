@@ -52,13 +52,72 @@ const fn clamp_counter(value: u64) -> i64 {
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
 
+/// One runtime profile tree together with the fragment its facts belong to.
+///
+/// The attribution travels beside the tree rather than inside the root node's
+/// display name, because only the producer of a tree knows which fragment it
+/// describes. A fragment profiler names its own root plan node; a task names a
+/// task, and only the frontend can map that task's stage back to a fragment.
+///
+/// A tree that describes no single fragment -- the frontend's own split
+/// assignment counters, one participant's runtime-filter contribution --
+/// carries `None` and contributes no per-fragment facts. There is deliberately
+/// no rule here for deriving a key that was not supplied: EXPLAIN ANALYZE
+/// validates every fragment key against the sealed plan, and a guessed key
+/// fails that check far from the place that guessed it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FragmentProfileTree {
+    fragment_root_plan_node_id: Option<i32>,
+    tree: RuntimeProfileTree,
+}
+
+impl FragmentProfileTree {
+    /// A tree whose facts belong to the fragment whose root (output) plan node
+    /// is `root_plan_node_id` -- the same id EXPLAIN ANALYZE keys a
+    /// `PLAN FRAGMENT` by.
+    pub(crate) const fn for_fragment(root_plan_node_id: i32, tree: RuntimeProfileTree) -> Self {
+        Self {
+            fragment_root_plan_node_id: Some(root_plan_node_id),
+            tree,
+        }
+    }
+
+    /// A tree that belongs to no single fragment.
+    pub(crate) const fn unattributed(tree: RuntimeProfileTree) -> Self {
+        Self {
+            fragment_root_plan_node_id: None,
+            tree,
+        }
+    }
+
+    /// A tree built by the execution-side fragment root profiler, which writes
+    /// the fragment's root plan-node id into the root node's name
+    /// (`execute_fragment_native (plan_node_id=N)`). Reading it back here is
+    /// reading that producer's declared key, not inferring one: a tree that
+    /// does not carry it stays unattributed.
+    pub(crate) fn from_fragment_profiler(tree: RuntimeProfileTree) -> Self {
+        Self {
+            fragment_root_plan_node_id: parse_plan_node_id(&tree.root.name),
+            tree,
+        }
+    }
+
+    pub(crate) const fn fragment_root_plan_node_id(&self) -> Option<i32> {
+        self.fragment_root_plan_node_id
+    }
+
+    pub(crate) fn into_tree(self) -> RuntimeProfileTree {
+        self.tree
+    }
+}
+
 /// Pure consuming builder from neutral native reports to the intent-safe
 /// profile completion payload.
 ///
 /// An execution can legitimately produce no fragment profile, so completion
 /// deliberately does not impose a non-empty production invariant.
 pub struct ProfileTerminalBuilder {
-    profiles: Vec<RuntimeProfileTree>,
+    profiles: Vec<FragmentProfileTree>,
     runtime_filter_totals: RuntimeFilterProfileTotals,
 }
 
@@ -95,11 +154,11 @@ impl ProfileTerminalBuilder {
             .checked_merged(participant_totals)?;
         execution_totals.validate_profile_range()?;
 
-        self.profiles.push(runtime_filter_profile_tree(
-            snapshot,
-            &contribution,
-            participant_totals,
-        )?);
+        // One participant's runtime-filter totals span every fragment it ran,
+        // so this tree belongs to no single fragment and names none.
+        self.profiles.push(FragmentProfileTree::unattributed(
+            runtime_filter_profile_tree(snapshot, &contribution, participant_totals)?,
+        ));
         self.runtime_filter_totals = execution_totals;
         Ok(())
     }
@@ -123,10 +182,11 @@ impl ProfileTerminalBuilder {
         if let Some(novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(profile)) =
             telemetry.telemetry.as_ref()
         {
+            let tree = decode_runtime_profile_tree(profile).map_err(|error| {
+                DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+            })?;
             self.profiles
-                .push(decode_runtime_profile_tree(profile).map_err(|error| {
-                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-                })?);
+                .push(FragmentProfileTree::from_fragment_profiler(tree));
         }
         Ok(())
     }
@@ -142,9 +202,16 @@ impl ProfileTerminalBuilder {
     /// apply counters and the pipeline/driver nesting the old telemetry
     /// carried are absent rather than zero -- a renderer that keys on them
     /// finds nothing, which is the honest answer.
+    ///
+    /// `fragment_root_plan_node_id` is the fragment this task ran, supplied by
+    /// the caller because only it can resolve one: the projection the backend
+    /// publishes carries per-operator plan-node ids and nothing that names the
+    /// fragment, and the frontend holds both the task's stage and the sealed
+    /// plan that stage came from.
     pub(crate) fn apply_task_operator_statistics(
         &mut self,
         info: &FinalTaskInfo,
+        fragment_root_plan_node_id: i32,
     ) -> Result<(), DistributedQueryError> {
         if info.operator_statistics().is_empty() && !info.operator_statistics_truncated() {
             return Ok(());
@@ -197,7 +264,10 @@ impl ProfileTerminalBuilder {
                 );
             }
         }
-        self.profiles.push(task.to_native_tree());
+        self.profiles.push(FragmentProfileTree::for_fragment(
+            fragment_root_plan_node_id,
+            task.to_native_tree(),
+        ));
         Ok(())
     }
 
@@ -219,7 +289,10 @@ impl ProfileTerminalBuilder {
         ] {
             common.counter_set(name, ProfileUnit::Unit, value.min(i64::MAX as u64) as i64);
         }
-        self.profiles.push(node.to_native_tree());
+        // Split assignment happens on the frontend, before any fragment runs.
+        // It belongs to the query, not to one of its fragments.
+        self.profiles
+            .push(FragmentProfileTree::unattributed(node.to_native_tree()));
     }
 }
 
@@ -939,40 +1012,27 @@ pub(crate) fn format_counter_sums_from_profile_trees(
     Some(format!("{label}: {}", parts.join(" ")))
 }
 
-/// Per-fragment attribution (W0'b): group each fragment-instance profile tree by the fragment's
-/// root (output) plan-node id (see `fragment_root_plan_node_id`), merging instances of the same
-/// fragment. The renderer maps each `PLAN FRAGMENT` to the same id via `fragment.root.node_id` and
-/// prints the matching summary. Reuses `summarize_one_tree` so the math matches the query-level
-/// summary exactly.
+/// Per-fragment attribution (W0'b): group each profile tree by the fragment's root (output)
+/// plan-node id its producer named, merging every instance of the same fragment. The renderer maps
+/// each `PLAN FRAGMENT` to the same id via `fragment.root.node_id` and prints the matching summary.
+/// Reuses `summarize_one_tree` so the math matches the query-level summary exactly.
+///
+/// A tree that names no fragment contributes nothing. It is not attributed to a representative
+/// operator id: that key would name a real plan node the facts do not belong to, and EXPLAIN
+/// ANALYZE -- which requires every fragment key to be a fragment *root* of the sealed plan --
+/// would then reject the whole render with an error naming a node id nothing here chose.
 pub(crate) fn collect_per_fragment_profile_summaries(
-    trees: &[RuntimeProfileTree],
+    profiles: &[FragmentProfileTree],
 ) -> HashMap<i32, DistributedProfileSummary> {
     let mut by_fragment: HashMap<i32, DistributedProfileSummary> = HashMap::new();
-    for tree in trees {
-        let Some(fragment_key) = fragment_root_plan_node_id(tree) else {
+    for profile in profiles {
+        let Some(fragment_key) = profile.fragment_root_plan_node_id() else {
             continue;
         };
-        let one = summarize_one_tree(tree);
+        let one = summarize_one_tree(&profile.tree);
         merge_summary(by_fragment.entry(fragment_key).or_default(), &one);
     }
     by_fragment
-}
-
-/// The fragment's root (output) plan-node id — the unambiguous per-fragment key. It is encoded in
-/// the fragment profiler's root node name `execute_fragment (plan_node_id=N)` (see
-/// `src/lower/compat/fragment.rs`), where `N = fragment.plan.nodes.first().node_id`, and it equals the
-/// `DistributedPlan` `fragment.root.node_id` the renderer keys by. This is unique per fragment and
-/// is never a cross-fragment-shared exchange node id (the root is the fragment's output operator),
-/// so it avoids the collision that a min-over-nodes representative hits on shared exchange ids.
-/// Falls back to the smallest operator id only if the tree root carries no plan-node id (e.g. some
-/// synthetic test trees) — real fragment trees always have the `execute_fragment` root.
-fn fragment_root_plan_node_id(tree: &RuntimeProfileTree) -> Option<i32> {
-    if let Some(id) = parse_plan_node_id(&tree.root.name) {
-        return Some(id);
-    }
-    let mut operators: HashMap<i32, ActualMetrics> = HashMap::new();
-    collect_native_tree_rec(&tree.root, &mut operators);
-    operators.keys().copied().min()
 }
 
 /// Summarize one fragment-instance profile tree into a single-instance summary.
@@ -1213,9 +1273,17 @@ mod tests {
     };
     use crate::query_execution::contract::QueryId;
     use novarocks_execution::runtime::profile::{ProfileUnit, Profiler};
+    use novarocks_execution::task_execution::{
+        FinalTaskInfo, OperatorStatistics, SafeDetail, TaskIdentity, TaskOutputFacts, TaskState,
+        TaskStatus, TaskStatusVersion,
+    };
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
     use novarocks_proto_models::{common, novarocks};
     use novarocks_spi::connector::read_stack::SplitSourceProfile;
+    use novarocks_types::identity::{
+        AttemptId as NativeAttemptId, BackendProcessId, QueryExecutionId as NativeQueryExecutionId,
+        QueryId as NativeQueryId, StageId, TaskId,
+    };
 
     fn test_backend_process_id(participant_seed: u64) -> novarocks::BackendProcessId {
         let mut value = vec![
@@ -1303,19 +1371,25 @@ mod tests {
 
         let profiles = builder.finish().into_profiles();
         assert_eq!(profiles.len(), 2);
+        // A participant's filter totals span every fragment it ran, so neither
+        // tree names a fragment.
+        assert_eq!(profiles[0].fragment_root_plan_node_id(), None);
+        assert_eq!(profiles[1].fragment_root_plan_node_id(), None);
         assert!(
             profiles[0]
+                .tree
                 .root
                 .name
                 .starts_with("RuntimeFilterParticipant (process_id=")
         );
         assert!(
             profiles[1]
+                .tree
                 .root
                 .name
                 .starts_with("RuntimeFilterParticipant (process_id=")
         );
-        assert!(profiles[0].root.children.iter().any(|node| {
+        assert!(profiles[0].tree.root.children.iter().any(|node| {
             node.name == "RuntimeFilterChannel (channel_binding_id=11, channel_id=1)"
                 && node.children.iter().any(|consumer| {
                     consumer
@@ -1324,11 +1398,15 @@ mod tests {
                 })
         }));
 
-        let apply = super::collect_native_runtime_filter_apply_from_profile_trees(&profiles)
+        let trees = profiles
+            .into_iter()
+            .map(super::FragmentProfileTree::into_tree)
+            .collect::<Vec<_>>();
+        let apply = super::collect_native_runtime_filter_apply_from_profile_trees(&trees)
             .expect("row effects produce RuntimeFilterApply");
         assert_eq!((apply.input_rows, apply.output_rows), (100, 30));
         let scans = super::sum_profile_counters_by_name_from_profile_trees(
-            &profiles,
+            &trees,
             &[
                 super::RUNTIME_FILTER_SCAN_UNITS_PRUNED,
                 super::RUNTIME_FILTER_SCAN_UNITS_KEPT,
@@ -1397,8 +1475,12 @@ mod tests {
 
         let profiles = builder.finish().into_profiles();
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].root.name, "FrontendSplitAssignment");
+        // Split assignment runs on the frontend, before any fragment, so its
+        // counters belong to the query rather than to one fragment.
+        assert_eq!(profiles[0].fragment_root_plan_node_id(), None);
+        assert_eq!(profiles[0].tree.root.name, "FrontendSplitAssignment");
         let common = profiles[0]
+            .tree
             .root
             .children
             .iter()
@@ -2100,7 +2182,10 @@ mod tests {
             p.to_native_tree()
         };
 
-        let trees = vec![make_a(10_000, 100), make_a(20_000, 200), make_b()];
+        let trees = [make_a(10_000, 100), make_a(20_000, 200), make_b()]
+            .into_iter()
+            .map(super::FragmentProfileTree::from_fragment_profiler)
+            .collect::<Vec<_>>();
         let by_fragment = collect_per_fragment_profile_summaries(&trees);
 
         assert_eq!(by_fragment.len(), 2);
@@ -2112,6 +2197,105 @@ mod tests {
         assert_eq!(b.fragment_instance_count, 1);
         assert_eq!(b.operator_active_time_ns, 5_000);
         assert_eq!(b.driver_blocked_time_ns, 300);
+    }
+
+    fn finished_task_info(
+        stage: u32,
+        task: u32,
+        operators: Vec<OperatorStatistics>,
+    ) -> FinalTaskInfo {
+        let identity = TaskIdentity::new(
+            NativeQueryExecutionId::new(
+                NativeQueryId::new(31, 41),
+                NativeAttemptId::new(1).expect("nonzero attempt"),
+            )
+            .expect("execution id"),
+            StageId::new(stage).expect("nonzero stage"),
+            TaskId::new(task).expect("nonzero task"),
+            BackendProcessId::new_v7(),
+        );
+        let status = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(1).expect("nonzero version"),
+            TaskState::Finished,
+            None,
+            TaskOutputFacts::new(true),
+        )
+        .expect("a legal terminal snapshot");
+        FinalTaskInfo::try_new(identity, status, operators, false).expect("a matching final info")
+    }
+
+    /// On the task protocol a profile tree's root names a task, not a plan
+    /// node, so nothing in the tree itself says which fragment it belongs to.
+    /// The fragment key must therefore be the one the caller supplies from the
+    /// sealed plan.
+    ///
+    /// The guard is that the key is *not* derivable from the tree: this task
+    /// ran the fragment rooted at plan node 7 while carrying operators 3 and 5,
+    /// so any rule that picks a representative operator id lands on a node that
+    /// is not a fragment root. `render_distributed_explain_analyze` refuses a
+    /// fragment key that is not a fragment root of the sealed plan, so such a
+    /// key does not degrade the output -- it fails every EXPLAIN ANALYZE on the
+    /// task protocol, with an error naming a node id nothing deliberately
+    /// chose.
+    #[test]
+    fn a_task_profile_is_keyed_by_its_fragment_root_and_not_by_an_operator_it_carries() {
+        let mut builder = ProfileTerminalBuilder::new();
+        builder
+            .apply_task_operator_statistics(
+                &finished_task_info(
+                    2,
+                    4,
+                    vec![
+                        OperatorStatistics::new(5, SafeDetail::new("HASH_JOIN").expect("detail"))
+                            .with_rows(6, 3)
+                            .with_wall_time(std::time::Duration::from_nanos(10_000)),
+                        OperatorStatistics::new(3, SafeDetail::new("SCAN").expect("detail"))
+                            .with_rows(0, 6)
+                            .with_wall_time(std::time::Duration::from_nanos(4_000)),
+                    ],
+                ),
+                7,
+            )
+            .expect("task operator statistics");
+        // A second task of the same stage: two instances of one fragment merge
+        // under the one key rather than becoming two fragments.
+        builder
+            .apply_task_operator_statistics(
+                &finished_task_info(
+                    2,
+                    5,
+                    vec![
+                        OperatorStatistics::new(3, SafeDetail::new("SCAN").expect("detail"))
+                            .with_rows(0, 2)
+                            .with_wall_time(std::time::Duration::from_nanos(1_000)),
+                    ],
+                ),
+                7,
+            )
+            .expect("task operator statistics");
+
+        let profiles = builder.finish().into_profiles();
+        assert_eq!(profiles.len(), 2);
+        assert!(
+            profiles[0]
+                .tree
+                .root
+                .name
+                .starts_with("Task (stage=2 task=4"),
+            "{}",
+            profiles[0].tree.root.name
+        );
+
+        let by_fragment = collect_per_fragment_profile_summaries(&profiles);
+        assert_eq!(
+            by_fragment.keys().copied().collect::<Vec<_>>(),
+            vec![7],
+            "the only fragment key is the sealed fragment root the caller named"
+        );
+        let fragment = by_fragment.get(&7).expect("fragment root node 7");
+        assert_eq!(fragment.fragment_instance_count, 2);
+        assert_eq!(fragment.operator_active_time_ns, 15_000);
     }
 
     #[test]
