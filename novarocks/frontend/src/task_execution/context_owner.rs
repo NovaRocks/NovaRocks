@@ -386,6 +386,7 @@ impl QueryContextOwner {
                 return Err(TaskExecutionError::OperationFailed {
                     kind: OperationKind::UpdateQueryContext,
                     outcome: OperationOutcome::DomainConflict,
+                    detail: ack.detail().map(|d| d.as_str().to_owned()),
                 });
             }
             // The schedule comes from the frontend-local send time plus the
@@ -408,6 +409,7 @@ impl QueryContextOwner {
                         return Err(TaskExecutionError::OperationFailed {
                             kind: OperationKind::UpdateQueryContext,
                             outcome: OperationOutcome::InvalidStateOrRequest,
+                            detail: ack.detail().map(|d| d.as_str().to_owned()),
                         });
                     }
                 }
@@ -440,6 +442,7 @@ impl QueryContextOwner {
         Err(TaskExecutionError::OperationFailed {
             kind: OperationKind::UpdateQueryContext,
             outcome: ack.outcome(),
+            detail: ack.detail().map(|d| d.as_str().to_owned()),
         })
     }
 

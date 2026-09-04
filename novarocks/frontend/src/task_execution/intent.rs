@@ -30,6 +30,7 @@ use novarocks_execution::task_execution::{
     FetchTaskDynamicFilters, GetFinalTaskInfo, OperationKind, OperationOutcome,
     QueryContextDomainUpdate, QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
     TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    status::SafeDetail,
 };
 use novarocks_types::identity::BackendProcessId;
 
@@ -174,6 +175,12 @@ pub struct OperationAcknowledgement {
     kind: OperationKind,
     outcome: OperationOutcome,
     payload: AckPayload,
+    /// The backend's own reason for a refusal, when it gave one.
+    ///
+    /// A refusal that reaches a client as an outcome name alone tells them
+    /// nothing they can act on: the engine knew it was a struct field-count
+    /// mismatch, and the client was shown `InvalidStateOrRequest`.
+    detail: Option<SafeDetail>,
 }
 
 impl OperationAcknowledgement {
@@ -188,7 +195,14 @@ impl OperationAcknowledgement {
             kind,
             outcome,
             payload,
+            detail: None,
         }
+    }
+
+    /// The same acknowledgement, carrying the backend's stated reason.
+    pub fn with_detail(mut self, detail: Option<SafeDetail>) -> Self {
+        self.detail = detail;
+        self
     }
 
     pub const fn operation_id(&self) -> TaskOperationId {
@@ -205,6 +219,10 @@ impl OperationAcknowledgement {
 
     pub const fn payload(&self) -> &AckPayload {
         &self.payload
+    }
+
+    pub const fn detail(&self) -> Option<&SafeDetail> {
+        self.detail.as_ref()
     }
 
     /// Whether the backend applied this operation, or replayed an already

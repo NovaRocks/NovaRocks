@@ -822,12 +822,14 @@ fn acknowledgement(
             item.kind,
             outcome,
             AckPayload::None,
-        );
+        )
+        .with_detail(header.detail().cloned());
     }
     match decode_ack(item.kind, item.address, receipt) {
         Ok(payload) => {
             observe_settled(item.kind, item.lease_renewal, outcome);
             OperationAcknowledgement::new(item.operation_id, item.kind, outcome, payload)
+                .with_detail(header.detail().cloned())
         }
         Err(detail) => {
             // An applied operation whose acknowledgement body cannot be read

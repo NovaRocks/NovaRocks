@@ -79,6 +79,12 @@ pub enum TaskExecutionError {
     OperationFailed {
         kind: OperationKind,
         outcome: OperationOutcome,
+        /// What the backend said, when it said anything.
+        ///
+        /// Without it a refusal reaches the client as an outcome name and the
+        /// engine's own message -- a CAST field-count mismatch, a bitmap
+        /// aggregate's argument rule -- is lost on the way out.
+        detail: Option<String>,
     },
     /// The root result stream lost, repeated, or overran a packet, so the
     /// result this frontend holds is not provably the whole result.
@@ -207,9 +213,14 @@ impl fmt::Display for TaskExecutionError {
             Self::IllegalTaskTransition { from, to } => {
                 write!(formatter, "task state {from} may not become {to}")
             }
-            Self::OperationFailed { kind, outcome } => {
-                write!(formatter, "{kind} failed closed with {outcome:?}")
-            }
+            Self::OperationFailed {
+                kind,
+                outcome,
+                detail,
+            } => match detail {
+                Some(detail) => write!(formatter, "{kind} failed closed: {detail}"),
+                None => write!(formatter, "{kind} failed closed with {outcome:?}"),
+            },
             Self::ResultStream(verdict) => {
                 write!(formatter, "root result stream is not intact: {verdict}")
             }

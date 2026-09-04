@@ -811,11 +811,19 @@ fn encode_release_outcome(value: ReleaseOutcome) -> i32 {
 pub struct ReceiptHeader {
     operation_id: TaskOperationId,
     outcome: OperationOutcome,
+    /// The backend's own account of a refusal, already validated as safe to
+    /// leave the process.
+    ///
+    /// Kept rather than discarded: this decoder was validating the field and
+    /// then dropping it, so a refusal reached the client as an outcome name
+    /// with the reason it had in hand thrown away.
+    detail: Option<novarocks_execution::task_execution::status::SafeDetail>,
 }
 
 impl ReceiptHeader {
     pub const fn new(operation_id: TaskOperationId, outcome: OperationOutcome) -> Self {
         Self {
+            detail: None,
             operation_id,
             outcome,
         }
@@ -827,6 +835,11 @@ impl ReceiptHeader {
 
     pub const fn outcome(&self) -> OperationOutcome {
         self.outcome
+    }
+
+    /// The backend's own reason for a refusal, if it gave one.
+    pub const fn detail(&self) -> Option<&novarocks_execution::task_execution::status::SafeDetail> {
+        self.detail.as_ref()
     }
 }
 
@@ -843,7 +856,7 @@ pub fn decode_receipt_header(
     })?;
     let operation_id = decode_task_operation_id(operation_id, path.clone().field("operation_id"))?;
     let outcome = decode_outcome(src.outcome, path.clone().field("outcome"))?;
-    crate::task_execution::status::decode_safe_detail(
+    let detail = crate::task_execution::status::decode_safe_detail(
         &src.safe_detail,
         path.clone().field("safe_detail"),
     )?;
@@ -855,7 +868,14 @@ pub fn decode_receipt_header(
             "safe field path exceeds the redacted text limit",
         ));
     }
-    Ok(ReceiptHeader::new(operation_id, outcome))
+    Ok(ReceiptHeader {
+        operation_id,
+        outcome,
+        // Only a refusal has anything to explain; an applied operation's
+        // detail is empty by contract and carrying it would invite a reader
+        // to look for meaning that is not there.
+        detail: (!detail.as_str().is_empty()).then_some(detail),
+    })
 }
 
 /// Decodes a batch response, which must carry exactly one receipt per request

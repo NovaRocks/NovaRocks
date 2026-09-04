@@ -393,6 +393,7 @@ impl QueryTaskExecution {
                         return Err(TaskExecutionError::OperationFailed {
                             kind: OperationKind::CreateTask,
                             outcome,
+                            detail: ack.detail().map(|d| d.as_str().to_owned()),
                         });
                     }
                     // A genuinely unknown outcome leaves the identical request
@@ -411,6 +412,7 @@ impl QueryTaskExecution {
                     Err(TaskExecutionError::OperationFailed {
                         kind: OperationKind::UpdateTask,
                         outcome,
+                        detail: ack.detail().map(|d| d.as_str().to_owned()),
                     })
                 }
                 _ => Ok(()),
@@ -439,6 +441,7 @@ impl QueryTaskExecution {
                             Err(TaskExecutionError::OperationFailed {
                                 kind: OperationKind::ReleaseQueryContext,
                                 outcome,
+                                detail: ack.detail().map(|d| d.as_str().to_owned()),
                             })
                         }
                         _ => Ok(()),
