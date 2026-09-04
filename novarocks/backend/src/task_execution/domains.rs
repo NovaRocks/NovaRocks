@@ -322,12 +322,42 @@ fn classify(
         }
     };
     if let DomainProgression::Conflict(conflict) = progression {
+        // Name the domain and the token it arrived with. A conflict that
+        // reports only its kind cannot be told apart from the same kind in a
+        // different domain, so every occurrence costs a cluster run just to
+        // learn which of the three was involved -- and the three are advanced
+        // by unrelated producers.
         return Err(DomainRejection::new(
             OperationOutcome::DomainConflict,
-            conflict.to_string(),
+            format!("{conflict} ({})", conflicting_token(update)),
         ));
     }
     Ok(progression)
+}
+
+/// The domain and the token this update carried, for a conflict's detail.
+///
+/// Held to what the request itself states: the state it lost against belongs
+/// to the task and is already reported by that task's own status, so
+/// restating it here would make this detail a second account of it.
+fn conflicting_token(update: &TaskDomainUpdate) -> String {
+    match update {
+        TaskDomainUpdate::SplitAssignment(intent) => format!(
+            "domain=split_assignment plan_node={} offered={}..={} no_more={}",
+            intent.node(),
+            intent.first().get(),
+            intent.last().get(),
+            intent.no_more_splits()
+        ),
+        TaskDomainUpdate::TaskDynamicFilter { version, .. } => {
+            format!("domain=task_dynamic_filter version={}", version.get())
+        }
+        TaskDomainUpdate::OpenExchangeEdges { version, edges } => format!(
+            "domain=open_exchange_edges version={} edges={:?}",
+            version.get(),
+            edges
+        ),
+    }
 }
 
 /// Classifies one split batch, routing a pure terminal marker to the

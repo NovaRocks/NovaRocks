@@ -134,6 +134,43 @@ pub struct RemoteTask {
     converged_after_terminal: usize,
 }
 
+/// An edge-open refusal that names the version and edge set it refused.
+fn edge_regression(
+    version: novarocks_execution::task_execution::EdgeOpenVersion,
+    edges: &[novarocks_execution::task_execution::ExchangeEdgeId],
+    conflict: DomainConflict,
+) -> TaskExecutionError {
+    TaskExecutionError::DomainRegression {
+        domain: "open_exchange_edges",
+        token: format!("version={} edges={edges:?}", version.get()),
+        conflict,
+    }
+}
+
+/// A split-domain refusal that names the offer it refused.
+fn split_regression(
+    intent: &novarocks_execution::task_execution::SplitAssignmentIntent,
+    watermark: novarocks_execution::task_execution::SplitWatermark,
+    conflict: DomainConflict,
+) -> TaskExecutionError {
+    TaskExecutionError::DomainRegression {
+        domain: "split_assignment",
+        // Both halves. A conflict is a relation between the offer and the
+        // state it lost against, and reporting only the offer leaves the
+        // reader to obtain the other half from a cluster run.
+        token: format!(
+            "plan_node={} offered={}..={} no_more={} against accepted_through={:?} sealed={}",
+            intent.node(),
+            intent.first().get(),
+            intent.last().get(),
+            intent.no_more_splits(),
+            watermark.accepted_through().map(|s| s.get()),
+            watermark.no_more_splits()
+        ),
+        conflict,
+    }
+}
+
 impl RemoteTask {
     /// Freezes one task's create request from its descriptor.
     pub fn new(
@@ -301,7 +338,9 @@ impl RemoteTask {
         match update {
             TaskDomainUpdate::SplitAssignment(intent) => {
                 if !self.descriptor().accepts_split_plan_node(intent.node()) {
-                    return Err(TaskExecutionError::DomainRegression(
+                    return Err(split_regression(
+                        intent,
+                        self.progress.splits.watermark(intent.node()),
                         DomainConflict::UnknownMember,
                     ));
                 }
@@ -323,23 +362,49 @@ impl RemoteTask {
                         );
                         Ok(())
                     }
-                    DomainProgression::Idempotent | DomainProgression::Older => Err(
-                        TaskExecutionError::DomainRegression(DomainConflict::NotMonotonic),
-                    ),
+                    // An offer this owner already applied. ADR-0123 makes the
+                    // identical request the recovery for an unknown outcome,
+                    // and by then this side's watermark has advanced, so the
+                    // resend can only classify as idempotent -- refusing it
+                    // made the frontend reject its own recovery. Observed as a
+                    // seal offered twice: `offered=1..=1 no_more=true` against
+                    // a watermark already sealed there.
+                    //
+                    // The producer-bug this used to catch -- a sequence reused
+                    // for different content -- is not catchable here either:
+                    // ADR-0123 records that only the watermark is kept, so an
+                    // exact replay and a reused sequence are indistinguishable
+                    // by construction. Nothing advances; the watermark is
+                    // already where this update would put it.
+                    DomainProgression::Idempotent => Ok(()),
+                    DomainProgression::Older => Err(split_regression(
+                        intent,
+                        watermark,
+                        DomainConflict::NotMonotonic,
+                    )),
                     DomainProgression::Conflict(conflict) => {
-                        Err(TaskExecutionError::DomainRegression(conflict))
+                        Err(split_regression(intent, watermark, conflict))
                     }
                 }
             }
             TaskDomainUpdate::TaskDynamicFilter { version, .. } => {
+                // Same rule as the split domain: re-offering the accepted
+                // version is this owner's own resend; only a strictly older
+                // one reverses a decision.
                 if self
                     .progress
                     .dynamic_filter
-                    .is_some_and(|accepted| *version <= accepted)
+                    .is_some_and(|accepted| *version < accepted)
                 {
-                    return Err(TaskExecutionError::DomainRegression(
-                        DomainConflict::NotMonotonic,
-                    ));
+                    return Err(TaskExecutionError::DomainRegression {
+                        domain: "task_dynamic_filter",
+                        token: format!(
+                            "version={} accepted={:?}",
+                            version.get(),
+                            self.progress.dynamic_filter.map(|v| v.get())
+                        ),
+                        conflict: DomainConflict::NotMonotonic,
+                    });
                 }
                 self.progress.dynamic_filter = Some(*version);
                 Ok(())
@@ -353,11 +418,13 @@ impl RemoteTask {
                     DomainProgression::Idempotent => Err(TaskExecutionError::EdgeAlreadyOpened(
                         *edges.first().expect("a validated edge set is nonempty"),
                     )),
-                    DomainProgression::Older => Err(TaskExecutionError::DomainRegression(
+                    DomainProgression::Older => Err(edge_regression(
+                        *version,
+                        edges,
                         DomainConflict::NotMonotonic,
                     )),
                     DomainProgression::Conflict(conflict) => {
-                        Err(TaskExecutionError::DomainRegression(conflict))
+                        Err(edge_regression(*version, edges, conflict))
                     }
                 }
             }

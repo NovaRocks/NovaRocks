@@ -1076,11 +1076,30 @@ fn a_domain_regression_is_refused_where_it_is_produced() {
         .execution
         .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
         .expect("the first split batch is recorded");
-    let error = harness
+    // An offer that adds nothing is settled, not refused. ADR-0123 keeps only
+    // the watermark, so an exact replay and a sequence reused for different
+    // content are indistinguishable here by construction -- and the replay is
+    // the recovery path for an unknown outcome, so refusing it would make this
+    // owner reject its own retry.
+    harness
         .execution
         .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
-        .expect_err("a reused split sequence is not a progression");
-    assert!(matches!(error, TaskExecutionError::DomainRegression(_)));
+        .expect("a re-offer of an applied range adds nothing and is settled");
+
+    // What stays verifiable is a producer that skips ahead: the watermark
+    // knows the next legal sequence, so a gap is a real regression and is
+    // refused where it is produced.
+    let error = harness
+        .execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 5, false))
+        .expect_err("a sequence past the next expected one is not a progression");
+    assert!(matches!(
+        error,
+        TaskExecutionError::DomainRegression {
+            domain: "split_assignment",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -1091,7 +1110,13 @@ fn a_split_for_a_plan_node_the_descriptor_does_not_own_is_refused() {
         .execution
         .enqueue_task_update(middle, split_update(SCAN_NODE, 1, false))
         .expect_err("a task with no scan node accepts no split");
-    assert!(matches!(error, TaskExecutionError::DomainRegression(_)));
+    assert!(matches!(
+        error,
+        TaskExecutionError::DomainRegression {
+            domain: "split_assignment",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2384,15 +2409,14 @@ fn a_terminal_marker_after_a_task_took_its_splits_is_admitted() {
         .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, true))
         .expect("the terminal marker for an already-accepted range is admitted");
 
-    // A seal is idempotent, but a genuinely older range without one is still
-    // a regression: the relaxation is exactly the seal, nothing wider.
-    assert!(
-        harness
-            .execution
-            .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
-            .is_err(),
-        "a re-offered range that seals nothing is still a regression"
-    );
+    // The relaxation is wider than the seal, and the evidence forced it: a
+    // seal re-offered after it was applied showed up on a real cluster as
+    // `offered=1..=1 no_more=true` refused as non-monotonic. Anything that
+    // adds nothing is settled, sealed or not.
+    harness
+        .execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
+        .expect("a re-offered range that adds nothing is settled");
 }
 
 // ---------------------------------------------------------------------------

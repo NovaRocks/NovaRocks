@@ -56,7 +56,17 @@ pub enum TaskExecutionError {
     /// A receipt addressed a different task, stage, query, or process.
     Identity(IdentityMismatch),
     /// An update would move one of a task's domains backwards.
-    DomainRegression(DomainConflict),
+    /// A domain update this owner refused, naming which domain and the token
+    /// it arrived with.
+    ///
+    /// The three task domains are advanced by unrelated producers, so a
+    /// conflict that reports only its kind costs a cluster run just to learn
+    /// which producer to look at.
+    DomainRegression {
+        domain: &'static str,
+        token: String,
+        conflict: DomainConflict,
+    },
     /// An edge-open decision repeats an edge this owner already opened.
     EdgeAlreadyOpened(ExchangeEdgeId),
     /// A published status snapshot cannot be reconciled with what this owner
@@ -178,10 +188,14 @@ impl fmt::Display for TaskExecutionError {
                 write!(formatter, "{kind} was accepted without its receipt")
             }
             Self::Identity(mismatch) => write!(formatter, "task protocol receipt {mismatch}"),
-            Self::DomainRegression(conflict) => {
+            Self::DomainRegression {
+                domain,
+                token,
+                conflict,
+            } => {
                 write!(
                     formatter,
-                    "task domain update is not a progression: {conflict}"
+                    "task domain update is not a progression: {conflict} (domain={domain} {token})"
                 )
             }
             Self::EdgeAlreadyOpened(edge) => {
