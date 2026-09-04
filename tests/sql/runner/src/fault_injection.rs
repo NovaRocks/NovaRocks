@@ -35,9 +35,10 @@ const POST_FRAGMENT_START_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RESTART_AFTER_ESTABLISH_CONTEXT: &str = "restart-after-establish-context";
 /// The token-scoped marker that rendezvous publishes.
 const TASK_ESTABLISH_CONTEXT_OBSERVED: &str = "NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED";
-/// The retired lifecycle protocol's restart rendezvous marker.
-const QUERY_INIT_ACK_OBSERVED: &str = "NOVAROCKS_QUERY_INIT_ACK_OBSERVED";
-
+/// The only action the frontend phase barrier still publishes. The barrier
+/// waits for a runner-owned kill of the target query; there is no longer a
+/// coordinator-crash variant of the same marker.
+const LIFECYCLE_PHASE_ACTION: &str = "kill_query";
 /// What a replaced backend process must not be found doing.
 ///
 /// A restart proof is only as good as the markers it looks for: a fresh
@@ -53,18 +54,6 @@ struct RestartNonRestoreContract {
     family_prefix: &'static str,
     identity_field: &'static str,
 }
-
-/// The retired Init/Stage/Start protocol's contract.
-const LIFECYCLE_RESTART_CONTRACT: RestartNonRestoreContract = RestartNonRestoreContract {
-    kind: "be-restart",
-    forbidden: &[
-        "NOVAROCKS_QUERY_CONTROL_READY",
-        "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
-        "NOVAROCKS_QUERY_INIT_APPLIED",
-    ],
-    family_prefix: "NOVAROCKS_QUERY_",
-    identity_field: "process_id",
-};
 
 /// The task protocol's contract.
 ///
@@ -118,40 +107,6 @@ impl ActiveQueryFaultState {
     }
 }
 
-pub(crate) type SharedServerHandle = Arc<Mutex<Box<dyn ServerHandle>>>;
-
-pub(crate) struct FragmentFailureStepGuard {
-    target: Option<(SharedServerHandle, usize)>,
-}
-
-pub(crate) fn fragment_failure_step_guard(
-    meta: &QueryMeta,
-    server: Arc<Mutex<Box<dyn ServerHandle>>>,
-) -> FragmentFailureStepGuard {
-    FragmentFailureStepGuard {
-        target: meta
-            .fail_fragment_after_start_be_index
-            .map(|index| (server, index)),
-    }
-}
-
-impl Drop for FragmentFailureStepGuard {
-    fn drop(&mut self) {
-        let Some((server, index)) = self.target.take() else {
-            return;
-        };
-        let mut server = match server.lock() {
-            Ok(server) => server,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Err(error) = server.disarm_fragment_executor_failure(index) {
-            eprintln!(
-                "failed to disarm fragment executor failure for BE[{index}] after SQL step: {error:#}"
-            );
-        }
-    }
-}
-
 pub(crate) struct QueryLifecycleFaultStepGuard {
     server: Option<Arc<Mutex<Box<dyn ServerHandle>>>>,
 }
@@ -192,7 +147,6 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.stop_query_control_heartbeat_be_index.is_some()
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.kill_fe_after_mv_known_committed_before_projector_cas
-        || meta.restart_be_after_init_ack_index.is_some()
         || meta.restart_be_after_establish_context_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
         || meta.kill_query_after_be_log_contains.is_some()
@@ -207,7 +161,6 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.terminal_snapshot_conflict_be_index.is_some()
         || !configured_query_lifecycle_faults(meta).is_empty()
         || meta.kill_query_at_lifecycle_phase.is_some()
-        || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta.kill_be_at_lifecycle_phase.is_some()
         || meta
             .stop_query_control_heartbeat_after_stage_be_index
@@ -237,8 +190,6 @@ impl Drop for QueryLifecycleFaultStepGuard {
 pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
     meta.cleanup_fault.is_some()
         || meta.kill_be_index.is_some()
-        || meta.kill_be_after_fragment_start.is_some()
-        || meta.fail_fragment_after_start_be_index.is_some()
         || meta.network_partition_be.is_some()
         || meta.heartbeat_delay_ms.is_some()
         || meta.restart_be_delay_ms.is_some()
@@ -246,7 +197,6 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.stop_query_control_heartbeat_be_index.is_some()
         || meta.kill_fe_after_control_ready_count.is_some()
         || meta.kill_fe_after_mv_known_committed_before_projector_cas
-        || meta.restart_be_after_init_ack_index.is_some()
         || meta.restart_be_after_establish_context_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
         || meta.kill_query_after_be_log_contains.is_some()
@@ -261,7 +211,6 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.terminal_snapshot_conflict_be_index.is_some()
         || !configured_query_lifecycle_faults(meta).is_empty()
         || meta.kill_query_at_lifecycle_phase.is_some()
-        || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta.kill_be_at_lifecycle_phase.is_some()
         || meta
             .stop_query_control_heartbeat_after_stage_be_index
@@ -286,7 +235,6 @@ fn configured_query_lifecycle_faults(
 pub(crate) fn permits_terminal_retention(meta: &QueryMeta) -> bool {
     meta.kill_fe_after_control_ready_count.is_some()
         || meta.kill_fe_after_mv_known_committed_before_projector_cas
-        || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta.kill_fe_after_be_log_contains.is_some()
 }
 
@@ -296,16 +244,14 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     }
     let fragment_fault_count = [
         meta.kill_be_index.is_some(),
-        meta.kill_be_after_fragment_start.is_some(),
         meta.kill_be_after_be_log_contains.is_some(),
-        meta.fail_fragment_after_start_be_index.is_some(),
     ]
     .into_iter()
     .filter(|configured| *configured)
     .count();
     if fragment_fault_count > 1 {
         bail!(
-            "a SQL step may configure at most one fragment fault directive: kill_be_index, kill_be_after_fragment_start, kill_be_after_be_log_contains, or fail_fragment_after_start_be_index"
+            "a SQL step may configure at most one fragment fault directive: kill_be_index or kill_be_after_be_log_contains"
         );
     }
 
@@ -314,7 +260,6 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.stop_query_control_heartbeat_be_index.is_some(),
         meta.kill_fe_after_control_ready_count.is_some(),
         meta.kill_fe_after_mv_known_committed_before_projector_cas,
-        meta.restart_be_after_init_ack_index.is_some(),
         meta.restart_be_after_establish_context_index.is_some(),
         meta.kill_query_after_control_ready_count.is_some(),
         meta.kill_query_after_be_log_contains.is_some(),
@@ -328,7 +273,6 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.terminal_snapshot_conflict_be_index.is_some(),
         !configured_query_lifecycle_faults(meta).is_empty(),
         meta.kill_query_at_lifecycle_phase.is_some(),
-        meta.kill_fe_at_lifecycle_phase.is_some(),
         meta.kill_be_at_lifecycle_phase.is_some(),
         meta.stop_query_control_heartbeat_after_stage_be_index
             .is_some(),
@@ -380,10 +324,6 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         (
             "stop_query_control_heartbeat_be_index",
             meta.stop_query_control_heartbeat_be_index,
-        ),
-        (
-            "restart_be_after_init_ack_index",
-            meta.restart_be_after_init_ack_index,
         ),
         (
             "restart_be_after_establish_context_index",
@@ -482,9 +422,6 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     if meta.kill_fe_after_mv_known_committed_before_projector_cas {
         server.arm_mv_known_committed_before_projector_cas()?;
     }
-    if let Some(index) = meta.restart_be_after_init_ack_index {
-        server.arm_be_restart_after_init_ack(index)?;
-    }
     if let Some(index) = meta.restart_be_after_establish_context_index {
         // Armed through the generic lifecycle-fault hook rather than through a
         // dedicated harness method: the arm file, its token and its cleanup
@@ -519,9 +456,6 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     if let Some(phase) = meta.kill_query_at_lifecycle_phase {
         server.arm_kill_query_at_lifecycle_phase(phase)?;
     }
-    if let Some(phase) = meta.kill_fe_at_lifecycle_phase {
-        server.arm_fe_crash_at_lifecycle_phase(phase)?;
-    }
     if let Some(fault) = meta.kill_be_at_lifecycle_phase {
         server.arm_be_kill_at_lifecycle_phase(fault.phase)?;
     }
@@ -533,10 +467,6 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     }
     if let Some(limit) = meta.query_control_fragment_backend_limit {
         server.arm_query_control_fragment_backend_limit(limit)?;
-    }
-
-    if let Some(index) = meta.fail_fragment_after_start_be_index {
-        server.arm_fragment_executor_failure(index)?;
     }
 
     if let Some(index) = meta.kill_be_index {
@@ -566,11 +496,8 @@ where
 {
     #[derive(Clone)]
     enum PostQueryFault {
-        KillBackend(usize),
-        ReleaseFragmentFailure(usize),
         KillFrontendAfterControlReady(usize),
         KillFrontendAfterMvKnownCommittedBeforeProjectorCas,
-        RestartBackendAfterInitAck(usize),
         RestartBackendAfterEstablishContext(usize),
         KillFrontendAfterBeLogContains {
             pattern: String,
@@ -591,7 +518,6 @@ where
             phase: crate::types::QueryLifecyclePhase,
             connection_id: u32,
         },
-        KillFrontendAtLifecyclePhase(crate::types::QueryLifecyclePhase),
         KillBackendAtLifecyclePhase {
             index: usize,
             phase: crate::types::QueryLifecyclePhase,
@@ -599,10 +525,6 @@ where
     }
 
     enum FaultBaseline {
-        ScheduledFragments(Vec<(usize, u64)>),
-        FrontendStage {
-            marker_count: u64,
-        },
         FrontendReady {
             ready_count: u64,
             coordinator_lost: Vec<u64>,
@@ -616,7 +538,6 @@ where
         },
         FrontendPhase {
             phase: crate::types::QueryLifecyclePhase,
-            fe_crash: bool,
             marker_count: u64,
         },
         MvKnownCommittedBeforeProjectorCas {
@@ -640,16 +561,10 @@ where
     }
 
     let faults = [
-        meta.kill_be_after_fragment_start
-            .map(PostQueryFault::KillBackend),
-        meta.fail_fragment_after_start_be_index
-            .map(PostQueryFault::ReleaseFragmentFailure),
         meta.kill_fe_after_control_ready_count
             .map(PostQueryFault::KillFrontendAfterControlReady),
         meta.kill_fe_after_mv_known_committed_before_projector_cas
             .then_some(PostQueryFault::KillFrontendAfterMvKnownCommittedBeforeProjectorCas),
-        meta.restart_be_after_init_ack_index
-            .map(PostQueryFault::RestartBackendAfterInitAck),
         meta.restart_be_after_establish_context_index
             .map(PostQueryFault::RestartBackendAfterEstablishContext),
         meta.kill_fe_after_be_log_contains
@@ -699,8 +614,6 @@ where
                     ))
             })
             .transpose()?,
-        meta.kill_fe_at_lifecycle_phase
-            .map(PostQueryFault::KillFrontendAtLifecyclePhase),
         meta.kill_be_at_lifecycle_phase.map(|fault| {
             PostQueryFault::KillBackendAtLifecyclePhase {
                 index: fault.be_index,
@@ -726,29 +639,6 @@ where
             bail!("post-query faults require a mutable cross-process server handle");
         }
         match fault.clone() {
-            PostQueryFault::KillBackend(index) => {
-                if index >= server.be_count() {
-                    bail!(
-                        "post-query fault index {index} is out of bounds for {} BE(s)",
-                        server.be_count()
-                    );
-                }
-                FaultBaseline::ScheduledFragments(vec![(
-                    index,
-                    server.scheduled_fragment_count(index)?,
-                )])
-            }
-            PostQueryFault::ReleaseFragmentFailure(index) => {
-                if index >= server.be_count() {
-                    bail!(
-                        "post-query fault index {index} is out of bounds for {} BE(s)",
-                        server.be_count()
-                    );
-                }
-                FaultBaseline::FrontendStage {
-                    marker_count: server.fe_log_count("NOVAROCKS_QUERY_STAGE_BARRIER")? as u64,
-                }
-            }
             PostQueryFault::KillFrontendAfterControlReady(_) => FaultBaseline::FrontendReady {
                 ready_count: server.fe_log_count("NOVAROCKS_QUERY_CONTROL_READY")? as u64,
                 coordinator_lost: (0..server.be_count())
@@ -786,24 +676,6 @@ where
                     .collect::<Result<Vec<_>>>()?;
                 FaultBaseline::BeLogPattern { pattern, counts }
             }
-            PostQueryFault::RestartBackendAfterInitAck(index) => {
-                if index >= server.be_count() {
-                    bail!(
-                        "post-query fault index {index} is out of bounds for {} BE(s)",
-                        server.be_count()
-                    );
-                }
-                FaultBaseline::BackendInit {
-                    index,
-                    token: server
-                        .armed_query_lifecycle_fault_token(index, "restart-after-init-ack")?
-                        .context("restart-after-InitAck fault has no armed token")?,
-                    // The harness already parses it: a process identity crosses
-                    // this boundary as a type, not as text to re-parse.
-                    process_id: server.backend_process_id(index)?,
-                    marker: QUERY_INIT_ACK_OBSERVED,
-                }
-            }
             PostQueryFault::RestartBackendAfterEstablishContext(index) => {
                 if index >= server.be_count() {
                     bail!(
@@ -816,21 +688,18 @@ where
                     token: server
                         .armed_query_lifecycle_fault_token(index, RESTART_AFTER_ESTABLISH_CONTEXT)?
                         .context("restart-after-EstablishQueryContext fault has no armed token")?,
+                    // The harness already parses it: a process identity crosses
+                    // this boundary as a type, not as text to re-parse.
                     process_id: server.backend_process_id(index)?,
                     marker: TASK_ESTABLISH_CONTEXT_OBSERVED,
                 }
             }
             PostQueryFault::KillQueryAtLifecyclePhase { phase, .. }
-            | PostQueryFault::KillFrontendAtLifecyclePhase(phase)
             | PostQueryFault::KillBackendAtLifecyclePhase { phase, .. } => {
                 FaultBaseline::FrontendPhase {
                     phase,
-                    fe_crash: matches!(fault, PostQueryFault::KillFrontendAtLifecyclePhase(_)),
-                    marker_count: lifecycle_phase_marker_count(
-                        &server.fe_log_contents()?,
-                        phase,
-                        matches!(fault, PostQueryFault::KillFrontendAtLifecyclePhase(_)),
-                    )? as u64,
+                    marker_count: lifecycle_phase_marker_count(&server.fe_log_contents()?, phase)?
+                        as u64,
                 }
             }
             PostQueryFault::KillFrontendAfterMvKnownCommittedBeforeProjectorCas => {
@@ -874,23 +743,6 @@ where
                     .lock()
                     .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
                 match &baseline {
-                    FaultBaseline::ScheduledFragments(baselines) => {
-                        let mut all_fresh = true;
-                        for &(index, baseline) in baselines {
-                            let current = server.scheduled_fragment_count(index)?;
-                            if current < baseline {
-                                bail!(
-                                    "BE[{index}] fragment-start marker count decreased from {baseline} to {current}"
-                                );
-                            }
-                            all_fresh &= current > baseline;
-                        }
-                        all_fresh
-                    }
-                    FaultBaseline::FrontendStage { marker_count } => {
-                        server.fe_log_count("NOVAROCKS_QUERY_STAGE_BARRIER")?
-                            > *marker_count as usize
-                    }
                     FaultBaseline::FrontendReady { ready_count, .. } => {
                         let target = match &fault {
                             PostQueryFault::KillFrontendAfterControlReady(target) => *target,
@@ -914,10 +766,9 @@ where
                     }),
                     FaultBaseline::FrontendPhase {
                         phase,
-                        fe_crash,
                         marker_count,
                     } => {
-                        lifecycle_phase_marker_count(&server.fe_log_contents()?, *phase, *fe_crash)?
+                        lifecycle_phase_marker_count(&server.fe_log_contents()?, *phase)?
                             > *marker_count as usize
                     }
                     FaultBaseline::MvKnownCommittedBeforeProjectorCas { marker_count } => {
@@ -962,28 +813,20 @@ where
                     (
                         FaultBaseline::FrontendPhase {
                             phase,
-                            fe_crash,
                             marker_count,
                         },
                         PostQueryFault::KillQueryAtLifecyclePhase { .. }
-                        | PostQueryFault::KillFrontendAtLifecyclePhase(_)
                         | PostQueryFault::KillBackendAtLifecyclePhase { .. },
                     ) => fresh_lifecycle_phase_execution(
                         &server.fe_log_contents()?,
                         *marker_count as usize,
                         *phase,
-                        *fe_crash,
                     )?,
                     _ => None,
                 };
                 let action_result = (|| -> Result<()> {
                     match fault.clone() {
-                        PostQueryFault::KillBackend(index) => server.kill_be(index)?,
-                        PostQueryFault::ReleaseFragmentFailure(index) => {
-                            server.release_fragment_executor_failure(index)?
-                        }
-                        PostQueryFault::RestartBackendAfterInitAck(index)
-                        | PostQueryFault::RestartBackendAfterEstablishContext(index) => {
+                        PostQueryFault::RestartBackendAfterEstablishContext(index) => {
                             let FaultBaseline::BackendInit {
                                 token,
                                 process_id,
@@ -993,21 +836,13 @@ where
                             else {
                                 unreachable!("BE restart fault has BackendInit baseline")
                             };
-                            let contract = if matches!(
-                                fault,
-                                PostQueryFault::RestartBackendAfterEstablishContext(_)
-                            ) {
-                                TASK_RESTART_CONTRACT
-                            } else {
-                                LIFECYCLE_RESTART_CONTRACT
-                            };
                             evidence_execution = Some(restart_backend_and_prove_no_restore(
                                 &mut **server,
                                 index,
                                 token,
                                 *process_id,
                                 marker,
-                                contract,
+                                TASK_RESTART_CONTRACT,
                                 deadline,
                             )?);
                         }
@@ -1022,12 +857,7 @@ where
                             connection_id,
                         } => {
                             server.kill_query_until(connection_id, deadline)?;
-                            server.release_query_lifecycle_phase_fault(phase, false)?;
-                        }
-                        PostQueryFault::KillFrontendAtLifecyclePhase(phase) => {
-                            server.kill_fe()?;
-                            server.release_query_lifecycle_phase_fault(phase, true)?;
-                            server.restart_fe_until(deadline)?;
+                            server.release_query_lifecycle_phase_fault(phase)?;
                         }
                         PostQueryFault::KillBackendAfterBeLogContains { index, .. } => {
                             server.kill_be(index)?
@@ -1132,9 +962,6 @@ where
                         | PostQueryFault::KillQueryAfterControlReady { .. }
                         | PostQueryFault::KillQueryAfterBeLogContains { .. }
                         | PostQueryFault::KillFrontendAfterBeLogContains { .. }
-                        | PostQueryFault::KillFrontendAtLifecyclePhase(
-                            crate::types::QueryLifecyclePhase::TerminalRetained
-                        )
                 ) {
                     deadline_cancel_sent = true;
                 }
@@ -1165,26 +992,14 @@ where
                     )?;
                     let evidence_ready = match &fault {
                         PostQueryFault::KillFrontendAfterControlReady(_)
-                        | PostQueryFault::KillQueryAfterControlReady { .. }
-                        | PostQueryFault::KillFrontendAtLifecyclePhase(
-                            crate::types::QueryLifecyclePhase::TerminalRetained,
-                        ) => {
+                        | PostQueryFault::KillQueryAfterControlReady { .. } => {
                             let execution = evidence_execution
                                 .as_deref()
                                 .context("post-query lifecycle fault has no execution anchor")?;
                             let server = worker_server
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
-                            terminal_cleanup_on_all_backends(
-                                server.as_ref(),
-                                execution,
-                                !matches!(
-                                    &fault,
-                                    PostQueryFault::KillFrontendAtLifecyclePhase(
-                                        crate::types::QueryLifecyclePhase::TerminalRetained,
-                                    )
-                                ),
-                            )?
+                            terminal_cleanup_on_all_backends(server.as_ref(), execution)?
                         }
                         _ => true,
                     };
@@ -1284,15 +1099,13 @@ fn fresh_fe_control_ready_execution(log: &str, baseline: usize) -> Result<Option
 fn lifecycle_phase_marker_count(
     log: &str,
     phase: crate::types::QueryLifecyclePhase,
-    fe_crash: bool,
 ) -> Result<usize> {
-    let action = if fe_crash { "kill_fe" } else { "kill_query" };
     let markers = log
         .lines()
         .filter(|line| line.contains("NOVAROCKS_QUERY_LIFECYCLE_PHASE"))
         .filter(|line| {
             marker_field(line, "phase").as_deref() == Some(phase.as_str())
-                && marker_field(line, "action").as_deref() == Some(action)
+                && marker_field(line, "action").as_deref() == Some(LIFECYCLE_PHASE_ACTION)
         })
         .collect::<Vec<_>>();
     if markers
@@ -1308,15 +1121,13 @@ fn fresh_lifecycle_phase_execution(
     log: &str,
     baseline: usize,
     phase: crate::types::QueryLifecyclePhase,
-    fe_crash: bool,
 ) -> Result<Option<String>> {
-    let action = if fe_crash { "kill_fe" } else { "kill_query" };
     let executions = log
         .lines()
         .filter(|line| line.contains("NOVAROCKS_QUERY_LIFECYCLE_PHASE"))
         .filter(|line| {
             marker_field(line, "phase").as_deref() == Some(phase.as_str())
-                && marker_field(line, "action").as_deref() == Some(action)
+                && marker_field(line, "action").as_deref() == Some(LIFECYCLE_PHASE_ACTION)
         })
         .skip(baseline)
         .filter_map(|line| marker_field(line, "execution_id"))
@@ -1330,11 +1141,7 @@ fn fresh_lifecycle_phase_execution(
     Ok(Some(first.clone()))
 }
 
-fn terminal_cleanup_on_all_backends(
-    server: &dyn ServerHandle,
-    execution_id: &str,
-    require_terminated_marker: bool,
-) -> Result<bool> {
+fn terminal_cleanup_on_all_backends(server: &dyn ServerHandle, execution_id: &str) -> Result<bool> {
     if server.be_count() != 3 {
         bail!(
             "post-query lifecycle terminal cleanup evidence requires exactly 3 BEs, found {}",
@@ -1353,7 +1160,7 @@ fn terminal_cleanup_on_all_backends(
                 && marker_field(line, "active").as_deref() == Some("false")
                 && marker_field(line, "tombstone").as_deref() == Some("true")
         });
-        if (require_terminated_marker && !terminated) || !cleaned {
+        if !terminated || !cleaned {
             return Ok(false);
         }
     }
@@ -1503,16 +1310,6 @@ mod tests {
             Ok(())
         }
 
-        fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
-            self.events.push(format!("arm-failure:{index}"));
-            Ok(())
-        }
-
-        fn disarm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
-            self.events.push(format!("disarm-failure:{index}"));
-            Ok(())
-        }
-
         fn arm_init_ack_drop(&mut self, index: usize) -> Result<()> {
             self.events.push(format!("arm-init-ack-drop:{index}"));
             Ok(())
@@ -1525,11 +1322,6 @@ mod tests {
 
         fn arm_fe_crash_after_control_ready(&mut self, count: usize) -> Result<()> {
             self.events.push(format!("arm-fe-crash:{count}"));
-            Ok(())
-        }
-
-        fn arm_be_restart_after_init_ack(&mut self, index: usize) -> Result<()> {
-            self.events.push(format!("arm-be-restart:{index}"));
             Ok(())
         }
 
@@ -1570,15 +1362,6 @@ mod tests {
         ) -> Result<()> {
             self.events
                 .push(format!("arm-kill-query-phase:{}", phase.as_str()));
-            Ok(())
-        }
-
-        fn arm_fe_crash_at_lifecycle_phase(
-            &mut self,
-            phase: crate::types::QueryLifecyclePhase,
-        ) -> Result<()> {
-            self.events
-                .push(format!("arm-fe-crash-phase:{}", phase.as_str()));
             Ok(())
         }
 
@@ -1693,10 +1476,6 @@ mod tests {
                 ..QueryMeta::default()
             },
             QueryMeta {
-                restart_be_after_init_ack_index: Some(0),
-                ..QueryMeta::default()
-            },
-            QueryMeta {
                 kill_query_after_control_ready_count: Some(1),
                 ..QueryMeta::default()
             },
@@ -1722,10 +1501,6 @@ mod tests {
             },
             QueryMeta {
                 kill_query_at_lifecycle_phase: Some(crate::types::QueryLifecyclePhase::Staged),
-                ..QueryMeta::default()
-            },
-            QueryMeta {
-                kill_fe_at_lifecycle_phase: Some(crate::types::QueryLifecyclePhase::Staged),
                 ..QueryMeta::default()
             },
             QueryMeta {
@@ -1852,13 +1627,6 @@ mod tests {
             ),
             (
                 QueryMeta {
-                    restart_be_after_init_ack_index: Some(5),
-                    ..QueryMeta::default()
-                },
-                "restart_be_after_init_ack_index 5 is out of bounds for 3 BE(s)",
-            ),
-            (
-                QueryMeta {
                     kill_fe_after_control_ready_count: Some(0),
                     ..QueryMeta::default()
                 },
@@ -1957,13 +1725,6 @@ mod tests {
             ),
             (
                 QueryMeta {
-                    restart_be_after_init_ack_index: Some(0),
-                    ..QueryMeta::default()
-                },
-                "arm-be-restart:0",
-            ),
-            (
-                QueryMeta {
                     query_control_fragment_backend_limit: Some(2),
                     ..QueryMeta::default()
                 },
@@ -2012,13 +1773,6 @@ mod tests {
                     ..QueryMeta::default()
                 },
                 "arm-kill-query-phase:starting",
-            ),
-            (
-                QueryMeta {
-                    kill_fe_at_lifecycle_phase: Some(crate::types::QueryLifecyclePhase::Staged),
-                    ..QueryMeta::default()
-                },
-                "arm-fe-crash-phase:staged",
             ),
             (
                 QueryMeta {
@@ -2118,43 +1872,27 @@ mod tests {
     }
 
     #[test]
-    fn fragment_executor_failure_is_armed_before_query_but_fires_after_start() {
+    fn multiple_fragment_faults_are_rejected_before_mutating_the_cluster() {
         let meta = QueryMeta {
-            fail_fragment_after_start_be_index: Some(2),
+            kill_be_index: Some(0),
+            kill_be_after_be_log_contains: Some(crate::types::KillBeAfterBeLogDirective {
+                be_index: 1,
+                pattern: "NOVAROCKS_TASK_CREATE_APPLIED".to_string(),
+            }),
             ..QueryMeta::default()
         };
         let mut server = RecordingServerHandle::default();
 
-        apply_pre_query(&meta, &mut server).expect("arm fragment executor failure");
+        let error = apply_pre_query(&meta, &mut server)
+            .expect_err("a step must select exactly one fragment fault");
 
-        assert_eq!(server.events, vec!["arm-failure:2"]);
-    }
-
-    #[test]
-    fn multiple_fragment_faults_are_rejected_before_mutating_the_cluster() {
-        for meta in [
-            QueryMeta {
-                kill_be_index: Some(0),
-                kill_be_after_fragment_start: Some(1),
-                ..QueryMeta::default()
-            },
-            QueryMeta {
-                kill_be_after_fragment_start: Some(1),
-                fail_fragment_after_start_be_index: Some(2),
-                ..QueryMeta::default()
-            },
-        ] {
-            let mut server = RecordingServerHandle::default();
-            let error = apply_pre_query(&meta, &mut server)
-                .expect_err("a step must select exactly one fragment fault");
-            assert!(
-                error
-                    .to_string()
-                    .contains("at most one fragment fault directive"),
-                "{error}"
-            );
-            assert!(server.events.is_empty());
-        }
+        assert!(
+            error
+                .to_string()
+                .contains("at most one fragment fault directive"),
+            "{error}"
+        );
+        assert!(server.events.is_empty());
     }
 
     #[test]
@@ -2165,52 +1903,6 @@ mod tests {
         assert!(
             !state.claim_fault(),
             "a fault worker must not claim permission to kill after query completion"
-        );
-    }
-
-    struct SharedCleanupServerHandle {
-        events: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl ServerHandle for SharedCleanupServerHandle {
-        fn target_host(&self) -> Option<&str> {
-            None
-        }
-
-        fn target_port(&self) -> Option<u16> {
-            None
-        }
-
-        fn disarm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
-            self.events
-                .lock()
-                .expect("cleanup events")
-                .push(format!("disarm-failure:{index}"));
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn fragment_failure_step_guard_disarms_during_unwind() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let server: Arc<Mutex<Box<dyn ServerHandle>>> =
-            Arc::new(Mutex::new(Box::new(SharedCleanupServerHandle {
-                events: Arc::clone(&events),
-            })));
-        let meta = QueryMeta {
-            fail_fragment_after_start_be_index: Some(2),
-            ..QueryMeta::default()
-        };
-
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = fragment_failure_step_guard(&meta, Arc::clone(&server));
-            panic!("simulated step panic");
-        }));
-
-        assert!(panic.is_err());
-        assert_eq!(
-            *events.lock().expect("cleanup events"),
-            vec!["disarm-failure:2"]
         );
     }
 
@@ -2242,17 +1934,18 @@ mod tests {
             2
         }
 
-        fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
+        fn be_log_count(&self, index: usize, needle: &str) -> Result<usize> {
             assert_eq!(index, 1);
+            assert_eq!(needle, "NOVAROCKS_TASK_CREATE_APPLIED");
             let (lock, _) = self.state.as_ref();
             let mut state = lock.lock().expect("active query state");
             let event = if state.fragment_started {
-                "scheduled:fresh"
+                "marker:fresh"
             } else {
-                "scheduled:baseline"
+                "marker:baseline"
             };
             state.events.push(event);
-            Ok(u64::from(state.fragment_started))
+            Ok(usize::from(state.fragment_started))
         }
 
         fn kill_be(&mut self, index: usize) -> Result<()> {
@@ -2266,17 +1959,24 @@ mod tests {
         }
     }
 
+    fn kill_be_after_marker_meta() -> QueryMeta {
+        QueryMeta {
+            kill_be_after_be_log_contains: Some(crate::types::KillBeAfterBeLogDirective {
+                be_index: 1,
+                pattern: "NOVAROCKS_TASK_CREATE_APPLIED".to_string(),
+            }),
+            ..QueryMeta::default()
+        }
+    }
+
     #[test]
-    fn active_query_kill_waits_for_fresh_scheduled_fragment_count() {
+    fn active_query_kill_waits_for_a_fresh_backend_log_marker() {
         let state = Arc::new((Mutex::new(ActiveQueryState::default()), Condvar::new()));
         let server_handle: Arc<Mutex<Box<dyn ServerHandle>>> =
             Arc::new(Mutex::new(Box::new(ActiveQueryServerHandle {
                 state: Arc::clone(&state),
             })));
-        let meta = QueryMeta {
-            kill_be_after_fragment_start: Some(1),
-            ..QueryMeta::default()
-        };
+        let meta = kill_be_after_marker_meta();
 
         let result =
             execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || {
@@ -2297,110 +1997,13 @@ mod tests {
         assert_eq!(
             state.0.lock().expect("active query state").events,
             vec![
-                "scheduled:baseline",
+                "marker:baseline",
                 "query:start",
-                "scheduled:fresh",
+                "marker:fresh",
                 "kill",
                 "query:end",
             ]
         );
-    }
-
-    struct AllBackendsReleaseServerHandle {
-        state: Arc<(Mutex<AllBackendsReleaseState>, Condvar)>,
-    }
-
-    #[derive(Default)]
-    struct AllBackendsReleaseState {
-        baseline_reads: Vec<usize>,
-        fresh_reads: Vec<usize>,
-        query_started: bool,
-        released_index: Option<usize>,
-        events: Vec<&'static str>,
-    }
-
-    impl ServerHandle for AllBackendsReleaseServerHandle {
-        fn target_host(&self) -> Option<&str> {
-            None
-        }
-
-        fn target_port(&self) -> Option<u16> {
-            None
-        }
-
-        fn supports_fault_injection(&self) -> bool {
-            true
-        }
-
-        fn be_count(&self) -> usize {
-            3
-        }
-
-        fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
-            let (lock, _) = self.state.as_ref();
-            let mut state = lock.lock().expect("all-backend release state");
-            if state.query_started {
-                state.fresh_reads.push(index);
-                Ok(11)
-            } else {
-                state.baseline_reads.push(index);
-                Ok(10)
-            }
-        }
-
-        fn fe_log_count(&self, marker: &str) -> Result<usize> {
-            assert_eq!(marker, "NOVAROCKS_QUERY_STAGE_BARRIER");
-            let (lock, _) = self.state.as_ref();
-            let state = lock.lock().expect("all-backend release state");
-            Ok(usize::from(state.query_started))
-        }
-
-        fn release_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
-            let (lock, wake) = self.state.as_ref();
-            let mut state = lock.lock().expect("all-backend release state");
-            state.released_index = Some(index);
-            state.events.push("release");
-            wake.notify_all();
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn fragment_failure_release_waits_for_the_stage_barrier() {
-        let state = Arc::new((
-            Mutex::new(AllBackendsReleaseState::default()),
-            Condvar::new(),
-        ));
-        let server_handle: Arc<Mutex<Box<dyn ServerHandle>>> =
-            Arc::new(Mutex::new(Box::new(AllBackendsReleaseServerHandle {
-                state: Arc::clone(&state),
-            })));
-        let meta = QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
-            ..QueryMeta::default()
-        };
-
-        let result =
-            execute_with_post_fragment_start_fault(&meta, &server_handle, None, None, || {
-                let (lock, wake) = state.as_ref();
-                let mut query = lock.lock().expect("all-backend release state");
-                query.events.push("query:start");
-                query.query_started = true;
-                wake.notify_all();
-                query = wake
-                    .wait_while(query, |state| state.released_index.is_none())
-                    .expect("wait for runner release");
-                query.events.push("query:end");
-                42
-            })
-            .expect("active-query fragment failure release");
-
-        assert_eq!(result, 42);
-        let state = state.0.lock().expect("all-backend release state");
-        assert!(state.baseline_reads.is_empty());
-        assert!(state.fresh_reads.is_empty());
-        assert_eq!(state.released_index, Some(1));
-        assert_eq!(state.events, vec!["query:start", "release", "query:end"]);
     }
 
     #[test]
@@ -2410,10 +2013,7 @@ mod tests {
             Arc::new(Mutex::new(Box::new(ActiveQueryServerHandle {
                 state: Arc::clone(&state),
             })));
-        let meta = QueryMeta {
-            kill_be_after_fragment_start: Some(1),
-            ..QueryMeta::default()
-        };
+        let meta = kill_be_after_marker_meta();
 
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = execute_with_post_fragment_start_fault(
@@ -2626,44 +2226,28 @@ mod tests {
     fn restart_nonrestore_proof_accepts_a_distinct_process_without_old_execution() {
         let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
         let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
-        for contract in [LIFECYCLE_RESTART_CONTRACT, TASK_RESTART_CONTRACT] {
-            validate_restarted_process_has_no_attempt_evidence("", "10:20:1", old, new, contract)
-                .expect("a distinct fresh process with no old execution is valid");
-        }
+        validate_restarted_process_has_no_attempt_evidence(
+            "",
+            "10:20:1",
+            old,
+            new,
+            TASK_RESTART_CONTRACT,
+        )
+        .expect("a distinct fresh process with no old execution is valid");
     }
 
     #[test]
     fn restart_nonrestore_proof_rejects_same_process_identity() {
         let process_id = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
-        for contract in [LIFECYCLE_RESTART_CONTRACT, TASK_RESTART_CONTRACT] {
-            let error = validate_restarted_process_has_no_attempt_evidence(
-                "", "10:20:1", process_id, process_id, contract,
-            )
-            .expect_err("restart must install a new BackendProcessId");
-            assert!(error.to_string().contains("retained process identity"));
-        }
-    }
-
-    #[test]
-    fn restart_nonrestore_proof_rejects_old_execution_control_or_fragment_state() {
-        let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
-        let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
-        for marker in [
-            "NOVAROCKS_QUERY_CONTROL_READY",
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
-            "NOVAROCKS_QUERY_INIT_APPLIED",
-        ] {
-            let log = format!("{marker} execution_id=10:20:1 process_id={new}\n");
-            let error = validate_restarted_process_has_no_attempt_evidence(
-                &log,
-                "10:20:1",
-                old,
-                new,
-                LIFECYCLE_RESTART_CONTRACT,
-            )
-            .expect_err("old execution state must fail");
-            assert!(error.to_string().contains(marker));
-        }
+        let error = validate_restarted_process_has_no_attempt_evidence(
+            "",
+            "10:20:1",
+            process_id,
+            process_id,
+            TASK_RESTART_CONTRACT,
+        )
+        .expect_err("restart must install a new BackendProcessId");
+        assert!(error.to_string().contains("retained process identity"));
     }
 
     /// The task protocol names its own two admission points, and its markers
@@ -2689,22 +2273,6 @@ mod tests {
             .expect_err("old execution admission state must fail");
             assert!(error.to_string().contains(marker));
         }
-    }
-
-    #[test]
-    fn restart_nonrestore_proof_rejects_retired_process_identity() {
-        let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
-        let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
-        let log = format!("NOVAROCKS_QUERY_CONTROL_READY execution_id=other process_id={old}\n");
-        let error = validate_restarted_process_has_no_attempt_evidence(
-            &log,
-            "10:20:1",
-            old,
-            new,
-            LIFECYCLE_RESTART_CONTRACT,
-        )
-        .expect_err("new process must not emit retired identity");
-        assert!(error.to_string().contains("retired process_id"));
     }
 
     #[test]
@@ -2794,16 +2362,4 @@ mod tests {
         }));
         assert!(!permits_terminal_retention(&QueryMeta::default()));
     }
-}
-
-/// Parse the harness's textual backend process identity into the typed form the
-/// failpoint scopes carry.
-///
-/// The harness reports the identity as it appears in `SHOW BACKENDS`, while the
-/// fault scopes hold a validated `BackendProcessId`; converting here keeps the
-/// comparison and the evidence on the typed value instead of on formatting.
-fn parse_backend_process_id(value: &str) -> Result<novarocks_types::BackendProcessId> {
-    value
-        .parse::<novarocks_types::BackendProcessId>()
-        .map_err(|error| anyhow::anyhow!("backend process identity {value} is invalid: {error}"))
 }

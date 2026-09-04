@@ -62,7 +62,6 @@ pub(crate) fn validate_record_source(
 #[derive(Debug, Default)]
 pub(crate) struct BeLogSnapshot {
     counts: HashMap<(usize, String), usize>,
-    fragment_failure_token: Option<String>,
     log_lengths: Vec<usize>,
     lifecycle_token: Option<(usize, &'static str, String)>,
     evidence_deadline: Option<Instant>,
@@ -92,9 +91,7 @@ pub(crate) fn step_evidence_deadline(meta: &QueryMeta) -> Option<Instant> {
     // joining `is_query_lifecycle_step`: they need the shared deadline the
     // post-query worker runs against, but they must not be held to the
     // retired protocol's terminal facts.
-    (meta.kill_be_after_fragment_start.is_some()
-        || meta.fail_fragment_after_start_be_index.is_some()
-        || meta.restart_be_after_establish_context_index.is_some()
+    (meta.restart_be_after_establish_context_index.is_some()
         || meta.kill_fe_after_be_log_contains.is_some()
         || is_query_lifecycle_step(meta))
     .then(|| Instant::now() + QUERY_LIFECYCLE_STEP_TIMEOUT)
@@ -114,7 +111,6 @@ fn is_query_lifecycle_step(meta: &QueryMeta) -> bool {
     meta.drop_next_init_ack_be_index.is_some()
         || meta.stop_query_control_heartbeat_be_index.is_some()
         || meta.kill_fe_after_control_ready_count.is_some()
-        || meta.restart_be_after_init_ack_index.is_some()
         || meta.drop_next_terminal_ack_be_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
         || meta.query_control_fragment_backend_limit.is_some()
@@ -163,32 +159,12 @@ pub(crate) fn snapshot_with_deadline(
             );
         }
     }
-    let fragment_failure_token = if meta.be_log_exact_fragment_cancellation.is_some() {
-        let index = meta.fail_fragment_after_start_be_index.context(
-            "@be_log_exact_fragment_cancellation requires @fail_fragment_after_start_be_index",
-        )?;
-        Some(
-            server_handle
-                .armed_fragment_failure_token(index)?
-                .with_context(|| {
-                    format!(
-                        "BE[{index}] has no armed fragment failure token for exact cancellation evidence"
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
     let lifecycle_fault = meta
         .drop_next_init_ack_be_index
         .map(|index| (index, "init-ack-drop"))
         .or_else(|| {
             meta.stop_query_control_heartbeat_be_index
                 .map(|index| (index, "heartbeat-stop"))
-        })
-        .or_else(|| {
-            meta.restart_be_after_init_ack_index
-                .map(|index| (index, "restart-after-init-ack"))
         })
         .or_else(|| {
             meta.query_lifecycle_fault
@@ -204,7 +180,6 @@ pub(crate) fn snapshot_with_deadline(
         .transpose()?;
     Ok(BeLogSnapshot {
         counts,
-        fragment_failure_token,
         log_lengths,
         lifecycle_token,
         evidence_deadline,
@@ -361,21 +336,17 @@ fn lifecycle_evidence(
                 )])));
             }
         }
-        return Ok(Some(LogEvidenceCheck::Pending(
-            format!(
-                "no single execution proves {endpoint_count} participants, {} service-only participants, and {limit} fragment executors",
-                endpoint_count.saturating_sub(limit)
-            ),
-        )));
+        return Ok(Some(LogEvidenceCheck::Pending(format!(
+            "no single execution proves {endpoint_count} participants, {} service-only participants, and {limit} fragment executors",
+            endpoint_count.saturating_sub(limit)
+        ))));
     }
 
     let anchor = if let Some((index, _, token)) = &snapshot.lifecycle_token {
         let marker = if step.meta.drop_next_init_ack_be_index.is_some() {
             "NOVAROCKS_QUERY_INIT_ACK_DROPPED"
-        } else if step.meta.stop_query_control_heartbeat_be_index.is_some() {
-            "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED"
         } else {
-            "NOVAROCKS_QUERY_INIT_ACK_OBSERVED"
+            "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED"
         };
         logs[*index]
             .lines()
@@ -385,17 +356,6 @@ fn lifecycle_evidence(
     } else {
         None
     };
-
-    if step.meta.restart_be_after_init_ack_index.is_some() {
-        return Ok(Some(if anchor.is_some() {
-            LogEvidenceCheck::Satisfied(vec![
-                "    query_lifecycle_evidence PASS kind=be-restart token_scoped_init_ack=true"
-                    .to_string(),
-            ])
-        } else {
-            LogEvidenceCheck::Pending("token-scoped restart InitAck marker missing".to_string())
-        }));
-    }
 
     if step.meta.drop_next_init_ack_be_index.is_some() {
         let Some(execution) = anchor else {
@@ -499,21 +459,6 @@ fn lifecycle_evidence(
     )))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct QueryIdentity {
-    hi: i64,
-    lo: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct FragmentIdentity {
-    query: QueryIdentity,
-    finst_hi: i64,
-    finst_lo: i64,
-}
-
-type FragmentMultiset = BTreeMap<FragmentIdentity, usize>;
-
 fn marker_payload<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     line.find(marker)
         .map(|position| &line[position + marker.len()..])
@@ -533,348 +478,6 @@ fn marker_fields<'a>(payload: &'a str, marker: &str) -> Result<HashMap<&'a str, 
         }
     }
     Ok(fields)
-}
-
-fn parse_i64_field(fields: &HashMap<&str, &str>, marker: &str, field: &str) -> Result<i64> {
-    fields
-        .get(field)
-        .with_context(|| format!("{marker} is missing {field}"))?
-        .parse::<i64>()
-        .with_context(|| format!("{marker} has invalid {field}"))
-}
-
-fn parse_fragment_identity(fields: &HashMap<&str, &str>, marker: &str) -> Result<FragmentIdentity> {
-    Ok(FragmentIdentity {
-        query: QueryIdentity {
-            hi: parse_i64_field(fields, marker, "query_hi")?,
-            lo: parse_i64_field(fields, marker, "query_lo")?,
-        },
-        finst_hi: parse_i64_field(fields, marker, "finst_hi")?,
-        finst_lo: parse_i64_field(fields, marker, "finst_lo")?,
-    })
-}
-
-fn parse_identity_markers(log: &str, marker: &str) -> Result<Vec<FragmentIdentity>> {
-    log.lines()
-        .filter_map(|line| marker_payload(line, marker))
-        .map(|payload| {
-            let fields = marker_fields(payload, marker)?;
-            parse_fragment_identity(&fields, marker)
-        })
-        .collect()
-}
-
-fn parse_query_terminal_ack_markers(log: &str) -> Result<Vec<QueryIdentity>> {
-    const MARKER: &str = "NOVAROCKS_QUERY_TERMINAL_ACK";
-    log.lines()
-        .filter_map(|line| marker_payload(line, MARKER))
-        .map(|payload| {
-            let fields = marker_fields(payload, MARKER)?;
-            // Validate the complete terminal identity, while only query id is
-            // needed to relate a terminal ACK to the injected fragment.
-            parse_i64_field(&fields, MARKER, "query_hi")?;
-            parse_i64_field(&fields, MARKER, "query_lo")?;
-            fields
-                .get("attempt")
-                .with_context(|| format!("{MARKER} is missing attempt"))?
-                .parse::<u64>()
-                .with_context(|| format!("{MARKER} has invalid attempt"))?;
-            fields
-                .get("process_id")
-                .with_context(|| format!("{MARKER} is missing process_id"))?
-                .parse::<novarocks_types::BackendProcessId>()
-                .with_context(|| format!("{MARKER} has invalid process_id"))?;
-            Ok(QueryIdentity {
-                hi: parse_i64_field(&fields, MARKER, "query_hi")?,
-                lo: parse_i64_field(&fields, MARKER, "query_lo")?,
-            })
-        })
-        .collect()
-}
-
-fn parse_stage_fragment_acceptance_markers(log: &str) -> Result<Vec<FragmentIdentity>> {
-    const MARKER: &str = "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED";
-    log.lines()
-        .filter_map(|line| marker_payload(line, MARKER))
-        .map(|payload| {
-            let fields = marker_fields(payload, MARKER)?;
-            let execution_id = fields
-                .get("execution_id")
-                .with_context(|| format!("{MARKER} is missing execution_id"))?;
-            let mut execution_parts = execution_id.split(':');
-            let query_hi = execution_parts
-                .next()
-                .context(format!("{MARKER} has malformed execution_id"))?
-                .parse::<i64>()
-                .with_context(|| format!("{MARKER} has invalid execution_id query high bits"))?;
-            let query_lo = execution_parts
-                .next()
-                .context(format!("{MARKER} has malformed execution_id"))?
-                .parse::<i64>()
-                .with_context(|| format!("{MARKER} has invalid execution_id query low bits"))?;
-            let attempt = execution_parts
-                .next()
-                .context(format!("{MARKER} has malformed execution_id"))?;
-            attempt
-                .parse::<u64>()
-                .with_context(|| format!("{MARKER} has invalid execution_id attempt"))?;
-            if execution_parts.next().is_some() {
-                bail!("{MARKER} has malformed execution_id");
-            }
-
-            let finst_id = fields
-                .get("finst_id")
-                .with_context(|| format!("{MARKER} is missing finst_id"))?;
-            let bytes = finst_id.as_bytes();
-            if bytes.len() != 36
-                || bytes.get(8) != Some(&b'-')
-                || bytes.get(13) != Some(&b'-')
-                || bytes.get(18) != Some(&b'-')
-                || bytes.get(23) != Some(&b'-')
-            {
-                bail!("{MARKER} has malformed finst_id");
-            }
-            let compact = finst_id.replace('-', "");
-            if compact.len() != 32 || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                bail!("{MARKER} has malformed finst_id");
-            }
-            let hi = u64::from_str_radix(&compact[..16], 16)
-                .with_context(|| format!("{MARKER} has invalid finst_id high bits"))?;
-            let lo = u64::from_str_radix(&compact[16..], 16)
-                .with_context(|| format!("{MARKER} has invalid finst_id low bits"))?;
-            Ok(FragmentIdentity {
-                query: QueryIdentity {
-                    hi: query_hi,
-                    lo: query_lo,
-                },
-                finst_hi: hi as i64,
-                finst_lo: lo as i64,
-            })
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn parse_legacy_submit_acceptance_markers(log: &str) -> Result<Vec<FragmentIdentity>> {
-    parse_identity_markers(log, "NOVAROCKS_GRPC_SUBMIT_ACCEPTED")
-}
-
-fn parse_fragment_acceptance_markers(log: &str) -> Result<Vec<FragmentIdentity>> {
-    #[cfg(test)]
-    let mut accepted = parse_stage_fragment_acceptance_markers(log)?;
-    #[cfg(not(test))]
-    let accepted = parse_stage_fragment_acceptance_markers(log)?;
-    #[cfg(test)]
-    accepted.extend(parse_legacy_submit_acceptance_markers(log)?);
-    Ok(accepted)
-}
-
-fn parse_failure_markers(log: &str) -> Result<Vec<(String, FragmentIdentity)>> {
-    const MARKER: &str = "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED";
-    log.lines()
-        .filter_map(|line| marker_payload(line, MARKER))
-        .map(|payload| {
-            let fields = marker_fields(payload, MARKER)?;
-            let token = fields
-                .get("token")
-                .with_context(|| format!("{MARKER} is missing token"))?;
-            Ok((
-                (*token).to_string(),
-                parse_fragment_identity(&fields, MARKER)?,
-            ))
-        })
-        .collect()
-}
-
-fn identity_multiset(
-    identities: impl IntoIterator<Item = FragmentIdentity>,
-    query: QueryIdentity,
-) -> FragmentMultiset {
-    let mut result = FragmentMultiset::new();
-    for identity in identities {
-        if identity.query == query {
-            *result.entry(identity).or_insert(0) += 1;
-        }
-    }
-    result
-}
-
-fn exact_fragment_cancellation_evidence(
-    server_handle: &dyn ServerHandle,
-    snapshot: &BeLogSnapshot,
-    endpoint_count: usize,
-    required_be_count: usize,
-) -> Result<LogEvidenceCheck> {
-    if endpoint_count != required_be_count {
-        bail!(
-            "@be_log_exact_fragment_cancellation requires exactly {required_be_count} runner-owned BEs; found {endpoint_count}"
-        );
-    }
-    let token = snapshot
-        .fragment_failure_token
-        .as_deref()
-        .context("@be_log_exact_fragment_cancellation snapshot has no fragment failure token")?;
-    let logs = (0..endpoint_count)
-        .map(|index| server_handle.be_log_contents(index))
-        .collect::<Result<Vec<_>>>()?;
-
-    let failure_markers = logs
-        .iter()
-        .map(|log| parse_failure_markers(log))
-        .collect::<Result<Vec<_>>>();
-    let failure_markers = match failure_markers {
-        Ok(markers) => markers,
-        Err(error) => {
-            return Ok(LogEvidenceCheck::Pending(format!(
-                "malformed fragment failure marker: {error:#}"
-            )));
-        }
-    };
-    let anchors = failure_markers
-        .into_iter()
-        .enumerate()
-        .flat_map(|(be_index, markers)| markers.into_iter().map(move |marker| (be_index, marker)))
-        .filter_map(|(be_index, (marker_token, identity))| {
-            (marker_token == token).then_some((be_index, identity))
-        })
-        .collect::<Vec<_>>();
-    let (anchor_be_index, anchor) = match anchors.as_slice() {
-        [] => {
-            return Ok(LogEvidenceCheck::Pending(format!(
-                "no fragment failure marker has current step token {token:?}"
-            )));
-        }
-        [(be_index, identity)] => (*be_index, *identity),
-        _ => {
-            bail!(
-                "fragment failure token {token:?} anchored {} failure markers; expected exactly one",
-                anchors.len()
-            );
-        }
-    };
-
-    let acknowledgements = logs
-        .iter()
-        .map(|log| parse_identity_markers(log, "NOVAROCKS_FAILED_FRAGMENT_REPORT_ACK"))
-        .collect::<Result<Vec<_>>>();
-    let acknowledgements = match acknowledgements {
-        Ok(markers) => markers,
-        Err(error) => {
-            return Ok(LogEvidenceCheck::Pending(format!(
-                "malformed failed-report ACK marker: {error:#}"
-            )));
-        }
-    };
-    let acknowledgements_total = acknowledgements
-        .iter()
-        .flatten()
-        .filter(|identity| **identity == anchor)
-        .count();
-    if acknowledgements_total == 0 {
-        // Native QLC-4 stops final ReportExecStatus delivery. Its terminal
-        // acknowledgement is query-scoped, immutable, and can arrive through
-        // either the stream or unary fallback. The legacy marker above remains
-        // available for older native lifecycle evidence.
-        let terminal_acks = logs
-            .iter()
-            .map(|log| parse_query_terminal_ack_markers(log))
-            .collect::<Result<Vec<_>>>();
-        let terminal_acks = match terminal_acks {
-            Ok(markers) => markers,
-            Err(error) => {
-                return Ok(LogEvidenceCheck::Pending(format!(
-                    "malformed query-terminal ACK marker: {error:#}"
-                )));
-            }
-        };
-        let on_failure_be = terminal_acks[anchor_be_index]
-            .iter()
-            .filter(|identity| **identity == anchor.query)
-            .count();
-        if on_failure_be != 1 {
-            return Ok(LogEvidenceCheck::Pending(format!(
-                "no terminal ACK for injected fragment query {:?} on failure BE[{anchor_be_index}]",
-                anchor.query
-            )));
-        }
-    } else {
-        if acknowledgements_total != 1 {
-            bail!(
-                "injected fragment {anchor:?} has {acknowledgements_total} explicit frontend ACK markers; expected exactly one"
-            );
-        }
-        let acknowledgements_on_failure_be = acknowledgements[anchor_be_index]
-            .iter()
-            .filter(|identity| **identity == anchor)
-            .count();
-        if acknowledgements_on_failure_be != 1 {
-            bail!("injected fragment {anchor:?} ACK is not on failure BE[{anchor_be_index}]");
-        }
-    }
-
-    let mut total = 0usize;
-    let mut mismatches = Vec::new();
-    for (index, log) in logs.iter().enumerate() {
-        let accepted = match parse_fragment_acceptance_markers(log) {
-            Ok(identities) => identity_multiset(identities, anchor.query),
-            Err(error) => {
-                return Ok(LogEvidenceCheck::Pending(format!(
-                    "BE[{index}] has malformed accepted-fragment marker: {error:#}"
-                )));
-            }
-        };
-        let cancelled = match parse_identity_markers(log, "NOVAROCKS_CANCEL_FINST") {
-            Ok(identities) => identity_multiset(identities, anchor.query),
-            Err(error) => {
-                return Ok(LogEvidenceCheck::Pending(format!(
-                    "BE[{index}] has malformed cancelled-fragment marker: {error:#}"
-                )));
-            }
-        };
-        total = total
-            .checked_add(accepted.len())
-            .context("accepted fragment identity count overflow")?;
-
-        let accepted_duplicates = accepted
-            .iter()
-            .filter(|(_, count)| **count != 1)
-            .collect::<Vec<_>>();
-        let cancelled_duplicates = cancelled
-            .iter()
-            .filter(|(_, count)| **count != 1)
-            .collect::<Vec<_>>();
-        if accepted != cancelled {
-            mismatches.push(format!(
-                "BE[{index}] identity mismatch accepted={accepted:?} cancelled={cancelled:?}"
-            ));
-        } else if !accepted_duplicates.is_empty() {
-            mismatches.push(format!(
-                "BE[{index}] accepted duplicate fragment identities: {accepted_duplicates:?}"
-            ));
-        } else if !cancelled_duplicates.is_empty() {
-            mismatches.push(format!(
-                "BE[{index}] cancelled duplicate fragment identities: {cancelled_duplicates:?}"
-            ));
-        }
-        if index == anchor_be_index && accepted.get(&anchor) != Some(&1) {
-            mismatches.push(format!(
-                "injected fragment {anchor:?} was not accepted exactly once on failure BE[{index}]"
-            ));
-        }
-        if index == anchor_be_index && cancelled.get(&anchor) != Some(&1) {
-            mismatches.push(format!(
-                "injected fragment {anchor:?} was not cancelled exactly once on failure BE[{index}]"
-            ));
-        }
-    }
-    if !mismatches.is_empty() {
-        return Ok(LogEvidenceCheck::Pending(mismatches.join("; ")));
-    }
-
-    Ok(LogEvidenceCheck::Satisfied(vec![format!(
-        "    @be_log_exact_fragment_cancellation PASS query_hi={} query_lo={} be_count={} total={total}",
-        anchor.query.hi, anchor.query.lo, endpoint_count
-    )]))
 }
 
 fn evaluate_log_evidence(
@@ -948,18 +551,6 @@ fn evaluate_log_evidence(
             successes.push(format!(
                 "    @be_log_be_count_at_least PASS pattern={pattern:?} actual={actual} required={required}"
             ));
-        }
-    }
-
-    if let Some(required_be_count) = step.meta.be_log_exact_fragment_cancellation {
-        match exact_fragment_cancellation_evidence(
-            server_handle,
-            snapshot,
-            endpoint_count,
-            required_be_count,
-        )? {
-            LogEvidenceCheck::Satisfied(exact_successes) => successes.extend(exact_successes),
-            LogEvidenceCheck::Pending(reason) => pending.push(reason),
         }
     }
 
@@ -1061,25 +652,18 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use crate::types::{QueryMeta, SqlStep};
-    use anyhow::{Result, bail};
+    use anyhow::Result;
     use std::sync::{Arc, Mutex};
 
     struct FakeBeLogHandle {
         logs: Mutex<Vec<String>>,
-        fragment_failure_token: Option<String>,
     }
 
     impl FakeBeLogHandle {
         fn new(logs: Vec<&str>) -> Self {
             Self {
                 logs: Mutex::new(logs.into_iter().map(ToString::to_string).collect()),
-                fragment_failure_token: None,
             }
-        }
-
-        fn with_fragment_failure_token(mut self, token: &str) -> Self {
-            self.fragment_failure_token = Some(token.to_string());
-            self
         }
 
         fn append_log(&self, index: usize, text: &str) {
@@ -1119,13 +703,6 @@ mod tests {
 
         fn fe_log_contents(&self) -> Result<String> {
             Ok("fe-tail-sentinel\n".to_string())
-        }
-
-        fn armed_fragment_failure_token(&self, index: usize) -> Result<Option<String>> {
-            if index >= self.logs.lock().expect("logs lock").len() {
-                bail!("missing fake BE {index}");
-            }
-            Ok(self.fragment_failure_token.clone())
         }
     }
 
@@ -1252,255 +829,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_injected_query_cancellation_compares_per_be_identity_multisets() {
-        let handle = FakeBeLogHandle::new(vec![
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=1:2:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=00000000-0000-0003-0000-000000000004\n",
-            "",
-            "",
-        ])
-        .with_fragment_failure_token("step-token");
-        let step = step(QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
-            be_log_exact_fragment_cancellation: Some(3),
-            ..QueryMeta::default()
-        });
-        let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
-        handle.append_log(
-            0,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=7:8:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=00000000-0000-0009-0000-00000000000a\n",
-        );
-        handle.append_log(
-            0,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=00000000-0000-0065-0000-0000000000c9\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
-        );
-        handle.append_log(
-            1,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd finst_id=00000000-0000-0066-0000-0000000000ca\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
-        );
-        handle.append_log(
-            2,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe finst_id=00000000-0000-0067-0000-0000000000cb\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe finst_id=00000000-0000-0068-0000-0000000000cc\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=104 finst_lo=204\n",
-        );
-        let mut log = String::new();
-
-        run(&step, &handle, &before, &mut log)
-            .expect("every accepted current-query identity is cancelled exactly once");
-
-        assert!(
-            log.contains(
-                "@be_log_exact_fragment_cancellation PASS query_hi=10 query_lo=20 be_count=3 total=4"
-            ),
-            "{log}"
-        );
-    }
-
-    #[test]
-    fn exact_injected_query_cancellation_accepts_native_terminal_ack() {
-        let handle =
-            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("terminal-token");
-        let step = step(QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
-            be_log_exact_fragment_cancellation: Some(3),
-            ..QueryMeta::default()
-        });
-        let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
-        handle.append_log(
-            0,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=00000000-0000-0065-0000-0000000000c9\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
-        );
-        handle.append_log(
-            1,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd finst_id=00000000-0000-0066-0000-0000000000ca\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=terminal-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_QUERY_TERMINAL_ACK query_hi=10 query_lo=20 attempt=1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
-        );
-        handle.append_log(
-            2,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe finst_id=00000000-0000-0067-0000-0000000000cb\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\n",
-        );
-
-        run(&step, &handle, &before, &mut String::new())
-            .expect("native terminal ACK must replace native final-report ACK evidence");
-    }
-
-    #[test]
-    fn exact_injected_query_cancellation_rejects_equal_counts_with_wrong_identity() {
-        let handle =
-            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
-        let step = step(QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
-            be_log_exact_fragment_cancellation: Some(3),
-            ..QueryMeta::default()
-        });
-        let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
-        handle.append_log(
-            0,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\nNOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=105 finst_lo=205\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
-        );
-        handle.append_log(
-            1,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
-        );
-        handle.append_log(
-            2,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\n",
-        );
-        let mut log = String::new();
-
-        let error = run(&step, &handle, &before, &mut log)
-            .expect_err("A/B accepted but A/A cancelled must fail exact identity evidence");
-
-        assert!(
-            error.to_string().contains("BE[0] identity mismatch"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn exact_injected_query_cancellation_compares_each_be_not_only_global_identity() {
-        let handle =
-            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
-        let step = step(QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
-            be_log_exact_fragment_cancellation: Some(3),
-            ..QueryMeta::default()
-        });
-        let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
-        handle.append_log(
-            0,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
-        );
-        handle.append_log(
-            1,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
-        );
-        handle.append_log(
-            2,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\n",
-        );
-
-        let error = run(&step, &handle, &before, &mut String::new())
-            .expect_err("globally equal identities assigned to the wrong BEs must fail");
-
-        assert!(
-            error.to_string().contains("BE[0] identity mismatch"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn exact_injected_query_cancellation_binds_failure_and_ack_to_the_same_be() {
-        let handle =
-            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
-        let step = step(QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
-            be_log_exact_fragment_cancellation: Some(3),
-            ..QueryMeta::default()
-        });
-        let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
-        handle.append_log(
-            0,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
-        );
-        handle.append_log(
-            1,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=105 finst_lo=205\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=105 finst_lo=205\n",
-        );
-        handle.append_log(
-            2,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\n",
-        );
-
-        let error = run(&step, &handle, &before, &mut String::new()).expect_err(
-            "the injected identity and its ACK must be proven on the BE that consumed the token",
-        );
-
-        assert!(error.to_string().contains("injected fragment"), "{error:#}");
-    }
-
-    #[test]
-    fn exact_injected_query_cancellation_rejects_duplicate_identity_evidence() {
-        let handle =
-            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
-        let step = step(QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
-            be_log_exact_fragment_cancellation: Some(3),
-            ..QueryMeta::default()
-        });
-        let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
-        handle.append_log(
-            0,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\nNOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
-        );
-        handle.append_log(
-            1,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
-        );
-        handle.append_log(
-            2,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\n",
-        );
-
-        let error = run(&step, &handle, &before, &mut String::new())
-            .expect_err("matching duplicate identity evidence must fail closed");
-
-        assert!(
-            error
-                .to_string()
-                .contains("accepted duplicate fragment identities"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn exact_injected_query_cancellation_requires_declared_be_coverage() {
-        let handle = FakeBeLogHandle::new(vec!["", ""]).with_fragment_failure_token("step-token");
-        let step = step(QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
-            be_log_exact_fragment_cancellation: Some(3),
-            ..QueryMeta::default()
-        });
-        let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
-
-        let error = run(&step, &handle, &before, &mut String::new())
-            .expect_err("a two-BE cluster cannot satisfy a three-BE proof");
-
-        assert!(error.to_string().contains("found 2"), "{error:#}");
-    }
-
-    #[test]
-    fn exact_injected_query_cancellation_rejects_malformed_markers() {
-        let handle =
-            FakeBeLogHandle::new(vec!["", "", ""]).with_fragment_failure_token("step-token");
-        let step = step(QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
-            be_log_exact_fragment_cancellation: Some(3),
-            ..QueryMeta::default()
-        });
-        let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
-        handle.append_log(
-            0,
-            "NOVAROCKS_GRPC_SUBMIT_ACCEPTED query_hi=10 query_lo=20 finst_hi=101\n",
-        );
-        handle.append_log(
-            1,
-            "NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
-        );
-
-        let error = run(&step, &handle, &before, &mut String::new())
-            .expect_err("malformed identity marker must fail closed");
-
-        assert!(
-            error
-                .to_string()
-                .contains("malformed accepted-fragment marker"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
-    fn post_query_fragment_fault_starts_the_shared_evidence_deadline_before_execution() {
+    fn post_query_process_fault_starts_the_shared_evidence_deadline_before_execution() {
         let handle = FakeBeLogHandle::new(vec!["", "", ""]);
         let meta = QueryMeta {
-            fail_fragment_after_start_be_index: Some(1),
+            restart_be_after_establish_context_index: Some(1),
             ..QueryMeta::default()
         };
 
@@ -1567,10 +899,6 @@ mod tests {
             },
             QueryMeta {
                 kill_fe_after_control_ready_count: Some(1),
-                ..QueryMeta::default()
-            },
-            QueryMeta {
-                restart_be_after_init_ack_index: Some(0),
                 ..QueryMeta::default()
             },
             QueryMeta {

@@ -304,8 +304,6 @@ pub struct QueryMeta {
     pub retry_count: Option<usize>,
     pub retry_interval_ms: Option<u64>,
     pub kill_be_index: Option<usize>,
-    pub kill_be_after_fragment_start: Option<usize>,
-    pub fail_fragment_after_start_be_index: Option<usize>,
     pub network_partition_be: Option<usize>,
     pub heartbeat_delay_ms: Option<u64>,
     pub restart_be_delay_ms: Option<u64>,
@@ -324,10 +322,8 @@ pub struct QueryMeta {
     /// Kill and restart FE after an MV lake publication is known committed but
     /// before the Accelerator projector can CAS its local projection.
     pub kill_fe_after_mv_known_committed_before_projector_cas: bool,
-    pub restart_be_after_init_ack_index: Option<usize>,
     /// Replace one BE process after its task-protocol `EstablishQueryContext`
-    /// has been applied. The task-protocol successor of
-    /// `restart_be_after_init_ack_index`.
+    /// has been applied.
     pub restart_be_after_establish_context_index: Option<usize>,
     /// Execute KILL QUERY from a separate client after this query's Nth ControlReady.
     pub kill_query_after_control_ready_count: Option<usize>,
@@ -369,7 +365,6 @@ pub struct QueryMeta {
     /// intentionally separate from `expect_error` and log assertions.
     pub query_lifecycle_structured_assertion: Option<QueryLifecycleStructuredAssertion>,
     pub kill_query_at_lifecycle_phase: Option<QueryLifecyclePhase>,
-    pub kill_fe_at_lifecycle_phase: Option<QueryLifecyclePhase>,
     /// Kill one BE only after FE has retained an immutable participant outcome
     /// for the requested lifecycle phase.
     pub kill_be_at_lifecycle_phase: Option<KillBeAtLifecyclePhaseDirective>,
@@ -414,11 +409,6 @@ pub struct QueryMeta {
     pub be_log_count_at_least: Vec<(String, usize)>,
     /// Require a substring to appear in at least this many distinct BE logs.
     pub be_log_be_count_at_least: Vec<(String, usize)>,
-    /// Prove exact accepted/cancelled fragment identity equality for the injected query.
-    ///
-    /// The value is the exact number of runner-owned BE logs that must contribute
-    /// at least one accepted fragment for that query.
-    pub be_log_exact_fragment_cancellation: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,7 +520,6 @@ impl QueryMeta {
             || !self.be_log_not_contains.is_empty()
             || !self.be_log_count_at_least.is_empty()
             || !self.be_log_be_count_at_least.is_empty()
-            || self.be_log_exact_fragment_cancellation.is_some()
     }
 }
 

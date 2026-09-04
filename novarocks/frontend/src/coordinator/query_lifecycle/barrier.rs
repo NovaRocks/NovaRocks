@@ -708,51 +708,53 @@ pub(super) fn record_lifecycle_phase_marker_for_execution(
     let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(());
     };
-    for (kind, action) in [("kill-query", "kill_query"), ("fe-crash", "kill_fe")] {
-        let path = root.join(format!("{kind}-at-{phase}.trigger"));
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(contract_error(format!(
-                    "read runner-owned lifecycle phase trigger {}: {error}",
-                    path.display()
-                )));
-            }
-        };
-        let fields = contents
-            .lines()
-            .filter_map(|line| line.split_once('='))
-            .collect::<BTreeMap<_, _>>();
-        let token = fields
-            .get("token")
-            .copied()
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| contract_error("runner-owned lifecycle phase trigger has no token"))?;
-        if fields.get("phase").copied() != Some(phase) || fields.len() != 2 {
+    // The barrier publishes exactly one action: the runner kills the target
+    // query at the named phase. A coordinator-crash variant of the same
+    // trigger no longer exists, so this reads one file rather than a family.
+    const ACTION: &str = "kill_query";
+    let path = root.join(format!("kill-query-at-{phase}.trigger"));
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
             return Err(contract_error(format!(
-                "runner-owned lifecycle phase trigger {} has invalid contents",
+                "read runner-owned lifecycle phase trigger {}: {error}",
                 path.display()
             )));
         }
-        eprintln!(
-            "NOVAROCKS_QUERY_LIFECYCLE_PHASE execution_id={}:{}:{} phase={} action={} token={}",
-            execution_id.query_id().high(),
-            execution_id.query_id().low(),
-            execution_id.attempt_id().get(),
-            phase,
-            action,
-            token
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while path.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if path.exists() {
-            return Err(failed(format!(
-                "timed out waiting for runner to execute {action} at lifecycle phase {phase}"
-            )));
-        }
+    };
+    let fields = contents
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    let token = fields
+        .get("token")
+        .copied()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| contract_error("runner-owned lifecycle phase trigger has no token"))?;
+    if fields.get("phase").copied() != Some(phase) || fields.len() != 2 {
+        return Err(contract_error(format!(
+            "runner-owned lifecycle phase trigger {} has invalid contents",
+            path.display()
+        )));
+    }
+    eprintln!(
+        "NOVAROCKS_QUERY_LIFECYCLE_PHASE execution_id={}:{}:{} phase={} action={} token={}",
+        execution_id.query_id().high(),
+        execution_id.query_id().low(),
+        execution_id.attempt_id().get(),
+        phase,
+        ACTION,
+        token
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if path.exists() {
+        return Err(failed(format!(
+            "timed out waiting for runner to execute {ACTION} at lifecycle phase {phase}"
+        )));
     }
     Ok(())
 }

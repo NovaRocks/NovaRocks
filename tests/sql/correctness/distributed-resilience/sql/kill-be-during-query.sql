@@ -22,10 +22,10 @@
 --
 -- Migrated onto the task protocol. Both retired parts are replaced:
 --
---   * the trigger. `@kill_be_after_fragment_start` waits for SHOW BACKENDS to
---     report a fresh ScheduledFragments count, and that column is only fed by
---     the retired stage loop, so on the task path it never moves and the kill
---     was never delivered. The kill is now released by the backend's own
+--   * the trigger. The retired directive waited for SHOW BACKENDS to report a
+--     fresh ScheduledFragments count, and that column is only fed by the
+--     retired stage loop, so on the task path it never moves and the kill was
+--     never delivered. The kill is now released by the backend's own
 --     admission marker.
 --   * the fragment backend limit. It existed so the killed backend was
 --     certainly a fragment executor. Every backend the task protocol gives a

@@ -462,18 +462,6 @@ fn parse_meta_with_sql_error_descriptors(
                     .with_context(|| format!("invalid kill_be_index: {}", raw_value))?;
                 meta.kill_be_index = Some(value);
             }
-            "kill_be_after_fragment_start" => {
-                let value: usize = raw_value.parse().with_context(|| {
-                    format!("invalid kill_be_after_fragment_start: {}", raw_value)
-                })?;
-                meta.kill_be_after_fragment_start = Some(value);
-            }
-            "fail_fragment_after_start_be_index" => {
-                let value: usize = raw_value.parse().with_context(|| {
-                    format!("invalid fail_fragment_after_start_be_index: {}", raw_value)
-                })?;
-                meta.fail_fragment_after_start_be_index = Some(value);
-            }
             "network_partition_be" => {
                 let value: usize = raw_value
                     .parse()
@@ -530,12 +518,6 @@ fn parse_meta_with_sql_error_descriptors(
             "kill_fe_after_mv_known_committed_before_projector_cas" => {
                 meta.kill_fe_after_mv_known_committed_before_projector_cas =
                     parse_bool(&raw_value)?;
-            }
-            "restart_be_after_init_ack_index" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid restart_be_after_init_ack_index: {raw_value}")
-                })?;
-                meta.restart_be_after_init_ack_index = Some(value);
             }
             "restart_be_after_establish_context_index" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
@@ -672,22 +654,6 @@ fn parse_meta_with_sql_error_descriptors(
                     })
                     .map(Some)?;
             }
-            "kill_fe_at_lifecycle_phase" => {
-                let phase = QueryLifecyclePhase::parse(&raw_value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged or terminal-retained"
-                    )
-                })?;
-                if !matches!(
-                    phase,
-                    QueryLifecyclePhase::Staged | QueryLifecyclePhase::TerminalRetained
-                ) {
-                    bail!(
-                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged or terminal-retained"
-                    );
-                }
-                meta.kill_fe_at_lifecycle_phase = Some(phase);
-            }
             "kill_be_at_lifecycle_phase" => {
                 meta.kill_be_at_lifecycle_phase =
                     Some(parse_kill_be_at_lifecycle_phase(&raw_value)?);
@@ -782,15 +748,6 @@ fn parse_meta_with_sql_error_descriptors(
                 }
                 meta.be_log_be_count_at_least
                     .push((pattern.to_string(), count));
-            }
-            "be_log_exact_fragment_cancellation" => {
-                let count = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid @be_log_exact_fragment_cancellation BE count: {raw_value}")
-                })?;
-                if count == 0 {
-                    bail!("@be_log_exact_fragment_cancellation BE count must be positive");
-                }
-                meta.be_log_exact_fragment_cancellation = Some(count);
             }
             "sequential" => {
                 // Parsed here but ignored in merge_meta; handled at case level.
@@ -928,12 +885,6 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         retry_count: override_meta.retry_count.or(base.retry_count),
         retry_interval_ms: override_meta.retry_interval_ms.or(base.retry_interval_ms),
         kill_be_index: override_meta.kill_be_index.or(base.kill_be_index),
-        kill_be_after_fragment_start: override_meta
-            .kill_be_after_fragment_start
-            .or(base.kill_be_after_fragment_start),
-        fail_fragment_after_start_be_index: override_meta
-            .fail_fragment_after_start_be_index
-            .or(base.fail_fragment_after_start_be_index),
         network_partition_be: override_meta
             .network_partition_be
             .or(base.network_partition_be),
@@ -953,9 +904,6 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         kill_fe_after_mv_known_committed_before_projector_cas: override_meta
             .kill_fe_after_mv_known_committed_before_projector_cas
             || base.kill_fe_after_mv_known_committed_before_projector_cas,
-        restart_be_after_init_ack_index: override_meta
-            .restart_be_after_init_ack_index
-            .or(base.restart_be_after_init_ack_index),
         restart_be_after_establish_context_index: override_meta
             .restart_be_after_establish_context_index
             .or(base.restart_be_after_establish_context_index),
@@ -1024,9 +972,6 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         kill_query_at_lifecycle_phase: override_meta
             .kill_query_at_lifecycle_phase
             .or(base.kill_query_at_lifecycle_phase),
-        kill_fe_at_lifecycle_phase: override_meta
-            .kill_fe_at_lifecycle_phase
-            .or(base.kill_fe_at_lifecycle_phase),
         kill_be_at_lifecycle_phase: override_meta
             .kill_be_at_lifecycle_phase
             .or(base.kill_be_at_lifecycle_phase),
@@ -1088,9 +1033,6 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         } else {
             override_meta.be_log_be_count_at_least.clone()
         },
-        be_log_exact_fragment_cancellation: override_meta
-            .be_log_exact_fragment_cancellation
-            .or(base.be_log_exact_fragment_cancellation),
     }
 }
 
@@ -1477,8 +1419,8 @@ mod opt5_directive_tests {
                 },
             ),
         ] {
-            let meta = parse_meta(&[directive.to_string()], &re)
-                .expect("parse catalog observation fault");
+            let meta =
+                parse_meta(&[directive.to_string()], &re).expect("parse catalog observation fault");
             assert_eq!(meta.publication_catalog_fault, Some(expected));
         }
         let error = parse_meta(
@@ -1573,8 +1515,6 @@ mod opt5_directive_tests {
         let re = meta_re();
         let lines = vec![
             "-- @kill_be_index=1".to_string(),
-            "-- @kill_be_after_fragment_start=2".to_string(),
-            "-- @fail_fragment_after_start_be_index=0".to_string(),
             "-- @network_partition_be=2".to_string(),
             "-- @heartbeat_delay_ms=250".to_string(),
             "-- @restart_be_delay_ms=500".to_string(),
@@ -1583,8 +1523,6 @@ mod opt5_directive_tests {
         let meta = parse_meta(&lines, &re).expect("parse ok");
 
         assert_eq!(meta.kill_be_index, Some(1));
-        assert_eq!(meta.kill_be_after_fragment_start, Some(2));
-        assert_eq!(meta.fail_fragment_after_start_be_index, Some(0));
         assert_eq!(meta.network_partition_be, Some(2));
         assert_eq!(meta.heartbeat_delay_ms, Some(250));
         assert_eq!(meta.restart_be_delay_ms, Some(500));
@@ -1615,7 +1553,6 @@ mod opt5_directive_tests {
             "-- @stop_query_control_heartbeat_be_index=2".to_string(),
             "-- @kill_fe_after_control_ready_count=3".to_string(),
             "-- @kill_fe_after_mv_known_committed_before_projector_cas=true".to_string(),
-            "-- @restart_be_after_init_ack_index=0".to_string(),
             "-- @kill_query_after_control_ready_count=2".to_string(),
             "-- @kill_query_after_be_log_contains=split_id=iceberg-metadata-0".to_string(),
             "-- @fail_stage_prepare_ordinal=2".to_string(),
@@ -1624,7 +1561,6 @@ mod opt5_directive_tests {
             "-- @suppress_start_ack_be_index=0".to_string(),
             "-- @drop_next_terminal_ack_be_index=1".to_string(),
             "-- @kill_query_at_lifecycle_phase=starting".to_string(),
-            "-- @kill_fe_at_lifecycle_phase=staged".to_string(),
             "-- @kill_be_at_lifecycle_phase=2,terminal-retained".to_string(),
             "-- @stop_query_control_heartbeat_after_stage_be_index=1".to_string(),
             "-- @hold_start_until_early_ingress=true".to_string(),
@@ -1637,7 +1573,6 @@ mod opt5_directive_tests {
         assert_eq!(meta.stop_query_control_heartbeat_be_index, Some(2));
         assert_eq!(meta.kill_fe_after_control_ready_count, Some(3));
         assert!(meta.kill_fe_after_mv_known_committed_before_projector_cas);
-        assert_eq!(meta.restart_be_after_init_ack_index, Some(0));
         assert_eq!(meta.kill_query_after_control_ready_count, Some(2));
         assert_eq!(
             meta.kill_query_after_be_log_contains.as_deref(),
@@ -1658,10 +1593,6 @@ mod opt5_directive_tests {
         assert_eq!(
             meta.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Starting)
-        );
-        assert_eq!(
-            meta.kill_fe_at_lifecycle_phase,
-            Some(QueryLifecyclePhase::Staged)
         );
         assert_eq!(
             meta.stop_query_control_heartbeat_after_stage_be_index,
@@ -1686,10 +1617,6 @@ mod opt5_directive_tests {
             (
                 "kill_fe_after_control_ready_count=all",
                 "invalid kill_fe_after_control_ready_count: all",
-            ),
-            (
-                "restart_be_after_init_ack_index=middle",
-                "invalid restart_be_after_init_ack_index: middle",
             ),
             (
                 "kill_query_after_control_ready_count=some",
@@ -1726,7 +1653,6 @@ mod opt5_directive_tests {
 
         for directive in [
             "kill_query_at_lifecycle_phase=after-start",
-            "kill_fe_at_lifecycle_phase=running",
             "hold_start_until_early_ingress=maybe",
         ] {
             assert!(
@@ -2063,7 +1989,6 @@ mod opt5_directive_tests {
             stop_query_control_heartbeat_be_index: Some(1),
             kill_fe_after_control_ready_count: Some(2),
             kill_fe_after_mv_known_committed_before_projector_cas: true,
-            restart_be_after_init_ack_index: Some(0),
             kill_query_after_control_ready_count: Some(1),
             kill_query_after_be_log_contains: Some("reader-open".to_string()),
             fail_stage_prepare_ordinal: Some(2),
@@ -2072,7 +1997,6 @@ mod opt5_directive_tests {
             suppress_start_ack_be_index: Some(2),
             drop_next_terminal_ack_be_index: Some(1),
             kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Staging),
-            kill_fe_at_lifecycle_phase: Some(QueryLifecyclePhase::Staged),
             stop_query_control_heartbeat_after_stage_be_index: Some(1),
             hold_start_until_early_ingress: true,
             query_control_fragment_backend_limit: Some(2),
@@ -2083,7 +2007,6 @@ mod opt5_directive_tests {
         assert_eq!(inherited.stop_query_control_heartbeat_be_index, Some(1));
         assert_eq!(inherited.kill_fe_after_control_ready_count, Some(2));
         assert!(inherited.kill_fe_after_mv_known_committed_before_projector_cas);
-        assert_eq!(inherited.restart_be_after_init_ack_index, Some(0));
         assert_eq!(inherited.kill_query_after_control_ready_count, Some(1));
         assert_eq!(
             inherited.kill_query_after_be_log_contains.as_deref(),
@@ -2099,10 +2022,6 @@ mod opt5_directive_tests {
             Some(QueryLifecyclePhase::Staging)
         );
         assert_eq!(
-            inherited.kill_fe_at_lifecycle_phase,
-            Some(QueryLifecyclePhase::Staged)
-        );
-        assert_eq!(
             inherited.stop_query_control_heartbeat_after_stage_be_index,
             Some(1)
         );
@@ -2113,7 +2032,6 @@ mod opt5_directive_tests {
             drop_next_init_ack_be_index: Some(2),
             stop_query_control_heartbeat_be_index: Some(0),
             kill_fe_after_control_ready_count: Some(3),
-            restart_be_after_init_ack_index: Some(2),
             kill_query_after_control_ready_count: Some(3),
             kill_query_after_be_log_contains: Some("metadata-open".to_string()),
             fail_stage_prepare_ordinal: Some(4),
@@ -2131,7 +2049,6 @@ mod opt5_directive_tests {
         assert_eq!(overridden.stop_query_control_heartbeat_be_index, Some(0));
         assert_eq!(overridden.kill_fe_after_control_ready_count, Some(3));
         assert!(overridden.kill_fe_after_mv_known_committed_before_projector_cas);
-        assert_eq!(overridden.restart_be_after_init_ack_index, Some(2));
         assert_eq!(overridden.kill_query_after_control_ready_count, Some(3));
         assert_eq!(
             overridden.kill_query_after_be_log_contains.as_deref(),
@@ -2145,10 +2062,6 @@ mod opt5_directive_tests {
         assert_eq!(
             overridden.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Running)
-        );
-        assert_eq!(
-            overridden.kill_fe_at_lifecycle_phase,
-            Some(QueryLifecyclePhase::Staged)
         );
         assert_eq!(
             overridden.stop_query_control_heartbeat_after_stage_be_index,
@@ -2166,7 +2079,6 @@ mod opt5_directive_tests {
             "-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string(),
             "-- @be_log_count_at_least=runtime_filter_receive,2".to_string(),
             "-- @be_log_be_count_at_least=exchange_receive eos=true,2".to_string(),
-            "-- @be_log_exact_fragment_cancellation=3".to_string(),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse BE log directives");
@@ -2187,7 +2099,6 @@ mod opt5_directive_tests {
             meta.be_log_be_count_at_least,
             vec![("exchange_receive eos=true".to_string(), 2)]
         );
-        assert_eq!(meta.be_log_exact_fragment_cancellation, Some(3));
     }
 
     #[test]
@@ -2199,19 +2110,6 @@ mod opt5_directive_tests {
 
         assert!(
             format!("{error:#}").contains("invalid @be_log_count_at_least count: zero"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn exact_fragment_cancellation_requires_positive_be_count() {
-        let re = meta_re();
-        let lines = vec!["-- @be_log_exact_fragment_cancellation=0".to_string()];
-
-        let error = parse_meta(&lines, &re).expect_err("zero BE coverage must fail");
-
-        assert!(
-            format!("{error:#}").contains("BE count must be positive"),
             "unexpected error: {error:#}"
         );
     }

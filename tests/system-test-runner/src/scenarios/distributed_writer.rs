@@ -1444,7 +1444,7 @@ fn run_faulted_write(
                 .context("abort the in-flight distributed write")?;
             context
                 .handle()
-                .release_query_lifecycle_phase_fault(PHASE, false)
+                .release_query_lifecycle_phase_fault(PHASE)
                 .context("release the running-phase abort")?;
             let outcome = write
                 .done

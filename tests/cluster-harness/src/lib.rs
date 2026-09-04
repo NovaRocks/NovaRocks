@@ -2094,13 +2094,9 @@ pub trait ServerHandle: Send {
             self.query_lifecycle_structured_snapshot()
         })
     }
-    fn release_query_lifecycle_phase_fault(
-        &mut self,
-        phase: QueryLifecyclePhase,
-        fe_crash: bool,
-    ) -> Result<()> {
+    fn release_query_lifecycle_phase_fault(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
-            "lifecycle phase fault release is unsupported by this server mode (phase={}, fe_crash={fe_crash})",
+            "lifecycle phase fault release is unsupported by this server mode (phase={})",
             phase.as_str()
         )
     }
@@ -2159,12 +2155,6 @@ pub trait ServerHandle: Send {
             phase.as_str()
         )
     }
-    fn arm_fe_crash_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
-        bail!(
-            "FE lifecycle phase fault is unsupported by this server mode (phase={})",
-            phase.as_str()
-        )
-    }
     fn arm_mv_known_committed_before_projector_cas(&mut self) -> Result<()> {
         bail!("MV known-committed projector barrier is unsupported by this server mode")
     }
@@ -2199,10 +2189,6 @@ pub trait ServerHandle: Send {
     fn be_count(&self) -> usize {
         0
     }
-    fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
-        bail!("scheduled fragment telemetry is unsupported by this server mode (index={index})")
-    }
-
     fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
         bail!(
             "fragment executor failure injection is unsupported by this server mode (index={index})"
@@ -2217,9 +2203,6 @@ pub trait ServerHandle: Send {
         bail!(
             "fragment executor failure cleanup is unsupported by this server mode (index={index})"
         )
-    }
-    fn armed_fragment_failure_token(&self, index: usize) -> Result<Option<String>> {
-        bail!("fragment failure token is unsupported by this server mode (index={index})")
     }
     #[allow(dead_code)]
     fn assert_be_log(&self, index: usize, _needle: &str) -> Result<()> {
@@ -2587,11 +2570,6 @@ impl QueryLifecycleFaultFiles {
             .join(format!("kill-query-at-{}.trigger", phase.as_str()))
     }
 
-    fn fe_crash_at_phase_path(&self, phase: QueryLifecyclePhase) -> PathBuf {
-        self.root
-            .join(format!("fe-crash-at-{}.trigger", phase.as_str()))
-    }
-
     fn mv_known_committed_before_projector_cas_trigger_path(&self) -> PathBuf {
         mv_known_committed_before_projector_cas_trigger_path(&self.root)
     }
@@ -2672,15 +2650,6 @@ impl QueryLifecycleFaultFiles {
     fn publish_kill_query_at_phase(&self, phase: QueryLifecyclePhase) -> Result<String> {
         self.publish_fields(
             self.kill_query_at_phase_path(phase),
-            self.be_count,
-            "phase",
-            phase.as_str(),
-        )
-    }
-
-    fn publish_fe_crash_at_phase(&self, phase: QueryLifecyclePhase) -> Result<String> {
-        self.publish_fields(
-            self.fe_crash_at_phase_path(phase),
             self.be_count,
             "phase",
             phase.as_str(),
@@ -3856,20 +3825,6 @@ impl ServerHandle for CrossProcessServerHandle {
         Ok(())
     }
 
-    fn arm_fe_crash_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_fe_crash_at_phase(phase)?;
-        println!(
-            "armed FE crash at lifecycle phase={} token={token} trigger={}",
-            phase.as_str(),
-            self.query_lifecycle_fault_files
-                .fe_crash_at_phase_path(phase)
-                .display()
-        );
-        Ok(())
-    }
-
     fn arm_mv_known_committed_before_projector_cas(&mut self) -> Result<()> {
         let token = self
             .query_lifecycle_fault_files
@@ -3930,22 +3885,13 @@ impl ServerHandle for CrossProcessServerHandle {
         Ok(())
     }
 
-    fn release_query_lifecycle_phase_fault(
-        &mut self,
-        phase: QueryLifecyclePhase,
-        fe_crash: bool,
-    ) -> Result<()> {
-        let path = if fe_crash {
-            self.query_lifecycle_fault_files
-                .fe_crash_at_phase_path(phase)
-        } else {
-            self.query_lifecycle_fault_files
-                .kill_query_at_phase_path(phase)
-        };
+    fn release_query_lifecycle_phase_fault(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        let path = self
+            .query_lifecycle_fault_files
+            .kill_query_at_phase_path(phase);
         remove_fragment_failure_file(&path).with_context(|| {
             format!(
-                "release {} lifecycle phase fault {}",
-                if fe_crash { "FE crash" } else { "KILL QUERY" },
+                "release KILL QUERY lifecycle phase fault {}",
                 phase.as_str()
             )
         })
@@ -3976,25 +3922,6 @@ impl ServerHandle for CrossProcessServerHandle {
                 .display()
         );
         Ok(())
-    }
-
-    fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
-        self.ensure_be_index(index)?;
-        let grpc_port = self.be_grpc_ports[index];
-        let rows = query_frontend_backend_topology(
-            &self.mysql_user,
-            &self.target_host,
-            self.target_port,
-            TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
-        )?;
-        rows.into_iter()
-            .find(|row| row.grpc_port == grpc_port && row.is_eligible_live())
-            .map(|row| row.scheduled_fragments)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
-                )
-            })
     }
 
     fn backend_process_id(&self, index: usize) -> Result<novarocks_types::BackendProcessId> {
@@ -4096,11 +4023,6 @@ impl ServerHandle for CrossProcessServerHandle {
         })?;
         self.fragment_failure_tokens[index] = None;
         Ok(())
-    }
-
-    fn armed_fragment_failure_token(&self, index: usize) -> Result<Option<String>> {
-        self.ensure_be_index(index)?;
-        Ok(self.fragment_failure_tokens[index].clone())
     }
 
     fn assert_be_log(&self, index: usize, needle: &str) -> Result<()> {

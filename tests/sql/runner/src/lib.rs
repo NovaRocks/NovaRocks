@@ -1615,7 +1615,6 @@ fn execute_target_query_with_fault(
     });
     if meta.kill_fe_after_control_ready_count.is_some()
         || meta.kill_fe_after_mv_known_committed_before_projector_cas
-        || meta.kill_fe_at_lifecycle_phase.is_some()
         || meta.kill_fe_after_be_log_contains.is_some()
     {
         if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -2309,10 +2308,6 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 break;
             }
         }
-        let _fragment_failure_guard = fault_injection::fragment_failure_step_guard(
-            &step.meta,
-            Arc::clone(&ctx.server_handle),
-        );
         let _query_lifecycle_fault_guard = fault_injection::query_lifecycle_fault_step_guard(
             &step.meta,
             Arc::clone(&ctx.server_handle),
@@ -3764,7 +3759,6 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "stop_query_control_heartbeat_be_index",
         "kill_fe_after_control_ready_count",
         "kill_fe_after_mv_known_committed_before_projector_cas",
-        "restart_be_after_init_ack_index",
         "restart_be_after_establish_context_index",
         "kill_query_after_control_ready_count",
         "kill_query_after_be_log_contains",
@@ -3789,12 +3783,10 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "expect_runtime_filter_detail",
         "expect_runtime_filter_total_at_least",
         "kill_query_at_lifecycle_phase",
-        "kill_fe_at_lifecycle_phase",
         "kill_be_at_lifecycle_phase",
         "stop_query_control_heartbeat_after_stage_be_index",
         "hold_start_until_early_ingress",
         "query_control_fragment_backend_limit",
-        "fail_fragment_after_start_be_index",
     ];
     const LIFECYCLE_EVIDENCE_MARKERS: &[&str] = &[
         "NOVAROCKS_QUERY_INIT_",
@@ -5097,7 +5089,7 @@ mod tests {
             "-- @hold_start_until_early_ingress=true\nSELECT 1;"
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @fail_fragment_after_start_be_index=1\nSELECT 1;"
+            "-- @restart_be_after_establish_context_index=1\nSELECT 1;"
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3\nSELECT 1;"
