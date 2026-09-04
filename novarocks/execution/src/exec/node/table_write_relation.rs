@@ -44,6 +44,38 @@ use novarocks_types::SlotId;
 
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 
+/// Exact ordinary-aggregate boundary inside the composite write dataflow.
+///
+/// The enum is deliberately provider-neutral: it names only execution work,
+/// while the application-owned guard decides whether a query-scoped test fault
+/// rejects that work. A guard may reject; it cannot manufacture a partial or
+/// final value and therefore cannot become a data fallback.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableWriteAggregateBoundary {
+    PartialUpdate,
+    PartialFinalize,
+    FinalMerge,
+    FinalFinalize,
+}
+
+/// Application-supplied rejection guard for composite-write aggregate work.
+#[cfg(debug_assertions)]
+pub trait TableWriteAggregateGuard: Send + Sync {
+    fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError>;
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Default)]
+pub struct AllowTableWriteAggregates;
+
+#[cfg(debug_assertions)]
+impl TableWriteAggregateGuard for AllowTableWriteAggregates {
+    fn check(&self, _boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
 /// Slot id of the `kind` column in both write relations.
 ///
 /// These are the ids the write contract reserves, not a fresh tuple layout:

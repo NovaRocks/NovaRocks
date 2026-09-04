@@ -60,6 +60,9 @@ impl BackendMetricsRegistry {
         novarocks_execution::runtime::fragment::io::exchange_metrics::register_exchange_metrics(
             &registry,
         )?;
+        novarocks_execution::runtime::table_writer_metrics::register_table_writer_metrics(
+            &registry,
+        )?;
         Ok(Self { registry })
     }
 
@@ -267,6 +270,9 @@ static BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("construct novarocks_backend_connector_write_root_prepared_set_peak")
 });
 
+static BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+static BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
 static BACKEND_NATIVE_AUTHENTICATION_FAILURES: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
     prometheus::IntCounterVec::new(
         Opts::new(
@@ -315,12 +321,27 @@ pub(crate) fn record_connector_write_writer_finished(rows: u64, fragments: u64) 
 /// gauge keeps the process-wide high-water mark, so a later, smaller write
 /// never erases the peak an operator needs in order to size the budgets.
 pub(crate) fn publish_connector_write_root_prepared_set_peak(bytes: u64, entries: u64) {
-    for (dimension, value) in [("bytes", bytes), ("entries", entries)] {
+    for (dimension, value, peak) in [
+        ("bytes", bytes, &BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK_BYTES),
+        (
+            "entries",
+            entries,
+            &BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK_ENTRIES,
+        ),
+    ] {
         let gauge = BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK.with_label_values(&[dimension]);
-        let observed = i64::try_from(value).unwrap_or(i64::MAX);
-        if observed > gauge.get() {
-            gauge.set(observed);
-        }
+        publish_monotonic_peak(peak, &gauge, value);
+    }
+}
+
+fn publish_monotonic_peak(peak: &AtomicU64, gauge: &prometheus::IntGauge, value: u64) {
+    let value = value.min(i64::MAX as u64);
+    let previous = peak.fetch_max(value, Ordering::AcqRel);
+    if value > previous {
+        // Every successful maximum advance contributes only its delta. Gauge
+        // addition is atomic, so concurrent advances telescope to the largest
+        // observed value regardless of the order in which the winners publish.
+        gauge.add((value - previous) as i64);
     }
 }
 
@@ -607,6 +628,8 @@ fn ensure_backend_metric_label_families() {
 }
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use prometheus::{IntGauge, Opts, Registry};
 
     use super::*;
@@ -646,5 +669,46 @@ mod tests {
         assert!(rendered.contains("novarocks_backend_query_lifecycle_entries"));
         assert!(rendered.contains("novarocks_exchange_shuffle_bytes_total"));
         assert!(!rendered.contains("novarocks_frontend_only_fixture"));
+    }
+
+    #[test]
+    fn prepared_set_peak_is_monotonic_under_concurrent_publication() {
+        let peak = Arc::new(AtomicU64::new(0));
+        let gauge = Arc::new(
+            IntGauge::with_opts(Opts::new(
+                "connector_write_root_peak_concurrency_fixture",
+                "Concurrent peak publication fixture.",
+            ))
+            .expect("construct peak fixture"),
+        );
+        publish_monotonic_peak(&peak, &gauge, 73);
+
+        let values = [72_u64, 1, 37, 1_024, 511, 73, 999, 8];
+        let start = Arc::new(Barrier::new(values.len() + 1));
+        let threads = values
+            .into_iter()
+            .map(|value| {
+                let peak = Arc::clone(&peak);
+                let gauge = Arc::clone(&gauge);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    publish_monotonic_peak(&peak, &gauge, value);
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for thread in threads {
+            thread.join().expect("peak publisher");
+        }
+
+        assert_eq!(peak.load(Ordering::Acquire), 1_024);
+        assert_eq!(gauge.get(), 1_024);
+        publish_monotonic_peak(&peak, &gauge, 2);
+        assert_eq!(
+            gauge.get(),
+            1_024,
+            "a late lower value must not erase the peak"
+        );
     }
 }

@@ -595,7 +595,7 @@ mod tests {
         let encoded = encode_physical_node(
             &physical,
             7,
-            &NativePlanEncodeContext {
+            &NativePlanEncodeContext::<super::super::scan_facts::NoScanFacts> {
                 scan_facts: None,
                 node_outputs: None,
                 fragment_edge_outputs: None,

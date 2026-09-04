@@ -293,12 +293,13 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
             )
         })?;
         let sql_columns = sql_visible_columns(&metadata.schema);
-        let requested_metric_count = 1usize.saturating_add(sql_columns.len().saturating_mul(5));
-        if requested_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
+        let requested_column_metric_count = sql_columns.len().saturating_mul(5);
+        if requested_column_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
             return Err(StatisticsApplicationError::new(format!(
-                "SHOW TABLE STATS requires {requested_metric_count} metrics, exceeding the connector statistics limit of {MAX_CONNECTOR_STATISTICS_METRICS}",
+                "SHOW TABLE STATS requires {requested_column_metric_count} column metrics, exceeding the connector statistics limit of {MAX_CONNECTOR_STATISTICS_METRICS}",
             )));
         }
+        let requested_metric_count = 1usize.saturating_add(requested_column_metric_count);
         let mut metrics = Vec::with_capacity(requested_metric_count);
         metrics.push(StatisticsMetric::RowCount);
         for column in sql_columns {

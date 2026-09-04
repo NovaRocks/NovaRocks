@@ -48,6 +48,10 @@ use prost::Message;
 use novarocks_execution::exec::node::table_write_relation::{
     ConnectorCommitFragmentCarrierValidator, ConnectorCommitFragmentEncoder,
 };
+#[cfg(debug_assertions)]
+use novarocks_execution::exec::node::table_write_relation::{
+    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+};
 use novarocks_proto_codec::connector_write::{
     ConnectorWriteFragmentEncoder, ValidatedCommitFragment,
 };
@@ -197,6 +201,56 @@ impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValida
             "root aggregation accepted a commit fragment carrier"
         );
         Ok(())
+    }
+}
+
+/// Query-scoped rejection guard installed on both halves of the composite
+/// write aggregate. The backend owns binding a runner token to an exact native
+/// attempt; Execution sees only a typed boundary and can neither inspect the
+/// token protocol nor fabricate replacement aggregate data.
+#[cfg(debug_assertions)]
+pub(crate) struct QueryScopedTableWriteAggregateGuard {
+    execution_id: QueryExecutionId,
+    node_id: i32,
+}
+
+#[cfg(debug_assertions)]
+impl QueryScopedTableWriteAggregateGuard {
+    pub(crate) const fn new(execution_id: QueryExecutionId, node_id: i32) -> Self {
+        Self {
+            execution_id,
+            node_id,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl TableWriteAggregateGuard for QueryScopedTableWriteAggregateGuard {
+    fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
+        let kind = match boundary {
+            TableWriteAggregateBoundary::PartialUpdate => {
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWritePartialUpdateFailure
+            }
+            TableWriteAggregateBoundary::PartialFinalize => {
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWritePartialFinalizeFailure
+            }
+            TableWriteAggregateBoundary::FinalMerge => {
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteFinalMergeFailure
+            }
+            TableWriteAggregateBoundary::FinalFinalize => {
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteFinalFinalizeFailure
+            }
+        };
+        claim_write_fault(self.execution_id, kind).map_or(Ok(()), |token| {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!(
+                    "injected connector write {} on node_id={} (token={token})",
+                    kind.file_stem(),
+                    self.node_id
+                ),
+            ))
+        })
     }
 }
 

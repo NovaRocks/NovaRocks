@@ -107,6 +107,7 @@ impl PublicationAction {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PublicationFault {
     BeforeDispatch,
+    BeforeDispatchHoldForConcurrentShell,
     AfterCommitBeforeResponse,
     AfterCommitHoldForFrontendKill,
     IncompleteDiscovery,
@@ -117,6 +118,9 @@ impl PublicationFault {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::BeforeDispatch => "before-dispatch",
+            Self::BeforeDispatchHoldForConcurrentShell => {
+                "before-dispatch-hold-for-concurrent-shell"
+            }
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
             Self::IncompleteDiscovery => "incomplete-discovery",
@@ -268,7 +272,7 @@ impl FixtureControl {
             }
             if Instant::now() >= deadline {
                 anyhow::bail!(
-                    "timed out waiting for publication catalog fault {arm_id} to reach the downstream-successful hold"
+                    "timed out waiting for publication catalog fault {arm_id} to reach its hold"
                 );
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -289,6 +293,9 @@ fn parse_action(value: &str) -> Result<PublicationAction> {
 fn parse_fault(value: &str) -> Result<PublicationFault> {
     match value {
         "before-dispatch" => Ok(PublicationFault::BeforeDispatch),
+        "before-dispatch-hold-for-concurrent-shell" => {
+            Ok(PublicationFault::BeforeDispatchHoldForConcurrentShell)
+        }
         "after-commit-before-response" => Ok(PublicationFault::AfterCommitBeforeResponse),
         "after-commit-hold-for-frontend-kill" => {
             Ok(PublicationFault::AfterCommitHoldForFrontendKill)
@@ -453,6 +460,11 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
         // ambiguity; no private catalog protocol participates.
         return known_not_dispatched("publication REST request rejected before dispatch");
     }
+    if let Some(armed) = fault.as_ref()
+        && armed.fault == PublicationFault::BeforeDispatchHoldForConcurrentShell
+    {
+        armed.release.notified().await;
+    }
     let response = proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
     if let Some(armed) = fault
         && response.status().is_success()
@@ -481,6 +493,7 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
                 );
             }
             PublicationFault::BeforeDispatch => unreachable!("returned before dispatch"),
+            PublicationFault::BeforeDispatchHoldForConcurrentShell => {}
         }
     }
     response
@@ -526,7 +539,10 @@ fn take_matching_fault(
     if armed.action != action {
         return None;
     }
-    let armed = armed.clone();
+    // Consume the arm before the request is dispatched. In particular, a
+    // definite OCC conflict may cause the product to issue one fresh attempt;
+    // that second standard request must not re-enter this one-shot hold.
+    let armed = next.armed.take().expect("matching arm exists");
     next.status = Some(ConsumedNextFault {
         arm_id: armed.arm_id.clone(),
         entered: true,
@@ -672,5 +688,6 @@ mod tests {
             .expect("matching fault is consumed");
         assert_eq!(consumed.arm_id, "one");
         assert_eq!(consumed.fault, PublicationFault::AfterCommitBeforeResponse);
+        assert!(take_matching_fault(&state, PublicationAction::TableCommit).is_none());
     }
 }

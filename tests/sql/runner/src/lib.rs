@@ -1673,6 +1673,111 @@ struct InflightPublicationFrontendKill<'a> {
     log: &'a mut String,
 }
 
+struct InflightPublicationConcurrentShell<'a> {
+    meta: &'a QueryMeta,
+    server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
+    session_config: ConnectionConfig,
+    query_timeout: u64,
+    sql: String,
+    db: Option<String>,
+    fault_guard: &'a mut publication_catalog::FixtureFaultGuard,
+    fault_deadline: Option<Instant>,
+    shell: &'a str,
+    log: &'a mut String,
+}
+
+fn execute_target_query_with_inflight_publication_concurrent_shell(
+    request: InflightPublicationConcurrentShell<'_>,
+) -> (bool, Option<QueryExecution>, String) {
+    let InflightPublicationConcurrentShell {
+        meta,
+        server_handle,
+        session_config,
+        query_timeout,
+        sql,
+        db,
+        fault_guard,
+        fault_deadline,
+        shell,
+        log,
+    } = request;
+    let deadline = fault_deadline
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(query_timeout.saturating_add(10)));
+    let thread_meta = meta.clone();
+    let thread_server = Arc::clone(server_handle);
+    let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
+    let query_thread = std::thread::spawn(move || match MysqlSession::new(&session_config) {
+        Ok(mut session) => execute_target_query_with_fault(
+            &thread_meta,
+            &thread_server,
+            &mut session,
+            query_timeout,
+            &sql,
+            db.as_deref(),
+            Some(deadline),
+        ),
+        Err(error) => (
+            false,
+            None,
+            format!("FAIL (runner publication hold): open query session: {error:#}"),
+        ),
+    });
+
+    if let Err(error) = fault_guard.wait_until_entered(deadline) {
+        if fault_guard.release().is_ok() {
+            let _ = query_thread.join();
+        }
+        return (
+            false,
+            None,
+            fault_timeout_diagnostics(
+                server_handle,
+                &format!("publication before-dispatch hold was not observed: {error:#}"),
+            ),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_catalog_fault before-dispatch hold reached"
+    );
+
+    let (companion_ok, _, companion_error) =
+        shell::execute_shell_step(&format!("shell: {shell}"));
+    if !companion_ok {
+        if fault_guard.release().is_ok() {
+            let _ = query_thread.join();
+        }
+        return (
+            false,
+            None,
+            format!("FAIL (runner concurrent publication shell): {companion_error}"),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_catalog_concurrent_shell completed before release"
+    );
+    if let Err(error) = fault_guard.release() {
+        // A failed control request may leave the primary REST call held. Do
+        // not join that thread; step cleanup drops the guard and retries the
+        // release before cluster teardown.
+        drop(query_thread);
+        return (
+            false,
+            None,
+            format!("FAIL (runner publication hold): release before-dispatch hold: {error:#}"),
+        );
+    }
+    match query_thread.join() {
+        Ok(result) => result,
+        Err(_) => (
+            false,
+            None,
+            "FAIL (runner publication hold): query thread panicked".to_string(),
+        ),
+    }
+}
+
 fn execute_target_query_with_inflight_publication_frontend_kill(
     request: InflightPublicationFrontendKill<'_>,
 ) -> (bool, Option<QueryExecution>, String) {
@@ -2419,6 +2524,33 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
                         shell::execute_shell_step(&step.sql)
+                    } else if step
+                        .meta
+                        .publication_catalog_fault
+                        .is_some_and(|directive| directive.fault.requires_concurrent_shell())
+                    {
+                        let Some(fault_guard) = publication_catalog_fault_guard.as_mut() else {
+                            unreachable!("concurrent shell requires an armed fixture guard");
+                        };
+                        let Some(concurrent_shell) =
+                            step.meta.publication_catalog_concurrent_shell.as_deref()
+                        else {
+                            unreachable!("validated concurrent shell directive is missing");
+                        };
+                        execute_target_query_with_inflight_publication_concurrent_shell(
+                            InflightPublicationConcurrentShell {
+                                meta: &step.meta,
+                                server_handle: &ctx.server_handle,
+                                session_config: case_target_conn.clone(),
+                                query_timeout: ctx.query_timeout,
+                                sql: step.sql.clone(),
+                                db: step.meta.db.clone(),
+                                fault_guard,
+                                fault_deadline: be_log_snapshot.evidence_deadline(),
+                                shell: concurrent_shell,
+                                log: &mut log,
+                            },
+                        )
                     } else if step
                         .meta
                         .publication_catalog_fault
@@ -3928,10 +4060,13 @@ fn validate_publication_catalog_directives(
     cases: &[SqlCase],
     fixture_available: bool,
     cluster_mode: ClusterMode,
+    mode: Mode,
 ) -> Result<()> {
     for case in cases {
         for step in &case.steps {
-            if step.meta.publication_catalog_fault.is_none() {
+            if step.meta.publication_catalog_fault.is_none()
+                && step.meta.publication_catalog_concurrent_shell.is_none()
+            {
                 continue;
             }
             if !matches!(suite_name, "lake-publication" | "lnp-3d-mv-accelerator") {
@@ -3949,6 +4084,21 @@ fn validate_publication_catalog_directives(
             if !fixture_available {
                 bail!(
                     "@publication_catalog_fault requires the runner-owned publication catalog fixture"
+                );
+            }
+            let requires_concurrent_shell = step
+                .meta
+                .publication_catalog_fault
+                .is_some_and(|directive| directive.fault.requires_concurrent_shell());
+            if requires_concurrent_shell != step.meta.publication_catalog_concurrent_shell.is_some()
+            {
+                bail!(
+                    "@publication_catalog_concurrent_shell must appear exactly with @publication_catalog_fault=table-commit,before-dispatch-hold-for-concurrent-shell"
+                );
+            }
+            if requires_concurrent_shell && mode != Mode::Verify {
+                bail!(
+                    "@publication_catalog_concurrent_shell is acceptance-only and requires --mode verify"
                 );
             }
             if step
@@ -4599,6 +4749,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 &cases,
                 publication_catalog_control.is_some(),
                 selected_cluster_mode,
+                cli.mode,
             ) {
                 println!("❌ ERROR: suite {}: {error}", suite.name);
                 return Ok(1);

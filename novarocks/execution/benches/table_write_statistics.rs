@@ -86,6 +86,7 @@ const THETA_PARTIAL_SLOT: SlotId = SlotId::new(10_000);
 const THETA_FINAL_SLOT: SlotId = SlotId::new(10_001);
 const GROUPING_OUTPUT_SLOT: SlotId = SlotId::new(10_002);
 const POLL_TIMEOUT: Duration = Duration::from_secs(60);
+const BENCHMARK_SCHEMA_VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug)]
 enum AuxiliaryCase {
@@ -308,7 +309,7 @@ fn run() -> Result<(), String> {
 
     emit(json!({
         "record": "config",
-        "schema_version": 1,
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
         "package_version": env!("CARGO_PKG_VERSION"),
         "rows": config.rows,
         "batch_rows": config.batch_rows,
@@ -632,7 +633,7 @@ fn run_once(
     Ok(RunResult {
         value: json!({
             "record": "sample",
-            "schema_version": 1,
+            "schema_version": BENCHMARK_SCHEMA_VERSION,
             "case": case.name(),
             "phase": phase,
             "iteration": iteration,
@@ -646,13 +647,21 @@ fn run_once(
             "driver_finish_blocked_polls": driver_finish_blocked_polls,
             "writer_queue_blocked_checks": counter(&writer_profiles, "WriterQueueBlockedChecks"),
             "composite_writer_blocked_checks": counter(&writer_profiles, "CompositeWriterBlockedChecks"),
+            "writer_queue_blocked_intervals": counter(&writer_profiles, "WriterQueueBlockedIntervals"),
+            "writer_queue_blocked_time_ns": counter(&writer_profiles, "WriterQueueBlockedTime"),
+            "composite_writer_blocked_intervals": counter(&writer_profiles, "CompositeWriterBlockedIntervals"),
+            "composite_writer_blocked_time_ns": counter(&writer_profiles, "CompositeWriterBlockedTime"),
             "writer_queue_peak_batches": counter(&writer_profiles, "WriterQueuePeakBatches"),
             "writer_queue_peak_rows": counter(&writer_profiles, "WriterQueuePeakRows"),
             "writer_queue_peak_bytes": counter(&writer_profiles, "WriterQueuePeakBytes"),
             "writer_partial_rows": counter(&writer_profiles, "WriterPartialRows"),
             "writer_partial_bytes": counter(&writer_profiles, "WriterPartialBytes"),
             "writer_partial_aggregate_peak_bytes": counter(&writer_profiles, "WriterPartialAggregatePeakBytes"),
-            "final_aggregate_blocked_count": counter(&finish_profiles, "FinalAggregateBlockedCount"),
+            "final_aggregate_blocked_intervals": counter(
+                &finish_profiles,
+                "FinalAggregateBlockedCount",
+            ),
+            "final_aggregate_blocked_time_ns": counter(&finish_profiles, "FinalAggregateBlockedTime"),
             "final_aggregate_cpu_time_ns": counter(&finish_profiles, "FinalAggregateCpuTime"),
             "writer_multiplex_rows": counter(&finish_profiles, "WriterMultiplexRows"),
             "writer_multiplex_bytes": counter(&finish_profiles, "WriterMultiplexBytes"),
@@ -975,7 +984,7 @@ fn summarize(case: AuxiliaryCase, samples: &[Value]) -> Result<Value, String> {
     peak.sort_unstable();
     Ok(json!({
         "record": "summary",
-        "schema_version": 1,
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
         "case": case.name(),
         "measurement_rounds": selected.len(),
         "median_throughput_rows_per_second": throughputs[throughputs.len() / 2],

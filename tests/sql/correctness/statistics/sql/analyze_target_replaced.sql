@@ -30,7 +30,7 @@ CREATE DATABASE IF NOT EXISTS statistics_cat_${suite_uuid0}.nr_replaced_${suite_
 -- @skip_result_check=true
 CREATE TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} (
     k BIGINT NOT NULL
-);
+) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
 
 -- query 3
 -- @skip_result_check=true
@@ -49,7 +49,7 @@ DROP TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${
 -- @skip_result_check=true
 CREATE TABLE statistics_cat_${suite_uuid0}.nr_replaced_${suite_uuid0}.same_name_${uuid0} (
     k BIGINT NOT NULL
-);
+) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
 
 -- query 7
 -- @skip_result_check=true

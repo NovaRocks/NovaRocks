@@ -143,7 +143,11 @@ impl WriteCommitBarrier {
             None | Some(WriteVerdict::AttemptFailed) => {
                 return Err(WriteCommitBlocked::ExecutionDidNotSucceed);
             }
-            Some(verdict) if !verdict.is_complete() => {
+            Some(
+                WriteVerdict::TaskNotFinished { .. }
+                | WriteVerdict::WriterCanceled(_)
+                | WriteVerdict::UndeclaredWriter(_),
+            ) => {
                 return Err(WriteCommitBlocked::TaskExecutionIncomplete);
             }
             Some(WriteVerdict::Complete) => {}
@@ -159,6 +163,15 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone, Copy, Debug)]
+    enum CompletionFact {
+        PreparedWriteSet,
+        ExecutionAllSuccess,
+        TaskFailure,
+        Cancelled,
+        DeadlineExpired,
+    }
+
     fn complete_set() -> DecodedPreparedWriteSet {
         DecodedPreparedWriteSet::for_test(
             7,
@@ -169,36 +182,78 @@ mod tests {
         )
     }
 
+    fn permutations(facts: &[CompletionFact]) -> Vec<Vec<CompletionFact>> {
+        if facts.is_empty() {
+            return vec![Vec::new()];
+        }
+        let mut result = Vec::new();
+        for index in 0..facts.len() {
+            let mut remaining = facts.to_vec();
+            let fact = remaining.remove(index);
+            for mut suffix in permutations(&remaining) {
+                let mut permutation = Vec::with_capacity(facts.len());
+                permutation.push(fact);
+                permutation.append(&mut suffix);
+                result.push(permutation);
+            }
+        }
+        result
+    }
+
+    fn observe(barrier: &mut WriteCommitBarrier, fact: CompletionFact) {
+        match fact {
+            CompletionFact::PreparedWriteSet => {
+                // Production can construct this value only after the Root
+                // decoder proved exact row membership and observed EOF.
+                barrier.observe_prepared_write_set(complete_set());
+            }
+            CompletionFact::ExecutionAllSuccess => {
+                barrier.observe_execution_terminals(true);
+            }
+            CompletionFact::TaskFailure => barrier.observe_execution_terminals(false),
+            CompletionFact::Cancelled => barrier.observe_cancelled(),
+            CompletionFact::DeadlineExpired => barrier.observe_deadline_expired(),
+        }
+    }
+
+    fn run(facts: &[CompletionFact]) -> Result<DecodedPreparedWriteSet, WriteCommitBlocked> {
+        let mut barrier = WriteCommitBarrier::new();
+        for fact in facts {
+            observe(&mut barrier, *fact);
+        }
+        barrier.into_committable()
+    }
+
     #[test]
     fn both_facts_together_open_the_gate_in_either_arrival_order() {
-        let mut barrier = WriteCommitBarrier::new();
-        barrier.observe_prepared_write_set(complete_set());
-        barrier.observe_execution_terminals(true);
-        assert_eq!(
-            barrier.into_committable().expect("committable").row_count(),
-            7
-        );
-
-        let mut barrier = WriteCommitBarrier::new();
-        barrier.observe_execution_terminals(true);
-        barrier.observe_prepared_write_set(complete_set());
-        assert_eq!(
-            barrier.into_committable().expect("committable").row_count(),
-            7
-        );
+        let facts = [
+            CompletionFact::PreparedWriteSet,
+            CompletionFact::ExecutionAllSuccess,
+        ];
+        for order in permutations(&facts) {
+            assert_eq!(
+                run(&order).expect("committable").row_count(),
+                7,
+                "{order:?}"
+            );
+        }
     }
 
     #[test]
     fn a_complete_set_does_not_stand_in_for_a_successful_execution() {
         // The data plane closed, but some other participant failed. Committing
         // here would publish a snapshot for a query that did not succeed.
-        let mut barrier = WriteCommitBarrier::new();
-        barrier.observe_prepared_write_set(complete_set());
-        barrier.observe_execution_terminals(false);
-        assert_eq!(
-            barrier.into_committable().expect_err("must not commit"),
-            WriteCommitBlocked::ExecutionDidNotSucceed
-        );
+        let facts = [
+            CompletionFact::PreparedWriteSet,
+            CompletionFact::TaskFailure,
+        ];
+        for order in permutations(&facts) {
+            assert_eq!(
+                run(&order).expect_err("must not commit"),
+                WriteCommitBlocked::ExecutionDidNotSucceed,
+                "{order:?}"
+            );
+        }
     }
 
     #[test]
@@ -216,14 +271,18 @@ mod tests {
 
     #[test]
     fn cancellation_vetoes_a_write_that_otherwise_had_both_facts() {
-        let mut barrier = WriteCommitBarrier::new();
-        barrier.observe_prepared_write_set(complete_set());
-        barrier.observe_execution_terminals(true);
-        barrier.observe_cancelled();
-        assert_eq!(
-            barrier.into_committable().expect_err("must not commit"),
-            WriteCommitBlocked::Cancelled
-        );
+        let facts = [
+            CompletionFact::PreparedWriteSet,
+            CompletionFact::ExecutionAllSuccess,
+            CompletionFact::Cancelled,
+        ];
+        for order in permutations(&facts) {
+            assert_eq!(
+                run(&order).expect_err("must not commit"),
+                WriteCommitBlocked::Cancelled,
+                "{order:?}"
+            );
+        }
     }
 
     #[test]
@@ -278,14 +337,18 @@ mod tests {
 
     #[test]
     fn deadline_vetoes_a_write_that_otherwise_had_both_facts() {
-        let mut barrier = WriteCommitBarrier::new();
-        barrier.observe_prepared_write_set(complete_set());
-        barrier.observe_task_execution(WriteVerdict::Complete);
-        barrier.observe_deadline_expired();
-        assert_eq!(
-            barrier.into_committable().expect_err("must not commit"),
-            WriteCommitBlocked::DeadlineExpired
-        );
+        let facts = [
+            CompletionFact::PreparedWriteSet,
+            CompletionFact::ExecutionAllSuccess,
+            CompletionFact::DeadlineExpired,
+        ];
+        for order in permutations(&facts) {
+            assert_eq!(
+                run(&order).expect_err("must not commit"),
+                WriteCommitBlocked::DeadlineExpired,
+                "{order:?}"
+            );
+        }
     }
 
     #[test]

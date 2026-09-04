@@ -48,3 +48,39 @@ are byte-for-byte source-identical between Trino tag 483 and the NovaRocks revie
 
 If JDK 25 is absent, this command fails before compiling with an explicit prerequisite error. A
 Java 21 run, or the Java 6.2.0 oracle above, must not be reported as Trino evidence.
+
+## Trino 483 Iceberg REST/Puffin reader
+
+`trino/verify_rest_catalog.sh` runs the released Trino 483 server and its production Iceberg REST
+connector in a transient Docker container. It does not use a host JDK, publish a host port, or add
+a service to the shared Compose project. The container joins the existing Iceberg REST/MinIO
+network, mounts the checked-in configuration read-only, and is removed on every success or error
+path. The image reference must carry the frozen Trino 483 multi-platform manifest digest
+`sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534`.
+
+The strongest product path is the native `statistics/trino_rest_puffin_show_stats.sql` regression:
+Trino creates an Iceberg v3 table, writes `{1,2}`, and publishes its parent Puffin with `ANALYZE`;
+NovaRocks enables collect-on-write and appends `{2,3}`; then a new Trino process reads the current
+snapshot and requires the `id` row from `SHOW STATS` to contain the numeric unioned NDV `3.0`.
+It also reads the data source and current snapshot, requiring four physical rows, three distinct
+ids, and range `1..3`.
+
+Run it against the canonical REST fixture and native `1FE+3BE` topology:
+
+```shell
+docker/iceberg-rest/up.sh
+source docker/iceberg-rest/runtime/current/env.sh
+export NOVA_TRINO_IMAGE='trinodb/trino@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534'
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
+  --suite statistics \
+  --only trino_rest_puffin_show_stats \
+  --mode verify \
+  --cluster-mode cross-process \
+  --cluster-size 3 \
+  --query-timeout 300 \
+  --fail-fast -j 1
+```
+
+`NOVA_TRINO_IMAGE` may use a registry mirror when Docker Hub is unavailable, but it must retain
+the exact digest above. Omitting it uses the official `trinodb/trino` repository at that digest.

@@ -80,5 +80,77 @@ SELECT COUNT(*) AS n
   FROM lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success;
 
 -- query 8
+-- Seed a current-snapshot parent sketch. The held append below freezes this
+-- snapshot and its ordinary aggregate result before the cross-engine DELETE
+-- advances the table.
+-- @skip_result_check=true
+CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation (
+  id BIGINT,
+  k BIGINT
+)
+TBLPROPERTIES (
+  "format-version" = "3",
+  "write.row-lineage" = "true",
+  "novarocks.statistics.collect-on-write" = "true"
+);
+INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation VALUES
+  (1, 10), (2, 20);
+
+-- query 9
+-- The proxy stops this commit before dispatch. Spark then commits DELETE(1)
+-- directly through the real REST catalog. Releasing the request forces Nova
+-- to observe an actual OCC conflict and build a fresh eager attempt from the
+-- mutation snapshot while reusing its already-written file and sketch body.
+-- @publication_catalog_fault=table-commit,before-dispatch-hold-for-concurrent-shell
+-- @publication_catalog_concurrent_shell=tmp_sql=$(mktemp "${TMPDIR:-/tmp}/novarocks-concurrent-mutation-XXXXXX.sql"); trap 'rm -f "$tmp_sql"' EXIT; printf '%s\n' "DELETE FROM ice_rest.ns_${uuid0}.concurrent_append_mutation WHERE id = 1;" > "$tmp_sql"; "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
+-- @skip_result_check=true
+INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation VALUES
+  (3, 30);
+
+-- query 10
+-- Both external mutations are visible exactly once. In particular, a fresh
+-- attempt must not replay the data file or resurrect the deleted row.
+SELECT id, k
+FROM lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation
+ORDER BY id;
+
+-- query 11
+-- The current snapshot is the append rebased on top of Spark's DELETE. The
+-- mutation invalidates the original incremental parent: the fresh attempt must
+-- not relabel that sketch as current-snapshot evidence. The original ancestor
+-- statistics remain readable with their original basis.
+-- @result_contains=CONCURRENT_APPEND_MUTATION_OK
+shell: set -eu
+tmp_scala="$(mktemp "${TMPDIR:-/tmp}/novarocks-concurrent-append-mutation-XXXXXX.scala")"
+trap 'rm -f "$tmp_scala"' EXIT
+cat > "$tmp_scala" <<'SPARK_SCALA'
+import scala.jdk.CollectionConverters._
+import org.apache.iceberg.puffin.StandardBlobTypes
+import org.apache.iceberg.spark.Spark3Util
+
+val table = Spark3Util.loadIcebergTable(spark, "ice_rest.ns_${uuid0}.concurrent_append_mutation")
+val current = table.currentSnapshot()
+val parent = table.snapshot(current.parentId())
+require(current.operation() == "append", "current snapshot is not the rebased Nova append")
+require(parent.operation() == "overwrite", "Nova append did not rebase on the concurrent copy-on-write DELETE")
+require(table.snapshots().asScala.size == 3, "conflict created an extra committed snapshot")
+val statistics = table.statisticsFiles().asScala.toSeq
+require(statistics.forall(_.snapshotId() != current.snapshotId()), "mutation conflict produced false current-snapshot statistics")
+require(statistics.size == 1, "original ancestor StatisticsFile was not preserved exactly once")
+val measured = table.snapshot(statistics.head.snapshotId())
+val theta = statistics.head.blobMetadata().asScala
+  .filter(_.`type`() == StandardBlobTypes.APACHE_DATASKETCHES_THETA_V1)
+  .toSeq
+require(theta.size == 2, "ancestor StatisticsFile did not preserve both Theta fields")
+require(theta.forall(_.sourceSnapshotId() == measured.snapshotId()), "Theta blob lost its ancestor snapshot basis")
+require(theta.forall(_.sourceSnapshotSequenceNumber() == measured.sequenceNumber()), "Theta blob lost its ancestor sequence basis")
+require(theta.forall(_.properties().get("ndv") == "2"), "ancestor NDV was changed by the conflicting append")
+println("CONCURRENT_APPEND_MUTATION_OK")
+SPARK_SCALA
+spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)"
+printf '%s\n' "$spark_out"
+printf '%s\n' "$spark_out" | grep -F "CONCURRENT_APPEND_MUTATION_OK"
+
+-- query 12
 -- @skip_result_check=true
 DROP DATABASE lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;

@@ -41,6 +41,10 @@ use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::ExecNode;
 use crate::exec::node::table_write_aggregate::WriterPartialAggregatePlan;
 use crate::exec::node::table_write_relation::ConnectorCommitFragmentEncoder;
+#[cfg(debug_assertions)]
+use crate::exec::node::table_write_relation::{
+    AllowTableWriteAggregates, TableWriteAggregateGuard,
+};
 use novarocks_types::SlotId;
 
 /// The attempt-local facts every driver of one `TableWriter` shares.
@@ -225,6 +229,8 @@ pub struct TableWriterNode {
     fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
     writer_multiplex_schema: crate::exec::node::table_write_relation::WriterMultiplexRelationSchema,
     partial_aggregate_plan: WriterPartialAggregatePlan,
+    #[cfg(debug_assertions)]
+    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
 impl TableWriterNode {
@@ -303,7 +309,16 @@ impl TableWriterNode {
             fragment_encoder,
             writer_multiplex_schema,
             partial_aggregate_plan,
+            #[cfg(debug_assertions)]
+            aggregate_guard: Arc::new(AllowTableWriteAggregates),
         })
+    }
+
+    /// Bind the application-owned, query-scoped aggregate rejection guard.
+    #[cfg(debug_assertions)]
+    pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
+        self.aggregate_guard = guard;
+        self
     }
 
     pub const fn handle(&self) -> &ConnectorWriterHandle {
@@ -351,6 +366,11 @@ impl TableWriterNode {
 
     pub const fn partial_aggregate_plan(&self) -> &WriterPartialAggregatePlan {
         &self.partial_aggregate_plan
+    }
+
+    #[cfg(debug_assertions)]
+    pub const fn aggregate_guard(&self) -> &Arc<dyn TableWriteAggregateGuard> {
+        &self.aggregate_guard
     }
 }
 

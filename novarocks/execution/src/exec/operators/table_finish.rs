@@ -61,8 +61,13 @@ use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentCarrierValidator, RootWriteResultRelationSchema,
     WriterMultiplexRelationSchema,
 };
+#[cfg(debug_assertions)]
+use crate::exec::node::table_write_relation::{
+    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+};
 use crate::exec::node::unpivot::{UnpivotPassthroughColumn, UnpivotValueMapping};
 use crate::exec::operators::aggregate::AggregateProcessorFactory;
+use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 use crate::exec::operators::unpivot_processor::UnpivotProcessorFactory;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -79,6 +84,8 @@ pub struct TableFinishOperatorFactory {
     writer_schema: WriterMultiplexRelationSchema,
     root_schema: RootWriteResultRelationSchema,
     final_plan: WriterFinalAggregatePlan,
+    #[cfg(debug_assertions)]
+    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     arena: Arc<ExprArena>,
 }
 
@@ -98,6 +105,8 @@ impl TableFinishOperatorFactory {
             writer_schema: node.writer_multiplex_schema().clone(),
             root_schema: node.root_result_schema().clone(),
             final_plan: node.final_aggregate_plan().clone(),
+            #[cfg(debug_assertions)]
+            aggregate_guard: Arc::clone(node.aggregate_guard()),
             arena,
         }
     }
@@ -121,6 +130,8 @@ impl TableFinishOperatorFactory {
             writer_schema: self.writer_schema.clone(),
             root_schema: self.root_schema.clone(),
             final_plan: self.final_plan.clone(),
+            #[cfg(debug_assertions)]
+            aggregate_guard: Arc::clone(&self.aggregate_guard),
             channel_to_call: self
                 .writer_schema
                 .contract()
@@ -149,6 +160,7 @@ impl TableFinishOperatorFactory {
             output_tracker: None,
             profiles: None,
             runtime_error: None,
+            final_aggregate_blocked_time: BlockedDuration::default(),
         }
     }
 }
@@ -399,6 +411,8 @@ struct TableFinishOperator {
     writer_schema: WriterMultiplexRelationSchema,
     root_schema: RootWriteResultRelationSchema,
     final_plan: WriterFinalAggregatePlan,
+    #[cfg(debug_assertions)]
+    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     channel_to_call: Vec<Option<usize>>,
     arena: Arc<ExprArena>,
     parallelism_error: Option<String>,
@@ -416,6 +430,7 @@ struct TableFinishOperator {
     output_tracker: Option<Arc<MemTracker>>,
     profiles: Option<OperatorProfiles>,
     runtime_error: Option<Arc<RuntimeErrorState>>,
+    final_aggregate_blocked_time: BlockedDuration,
 }
 
 impl TableFinishOperator {
@@ -434,6 +449,8 @@ impl TableFinishOperator {
     fn fail<T>(&mut self, error: String) -> Result<T, String> {
         self.release_buffer();
         self.phase = FinishPhase::Failed;
+        self.finish_final_aggregate_blocked_interval();
+        self.sync_metrics();
         Err(error)
     }
 
@@ -699,6 +716,27 @@ impl TableFinishOperator {
                 .common
                 .counter_add_bytes("RootOutputBytes", output.logical_bytes() as i64);
         }
+    }
+
+    fn finish_final_aggregate_blocked_interval(&self) {
+        self.final_aggregate_blocked_time.observe(false);
+    }
+
+    fn sync_metrics(&self) {
+        let Some(profiles) = self.profiles.as_ref() else {
+            return;
+        };
+        profiles.common.counter_set_unit(
+            "FinalAggregateBlockedCount",
+            i64::try_from(self.final_aggregate_blocked_time.intervals()).unwrap_or(i64::MAX),
+        );
+        profiles.common.counter_set(
+            "FinalAggregateBlockedTime",
+            ProfileUnit::TimeNs,
+            crate::runtime::profile::clamp_u128_to_i64(
+                self.final_aggregate_blocked_time.elapsed_ns(),
+            ),
+        );
     }
 }
 
@@ -1120,10 +1158,8 @@ impl Operator for TableFinishOperator {
     }
 
     fn set_profiles(&mut self, profiles: OperatorProfiles) {
-        profiles
-            .common
-            .counter_add_unit("FinalAggregateBlockedCount", 0);
         self.profiles = Some(profiles);
+        self.sync_metrics();
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
@@ -1156,6 +1192,14 @@ impl Operator for TableFinishOperator {
     fn cancel(&mut self) {
         self.release_buffer();
         self.phase = FinishPhase::Failed;
+        self.finish_final_aggregate_blocked_interval();
+        self.sync_metrics();
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        self.finish_final_aggregate_blocked_interval();
+        self.sync_metrics();
+        Ok(())
     }
 
     fn on_driver_failure(&mut self) {
@@ -1163,15 +1207,30 @@ impl Operator for TableFinishOperator {
     }
 
     fn is_finished(&self) -> bool {
-        matches!(self.phase, FinishPhase::Failed | FinishPhase::Finished)
+        let finished = matches!(self.phase, FinishPhase::Failed | FinishPhase::Finished);
+        if finished {
+            self.finish_final_aggregate_blocked_interval();
+            self.sync_metrics();
+        }
+        finished
     }
 
     fn pending_finish(&self) -> bool {
-        matches!(self.phase, FinishPhase::Finalizing | FinishPhase::Producing)
+        let pending = matches!(self.phase, FinishPhase::Finalizing | FinishPhase::Producing)
             && self
                 .aggregate
                 .as_ref()
-                .is_some_and(|aggregate| aggregate.pending_finish())
+                .is_some_and(|aggregate| aggregate.pending_finish());
+        // PipelineDriver parks an EOS'd pipeline solely through this callback;
+        // it does not call `has_output` while an asynchronous final aggregate
+        // still reports pending finish. Observe that real scheduler boundary
+        // here, keeping repeated polls inside one continuous interval. Do not
+        // disturb a pre-EOS input-backpressure interval while still Consuming.
+        if self.phase != FinishPhase::Consuming {
+            self.final_aggregate_blocked_time
+                .observe(pending && self.runtime_error().is_none());
+        }
+        pending
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -1185,27 +1244,42 @@ impl Operator for TableFinishOperator {
 
 impl ProcessorOperator for TableFinishOperator {
     fn need_input(&self) -> bool {
-        self.phase == FinishPhase::Consuming
-            && self.runtime_error().is_none()
-            && self
-                .aggregate
-                .as_ref()
-                .and_then(|aggregate| aggregate.as_processor_ref())
-                .is_none_or(ProcessorOperator::need_input)
+        let aggregate_ready = self
+            .aggregate
+            .as_ref()
+            .and_then(|aggregate| aggregate.as_processor_ref())
+            .is_none_or(ProcessorOperator::need_input);
+        let consuming = self.phase == FinishPhase::Consuming && self.runtime_error().is_none();
+        if self.phase == FinishPhase::Consuming {
+            self.final_aggregate_blocked_time
+                .observe(consuming && !aggregate_ready);
+        } else {
+            self.finish_final_aggregate_blocked_interval();
+        }
+        consuming && aggregate_ready
     }
 
     /// Nothing is available before every sender reached EOS.
     fn has_output(&self) -> bool {
-        self.runtime_error().is_some()
-            || (self.phase == FinishPhase::Producing
-                && (self.prefix_output.is_some()
-                    || self.grouped_unpivot.is_some()
-                    || self.aggregate.as_ref().is_some_and(|aggregate| {
-                        aggregate.is_finished()
-                            || aggregate
-                                .as_processor_ref()
-                                .is_some_and(ProcessorOperator::has_output)
-                    })))
+        let aggregate_ready = self.aggregate.as_ref().is_some_and(|aggregate| {
+            aggregate.is_finished()
+                || aggregate
+                    .as_processor_ref()
+                    .is_some_and(ProcessorOperator::has_output)
+        });
+        let producing = self.phase == FinishPhase::Producing;
+        let other_output = self.prefix_output.is_some() || self.grouped_unpivot.is_some();
+        if producing {
+            self.final_aggregate_blocked_time.observe(
+                !other_output
+                    && self.aggregate.is_some()
+                    && !aggregate_ready
+                    && self.runtime_error().is_none(),
+            );
+        } else if self.phase != FinishPhase::Consuming {
+            self.finish_final_aggregate_blocked_interval();
+        }
+        self.runtime_error().is_some() || (producing && (other_output || aggregate_ready))
     }
 
     fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
@@ -1224,11 +1298,6 @@ impl ProcessorOperator for TableFinishOperator {
                 .expect("final aggregate processor")
                 .need_input()
         }) {
-            if let Some(profiles) = self.profiles.as_ref() {
-                profiles
-                    .common
-                    .counter_add_unit("FinalAggregateBlockedCount", 1);
-            }
             return self.fail(
                 "table finish received input while its final aggregate was not ready".to_string(),
             );
@@ -1256,6 +1325,13 @@ impl ProcessorOperator for TableFinishOperator {
         }
         if partial_rows.iter().any(|value| *value) {
             let filtered = self.filter_aggregate_rows(&chunk, &partial_rows)?;
+            #[cfg(debug_assertions)]
+            if let Err(error) = self
+                .aggregate_guard
+                .check(TableWriteAggregateBoundary::FinalMerge)
+            {
+                return self.fail(format!("table finish final aggregate merge: {error}"));
+            }
             let Some(aggregate) = self.aggregate.as_mut() else {
                 return self.fail(
                     "table finish aggregate partials arrived before aggregate binding".to_string(),
@@ -1266,11 +1342,6 @@ impl ProcessorOperator for TableFinishOperator {
                 .expect("final aggregate processor")
                 .need_input()
             {
-                if let Some(profiles) = self.profiles.as_ref() {
-                    profiles
-                        .common
-                        .counter_add_unit("FinalAggregateBlockedCount", 1);
-                }
                 return self.fail(
                     "table finish received input while its final aggregate was not ready"
                         .to_string(),
@@ -1307,6 +1378,7 @@ impl ProcessorOperator for TableFinishOperator {
             if let Some(prefix) = self.prefix_output.as_mut() {
                 match prefix.pull() {
                     Ok(Some(output)) => {
+                        self.finish_final_aggregate_blocked_interval();
                         self.record_output(&output);
                         return Ok(Some(output));
                     }
@@ -1321,6 +1393,7 @@ impl ProcessorOperator for TableFinishOperator {
             if let Some(unpivot) = self.grouped_unpivot.as_mut() {
                 match unpivot.pull(state) {
                     Ok(Some(output)) => {
+                        self.finish_final_aggregate_blocked_interval();
                         self.record_output(&output);
                         return Ok(Some(output));
                     }
@@ -1332,7 +1405,7 @@ impl ProcessorOperator for TableFinishOperator {
                 }
             }
 
-            let Some(aggregate) = self.aggregate.as_mut() else {
+            let Some(aggregate) = self.aggregate.as_ref() else {
                 self.aggregate_coverage.clear();
                 self.final_groups_seen.clear();
                 self.phase = FinishPhase::Finished;
@@ -1343,7 +1416,9 @@ impl ProcessorOperator for TableFinishOperator {
                 .expect("final aggregate processor")
                 .has_output();
             if has_output {
+                self.finish_final_aggregate_blocked_interval();
                 let started = Instant::now();
+                let aggregate = self.aggregate.as_mut().expect("final aggregate");
                 let result = aggregate
                     .as_processor_mut()
                     .expect("final aggregate processor")
@@ -1386,8 +1461,10 @@ impl ProcessorOperator for TableFinishOperator {
                     return self.fail(error);
                 }
                 self.aggregate = None;
+                self.finish_final_aggregate_blocked_interval();
                 continue;
             }
+            self.final_aggregate_blocked_time.observe(true);
             return Ok(None);
         }
     }
@@ -1403,6 +1480,15 @@ impl ProcessorOperator for TableFinishOperator {
             return Err("table finish cannot finalize a failed write stream".to_string());
         }
         self.phase = FinishPhase::Finalizing;
+        self.finish_final_aggregate_blocked_interval();
+        #[cfg(debug_assertions)]
+        if self.aggregate.is_some()
+            && let Err(error) = self
+                .aggregate_guard
+                .check(TableWriteAggregateBoundary::FinalFinalize)
+        {
+            return self.fail(format!("table finish final aggregate finalize: {error}"));
+        }
         let started = Instant::now();
         let result = self.begin_finalize(state);
         if let Some(profiles) = self.profiles.as_ref() {
@@ -1453,6 +1539,7 @@ impl ProcessorOperator for TableFinishOperator {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use arrow::array::{BinaryArray, ListArray, StringArray};
     use arrow::datatypes::DataType;
@@ -1508,6 +1595,22 @@ mod tests {
                 ConnectorErrorKind::CorruptData,
                 "not a canonical carrier of the expected provider",
             ))
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    struct RejectAggregateBoundary(TableWriteAggregateBoundary);
+
+    #[cfg(debug_assertions)]
+    impl TableWriteAggregateGuard for RejectAggregateBoundary {
+        fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
+            if boundary == self.0 {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("rejected {boundary:?}"),
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -2859,6 +2962,10 @@ mod tests {
         let ready = Arc::clone(&scripted.ready);
         let observable = Arc::clone(&scripted.observable);
         let mut operator = factory.create_operator(1, 0);
+        let profiles = OperatorProfiles::new(crate::runtime::profile::RuntimeProfile::new(
+            "final-aggregate-blocked-metrics",
+        ));
+        operator.set_profiles(profiles.clone());
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.aggregate = Some(Box::new(scripted));
@@ -2871,6 +2978,7 @@ mod tests {
             &operator.sink_observable().expect("sink observable"),
             &observable
         ));
+        std::thread::sleep(Duration::from_millis(1));
         accepting.store(true, Ordering::Release);
         observable.notify_observers();
         assert!(operator.need_input());
@@ -2901,6 +3009,130 @@ mod tests {
         while !operator.is_finished() {
             let _ = operator.pull_chunk(&state).expect("root output");
         }
+        operator.close().expect("close");
+        assert!(
+            profiles
+                .common
+                .counter_value("FinalAggregateBlockedCount")
+                .is_some_and(|intervals| intervals >= 1)
+        );
+        assert!(
+            profiles
+                .common
+                .counter_value("FinalAggregateBlockedTime")
+                .is_some_and(|elapsed| elapsed > 0)
+        );
+    }
+
+    #[test]
+    fn composite_finish_counts_driver_pending_finalize_as_one_wait_interval() {
+        let (factory, state, writer_schema) = composite_fixture(1, 1, 8);
+        let final_batch =
+            scripted_final_chunk(&factory, vec![(0, vec![Some(b"complete".to_vec())])]);
+        let scripted = ScriptedFinalAggregate::new(vec![final_batch], true, false);
+        let ready = Arc::clone(&scripted.ready);
+        let mut operator = factory.create_operator(1, 0);
+        let profiles = OperatorProfiles::new(crate::runtime::profile::RuntimeProfile::new(
+            "driver-pending-finalize-metrics",
+        ));
+        operator.set_profiles(profiles.clone());
+        operator.prepare().expect("prepare");
+        operator.bind_runtime_state(&state).expect("bind");
+        operator.aggregate = Some(Box::new(scripted));
+        operator
+            .push_chunk(
+                &state,
+                composite_rows(
+                    &writer_schema,
+                    vec![(
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![Some(b"partial".to_vec())],
+                    )],
+                ),
+            )
+            .expect("partial input");
+
+        // This is PipelineDriver's EOS sequence: set finishing once, then
+        // poll only pending_finish while the asynchronous owner is parked.
+        operator.set_finishing(&state).expect("gather EOS");
+        assert!(operator.pending_finish());
+        assert!(operator.pending_finish());
+        std::thread::sleep(Duration::from_millis(1));
+        assert!(operator.pending_finish());
+        ready.store(true, Ordering::Release);
+        assert!(!operator.pending_finish());
+
+        while !operator.is_finished() {
+            let _ = operator.pull_chunk(&state).expect("root output");
+        }
+        operator.close().expect("close");
+        assert_eq!(
+            profiles.common.counter_value("FinalAggregateBlockedCount"),
+            Some(1),
+            "repeated pending_finish polls belong to one continuous wait"
+        );
+        assert!(
+            profiles
+                .common
+                .counter_value("FinalAggregateBlockedTime")
+                .is_some_and(|elapsed| elapsed > 0),
+            "the EOS pending-finish wait must contribute wall time"
+        );
+    }
+
+    #[test]
+    fn composite_finish_closes_driver_pending_finalize_on_failure() {
+        let (factory, state, writer_schema) = composite_fixture(1, 1, 8);
+        let scripted = ScriptedFinalAggregate::new(Vec::new(), true, false);
+        let mut operator = factory.create_operator(1, 0);
+        let profiles = OperatorProfiles::new(crate::runtime::profile::RuntimeProfile::new(
+            "failed-driver-pending-finalize-metrics",
+        ));
+        operator.set_profiles(profiles.clone());
+        operator.prepare().expect("prepare");
+        operator.bind_runtime_state(&state).expect("bind");
+        operator.aggregate = Some(Box::new(scripted));
+        operator
+            .push_chunk(
+                &state,
+                composite_rows(
+                    &writer_schema,
+                    vec![(
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![Some(b"partial".to_vec())],
+                    )],
+                ),
+            )
+            .expect("partial input");
+        operator.set_finishing(&state).expect("gather EOS");
+        assert!(operator.pending_finish());
+        assert!(operator.pending_finish());
+        std::thread::sleep(Duration::from_millis(1));
+
+        operator.on_driver_failure();
+        assert!(operator.is_finished());
+        assert!(!operator.pending_finish());
+        let elapsed_after_failure = profiles
+            .common
+            .counter_value("FinalAggregateBlockedTime")
+            .expect("failure must publish the closed interval");
+        std::thread::sleep(Duration::from_millis(1));
+        operator.close().expect("close after failure");
+        assert_eq!(
+            profiles.common.counter_value("FinalAggregateBlockedCount"),
+            Some(1)
+        );
+        assert_eq!(
+            profiles.common.counter_value("FinalAggregateBlockedTime"),
+            Some(elapsed_after_failure),
+            "failure must stop the timer rather than leave a live interval"
+        );
     }
 
     #[test]
@@ -2976,6 +3208,93 @@ mod tests {
         assert!(error.contains("synchronous finalize failure"), "{error}");
         assert!(operator.is_finished());
         assert_eq!(tracker.current(), 0, "failed finalize releases all buffers");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn final_aggregate_guard_rejects_merge_without_root_output() {
+        let (mut factory, state, writer_schema) = composite_fixture(1, 1, 8);
+        factory.aggregate_guard = Arc::new(RejectAggregateBoundary(
+            TableWriteAggregateBoundary::FinalMerge,
+        ));
+        let mut operator = factory.create_operator(1, 0);
+        operator.prepare().expect("prepare");
+        operator.bind_runtime_state(&state).expect("bind");
+
+        let error = operator
+            .push_chunk(
+                &state,
+                composite_rows(
+                    &writer_schema,
+                    vec![(
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![Some(b"partial".to_vec())],
+                    )],
+                ),
+            )
+            .expect_err("final merge fault");
+
+        assert!(error.contains("FinalMerge"), "{error}");
+        assert!(operator.is_finished(), "the Root operator must fail closed");
+        assert!(
+            !operator.has_output(),
+            "a failed Root cannot expose EOF data"
+        );
+        assert!(
+            operator
+                .pull_chunk(&state)
+                .expect("failed Root pull")
+                .is_none(),
+            "a failed Root cannot emit a successful result row"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn final_aggregate_guard_rejects_finalize_without_root_output() {
+        let (mut factory, state, writer_schema) = composite_fixture(1, 1, 8);
+        factory.aggregate_guard = Arc::new(RejectAggregateBoundary(
+            TableWriteAggregateBoundary::FinalFinalize,
+        ));
+        let mut operator = factory.create_operator(1, 0);
+        operator.prepare().expect("prepare");
+        operator.bind_runtime_state(&state).expect("bind");
+        operator
+            .push_chunk(
+                &state,
+                composite_rows(
+                    &writer_schema,
+                    vec![(
+                        WriterRowKind::AggregatePartial.to_wire(),
+                        0,
+                        None,
+                        None,
+                        vec![Some(b"partial".to_vec())],
+                    )],
+                ),
+            )
+            .expect("partial input before finalize fault");
+
+        let error = operator
+            .set_finishing(&state)
+            .expect_err("final finalize fault");
+
+        assert!(error.contains("FinalFinalize"), "{error}");
+        assert!(operator.is_finished(), "the Root operator must fail closed");
+        assert!(
+            !operator.has_output(),
+            "a failed Root cannot expose EOF data"
+        );
+        assert!(
+            operator
+                .pull_chunk(&state)
+                .expect("failed Root pull")
+                .is_none(),
+            "a failed Root cannot emit a successful result row"
+        );
     }
 
     #[test]

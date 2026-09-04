@@ -881,6 +881,13 @@ pub(super) fn lower_table_writer_node(
             format!("native node_id={node_id} table writer: {error}"),
         )
     })?;
+    #[cfg(debug_assertions)]
+    let lowered = lowered.with_aggregate_guard(Arc::new(
+        crate::connector::write_data_plane::QueryScopedTableWriteAggregateGuard::new(
+            execution_id,
+            node_id,
+        ),
+    ));
 
     let output_schema = Arc::clone(lowered.writer_multiplex_schema().chunk_schema());
     let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());
@@ -977,17 +984,19 @@ pub(super) fn lower_table_finish_node(
         ctx,
     )?;
 
+    let execution_id = ctx
+        .typed_scan_runtime()
+        .map(|runtime| runtime.execution_id())
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone(),
+                format!(
+                    "native node_id={node_id} table finish requires a query-leased catalog runtime"
+                ),
+            )
+        })?;
     let validator = Arc::new(RootCommitFragmentCarrierValidator::new(
-        ctx.typed_scan_runtime()
-            .map(|runtime| runtime.execution_id())
-            .ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    path.clone(),
-                    format!(
-                        "native node_id={node_id} table finish requires a query-leased catalog runtime"
-                    ),
-                )
-            })?,
+        execution_id,
         node_id,
     ));
 
@@ -1007,6 +1016,13 @@ pub(super) fn lower_table_finish_node(
             format!("native node_id={node_id} table finish: {error}"),
         )
     })?;
+    #[cfg(debug_assertions)]
+    let lowered = lowered.with_aggregate_guard(Arc::new(
+        crate::connector::write_data_plane::QueryScopedTableWriteAggregateGuard::new(
+            execution_id,
+            node_id,
+        ),
+    ));
 
     let output_schema = Arc::clone(lowered.root_result_schema().chunk_schema());
     let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());

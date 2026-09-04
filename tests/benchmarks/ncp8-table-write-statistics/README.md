@@ -38,8 +38,8 @@ Standard output contains only JSON objects, one per line:
   explicit production-object-read observability gap.
 - `record=sample`: one warm-up or measurement round. Raw values include wall
   and process CPU time, rows/s, query-accounted peak memory, writer/final
-  blocked counters, queue high-water marks, writer multiplex bytes, Root bytes,
-  batch counts, and fixture provider lifecycle counts.
+  blocked intervals and duration, queue high-water marks, writer multiplex
+  bytes, Root bytes, batch counts, and fixture provider lifecycle counts.
 - `record=summary`: median measured throughput, median process CPU time, and
   maximum measured peak accounted memory for one case.
 
@@ -49,11 +49,27 @@ includes the sink I/O worker. `peak_accounted_memory_bytes` is the query
 `writer_multiplex_bytes` are the production operator counters;
 `root_output_logical_bytes_observed` independently sums the pulled chunks.
 
+The `*_blocked_time_ns` fields are operator wall-clock wait durations, measured
+from the first readiness observation that denies progress until the observation
+that allows progress (or operator termination). They are not CPU time and are
+not inferred from poll counts. `writer_queue_blocked_time_ns` isolates page-sink
+queue backpressure; `composite_writer_blocked_time_ns` covers any TableWriter
+input blocker, including the queue, partial aggregate, or pending multiplex
+output; `final_aggregate_blocked_time_ns` covers TableFinish input/output waits
+on its final aggregate. Repeated polls during one wait count as one interval.
+
 The harness cannot measure production object-store reads because the Execution
 write API deliberately exposes only writer `open/append/finish/abort`; it has no
 provider read-observer contract. The config row therefore emits
-`production_object_read_calls: null` instead of fabricating a zero. Proving no
-production reread requires provider-level I/O tracing in an integration run.
+`production_object_read_calls: null` instead of fabricating a zero. The
+provider-level OCC regression supplies that separate evidence with a counting
+Iceberg `FileIO`: a fresh eager attempt may rewrite attempt-owned manifest and
+Puffin metadata, while data-path opens, metadata calls, reads, and readers stay
+at zero and the computed `Bytes` allocation is reused.
+
+```bash
+cargo test -p novarocks-connector-iceberg eager_attempt_io_tests --lib
+```
 
 ## Interpretation
 

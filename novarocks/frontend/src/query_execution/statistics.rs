@@ -817,13 +817,13 @@ mod tests {
     fn statistics_root_body_budget_admits_every_maximal_theta_requirement() {
         const MAX_COMPACT_THETA_BYTES: usize = 65_560;
         let mut charged = 0;
-        for _ in 0..novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_METRICS {
+        for _ in 0..novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_COLUMNS {
             charged = charge_statistics_body_bytes(charged, MAX_COMPACT_THETA_BYTES)
                 .expect("all maximal Theta bodies fit the result budget");
         }
         assert_eq!(
             charged,
-            novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_METRICS * MAX_COMPACT_THETA_BYTES
+            novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_COLUMNS * MAX_COMPACT_THETA_BYTES
         );
     }
 }

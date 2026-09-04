@@ -3466,6 +3466,7 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "hex",
+ "novarocks-functions",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-spi",

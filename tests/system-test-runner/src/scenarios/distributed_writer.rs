@@ -50,9 +50,10 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, anyhow, bail};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::{CrossProcessChildEnvironment, QueryLifecyclePhase, ServerHandle};
+use novarocks_cluster_harness::{CrossProcessChildEnvironment, ServerHandle};
 use novarocks_connector_iceberg::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
@@ -66,6 +67,7 @@ use super::connector::{
 const WRITER_OPENS: &str = "novarocks_backend_connector_write_writer_opens_total";
 const WRITER_TOTALS: &str = "novarocks_backend_connector_write_writer_totals";
 const ROOT_PEAK: &str = "novarocks_backend_connector_write_root_prepared_set_peak";
+const WRITER_PARTIAL_TOTALS: &str = "novarocks_table_writer_partial_totals";
 
 /// `LakePublicationFamily::Write` — INSERT and INSERT OVERWRITE.
 const WRITE_FAMILY: &str = "write";
@@ -83,6 +85,11 @@ const SEED_FILES: i64 = 6;
 const SEED_ROWS: i64 = SEED_ROWS_PER_FILE * SEED_FILES;
 /// `SEED_ROWS * (SEED_ROWS + 1) / 2`, the sum of `1..=SEED_ROWS`.
 const SEED_SUM: i64 = SEED_ROWS * (SEED_ROWS + 1) / 2;
+const WIDE_STATISTICS_CHANNELS: usize = 1_024;
+const WIDE_SEED_FILES: i64 = 12;
+const WIDE_ROWS_PER_FILE: i64 = 4;
+const WIDE_ROWS: i64 = WIDE_ROWS_PER_FILE * WIDE_SEED_FILES;
+const STATISTICS_PACKET_BYTES: usize = 320 * 1024;
 
 /// One sleeping row per file for the abort case's source, and how long each
 /// row sleeps.
@@ -138,6 +145,57 @@ fn all_write_counters(context: &mut ScenarioContext) -> Result<Vec<WriteCounters
     let count = context.handle().be_count();
     (0..count)
         .map(|index| write_counters(context, index))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct WriterPartialCounters {
+    batches: f64,
+    rows: f64,
+    bytes: f64,
+    non_null_channels: f64,
+    sparse_rows: f64,
+}
+
+fn writer_partial_counters(
+    context: &mut ScenarioContext,
+    index: usize,
+) -> Result<WriterPartialCounters> {
+    let handle = context.handle();
+    let metric =
+        |unit| handle.backend_connector_write_metric(index, WRITER_PARTIAL_TOTALS, "unit", unit);
+    Ok(WriterPartialCounters {
+        batches: metric("batches")?,
+        rows: metric("rows")?,
+        bytes: metric("bytes")?,
+        non_null_channels: metric("non_null_channels")?,
+        sparse_rows: metric("sparse_rows")?,
+    })
+}
+
+fn all_writer_partial_counters(
+    context: &mut ScenarioContext,
+) -> Result<Vec<WriterPartialCounters>> {
+    let count = context.handle().be_count();
+    (0..count)
+        .map(|index| writer_partial_counters(context, index))
+        .collect()
+}
+
+fn writer_partial_delta(
+    before: &[WriterPartialCounters],
+    after: &[WriterPartialCounters],
+) -> Vec<WriterPartialCounters> {
+    before
+        .iter()
+        .zip(after)
+        .map(|(before, after)| WriterPartialCounters {
+            batches: after.batches - before.batches,
+            rows: after.rows - before.rows,
+            bytes: after.bytes - before.bytes,
+            non_null_channels: after.non_null_channels - before.non_null_channels,
+            sparse_rows: after.sparse_rows - before.sparse_rows,
+        })
         .collect()
 }
 
@@ -689,7 +747,16 @@ impl Scenario for DistributedStatisticsDataflow {
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        let mut config = connector_launch_config();
+        let backend = config.config_overlay.be.get_or_insert_with(String::new);
+        let runtime_cache = backend.find("[runtime.cache]").ok_or_else(|| {
+            anyhow::anyhow!("connector backend overlay has no runtime cache table")
+        })?;
+        backend.insert_str(
+            runtime_cache,
+            &format!("exchange_max_transmit_batched_bytes = {STATISTICS_PACKET_BYTES}\n"),
+        );
+        Ok(config)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -869,17 +936,134 @@ impl Scenario for DistributedStatisticsDataflow {
             bail!("collect-on-write target contains {rows} rows; expected {SEED_ROWS}");
         }
 
+        const WIDE_SOURCE: &str = "native_statistics_wide_source";
+        const WIDE_TARGET: &str = "native_statistics_wide_target";
+        let wide_source = format!("{CATALOG}.{DATABASE}.{WIDE_SOURCE}");
+        let wide_target = format!("{CATALOG}.{DATABASE}.{WIDE_TARGET}");
+        let wide_schema = (0..WIDE_STATISTICS_CHANNELS)
+            .map(|index| format!("v{index} BIGINT"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let wide_column_names = (0..WIDE_STATISTICS_CHANNELS)
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let wide_values = (0..WIDE_STATISTICS_CHANNELS)
+            .map(|index| format!("generate_series + {}", index * 1_000_000))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        context.action("seed a 1024-field source with twelve independently splittable files");
+        control
+            .query_drop(format!(
+                "CREATE TABLE {wide_source} ({wide_schema}) TBLPROPERTIES \
+                 ('novarocks.statistics.collect-on-write' = 'false')"
+            ))
+            .context("create wide native statistics source")?;
+        for file in 0..WIDE_SEED_FILES {
+            let low = file * WIDE_ROWS_PER_FILE + 1;
+            let high = (file + 1) * WIDE_ROWS_PER_FILE;
+            control
+                .query_drop(format!(
+                    "INSERT INTO {wide_source} SELECT {wide_values} FROM \
+                     TABLE(generate_series({low}, {high}))"
+                ))
+                .with_context(|| format!("seed wide native statistics rows {low}..{high}"))?;
+        }
+        control
+            .query_drop(format!(
+                "CREATE TABLE {wide_target} ({wide_schema}) TBLPROPERTIES \
+                 ('novarocks.statistics.collect-on-write' = 'true')"
+            ))
+            .context("create wide collect-on-write target")?;
+
+        let wide_target_root = hadoop_table_root(&warehouse, DATABASE, WIDE_TARGET);
+        let wide_metadata_before = hadoop_metadata_version(&wide_target_root)?;
+        let wide_snapshots_before = snapshot_count(&mut control, &wide_target)?;
+        let wide_write_before = all_write_counters(context)?;
+        let wide_peak_ceiling = peak_ceiling(&wide_write_before);
+        let wide_partial_before = all_writer_partial_counters(context)?;
+        let wide_terminals_before = publication_terminals(context, WRITE_FAMILY)?;
+
+        context.action(
+            "collect 1024 writer aggregates through sparse multi-batch output on all backends",
+        );
+        control
+            .query_drop(format!(
+                "INSERT INTO {wide_target} SELECT {wide_column_names} FROM {wide_source}"
+            ))
+            .context("run wide native collect-on-write INSERT")?;
+
+        let wide_write_after = all_write_counters(context)?;
+        let wide_write_delta = write_delta(&wide_write_before, &wide_write_after);
+        if wide_write_delta.writing_backends.len() != 3 {
+            bail!(
+                "wide collect-on-write opened writers on {:?}; expected all three backends",
+                wide_write_delta.writing_backends
+            );
+        }
+        if (wide_write_delta.rows - WIDE_ROWS as f64).abs() > f64::EPSILON {
+            bail!(
+                "wide collect-on-write writers accepted {} rows; expected {WIDE_ROWS}",
+                wide_write_delta.rows
+            );
+        }
+        let wide_root = identify_root(
+            &wide_write_after,
+            wide_peak_ceiling,
+            wide_write_delta.commit_fragments,
+            "wide native collect-on-write",
+        )?;
+
+        let wide_partial_after = all_writer_partial_counters(context)?;
+        let wide_partial_delta = writer_partial_delta(&wide_partial_before, &wide_partial_after);
+        assert_wide_writer_partials(&wide_write_delta.opens, &wide_partial_delta)?;
+
+        let wide_terminals_after = publication_terminals(context, WRITE_FAMILY)?;
+        assert_committed_once(
+            wide_terminals_before,
+            wide_terminals_after,
+            "wide native collect-on-write",
+        )?;
+        let wide_snapshots_after = snapshot_count(&mut control, &wide_target)?;
+        if wide_snapshots_after != wide_snapshots_before + 1 {
+            bail!(
+                "wide collect-on-write moved {wide_target} from {wide_snapshots_before} to \
+                 {wide_snapshots_after} snapshots; expected one"
+            );
+        }
+        let wide_metadata_after = hadoop_metadata_version(&wide_target_root)?;
+        if wide_metadata_after != wide_metadata_before + 1 {
+            bail!(
+                "wide collect-on-write advanced Hadoop metadata from v{wide_metadata_before} to \
+                 v{wide_metadata_after}; data and 1024 statistics artifacts must share one commit"
+            );
+        }
+        assert_current_theta_metadata_count(
+            &wide_target_root,
+            WIDE_ROWS as f64,
+            WIDE_STATISTICS_CHANNELS,
+            "wide native collect-on-write",
+        )?;
+        let wide_rows = row_count(&mut control, &wide_target)?;
+        if wide_rows != WIDE_ROWS {
+            bail!("wide collect-on-write target contains {wide_rows} rows; expected {WIDE_ROWS}");
+        }
+
         println!(
             "native-statistics-dataflow topology=1FE+3BE \
              analyze_fragment_delta={analyze_fragment_delta:?} analyze_ndv={analyze_ndv} \
              write_fragment_delta={write_fragment_delta:?} writing_backends={:?} root_be={} \
-             commit_fragments={} write_ndv={} metadata_versions={}=>{}",
+             commit_fragments={} write_ndv={} metadata_versions={}=>{} \
+             wide_channels={} wide_root_be={} wide_partial_delta={wide_partial_delta:?}",
             delta.writing_backends,
             root,
             delta.commit_fragments,
             write_ndv,
             metadata_before,
             metadata_after,
+            WIDE_STATISTICS_CHANNELS,
+            wide_root,
         );
 
         await_frontend_attempts_drained(context, "the native statistics dataflow")?;
@@ -934,6 +1118,44 @@ fn assert_show_theta_statistics(
     Ok(())
 }
 
+fn assert_wide_writer_partials(
+    writer_opens: &[f64],
+    partials: &[WriterPartialCounters],
+) -> Result<()> {
+    if writer_opens.len() != 3 || partials.len() != 3 {
+        bail!("wide writer partial evidence is not from exactly three backends");
+    }
+    for (index, (opens, partial)) in writer_opens.iter().zip(partials).enumerate() {
+        if *opens <= 0.0 {
+            bail!("wide collect-on-write opened no writer on BE[{index}]");
+        }
+        let expected_channels = *opens * WIDE_STATISTICS_CHANNELS as f64;
+        if partial.non_null_channels != expected_channels {
+            bail!(
+                "BE[{index}] emitted {} non-null writer partial channels for {opens} writers; \
+                 expected {expected_channels}",
+                partial.non_null_channels
+            );
+        }
+        if partial.batches != partial.rows || partial.rows <= *opens {
+            bail!(
+                "BE[{index}] writer partial delta is {partial:?}; the {opens} writers must each \
+                 split their 1024 channels into more than one single-row batch"
+            );
+        }
+        if partial.sparse_rows <= 0.0 || partial.sparse_rows > partial.rows {
+            bail!(
+                "BE[{index}] writer partial delta is {partial:?}; at least one row must be sparse \
+                 under the {STATISTICS_PACKET_BYTES}-byte packet budget"
+            );
+        }
+        if partial.bytes <= 0.0 {
+            bail!("BE[{index}] emitted writer partial rows without encoded bytes");
+        }
+    }
+    Ok(())
+}
+
 fn hadoop_table_root(warehouse: &Path, database: &str, table: &str) -> std::path::PathBuf {
     warehouse.join(database).join(table)
 }
@@ -948,6 +1170,16 @@ fn hadoop_metadata_version(table_root: &Path) -> Result<u32> {
 }
 
 fn assert_current_theta_metadata(table_root: &Path, expected_ndv: f64, label: &str) -> Result<f64> {
+    let values = assert_current_theta_metadata_count(table_root, expected_ndv, 1, label)?;
+    Ok(values[0])
+}
+
+fn assert_current_theta_metadata_count(
+    table_root: &Path,
+    expected_ndv: f64,
+    expected_blobs: usize,
+    label: &str,
+) -> Result<Vec<f64>> {
     let version = hadoop_metadata_version(table_root)?;
     let path = table_root
         .join("metadata")
@@ -975,33 +1207,41 @@ fn assert_current_theta_metadata(table_root: &Path, expected_ndv: f64, label: &s
         .iter()
         .filter(|blob| blob.r#type == APACHE_DATASKETCHES_THETA_V1)
         .collect::<Vec<_>>();
-    let [theta] = theta.as_slice() else {
+    if theta.len() != expected_blobs {
         bail!(
-            "{label} current StatisticsFile has {} Theta blobs; a one-column table requires one",
-            theta.len()
-        );
-    };
-    if theta.snapshot_id != current.snapshot_id()
-        || theta.sequence_number != current.sequence_number()
-        || theta.fields.len() != 1
-    {
-        bail!(
-            "{label} Theta provenance does not match the current snapshot: \
-             snapshot={} sequence={} fields={:?}, expected snapshot={} sequence={}",
-            theta.snapshot_id,
-            theta.sequence_number,
-            theta.fields,
-            current.snapshot_id(),
-            current.sequence_number()
+            "{label} current StatisticsFile has {} Theta blobs; expected {expected_blobs}",
+            theta.len(),
         );
     }
-    let ndv = theta
-        .properties
-        .get("ndv")
-        .with_context(|| format!("{label} Theta blob has no ndv property"))?
-        .parse::<f64>()
-        .with_context(|| format!("parse {label} Theta ndv property"))?;
-    assert_theta_estimate(ndv, expected_ndv, label)?;
+    let mut fields = BTreeSet::new();
+    let mut values = Vec::with_capacity(theta.len());
+    for blob in theta {
+        if blob.snapshot_id != current.snapshot_id()
+            || blob.sequence_number != current.sequence_number()
+            || blob.fields.len() != 1
+        {
+            bail!(
+                "{label} Theta provenance does not match the current snapshot: \
+                 snapshot={} sequence={} fields={:?}, expected snapshot={} sequence={}",
+                blob.snapshot_id,
+                blob.sequence_number,
+                blob.fields,
+                current.snapshot_id(),
+                current.sequence_number()
+            );
+        }
+        if !fields.insert(blob.fields[0]) {
+            bail!("{label} repeats Theta field identity {}", blob.fields[0]);
+        }
+        let ndv = blob
+            .properties
+            .get("ndv")
+            .with_context(|| format!("{label} Theta blob has no ndv property"))?
+            .parse::<f64>()
+            .with_context(|| format!("parse {label} Theta ndv property"))?;
+        assert_theta_estimate(ndv, expected_ndv, label)?;
+        values.push(ndv);
+    }
     let puffin_location = statistics
         .statistics_path
         .strip_prefix("file://")
@@ -1019,7 +1259,7 @@ fn assert_current_theta_metadata(table_root: &Path, expected_ndv: f64, label: &s
             statistics.file_size_in_bytes
         );
     }
-    Ok(ndv)
+    Ok(values)
 }
 
 fn assert_theta_estimate(actual: f64, expected: f64, label: &str) -> Result<()> {
@@ -1567,6 +1807,17 @@ enum WriteFault {
     WriterEgress,
     /// The root rejects a commit-fragment carrier at validation.
     RootValidation,
+    /// One writer rejects the ordinary partial aggregate update for its input
+    /// page, after writer capacity was reserved but before either side accepts
+    /// the page.
+    PartialAggregateUpdate,
+    /// One writer rejects ordinary partial aggregate finalization at EOS.
+    PartialAggregateFinalize,
+    /// The single root rejects merging a writer partial into its ordinary
+    /// final aggregate.
+    FinalAggregateMerge,
+    /// The single root rejects ordinary final aggregate finalization at EOS.
+    FinalAggregateFinalize,
     /// One backend's participant task is failed after it published RUNNING.
     /// Its writers were already opened while the task was prepared, but the
     /// drivers never run, so the stream it owes the root aggregation never
@@ -1634,6 +1885,18 @@ impl WriteFault {
             Self::RootValidation => InjectionEvidence::Frontend(
                 "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-root-failure ",
             ),
+            Self::PartialAggregateUpdate => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-partial-update-failure ",
+            ),
+            Self::PartialAggregateFinalize => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-partial-finalize-failure ",
+            ),
+            Self::FinalAggregateMerge => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-final-merge-failure ",
+            ),
+            Self::FinalAggregateFinalize => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-final-finalize-failure ",
+            ),
             Self::SeveredWriterStream => {
                 InjectionEvidence::Backend(SEVERED_BACKEND, TASK_EXECUTION_FAILURE_INJECTED)
             }
@@ -1654,6 +1917,18 @@ impl WriteFault {
         match self {
             Self::WriterEgress => Some("injected connector write writer failure"),
             Self::RootValidation => Some("injected connector write root failure"),
+            Self::PartialAggregateUpdate => {
+                Some("injected connector write connector-write-partial-update-failure")
+            }
+            Self::PartialAggregateFinalize => {
+                Some("injected connector write connector-write-partial-finalize-failure")
+            }
+            Self::FinalAggregateMerge => {
+                Some("injected connector write connector-write-final-merge-failure")
+            }
+            Self::FinalAggregateFinalize => {
+                Some("injected connector write connector-write-final-finalize-failure")
+            }
             Self::SeveredWriterStream | Self::FetchAbort => None,
         }
     }
@@ -1662,9 +1937,13 @@ impl WriteFault {
     const fn statement<'a>(&self, statements: &WriteStatements<'a>) -> &'a str {
         match self {
             Self::FetchAbort => statements.delayed,
-            Self::WriterEgress | Self::RootValidation | Self::SeveredWriterStream => {
-                statements.full
-            }
+            Self::WriterEgress
+            | Self::RootValidation
+            | Self::PartialAggregateUpdate
+            | Self::PartialAggregateFinalize
+            | Self::FinalAggregateMerge
+            | Self::FinalAggregateFinalize
+            | Self::SeveredWriterStream => statements.full,
         }
     }
 
@@ -1683,7 +1962,13 @@ impl WriteFault {
                 }
                 Ok(())
             }
-            Self::WriterEgress | Self::RootValidation | Self::FetchAbort => Ok(()),
+            Self::WriterEgress
+            | Self::RootValidation
+            | Self::PartialAggregateUpdate
+            | Self::PartialAggregateFinalize
+            | Self::FinalAggregateMerge
+            | Self::FinalAggregateFinalize
+            | Self::FetchAbort => Ok(()),
         }
     }
 
@@ -1691,6 +1976,10 @@ impl WriteFault {
         match self {
             Self::WriterEgress => "a writer that fails at commit-fragment egress",
             Self::RootValidation => "a root that rejects a commit-fragment carrier",
+            Self::PartialAggregateUpdate => "a writer partial aggregate that rejects input",
+            Self::PartialAggregateFinalize => "a writer partial aggregate that rejects EOS",
+            Self::FinalAggregateMerge => "a root final aggregate that rejects a partial",
+            Self::FinalAggregateFinalize => "a root final aggregate that rejects EOS",
             Self::SeveredWriterStream => "a writer stream that never reaches the root aggregation",
             Self::FetchAbort => "an aborted attempt that never fetches the root's result",
         }
@@ -1776,7 +2065,8 @@ impl Scenario for DistributedWriterFaults {
         seed_delay_source_files(&mut control, CATALOG, DATABASE, DELAY_SOURCE)?;
         control
             .query_drop(format!(
-                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
+                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT) \
+                 TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true')"
             ))
             .context("create distributed writer fault table")?;
 
@@ -1799,6 +2089,10 @@ impl Scenario for DistributedWriterFaults {
         for fault in [
             WriteFault::WriterEgress,
             WriteFault::RootValidation,
+            WriteFault::PartialAggregateUpdate,
+            WriteFault::PartialAggregateFinalize,
+            WriteFault::FinalAggregateMerge,
+            WriteFault::FinalAggregateFinalize,
             WriteFault::SeveredWriterStream,
             WriteFault::FetchAbort,
         ] {
@@ -1885,10 +2179,20 @@ fn run_faulted_write(
     let case = fault.case();
     let insert = fault.statement(statements);
     match fault {
-        WriteFault::WriterEgress | WriteFault::RootValidation => {
+        WriteFault::WriterEgress
+        | WriteFault::RootValidation
+        | WriteFault::PartialAggregateUpdate
+        | WriteFault::PartialAggregateFinalize
+        | WriteFault::FinalAggregateMerge
+        | WriteFault::FinalAggregateFinalize => {
             let kind = match fault {
                 WriteFault::WriterEgress => "connector-write-writer-failure",
-                _ => "connector-write-root-failure",
+                WriteFault::RootValidation => "connector-write-root-failure",
+                WriteFault::PartialAggregateUpdate => "connector-write-partial-update-failure",
+                WriteFault::PartialAggregateFinalize => "connector-write-partial-finalize-failure",
+                WriteFault::FinalAggregateMerge => "connector-write-final-merge-failure",
+                WriteFault::FinalAggregateFinalize => "connector-write-final-finalize-failure",
+                _ => unreachable!("aggregate/egress fault match is exhaustive"),
             };
             for index in 0..context.handle().be_count() {
                 context

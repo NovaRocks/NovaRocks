@@ -33,3 +33,11 @@ interop acceptance: Spark creates a REST-catalog table, NovaRocks publishes
 statistics through native `ANALYZE`, then Spark's Iceberg `Table` API reads the
 published `StatisticsFile` and verifies standard Apache DataSketches Theta
 Puffin metadata.
+
+`trino_rest_puffin_show_stats.sql` is the released-engine reader acceptance.
+Trino 483 creates and analyzes the parent table through its production Iceberg
+REST connector; NovaRocks appends with collect-on-write; a fresh Trino 483
+process reads the Nova current snapshot and requires a numeric, non-unknown
+unioned NDV in the target column's `SHOW STATS` row. The transient Docker
+harness and pinned image/configuration contract are documented in
+`tests/datasketches-tck/interop/README.md`.

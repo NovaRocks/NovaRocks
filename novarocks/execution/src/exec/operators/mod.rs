@@ -29,6 +29,7 @@ pub(crate) mod analytic_shared;
 mod analytic_sink;
 mod analytic_source;
 mod assert_num_rows_processor;
+mod blocked_duration;
 mod change_event_expand_processor;
 mod data_stream_sink;
 mod exchange_source;

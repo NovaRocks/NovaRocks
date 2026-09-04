@@ -58,10 +58,15 @@ use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentEncoder, WriterMultiplexRelationSchema,
 };
+#[cfg(debug_assertions)]
+use crate::exec::node::table_write_relation::{
+    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+};
 use crate::exec::node::table_writer::{
     TableWriterInputProjection, TableWriterNode, TableWriterPhysicalContextTemplate,
 };
 use crate::exec::operators::AggregateProcessorFactory;
+use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::pipeline::async_writer::{AsyncWriterOwner, AsyncWriterQueueConfig};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -70,7 +75,11 @@ use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
 
-const MAX_WRITER_MULTIPLEX_BATCH_BYTES: usize = 16 * 1024 * 1024;
+/// Hard ceiling for one indivisible writer-relation row. The runtime exchange
+/// batching setting is only a flush target: just like `DataStreamSink`, a
+/// single row may exceed that target, but it must remain safely below the
+/// 64 MiB native gRPC message limit.
+const MAX_WRITER_MULTIPLEX_ROW_BYTES: usize = 16 * 1024 * 1024;
 
 /// The immutable per-node facts every driver copies when it opens its writer.
 struct TableWriterPlan {
@@ -84,6 +93,8 @@ struct TableWriterPlan {
     fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
     writer_multiplex_schema: WriterMultiplexRelationSchema,
     partial_aggregate_factory: Option<AggregateProcessorFactory>,
+    #[cfg(debug_assertions)]
+    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
 /// Factory for per-driver table writers.
@@ -121,6 +132,8 @@ impl TableWriterOperatorFactory {
                 fragment_encoder: Arc::clone(node.fragment_encoder()),
                 writer_multiplex_schema: node.writer_multiplex_schema().clone(),
                 partial_aggregate_factory,
+                #[cfg(debug_assertions)]
+                aggregate_guard: Arc::clone(node.aggregate_guard()),
             }),
         })
     }
@@ -262,6 +275,8 @@ impl TableWriterOperatorFactory {
             target,
             relation: plan.writer_multiplex_schema.clone(),
             partial_aggregate,
+            #[cfg(debug_assertions)]
+            aggregate_guard: Arc::clone(&plan.aggregate_guard),
             state: TableWriterState::Open,
             logical_rows: 0,
             aggregate_output: None,
@@ -274,8 +289,14 @@ impl TableWriterOperatorFactory {
             aggregate_tracker: None,
             profiles: None,
             blocked_checks: AtomicUsize::new(0),
+            writer_queue_blocked_time: BlockedDuration::default(),
+            composite_blocked_time: BlockedDuration::default(),
             partial_rows: 0,
             partial_bytes: 0,
+            partial_batches: 0,
+            partial_channels: 0,
+            sparse_partial_rows: 0,
+            target_multiplex_batch_bytes: MAX_WRITER_MULTIPLEX_ROW_BYTES,
             readiness_observable,
         }
     }
@@ -333,6 +354,8 @@ struct TableWriterOperator {
     target: WriteTargetOrdinal,
     relation: WriterMultiplexRelationSchema,
     partial_aggregate: Option<Box<dyn Operator>>,
+    #[cfg(debug_assertions)]
+    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     state: TableWriterState,
     logical_rows: u64,
     aggregate_output: Option<Chunk>,
@@ -345,8 +368,14 @@ struct TableWriterOperator {
     aggregate_tracker: Option<Arc<MemTracker>>,
     profiles: Option<OperatorProfiles>,
     blocked_checks: AtomicUsize,
+    writer_queue_blocked_time: BlockedDuration,
+    composite_blocked_time: BlockedDuration,
     partial_rows: usize,
     partial_bytes: usize,
+    partial_batches: usize,
+    partial_channels: usize,
+    sparse_partial_rows: usize,
+    target_multiplex_batch_bytes: usize,
     readiness_observable: Arc<Observable>,
 }
 
@@ -423,6 +452,7 @@ impl Operator for TableWriterOperator {
             partial.set_profiles(profiles.clone());
         }
         self.profiles = Some(profiles);
+        self.sync_metrics();
     }
 
     fn prepare(&mut self) -> Result<(), String> {
@@ -436,6 +466,12 @@ impl Operator for TableWriterOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        self.target_multiplex_batch_bytes = state
+            .execution_runtime()
+            .map(|runtime| runtime.config().exchange_max_transmit_batched_bytes)
+            .unwrap_or(MAX_WRITER_MULTIPLEX_ROW_BYTES)
+            .min(MAX_WRITER_MULTIPLEX_ROW_BYTES)
+            .max(1);
         if let Some(partial) = self.partial_aggregate.as_mut()
             && let Err(error) = partial.bind_runtime_state(state)
         {
@@ -452,6 +488,8 @@ impl Operator for TableWriterOperator {
     }
 
     fn close(&mut self) -> Result<(), String> {
+        self.finish_blocked_intervals();
+        self.sync_metrics();
         if let Some(partial) = self.partial_aggregate.as_mut() {
             partial.close()?;
         }
@@ -472,6 +510,7 @@ impl Operator for TableWriterOperator {
         self.aggregate_output = None;
         self.writer_completion = None;
         self.state = TableWriterState::Aborting;
+        self.finish_blocked_intervals();
         self.sync_metrics();
     }
 
@@ -515,6 +554,8 @@ impl Operator for TableWriterOperator {
 impl ProcessorOperator for TableWriterOperator {
     fn need_input(&self) -> bool {
         if self.state != TableWriterState::Open {
+            self.writer_queue_blocked_time.observe(false);
+            self.composite_blocked_time.observe(false);
             return false;
         }
         let aggregate_ready = self
@@ -522,11 +563,14 @@ impl ProcessorOperator for TableWriterOperator {
             .as_ref()
             .and_then(|partial| partial.as_processor_ref())
             .is_none_or(ProcessorOperator::need_input);
+        let writer_ready = self.writer.can_accept();
         let ready = aggregate_ready
             && self.aggregate_output.is_none()
             && !self.partial_child_has_output()
             && self.writer_completion.is_none()
-            && self.writer.can_accept();
+            && writer_ready;
+        self.writer_queue_blocked_time.observe(!writer_ready);
+        self.composite_blocked_time.observe(!ready);
         if !ready {
             self.blocked_checks.fetch_add(1, Ordering::Relaxed);
         }
@@ -573,6 +617,10 @@ impl ProcessorOperator for TableWriterOperator {
                 additional_bytes,
             )?;
             if let Some(partial) = self.partial_aggregate.as_mut() {
+                #[cfg(debug_assertions)]
+                self.aggregate_guard
+                    .check(TableWriteAggregateBoundary::PartialUpdate)
+                    .map_err(|error| format!("update writer partial aggregate: {error}"))?;
                 let processor = partial
                     .as_processor_mut()
                     .ok_or_else(|| "writer partial aggregate is not a processor".to_string())?;
@@ -641,10 +689,10 @@ impl ProcessorOperator for TableWriterOperator {
             self.emitted_row_count = true;
             let output = self.build_prefix_output(Some(self.logical_rows), &[])?;
             let bytes = self.output_size(&output)?;
-            if bytes > MAX_WRITER_MULTIPLEX_BATCH_BYTES {
+            if bytes > MAX_WRITER_MULTIPLEX_ROW_BYTES {
                 return Err(format!(
                     "ResourceExhausted: table writer row-count output requires {bytes} bytes, limit is {}",
-                    MAX_WRITER_MULTIPLEX_BATCH_BYTES
+                    MAX_WRITER_MULTIPLEX_ROW_BYTES
                 ));
             }
             Some(output)
@@ -672,7 +720,18 @@ impl ProcessorOperator for TableWriterOperator {
             return Ok(());
         }
         self.state = TableWriterState::Draining;
+        self.finish_blocked_intervals();
         if let Some(partial) = self.partial_aggregate.as_mut() {
+            #[cfg(debug_assertions)]
+            if let Err(error) = self
+                .aggregate_guard
+                .check(TableWriteAggregateBoundary::PartialFinalize)
+            {
+                self.state = TableWriterState::Failed;
+                self.writer.request_abort();
+                self.state = TableWriterState::Aborting;
+                return Err(format!("finish writer partial aggregate: {error}"));
+            }
             let processor = partial
                 .as_processor_mut()
                 .ok_or_else(|| "writer partial aggregate is not a processor".to_string())?;
@@ -828,13 +887,19 @@ impl TableWriterOperator {
                 .map(|fragment| fragment.bytes.as_slice())
                 .collect::<Vec<_>>();
             let candidate = self.build_prefix_output(None, &refs)?;
-            if self.output_size(&candidate)? <= MAX_WRITER_MULTIPLEX_BATCH_BYTES {
+            let bytes = self.output_size(&candidate)?;
+            if bytes <= self.target_multiplex_batch_bytes
+                || (middle == 1 && bytes <= MAX_WRITER_MULTIPLEX_ROW_BYTES)
+            {
                 best = Some((middle, candidate));
+                if bytes > self.target_multiplex_batch_bytes {
+                    break;
+                }
                 low = middle + 1;
             } else if middle == 1 {
                 return Err(format!(
-                    "ResourceExhausted: one table writer fragment row exceeds the {} byte multiplex batch limit",
-                    MAX_WRITER_MULTIPLEX_BATCH_BYTES
+                    "ResourceExhausted: one table writer fragment row requires {bytes} bytes, limit is {}",
+                    MAX_WRITER_MULTIPLEX_ROW_BYTES
                 ));
             } else {
                 high = middle - 1;
@@ -903,14 +968,19 @@ impl TableWriterOperator {
                 let candidate = self.build_partial_output(&candidates[..middle])?;
                 let bytes = self.output_size(&candidate)?;
                 drop(candidate);
-                if bytes <= MAX_WRITER_MULTIPLEX_BATCH_BYTES {
+                if bytes <= self.target_multiplex_batch_bytes
+                    || (middle == 1 && bytes <= MAX_WRITER_MULTIPLEX_ROW_BYTES)
+                {
                     best_count = Some(middle);
                     best_bytes = bytes;
+                    if bytes > self.target_multiplex_batch_bytes {
+                        break;
+                    }
                     low = middle + 1;
                 } else if middle == 1 {
                     return Err(format!(
                         "ResourceExhausted: one writer aggregate intermediate value requires {bytes} bytes, limit is {}",
-                        MAX_WRITER_MULTIPLEX_BATCH_BYTES
+                        MAX_WRITER_MULTIPLEX_ROW_BYTES
                     ));
                 } else {
                     high = middle - 1;
@@ -921,6 +991,17 @@ impl TableWriterOperator {
             self.next_auxiliary = candidates[count - 1] + 1;
             self.partial_rows = self.partial_rows.saturating_add(1);
             self.partial_bytes = self.partial_bytes.saturating_add(best_bytes);
+            self.partial_batches = self.partial_batches.saturating_add(1);
+            self.partial_channels = self.partial_channels.saturating_add(count);
+            let sparse_rows =
+                usize::from(count < self.relation.contract().auxiliary_channels().len());
+            self.sparse_partial_rows = self.sparse_partial_rows.saturating_add(sparse_rows);
+            crate::runtime::table_writer_metrics::observe_partial_output(
+                output.len(),
+                best_bytes,
+                count,
+                sparse_rows,
+            );
             if self.next_non_null_auxiliary().is_none() {
                 self.advance_partial_row();
             }
@@ -1019,7 +1100,13 @@ impl TableWriterOperator {
         self.aggregate_output = None;
         self.writer_completion = None;
         self.state = TableWriterState::Aborting;
+        self.finish_blocked_intervals();
         self.sync_metrics();
+    }
+
+    fn finish_blocked_intervals(&self) {
+        self.writer_queue_blocked_time.observe(false);
+        self.composite_blocked_time.observe(false);
     }
 
     fn sync_metrics(&self) {
@@ -1034,6 +1121,24 @@ impl TableWriterOperator {
         profiles.common.counter_set_unit(
             "CompositeWriterBlockedChecks",
             i64::try_from(self.blocked_checks.load(Ordering::Relaxed)).unwrap_or(i64::MAX),
+        );
+        profiles.common.counter_set(
+            "WriterQueueBlockedTime",
+            crate::runtime::profile::ProfileUnit::TimeNs,
+            crate::runtime::profile::clamp_u128_to_i64(self.writer_queue_blocked_time.elapsed_ns()),
+        );
+        profiles.common.counter_set_unit(
+            "WriterQueueBlockedIntervals",
+            i64::try_from(self.writer_queue_blocked_time.intervals()).unwrap_or(i64::MAX),
+        );
+        profiles.common.counter_set(
+            "CompositeWriterBlockedTime",
+            crate::runtime::profile::ProfileUnit::TimeNs,
+            crate::runtime::profile::clamp_u128_to_i64(self.composite_blocked_time.elapsed_ns()),
+        );
+        profiles.common.counter_set_unit(
+            "CompositeWriterBlockedIntervals",
+            i64::try_from(self.composite_blocked_time.intervals()).unwrap_or(i64::MAX),
         );
         profiles.common.counter_set_unit(
             "WriterQueuePeakBatches",
@@ -1058,6 +1163,18 @@ impl TableWriterOperator {
         profiles.common.counter_set_bytes(
             "WriterPartialBytes",
             i64::try_from(self.partial_bytes).unwrap_or(i64::MAX),
+        );
+        profiles.common.counter_set_unit(
+            "WriterPartialBatches",
+            i64::try_from(self.partial_batches).unwrap_or(i64::MAX),
+        );
+        profiles.common.counter_set_unit(
+            "WriterPartialChannels",
+            i64::try_from(self.partial_channels).unwrap_or(i64::MAX),
+        );
+        profiles.common.counter_set_unit(
+            "WriterSparsePartialRows",
+            i64::try_from(self.sparse_partial_rows).unwrap_or(i64::MAX),
         );
         if let Some(tracker) = self.aggregate_tracker.as_ref() {
             profiles
@@ -1140,7 +1257,7 @@ pub(crate) mod tests {
         WriterAuxiliaryChannel, WriterMultiplexSchema,
     };
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorError,
+        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorError, ConnectorErrorKind,
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
         ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -1173,11 +1290,34 @@ pub(crate) mod tests {
         pred()
     }
 
+    #[cfg(debug_assertions)]
+    struct RejectAggregateBoundary(TableWriteAggregateBoundary);
+
+    #[cfg(debug_assertions)]
+    impl TableWriteAggregateGuard for RejectAggregateBoundary {
+        fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
+            if boundary == self.0 {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("injected {boundary:?}"),
+                ));
+            }
+            Ok(())
+        }
+    }
+
     fn test_runtime_state() -> RuntimeState {
         test_runtime_state_with_mem(None)
     }
 
     fn test_runtime_state_with_mem(mem_tracker: Option<Arc<MemTracker>>) -> RuntimeState {
+        test_runtime_state_with_packet_budget(MAX_WRITER_MULTIPLEX_ROW_BYTES, mem_tracker)
+    }
+
+    fn test_runtime_state_with_packet_budget(
+        max_packet_bytes: usize,
+        mem_tracker: Option<Arc<MemTracker>>,
+    ) -> RuntimeState {
         let runtime = Arc::new(
             crate::runtime::ExecutionRuntime::new(
                 crate::runtime::ExecutionRuntimeConfig {
@@ -1191,7 +1331,7 @@ pub(crate) mod tests {
                     exchange_wait_ms: 120_000,
                     exchange_io_threads: 1,
                     exchange_io_max_inflight_bytes: 1024,
-                    exchange_max_transmit_batched_bytes: 1024,
+                    exchange_max_transmit_batched_bytes: max_packet_bytes,
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1024,
                     local_exchange_max_buffered_rows: 1024,
@@ -2039,6 +2179,62 @@ pub(crate) mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn partial_aggregate_guard_rejects_update_before_either_consumer_accepts_the_page() {
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
+        let writer_rows = Arc::clone(&execution.writer_rows);
+        let (node, function_set) = writer_node_with_count_partials(execution, 1);
+        let node = node.with_aggregate_guard(Arc::new(RejectAggregateBoundary(
+            TableWriteAggregateBoundary::PartialUpdate,
+        )));
+        let mut operator = TableWriterOperatorFactory::try_new(&node, function_set)
+            .expect("writer factory")
+            .create(1, 0);
+        let state = test_runtime_state();
+        bind(&mut operator, &state);
+        let error = operator
+            .as_processor_mut()
+            .expect("processor")
+            .push_chunk(&state, input_chunk(vec![1, 2, 3]))
+            .expect_err("partial update fault");
+        assert!(error.contains("PartialUpdate"), "{error}");
+        assert!(
+            writer_rows.lock().expect("writer rows").is_empty(),
+            "the reserved page must not reach the provider writer"
+        );
+        assert!(!operator.as_processor_ref().expect("processor").has_output());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn partial_aggregate_guard_rejects_finalize_without_success_output() {
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
+        let (node, function_set) = writer_node_with_count_partials(execution, 1);
+        let node = node.with_aggregate_guard(Arc::new(RejectAggregateBoundary(
+            TableWriteAggregateBoundary::PartialFinalize,
+        )));
+        let mut operator = TableWriterOperatorFactory::try_new(&node, function_set)
+            .expect("writer factory")
+            .create(1, 0);
+        let state = test_runtime_state();
+        bind(&mut operator, &state);
+        operator
+            .as_processor_mut()
+            .expect("processor")
+            .push_chunk(&state, input_chunk(vec![1, 2, 3]))
+            .expect("input before finalize fault");
+        let error = operator
+            .as_processor_mut()
+            .expect("processor")
+            .set_finishing(&state)
+            .expect_err("partial finalize fault");
+        assert!(error.contains("PartialFinalize"), "{error}");
+        assert!(!operator.as_processor_ref().expect("processor").has_output());
+    }
+
     #[test]
     fn table_writer_emits_one_row_count_row_and_one_row_per_fragment() {
         for fragment_count in [0usize, 1, 3] {
@@ -2261,6 +2457,8 @@ pub(crate) mod tests {
 
     #[test]
     fn one_oversized_partial_value_fails_the_attempt_without_success_output() {
+        const PACKET_BYTES: usize = 64 * 1024;
+
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
         let channel = WriterAuxiliaryChannel::try_new(20_000, "huge", DataType::Binary)
@@ -2289,7 +2487,7 @@ pub(crate) mod tests {
             DataType::Binary,
             true,
         )]));
-        let value = vec![7u8; MAX_WRITER_MULTIPLEX_BATCH_BYTES];
+        let value = vec![7u8; MAX_WRITER_MULTIPLEX_ROW_BYTES];
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(BinaryArray::from(vec![Some(value.as_slice())]))],
@@ -2304,7 +2502,7 @@ pub(crate) mod tests {
         let factory = writer_factory(&node);
         let mut operator = factory.create_operator(1, 0);
         operator.replace_partial_aggregate_for_test(Box::new(OneShotPartial::new(partial)));
-        let state = test_runtime_state();
+        let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         assert!(poll_until(
@@ -2317,6 +2515,10 @@ pub(crate) mod tests {
             .expect_err("one oversized value must fail before any sparse row is emitted");
         assert!(error.contains("ResourceExhausted"), "{error}");
         assert!(error.contains("one writer aggregate intermediate value"));
+        assert!(
+            error.contains(&format!("limit is {MAX_WRITER_MULTIPLEX_ROW_BYTES}")),
+            "{error}"
+        );
         assert!(!ProcessorOperator::has_output(&operator));
         assert!(poll_until(
             || stats.aborted.load(Ordering::Relaxed) == 1,
@@ -2328,6 +2530,7 @@ pub(crate) mod tests {
     fn sparse_packer_splits_1024_typed_channels_across_multiple_batches() {
         const CHANNELS: usize = 1_024;
         const VALUE_BYTES: usize = 20 * 1024;
+        const PACKET_BYTES: usize = 320 * 1024;
 
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
@@ -2384,7 +2587,7 @@ pub(crate) mod tests {
         let factory = writer_factory(&node);
         let mut operator = factory.create_operator(1, 0);
         operator.replace_partial_aggregate_for_test(Box::new(OneShotPartial::new(partial)));
-        let state = test_runtime_state();
+        let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         assert!(poll_until(
@@ -2402,16 +2605,22 @@ pub(crate) mod tests {
                 .expect("sparse batch");
             output_batches += 1;
             assert_eq!(output.len(), 1);
+            assert!(
+                operator.output_size(&output).expect("encoded output size") <= PACKET_BYTES,
+                "every sparse batch must honor the runtime packet budget"
+            );
             let prefix = TableWriteRelationColumns::try_from_chunk(&output).expect("prefix");
             assert_eq!(
                 WriterRowKind::from_wire(prefix.kinds.value(0)).expect("kind"),
                 WriterRowKind::AggregatePartial
             );
+            let mut populated = 0usize;
             for (index, slot_id) in slot_ids.iter().enumerate() {
                 let array = output
                     .column_by_slot_id(*slot_id)
                     .expect("sparse auxiliary channel");
                 if !array.is_null(0) {
+                    populated += 1;
                     assert!(!seen[index], "channel {index} was emitted twice");
                     let value = array
                         .as_any()
@@ -2423,8 +2632,12 @@ pub(crate) mod tests {
                     seen[index] = true;
                 }
             }
+            assert!(populated > 0 && populated < CHANNELS);
         }
         assert!(output_batches > 1, "the wide row must be split by bytes");
+        assert_eq!(operator.partial_batches, output_batches);
+        assert_eq!(operator.sparse_partial_rows, output_batches);
+        assert_eq!(operator.partial_channels, CHANNELS);
         assert!(seen.into_iter().all(|channel| channel));
         assert!(ProcessorOperator::need_input(&operator));
         operator.cancel();
@@ -2755,6 +2968,10 @@ pub(crate) mod tests {
         });
         let factory = writer_factory(&writer_node(execution));
         let mut operator = factory.create_operator(1, 0);
+        let profiles = OperatorProfiles::new(crate::runtime::profile::RuntimeProfile::new(
+            "slow-writer-metrics",
+        ));
+        operator.set_profiles(profiles.clone());
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
@@ -2773,6 +2990,7 @@ pub(crate) mod tests {
             !ProcessorOperator::need_input(&operator),
             "the slow writer's full queue must block composite input"
         );
+        std::thread::sleep(Duration::from_millis(1));
 
         gate.notify_one();
         assert!(poll_until(
@@ -2787,6 +3005,16 @@ pub(crate) mod tests {
         let prefix = TableWriteRelationColumns::try_from_chunk(&outputs[0]).expect("prefix");
         assert_eq!(prefix.row_counts.value(0), 5);
         assert_eq!(rows.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            profiles.common.counter_value("WriterQueueBlockedIntervals"),
+            Some(1)
+        );
+        assert!(
+            profiles
+                .common
+                .counter_value("WriterQueueBlockedTime")
+                .is_some_and(|elapsed| elapsed > 0)
+        );
     }
 
     #[test]

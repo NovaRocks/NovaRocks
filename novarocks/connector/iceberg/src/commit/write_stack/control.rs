@@ -688,6 +688,54 @@ fn written_file_from_fragment(
     })
 }
 
+/// Immutable inputs that survive an eager OCC conflict.
+///
+/// Writer fragments have already materialized the data files and ordinary
+/// aggregation has already materialized the statistic bodies before this
+/// owner enters the catalog attempt loop. A fresh attempt may rebuild only
+/// attempt-bound metadata; it must never turn either value back into a source
+/// that can reopen the user's data files or recompute the aggregate.
+#[derive(Clone)]
+struct ReusableEagerWriteInputs {
+    files: Arc<[WrittenFile]>,
+    statistics: Arc<[novarocks_spi::connector::StatisticsArtifactDraft]>,
+}
+
+impl ReusableEagerWriteInputs {
+    fn new(
+        files: Vec<WrittenFile>,
+        statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+    ) -> Self {
+        Self {
+            files: files.into(),
+            statistics: statistics.into(),
+        }
+    }
+
+    fn install_files(&self, collector: &IcebergCommitCollector) {
+        collector.inject_reusable_written_files(self.files.iter().cloned().collect());
+    }
+
+    fn statistics_for_attempt(&self) -> Vec<novarocks_spi::connector::StatisticsArtifactDraft> {
+        self.statistics.iter().cloned().collect()
+    }
+}
+
+fn permits_fresh_eager_attempt(
+    outcome: &CatalogOutcome<crate::catalog::transaction::CommitProof>,
+    attempt: usize,
+    max_attempts: usize,
+    has_repartition: bool,
+) -> bool {
+    matches!(
+        outcome,
+        CatalogOutcome::KnownUncommitted { failure }
+            if failure.kind() == ConnectorMutationFailureKind::Conflict
+                && attempt + 1 < max_attempts
+                && !has_repartition
+    )
+}
+
 /// The summary properties the single external commit stamps onto its snapshot.
 ///
 /// Two things are recorded, and each exists because something later reads it
@@ -1344,6 +1392,7 @@ impl IcebergWriteSessionControl {
             .iter()
             .filter(|file| file.content == DataContentType::Data)
             .fold(0u64, |total, file| total.saturating_add(file.record_count));
+        let reusable = ReusableEagerWriteInputs::new(files, statistics);
         let snapshot_properties = match session_snapshot_properties(handle, staged_data_rows) {
             Ok(properties) => properties,
             Err(error) => {
@@ -1438,7 +1487,7 @@ impl IcebergWriteSessionControl {
                 )
                 .with_table_metadata(attempt_metadata.clone()),
             );
-            collector.inject_reusable_written_files(files.clone());
+            reusable.install_files(&collector);
             let commit_uuid = uuid::Uuid::new_v4();
             collector.set_manifest_cleanup_token(commit_uuid.to_string());
             let abort_handle = Arc::clone(&collector.abort_log);
@@ -1448,7 +1497,7 @@ impl IcebergWriteSessionControl {
             let file_io = table.file_io().clone();
             let target_ref = facts.target_ref().to_string();
             let snapshot_properties = snapshot_properties.clone();
-            let current_artifacts = statistics.clone();
+            let current_artifacts = reusable.statistics_for_attempt();
             let initial_updates = handle
                 .repartition()
                 .map_or_else(Vec::new, |prepared| prepared.metadata_updates().to_vec());
@@ -1598,6 +1647,12 @@ impl IcebergWriteSessionControl {
                     });
                 }
             };
+            let retry_conflict = permits_fresh_eager_attempt(
+                &catalog_outcome,
+                attempt,
+                MAX_ATTEMPTS,
+                handle.repartition().is_some(),
+            );
             match catalog_outcome {
                 CatalogOutcome::KnownCommitted {
                     effect,
@@ -1643,11 +1698,7 @@ impl IcebergWriteSessionControl {
                         finalization,
                     });
                 }
-                CatalogOutcome::KnownUncommitted { failure: rejected }
-                    if rejected.kind() == ConnectorMutationFailureKind::Conflict
-                        && attempt + 1 < MAX_ATTEMPTS
-                        && handle.repartition().is_none() =>
-                {
+                CatalogOutcome::KnownUncommitted { .. } if retry_conflict => {
                     cleanup_eager_logs(
                         self.runtime.as_ref(),
                         cleanup_fs.clone(),
@@ -3315,5 +3366,464 @@ mod statistics_contract_tests {
             "seven".into(),
         )]);
         assert!(validate_theta_properties(&non_numeric, 7.0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod eager_attempt_io_tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::catalog::CatalogTableName;
+    use crate::catalog::error::CatalogCommitEvidence;
+    use crate::catalog::transaction::{CatalogCommitDispatch, CommitProof, TransactionShape};
+    use crate::iceberg::io::{
+        FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, MemoryStorage, OutputFile,
+        Storage, StorageConfig, StorageFactory,
+    };
+    use crate::iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use crate::iceberg::spec::{
+        DataContentType, DataFileFormat, FormatVersion, NestedField, PartitionSpec, PrimitiveType,
+        Schema, SortOrder, Struct, TableMetadataBuilder, Type,
+    };
+    use crate::iceberg::{CatalogBuilder, Error as IcebergError, ErrorKind, TableIdent};
+
+    const DATA_PATH: &str = "memory://warehouse/db/t/data/already-written.parquet";
+
+    #[derive(Debug, Default)]
+    struct IoTrace {
+        data_input_opens: AtomicUsize,
+        data_exists_calls: AtomicUsize,
+        data_metadata_calls: AtomicUsize,
+        data_read_calls: AtomicUsize,
+        data_reader_calls: AtomicUsize,
+        written_paths: Mutex<Vec<String>>,
+    }
+
+    impl IoTrace {
+        fn is_data(&self, path: &str) -> bool {
+            path == DATA_PATH
+        }
+
+        fn observe_write(&self, path: &str) {
+            self.written_paths
+                .lock()
+                .expect("I/O trace lock")
+                .push(path.to_string());
+        }
+
+        fn assert_data_was_not_reopened(&self) {
+            assert_eq!(self.data_input_opens.load(Ordering::SeqCst), 0);
+            assert_eq!(self.data_exists_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(self.data_metadata_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(self.data_read_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(self.data_reader_calls.load(Ordering::SeqCst), 0);
+        }
+
+        fn attempt_derivative_counts(&self) -> (usize, usize) {
+            let paths = self.written_paths.lock().expect("I/O trace lock");
+            (
+                paths.iter().filter(|path| path.ends_with(".avro")).count(),
+                paths
+                    .iter()
+                    .filter(|path| path.ends_with(".puffin"))
+                    .count(),
+            )
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct CountingStorage {
+        inner: MemoryStorage,
+        #[serde(skip, default)]
+        trace: Arc<IoTrace>,
+    }
+
+    #[typetag::serde(name = "ncp8-counting-memory-storage")]
+    #[async_trait]
+    impl Storage for CountingStorage {
+        async fn exists(&self, path: &str) -> crate::iceberg::Result<bool> {
+            if self.trace.is_data(path) {
+                self.trace.data_exists_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.exists(path).await
+        }
+
+        async fn list_directories(&self, path: &str) -> crate::iceberg::Result<Vec<String>> {
+            self.inner.list_directories(path).await
+        }
+
+        async fn metadata(&self, path: &str) -> crate::iceberg::Result<FileMetadata> {
+            if self.trace.is_data(path) {
+                self.trace
+                    .data_metadata_calls
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.metadata(path).await
+        }
+
+        async fn read(&self, path: &str) -> crate::iceberg::Result<Bytes> {
+            if self.trace.is_data(path) {
+                self.trace.data_read_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.read(path).await
+        }
+
+        async fn reader(&self, path: &str) -> crate::iceberg::Result<Box<dyn FileRead>> {
+            if self.trace.is_data(path) {
+                self.trace.data_reader_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.reader(path).await
+        }
+
+        async fn write(&self, path: &str, bytes: Bytes) -> crate::iceberg::Result<()> {
+            self.trace.observe_write(path);
+            self.inner.write(path, bytes).await
+        }
+
+        async fn writer(&self, path: &str) -> crate::iceberg::Result<Box<dyn FileWrite>> {
+            self.trace.observe_write(path);
+            self.inner.writer(path).await
+        }
+
+        async fn delete(&self, path: &str) -> crate::iceberg::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn delete_prefix(&self, path: &str) -> crate::iceberg::Result<()> {
+            self.inner.delete_prefix(path).await
+        }
+
+        fn new_input(&self, path: &str) -> crate::iceberg::Result<InputFile> {
+            if self.trace.is_data(path) {
+                self.trace.data_input_opens.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+
+        fn new_output(&self, path: &str) -> crate::iceberg::Result<OutputFile> {
+            Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct CountingStorageFactory {
+        inner: MemoryStorage,
+        #[serde(skip, default)]
+        trace: Arc<IoTrace>,
+    }
+
+    #[typetag::serde(name = "ncp8-counting-memory-storage-factory")]
+    impl StorageFactory for CountingStorageFactory {
+        fn build(&self, _config: &StorageConfig) -> crate::iceberg::Result<Arc<dyn Storage>> {
+            Ok(Arc::new(CountingStorage {
+                inner: self.inner.clone(),
+                trace: Arc::clone(&self.trace),
+            }))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DispatchBehavior {
+        Conflict,
+        Commit,
+        LoseResponse,
+    }
+
+    #[derive(Debug)]
+    struct CountingDispatch {
+        behavior: DispatchBehavior,
+        dispatches: AtomicUsize,
+    }
+
+    impl CountingDispatch {
+        fn new(behavior: DispatchBehavior) -> Arc<Self> {
+            Arc::new(Self {
+                behavior,
+                dispatches: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CatalogCommitDispatch for CountingDispatch {
+        async fn dispatch_once(
+            &self,
+            staged: Option<crate::iceberg::TableCommit>,
+        ) -> Result<CommitProof, IcebergError> {
+            assert!(
+                staged.is_some(),
+                "an eager attempt must dispatch its staged commit"
+            );
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                DispatchBehavior::Conflict => Err(IcebergError::new(
+                    ErrorKind::CatalogCommitConflicts,
+                    "injected OCC conflict",
+                )),
+                DispatchBehavior::Commit => Ok(CommitProof::applied(Some(1))),
+                DispatchBehavior::LoseResponse => Err(IcebergError::new(
+                    ErrorKind::Unexpected,
+                    "injected lost response",
+                )),
+            }
+        }
+
+        async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
+            Ok(None)
+        }
+    }
+
+    struct Fixture {
+        table: crate::iceberg::table::Table,
+        catalog: crate::iceberg::MemoryCatalog,
+        reusable: ReusableEagerWriteInputs,
+        original_body_address: usize,
+        trace: Arc<IoTrace>,
+    }
+
+    async fn fixture() -> Fixture {
+        let trace = Arc::new(IoTrace::default());
+        let factory = Arc::new(CountingStorageFactory {
+            inner: MemoryStorage::new(),
+            trace: Arc::clone(&trace),
+        });
+        let file_io = FileIOBuilder::new(factory.clone()).build();
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://warehouse/db/t".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = crate::iceberg::table::Table::builder()
+            .identifier(TableIdent::from_strs(["db", "t"]).expect("identifier"))
+            .metadata(metadata)
+            .file_io(file_io)
+            .build()
+            .expect("table");
+        let catalog = MemoryCatalogBuilder::default()
+            .with_storage_factory(factory)
+            .load(
+                "counting",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "memory://warehouse".to_string(),
+                )]),
+            )
+            .await
+            .expect("memory catalog");
+        let body = Bytes::from_static(include_bytes!(
+            "../../../../../../tests/datasketches-tck/fixtures/theta/rust_quickselect_n1000_ordered_v3.sk"
+        ));
+        let original_body_address = body.as_ptr() as usize;
+        let statistics = normalized_theta_artifact(
+            StatisticsArtifactIdentity::try_new(
+                vec![1],
+                crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1,
+            )
+            .expect("statistics identity"),
+            body,
+        )
+        .expect("statistics artifact");
+        let file = WrittenFile {
+            path: DATA_PATH.to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count: 1_000,
+            file_size_in_bytes: 8_192,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        };
+        Fixture {
+            table,
+            catalog,
+            reusable: ReusableEagerWriteInputs::new(vec![file], vec![statistics]),
+            original_body_address,
+            trace,
+        }
+    }
+
+    struct StagedAttempt {
+        frontier: crate::catalog::transaction::Transaction,
+        snapshot_id: i64,
+        manifest_paths: Vec<String>,
+        puffin_path: String,
+        body_address: usize,
+    }
+
+    async fn stage_attempt(
+        fixture: &Fixture,
+        attempt: u8,
+        dispatch: Arc<CountingDispatch>,
+    ) -> StagedAttempt {
+        let table = fixture.table.clone();
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::FastAppend,
+                table.identifier().clone(),
+                None,
+                table.metadata().last_sequence_number(),
+                table.metadata().current_schema().clone(),
+                table.metadata().default_partition_spec().clone(),
+                "memory://warehouse/db/t/staging".to_string(),
+            )
+            .with_table_metadata(table.metadata().clone()),
+        );
+        fixture.reusable.install_files(&collector);
+        let abort_handle = Arc::clone(&collector.abort_log);
+        let commit_uuid = uuid::Uuid::from_bytes([attempt; 16]);
+        let properties = BTreeMap::new();
+        let (mut transaction, outcome) =
+            crate::commit::fast_append::stage_eager_fast_append(crate::commit::action::CommitCtx {
+                collector: &collector,
+                table: &table,
+                catalog: &fixture.catalog,
+                file_io: table.file_io(),
+                commit_uuid,
+                abort_handle,
+                target_ref: "main",
+                snapshot_properties: &properties,
+            })
+            .await
+            .expect("eager append stage");
+        let staged_metadata = transaction.staged_table().metadata().clone();
+        let artifacts = artifacts_for_staged_snapshot(
+            &table,
+            &staged_metadata,
+            "main",
+            CommitOpKind::FastAppend,
+            fixture.reusable.statistics_for_attempt(),
+        )
+        .await
+        .expect("statistics for staged snapshot");
+        assert_eq!(artifacts.len(), 1);
+        let body_address = artifacts[0].body().as_ptr() as usize;
+        let puffin_path = crate::stats_assembler::puffin_path_for_statistics_operation(
+            &staged_metadata,
+            outcome.new_snapshot_id,
+            [attempt; 16],
+        );
+        collector.abort_log.record_manifest(puffin_path.clone());
+        let statistics_file = crate::stats_assembler::write_puffin_artifacts(
+            table.file_io(),
+            &puffin_path,
+            outcome.new_snapshot_id,
+            staged_metadata.last_sequence_number(),
+            &artifacts,
+        )
+        .await
+        .expect("write attempt Puffin")
+        .expect("non-empty statistics file");
+        transaction = transaction
+            .update_statistics()
+            .set_statistics(statistics_file)
+            .apply(transaction)
+            .await
+            .expect("stage SetStatistics");
+        let mut commit = transaction.into_table_commit();
+        commit.add_requirement(crate::iceberg::TableRequirement::UuidMatch {
+            uuid: table.metadata().uuid(),
+        });
+        let mut frontier = crate::catalog::transaction::Transaction::new(
+            TransactionIdentity::new("eager-I/O-test", [attempt; 16]),
+            CatalogTableName::new("db", "t"),
+            TransactionShape::Existing,
+            CatalogCommitEvidence::for_target("db.t")
+                .with_commit_uuid(format!("attempt-{attempt}")),
+            dispatch,
+        );
+        frontier.stage(commit).expect("stage provider frontier");
+        StagedAttempt {
+            frontier,
+            snapshot_id: outcome.new_snapshot_id,
+            manifest_paths: outcome.written_manifest_paths,
+            puffin_path,
+            body_address,
+        }
+    }
+
+    #[tokio::test]
+    async fn conflict_fresh_attempt_reuses_data_and_computed_body_without_data_io() {
+        let fixture = fixture().await;
+        let conflict = CountingDispatch::new(DispatchBehavior::Conflict);
+        let mut first = stage_attempt(&fixture, 1, Arc::clone(&conflict)).await;
+        let first_outcome = first.frontier.commit().await;
+        assert!(permits_fresh_eager_attempt(&first_outcome, 0, 3, false));
+        assert_eq!(conflict.dispatches.load(Ordering::SeqCst), 1);
+
+        let committed = CountingDispatch::new(DispatchBehavior::Commit);
+        let mut fresh = stage_attempt(&fixture, 2, Arc::clone(&committed)).await;
+        let fresh_outcome = fresh.frontier.commit().await;
+        assert!(matches!(
+            fresh_outcome,
+            CatalogOutcome::KnownCommitted { .. }
+        ));
+        assert_eq!(committed.dispatches.load(Ordering::SeqCst), 1);
+
+        assert_ne!(first.snapshot_id, fresh.snapshot_id);
+        assert_ne!(first.manifest_paths, fresh.manifest_paths);
+        assert_ne!(first.puffin_path, fresh.puffin_path);
+        assert_eq!(first.body_address, fixture.original_body_address);
+        assert_eq!(fresh.body_address, fixture.original_body_address);
+        fixture.trace.assert_data_was_not_reopened();
+        let (manifest_writes, puffin_writes) = fixture.trace.attempt_derivative_counts();
+        assert!(
+            manifest_writes >= 4,
+            "each attempt must rebuild manifest metadata"
+        );
+        assert_eq!(
+            puffin_writes, 2,
+            "each attempt must rebuild one Puffin file"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_unknown_never_stages_or_dispatches_a_fresh_attempt() {
+        let fixture = fixture().await;
+        let lost = CountingDispatch::new(DispatchBehavior::LoseResponse);
+        let mut attempt = stage_attempt(&fixture, 7, Arc::clone(&lost)).await;
+        let before_unknown = fixture.trace.attempt_derivative_counts();
+        let outcome = attempt.frontier.commit().await;
+        assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
+        assert!(!permits_fresh_eager_attempt(&outcome, 0, 3, false));
+
+        let repeated = attempt.frontier.commit().await;
+        assert!(matches!(repeated, CatalogOutcome::CommitUnknown { .. }));
+        assert_eq!(lost.dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.trace.attempt_derivative_counts(), before_unknown);
+        fixture.trace.assert_data_was_not_reopened();
     }
 }

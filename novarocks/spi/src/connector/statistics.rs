@@ -38,8 +38,14 @@ use super::{
 /// are never executable code or BE runtime state.
 pub const MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES: usize = 64 * 1024;
 
-/// Maximum number of independently requested metrics in one provider call.
-pub const MAX_CONNECTOR_STATISTICS_METRICS: usize = 1024;
+/// Maximum number of columns addressed by one statistics operation.
+pub const MAX_CONNECTOR_STATISTICS_COLUMNS: usize = 1024;
+
+/// Maximum number of independently requested column metrics in one provider
+/// read. Each bounded column can request every currently defined column metric;
+/// a request may additionally contain the single table-level
+/// [`StatisticsMetric::RowCount`] metric.
+pub const MAX_CONNECTOR_STATISTICS_METRICS: usize = MAX_CONNECTOR_STATISTICS_COLUMNS * 5;
 
 /// Maximum number of provider artifacts produced by one statistics session.
 pub const MAX_CONNECTOR_STATISTICS_ARTIFACTS: usize = 4096;
@@ -132,10 +138,33 @@ impl StatisticsMetricRequest {
                 "statistics metric request must not be empty",
             ));
         }
-        if metrics.len() > MAX_CONNECTOR_STATISTICS_METRICS {
+        let column_metrics = metrics.iter().filter_map(metric_column);
+        let column_metric_count = column_metrics.clone().count();
+        if column_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
-                "statistics metric request exceeds the metric limit",
+                "statistics metric request exceeds the column metric limit",
+            ));
+        }
+        if metrics
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != metrics.len()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "statistics metric request contains a duplicate metric",
+            ));
+        }
+        if column_metrics
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > MAX_CONNECTOR_STATISTICS_COLUMNS
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "statistics metric request exceeds the column limit",
             ));
         }
         for metric in &metrics {
@@ -168,10 +197,10 @@ pub enum StatisticsColumnSelection {
 
 impl StatisticsColumnSelection {
     pub fn explicit(columns: Vec<Arc<str>>) -> Result<Self, ConnectorError> {
-        if columns.len() > MAX_CONNECTOR_STATISTICS_METRICS {
+        if columns.len() > MAX_CONNECTOR_STATISTICS_COLUMNS {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
-                "statistics column selection exceeds the metric limit",
+                "statistics column selection exceeds the column limit",
             ));
         }
         let mut normalized = std::collections::BTreeSet::new();
@@ -207,7 +236,7 @@ impl StatisticsArtifactIdentity {
     ) -> Result<Self, ConnectorError> {
         let blob_type = blob_type.into();
         if input_fields.is_empty()
-            || input_fields.len() > MAX_CONNECTOR_STATISTICS_METRICS
+            || input_fields.len() > MAX_CONNECTOR_STATISTICS_COLUMNS
             || input_fields.iter().any(|field_id| *field_id <= 0)
         {
             return Err(ConnectorError::new(
@@ -379,7 +408,7 @@ impl StatisticsCollectionStart {
         required_aggregations: Vec<StatisticsRequiredAggregation>,
         session: Box<dyn StatisticsCollectionSession>,
     ) -> Result<Self, ConnectorError> {
-        if required_aggregations.len() > MAX_CONNECTOR_STATISTICS_METRICS {
+        if required_aggregations.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "statistics aggregation requirement count exceeds the metric limit",

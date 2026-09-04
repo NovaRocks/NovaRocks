@@ -22,10 +22,10 @@ use novarocks_spi::connector::{
     ConnectorMvMetadataOnlyProvenance, ConnectorProviderId, ConnectorRefAction,
     ConnectorRefreshPublicationGuard, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
     ConnectorTableHandle, ConnectorTableObjectId, ExternalMutationEvidence, LakePublicationId,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
-    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
-    ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsMetric,
-    StatisticsMetricRequest,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_COLUMNS,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, ProviderBindingEpoch, StatisticsDataVersion,
+    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -327,13 +327,57 @@ fn statistics_metric_request_requires_a_bounded_nonempty_typed_selection() {
             .kind(),
         ConnectorErrorKind::InvalidRequest
     );
+    let bounded_wide_request = std::iter::once(StatisticsMetric::RowCount)
+        .chain(
+            (0..MAX_CONNECTOR_STATISTICS_COLUMNS).map(|index| StatisticsMetric::ThetaNdv {
+                column: Arc::from(format!("c{index}")),
+            }),
+        )
+        .collect();
+    StatisticsMetricRequest::try_new(bounded_wide_request)
+        .expect("one table metric plus the maximum column metrics must fit");
+
+    let mut all_metrics_wide_request = Vec::with_capacity(1 + MAX_CONNECTOR_STATISTICS_METRICS);
+    all_metrics_wide_request.push(StatisticsMetric::RowCount);
+    for index in 0..MAX_CONNECTOR_STATISTICS_COLUMNS {
+        let column: Arc<str> = Arc::from(format!("c{index}"));
+        all_metrics_wide_request.extend([
+            StatisticsMetric::NullCount {
+                column: Arc::clone(&column),
+            },
+            StatisticsMetric::Minimum {
+                column: Arc::clone(&column),
+            },
+            StatisticsMetric::Maximum {
+                column: Arc::clone(&column),
+            },
+            StatisticsMetric::AverageSize {
+                column: Arc::clone(&column),
+            },
+            StatisticsMetric::ThetaNdv { column },
+        ]);
+    }
+    StatisticsMetricRequest::try_new(all_metrics_wide_request)
+        .expect("every metric for the maximum column count must fit");
+
+    let oversized_column_request = (0..=MAX_CONNECTOR_STATISTICS_COLUMNS)
+        .map(|index| StatisticsMetric::ThetaNdv {
+            column: Arc::from(format!("c{index}")),
+        })
+        .collect();
+    assert_eq!(
+        StatisticsMetricRequest::try_new(oversized_column_request)
+            .expect_err("oversized column metric request must fail")
+            .kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
     assert_eq!(
         StatisticsMetricRequest::try_new(vec![
-            StatisticsMetric::RowCount;
-            MAX_CONNECTOR_STATISTICS_METRICS + 1
+            StatisticsMetric::RowCount,
+            StatisticsMetric::RowCount,
         ])
-        .expect_err("oversized statistics request must fail")
+        .expect_err("duplicate table metrics must fail")
         .kind(),
-        ConnectorErrorKind::ResourceExhausted
+        ConnectorErrorKind::InvalidRequest
     );
 }

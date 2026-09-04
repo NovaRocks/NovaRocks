@@ -315,6 +315,11 @@ pub struct QueryMeta {
     /// One bounded runner-owned fault for the next matching standard Iceberg
     /// REST publication request. The SQL case never names an operation id.
     pub publication_catalog_fault: Option<PublicationCatalogFaultDirective>,
+    /// One cross-engine shell command executed only after a matching
+    /// before-dispatch publication hold has been reached. This is kept
+    /// separate from the primary SQL so the runner can establish an exact OCC
+    /// interleaving without sleeps.
+    pub publication_catalog_concurrent_shell: Option<String>,
     /// Kill and restart FE after an MV lake publication is known committed but
     /// before the Accelerator projector can CAS its local projection.
     pub kill_fe_after_mv_known_committed_before_projector_cas: bool,
@@ -447,6 +452,10 @@ impl PublicationCatalogAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationCatalogFault {
     BeforeDispatch,
+    /// Hold before forwarding the matching REST request, run the SQL case's
+    /// cross-engine companion, then forward the original request. This freezes
+    /// the NovaRocks attempt before the companion advances the Iceberg table.
+    BeforeDispatchHoldForConcurrentShell,
     AfterCommitBeforeResponse,
     /// Hold the downstream-successful response until the runner has killed
     /// the frontend while the issuing statement is still in flight.
@@ -461,6 +470,9 @@ impl PublicationCatalogFault {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::BeforeDispatch => "before-dispatch",
+            Self::BeforeDispatchHoldForConcurrentShell => {
+                "before-dispatch-hold-for-concurrent-shell"
+            }
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
             Self::IncompleteDiscovery => "incomplete-discovery",
@@ -470,6 +482,10 @@ impl PublicationCatalogFault {
 
     pub const fn requires_inflight_frontend_kill(self) -> bool {
         matches!(self, Self::AfterCommitHoldForFrontendKill)
+    }
+
+    pub const fn requires_concurrent_shell(self) -> bool {
+        matches!(self, Self::BeforeDispatchHoldForConcurrentShell)
     }
 }
 
