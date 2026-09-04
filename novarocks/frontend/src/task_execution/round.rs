@@ -39,7 +39,9 @@ use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
 use super::intent::OperationAcknowledgement;
 use super::remote_task::RemoteTaskState;
-use crate::native::task_transport::{TaskAckIntake, TaskStatusSubscriber};
+use crate::native::task_transport::{
+    SubscriptionState, TaskAckIntake, TaskStatusSubscriber,
+};
 
 /// Something that must see every acknowledgement this runner settles.
 ///
@@ -102,6 +104,16 @@ pub(crate) trait StatusSubscriptions: Send + Sync {
         context: QueryContextRef,
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String>;
+
+    /// The subscription's state once it has settled somewhere resubscribing
+    /// cannot repair, and `None` while it can still recover.
+    ///
+    /// A backend whose process is gone stops answering: its stream breaks, the
+    /// bounded resubscription budget runs out, and the state settles. Nothing
+    /// else in the attempt is obliged to notice, so reporting it here is what
+    /// lets the round decide the attempt on transport evidence instead of
+    /// leaving it to a statement deadline.
+    fn settled_fatally(&self, context: QueryContextRef) -> Option<SubscriptionState>;
 }
 
 impl StatusSubscriptions for TaskStatusSubscriber {
@@ -111,6 +123,10 @@ impl StatusSubscriptions for TaskStatusSubscriber {
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String> {
         Self::ensure(self, context, cursors)
+    }
+
+    fn settled_fatally(&self, context: QueryContextRef) -> Option<SubscriptionState> {
+        Self::state(self, context).filter(|state| state.is_fatal())
     }
 }
 
@@ -302,6 +318,16 @@ impl TaskRound {
             self.subscriber
                 .ensure(context, cursors)
                 .map_err(TaskExecutionError::Schedule)?;
+            // A settled subscription is this attempt's evidence that the
+            // backend process is gone. It is read after `ensure` on purpose:
+            // `ensure` is what restarts a stream that can still recover, so
+            // asking first would report a state the very next call repairs.
+            if let Some(state) = self.subscriber.settled_fatally(context) {
+                return Err(TaskExecutionError::ParticipantUnobservable {
+                    backend: context.backend_process_id(),
+                    state: state.as_str(),
+                });
+            }
         }
 
         Ok(report)

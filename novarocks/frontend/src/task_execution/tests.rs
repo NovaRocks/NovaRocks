@@ -1947,6 +1947,9 @@ fn an_accepted_create_without_its_receipt_is_refused() {
 #[derive(Debug, Default)]
 struct RecordingSubscriptions {
     ensured: Mutex<Vec<(QueryContextRef, usize)>>,
+    /// What a settled subscription reports, so a test can put a backend out
+    /// of observation without a transport.
+    settled: Mutex<Option<crate::native::task_transport::SubscriptionState>>,
 }
 
 impl crate::task_execution::round::StatusSubscriptions for RecordingSubscriptions {
@@ -1960,6 +1963,18 @@ impl crate::task_execution::round::StatusSubscriptions for RecordingSubscription
             .expect("subscription ledger")
             .push((context, cursors.len()));
         Ok(())
+    }
+
+    fn settled_fatally(
+        &self,
+        _context: QueryContextRef,
+    ) -> Option<crate::native::task_transport::SubscriptionState> {
+        // The fake owes the trait's contract, not just its shape: a state
+        // resubscribing can still repair is not something to report.
+        self.settled
+            .lock()
+            .expect("settled subscription")
+            .filter(|state| state.is_fatal())
     }
 }
 
@@ -2136,6 +2151,67 @@ fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
     subscribed.sort_unstable();
     subscribed.dedup();
     assert_eq!(subscribed.len(), contexts);
+}
+
+/// The defect this catches: `SubscriptionState::is_fatal` was computed and
+/// never consumed, so nothing in the attempt noticed a backend it could no
+/// longer observe. A lease renewal that cannot reach a dead process
+/// classifies as a retryable transport unknown and is retried, an exchange
+/// peer fails only if it happens to have one, and a root task on a surviving
+/// backend simply blocks. Measured on 1FE+3BE: killing one of three backends
+/// left a distributed SELECT hanging for the full 30 s step budget whenever
+/// the killed process did not host the root task; with this it fails in
+/// under three seconds and names the backend.
+#[test]
+fn a_backend_whose_subscription_settled_fatally_fails_the_attempt_by_name() {
+    use crate::native::task_transport::{SubscriptionState, TaskAckIntake};
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let harness = Harness::from_graph(graph);
+    let sink = Arc::clone(&harness.sink);
+    let wake = Arc::clone(&harness.wake);
+    let subscriptions = Arc::new(RecordingSubscriptions::default());
+    let intake = TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>);
+    let acks = intake.handle();
+
+    let mut round = TaskRound::new(
+        harness.execution,
+        intake,
+        Box::new(FakeEstablish),
+        Arc::clone(&subscriptions) as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+    round.seal_pumps();
+
+    round.turn().expect("a turn on a fresh attempt");
+    for intent in released_establishes(&sink) {
+        acks.publish(establish_ack(&intent));
+    }
+    round
+        .turn()
+        .expect("a turn that settles every establish and subscribes");
+
+    // A state resubscribing can still repair is not evidence of anything.
+    *subscriptions.settled.lock().expect("settled") = Some(SubscriptionState::Resubscribing);
+    round
+        .turn()
+        .expect("a recoverable subscription decides nothing");
+
+    // One that has settled is.
+    *subscriptions.settled.lock().expect("settled") = Some(SubscriptionState::BudgetExhausted);
+    let error = round
+        .turn()
+        .expect_err("a backend out of observation fails the attempt");
+    let TaskExecutionError::ParticipantUnobservable { backend, state } = error else {
+        panic!("expected an unobservable participant, got {error:?}");
+    };
+    assert_eq!(state, "budget_exhausted");
+    assert!(
+        processes.values().any(|process| *process == backend),
+        "the failure has to name a backend of this attempt, got {backend}"
+    );
 }
 
 #[test]

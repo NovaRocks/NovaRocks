@@ -92,6 +92,21 @@ pub enum TaskExecutionError {
     /// A fetched final task info contradicts the terminal status this attempt
     /// already observed.
     FinalInfo(FinalInfoDisagreement),
+    /// A backend's status subscription settled somewhere resubscribing cannot
+    /// repair, so this attempt has no observation of that backend left.
+    ///
+    /// This is the transport evidence that decides an attempt whose backend
+    /// process is gone. Nothing else in the attempt is obliged to notice one:
+    /// a lease renewal that cannot reach the process classifies as a
+    /// retryable transport unknown and is retried, an exchange peer fails only
+    /// if it happens to have one, and a root task on a surviving backend
+    /// simply blocks. Measured before this existed: killing one of three
+    /// backends left a distributed SELECT hanging until its statement
+    /// deadline whenever the killed process did not host the root task.
+    ParticipantUnobservable {
+        backend: BackendProcessId,
+        state: &'static str,
+    },
 }
 
 /// Which transport capacity bound was reached.
@@ -225,6 +240,10 @@ impl fmt::Display for TaskExecutionError {
                 write!(formatter, "root result stream is not intact: {verdict}")
             }
             Self::FinalInfo(disagreement) => write!(formatter, "{disagreement}"),
+            Self::ParticipantUnobservable { backend, state } => write!(
+                formatter,
+                "backend {backend} is no longer observable: task status subscription {state}"
+            ),
         }
     }
 }
