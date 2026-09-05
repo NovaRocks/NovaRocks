@@ -1235,10 +1235,6 @@ impl ProcessorOperator for AggregateProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn has_passive_ready_work(&self) -> bool {
-        self.pending_output.is_some()
-    }
-
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         let result = (|| {
             if self.finished {

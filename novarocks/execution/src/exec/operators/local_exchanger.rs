@@ -103,6 +103,7 @@ struct LocalExchangerSpillState {
     restore_inflight: AtomicBool,
     restore_blocked: AtomicBool,
     spill_files: Mutex<Vec<VecDeque<SpillFileEntry>>>,
+    capacity_forwarding_installed: OnceLock<()>,
 }
 
 impl LocalExchangerSpillState {
@@ -127,6 +128,7 @@ impl LocalExchangerSpillState {
             restore_inflight: AtomicBool::new(false),
             restore_blocked: AtomicBool::new(false),
             spill_files: Mutex::new(spill_files),
+            capacity_forwarding_installed: OnceLock::new(),
         }
     }
 }
@@ -343,24 +345,10 @@ impl LocalExchanger {
     }
 
     pub(crate) fn source_observable(&self) -> Arc<Observable> {
-        if let Some(spill) = self.spill_state()
-            && spill.restore_blocked.load(Ordering::Acquire)
-        {
-            spill.channel.register_capacity_waiter();
-            spill.restore_blocked.store(false, Ordering::Release);
-            return spill.channel.capacity_observable();
-        }
         Arc::clone(&self.source_observable)
     }
 
     pub(crate) fn sink_observable(&self) -> Arc<Observable> {
-        if let Some(spill) = self.spill_state()
-            && spill.spill_blocked.load(Ordering::Acquire)
-        {
-            spill.channel.register_capacity_waiter();
-            spill.spill_blocked.store(false, Ordering::Release);
-            return spill.channel.capacity_observable();
-        }
         Arc::clone(&self.sink_observable)
     }
 
@@ -467,6 +455,7 @@ impl LocalExchanger {
         state: &RuntimeState,
     ) -> Result<Option<Arc<LocalExchangerSpillState>>, String> {
         if let Some(existing) = self.spill_state.get() {
+            self.ensure_spill_capacity_forwarding(existing);
             return Ok(Some(Arc::clone(existing)));
         }
         let Some(config) = state.spill_config().cloned() else {
@@ -492,8 +481,43 @@ impl LocalExchanger {
             manager.profile(),
             self.partition_count,
         ));
-        let _ = self.spill_state.set(Arc::clone(&spill_state));
-        Ok(self.spill_state())
+        let installed = self.spill_state.get_or_init(|| spill_state);
+        self.ensure_spill_capacity_forwarding(installed);
+        Ok(Some(Arc::clone(installed)))
+    }
+
+    fn ensure_spill_capacity_forwarding(&self, spill: &Arc<LocalExchangerSpillState>) {
+        spill.capacity_forwarding_installed.get_or_init(|| {
+            let capacity = spill.channel.capacity_observable();
+            self.forward_spill_capacity(spill, &capacity);
+        });
+    }
+
+    fn forward_spill_capacity(
+        &self,
+        spill: &Arc<LocalExchangerSpillState>,
+        capacity: &Arc<Observable>,
+    ) {
+        // Capacity recovery is a state transition, not merely a wakeup. Clear
+        // the matching blocked latch before notifying the stable operator-facing
+        // observable so the resumed driver can retry submission. Keep every
+        // callback edge weak because the capacity observable is owned by spill.
+        let spill = Arc::downgrade(spill);
+        let source = Arc::downgrade(&self.source_observable);
+        let sink = Arc::downgrade(&self.sink_observable);
+        capacity.add_observer(Arc::new(move || {
+            let Some(spill) = spill.upgrade() else {
+                return;
+            };
+            let restore_ready = spill.restore_blocked.swap(false, Ordering::AcqRel);
+            let spill_ready = spill.spill_blocked.swap(false, Ordering::AcqRel);
+            if restore_ready && let Some(source) = source.upgrade() {
+                source.notify_observers();
+            }
+            if spill_ready && let Some(sink) = sink.upgrade() {
+                sink.notify_observers();
+            }
+        }));
     }
 
     fn maybe_schedule_spill(self: &Arc<Self>, state: &RuntimeState) -> Result<(), String> {
@@ -970,4 +994,219 @@ pub(crate) struct LocalExchangeStats {
     pub exchange_id: usize,
     pub remaining_producers: usize,
     pub partitions: Vec<LocalExchangePartitionStats>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::time::Duration;
+
+    use arrow::datatypes::Schema;
+
+    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::operators::local_exchange_source::LocalExchangeSourceFactory;
+    use crate::exec::pipeline::operator_factory::OperatorFactory;
+    use crate::exec::spill::block_manager::{BlockHeader, BlockMeta};
+    use crate::exec::spill::ipc_serde::SpillCodec;
+
+    fn exchanger() -> Arc<LocalExchanger> {
+        LocalExchanger::new(
+            1,
+            1,
+            LocalExchangePartitionSpec::Single,
+            Arc::new(ExprArena::default()),
+        )
+    }
+
+    fn spill_config() -> SpillConfig {
+        SpillConfig {
+            enable_spill: true,
+            spill_mode: SpillMode::Force,
+            spill_mem_limit_threshold: None,
+            spill_operator_min_bytes: None,
+            spill_operator_max_bytes: None,
+            spill_encode_level: None,
+            enable_spill_buffer_read: None,
+            max_spill_read_buffer_bytes_per_driver: None,
+            spill_mem_table_size: None,
+            spill_mem_table_num: None,
+        }
+    }
+
+    fn install_spill_state(
+        exchanger: &Arc<LocalExchanger>,
+        channel: SpillChannelHandle,
+    ) -> Arc<LocalExchangerSpillState> {
+        let spill = Arc::new(LocalExchangerSpillState::new(
+            spill_config(),
+            Arc::new(Spiller::new()),
+            channel,
+            None,
+            1,
+        ));
+        assert!(exchanger.spill_state.set(Arc::clone(&spill)).is_ok());
+        exchanger.ensure_spill_capacity_forwarding(&spill);
+        spill
+    }
+
+    fn saturate_channel(channel: &SpillChannelHandle) -> (Sender<()>, Sender<()>, Receiver<()>) {
+        let (release_active_tx, release_active_rx) = mpsc::channel();
+        let (active_tx, active_rx) = mpsc::channel();
+        channel
+            .submit(Box::new(move || {
+                active_tx.send(()).expect("active task signal");
+                release_active_rx.recv().expect("release active task");
+                Ok(())
+            }))
+            .expect("submit active task");
+        active_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("active task started");
+
+        let (release_queued_tx, release_queued_rx) = mpsc::channel();
+        let (queued_tx, queued_rx) = mpsc::channel();
+        channel
+            .submit(Box::new(move || {
+                queued_tx.send(()).expect("queued task signal");
+                release_queued_rx.recv().expect("release queued task");
+                Ok(())
+            }))
+            .expect("fill spill queue");
+        (release_active_tx, release_queued_tx, queued_rx)
+    }
+
+    fn fake_spill_entry() -> SpillFileEntry {
+        SpillFileEntry {
+            schema: Arc::new(Schema::empty()),
+            chunk_schema: Arc::new(ChunkSchema::empty()),
+            file: SpillFile {
+                path: PathBuf::from("missing-local-exchange-spill-file"),
+                meta: BlockMeta {
+                    header: BlockHeader::new(SpillCodec::None, 0),
+                    index: Vec::new(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn observable_identity_is_stable_for_the_exchanger_lifetime() {
+        let exchanger = exchanger();
+        let source = exchanger.source_observable();
+        let sink = exchanger.sink_observable();
+
+        assert!(Arc::ptr_eq(&source, &exchanger.source_observable()));
+        assert!(Arc::ptr_eq(&sink, &exchanger.sink_observable()));
+        assert!(!Arc::ptr_eq(&source, &sink));
+    }
+
+    #[test]
+    fn spill_capacity_clears_blocked_latches_before_waking_stable_observables() {
+        let exchanger = exchanger();
+        let spill = install_spill_state(&exchanger, SpillChannelHandle::new_with_limits(1, 1));
+        let source = exchanger.source_observable();
+        let sink = exchanger.sink_observable();
+        spill.restore_blocked.store(true, Ordering::Release);
+        spill.spill_blocked.store(true, Ordering::Release);
+        let source_generation = source.generation();
+        let sink_generation = sink.generation();
+
+        spill.channel.capacity_observable().notify_observers();
+
+        assert!(!spill.restore_blocked.load(Ordering::Acquire));
+        assert!(!spill.spill_blocked.load(Ordering::Acquire));
+        assert_eq!(source.generation(), source_generation + 1);
+        assert_eq!(sink.generation(), sink_generation + 1);
+        assert!(Arc::ptr_eq(&source, &exchanger.source_observable()));
+        assert!(Arc::ptr_eq(&sink, &exchanger.sink_observable()));
+    }
+
+    #[test]
+    fn restore_retries_after_spill_capacity_recovers() {
+        let exchanger = exchanger();
+        let channel = SpillChannelHandle::new_with_limits(1, 1);
+        let spill = install_spill_state(&exchanger, channel.clone());
+        spill.spill_files.lock().expect("spill files lock")[0].push_back(fake_spill_entry());
+        let (release_active, release_queued, queued_started) = saturate_channel(&channel);
+
+        exchanger.maybe_schedule_restore(&RuntimeState::default(), 0);
+        assert!(spill.restore_blocked.load(Ordering::Acquire));
+        assert!(!spill.restore_inflight.load(Ordering::Acquire));
+
+        let source = exchanger.source_observable();
+        let (woken_tx, woken_rx) = mpsc::channel();
+        source.add_observer(Arc::new(move || {
+            let _ = woken_tx.send(());
+        }));
+        release_active.send(()).expect("release active task");
+        queued_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued task started");
+        woken_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("restore capacity wake");
+
+        let factory = LocalExchangeSourceFactory::new(1, 1, Arc::clone(&exchanger));
+        let mut source_operator = factory.create(1, 0);
+        assert!(
+            source_operator
+                .as_processor_ref()
+                .expect("source processor")
+                .has_output()
+        );
+        assert!(
+            source_operator
+                .as_processor_mut()
+                .expect("source processor")
+                .pull_chunk(&RuntimeState::default())
+                .expect("pull local exchange")
+                .is_none()
+        );
+        assert!(spill.restore_inflight.load(Ordering::Acquire));
+        assert!(!spill.restore_blocked.load(Ordering::Acquire));
+
+        release_queued.send(()).expect("release queued task");
+    }
+
+    #[test]
+    fn spill_retries_after_spill_capacity_recovers() {
+        let exchanger = exchanger();
+        let channel = SpillChannelHandle::new_with_limits(1, 1);
+        let spill = install_spill_state(&exchanger, channel.clone());
+        exchanger
+            .inner
+            .lock()
+            .expect("local exchanger lock")
+            .partitions[0]
+            .push_back(Chunk::default());
+        exchanger.memory_manager.update_memory_usage(1, 0);
+        let (release_active, release_queued, queued_started) = saturate_channel(&channel);
+
+        exchanger
+            .schedule_spill_if_needed(Arc::clone(&spill))
+            .expect("initial spill scheduling");
+        assert!(spill.spill_blocked.load(Ordering::Acquire));
+        assert!(!spill.spill_inflight.load(Ordering::Acquire));
+
+        let sink = exchanger.sink_observable();
+        let (woken_tx, woken_rx) = mpsc::channel();
+        sink.add_observer(Arc::new(move || {
+            let _ = woken_tx.send(());
+        }));
+        release_active.send(()).expect("release active task");
+        queued_started
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued task started");
+        woken_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("spill capacity wake");
+
+        assert!(!exchanger.need_input());
+        assert!(spill.spill_inflight.load(Ordering::Acquire));
+        assert!(!spill.spill_blocked.load(Ordering::Acquire));
+
+        release_queued.send(()).expect("release queued task");
+    }
 }

@@ -70,8 +70,9 @@ use crate::exec::operators::aggregate::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 use crate::exec::operators::unpivot_processor::UnpivotProcessorFactory;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{Operator, ProcessorOperator, forward_observable};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -161,6 +162,8 @@ impl TableFinishOperatorFactory {
             profiles: None,
             runtime_error: None,
             final_aggregate_blocked_time: BlockedDuration::default(),
+            source_observable: Arc::new(Observable::new()),
+            sink_observable: Arc::new(Observable::new()),
         }
     }
 }
@@ -431,9 +434,28 @@ struct TableFinishOperator {
     profiles: Option<OperatorProfiles>,
     runtime_error: Option<Arc<RuntimeErrorState>>,
     final_aggregate_blocked_time: BlockedDuration,
+    source_observable: Arc<Observable>,
+    sink_observable: Arc<Observable>,
 }
 
 impl TableFinishOperator {
+    fn install_aggregate(&mut self, aggregate: Box<dyn Operator>) {
+        if let Some(processor) = aggregate.as_processor_ref() {
+            if let Some(observable) = processor.source_observable() {
+                forward_observable(&observable, &self.source_observable);
+            }
+            if let Some(observable) = processor.sink_observable() {
+                forward_observable(&observable, &self.sink_observable);
+            }
+        }
+        self.aggregate = Some(aggregate);
+    }
+
+    fn install_grouped_unpivot(&mut self, driver: GroupedUnpivotDriver) {
+        forward_observable(&driver.source_observable(), &self.source_observable);
+        self.grouped_unpivot = Some(driver);
+    }
+
     fn release_buffer(&mut self) {
         self.fragments.clear();
         self.prefix_output = None;
@@ -674,7 +696,7 @@ impl TableFinishOperator {
                 ));
             }
         }
-        self.grouped_unpivot = Some(driver);
+        self.install_grouped_unpivot(driver);
         Ok(())
     }
 
@@ -720,20 +742,6 @@ impl TableFinishOperator {
 
     fn finish_final_aggregate_blocked_interval(&self) {
         self.final_aggregate_blocked_time.observe(false);
-    }
-
-    fn passive_ready_work_available(&self) -> bool {
-        let aggregate_ready = self.aggregate.as_ref().is_some_and(|aggregate| {
-            aggregate.is_finished()
-                || aggregate
-                    .as_processor_ref()
-                    .is_some_and(ProcessorOperator::has_passive_ready_work)
-        });
-        self.runtime_error().is_some()
-            || (self.phase == FinishPhase::Producing
-                && (self.prefix_output.is_some()
-                    || self.grouped_unpivot.is_some()
-                    || aggregate_ready))
     }
 
     fn sync_metrics(&self) {
@@ -827,6 +835,7 @@ struct GroupedUnpivotDriver {
     mappings: BTreeMap<u32, Vec<WriterGroupedUnpivotMapping>>,
     active: Option<Box<dyn Operator>>,
     tracker: Option<Arc<MemTracker>>,
+    source_observable: Arc<Observable>,
 }
 
 impl GroupedUnpivotDriver {
@@ -891,7 +900,18 @@ impl GroupedUnpivotDriver {
             mappings,
             active: None,
             tracker,
+            source_observable: Arc::new(Observable::new()),
         })
+    }
+
+    fn install_active(&mut self, active: Box<dyn Operator>) {
+        if let Some(observable) = active
+            .as_processor_ref()
+            .and_then(ProcessorOperator::source_observable)
+        {
+            forward_observable(&observable, &self.source_observable);
+        }
+        self.active = Some(active);
     }
 
     fn targets(&self) -> impl Iterator<Item = u32> + '_ {
@@ -990,7 +1010,7 @@ impl GroupedUnpivotDriver {
             .ok_or_else(|| "table finish grouped Unpivot is not a processor".to_string())?;
         processor.push_chunk(state, self.final_chunk.slice(row, 1))?;
         processor.set_finishing(state)?;
-        self.active = Some(active);
+        self.install_active(active);
         Ok(true)
     }
 
@@ -1019,13 +1039,8 @@ impl GroupedUnpivotDriver {
         self.next_row == self.rows.len() && self.active.is_none()
     }
 
-    fn source_observable(
-        &self,
-    ) -> Option<Arc<crate::exec::pipeline::schedule::observer::Observable>> {
-        self.active
-            .as_ref()
-            .and_then(|active| active.as_processor_ref())
-            .and_then(ProcessorOperator::source_observable)
+    fn source_observable(&self) -> Arc<Observable> {
+        Arc::clone(&self.source_observable)
     }
 }
 
@@ -1199,7 +1214,7 @@ impl Operator for TableFinishOperator {
         }
         aggregate.prepare()?;
         aggregate.bind_runtime_state(state)?;
-        self.aggregate = Some(aggregate);
+        self.install_aggregate(aggregate);
         Ok(())
     }
 
@@ -1275,23 +1290,25 @@ impl ProcessorOperator for TableFinishOperator {
 
     /// Nothing is available before every sender reached EOS.
     fn has_output(&self) -> bool {
+        let aggregate_ready = self.aggregate.as_ref().is_some_and(|aggregate| {
+            aggregate.is_finished()
+                || aggregate
+                    .as_processor_ref()
+                    .is_some_and(ProcessorOperator::has_output)
+        });
         let producing = self.phase == FinishPhase::Producing;
         let other_output = self.prefix_output.is_some() || self.grouped_unpivot.is_some();
         if producing {
             self.final_aggregate_blocked_time.observe(
                 !other_output
                     && self.aggregate.is_some()
-                    && !self.passive_ready_work_available()
+                    && !aggregate_ready
                     && self.runtime_error().is_none(),
             );
         } else if self.phase != FinishPhase::Consuming {
             self.finish_final_aggregate_blocked_interval();
         }
-        self.passive_ready_work_available()
-    }
-
-    fn has_passive_ready_work(&self) -> bool {
-        self.passive_ready_work_available()
+        self.runtime_error().is_some() || (producing && (other_output || aggregate_ready))
     }
 
     fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
@@ -1522,28 +1539,16 @@ impl ProcessorOperator for TableFinishOperator {
         if self.phase != FinishPhase::Consuming {
             return None;
         }
-        self.aggregate
-            .as_ref()
-            .and_then(|aggregate| aggregate.as_processor_ref())
-            .and_then(ProcessorOperator::sink_observable)
+        Some(Arc::clone(&self.sink_observable))
     }
 
     fn source_observable(
         &self,
     ) -> Option<Arc<crate::exec::pipeline::schedule::observer::Observable>> {
-        match self.phase {
-            FinishPhase::Finalizing | FinishPhase::Producing => self
-                .grouped_unpivot
-                .as_ref()
-                .and_then(GroupedUnpivotDriver::source_observable)
-                .or_else(|| {
-                    self.aggregate
-                        .as_ref()
-                        .and_then(|aggregate| aggregate.as_processor_ref())
-                        .and_then(ProcessorOperator::source_observable)
-                }),
-            _ => None,
+        if matches!(self.phase, FinishPhase::Failed | FinishPhase::Finished) {
+            return None;
         }
+        Some(Arc::clone(&self.source_observable))
     }
 }
 
@@ -2894,7 +2899,7 @@ mod tests {
         let mut operator = factory.create_operator(1, 0);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.aggregate = Some(Box::new(ScriptedFinalAggregate::new(
+        operator.install_aggregate(Box::new(ScriptedFinalAggregate::new(
             final_batches,
             true,
             true,
@@ -2980,19 +2985,33 @@ mod tests {
         operator.set_profiles(profiles.clone());
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.aggregate = Some(Box::new(scripted));
+        operator.install_aggregate(Box::new(scripted));
 
         assert!(
             !operator.need_input(),
             "blocked child must stop Gather input"
         );
+        let source_identity = operator
+            .source_observable()
+            .expect("stable source observable while consuming");
+        let sink_identity = operator
+            .sink_observable()
+            .expect("stable sink observable while consuming");
         assert!(Arc::ptr_eq(
-            &operator.sink_observable().expect("sink observable"),
-            &observable
+            &source_identity,
+            &operator.source_observable().expect("source identity")
         ));
+        assert!(Arc::ptr_eq(
+            &sink_identity,
+            &operator.sink_observable().expect("sink identity")
+        ));
+        let source_generation = source_identity.generation();
+        let sink_generation = sink_identity.generation();
         std::thread::sleep(Duration::from_millis(1));
         accepting.store(true, Ordering::Release);
         observable.notify_observers();
+        assert_eq!(source_identity.generation(), source_generation + 1);
+        assert_eq!(sink_identity.generation(), sink_generation + 1);
         assert!(operator.need_input());
         operator
             .push_chunk(
@@ -3012,11 +3031,16 @@ mod tests {
         operator.set_finishing(&state).expect("gather EOS");
         assert!(operator.pending_finish());
         assert!(Arc::ptr_eq(
-            &operator.source_observable().expect("source observable"),
-            &observable
+            &source_identity,
+            &operator
+                .source_observable()
+                .expect("same source observable after gather EOS")
         ));
+        assert!(operator.sink_observable().is_none());
+        let source_generation = source_identity.generation();
         ready.store(true, Ordering::Release);
         observable.notify_observers();
+        assert_eq!(source_identity.generation(), source_generation + 1);
         assert!(!operator.pending_finish());
         while !operator.is_finished() {
             let _ = operator.pull_chunk(&state).expect("root output");
@@ -3037,6 +3061,47 @@ mod tests {
     }
 
     #[test]
+    fn composite_finish_forwards_grouped_unpivot_child_readiness() {
+        let (factory, _state, _writer_schema) = composite_fixture(1, 1, 8);
+        let final_chunk =
+            scripted_final_chunk(&factory, vec![(0, vec![Some(b"complete".to_vec())])]);
+        let mut grouped = GroupedUnpivotDriver::try_new(
+            Arc::clone(&factory.arena),
+            factory
+                .final_plan
+                .unpivot
+                .as_ref()
+                .cloned()
+                .expect("grouped Unpivot plan"),
+            Arc::clone(factory.root_schema.chunk_schema()),
+            final_chunk,
+            None,
+        )
+        .expect("grouped Unpivot driver");
+        let child = ScriptedFinalAggregate::new(Vec::new(), true, false);
+        let child_observable = Arc::clone(&child.observable);
+        grouped.install_active(Box::new(child));
+
+        let mut operator = factory.create_operator(1, 0);
+        let source_identity = operator
+            .source_observable()
+            .expect("stable source observable while consuming");
+        operator.install_grouped_unpivot(grouped);
+        operator.phase = FinishPhase::Producing;
+        let generation = source_identity.generation();
+
+        child_observable.notify_observers();
+
+        assert!(Arc::ptr_eq(
+            &source_identity,
+            &operator
+                .source_observable()
+                .expect("same source observable while producing")
+        ));
+        assert_eq!(source_identity.generation(), generation + 1);
+    }
+
+    #[test]
     fn composite_finish_counts_driver_pending_finalize_as_one_wait_interval() {
         let (factory, state, writer_schema) = composite_fixture(1, 1, 8);
         let final_batch =
@@ -3050,7 +3115,7 @@ mod tests {
         operator.set_profiles(profiles.clone());
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.aggregate = Some(Box::new(scripted));
+        operator.install_aggregate(Box::new(scripted));
         operator
             .push_chunk(
                 &state,
@@ -3106,7 +3171,7 @@ mod tests {
         operator.set_profiles(profiles.clone());
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.aggregate = Some(Box::new(scripted));
+        operator.install_aggregate(Box::new(scripted));
         operator
             .push_chunk(
                 &state,
@@ -3153,7 +3218,7 @@ mod tests {
         let mut operator = factory.create_operator(1, 0);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.aggregate = Some(Box::new(ErrorOnlyFinalAggregate));
+        operator.install_aggregate(Box::new(ErrorOnlyFinalAggregate));
         operator
             .push_chunk(
                 &state,
@@ -3189,7 +3254,7 @@ mod tests {
         operator.set_mem_tracker(Arc::clone(&tracker));
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
-        operator.aggregate = Some(Box::new(FinalizeErrorAggregate));
+        operator.install_aggregate(Box::new(FinalizeErrorAggregate));
         operator
             .push_chunk(
                 &state,

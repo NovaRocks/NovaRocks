@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use super::blocked_driver_poller::BlockedDriverPoller;
 use super::driver::{DriverState, PipelineDriver};
 use super::fragment_context::FragmentContext;
-use super::operator::BlockedReason;
+use super::operator::{BlockedReason, DriverBlockDeadline};
 use crate::exec::pipeline::schedule::observer::Observable;
 
 /// Completion result payload reported when a fragment finishes execution.
@@ -228,32 +228,10 @@ impl DriverTask {
         }
     }
 
-    pub(crate) fn source_observable(&self) -> Option<Arc<Observable>> {
-        self.driver.source_observable()
-    }
-
-    pub(crate) fn sink_observable(&self) -> Option<Arc<Observable>> {
-        self.driver.sink_observable()
-    }
-
-    pub(crate) fn source_name(&self) -> &str {
-        self.driver.source_name()
-    }
-
-    pub(crate) fn sink_name(&self) -> &str {
-        self.driver.sink_name()
-    }
-
-    pub(crate) fn source_ready(&self) -> bool {
-        self.driver.source_ready()
-    }
-
-    pub(crate) fn sink_ready(&self) -> bool {
-        self.driver.sink_ready()
-    }
-
-    pub(crate) fn schedule_state(&self) -> Arc<super::driver::DriverScheduleState> {
-        self.driver.schedule_state()
+    pub(crate) fn blocked_observable_snapshot(
+        &self,
+    ) -> Option<(Arc<Observable>, u64, Option<DriverBlockDeadline>)> {
+        self.driver.blocked_observable_snapshot()
     }
 
     pub(crate) fn try_mark_source_observer_registered(&self, observable: &Arc<Observable>) -> bool {
@@ -268,12 +246,8 @@ impl DriverTask {
         self.driver.set_in_blocked(value);
     }
 
-    pub(crate) fn set_need_check_reschedule(&self, value: bool) {
-        self.driver.set_need_check_reschedule(value);
-    }
-
-    pub(crate) fn check_is_ready(&self) -> bool {
-        self.driver.check_is_ready()
+    pub(crate) fn pending_finish_complete(&self) -> bool {
+        self.driver.pending_finish_complete()
     }
 
     pub(crate) fn set_ready(&mut self) {
@@ -338,14 +312,12 @@ impl GlobalDriverExecutor {
             return;
         }
 
-        // Operator and scheduler callbacks must never run while the global
-        // worker queue is locked. Registration is contractually passive, but
-        // keeping it outside the critical section also prevents one faulty
-        // operator from stalling unrelated, already-admitted driver work.
+        // Scheduler attachment may start its notification thread, so keep it
+        // outside the global worker queue critical section. Observable
+        // registration belongs to the worker's exact blocked transition.
         for task in &tasks {
             let scheduler = task.fragment_ctx().event_scheduler();
             scheduler.attach_executor(Arc::clone(&self.shared));
-            scheduler.register_driver(task);
             task.driver.print_pipeline_structure();
         }
         let mut queue = self
@@ -447,8 +419,11 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
                                     task.fragment_instance_id(),
                                     task.driver_id()
                                 );
+                                let task = *task;
                                 task.fail(err);
-                                task.driver_finished();
+                                if let Some(task) = task.finish_due_to_abort() {
+                                    poller.add_pending_finish(task);
+                                }
                             }
                         }
                     }
@@ -462,8 +437,11 @@ fn worker_loop(shared: Arc<ExecutorShared>, poller: BlockedDriverPoller) {
                                     task.fragment_instance_id(),
                                     task.driver_id()
                                 );
+                                let task = *task;
                                 task.fail(err);
-                                task.driver_finished();
+                                if let Some(task) = task.finish_due_to_abort() {
+                                    poller.add_pending_finish(task);
+                                }
                             }
                         }
                     }

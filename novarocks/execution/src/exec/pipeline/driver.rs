@@ -21,7 +21,7 @@
 //! - Tracks driver state transitions, blocking reasons, and execution quotas.
 //!
 //! Key exported interfaces:
-//! - Types: `DriverState`, `DriverScheduleState`, `ScheduleToken`, `PipelineDriver`.
+//! - Types: `DriverState`, `DriverScheduleState`, `PipelineDriver`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use super::operator::{
-    BlockedReason, DictionaryCarrierStats, FinishingWait, Operator, ProcessorOperator,
+    BlockedReason, DictionaryCarrierStats, DriverBlockDeadline, Operator, ProcessorOperator,
     dictionary_carrier_stats, hydrate_for_downstream,
 };
 use crate::exec::chunk::Chunk;
@@ -82,12 +82,41 @@ enum DriverBlockedKind {
     Dependency,
 }
 
+enum WorkerBlockDecision {
+    Runnable,
+    NoBlocker,
+    Retry,
+    Blocked(Arc<Observable>, u64, Option<DriverBlockDeadline>),
+}
+
+enum StableObservableSnapshot {
+    Stable(Arc<Observable>, u64),
+    Changed,
+    Missing,
+}
+
+fn stable_observable_snapshot(
+    before: Option<Arc<Observable>>,
+    generation: Option<u64>,
+    after: Option<Arc<Observable>>,
+) -> StableObservableSnapshot {
+    match (before, generation, after) {
+        (Some(before), Some(generation), Some(after))
+            if Arc::ptr_eq(&before, &after)
+                && before.generation() == generation
+                && after.generation() == generation =>
+        {
+            StableObservableSnapshot::Stable(before, generation)
+        }
+        (None, None, None) => StableObservableSnapshot::Missing,
+        _ => StableObservableSnapshot::Changed,
+    }
+}
+
 #[derive(Debug)]
 /// Scheduling metadata for one driver including blocking and requeue state.
 pub(crate) struct DriverScheduleState {
     in_blocked: AtomicBool,
-    need_check_reschedule: AtomicBool,
-    schedule_token: AtomicBool,
     source_observables: Mutex<Vec<Weak<Observable>>>,
     sink_observables: Mutex<Vec<Weak<Observable>>>,
 }
@@ -96,28 +125,18 @@ impl DriverScheduleState {
     pub(crate) fn new() -> Self {
         Self {
             in_blocked: AtomicBool::new(false),
-            need_check_reschedule: AtomicBool::new(false),
-            schedule_token: AtomicBool::new(false),
             source_observables: Mutex::new(Vec::new()),
             sink_observables: Mutex::new(Vec::new()),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_in_blocked(&self) -> bool {
         self.in_blocked.load(Ordering::Acquire)
     }
 
     pub(crate) fn set_in_blocked(&self, value: bool) {
         self.in_blocked.store(value, Ordering::Release);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn need_check_reschedule(&self) -> bool {
-        self.need_check_reschedule.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn set_need_check_reschedule(&self, value: bool) {
-        self.need_check_reschedule.store(value, Ordering::Release);
     }
 
     pub(crate) fn try_mark_source_observer_registered(&self, observable: &Arc<Observable>) -> bool {
@@ -146,37 +165,6 @@ impl DriverScheduleState {
         }
         registered.push(candidate);
         true
-    }
-
-    pub(crate) fn acquire_schedule_token(self: &Arc<Self>) -> ScheduleToken {
-        let acquired = self
-            .schedule_token
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        ScheduleToken {
-            state: Arc::clone(self),
-            acquired,
-        }
-    }
-}
-
-/// Token passed through scheduler paths to preserve driver scheduling ownership.
-pub(crate) struct ScheduleToken {
-    state: Arc<DriverScheduleState>,
-    acquired: bool,
-}
-
-impl ScheduleToken {
-    pub(crate) fn acquired(&self) -> bool {
-        self.acquired
-    }
-}
-
-impl Drop for ScheduleToken {
-    fn drop(&mut self) {
-        if self.acquired {
-            self.state.schedule_token.store(false, Ordering::Release);
-        }
     }
 }
 
@@ -210,6 +198,7 @@ pub struct PipelineDriver {
     blocked_since: Option<(Instant, DriverBlockedKind)>,
     closed: bool,
     schedule_state: Arc<DriverScheduleState>,
+    blocked_observable: Option<(Arc<Observable>, u64, Option<DriverBlockDeadline>)>,
     pending_finish_state: Option<DriverState>,
     operator_terminal_signal: Option<DriverState>,
 
@@ -463,6 +452,7 @@ impl PipelineDriver {
             blocked_since: None,
             closed: false,
             schedule_state: Arc::new(DriverScheduleState::new()),
+            blocked_observable: None,
             pending_finish_state: None,
             operator_terminal_signal: None,
 
@@ -500,6 +490,7 @@ impl PipelineDriver {
         &self.state
     }
 
+    #[cfg(test)]
     pub(crate) fn schedule_state(&self) -> Arc<DriverScheduleState> {
         Arc::clone(&self.schedule_state)
     }
@@ -516,10 +507,6 @@ impl PipelineDriver {
 
     pub(crate) fn set_in_blocked(&self, value: bool) {
         self.schedule_state.set_in_blocked(value);
-    }
-
-    pub(crate) fn set_need_check_reschedule(&self, value: bool) {
-        self.schedule_state.set_need_check_reschedule(value);
     }
 
     pub(crate) fn has_pending_finish(&self) -> bool {
@@ -628,57 +615,64 @@ impl PipelineDriver {
                 continue;
             }
 
-            // If there is no buffered data, let source readiness decide first to avoid
-            // blocking on a full sink when the driver has nothing to push.
-            let has_buffered = self.edge_chunks.iter().any(|c| c.is_some());
+            // Readiness inspection below is intentionally worker-owned. Every
+            // blocked decision brackets the active operator checks with the
+            // exact observable identity and generation that can invalidate it.
+            // The scheduler consumes only the frozen snapshot and never polls
+            // operators.
+            let has_pending_data = self.edge_chunks.iter().any(|chunk| chunk.is_some())
+                || self.has_internal_output_on_worker();
 
-            // Async processors can exert real backpressure before the terminal
-            // sink. If such a processor is full while an upstream edge already
-            // owns a page, parking on the source would miss the processor's
-            // capacity wake-up and strand that page indefinitely.
-            if has_buffered && self.internal_sink_is_blocked() {
-                return self.block_or_fail(BlockedReason::OutputFull);
-            }
-
-            if !has_buffered
-                && let Some(source) = self.operators.first()
-                && !source.is_finished()
-            {
-                let Some(proc) = source.as_processor_ref() else {
-                    return self.finish_with_state(DriverState::Failed(
-                        "pipeline source missing processor operator".to_string(),
-                    ));
-                };
-                if !proc.has_output() {
-                    return self.block_or_fail(BlockedReason::InputEmpty);
+            if !has_pending_data {
+                match self.source_block_decision_on_worker() {
+                    Ok(WorkerBlockDecision::Blocked(observable, generation, deadline)) => {
+                        return self.block_on_observable(
+                            BlockedReason::InputEmpty,
+                            observable,
+                            generation,
+                            deadline,
+                        );
+                    }
+                    Ok(WorkerBlockDecision::Retry) => continue,
+                    Ok(WorkerBlockDecision::Runnable | WorkerBlockDecision::NoBlocker) => {}
+                    Err(error) => {
+                        return self.finish_with_state(DriverState::Failed(error));
+                    }
                 }
             }
 
-            if let Some(sink) = self.operators.last()
-                && !sink.is_finished()
-            {
-                let Some(proc) = sink.as_processor_ref() else {
-                    return self.finish_with_state(DriverState::Failed(
-                        "pipeline sink missing processor operator".to_string(),
-                    ));
-                };
-                if !proc.need_input() {
-                    return self.block_or_fail(BlockedReason::OutputFull);
+            // A ready source does not imply that its first consumer can accept
+            // another page. Check internal capacity after source readiness so a
+            // source-ready/internal-full pipeline parks on the consumer event
+            // instead of cycling through the global ready queue.
+            match self.internal_sink_block_decision_on_worker() {
+                Ok(WorkerBlockDecision::Blocked(observable, generation, deadline)) => {
+                    return self.block_on_observable(
+                        BlockedReason::OutputFull,
+                        observable,
+                        generation,
+                        deadline,
+                    );
+                }
+                Ok(WorkerBlockDecision::Retry) => continue,
+                Ok(WorkerBlockDecision::Runnable | WorkerBlockDecision::NoBlocker) => {}
+                Err(error) => {
+                    return self.finish_with_state(DriverState::Failed(error));
                 }
             }
 
-            if has_buffered
-                && let Some(source) = self.operators.first()
-                && !source.is_finished()
-            {
-                let Some(proc) = source.as_processor_ref() else {
-                    return self.finish_with_state(DriverState::Failed(
-                        "pipeline source missing processor operator".to_string(),
-                    ));
-                };
-                if !proc.has_output() {
-                    return self.block_or_fail(BlockedReason::InputEmpty);
+            match self.terminal_sink_block_decision_on_worker() {
+                Ok(WorkerBlockDecision::Blocked(observable, generation, deadline)) => {
+                    return self.block_on_observable(
+                        BlockedReason::OutputFull,
+                        observable,
+                        generation,
+                        deadline,
+                    );
                 }
+                Ok(WorkerBlockDecision::Retry) => continue,
+                Ok(WorkerBlockDecision::Runnable | WorkerBlockDecision::NoBlocker) => {}
+                Err(error) => return self.finish_with_state(DriverState::Failed(error)),
             }
 
             self.state = DriverState::Ready;
@@ -691,8 +685,12 @@ impl PipelineDriver {
             if op.is_finished() {
                 continue;
             }
-            let proc = op.as_processor_ref()?;
-            let dep = proc.precondition_dependency()?;
+            let Some(proc) = op.as_processor_ref() else {
+                continue;
+            };
+            let Some(dep) = proc.precondition_dependency() else {
+                continue;
+            };
             if dep.is_ready() {
                 continue;
             }
@@ -701,19 +699,26 @@ impl PipelineDriver {
         None
     }
 
-    pub(crate) fn source_observable(&self) -> Option<Arc<Observable>> {
+    fn source_observable_on_worker(&self) -> Option<Arc<Observable>> {
         let op = self.operators.first()?;
         let proc = op.as_processor_ref()?;
         proc.source_observable()
     }
 
-    pub(crate) fn sink_observable(&self) -> Option<Arc<Observable>> {
-        if let Some(observable) = self.internal_blocked_sink_observable() {
-            return Some(observable);
-        }
+    fn terminal_sink_observable_on_worker(&self) -> Option<Arc<Observable>> {
         let op = self.operators.last()?;
         let proc = op.as_processor_ref()?;
         proc.sink_observable()
+    }
+
+    pub(crate) fn blocked_observable_snapshot(
+        &self,
+    ) -> Option<(Arc<Observable>, u64, Option<DriverBlockDeadline>)> {
+        self.blocked_observable
+            .as_ref()
+            .map(|(observable, generation, deadline)| {
+                (Arc::clone(observable), *generation, *deadline)
+            })
     }
 
     pub(crate) fn source_name(&self) -> &str {
@@ -730,7 +735,7 @@ impl PipelineDriver {
             .unwrap_or("unknown")
     }
 
-    pub(crate) fn source_ready(&self) -> bool {
+    fn source_ready_on_worker(&self) -> bool {
         let Some(op) = self.operators.first() else {
             return true;
         };
@@ -747,10 +752,7 @@ impl PipelineDriver {
         op.is_finished()
     }
 
-    pub(crate) fn sink_ready(&self) -> bool {
-        if self.internal_sink_is_blocked() {
-            return false;
-        }
+    fn terminal_sink_ready_on_worker(&self) -> bool {
         let Some(op) = self.operators.last() else {
             return true;
         };
@@ -767,113 +769,113 @@ impl PipelineDriver {
         op.is_finished()
     }
 
-    fn internal_sink_is_blocked(&self) -> bool {
-        self.internal_blocked_sink_observable().is_some()
+    fn has_internal_output_on_worker(&self) -> bool {
+        if self.operators.len() <= 2 {
+            return false;
+        }
+        let end = self.operators.len().saturating_sub(1);
+        self.operators[1..end].iter().any(|operator| {
+            !operator.is_finished()
+                && operator
+                    .as_processor_ref()
+                    .is_some_and(ProcessorOperator::has_output)
+        })
     }
 
-    fn internal_blocked_sink_observable(&self) -> Option<Arc<Observable>> {
+    fn source_block_decision_on_worker(&self) -> Result<WorkerBlockDecision, String> {
+        let before = self.source_observable_on_worker();
+        let generation = before.as_ref().map(|observable| observable.generation());
+        if self.source_ready_on_worker() {
+            return Ok(WorkerBlockDecision::Runnable);
+        }
+        let after = self.source_observable_on_worker();
+        match stable_observable_snapshot(before, generation, after) {
+            StableObservableSnapshot::Stable(observable, generation) => {
+                let deadline = self
+                    .operators
+                    .first()
+                    .and_then(|operator| operator.as_processor_ref())
+                    .and_then(ProcessorOperator::source_block_deadline);
+                Ok(WorkerBlockDecision::Blocked(
+                    observable, generation, deadline,
+                ))
+            }
+            StableObservableSnapshot::Changed => Ok(WorkerBlockDecision::Retry),
+            StableObservableSnapshot::Missing => Err(format!(
+                "pipeline source {} is blocked without a readiness observable",
+                self.source_name()
+            )),
+        }
+    }
+
+    fn internal_sink_block_decision_on_worker(&self) -> Result<WorkerBlockDecision, String> {
+        if self.operators.len() <= 2 {
+            return Ok(WorkerBlockDecision::NoBlocker);
+        }
         let end = self.operators.len().saturating_sub(1);
-        for op in self.operators[..end].iter().rev() {
-            let Some(processor) = op.as_processor_ref() else {
+        for operator in self.operators[1..end].iter().rev() {
+            let Some(processor) = operator.as_processor_ref() else {
                 continue;
             };
-            if op.is_finished() {
+            let before = processor.sink_observable();
+            let generation = before.as_ref().map(|observable| observable.generation());
+            if operator.is_finished() {
                 continue;
             }
-            // A processor with passive ready work can make downstream progress
-            // even when it cannot accept another input page. Treating it as
-            // OutputFull would park on its input-capacity observable and lose
-            // an output, completion, or error transition that already happened.
-            if processor.has_passive_ready_work() {
-                return None;
+            if processor.has_output() {
+                return Ok(WorkerBlockDecision::Runnable);
             }
             if processor.need_input() {
                 continue;
             }
-            if let Some(observable) = processor.sink_observable() {
-                return Some(observable);
-            }
-        }
-        None
-    }
-
-    fn has_runnable_dataflow(&self) -> bool {
-        self.edge_chunks.iter().enumerate().any(|(edge, chunk)| {
-            let Some(downstream) = self
-                .operators
-                .get(edge + 1)
-                .and_then(|operator| operator.as_processor_ref())
-            else {
-                return false;
-            };
-            if !downstream.need_input() {
-                return false;
-            }
-            chunk.is_some()
-                || self
-                    .operators
-                    .get(edge)
-                    .and_then(|operator| operator.as_processor_ref())
-                    .is_some_and(ProcessorOperator::has_passive_ready_work)
-        })
-    }
-
-    pub(crate) fn check_is_ready(&self) -> bool {
-        match &self.state {
-            DriverState::Blocked(reason) => match reason {
-                BlockedReason::InputEmpty => {
-                    self.source_ready() || self.is_finished() || self.has_ready_finishing_work()
+            let after = processor.sink_observable();
+            match stable_observable_snapshot(before, generation, after) {
+                StableObservableSnapshot::Stable(observable, generation) => {
+                    return Ok(WorkerBlockDecision::Blocked(observable, generation, None));
                 }
-                BlockedReason::OutputFull => {
-                    self.has_runnable_dataflow()
-                        || self.sink_ready()
-                        || self.is_finished()
-                        || self.has_ready_finishing_work()
+                StableObservableSnapshot::Changed => return Ok(WorkerBlockDecision::Retry),
+                StableObservableSnapshot::Missing => {
+                    // A synchronous processor can transiently accept no input
+                    // and expose no output while pipeline-owned finishing or a
+                    // dependency publication converges (join probes are a
+                    // common example). Without an observable there is no
+                    // external capacity event for the scheduler to await, so
+                    // this is not an event-driven blocker. Keep inspecting the
+                    // remaining pipeline and leave the driver runnable.
+                    continue;
                 }
-                BlockedReason::Dependency(dep) => dep.is_ready(),
-            },
-            DriverState::PendingFinish => !self.has_pending_finish(),
-            DriverState::Ready | DriverState::Running => true,
-            DriverState::Finished | DriverState::Canceled | DriverState::Failed(_) => true,
+            }
+        }
+        Ok(WorkerBlockDecision::NoBlocker)
+    }
+
+    fn terminal_sink_block_decision_on_worker(&self) -> Result<WorkerBlockDecision, String> {
+        let before = self.terminal_sink_observable_on_worker();
+        let generation = before.as_ref().map(|observable| observable.generation());
+        if self.terminal_sink_ready_on_worker() {
+            return Ok(WorkerBlockDecision::Runnable);
+        }
+        let after = self.terminal_sink_observable_on_worker();
+        match stable_observable_snapshot(before, generation, after) {
+            StableObservableSnapshot::Stable(observable, generation) => {
+                Ok(WorkerBlockDecision::Blocked(observable, generation, None))
+            }
+            StableObservableSnapshot::Changed => Ok(WorkerBlockDecision::Retry),
+            StableObservableSnapshot::Missing => Err(format!(
+                "pipeline sink {} is blocked without a readiness observable",
+                self.sink_name()
+            )),
         }
     }
 
-    fn has_ready_finishing_work(&self) -> bool {
-        if self.operators.len() < 2 {
-            return false;
-        }
-        for idx in 1..self.operators.len() {
-            if self.operator_finishing_set[idx] {
-                continue;
-            }
-            let in_edge = idx - 1;
-            if in_edge >= self.edge_closed.len() {
-                continue;
-            }
-            if !self.edge_closed[in_edge] || self.edge_chunks[in_edge].is_some() {
-                continue;
-            }
-            // An operator waiting for an event it cannot produce has no
-            // finishing work that is ready; claiming otherwise would spin this
-            // driver instead of parking it. One that still owes output does:
-            // it is holding a payload or an end-of-stream marker that only its
-            // own next turn can push, and skipping it here is what parks a
-            // driver forever with that output in hand.
-            let wait = self
-                .operators
-                .get(idx)
-                .and_then(|op| op.as_processor_ref())
-                .map_or(FinishingWait::Complete, ProcessorOperator::finishing_wait);
-            if wait.is_pending() && !wait.can_progress() {
-                continue;
-            }
-            return true;
-        }
-        false
+    pub(crate) fn pending_finish_complete(&self) -> bool {
+        debug_assert_eq!(self.state, DriverState::PendingFinish);
+        !self.has_pending_finish()
     }
 
     pub(crate) fn set_ready(&mut self) {
         self.finish_blocked_interval();
+        self.blocked_observable = None;
         self.state = DriverState::Ready;
     }
 
@@ -908,9 +910,25 @@ impl PipelineDriver {
         }));
     }
 
+    fn block_on_observable(
+        &mut self,
+        reason: BlockedReason,
+        observable: Arc<Observable>,
+        generation: u64,
+        deadline: Option<DriverBlockDeadline>,
+    ) -> DriverState {
+        debug_assert!(matches!(
+            reason,
+            BlockedReason::InputEmpty | BlockedReason::OutputFull
+        ));
+        self.blocked_observable = Some((observable, generation, deadline));
+        self.block_or_fail(reason)
+    }
+
     fn block_or_fail(&mut self, reason: BlockedReason) -> DriverState {
         match reason {
             BlockedReason::Dependency(dep) => {
+                self.blocked_observable = None;
                 self.start_blocked_interval(DriverBlockedKind::Dependency);
                 if let Some((hi, lo)) = self.fragment_instance_id {
                     debug!(
@@ -930,11 +948,13 @@ impl PipelineDriver {
                 self.state.clone()
             }
             BlockedReason::InputEmpty => {
+                debug_assert!(self.blocked_observable.is_some());
                 self.start_blocked_interval(DriverBlockedKind::InputEmpty);
                 self.state = DriverState::Blocked(BlockedReason::InputEmpty);
                 self.state.clone()
             }
             BlockedReason::OutputFull => {
+                debug_assert!(self.blocked_observable.is_some());
                 self.start_blocked_interval(DriverBlockedKind::OutputFull);
                 self.state = DriverState::Blocked(BlockedReason::OutputFull);
                 self.state.clone()
@@ -1490,7 +1510,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use super::{BlockedReason, DriverState, PipelineDriver};
+    use super::{BlockedReason, DriverState, Observable, PipelineDriver};
     use crate::exec::chunk::Chunk;
     use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
     use crate::runtime::runtime_state::RuntimeState;
@@ -1549,6 +1569,7 @@ mod tests {
     struct ScriptedSink {
         wait: Arc<Mutex<FinishingWait>>,
         set_finishing_calls: Arc<AtomicUsize>,
+        observable: Arc<Observable>,
     }
 
     impl ScriptedSink {
@@ -1556,6 +1577,7 @@ mod tests {
             Self {
                 wait,
                 set_finishing_calls: Arc::new(AtomicUsize::new(0)),
+                observable: Arc::new(Observable::new()),
             }
         }
 
@@ -1615,14 +1637,17 @@ mod tests {
         fn finishing_wait(&self) -> FinishingWait {
             self.wait()
         }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
     }
 
-    /// The defect this catches: the driver asked one boolean -- "is finishing
-    /// pending?" -- for two different decisions, and used it to conclude that
-    /// a parked driver had no ready finishing work. An operator that still
-    /// owes output it can push on its own next turn was therefore skipped, and
-    /// since an exchange edge opening notifies nothing, the blocked-driver
-    /// poller's `check_is_ready` stayed false forever.
+    /// The defect this catches: a finishing sink can move from waiting on an
+    /// external event to owing output that only another driver turn can push.
+    /// The event-driven driver must park on the sink's stable observable and
+    /// resume from its generation change; it must neither poll the sink nor
+    /// latch finishing before the owed output is sent.
     ///
     /// The consequence is a query that hangs with no failure anywhere. The one
     /// producer holding rows parks with the payload in hand, never sends its
@@ -1641,6 +1666,7 @@ mod tests {
         let wait = Arc::new(Mutex::new(FinishingWait::ExternalEvent));
         let sink = ScriptedSink::new(Arc::clone(&wait));
         let calls = Arc::clone(&sink.set_finishing_calls);
+        let sink_observable = Arc::clone(&sink.observable);
         let mut driver = PipelineDriver::new(
             1,
             vec![Box::new(FinishedSource), Box::new(sink)],
@@ -1660,19 +1686,20 @@ mod tests {
             turns_before_parking >= 1,
             "the driver gives finishing at least one turn before it parks"
         );
-        assert!(
-            !driver.check_is_ready(),
-            "nothing can move while the sink waits on an event it cannot produce"
-        );
+        let (blocked, generation, deadline) = driver
+            .blocked_observable_snapshot()
+            .expect("finishing wait must freeze the sink readiness event");
+        assert!(Arc::ptr_eq(&blocked, &sink_observable));
+        assert_eq!(generation, sink_observable.generation());
+        assert!(deadline.is_none());
 
-        // The edge opens. The payload the sink parked is now output only its
-        // own next turn can push, so the driver must be re-readied -- and this
-        // is the assertion the defect fails.
+        // The edge opens. The sink publishes that the payload it parked is now
+        // output only its own next turn can push, and the scheduler requeues
+        // the driver from the generation change.
         *wait.lock().expect("scripted wait lock") = FinishingWait::OwedOutput;
-        assert!(
-            driver.check_is_ready(),
-            "a sink that can push the output it owes must re-ready its driver"
-        );
+        sink_observable.notify_observers();
+        assert_ne!(generation, sink_observable.generation());
+        driver.set_ready();
 
         // And the turn it is re-readied for is the one that pushes it.
         let state = driver.process(Duration::from_millis(10));
@@ -1699,6 +1726,31 @@ mod terminal_signal_tests {
 
     struct DriverPolledSource {
         observable: Arc<Observable>,
+    }
+
+    struct BufferedOnceOperator {
+        output: Option<Chunk>,
+        observable: Arc<Observable>,
+    }
+
+    struct RecoveringTerminal {
+        ready: Arc<AtomicBool>,
+        pushed: Arc<AtomicUsize>,
+        observable: Arc<Observable>,
+    }
+
+    struct GenerationChangingSource {
+        changed: AtomicBool,
+        observable: Arc<Observable>,
+    }
+
+    struct SynchronousJoinCompletion {
+        phase: Arc<AtomicUsize>,
+        pulls: Arc<AtomicUsize>,
+    }
+
+    struct DependencyBlockedJoin {
+        dependency: DependencyHandle,
     }
 
     impl Operator for DriverPolledSource {
@@ -1741,6 +1793,222 @@ mod terminal_signal_tests {
         }
     }
 
+    impl Operator for BufferedOnceOperator {
+        fn name(&self) -> &str {
+            "BUFFERED_ONCE"
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for BufferedOnceOperator {
+        fn need_input(&self) -> bool {
+            self.output.is_none()
+        }
+
+        fn has_output(&self) -> bool {
+            self.output.is_some()
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+            self.output = Some(chunk);
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(self.output.take())
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
+    impl Operator for RecoveringTerminal {
+        fn name(&self) -> &str {
+            "RECOVERING_TERMINAL"
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for RecoveringTerminal {
+        fn need_input(&self) -> bool {
+            self.ready.load(Ordering::Acquire)
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            if !self.need_input() {
+                return Err("recovering terminal received input while blocked".to_string());
+            }
+            self.pushed.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
+    impl Operator for GenerationChangingSource {
+        fn name(&self) -> &str {
+            "GENERATION_CHANGING_SOURCE"
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for GenerationChangingSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            if !self.changed.swap(true, Ordering::AcqRel) {
+                self.observable.notify_observers();
+            }
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn source_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+    }
+
+    impl Operator for SynchronousJoinCompletion {
+        fn name(&self) -> &str {
+            "SYNCHRONOUS_JOIN_COMPLETION"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.phase.load(Ordering::Acquire) == 2
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for SynchronousJoinCompletion {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            self.phase.load(Ordering::Acquire) == 1
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("synchronous join completion does not accept input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            if self
+                .phase
+                .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.pulls.fetch_add(1, Ordering::AcqRel);
+                return Ok(Some(Chunk::default()));
+            }
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl Operator for DependencyBlockedJoin {
+        fn name(&self) -> &str {
+            "DEPENDENCY_BLOCKED_JOIN"
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for DependencyBlockedJoin {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("dependency-blocked join cannot accept input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn precondition_dependency(&self) -> Option<DependencyHandle> {
+            Some(Arc::clone(&self.dependency))
+        }
+    }
+
     impl Operator for ControlledReadinessOperator {
         fn name(&self) -> &str {
             self.name
@@ -1764,10 +2032,6 @@ mod terminal_signal_tests {
             self.has_output
         }
 
-        fn has_passive_ready_work(&self) -> bool {
-            self.has_output
-        }
-
         fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
             Ok(())
         }
@@ -1781,6 +2045,10 @@ mod terminal_signal_tests {
         }
 
         fn sink_observable(&self) -> Option<Arc<Observable>> {
+            Some(Arc::clone(&self.observable))
+        }
+
+        fn source_observable(&self) -> Option<Arc<Observable>> {
             Some(Arc::clone(&self.observable))
         }
     }
@@ -1861,11 +2129,251 @@ mod terminal_signal_tests {
             None,
         );
 
-        assert!(driver.internal_blocked_sink_observable().is_none());
-        assert!(
-            driver.has_runnable_dataflow(),
-            "downstream output can move even while an earlier processor cannot accept input"
+        assert!(matches!(
+            driver
+                .internal_sink_block_decision_on_worker()
+                .expect("worker readiness decision"),
+            WorkerBlockDecision::Runnable
+        ));
+    }
+
+    #[test]
+    fn retained_internal_output_resumes_from_the_downstream_generation() {
+        let source_observable = Arc::new(Observable::new());
+        let internal_observable = Arc::new(Observable::new());
+        let terminal_observable = Arc::new(Observable::new());
+        let terminal_ready = Arc::new(AtomicBool::new(false));
+        let terminal_pushed = Arc::new(AtomicUsize::new(0));
+        let mut driver = PipelineDriver::new(
+            3,
+            vec![
+                Box::new(ControlledReadinessOperator {
+                    name: "SOURCE_EMPTY",
+                    need_input: false,
+                    has_output: false,
+                    observable: source_observable,
+                }),
+                Box::new(BufferedOnceOperator {
+                    output: Some(Chunk::default()),
+                    observable: internal_observable,
+                }),
+                Box::new(RecoveringTerminal {
+                    ready: Arc::clone(&terminal_ready),
+                    pushed: Arc::clone(&terminal_pushed),
+                    observable: Arc::clone(&terminal_observable),
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
         );
+
+        assert_eq!(
+            driver.process(Duration::from_secs(1)),
+            DriverState::Blocked(BlockedReason::OutputFull)
+        );
+        let (blocked, generation, deadline) = driver
+            .blocked_observable_snapshot()
+            .expect("driver freezes its downstream wait target");
+        assert!(Arc::ptr_eq(&blocked, &terminal_observable));
+        assert_eq!(generation, terminal_observable.generation());
+        assert!(deadline.is_none());
+
+        terminal_ready.store(true, Ordering::Release);
+        terminal_observable.notify_observers();
+        assert_ne!(generation, terminal_observable.generation());
+        driver.set_ready();
+        let _ = driver.process(Duration::from_secs(1));
+        assert_eq!(terminal_pushed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn short_pipeline_has_no_internal_operator_range() {
+        let observable = Arc::new(Observable::new());
+        let driver = PipelineDriver::new(
+            4,
+            vec![Box::new(ControlledReadinessOperator {
+                name: "ONLY_OPERATOR",
+                need_input: true,
+                has_output: false,
+                observable,
+            })],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        assert!(!driver.has_internal_output_on_worker());
+        assert!(matches!(
+            driver
+                .internal_sink_block_decision_on_worker()
+                .expect("short pipeline decision"),
+            WorkerBlockDecision::NoBlocker
+        ));
+    }
+
+    #[test]
+    fn worker_retries_when_readiness_generation_changes_during_the_check() {
+        let source_observable = Arc::new(Observable::new());
+        let terminal_observable = Arc::new(Observable::new());
+        let driver = PipelineDriver::new(
+            5,
+            vec![
+                Box::new(GenerationChangingSource {
+                    changed: AtomicBool::new(false),
+                    observable: source_observable,
+                }),
+                Box::new(ControlledReadinessOperator {
+                    name: "TERMINAL_READY",
+                    need_input: true,
+                    has_output: false,
+                    observable: terminal_observable,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        assert!(matches!(
+            driver
+                .source_block_decision_on_worker()
+                .expect("worker source decision"),
+            WorkerBlockDecision::Retry
+        ));
+    }
+
+    #[test]
+    fn source_ready_internal_full_parks_on_internal_generation() {
+        let source_observable = Arc::new(Observable::new());
+        let internal_observable = Arc::new(Observable::new());
+        let terminal_observable = Arc::new(Observable::new());
+        let mut driver = PipelineDriver::new(
+            6,
+            vec![
+                Box::new(ControlledReadinessOperator {
+                    name: "SOURCE_READY",
+                    need_input: false,
+                    has_output: true,
+                    observable: source_observable,
+                }),
+                Box::new(ControlledReadinessOperator {
+                    name: "INTERNAL_FULL",
+                    need_input: false,
+                    has_output: false,
+                    observable: Arc::clone(&internal_observable),
+                }),
+                Box::new(ControlledReadinessOperator {
+                    name: "TERMINAL_READY",
+                    need_input: true,
+                    has_output: false,
+                    observable: terminal_observable,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        assert_eq!(
+            driver.process(Duration::from_secs(1)),
+            DriverState::Blocked(BlockedReason::OutputFull)
+        );
+        let (blocked, generation, deadline) = driver
+            .blocked_observable_snapshot()
+            .expect("driver freezes the internal capacity wait target");
+        assert!(Arc::ptr_eq(&blocked, &internal_observable));
+        assert_eq!(generation, internal_observable.generation());
+        assert!(deadline.is_none());
+    }
+
+    #[test]
+    fn synchronous_join_completion_without_observable_stays_runnable_and_drains_output() {
+        let source_observable = Arc::new(Observable::new());
+        let terminal_observable = Arc::new(Observable::new());
+        let join_phase = Arc::new(AtomicUsize::new(0));
+        let join_pulls = Arc::new(AtomicUsize::new(0));
+        let mut driver = PipelineDriver::new(
+            7,
+            vec![
+                Box::new(ControlledReadinessOperator {
+                    name: "SOURCE_READY",
+                    need_input: false,
+                    has_output: true,
+                    observable: source_observable,
+                }),
+                Box::new(SynchronousJoinCompletion {
+                    phase: Arc::clone(&join_phase),
+                    pulls: Arc::clone(&join_pulls),
+                }),
+                Box::new(ControlledReadinessOperator {
+                    name: "TERMINAL_READY",
+                    need_input: true,
+                    has_output: false,
+                    observable: terminal_observable,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        assert_eq!(driver.process(Duration::from_secs(1)), DriverState::Ready);
+        assert!(driver.blocked_observable_snapshot().is_none());
+
+        // Join completion and unmatched-row emission are synchronous worker
+        // work. They do not acquire an event observable merely because the
+        // processor temporarily accepted no input before output became ready.
+        join_phase.store(1, Ordering::Release);
+        assert_eq!(driver.process(Duration::from_secs(1)), DriverState::Ready);
+        assert_eq!(join_pulls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn source_without_dependency_does_not_hide_internal_join_dependency() {
+        let dependency =
+            crate::exec::pipeline::dependency::DependencyManager::new().get_or_create("join");
+        let source_observable = Arc::new(Observable::new());
+        let terminal_observable = Arc::new(Observable::new());
+        let mut driver = PipelineDriver::new(
+            8,
+            vec![
+                Box::new(ControlledReadinessOperator {
+                    name: "SOURCE_WITHOUT_DEPENDENCY",
+                    need_input: false,
+                    has_output: true,
+                    observable: source_observable,
+                }),
+                Box::new(DependencyBlockedJoin {
+                    dependency: Arc::clone(&dependency),
+                }),
+                Box::new(ControlledReadinessOperator {
+                    name: "TERMINAL_READY",
+                    need_input: true,
+                    has_output: false,
+                    observable: terminal_observable,
+                }),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        assert_eq!(
+            driver.process(Duration::from_secs(1)),
+            DriverState::Blocked(BlockedReason::Dependency(Arc::clone(&dependency)))
+        );
+        assert!(driver.blocked_observable_snapshot().is_none());
+        assert!(!dependency.is_ready());
+
+        dependency.set_ready();
+        assert!(dependency.is_ready());
     }
 
     #[test]
@@ -1873,11 +2381,11 @@ mod terminal_signal_tests {
         let source_observable = Arc::new(Observable::new());
         let internal_observable = Arc::new(Observable::new());
         let terminal_observable = Arc::new(Observable::new());
-        let driver = PipelineDriver::new(
+        let mut driver = PipelineDriver::new(
             2,
             vec![
                 Box::new(DriverPolledSource {
-                    observable: source_observable,
+                    observable: Arc::clone(&source_observable),
                 }),
                 Box::new(ControlledReadinessOperator {
                     name: "INTERNAL_READY",
@@ -1898,8 +2406,12 @@ mod terminal_signal_tests {
             None,
         );
 
-        assert!(driver.internal_blocked_sink_observable().is_none());
-        assert!(!driver.has_runnable_dataflow());
+        let generation = source_observable.generation();
+        driver.blocked_observable = Some((Arc::clone(&source_observable), generation, None));
+        driver.state = DriverState::Blocked(BlockedReason::InputEmpty);
+        assert_eq!(generation, source_observable.generation());
+        source_observable.notify_observers();
+        assert_ne!(generation, source_observable.generation());
     }
 
     #[test]

@@ -30,7 +30,9 @@ use arrow::compute::filter_record_batch;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    FinishingWait, Operator, ProcessorOperator, forward_observable,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::ExchangeFrameTransmitter;
@@ -153,15 +155,14 @@ impl OperatorFactory for SplitDataStreamSinkFactory {
             });
         }
 
-        Box::new(SplitDataStreamSinkOperator {
-            name: self.name.clone(),
-            init_error: self.init_error.clone(),
-            split_arena: Arc::clone(&self.split_arena),
-            split_exprs: self.split_exprs.clone(),
-            fanout: self.fanout,
+        Box::new(SplitDataStreamSinkOperator::new(
+            self.name.clone(),
+            self.init_error.clone(),
+            Arc::clone(&self.split_arena),
+            self.split_exprs.clone(),
+            self.fanout,
             sinks,
-            finishing: false,
-        })
+        ))
     }
 
     fn is_sink(&self) -> bool {
@@ -181,6 +182,39 @@ struct SplitDataStreamSinkOperator {
     fanout: bool,
     sinks: Vec<InnerSinkRuntime>,
     finishing: bool,
+    sink_observable: Arc<Observable>,
+}
+
+impl SplitDataStreamSinkOperator {
+    fn new(
+        name: String,
+        init_error: Option<String>,
+        split_arena: Arc<ExprArena>,
+        split_exprs: Vec<ExprId>,
+        fanout: bool,
+        sinks: Vec<InnerSinkRuntime>,
+    ) -> Self {
+        let sink_observable = Arc::new(Observable::new());
+        for sink in &sinks {
+            if let Some(observable) = sink
+                .op
+                .as_processor_ref()
+                .and_then(ProcessorOperator::sink_observable)
+            {
+                forward_observable(&observable, &sink_observable);
+            }
+        }
+        Self {
+            name,
+            init_error,
+            split_arena,
+            split_exprs,
+            fanout,
+            sinks,
+            finishing: false,
+            sink_observable,
+        }
+    }
 }
 
 impl Operator for SplitDataStreamSinkOperator {
@@ -350,19 +384,7 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
         if self.is_finished() {
             return None;
         }
-        // Return the first inner sink's observable unconditionally.
-        // Checking need_input() here would be a TOCTOU race: by the time the
-        // scheduler calls sink_observable(), the blocking inner sink may already
-        // be ready, causing a spurious None and a fragment failure.
-        for sink in &self.sinks {
-            let Some(inner) = sink.op.as_processor_ref() else {
-                continue;
-            };
-            if let Some(obs) = inner.sink_observable() {
-                return Some(obs);
-            }
-        }
-        None
+        Some(Arc::clone(&self.sink_observable))
     }
 }
 
@@ -549,13 +571,13 @@ mod tests {
     fn split_sink_waits_for_inner_sinks_to_finish() {
         let first_done = Arc::new(AtomicBool::new(false));
         let second_done = Arc::new(AtomicBool::new(false));
-        let mut op = SplitDataStreamSinkOperator {
-            name: "SPLIT_DATA_STREAM_SINK(test)".to_string(),
-            init_error: None,
-            split_arena: Arc::new(ExprArena::default()),
-            split_exprs: Vec::new(),
-            fanout: false,
-            sinks: vec![
+        let mut op = SplitDataStreamSinkOperator::new(
+            "SPLIT_DATA_STREAM_SINK(test)".to_string(),
+            None,
+            Arc::new(ExprArena::default()),
+            Vec::new(),
+            false,
+            vec![
                 InnerSinkRuntime {
                     op: Box::new(PendingFinishSink::new("first", Arc::clone(&first_done))),
                 },
@@ -563,8 +585,7 @@ mod tests {
                     op: Box::new(PendingFinishSink::new("second", Arc::clone(&second_done))),
                 },
             ],
-            finishing: false,
-        };
+        );
 
         let state = RuntimeState::default();
         op.set_finishing(&state).expect("set finishing");
@@ -577,6 +598,38 @@ mod tests {
         second_done.store(true, Ordering::SeqCst);
         assert!(op.is_finished());
         assert!(op.sink_observable().is_none());
+    }
+
+    #[test]
+    fn split_sink_uses_one_identity_and_forwards_non_first_inner_wakes() {
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_done = Arc::new(AtomicBool::new(false));
+        let first = PendingFinishSink::new("first", first_done);
+        let second = PendingFinishSink::new("second", second_done);
+        let second_observable = Arc::clone(&second.observable);
+        let op = SplitDataStreamSinkOperator::new(
+            "SPLIT_DATA_STREAM_SINK(test)".to_string(),
+            None,
+            Arc::new(ExprArena::default()),
+            Vec::new(),
+            false,
+            vec![
+                InnerSinkRuntime {
+                    op: Box::new(first),
+                },
+                InnerSinkRuntime {
+                    op: Box::new(second),
+                },
+            ],
+        );
+        let first_identity = op.sink_observable().expect("stable sink observable");
+        let generation = first_identity.generation();
+
+        second_observable.notify_observers();
+
+        let second_identity = op.sink_observable().expect("stable sink observable");
+        assert!(Arc::ptr_eq(&first_identity, &second_identity));
+        assert_eq!(second_identity.generation(), generation + 1);
     }
 
     #[test]
@@ -711,13 +764,13 @@ mod tests {
         let closed = Arc::new(AtomicBool::new(false));
         let open_sealed = Arc::new(AtomicBool::new(false));
         let closed_sealed = Arc::new(AtomicBool::new(false));
-        let mut op = SplitDataStreamSinkOperator {
-            name: "SPLIT_DATA_STREAM_SINK(test)".to_string(),
-            init_error: None,
-            split_arena: Arc::new(ExprArena::default()),
-            split_exprs: Vec::new(),
-            fanout: false,
-            sinks: vec![
+        let mut op = SplitDataStreamSinkOperator::new(
+            "SPLIT_DATA_STREAM_SINK(test)".to_string(),
+            None,
+            Arc::new(ExprArena::default()),
+            Vec::new(),
+            false,
+            vec![
                 InnerSinkRuntime {
                     op: Box::new(GatedFinishSink::new(
                         "open",
@@ -733,8 +786,7 @@ mod tests {
                     )),
                 },
             ],
-            finishing: false,
-        };
+        );
 
         let state = RuntimeState::default();
         op.set_finishing(&state).expect("set finishing");

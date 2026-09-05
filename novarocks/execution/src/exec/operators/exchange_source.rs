@@ -27,8 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::exec::chunk::Chunk;
@@ -36,7 +36,7 @@ use crate::exec::expr::ExprArena;
 use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::operators::runtime_filter::RuntimeFilterConsumerSet;
 use crate::exec::pipeline::binding::ExchangeBinding;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{DriverBlockDeadline, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::exchange;
@@ -52,6 +52,155 @@ fn should_log_exchange_source_ready() -> bool {
     count.is_multiple_of(1024)
 }
 
+struct ExchangeIdleDeadlineState {
+    current: Option<DriverBlockDeadline>,
+    next_token: u64,
+    canceled: bool,
+}
+
+struct ExchangeIdleDeadline {
+    state: Mutex<ExchangeIdleDeadlineState>,
+}
+
+struct ExchangeIdleProgressListener {
+    deadline: std::sync::Weak<ExchangeIdleDeadline>,
+    observable: std::sync::Weak<Observable>,
+}
+
+struct ExchangeIdleProgressState {
+    receiver_observable: Option<std::sync::Weak<Observable>>,
+    listeners: Vec<ExchangeIdleProgressListener>,
+}
+
+struct ExchangeIdleProgress {
+    state: Mutex<ExchangeIdleProgressState>,
+}
+
+impl ExchangeIdleProgress {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ExchangeIdleProgressState {
+                receiver_observable: None,
+                listeners: Vec::new(),
+            }),
+        }
+    }
+
+    fn register(&self, deadline: &Arc<ExchangeIdleDeadline>, observable: &Arc<Observable>) {
+        self.state
+            .lock()
+            .expect("exchange idle progress lock")
+            .listeners
+            .push(ExchangeIdleProgressListener {
+                deadline: Arc::downgrade(deadline),
+                observable: Arc::downgrade(observable),
+            });
+    }
+
+    fn attach_receiver(self: &Arc<Self>, receiver_observable: &Arc<Observable>) {
+        let should_attach = {
+            let mut state = self.state.lock().expect("exchange idle progress lock");
+            match state.receiver_observable.as_ref() {
+                Some(current) if current.ptr_eq(&Arc::downgrade(receiver_observable)) => false,
+                Some(_) => {
+                    debug_assert!(false, "exchange source factory changed receiver observable");
+                    false
+                }
+                None => {
+                    state.receiver_observable = Some(Arc::downgrade(receiver_observable));
+                    true
+                }
+            }
+        };
+        if !should_attach {
+            return;
+        }
+
+        let progress = Arc::downgrade(self);
+        receiver_observable.add_observer(Arc::new(move || {
+            if let Some(progress) = progress.upgrade() {
+                progress.publish();
+            }
+        }));
+    }
+
+    fn publish(&self) {
+        let listeners = {
+            let mut state = self.state.lock().expect("exchange idle progress lock");
+            let mut listeners = Vec::with_capacity(state.listeners.len());
+            state.listeners.retain(|listener| {
+                let Some(deadline) = listener.deadline.upgrade() else {
+                    return false;
+                };
+                let Some(observable) = listener.observable.upgrade() else {
+                    return false;
+                };
+                listeners.push((deadline, observable));
+                true
+            });
+            listeners
+        };
+
+        // A receiver packet belongs to the shared exchange key, not to the
+        // driver that happens to win the queue pop. Reset every live driver's
+        // idle period before publishing any wake-up, so a fast sibling cannot
+        // consume the packet before another driver observes the progress.
+        for (deadline, _) in &listeners {
+            deadline.clear();
+        }
+        for (_, observable) in listeners {
+            observable.notify_observers();
+        }
+    }
+}
+
+impl ExchangeIdleDeadline {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ExchangeIdleDeadlineState {
+                current: None,
+                next_token: 0,
+                canceled: false,
+            }),
+        }
+    }
+
+    fn arm(&self, timeout: std::time::Duration) -> Option<DriverBlockDeadline> {
+        let mut state = self.state.lock().expect("exchange deadline state lock");
+        if state.canceled {
+            return None;
+        }
+        if let Some(current) = state.current {
+            return Some(current);
+        }
+        state.next_token = state.next_token.wrapping_add(1).max(1);
+        let deadline = DriverBlockDeadline::new(Instant::now() + timeout, state.next_token);
+        state.current = Some(deadline);
+        Some(deadline)
+    }
+
+    fn is_expired(&self) -> bool {
+        self.state
+            .lock()
+            .expect("exchange deadline state lock")
+            .current
+            .is_some_and(|deadline| deadline.at() <= Instant::now())
+    }
+
+    fn clear(&self) {
+        self.state
+            .lock()
+            .expect("exchange deadline state lock")
+            .current = None;
+    }
+
+    fn cancel(&self) {
+        let mut state = self.state.lock().expect("exchange deadline state lock");
+        state.canceled = true;
+        state.current = None;
+    }
+}
+
 /// Factory for exchange source operators that fetch and decode remote stream pages.
 pub struct ExchangeSourceFactory {
     name: String,
@@ -59,6 +208,7 @@ pub struct ExchangeSourceFactory {
     binding: ExchangeBinding,
     runtime_filter_execution: ExchangeSourceRuntimeFilterExecution,
     arena: Arc<ExprArena>,
+    idle_progress: Arc<ExchangeIdleProgress>,
 }
 
 struct ExchangeSourceRuntimeFilterExecution {
@@ -82,6 +232,7 @@ impl ExchangeSourceFactory {
             binding,
             runtime_filter_execution: ExchangeSourceRuntimeFilterExecution { consumers },
             arena,
+            idle_progress: Arc::new(ExchangeIdleProgress::new()),
         })
     }
 }
@@ -92,13 +243,19 @@ impl OperatorFactory for ExchangeSourceFactory {
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
+        let source_observable = Arc::new(Observable::new());
+        let idle_deadline = Arc::new(ExchangeIdleDeadline::new());
+        self.idle_progress
+            .register(&idle_deadline, &source_observable);
         Box::new(ExchangeSourceOperator {
             name: self.name.clone(),
             node: self.node.clone(),
             binding: self.binding.clone(),
             driver_id,
             receiver: None,
-            start: None,
+            idle_deadline,
+            idle_progress: Arc::clone(&self.idle_progress),
+            source_observable,
             finished: false,
             logged_first_pull: false,
             logged_first_none: false,
@@ -124,7 +281,9 @@ struct ExchangeSourceOperator {
     binding: ExchangeBinding,
     driver_id: i32,
     receiver: Option<exchange::ExchangeReceiverHandle>,
-    start: Option<Instant>,
+    source_observable: Arc<Observable>,
+    idle_deadline: Arc<ExchangeIdleDeadline>,
+    idle_progress: Arc<ExchangeIdleProgress>,
     finished: bool,
     logged_first_pull: bool,
     logged_first_none: bool,
@@ -151,6 +310,7 @@ impl Operator for ExchangeSourceOperator {
             receiver_key(self.binding.key),
             self.binding.expected_senders,
         )?;
+        self.idle_progress.attach_receiver(&receiver.observable());
         self.receiver = Some(receiver);
         debug!(
             "ExchangeSource prepared: finst={} node_id={} expected_senders={} timeout={:?}",
@@ -167,6 +327,15 @@ impl Operator for ExchangeSourceOperator {
             consumers.bind(state)?;
         }
         Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        self.idle_deadline.cancel();
+        Ok(())
+    }
+
+    fn cancel(&mut self) {
+        self.idle_deadline.cancel();
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -191,24 +360,23 @@ impl ProcessorOperator for ExchangeSourceOperator {
         if self.finished {
             return false;
         }
-        if let Some(start) = self.start
-            && start.elapsed() >= self.node.timeout
-        {
+        let Some(receiver) = self.receiver.as_ref() else {
+            return false;
+        };
+        let ready = receiver.has_output_or_finished(self.binding.expected_senders);
+        if ready {
+            self.idle_deadline.clear();
+        } else if self.idle_deadline.is_expired() {
             if should_log_exchange_source_ready() {
                 debug!(
-                    "ExchangeSource has_output due to timeout: finst={} node_id={} elapsed={:?} timeout={:?}",
+                    "ExchangeSource has_output due to idle timeout: finst={} node_id={} timeout={:?}",
                     self.binding.key.finst_uuid(),
                     self.node.node_id,
-                    start.elapsed(),
                     self.node.timeout
                 );
             }
             return true;
         }
-        let Some(receiver) = self.receiver.as_ref() else {
-            return false;
-        };
-        let ready = receiver.has_output_or_finished(self.binding.expected_senders);
         if ready && should_log_exchange_source_ready() {
             debug!(
                 "ExchangeSource has_output due to receiver: finst={} node_id={} expected_senders={}",
@@ -251,22 +419,6 @@ impl ProcessorOperator for ExchangeSourceOperator {
             );
         }
 
-        let start = self.start.get_or_insert_with(Instant::now);
-        if start.elapsed() >= self.node.timeout {
-            debug!(
-                "ExchangeSource timeout waiting for senders: finst_id={} node_id={} elapsed={:?} timeout={:?}",
-                self.binding.key.finst_uuid(),
-                self.node.node_id,
-                start.elapsed(),
-                self.node.timeout
-            );
-            return Err(format!(
-                "exchange timeout waiting for senders: finst_id={} node_id={}",
-                self.binding.key.finst_uuid(),
-                self.node.node_id
-            ));
-        }
-
         loop {
             let out = {
                 let receiver = self.receiver.as_ref().expect("receiver");
@@ -277,6 +429,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
 
             match out {
                 Some(exchange::ExchangePopResult::Chunk(chunk)) => {
+                    self.idle_deadline.clear();
                     let input_rows = chunk.len();
                     let chunk =
                         if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
@@ -307,6 +460,7 @@ impl ProcessorOperator for ExchangeSourceOperator {
                     return Ok(Some(chunk));
                 }
                 Some(exchange::ExchangePopResult::Finished(stats)) => {
+                    self.idle_deadline.cancel();
                     debug!(
                         "ExchangeSource finished: finst={} node_id={} driver_id={} request_received={} bytes_received={} deserialize_ns={} chunks_received={} rows_received={}",
                         self.binding.key.finst_uuid(),
@@ -322,6 +476,19 @@ impl ProcessorOperator for ExchangeSourceOperator {
                     return Ok(None);
                 }
                 None => {
+                    if self.idle_deadline.is_expired() {
+                        debug!(
+                            "ExchangeSource timeout waiting for senders: finst_id={} node_id={} timeout={:?}",
+                            self.binding.key.finst_uuid(),
+                            self.node.node_id,
+                            self.node.timeout
+                        );
+                        return Err(format!(
+                            "exchange timeout waiting for senders: finst_id={} node_id={}",
+                            self.binding.key.finst_uuid(),
+                            self.node.node_id
+                        ));
+                    }
                     if !self.logged_first_none {
                         self.logged_first_none = true;
                         debug!(
@@ -346,7 +513,17 @@ impl ProcessorOperator for ExchangeSourceOperator {
     }
 
     fn source_observable(&self) -> Option<Arc<Observable>> {
-        self.receiver.as_ref().map(|r| r.observable())
+        Some(Arc::clone(&self.source_observable))
+    }
+
+    fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
+        self.idle_deadline.arm(self.node.timeout)
+    }
+}
+
+impl Drop for ExchangeSourceOperator {
+    fn drop(&mut self) {
+        self.idle_deadline.cancel();
     }
 }
 
@@ -360,6 +537,7 @@ fn receiver_key(key: exchange::ExchangeKey) -> ExchangeReceiverKey {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crate::runtime_filter::{
@@ -377,6 +555,12 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
     use crate::exec::pipeline::binding::ExchangeBinding;
+    use crate::exec::pipeline::driver::PipelineDriver;
+    use crate::exec::pipeline::fragment_context::FragmentContext;
+    use crate::exec::pipeline::global_driver_executor::{
+        DriverTask, FragmentCompletion, GlobalDriverExecutor,
+    };
+    use crate::exec::pipeline::operator::Operator;
     use crate::runtime::fragment::io::ExchangeReceiverPort;
     use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
     use crate::runtime::runtime_state::RuntimeState;
@@ -524,7 +708,337 @@ mod tests {
         let session: execution::RuntimeFilterSessionRef = Arc::new(PublishedSession {
             subscription: Arc::new(PublishedSubscription(snapshot)),
         });
-        RuntimeState::default().with_runtime_filter_session(Some(session))
+        runtime_state().with_runtime_filter_session(Some(session))
+    }
+
+    fn runtime_state() -> RuntimeState {
+        RuntimeState::default()
+    }
+
+    struct CountingSink {
+        rows: Arc<AtomicUsize>,
+        finishing: bool,
+    }
+
+    impl Operator for CountingSink {
+        fn name(&self) -> &str {
+            "COUNTING_SINK"
+        }
+
+        fn is_finished(&self) -> bool {
+            self.finishing
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for CountingSink {
+        fn need_input(&self) -> bool {
+            !self.finishing
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+            self.rows.fetch_add(chunk.len(), Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finishing = true;
+            Ok(())
+        }
+    }
+
+    struct TimeoutPipeline {
+        state: Arc<RuntimeState>,
+        observable: Arc<Observable>,
+        rows: Arc<AtomicUsize>,
+        completion: Arc<FragmentCompletion>,
+        fragment: Arc<FragmentContext>,
+        source: Box<dyn Operator>,
+        binding: ExchangeBinding,
+    }
+
+    fn timeout_pipeline(key: exchange::ExchangeKey, timeout: Duration) -> TimeoutPipeline {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let node = ExchangeSourceNode::new(
+            key.node_id,
+            timeout,
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema"),
+        );
+        let binding = ExchangeBinding {
+            key,
+            expected_senders: 1,
+            receiver_port: in_process_test_exchange_receiver_port(),
+        };
+        let factory = ExchangeSourceFactory::new_native(
+            node,
+            binding.clone(),
+            Arc::new(ExprArena::default()),
+        )
+        .expect("exchange source factory");
+        let state = Arc::new(runtime_state());
+        let mut source = factory.create(1, 0);
+        source.prepare().expect("prepare exchange source");
+        source
+            .bind_runtime_state(&state)
+            .expect("bind exchange source runtime");
+        let observable = source
+            .as_processor_ref()
+            .and_then(ProcessorOperator::source_observable)
+            .expect("exchange source observable");
+        let rows = Arc::new(AtomicUsize::new(0));
+        let completion = FragmentCompletion::new(1);
+        let fragment = Arc::new(FragmentContext::new(
+            None,
+            Arc::clone(&state),
+            Some((key.finst_id_hi, key.finst_id_lo)),
+            None,
+            None,
+            None,
+        ));
+        TimeoutPipeline {
+            state,
+            observable,
+            rows,
+            completion,
+            fragment,
+            source,
+            binding,
+        }
+    }
+
+    fn submit_timeout_pipeline(
+        executor: &GlobalDriverExecutor,
+        state: Arc<RuntimeState>,
+        source: Box<dyn Operator>,
+        rows: Arc<AtomicUsize>,
+        completion: Arc<FragmentCompletion>,
+        fragment: Arc<FragmentContext>,
+    ) {
+        let driver = PipelineDriver::new(
+            0,
+            vec![
+                source,
+                Box::new(CountingSink {
+                    rows,
+                    finishing: false,
+                }),
+            ],
+            None,
+            Vec::new(),
+            state,
+            fragment.fragment_instance_id(),
+        );
+        let task = DriverTask::new(driver, completion, fragment, Duration::from_millis(5));
+        executor.submit(vec![task]);
+    }
+
+    fn wait_for_exchange_timeout(
+        completion: &Arc<FragmentCompletion>,
+        fragment: &Arc<FragmentContext>,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !completion.should_abort() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if !completion.should_abort() {
+            let error = "exchange timeout test did not complete".to_string();
+            completion.fail(error.clone());
+            fragment.set_final_status(error);
+        }
+        completion
+            .wait()
+            .expect_err("exchange timeout must fail the pipeline")
+    }
+
+    #[test]
+    fn no_first_packet_timeout_wakes_a_parked_pipeline() {
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 92_001,
+            finst_id_lo: 92_002,
+            node_id: 92_003,
+        };
+        let TimeoutPipeline {
+            state,
+            observable,
+            rows,
+            completion,
+            fragment,
+            source,
+            binding: _,
+        } = timeout_pipeline(key, Duration::from_millis(30));
+        let before = observable.generation();
+        let executor = GlobalDriverExecutor::new(1);
+        submit_timeout_pipeline(
+            &executor,
+            state,
+            source,
+            rows,
+            Arc::clone(&completion),
+            Arc::clone(&fragment),
+        );
+
+        let error = wait_for_exchange_timeout(&completion, &fragment);
+
+        assert!(error.contains("exchange timeout waiting for senders"));
+        assert_eq!(
+            observable.generation(),
+            before,
+            "deadline scheduling must not synthesize a receiver event"
+        );
+    }
+
+    #[test]
+    fn partial_data_stall_timeout_rewakes_the_same_parked_pipeline() {
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 92_011,
+            finst_id_lo: 92_012,
+            node_id: 92_013,
+        };
+        let TimeoutPipeline {
+            state,
+            observable,
+            rows,
+            completion,
+            fragment,
+            source,
+            binding,
+        } = timeout_pipeline(key, Duration::from_millis(100));
+        let executor = GlobalDriverExecutor::new(1);
+        submit_timeout_pipeline(
+            &executor,
+            state,
+            source,
+            Arc::clone(&rows),
+            Arc::clone(&completion),
+            Arc::clone(&fragment),
+        );
+
+        let registration_deadline = Instant::now() + Duration::from_secs(1);
+        while observable.num_observers() == 0 && Instant::now() < registration_deadline {
+            std::thread::yield_now();
+        }
+        assert!(observable.num_observers() > 0, "source did not park");
+        let after_park = observable.generation();
+        binding.receiver_port.push_local(
+            receiver_key(key),
+            0,
+            0,
+            vec![int32_chunk(vec![7])],
+            false,
+        );
+
+        let consume_deadline = Instant::now() + Duration::from_secs(1);
+        while rows.load(Ordering::Acquire) == 0 && Instant::now() < consume_deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(rows.load(Ordering::Acquire), 1);
+        let after_receiver = observable.generation();
+        assert!(
+            after_receiver > after_park,
+            "receiver event was not forwarded"
+        );
+
+        let error = wait_for_exchange_timeout(&completion, &fragment);
+        assert!(error.contains("exchange timeout waiting for senders"));
+        assert_eq!(
+            observable.generation(),
+            after_receiver,
+            "deadline scheduling must remain separate from receiver event generations"
+        );
+    }
+
+    #[test]
+    fn sibling_chunk_consumption_resets_every_driver_idle_deadline() {
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 92_021,
+            finst_id_lo: 92_022,
+            node_id: 92_023,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let node = ExchangeSourceNode::new(
+            key.node_id,
+            Duration::from_secs(1),
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema"),
+        );
+        let binding = ExchangeBinding {
+            key,
+            expected_senders: 1,
+            receiver_port: in_process_test_exchange_receiver_port(),
+        };
+        let factory = ExchangeSourceFactory::new_native(
+            node,
+            binding.clone(),
+            Arc::new(ExprArena::default()),
+        )
+        .expect("exchange source factory");
+        let mut first = factory.create(2, 0);
+        let mut second = factory.create(2, 1);
+        first.prepare().expect("prepare first exchange source");
+        second.prepare().expect("prepare second exchange source");
+
+        let first_before = first
+            .as_processor_ref()
+            .and_then(ProcessorOperator::source_block_deadline)
+            .expect("first source deadline");
+        let second_before = second
+            .as_processor_ref()
+            .and_then(ProcessorOperator::source_block_deadline)
+            .expect("second source deadline");
+        assert_eq!(first_before.token(), 1);
+        assert_eq!(second_before.token(), 1);
+
+        binding.receiver_port.push_local(
+            receiver_key(key),
+            0,
+            0,
+            vec![int32_chunk(vec![11])],
+            false,
+        );
+        let output = first
+            .as_processor_mut()
+            .expect("first processor")
+            .pull_chunk(&runtime_state())
+            .expect("first source pull")
+            .expect("first source chunk");
+        assert_eq!(int32_values(&output), vec![11]);
+        assert!(
+            !second
+                .as_processor_ref()
+                .expect("second processor")
+                .has_output(),
+            "the sibling consumed the only queued chunk"
+        );
+
+        let second_after = second
+            .as_processor_ref()
+            .and_then(ProcessorOperator::source_block_deadline)
+            .expect("reset second source deadline");
+        assert_ne!(
+            second_after.token(),
+            second_before.token(),
+            "receiver progress must rotate an idle deadline even when a sibling consumes the chunk"
+        );
+        assert!(second_after.at() >= second_before.at());
+        binding
+            .receiver_port
+            .cancel_fragment(UniqueId::new(key.finst_id_hi, key.finst_id_lo));
     }
 
     #[test]

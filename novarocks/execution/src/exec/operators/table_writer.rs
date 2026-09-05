@@ -590,14 +590,6 @@ impl ProcessorOperator for TableWriterOperator {
         }
     }
 
-    fn has_passive_ready_work(&self) -> bool {
-        // This is the scheduler-safe subset of `has_output`: every consulted
-        // output, error, or completion fact is already resident in the
-        // composite writer or its in-process partial aggregate. It never
-        // starts provider work or waits for it.
-        self.has_output()
-    }
-
     fn push_chunk(&mut self, state: &RuntimeState, mut chunk: Chunk) -> Result<(), String> {
         let result = (|| {
             if !self.need_input() {
@@ -3163,7 +3155,10 @@ pub(crate) mod tests {
         );
 
         abort_gate.notify_one();
-        assert!(poll_until(|| task.check_is_ready(), Duration::from_secs(5)));
+        assert!(poll_until(
+            || task.pending_finish_complete(),
+            Duration::from_secs(5)
+        ));
         assert!(
             task.finish_due_to_abort().is_none(),
             "driver must become terminal after the writer actor joins"

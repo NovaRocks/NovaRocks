@@ -14,11 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Blocked-driver poller for event-driven wake-up.
+//! Pending-finish poller for asynchronous operator teardown.
 //!
 //! Responsibilities:
-//! - Tracks blocked drivers and re-schedules them when dependencies become ready.
-//! - Reduces active-spin scheduling by polling readiness queues in batches.
+//! - Tracks only drivers whose asynchronous operators still own finish work.
+//! - Re-schedules them after all pending finish work completes.
 //!
 //! Key exported interfaces:
 //! - Types: `BlockedDriverPoller`.
@@ -152,7 +152,7 @@ fn drain_blocked(
             pending.push_back(entry);
             continue;
         }
-        if entry.task.check_is_ready() {
+        if entry.task.pending_finish_complete() {
             entry.task.set_ready();
             ready_tasks.push(entry.task);
         } else {
