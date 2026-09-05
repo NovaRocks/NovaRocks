@@ -80,7 +80,7 @@ pub(crate) trait QueryLifecycleConvergenceReader: Send + Sync {
 pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
     fn execution_id(&self) -> QueryExecutionId;
 
-    fn request_abort(&self, reason: String);
+    fn request_abort(&self, failure: LatchedQueryFailure);
 
     /// The terminal ingress is deliberately routed through the active attempt
     /// rather than the legacy execution-report registry.  This keeps the
@@ -110,41 +110,112 @@ struct RetainedTerminalIngress {
     expires_at: Instant,
 }
 
+/// Typed origin of a query failure retained by the FE query owner.
+///
+/// The variants deliberately describe evidence, not rendered text. This lets
+/// the registry preserve a concrete query failure when lifecycle supervision
+/// subsequently observes the control stream closing as a consequence of that
+/// failure.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum QueryFailureCause {
+    LifecycleHeartbeatTimeout,
+    RemoteTransportObservation,
+    BackendProcessLoss,
+    ClientCancellation,
+    FrontendExecution,
+    BackendLocalFailure,
+}
+
+impl QueryFailureCause {
+    const fn priority(self) -> QueryFailurePriority {
+        match self {
+            Self::LifecycleHeartbeatTimeout | Self::RemoteTransportObservation => {
+                QueryFailurePriority::LifecycleObservation
+            }
+            Self::BackendProcessLoss
+            | Self::ClientCancellation
+            | Self::FrontendExecution
+            | Self::BackendLocalFailure => QueryFailurePriority::ConcreteCause,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum QueryFailurePriority {
+    LifecycleObservation,
+    ConcreteCause,
+}
+
+/// The primary failure selected by the query registry.
+///
+/// `id` identifies the selected causal record, so abort cleanup may enrich
+/// only that exact failure and cannot overwrite a concurrently observed,
+/// higher-priority cause.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LatchedQueryFailure {
+    id: u64,
+    cause: QueryFailureCause,
+    message: String,
+}
+
+impl LatchedQueryFailure {
+    fn new(id: u64, cause: QueryFailureCause, message: String) -> Self {
+        Self { id, cause, message }
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 struct ActiveQuery {
     /// Process identities, not durable membership ids. A `backend_idx` is a
     /// round-local scheduling ordinal and must never identify an active
     /// attempt after topology publication.
     scheduled_backends: BTreeSet<BackendProcessId>,
-    /// The user-visible failure is the lexical minimum of all reported
-    /// failures.  This deliberately makes concurrent failure reporting
-    /// independent of arrival order until T9 introduces the richer typed
-    /// ordering.
-    first_failure: Option<String>,
+    /// A concrete cause supersedes a lifecycle observation. Within one
+    /// priority class the first observed cause remains primary, preserving
+    /// causal ordering without interpreting rendered error text.
+    first_failure: Option<LatchedQueryFailure>,
     /// Keep every losing distinct failure for the later structured
     /// convergence snapshot instead of discarding it at the first latch.
-    secondary_failures: BTreeSet<String>,
+    secondary_failures: BTreeSet<(QueryFailureCause, String)>,
+    next_failure_id: u64,
     cancellation_requested: bool,
     cancellation_dispatched: bool,
     active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
 }
 
 impl ActiveQuery {
-    /// Records a failure using a commutative, idempotent minimum fold.
-    ///
-    /// `first_failure` remains the compatibility-facing name for the primary
-    /// textual error while callers migrate to the typed T9 cause model.
-    fn record_failure(&mut self, message: String) -> String {
+    fn record_failure(&mut self, cause: QueryFailureCause, message: String) -> LatchedQueryFailure {
+        if let Some(primary) = &self.first_failure
+            && primary.cause == cause
+            && primary.message == message
+        {
+            return primary.clone();
+        }
+
+        let id = self.next_failure_id;
+        self.next_failure_id = self
+            .next_failure_id
+            .checked_add(1)
+            .expect("frontend query failure id exhausted");
+        let candidate = LatchedQueryFailure::new(id, cause, message);
         match self.first_failure.as_mut() {
-            None => self.first_failure = Some(message),
-            Some(primary) if message < *primary => {
-                let displaced = std::mem::replace(primary, message.clone());
-                self.secondary_failures.remove(&message);
-                self.secondary_failures.insert(displaced);
+            None => self.first_failure = Some(candidate),
+            Some(primary) if cause.priority() > primary.cause.priority() => {
+                let displaced = std::mem::replace(primary, candidate);
+                self.secondary_failures
+                    .insert((displaced.cause, displaced.message));
             }
-            Some(primary) if message != *primary => {
-                self.secondary_failures.insert(message);
+            Some(_) => {
+                self.secondary_failures
+                    .insert((candidate.cause, candidate.message));
             }
-            Some(_) => {}
         }
         self.first_failure
             .clone()
@@ -277,6 +348,7 @@ impl FrontendQueryRegistry {
                     scheduled_backends: BTreeSet::new(),
                     first_failure: None,
                     secondary_failures: BTreeSet::new(),
+                    next_failure_id: 1,
                     cancellation_requested: false,
                     cancellation_dispatched: false,
                     active_attempt: None,
@@ -310,8 +382,8 @@ impl FrontendQueryRegistry {
         let query = active
             .get_mut(&query_key(query_id))
             .ok_or_else(|| self.inactive_query(query_id))?;
-        if let Some(message) = &query.first_failure {
-            return Err(failed(message.clone()));
+        if let Some(failure) = &query.first_failure {
+            return Err(failed(failure.message.clone()));
         }
         if query.cancellation_requested {
             return Err(failed(
@@ -401,7 +473,11 @@ impl FrontendQueryRegistry {
                     "frontend query has no active attempt control binding",
                 )
             })?;
-        control.request_abort(reason);
+        control.request_abort(LatchedQueryFailure::new(
+            0,
+            QueryFailureCause::ClientCancellation,
+            reason,
+        ));
         Ok(())
     }
 
@@ -525,7 +601,12 @@ impl FrontendQueryRegistry {
             .lock()
             .expect("frontend query registry lock")
             .get(&query_key(query_id))
-            .and_then(|query| query.first_failure.clone())
+            .and_then(|query| {
+                query
+                    .first_failure
+                    .as_ref()
+                    .map(|failure| failure.message.clone())
+            })
     }
 
     pub(crate) fn retained_convergence_snapshot(
@@ -566,31 +647,62 @@ impl FrontendQueryRegistry {
     pub(crate) fn preserve_failure_context(
         &self,
         query_id: QueryId,
+        failure_id: u64,
         message: String,
     ) -> Result<(), DistributedQueryError> {
         let mut active = self.active.lock().expect("frontend query registry lock");
         let query = active
             .get_mut(&query_key(query_id))
             .ok_or_else(|| self.inactive_query(query_id))?;
-        query.record_failure(message);
+        if let Some(primary) = query.first_failure.as_mut()
+            && primary.id == failure_id
+        {
+            primary.message = message;
+        }
         Ok(())
     }
 
     pub(crate) fn latch_failure_and_cancel(
         &self,
         query_id: QueryId,
+        cause: QueryFailureCause,
         message: impl Into<String>,
-    ) -> Result<String, DistributedQueryError> {
-        let (message, cancellation) = {
-            let mut active = self.active.lock().expect("frontend query registry lock");
-            let query = active
-                .get_mut(&query_key(query_id))
-                .ok_or_else(|| self.inactive_query(query_id))?;
-            let message = query.record_failure(message.into());
-            (message, request_cancellation(query))
-        };
+    ) -> Result<LatchedQueryFailure, DistributedQueryError> {
+        let (message, cancellation) = self.latch_failure(query_id, cause, message.into())?;
         dispatch_cancellation(Some(cancellation));
         Ok(message)
+    }
+
+    /// Records the failure before moving potentially blocking abort work off
+    /// the caller. Control-stream readers use this form so observing a typed
+    /// LocalFailure is linearized before that same reader continues receiving
+    /// termination events.
+    pub(crate) fn latch_failure_and_cancel_async(
+        &self,
+        query_id: QueryId,
+        cause: QueryFailureCause,
+        message: impl Into<String>,
+    ) -> Result<LatchedQueryFailure, DistributedQueryError> {
+        let (message, cancellation) = self.latch_failure(query_id, cause, message.into())?;
+        if cancellation.active_attempt.is_some() {
+            std::thread::spawn(move || dispatch_cancellation(Some(cancellation)));
+        }
+        Ok(message)
+    }
+
+    fn latch_failure(
+        &self,
+        query_id: QueryId,
+        cause: QueryFailureCause,
+        message: String,
+    ) -> Result<(LatchedQueryFailure, CancellationDispatch), DistributedQueryError> {
+        let mut active = self.active.lock().expect("frontend query registry lock");
+        let query = active
+            .get_mut(&query_key(query_id))
+            .ok_or_else(|| self.inactive_query(query_id))?;
+        let failure = query.record_failure(cause, message);
+        let cancellation = request_cancellation(query);
+        Ok((failure, cancellation))
     }
 
     pub(crate) fn backend_failed(
@@ -607,10 +719,10 @@ impl FrontendQueryRegistry {
                     continue;
                 }
                 if query.first_failure.is_none() {
-                    query.record_failure(message.clone());
+                    query.record_failure(QueryFailureCause::BackendProcessLoss, message.clone());
                     affected.push(QueryId::new(high, low));
                 } else {
-                    query.record_failure(message.clone());
+                    query.record_failure(QueryFailureCause::BackendProcessLoss, message.clone());
                 }
                 cancellations.push(request_cancellation(query));
             }
@@ -754,7 +866,7 @@ impl Drop for ActiveQueryGuard {
 
 struct CancellationDispatch {
     active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
-    reason: String,
+    failure: LatchedQueryFailure,
 }
 
 fn request_cancellation(query: &mut ActiveQuery) -> CancellationDispatch {
@@ -770,10 +882,13 @@ fn request_cancellation(query: &mut ActiveQuery) -> CancellationDispatch {
     };
     CancellationDispatch {
         active_attempt,
-        reason: query
-            .first_failure
-            .clone()
-            .unwrap_or_else(|| "frontend query cancellation requested".to_string()),
+        failure: query.first_failure.clone().unwrap_or_else(|| {
+            LatchedQueryFailure::new(
+                0,
+                QueryFailureCause::ClientCancellation,
+                "frontend query cancellation requested".to_string(),
+            )
+        }),
     }
 }
 
@@ -781,7 +896,7 @@ fn dispatch_cancellation(cancellation: Option<CancellationDispatch>) {
     if let Some(cancellation) = cancellation
         && let Some(control) = cancellation.active_attempt
     {
-        control.request_abort(cancellation.reason);
+        control.request_abort(cancellation.failure);
     }
 }
 
@@ -818,7 +933,7 @@ mod tests {
             self.execution_id
         }
 
-        fn request_abort(&self, _reason: String) {}
+        fn request_abort(&self, _failure: LatchedQueryFailure) {}
 
         fn report_terminal_outcome(
             &self,
@@ -1010,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_primary_is_stable_when_reports_arrive_in_different_orders() {
+    fn same_priority_failure_preserves_first_causal_report() {
         fn record_in_order(messages: &[&str]) -> (String, Vec<String>) {
             let registry = Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(71)));
             let query_id = QueryId::new(71, 72);
@@ -1024,6 +1139,7 @@ mod tests {
                         scheduled_backends: BTreeSet::new(),
                         first_failure: None,
                         secondary_failures: BTreeSet::new(),
+                        next_failure_id: 1,
                         cancellation_requested: false,
                         cancellation_dispatched: false,
                         active_attempt: None,
@@ -1031,7 +1147,11 @@ mod tests {
                 );
             for message in messages {
                 registry
-                    .latch_failure_and_cancel(query_id, (*message).to_string())
+                    .latch_failure_and_cancel(
+                        query_id,
+                        QueryFailureCause::FrontendExecution,
+                        (*message).to_string(),
+                    )
                     .expect("latch failure");
             }
             let active = registry
@@ -1042,19 +1162,135 @@ mod tests {
                 .get(&query_key(query_id))
                 .expect("registered query remains active");
             (
-                query.first_failure.clone().expect("primary failure"),
-                query.secondary_failures.iter().cloned().collect(),
+                query
+                    .first_failure
+                    .clone()
+                    .expect("primary failure")
+                    .message,
+                query
+                    .secondary_failures
+                    .iter()
+                    .map(|(_, message)| message.clone())
+                    .collect(),
             )
         }
 
         let forward = record_in_order(&["zeta failure", "alpha failure", "middle failure"]);
         let reverse = record_in_order(&["middle failure", "alpha failure", "zeta failure"]);
 
-        assert_eq!(forward, reverse);
-        assert_eq!(forward.0, "alpha failure");
+        assert_eq!(forward.0, "zeta failure");
         assert_eq!(
             forward.1,
-            vec!["middle failure".to_string(), "zeta failure".to_string()]
+            vec!["alpha failure".to_string(), "middle failure".to_string()]
+        );
+        assert_eq!(reverse.0, "middle failure");
+        assert_eq!(
+            reverse.1,
+            vec!["alpha failure".to_string(), "zeta failure".to_string()]
+        );
+    }
+
+    #[test]
+    fn concrete_failure_supersedes_lifecycle_observation_in_either_arrival_order() {
+        fn primary_for_order(observation_first: bool) -> (QueryFailureCause, String) {
+            let mut query = ActiveQuery {
+                scheduled_backends: BTreeSet::new(),
+                first_failure: None,
+                secondary_failures: BTreeSet::new(),
+                next_failure_id: 1,
+                cancellation_requested: false,
+                cancellation_dispatched: false,
+                active_attempt: None,
+            };
+            let observation = || {
+                (
+                    QueryFailureCause::LifecycleHeartbeatTimeout,
+                    "aaa heartbeat timeout".to_string(),
+                )
+            };
+            let concrete = || {
+                (
+                    QueryFailureCause::BackendLocalFailure,
+                    "zzz fragment scan failed".to_string(),
+                )
+            };
+            let reports = if observation_first {
+                [observation(), concrete()]
+            } else {
+                [concrete(), observation()]
+            };
+            for (cause, message) in reports {
+                query.record_failure(cause, message);
+            }
+            let primary = query.first_failure.expect("primary failure");
+            (primary.cause, primary.message)
+        }
+
+        let expected = (
+            QueryFailureCause::BackendLocalFailure,
+            "zzz fragment scan failed".to_string(),
+        );
+        assert_eq!(primary_for_order(true), expected);
+        assert_eq!(primary_for_order(false), expected);
+    }
+
+    #[test]
+    fn stale_abort_context_cannot_overwrite_upgraded_concrete_failure() {
+        let registry = Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(73)));
+        let query_id = QueryId::new(73, 74);
+        registry
+            .active
+            .lock()
+            .expect("frontend query registry lock")
+            .insert(
+                query_key(query_id),
+                ActiveQuery {
+                    scheduled_backends: BTreeSet::new(),
+                    first_failure: None,
+                    secondary_failures: BTreeSet::new(),
+                    next_failure_id: 1,
+                    cancellation_requested: false,
+                    cancellation_dispatched: false,
+                    active_attempt: None,
+                },
+            );
+
+        let observation = registry
+            .latch_failure_and_cancel(
+                query_id,
+                QueryFailureCause::LifecycleHeartbeatTimeout,
+                "aaa heartbeat timeout",
+            )
+            .expect("latch lifecycle observation");
+        let concrete = registry
+            .latch_failure_and_cancel(
+                query_id,
+                QueryFailureCause::BackendLocalFailure,
+                "zzz fragment scan failed",
+            )
+            .expect("latch concrete failure");
+        registry
+            .preserve_failure_context(
+                query_id,
+                observation.id(),
+                "aaa heartbeat timeout; rollback failed".to_string(),
+            )
+            .expect("ignore stale lifecycle context");
+        assert_eq!(
+            registry.first_failure(query_id).as_deref(),
+            Some("zzz fragment scan failed")
+        );
+
+        registry
+            .preserve_failure_context(
+                query_id,
+                concrete.id(),
+                "zzz fragment scan failed; rollback failed".to_string(),
+            )
+            .expect("enrich selected concrete failure");
+        assert_eq!(
+            registry.first_failure(query_id).as_deref(),
+            Some("zzz fragment scan failed; rollback failed")
         );
     }
 

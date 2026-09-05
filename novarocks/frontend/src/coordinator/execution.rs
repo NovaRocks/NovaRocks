@@ -65,8 +65,9 @@ use super::query_lifecycle::{
     QueryControlSession, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
 };
 use super::query_registry::{
-    FrontendQueryRegistry, QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot,
-    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
+    FrontendQueryRegistry, QueryFailureCause, QueryLifecycleConvergenceReader,
+    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
+    RuntimeFilterTerminalRollupUnavailable,
 };
 use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
@@ -1448,15 +1449,15 @@ impl FrontendDistributedQueryCoordinator {
                     &mut round,
                     &split_delivery,
                     classification,
+                    QueryFailureCause::ClientCancellation,
                     "query cancelled while fetching result",
                 ));
             }
             if let Some(message) = self.registry.first_failure(query_id) {
-                break Err(self.fail_task_round(
+                break Err(self.fail_latched_task_round(
                     query_id,
                     &mut round,
                     &split_delivery,
-                    classification,
                     message,
                 ));
             }
@@ -1473,6 +1474,7 @@ impl FrontendDistributedQueryCoordinator {
                     &mut round,
                     &split_delivery,
                     classification,
+                    QueryFailureCause::FrontendExecution,
                     format!("query timed out after {timeout_ms} ms waiting on {waiting_on}"),
                 ));
             }
@@ -1485,6 +1487,7 @@ impl FrontendDistributedQueryCoordinator {
                         &mut round,
                         &split_delivery,
                         classification,
+                        QueryFailureCause::FrontendExecution,
                         format!("task execution did not advance: {error}"),
                     ));
                 }
@@ -1521,6 +1524,7 @@ impl FrontendDistributedQueryCoordinator {
                     &mut round,
                     &split_delivery,
                     classification,
+                    QueryFailureCause::BackendLocalFailure,
                     detail,
                 ));
             }
@@ -1540,6 +1544,7 @@ impl FrontendDistributedQueryCoordinator {
                     &mut round,
                     &split_delivery,
                     classification,
+                    QueryFailureCause::FrontendExecution,
                     detail,
                 ));
             }
@@ -1571,6 +1576,7 @@ impl FrontendDistributedQueryCoordinator {
                             &mut round,
                             &split_delivery,
                             classification,
+                            QueryFailureCause::FrontendExecution,
                             error,
                         ));
                     }
@@ -1592,6 +1598,7 @@ impl FrontendDistributedQueryCoordinator {
                                 &mut round,
                                 &split_delivery,
                                 classification,
+                                QueryFailureCause::FrontendExecution,
                                 format!("root result packet was refused: {error}"),
                             ));
                         }
@@ -1602,6 +1609,7 @@ impl FrontendDistributedQueryCoordinator {
                                     &mut round,
                                     &split_delivery,
                                     classification,
+                                    QueryFailureCause::FrontendExecution,
                                     error,
                                 ));
                             }
@@ -1612,6 +1620,7 @@ impl FrontendDistributedQueryCoordinator {
                                     &mut round,
                                     &split_delivery,
                                     classification,
+                                    QueryFailureCause::FrontendExecution,
                                     error,
                                 ));
                             }
@@ -1629,6 +1638,7 @@ impl FrontendDistributedQueryCoordinator {
                                 &mut round,
                                 &split_delivery,
                                 classification,
+                                QueryFailureCause::FrontendExecution,
                                 format!("root result end of stream was refused: {error}"),
                             ));
                         }
@@ -1640,6 +1650,7 @@ impl FrontendDistributedQueryCoordinator {
                                 &mut round,
                                 &split_delivery,
                                 classification,
+                                QueryFailureCause::FrontendExecution,
                                 error,
                             ));
                         }
@@ -1651,6 +1662,7 @@ impl FrontendDistributedQueryCoordinator {
                                 &mut round,
                                 &split_delivery,
                                 classification,
+                                QueryFailureCause::FrontendExecution,
                                 error,
                             ));
                         }
@@ -1667,7 +1679,7 @@ impl FrontendDistributedQueryCoordinator {
                         // it.
                         last_root_poll = RootResultPoll::NotReady;
                     }
-                    Ok(RootResultOutcome::Failed(detail)) | Err(detail) => {
+                    Ok(RootResultOutcome::Failed(detail)) => {
                         // A refused or failed poll is also how a read ends
                         // when the task it names has already gone. If this
                         // attempt has a failure of its own, that failure is
@@ -1681,6 +1693,26 @@ impl FrontendDistributedQueryCoordinator {
                             &mut round,
                             &split_delivery,
                             classification,
+                            QueryFailureCause::BackendLocalFailure,
+                            detail,
+                        ));
+                    }
+                    Err(detail) => {
+                        let (cause, detail) = round.failure_cause().map_or(
+                            (QueryFailureCause::RemoteTransportObservation, detail),
+                            |task_failure| {
+                                (
+                                    QueryFailureCause::BackendLocalFailure,
+                                    format!("task execution terminated: {task_failure:?}"),
+                                )
+                            },
+                        );
+                        break Err(self.fail_task_round(
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            cause,
                             detail,
                         ));
                     }
@@ -1918,9 +1950,11 @@ impl FrontendDistributedQueryCoordinator {
             }
         })();
         if let Err(error) = &outcome {
-            let _ = self
-                .registry
-                .latch_failure_and_cancel(query_id, error.message().to_string());
+            let _ = self.registry.latch_failure_and_cancel(
+                query_id,
+                QueryFailureCause::FrontendExecution,
+                error.message().to_string(),
+            );
             return Err(DistributedQueryError::new(error.kind(), error.message()));
         }
         outcome
@@ -1999,6 +2033,7 @@ impl FrontendDistributedQueryCoordinator {
         round: &mut TaskRound,
         split_delivery: &SplitDeliveryBridge,
         classification: TaskRoundFailureClassification<'_>,
+        cause: QueryFailureCause,
         message: impl Into<String>,
     ) -> DistributedQueryError {
         let message = message.into();
@@ -2015,8 +2050,26 @@ impl FrontendDistributedQueryCoordinator {
             &message,
         ) {
             Some(classified) => classified,
-            None => self.fail_and_cancel(query_id, message),
+            None => self.fail_and_cancel_with_cause(query_id, cause, message),
         }
+    }
+
+    /// Stands down a task round for a failure the registry already selected.
+    ///
+    /// Relatching that message as a frontend execution failure would discard
+    /// its typed origin and could incorrectly supersede an earlier lifecycle
+    /// observation. The existing registry record remains the single causal
+    /// authority; this helper only performs the task-protocol cleanup.
+    fn fail_latched_task_round(
+        &self,
+        query_id: QueryId,
+        round: &mut TaskRound,
+        split_delivery: &SplitDeliveryBridge,
+        message: String,
+    ) -> DistributedQueryError {
+        split_delivery.abandon(message.clone());
+        abort_task_round(round, &message);
+        failed(self.registry.first_failure(query_id).unwrap_or(message))
     }
 
     fn fail_and_cancel(
@@ -2024,8 +2077,20 @@ impl FrontendDistributedQueryCoordinator {
         query_id: QueryId,
         message: impl Into<String>,
     ) -> DistributedQueryError {
-        match self.registry.latch_failure_and_cancel(query_id, message) {
-            Ok(message) => failed(message),
+        self.fail_and_cancel_with_cause(query_id, QueryFailureCause::FrontendExecution, message)
+    }
+
+    fn fail_and_cancel_with_cause(
+        &self,
+        query_id: QueryId,
+        cause: QueryFailureCause,
+        message: impl Into<String>,
+    ) -> DistributedQueryError {
+        match self
+            .registry
+            .latch_failure_and_cancel(query_id, cause, message)
+        {
+            Ok(failure) => failed(failure.message().to_string()),
             Err(error) => error,
         }
     }

@@ -64,8 +64,9 @@ use super::{
     QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
 };
 use crate::coordinator::query_registry::{
-    ActiveQueryAttemptControl, FrontendQueryRegistry, QueryLifecycleConvergenceErrorSource,
-    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
+    ActiveQueryAttemptControl, FrontendQueryRegistry, QueryFailureCause,
+    QueryLifecycleConvergenceErrorSource, RuntimeFilterTerminalRollupSnapshot,
+    RuntimeFilterTerminalRollupUnavailable,
 };
 
 fn terminal_outcome(
@@ -2983,7 +2984,11 @@ fn frontend_query_lifecycle_query_registry_pre_init_cancellation_blocks_fanout()
     let (transport, _) = RecordingTransport::ready(&plan);
     let (registry, _query) = registry_for(&plan);
     registry
-        .latch_failure_and_cancel(query_id, "client cancelled before InitQuery")
+        .latch_failure_and_cancel(
+            query_id,
+            QueryFailureCause::ClientCancellation,
+            "client cancelled before InitQuery",
+        )
         .expect("latch pre-init cancellation");
     let barrier =
         FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
@@ -3094,7 +3099,11 @@ fn query_cancel_aborts_all_participants() {
         .expect("finish the only submission");
 
     registry
-        .latch_failure_and_cancel(query_id, "client requested statement cancellation")
+        .latch_failure_and_cancel(
+            query_id,
+            QueryFailureCause::ClientCancellation,
+            "client requested statement cancellation",
+        )
         .expect("first cancellation wins");
 
     for session in sessions.values() {

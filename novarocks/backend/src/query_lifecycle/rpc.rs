@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 
 use novarocks_proto_codec::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand as ProtocolQueryControlCommand,
@@ -349,7 +349,10 @@ pub(crate) async fn handle_query_control_stream(
     reason = "The control-stream task receives one explicitly named resource for each lifecycle responsibility."
 )]
 async fn run_attached_control_stream(
-    mut inbound: tonic::Streaming<proto::QueryControlRequest>,
+    mut inbound: impl Stream<Item = Result<proto::QueryControlRequest, tonic::Status>>
+    + Send
+    + Unpin
+    + 'static,
     mut lease: CoordinatorLease,
     mut events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
     mut runtime_filter_feedback: tokio::sync::mpsc::Receiver<QueryControlEvent>,
@@ -401,11 +404,70 @@ async fn run_attached_control_stream(
             _ = wait_for_query_control_shutdown(&mut shutdown) => {
                 break;
             }
-            inbound_message = inbound.message() => {
+            // Correctness events outrank liveness traffic. In particular,
+            // LocalFailure may be queued while a heartbeat sent before the
+            // failure is still readable on the inbound stream.
+            event = events.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                let terminal_stream_drop = match event.as_proto().event.as_ref() {
+                    Some(proto::query_control_response::Event::TerminalOutcome(outcome)) => {
+                        match outcome.outcome.as_ref() {
+                            Some(proto::participant_terminal_outcome::Outcome::Proof(_)) => {
+                                terminal_proof_stream_drop.as_ref()
+                            }
+                            Some(proto::participant_terminal_outcome::Outcome::NegativeAttestation(_)) => {
+                                terminal_attestation_stream_drop.as_ref()
+                            }
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(scope) = terminal_stream_drop {
+                    eprintln!(
+                        "NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED execution_id={}:{}:{} backend_index={} process_id={} token={}",
+                        scope.execution_id.query_id().high(),
+                        scope.execution_id.query_id().low(),
+                        scope.execution_id.attempt_id().get(),
+                        scope.backend_index,
+                        scope.process_id,
+                        scope.token,
+                    );
+                    break;
+                }
+                let termination_accepted = matches!(
+                    event.as_proto().event,
+                    Some(proto::query_control_response::Event::TerminationAccepted(_))
+                );
+                if !send_control_response(
+                    &outbound,
+                    Ok(event.as_proto().clone()),
+                    &mut shutdown,
+                )
+                .await
+                {
+                    break;
+                }
+                if termination_accepted {
+                    if awaiting_graceful_termination {
+                        // Abort may publish its legacy acknowledgement before
+                        // the asynchronous immutable TerminalSnapshot. Both
+                        // terminal paths retain that record until the
+                        // frontend acknowledges it, so this latch never
+                        // closes the command side by itself.
+                        continue;
+                    }
+                    lease.mark_graceful();
+                    break;
+                }
+            }
+            inbound_message = inbound.next() => {
                 let request = match inbound_message {
-                    Ok(Some(request)) => request,
-                    Ok(None) => break,
-                    Err(error) => {
+                    Some(Ok(request)) => request,
+                    None => break,
+                    Some(Err(error)) => {
                         let _ = send_control_response(
                             &outbound,
                             Err(tonic::Status::invalid_argument(format!(
@@ -455,7 +517,7 @@ async fn run_attached_control_stream(
                 );
                 let result = match command.as_proto().command.as_ref() {
                     Some(proto::query_control_request::Command::Heartbeat(heartbeat)) => {
-                        lease.control().heartbeat(heartbeat.sequence)
+                        lease.control().heartbeat(heartbeat.sequence).map(|_| ())
                     }
                     Some(proto::query_control_request::Command::Abort(abort)) => {
                         awaiting_graceful_termination = true;
@@ -511,62 +573,6 @@ async fn run_attached_control_stream(
                     // ACK has crossed the command side; otherwise the
                     // compatibility TerminationAccepted event can race the
                     // frontend's ACK and lose the retained record.
-                    break;
-                }
-            }
-            event = events.recv() => {
-                let Some(event) = event else {
-                    break;
-                };
-                let terminal_stream_drop = match event.as_proto().event.as_ref() {
-                    Some(proto::query_control_response::Event::TerminalOutcome(outcome)) => {
-                        match outcome.outcome.as_ref() {
-                            Some(proto::participant_terminal_outcome::Outcome::Proof(_)) => {
-                                terminal_proof_stream_drop.as_ref()
-                            }
-                            Some(proto::participant_terminal_outcome::Outcome::NegativeAttestation(_)) => {
-                                terminal_attestation_stream_drop.as_ref()
-                            }
-                            None => None,
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(scope) = terminal_stream_drop {
-                    eprintln!(
-                        "NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED execution_id={}:{}:{} backend_index={} process_id={} token={}",
-                        scope.execution_id.query_id().high(),
-                        scope.execution_id.query_id().low(),
-                        scope.execution_id.attempt_id().get(),
-                        scope.backend_index,
-                        scope.process_id,
-                        scope.token,
-                    );
-                    break;
-                }
-                let termination_accepted = matches!(
-                    event.as_proto().event,
-                    Some(proto::query_control_response::Event::TerminationAccepted(_))
-                );
-                if !send_control_response(
-                    &outbound,
-                    Ok(event.as_proto().clone()),
-                    &mut shutdown,
-                )
-                .await
-                {
-                    break;
-                }
-                if termination_accepted {
-                    if awaiting_graceful_termination {
-                        // Abort may publish its legacy acknowledgement before
-                        // the asynchronous immutable TerminalSnapshot. Both
-                        // terminal paths retain that record until the
-                        // frontend acknowledges it, so this latch never
-                        // closes the command side by itself.
-                        continue;
-                    }
-                    lease.mark_graceful();
                     break;
                 }
             }
@@ -788,5 +794,138 @@ pub(crate) fn status_from_contract_error(error: ProtocolError) -> tonic::Status 
         | ProtocolErrorKind::VersionMismatch => tonic::Status::invalid_argument(detail),
         ProtocolErrorKind::Conflict => tonic::Status::already_exists(detail),
         ProtocolErrorKind::Capacity => tonic::Status::resource_exhausted(detail),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use novarocks_proto_codec::lifecycle::QueryControlEvent;
+    use novarocks_proto_models::{catalog, novarocks as proto};
+
+    use super::{CoordinatorLease, run_attached_control_stream};
+    use crate::query_lifecycle::{
+        BackendQueryControl, QueryHeartbeatDisposition, QueryLifecycleError,
+    };
+
+    struct TerminalPendingControl {
+        heartbeat_seen: Arc<tokio::sync::Notify>,
+    }
+
+    impl BackendQueryControl for TerminalPendingControl {
+        fn heartbeat(
+            &self,
+            _sequence: u64,
+        ) -> Result<QueryHeartbeatDisposition, QueryLifecycleError> {
+            self.heartbeat_seen.notify_one();
+            Ok(QueryHeartbeatDisposition::TerminalDeliveryPending)
+        }
+
+        fn abort(&self, _reason: String) -> Result<(), QueryLifecycleError> {
+            unreachable!("test sends only heartbeat")
+        }
+
+        fn finalize(&self) -> Result<(), QueryLifecycleError> {
+            unreachable!("test sends only heartbeat")
+        }
+
+        fn coordinator_lost(
+            &self,
+            _reason: novarocks_proto_codec::lifecycle::QueryTerminationReason,
+        ) -> Result<(), QueryLifecycleError> {
+            Ok(())
+        }
+    }
+
+    fn control_event(event: proto::query_control_response::Event) -> QueryControlEvent {
+        QueryControlEvent::parse(proto::QueryControlResponse { event: Some(event) })
+            .expect("test control event is valid")
+    }
+
+    #[tokio::test]
+    async fn queued_local_failure_outranks_simultaneously_ready_heartbeat() {
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(2);
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(2);
+        let (_feedback_tx, feedback_rx) = tokio::sync::mpsc::channel(1);
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(3);
+        let heartbeat_seen = Arc::new(tokio::sync::Notify::new());
+        let control = Arc::new(TerminalPendingControl {
+            heartbeat_seen: Arc::clone(&heartbeat_seen),
+        });
+
+        events_tx
+            .send(control_event(
+                proto::query_control_response::Event::ControlReady(proto::QueryControlReady {
+                    catalog_load_state: Some(catalog::CatalogLoadState {
+                        state: Some(catalog::catalog_load_state::State::Ready(
+                            catalog::CatalogReady {},
+                        )),
+                    }),
+                }),
+            ))
+            .await
+            .expect("queue ControlReady");
+        events_tx
+            .send(control_event(
+                proto::query_control_response::Event::LocalFailure(
+                    proto::QueryControlLocalFailure {
+                        code: "FRAGMENT_EXECUTION_FAILED".to_owned(),
+                        detail: "deterministic terminal race".to_owned(),
+                    },
+                ),
+            ))
+            .await
+            .expect("queue LocalFailure");
+        inbound_tx
+            .send(Ok(proto::QueryControlRequest {
+                command: Some(proto::query_control_request::Command::Heartbeat(
+                    proto::QueryControlHeartbeat {
+                        sequence: 1,
+                        sent_mono_ns: 1,
+                    },
+                )),
+            }))
+            .await
+            .expect("queue heartbeat");
+
+        let task = tokio::spawn(run_attached_control_stream(
+            tokio_stream::wrappers::ReceiverStream::new(inbound_rx),
+            CoordinatorLease::new(control),
+            events_rx,
+            feedback_rx,
+            outbound_tx,
+            None,
+            None,
+            None,
+            false,
+        ));
+
+        let ready = outbound_rx
+            .recv()
+            .await
+            .expect("ControlReady response")
+            .expect("ControlReady is not a status error");
+        assert!(matches!(
+            ready.event,
+            Some(proto::query_control_response::Event::ControlReady(_))
+        ));
+        let failure = outbound_rx
+            .recv()
+            .await
+            .expect("LocalFailure response")
+            .expect("LocalFailure is not a status error");
+        assert!(matches!(
+            failure.event,
+            Some(proto::query_control_response::Event::LocalFailure(_))
+        ));
+
+        heartbeat_seen.notified().await;
+        drop(inbound_tx);
+        task.await.expect("control stream task exits cleanly");
+        assert!(
+            outbound_rx.recv().await.is_none(),
+            "terminal-pending heartbeat must not emit FailedPrecondition"
+        );
     }
 }
