@@ -487,6 +487,7 @@ fn run_pass(
         no_verify: !phase_requires_result_verification(phase),
         update_expected: false,
         write_actual_dir: None,
+        failure_artifact_dir: None,
         only: benchmark.only.clone(),
         skip: None,
         limit: None,

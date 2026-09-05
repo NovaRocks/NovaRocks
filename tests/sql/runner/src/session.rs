@@ -21,6 +21,7 @@ use crate::types::*;
 use anyhow::{Context, Result, bail};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder, Row as MysqlRow, Value as MysqlValue};
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 pub fn mysql_value_to_string(value: &MysqlValue) -> String {
@@ -172,7 +173,7 @@ impl MysqlSession {
             let mut saw_tabular_result = false;
             let mut failed = None;
 
-            for statement in &statements {
+            for (statement_index, statement) in statements.iter().enumerate() {
                 match self.conn.query_iter(statement) {
                     Ok(mut query_result) => {
                         while let Some(mut result_set) = query_result.iter() {
@@ -188,7 +189,7 @@ impl MysqlSession {
                                 match row_result {
                                     Ok(row) => rows.push(mysql_row_to_strings(row)),
                                     Err(exc) => {
-                                        failed = Some(exc.to_string());
+                                        failed = Some((statement_index, exc.to_string()));
                                         break;
                                     }
                                 }
@@ -219,7 +220,7 @@ impl MysqlSession {
                         }
                     }
                     Err(exc) => {
-                        failed = Some(exc.to_string());
+                        failed = Some((statement_index, exc.to_string()));
                     }
                 }
 
@@ -228,7 +229,7 @@ impl MysqlSession {
                 }
             }
 
-            if let Some(message) = failed {
+            if let Some((statement_index, message)) = failed {
                 let elapsed = started.elapsed();
                 if attempt + 1 < MAX_TRANSIENT_ATTEMPTS
                     && is_transient_iceberg_commit_error(&message)
@@ -244,7 +245,13 @@ impl MysqlSession {
                 return (
                     false,
                     None,
-                    format!("FAIL ({:.2}s): {}", elapsed.as_secs_f64(), clipped),
+                    format_statement_failure(
+                        elapsed,
+                        statement_index,
+                        statements.len(),
+                        &statements[statement_index],
+                        &clipped,
+                    ),
                 );
             }
 
@@ -264,6 +271,27 @@ impl MysqlSession {
             "FAIL (0.00s): exhausted query attempts unexpectedly".to_string(),
         )
     }
+}
+
+fn statement_sha256(statement: &str) -> String {
+    format!("{:x}", Sha256::digest(statement.as_bytes()))
+}
+
+fn format_statement_failure(
+    elapsed: Duration,
+    statement_index: usize,
+    statement_count: usize,
+    statement: &str,
+    error: &str,
+) -> String {
+    format!(
+        "FAIL ({:.2}s): statement {}/{} (sha256={}): {}",
+        elapsed.as_secs_f64(),
+        statement_index + 1,
+        statement_count,
+        statement_sha256(statement),
+        error
+    )
 }
 
 fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
@@ -528,7 +556,32 @@ pub fn drop_case_database(
 
 #[cfg(test)]
 mod splitter_tests {
-    use super::split_sql_statements;
+    use super::{format_statement_failure, split_sql_statements, statement_sha256};
+    use std::time::Duration;
+
+    #[test]
+    fn statement_hash_is_stable_and_does_not_reveal_statement_text() {
+        let statement = "SELECT 1";
+        let digest = statement_sha256(statement);
+        assert_eq!(
+            digest,
+            "e004ebd5b5532a4b85984a62f8ad48a81aa3460c1ca07701f386135d72cdecf5"
+        );
+        assert!(!digest.contains(statement));
+    }
+
+    #[test]
+    fn multi_statement_failure_identifies_ordinal_count_and_hash_only() {
+        let statement = "SELECT 'private-token'";
+        let rendered =
+            format_statement_failure(Duration::from_secs(2), 1, 3, statement, "query timed out");
+        assert!(rendered.contains("statement 2/3"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("sha256={}", statement_sha256(statement))),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("private-token"), "{rendered}");
+    }
 
     #[test]
     fn line_comment_semicolon_does_not_split() {

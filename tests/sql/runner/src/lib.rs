@@ -21,6 +21,7 @@ pub(crate) mod benchmark_bootstrap;
 mod cluster;
 mod config;
 mod extension_manifest;
+mod failure_artifacts;
 mod fault_injection;
 mod iceberg_orphan_fixture;
 mod parser;
@@ -42,6 +43,7 @@ use crate::config::{
     load_runner_config, placeholder_variables_with_run_id, resolve_config_path, resolve_path,
     resolve_reference_port, resolve_repo_root, resolve_target_port, suite_default_query_timeout,
 };
+use crate::failure_artifacts::{FailureArtifactContext, persist_cross_process_failure_logs};
 use crate::parser::load_suite_hook;
 use crate::results::{
     MismatchArtifacts, case_result_path, compare_result_sets, find_legacy_result_paths,
@@ -454,6 +456,13 @@ pub(crate) struct Cli {
 
     #[arg(long)]
     write_actual_dir: Option<String>,
+
+    /// Directory for failure-only cross-process FE/BE log snapshots.
+    ///
+    /// Defaults to `logs/sql-test-failures`; the environment fallback is
+    /// `NOVAROCKS_SQL_TEST_FAILURE_ARTIFACT_DIR`.
+    #[arg(long)]
+    failure_artifact_dir: Option<String>,
 
     #[arg(long)]
     only: Option<String>,
@@ -4242,9 +4251,25 @@ fn shutdown_server_handle(server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>) -> 
 fn finish_run_with_server_cleanup(
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
     primary_result: Result<i32>,
+    failure_artifacts: &FailureArtifactContext,
 ) -> Result<i32> {
+    let preserve_result = if matches!(&primary_result, Ok(0)) {
+        Ok(None)
+    } else {
+        match server_handle.lock() {
+            Ok(handle) => persist_cross_process_failure_logs(handle.as_ref(), failure_artifacts),
+            Err(_) => Err(anyhow::anyhow!(
+                "server handle lock poisoned while preserving failure artifacts"
+            )),
+        }
+    };
+    match &preserve_result {
+        Ok(Some(path)) => eprintln!("cross-process failure artifacts: {}", path.display()),
+        Ok(None) => {}
+        Err(error) => eprintln!("failed to preserve cross-process failure artifacts: {error:#}"),
+    }
     let cleanup_result = shutdown_server_handle(&server_handle);
-    match (primary_result, cleanup_result) {
+    let run_result = match (primary_result, cleanup_result) {
         (Ok(exit_code), Ok(())) => Ok(exit_code),
         (Err(primary), Ok(())) => Err(primary),
         (Ok(0), Err(cleanup)) => Err(anyhow::anyhow!(
@@ -4255,6 +4280,15 @@ fn finish_run_with_server_cleanup(
         )),
         (Err(primary), Err(cleanup)) => Err(anyhow::anyhow!(
             "run failed: {primary:#}; server lifecycle cleanup failed: {cleanup:#}"
+        )),
+    };
+    match (run_result, preserve_result) {
+        (result, Ok(_)) => result,
+        (Ok(exit_code), Err(artifact)) => Err(anyhow::anyhow!(
+            "run exited with code {exit_code}; failure artifact preservation failed: {artifact:#}"
+        )),
+        (Err(run), Err(artifact)) => Err(anyhow::anyhow!(
+            "{run:#}; failure artifact preservation failed: {artifact:#}"
         )),
     }
 }
@@ -4309,6 +4343,17 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
             println!("❌ ERROR: {error}");
             return Ok(1);
         }
+    };
+    let failure_artifact_override = cli
+        .failure_artifact_dir
+        .clone()
+        .or_else(|| env_optional("NOVAROCKS_SQL_TEST_FAILURE_ARTIFACT_DIR"));
+    let failure_artifact_root = resolve_path(failure_artifact_override.as_deref(), &base_dir)
+        .unwrap_or_else(|| base_dir.join("logs/sql-test-failures"));
+    let failure_artifacts = FailureArtifactContext {
+        root: failure_artifact_root,
+        lane: lane_label.to_string(),
+        suites: suite_names.clone(),
     };
     if !cli.dry_run {
         ensure_iceberg_object_store_prereqs(&runner_config)?;
@@ -5055,7 +5100,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 
         Ok(0)
     })();
-    finish_run_with_server_cleanup(server_handle, primary_result)
+    finish_run_with_server_cleanup(server_handle, primary_result, &failure_artifacts)
 }
 
 fn start_publication_catalog_fixture(
@@ -5988,6 +6033,21 @@ mod tests {
         assert_eq!(cli.cluster_mode, ClusterMode::CrossProcess);
     }
 
+    #[test]
+    fn cli_accepts_failure_artifact_directory_override() {
+        let cli = crate::Cli::parse_from([
+            "novarocks-sql-test",
+            "--suite",
+            "ssb",
+            "--failure-artifact-dir",
+            "logs/custom-sql-failures",
+        ]);
+        assert_eq!(
+            cli.failure_artifact_dir.as_deref(),
+            Some("logs/custom-sql-failures")
+        );
+    }
+
     struct CleanupFailureServer;
 
     impl crate::cluster::ServerHandle for CleanupFailureServer {
@@ -6012,15 +6072,99 @@ mod tests {
     fn post_launch_cleanup_reports_primary_shutdown_and_residual_failures() {
         let server: std::sync::Arc<std::sync::Mutex<Box<dyn crate::cluster::ServerHandle>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Box::new(CleanupFailureServer)));
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let failure_artifacts = crate::failure_artifacts::FailureArtifactContext {
+            root: temp.path().join("artifacts"),
+            lane: "correctness".to_string(),
+            suites: vec!["analytic".to_string()],
+        };
         let error = super::finish_run_with_server_cleanup(
             server,
             Err(anyhow::anyhow!("injected execution failure")),
+            &failure_artifacts,
         )
         .expect_err("primary and cleanup failures must be returned together");
         let message = format!("{error:#}");
         assert!(message.contains("injected execution failure"), "{message}");
         assert!(message.contains("injected shutdown failure"), "{message}");
         assert!(message.contains("4242"), "{message}");
+    }
+
+    struct ArtifactCapableServer;
+
+    impl crate::cluster::ServerHandle for ArtifactCapableServer {
+        fn target_host(&self) -> Option<&str> {
+            Some("127.0.0.1")
+        }
+
+        fn target_port(&self) -> Option<u16> {
+            Some(9030)
+        }
+
+        fn be_count(&self) -> usize {
+            1
+        }
+
+        fn fe_log_contents(&self) -> anyhow::Result<String> {
+            Ok("FE log".to_string())
+        }
+
+        fn be_log_contents(&self, index: usize) -> anyhow::Result<String> {
+            assert_eq!(index, 0);
+            Ok("BE log".to_string())
+        }
+    }
+
+    #[test]
+    fn successful_run_does_not_create_failure_artifacts() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let artifact_root = temp.path().join("must-not-exist");
+        let context = crate::failure_artifacts::FailureArtifactContext {
+            root: artifact_root.clone(),
+            lane: "correctness".to_string(),
+            suites: vec!["analytic".to_string()],
+        };
+        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
+
+        assert_eq!(
+            super::finish_run_with_server_cleanup(server, Ok(0), &context)
+                .expect("successful cleanup"),
+            0
+        );
+        assert!(!artifact_root.exists());
+    }
+
+    #[test]
+    fn failed_run_persists_logs_before_server_cleanup() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let artifact_root = temp.path().join("failures");
+        let context = crate::failure_artifacts::FailureArtifactContext {
+            root: artifact_root.clone(),
+            lane: "correctness".to_string(),
+            suites: vec!["analytic".to_string()],
+        };
+        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
+
+        assert_eq!(
+            super::finish_run_with_server_cleanup(server, Ok(1), &context)
+                .expect("failed test run retains its exit code"),
+            1
+        );
+        let artifact_dirs = fs::read_dir(&artifact_root)
+            .expect("artifact root")
+            .map(|entry| entry.expect("artifact entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(artifact_dirs.len(), 1);
+        assert_eq!(
+            fs::read_to_string(artifact_dirs[0].join("fe.log")).unwrap(),
+            "FE log"
+        );
+        assert_eq!(
+            fs::read_to_string(artifact_dirs[0].join("be-000.log")).unwrap(),
+            "BE log"
+        );
     }
 
     #[test]
