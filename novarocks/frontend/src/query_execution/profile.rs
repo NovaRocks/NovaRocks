@@ -1259,7 +1259,9 @@ mod tests {
         FinalTaskInfo, OperatorStatistics, SafeDetail, TaskIdentity, TaskOutputFacts, TaskState,
         TaskStatus, TaskStatusVersion,
     };
-    use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
+    use novarocks_proto_codec::lifecycle::{
+        AttemptId, QueryExecutionId, QueryTerminalProfileContributionTelemetry,
+    };
     use novarocks_proto_models::{common, novarocks};
     use novarocks_spi::connector::read_stack::SplitSourceProfile;
     use novarocks_types::identity::{
@@ -1286,40 +1288,33 @@ mod tests {
         BackendProcessId::try_from_bytes(bytes).expect("the fixture process id is a legal UUIDv7")
     }
 
-    /// Applies one fixture snapshot's contribution the way the task protocol
-    /// does: addressed to the backend whose query context released it.
-    fn apply_snapshot(
+    fn fixture_execution_id() -> QueryExecutionId {
+        QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
+            .expect("execution id")
+    }
+
+    /// Applies one fixture contribution the way the task protocol does:
+    /// addressed to the backend whose query context released it.
+    fn apply_contribution(
         builder: &mut ProfileTerminalBuilder,
-        snapshot: &QueryTerminalSnapshot,
+        participant_seed: u64,
+        telemetry: &QueryTerminalProfileContributionTelemetry,
     ) -> Result<(), crate::query_execution::contract::DistributedQueryError> {
-        let process_id = snapshot
-            .participant()
-            .backend_process_id()
-            .expect("the fixture participant carries a backend process id");
         builder.apply_runtime_filter_contribution(
-            snapshot.execution_id(),
-            process_id,
-            &snapshot.profile_contribution_telemetry(),
+            fixture_execution_id(),
+            test_backend_process_id_value(participant_seed),
+            telemetry,
         )
     }
 
-    fn runtime_filter_snapshot(
+    fn runtime_filter_contribution(
         participant_seed: u64,
         channel_binding_id: u32,
         input_rows: u64,
         output_rows: u64,
-    ) -> QueryTerminalSnapshot {
-        let execution_id =
-            QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
-                .expect("execution id");
-        QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
-            version: 1,
-            participant: Some(novarocks::ParticipantAttemptRef {
-                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id)),
-                backend_process_id: Some(test_backend_process_id(participant_seed)),
-            }),
-            fragments: Vec::new(),
-            profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+    ) -> QueryTerminalProfileContributionTelemetry {
+        QueryTerminalProfileContributionTelemetry::parse(
+            novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
                         novarocks::QueryTerminalProfileContributionV1 {
@@ -1363,17 +1358,17 @@ mod tests {
                         },
                     ),
                 ),
-            }),
-        })
-        .expect("terminal snapshot")
+            },
+        )
+        .expect("terminal profile contribution")
     }
 
     #[test]
     fn profile_terminal_builder_projects_participants_in_order_and_sums_effects() {
         let mut builder = ProfileTerminalBuilder::new();
-        apply_snapshot(&mut builder, &runtime_filter_snapshot(1, 11, 40, 10))
+        apply_contribution(&mut builder, 1, &runtime_filter_contribution(1, 11, 40, 10))
             .expect("first participant contribution");
-        apply_snapshot(&mut builder, &runtime_filter_snapshot(2, 22, 60, 20))
+        apply_contribution(&mut builder, 2, &runtime_filter_contribution(2, 22, 60, 20))
             .expect("second participant contribution");
 
         let profiles = builder.finish().into_profiles();
@@ -1436,19 +1431,8 @@ mod tests {
 
     #[test]
     fn profile_terminal_builder_ignores_canonical_empty_contribution() {
-        let snapshot = QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
-            version: 1,
-            participant: Some(novarocks::ParticipantAttemptRef {
-                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                    QueryExecutionId::new(
-                        QueryId::new(10, 20),
-                        AttemptId::new(1).expect("attempt id"),
-                    )
-                    .expect("execution id"),
-                )),
-                backend_process_id: Some(test_backend_process_id(1)),
-            }),
-            profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+        let telemetry = QueryTerminalProfileContributionTelemetry::parse(
+            novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
                         novarocks::QueryTerminalProfileContributionV1 {
@@ -1457,13 +1441,12 @@ mod tests {
                         },
                     ),
                 ),
-            }),
-            ..Default::default()
-        })
-        .expect("terminal snapshot");
+            },
+        )
+        .expect("terminal profile contribution");
         let mut builder = ProfileTerminalBuilder::new();
 
-        apply_snapshot(&mut builder, &snapshot).expect("empty contribution is valid");
+        apply_contribution(&mut builder, 1, &telemetry).expect("empty contribution is valid");
 
         assert!(builder.finish().into_profiles().is_empty());
     }
@@ -1500,13 +1483,14 @@ mod tests {
     #[test]
     fn profile_terminal_builder_rejects_cross_participant_i64_overflow() {
         let mut builder = ProfileTerminalBuilder::new();
-        apply_snapshot(
+        apply_contribution(
             &mut builder,
-            &runtime_filter_snapshot(1, 11, i64::MAX as u64, 0),
+            1,
+            &runtime_filter_contribution(1, 11, i64::MAX as u64, 0),
         )
         .expect("maximum profile counter is representable");
 
-        let error = apply_snapshot(&mut builder, &runtime_filter_snapshot(2, 22, 1, 0))
+        let error = apply_contribution(&mut builder, 2, &runtime_filter_contribution(2, 22, 1, 0))
             .expect_err("cross-participant sum must not saturate or truncate");
 
         assert!(
@@ -2249,14 +2233,7 @@ mod tests {
         let execution_id =
             QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
                 .expect("execution id");
-        let telemetry = novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
-            runtime_filter_snapshot(1, 11, 6_000, 20)
-                .as_proto()
-                .profile_contribution
-                .clone()
-                .expect("the fixture snapshot carries a contribution"),
-        )
-        .expect("the fixture contribution is valid");
+        let telemetry = runtime_filter_contribution(1, 11, 6_000, 20);
 
         let mut builder = ProfileTerminalBuilder::new();
         builder

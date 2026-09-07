@@ -31,8 +31,8 @@
 //! and `publish_task_round_convergence` in
 //! `novarocks/frontend/src/coordinator/execution.rs` deliberately publishes an
 //! empty outcome list rather than inventing proofs this protocol never made.
-//! `NOVAROCKS_QUERY_INIT_APPLIED` is emitted only by the retired
-//! `QueryLifecycleRegistry::log_init`, which no production query reaches.
+//! `NOVAROCKS_QUERY_INIT_APPLIED` was emitted only by the retired protocol's
+//! backend query-lifecycle registry, which no longer exists.
 //!
 //! So the confirmation is rebuilt here out of what the task protocol does
 //! own, and it is deliberately one helper rather than one per scenario: the

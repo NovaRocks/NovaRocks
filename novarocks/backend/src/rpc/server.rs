@@ -145,15 +145,6 @@ impl NovaRocksGrpc for BackendRpcService {
         >,
     >;
     type SubscribeTaskStatusStream = TaskStatusEventStream;
-    // Named only because the generated trait requires a type here. The RPC it
-    // belongs to is refused below, so this stream is never constructed.
-    type QueryControlStreamStream = std::pin::Pin<
-        Box<
-            dyn tokio_stream::Stream<Item = Result<proto::QueryControlResponse, tonic::Status>>
-                + Send
-                + 'static,
-        >,
-    >;
 
     async fn announce_backend(
         &self,
@@ -396,84 +387,6 @@ impl NovaRocksGrpc for BackendRpcService {
                 })??;
         Ok(tonic::Response::new(response))
     }
-
-    async fn report_query_terminal(
-        &self,
-        request: tonic::Request<proto::ReportQueryTerminalRequest>,
-    ) -> Result<tonic::Response<proto::ReportQueryTerminalResponse>, tonic::Status> {
-        let _ = request;
-        Ok(tonic::Response::new(proto::ReportQueryTerminalResponse {
-            outcome: proto::ReportQueryTerminalOutcome::RejectedGone as i32,
-            detail: "query terminal reports are accepted only by the frontend report endpoint"
-                .to_string(),
-        }))
-    }
-
-    // The six RPCs below belonged to the retired fragment lifecycle. Nothing in
-    // this process owns them any more: a query becomes work here through
-    // `apply_task_operations`, and its participants are terminated through the
-    // same owner. They stay only because the service definition still declares
-    // them, and each refuses rather than answering, so a caller that still
-    // dials one is told the truth instead of receiving a fabricated
-    // acknowledgement it would treat as admission.
-    async fn init_query(
-        &self,
-        request: tonic::Request<proto::InitQueryRequest>,
-    ) -> Result<tonic::Response<proto::InitQueryResponse>, tonic::Status> {
-        let _ = request;
-        Err(retired_lifecycle_rpc("InitQuery"))
-    }
-
-    async fn stage_fragments(
-        &self,
-        request: tonic::Request<proto::StageFragmentsRequest>,
-    ) -> Result<tonic::Response<proto::StageFragmentsResponse>, tonic::Status> {
-        let _ = request;
-        Err(retired_lifecycle_rpc("StageFragments"))
-    }
-
-    async fn start_prepared_query(
-        &self,
-        request: tonic::Request<proto::StartPreparedQueryRequest>,
-    ) -> Result<tonic::Response<proto::StartPreparedQueryResponse>, tonic::Status> {
-        let _ = request;
-        Err(retired_lifecycle_rpc("StartPreparedQuery"))
-    }
-
-    async fn task_update(
-        &self,
-        request: tonic::Request<proto::TaskUpdateRequest>,
-    ) -> Result<tonic::Response<proto::TaskUpdateResponse>, tonic::Status> {
-        let _ = request;
-        Err(retired_lifecycle_rpc("TaskUpdate"))
-    }
-
-    async fn abort_query(
-        &self,
-        request: tonic::Request<proto::AbortQueryRequest>,
-    ) -> Result<tonic::Response<proto::AbortQueryResponse>, tonic::Status> {
-        let _ = request;
-        Err(retired_lifecycle_rpc("AbortQuery"))
-    }
-
-    async fn query_control_stream(
-        &self,
-        request: tonic::Request<tonic::Streaming<proto::QueryControlRequest>>,
-    ) -> Result<tonic::Response<Self::QueryControlStreamStream>, tonic::Status> {
-        let _ = request;
-        Err(retired_lifecycle_rpc("QueryControlStream"))
-    }
-}
-
-/// Refuses one RPC of the retired fragment lifecycle.
-///
-/// `Unimplemented` is the exact answer: the method is reachable because the
-/// service definition still lists it, and this process implements no owner
-/// behind it.
-fn retired_lifecycle_rpc(method: &str) -> tonic::Status {
-    tonic::Status::unimplemented(format!(
-        "{method} belonged to the retired fragment query lifecycle and is not served by this backend"
-    ))
 }
 
 /// A backend application owns exactly one native listener.  Unlike the legacy

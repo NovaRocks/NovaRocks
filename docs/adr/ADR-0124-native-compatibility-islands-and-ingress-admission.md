@@ -11,7 +11,7 @@ provenance:
 code-anchors:
   - "novarocks/version/src/lib.rs (native_build_identity)"
   - "novarocks/frontend/src/topology.rs (ClusterBackendService::record_heartbeat_success)"
-  - "novarocks/backend/src/query_lifecycle/registry.rs (QueryLifecycleRegistry::init_query)"
+  - "novarocks/backend/src/task_execution/registry.rs (TaskExecutionRegistry::establish_query_context)"
   - "novarocks/backend/src/exchange_receiver.rs (BackendExchangeReceiverPort)"
   - "novarocks/frontend/src/workload_lifecycle.rs (FrontendServingLifecycle::base_ready)"
 ---

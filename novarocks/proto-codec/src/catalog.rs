@@ -58,51 +58,6 @@ pub struct PruneCatalogsResponse {
     raw: wire::PruneCatalogsResponse,
 }
 
-/// Validates the closed catalog state carried by the first control-stream
-/// response. The generated oneof remains the only representation so future
-/// wire variants cannot be accepted by accident.
-pub fn validate_catalog_load_state(
-    raw: &wire::CatalogLoadState,
-    root: FieldPath,
-) -> Result<(), ProtocolError> {
-    use wire::catalog_load_state::State;
-
-    match raw.state.as_ref() {
-        Some(State::Loading(_)) | Some(State::Ready(_)) => Ok(()),
-        Some(State::Failed(failure)) => validate_catalog_load_failed(failure, root.field("failed")),
-        None => Err(missing(
-            root.field("state"),
-            "catalog load state is required",
-        )),
-    }
-}
-
-/// Validates a typed asynchronous catalog-load failure. Details are safe,
-/// bounded diagnostics, never provider configuration or credentials.
-pub fn validate_catalog_load_failed(
-    raw: &wire::CatalogLoadFailed,
-    root: FieldPath,
-) -> Result<(), ProtocolError> {
-    match wire::CatalogLoadFailureReason::try_from(raw.reason) {
-        Ok(wire::CatalogLoadFailureReason::InvalidCatalogSet)
-        | Ok(wire::CatalogLoadFailureReason::InstallFailed)
-        | Ok(wire::CatalogLoadFailureReason::ResourceExhausted)
-        | Ok(wire::CatalogLoadFailureReason::Terminated)
-        | Ok(wire::CatalogLoadFailureReason::Internal) => {}
-        _ => {
-            return Err(invalid(
-                root.clone().field("reason"),
-                "catalog load failure reason is required and must be known",
-            ));
-        }
-    }
-    validate_safe_text(&raw.safe_detail, root.clone().field("safe_detail"))?;
-    if let Some(path) = raw.safe_field_path.as_deref() {
-        validate_safe_text(path, root.field("safe_field_path"))?;
-    }
-    Ok(())
-}
-
 impl CatalogSet {
     pub fn new(
         catalogs: impl IntoIterator<Item = CatalogProperties>,
@@ -608,48 +563,6 @@ mod tests {
             ],
         };
         assert!(CatalogSet::parse(raw).is_err());
-    }
-
-    #[test]
-    fn catalog_load_state_is_closed_and_failure_details_are_safe() {
-        validate_catalog_load_state(
-            &wire::CatalogLoadState {
-                state: Some(wire::catalog_load_state::State::Loading(
-                    wire::CatalogLoading {},
-                )),
-            },
-            FieldPath::root("catalog_load_state"),
-        )
-        .unwrap();
-
-        validate_catalog_load_state(
-            &wire::CatalogLoadState {
-                state: Some(wire::catalog_load_state::State::Failed(
-                    wire::CatalogLoadFailed {
-                        reason: wire::CatalogLoadFailureReason::InstallFailed as i32,
-                        safe_detail: "credential=secret".into(),
-                        safe_field_path: None,
-                    },
-                )),
-            },
-            FieldPath::root("catalog_load_state"),
-        )
-        .expect("opaque safe text may include ordinary words");
-
-        let error = validate_catalog_load_state(
-            &wire::CatalogLoadState {
-                state: Some(wire::catalog_load_state::State::Failed(
-                    wire::CatalogLoadFailed {
-                        reason: 0,
-                        safe_detail: "failed".into(),
-                        safe_field_path: None,
-                    },
-                )),
-            },
-            FieldPath::root("catalog_load_state"),
-        )
-        .expect_err("unspecified reason is invalid");
-        assert!(error.detail().contains("must be known"));
     }
 
     #[test]

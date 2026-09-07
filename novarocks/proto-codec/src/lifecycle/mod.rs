@@ -1,23 +1,27 @@
-//! Validated, role-neutral native query lifecycle values.
+//! Validated, role-neutral native query values.
 //!
-//! Modules are added incrementally as the Core parallel models are retired.
+//! What is left here after the fragment query lifecycle was retired is the
+//! vocabulary the task protocol still shares with both roles: query-attempt
+//! identity, the endpoint a backend is addressed by, query options, scan
+//! ranges, credential leases, the runtime-filter contribution installed with a
+//! query context, and the terminal runtime-filter observation released from
+//! it.
 
-mod canonical;
-pub mod control;
 pub mod credential_lease;
 pub mod identity;
 pub mod manifest;
 pub mod query_options;
 pub mod scan_range;
-pub mod stage;
 pub mod terminal;
 
-pub use control::{
-    FragmentLiveObservation, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
-    QueryControlEvent, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryTerminalAck,
-    QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationAck,
-    QueryTerminationReason, RuntimeFilterFeedbackEvent,
-};
+/// Why one backend-local query participant stood down.
+///
+/// No wire message carries this enum: the RPCs that did belonged to the
+/// retired fragment lifecycle. It survives as the vocabulary the backend's own
+/// runtime-filter participant close path is driven by from the task protocol's
+/// query-context host.
+pub use novarocks_proto_models::novarocks::QueryTerminationReason;
+
 pub use credential_lease::{
     CredentialLeaseSecretEnvelope, decode_credential_lease_descriptor,
     decode_credential_lease_secret_envelope, encode_credential_lease_descriptor,
@@ -27,19 +31,10 @@ pub use credential_lease::{
 pub use identity::{
     AttemptId, QueryExecutionId, decode_query_execution_id, encode_query_execution_id,
 };
-pub use manifest::{
-    ExchangeRouteManifest, ParticipantAttemptRef, ParticipantBackendIdentity, ParticipantManifest,
-    ParticipantManifestDigest, QueryControlEndpoint, RuntimeFilterContribution,
-};
+pub use manifest::{QueryControlEndpoint, RuntimeFilterContribution};
 pub use query_options::QueryOptions;
 pub use scan_range::{FileScanRange, ScanRange, ScanRangeParams};
-pub use stage::{
-    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
-    QueryStartRequest, StageDigest, StageFragment,
-};
 pub use terminal::{
-    FragmentTerminalOutcome, FragmentTerminalProfileTelemetry, FragmentTerminalSnapshot,
-    NegativeAttestation, ParticipantTerminalOutcome, QueryTerminalProfileContributionTelemetry,
-    QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalTelemetryUnavailable,
-    TerminalizationProof,
+    QueryTerminalProfileContributionTelemetry, QueryTerminalProfileContributionV1,
+    TerminalTelemetryUnavailable,
 };

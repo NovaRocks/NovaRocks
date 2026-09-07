@@ -9,8 +9,8 @@ date: 2026-07-27
 provenance:
   - "discussion: 2026-07-27 FE/BE query lifecycle process separation"
 code-anchors:
-  - "novarocks/frontend/src/native/transport.rs (LifecycleTransport)"
-  - "novarocks/backend/src/query_lifecycle/registry.rs (QueryLifecycleRegistry)"
+  - "novarocks/frontend/src/native/task_transport.rs (NativeTaskOperationSink)"
+  - "novarocks/backend/src/task_execution/registry.rs (TaskExecutionRegistry)"
   - "novarocks-server/src/composition.rs (run_all_in_one_until)"
 ---
 

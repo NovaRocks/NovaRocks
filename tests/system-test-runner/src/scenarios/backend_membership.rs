@@ -316,11 +316,11 @@ impl Scenario for PreReadyDmlReplan {
         let target = 0;
         let old_process_id = context.handle().backend_process_id(target)?;
         // The same rendezvous the read case uses. `restart-after-init-ack`
-        // parks inside the retired `InitQuery` handler, which a distributed
-        // write no longer reaches: `runs_on_query_lifecycle` keeps only
-        // Statistics on that chain, so arming it here left the fault with no
-        // emitter and this case waiting out its budget for
-        // `NOVAROCKS_QUERY_INIT_ACK_OBSERVED`.
+        // parked inside the retired `InitQuery` handler, which a distributed
+        // write stopped reaching once the task protocol took over admission,
+        // so arming it here left the fault with no emitter and this case
+        // waiting out its budget for `NOVAROCKS_QUERY_INIT_ACK_OBSERVED`.
+        // That handler and that fault kind have since been deleted.
         context
             .handle()
             .arm_query_lifecycle_fault(target, RESTART_AFTER_ESTABLISH_CONTEXT)

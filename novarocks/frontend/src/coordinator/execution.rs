@@ -1732,14 +1732,14 @@ impl FrontendDistributedQueryCoordinator {
     /// participant's contribution is either in hand or will never arrive.
     ///
     /// What this attempt genuinely does not have is not invented here. The
-    /// task protocol produces no `ParticipantTerminalOutcome`: a task's
-    /// terminal is its own status, and there is no per-participant proof or
-    /// attestation to report -- so the outcome list is empty rather than
-    /// populated with proofs this protocol never minted. `error_source` and
-    /// `primary_error` are likewise absent: this path is reached only after
-    /// the attempt's answer is already linearized as a success, and a failed
-    /// attempt aborts its contexts instead of releasing them, so it has no
-    /// sealed contribution to publish at all.
+    /// task protocol mints no per-participant proof or attestation at all: a
+    /// task's terminal is its own status, which is why the retired protocol's
+    /// participant-outcome list is gone from this evidence rather than
+    /// published empty. `error_source` and `primary_error` are absent for a
+    /// different reason: this path is reached only after the attempt's answer
+    /// is already linearized as a success, and a failed attempt aborts its
+    /// contexts instead of releasing them, so it has no sealed contribution to
+    /// publish at all.
     ///
     /// `metrics` carries the process-scoped frontend query counters. The task
     /// protocol has no producer for that set -- the retired lifecycle chain was
@@ -1776,7 +1776,6 @@ impl FrontendDistributedQueryCoordinator {
                 execution_id,
                 error_source: None,
                 primary_error: None,
-                participant_outcomes: Vec::new(),
                 runtime_filter,
                 metrics: FrontendProcessQueryCountersSnapshot::default(),
             });

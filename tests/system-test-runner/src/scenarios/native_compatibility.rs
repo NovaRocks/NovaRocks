@@ -28,11 +28,7 @@ use http::{Request, header};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
-use novarocks_proto_models::{catalog, common, novarocks as proto};
-use novarocks_types::BackendProcessId;
-use novarocks_version::{
-    NativeCarrierDeclaration, derive_repository_native_compatibility_material,
-};
+use novarocks_proto_models::novarocks as proto;
 use prost::Message;
 use std::collections::BTreeSet;
 use std::sync::mpsc;
@@ -320,63 +316,26 @@ impl Scenario for IslandDrainAndReplacement {
     }
 }
 
+/// Proves the one raw-ingress hard cut this backend still owns.
+///
+/// # The retired half
+///
+/// This used to open with an authenticated raw `InitQuery` and require the
+/// typed `QUERY_INIT_REJECTED_COMPATIBILITY_MISMATCH` answer, which was the
+/// backend's own re-check of the caller's compatibility island. `InitQuery` is
+/// gone, and nothing on the task protocol replaced that re-check: the
+/// establish carries a `native_compatibility_id`, but no backend ingress reads
+/// it. The surviving fence is the frontend's: a backend becomes eligible only
+/// when its announce and the FE-pull heartbeat agree on the immutable
+/// descriptor, which is exactly what this scenario's drain and readiness steps
+/// above assert. Asserting the retired answer here would be asserting a
+/// refusal no code can produce.
 fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
     let endpoint = context.handle().native_be_endpoint(2)?;
     let mode = context.handle().native_trust_mode();
     let connector = context.handle().native_probe_connector(endpoint, mode)?;
     let trust = context.handle().native_probe_trust()?;
     let authorization = authorization_header(&trust)?;
-    let material = derive_repository_native_compatibility_material(
-        [
-            NativeCarrierDeclaration::try_new("iceberg", 1)?,
-            NativeCarrierDeclaration::try_new("starrocks", 1)?,
-        ],
-        [0x31; 32],
-        [0x41; 32],
-    )?;
-    let init = proto::InitQueryRequest {
-        credential_lease_envelopes: vec![],
-        manifest: Some(proto::ParticipantManifest {
-            execution_id: Some(proto::QueryExecutionId {
-                query_id: Some(common::UniqueId { hi: 1, lo: 1 }),
-                attempt_id: 1,
-            }),
-            backend: Some(proto::ParticipantBackendIdentity {
-                endpoint: Some(proto::QueryControlEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    port: 1,
-                }),
-                process_id: Some(proto::BackendProcessId {
-                    value: BackendProcessId::new_v7().to_bytes().to_vec(),
-                }),
-            }),
-            native_compatibility_id: Some(proto::NativeCompatibilityId {
-                value: material.id().as_bytes().to_vec(),
-            }),
-            expected_fragment_instance_ids: vec![common::UniqueId { hi: 2, lo: 2 }],
-            query_options: Some(proto::QueryOptions::default()),
-            query_deadline_unix_ms: 1,
-            pre_start_timeout_ms: 1,
-            report_endpoint: Some(proto::QueryControlEndpoint {
-                host: "127.0.0.1".to_string(),
-                port: 1,
-            }),
-            catalog_set: Some(catalog::CatalogSet::default()),
-            ..Default::default()
-        }),
-    };
-    let init_response: proto::InitQueryResponse = raw_unary(
-        connector.clone(),
-        "/novarocks.NovaRocksGrpc/InitQuery",
-        &authorization,
-        init,
-    )?;
-    ensure!(
-        init_response.outcome
-            == proto::QueryInitOutcome::QueryInitRejectedCompatibilityMismatch as i32,
-        "raw InitQuery must receive typed compatibility mismatch, got {:?}",
-        init_response
-    );
     let exchange = proto::ExchangeRequest {
         finst_id_hi: 11,
         finst_id_lo: 12,
@@ -404,7 +363,7 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
         status.code != 0 && status.message.contains("exchange ingress route rejected"),
         "unknown malformed Exchange must reject before decode, got {status:?}"
     );
-    context.action("authenticated raw InitQuery returned typed compatibility mismatch and malformed unknown Exchange route rejected before decode");
+    context.action("malformed unknown Exchange route rejected before decode");
     Ok(())
 }
 

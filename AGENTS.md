@@ -140,10 +140,10 @@ SQL client
   snapshot and its mutually exclusive source modes (ADR-0115).
 
 - `novarocks/backend/src/**`
-  BE application composition, native gRPC services, query lifecycle registry,
+  BE application composition, native gRPC services, task execution registry,
   and connector execution host. `rpc/**` owns generated stubs, codec, client,
   listener composition, data-plane handlers, and the role-local data runtime;
-  `fragment/{ingress.rs,decode/**}`, `query_lifecycle/rpc.rs`,
+  `fragment/{ingress.rs,decode/**}`, `task_execution/{ingress.rs,receipt.rs}`,
   `runtime_filter/{rpc.rs,install_decode.rs,transport.rs}`, and
   `connector/binding_decode.rs` own their respective wire adapters.
 
@@ -308,26 +308,42 @@ SQL client
 3. `ExchangeScanOp` blocks until all senders reach EOS.
 4. On cancellation, `exchange::cancel_*` clears exchange keys and wakes blocked waiters.
 
-### 5.3 Native Distributed Query Lifecycle Path
+### 5.3 Native Distributed Task Execution Path
 
 1. `novarocks/frontend/src/coordinator/execution.rs` freezes a
-   `QueryExecutionId` and participant manifests from one live backend snapshot.
-2. `novarocks/frontend/src/coordinator/query_lifecycle/` concurrently sends
-   `InitQuery`, attaches every `QueryControlStream`, and waits for every
-   `ControlReady`.
-3. Only the resulting control-ready execution exposes native fragment
-   submission; each `SubmitFragmentRequest` carries the same execution id.
-4. `novarocks/backend/src/query_lifecycle/registry.rs` owns the BE-local wire
-   lifecycle entry, exact fragment admission, heartbeat fail-close, bounded
-   tombstones, and the single termination latch.
-5. Runtime-filter state is installed as an Init contribution. Client
-   cancellation remains `KILL QUERY` through the frontend query-control owner
-   and is delivered as lifecycle Abort.
-6. QLC-2 still submits and immediately starts fragments one by one after the
-   barrier. Atomic Stage/Start is a later lifecycle phase, so this path must not
-   be described as global atomic startup.
-
----
+   `QueryExecutionId` and, from one live backend snapshot, a task graph:
+   `novarocks/frontend/src/task_execution/graph.rs` mints a `TaskIdentity`
+   ({QueryExecutionId, StageId, TaskId, BackendProcessId}) per placement and a
+   `QueryContextRef` ({QueryExecutionId, FrontendProcessId, BackendProcessId})
+   per participating backend. A context exists only where the scheduler placed
+   a task, so the number of participants is a property of the plan and the
+   splits, never of the cluster size.
+2. `execute_round_on_task_protocol` establishes every context and creates every
+   task through a bounded, fair dispatcher
+   (`novarocks/frontend/src/task_execution/{round,dispatch,context_owner}.rs`).
+   Each operation gets one verdict per domain -- Apply / Idempotent / Older /
+   Conflict -- and a domain never rolls back, which is why replaying the exact
+   request is the prescribed recovery for an unknown outcome and a conflicting
+   answer is fatal.
+3. Push exchange edges start Closed and open once every frozen destination has
+   acknowledged its task's creation
+   (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no
+   frame can precede the receiver that counts it.
+4. `novarocks/backend/src/task_execution/registry.rs` owns the BE-local
+   context and task state, exact admission, lease renewal and expiry, bounded
+   tombstones, and one termination latch per task. The latch is first-wins with
+   a single exception: a derived cause (`Aborted(PeerTaskFailed)`) is a
+   placeholder that an originating cause (`Failed(TaskFailure)`) replaces
+   exactly once.
+5. Runtime-filter contributions and an operator's own counters ride
+   `ReleaseQueryContextAck`: release is the backend's own statement that every
+   local task is a terminal record, and the frontend drives it for every
+   intent. The task protocol mints no participant proof or attestation -- a
+   task's terminal *is* its own status.
+6. Client cancellation is `KILL QUERY` through the frontend query-control
+   owner, delivered as `AbortQueryContext`. The frontend withholds the
+   interrupt until its coordinator worker unwinds, so the next statement on
+   that connection cannot race the statement generation.
 
 ## 6. Core Data Structures (Current Implementation)
 
@@ -357,15 +373,21 @@ SQL client
   Generic result type used by standalone SQL execution and MySQL response
   encoding.
 
-- `QueryExecutionId` / `ParticipantManifest`:
-  `novarocks/core/src/query_execution/lifecycle/`
-  Immutable native query-attempt identity, participant contract, digest, and
-  wire codec shared across the process boundary.
+- `QueryExecutionId`: `novarocks/types/src/identity.rs`
+  Immutable native query-attempt identity, shared across the process boundary.
 
-- `QueryLifecycleRegistry`:
-  `novarocks/backend/src/query_lifecycle/registry.rs`
-  BE-owned lifecycle state, fragment admission, heartbeat/pre-start timeout,
-  termination, and bounded tombstone registry.
+- `TaskIdentity` / `QueryContextRef`:
+  `novarocks/execution/src/task_execution/identity.rs`
+  The indivisible {QueryExecutionId, StageId, TaskId, BackendProcessId} a task
+  is addressed by, and the {QueryExecutionId, FrontendProcessId,
+  BackendProcessId} a backend holds on an attempt's behalf. Any component
+  mismatching is fatal; neither is ever partially matched.
+
+- `TaskExecutionRegistry`:
+  `novarocks/backend/src/task_execution/registry.rs`
+  BE-owned context and task state, exact admission, per-domain progression,
+  lease renewal and expiry, bounded tombstones, and one termination latch per
+  task.
 
 ---
 
@@ -678,14 +700,14 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 - **Execution semantics/operator behavior**: inspect `src/exec/node/*` and `src/exec/operators/*`.
 - **Scheduling/parallelism**: inspect `src/exec/pipeline/*`.
 - **Exchange behavior**: inspect `src/runtime/exchange.rs`, `src/runtime/exchange_scan.rs`, `src/service/grpc_*.rs`.
-- **Native distributed query lifecycle**: inspect
+- **Native distributed task execution**: inspect
   `novarocks/frontend/src/coordinator/execution.rs`,
-  `novarocks/frontend/src/coordinator/query_lifecycle/**`,
-  `novarocks/backend/src/query_lifecycle/**`,
-  `novarocks/core/src/query_execution/lifecycle/**`, and
-  `novarocks/core/src/query_execution/fragment_transport.rs`. Preserve the
-  Init + ControlReady production barrier; do not add a lifecycle shim,
-  standalone direct-call path, or no-runtime-filter retry inside an attempt.
+  `novarocks/frontend/src/task_execution/**`,
+  `novarocks/backend/src/task_execution/**`, and
+  `novarocks/execution/src/task_execution/**`. Preserve the destination-ACK
+  gated edge-open barrier and the per-domain Apply / Idempotent / Older /
+  Conflict verdict; do not add a protocol shim, a standalone direct-call path,
+  or a no-runtime-filter retry inside an attempt. See ADR-0135.
 - **Connector behavior**: inspect `novarocks/connector/**` and
   `novarocks/fs/**`. StarRocks is a read-only external Connector, not a native
   internal-table catalog or a server protocol.

@@ -765,7 +765,7 @@ mod tests {
             },
             QueryMeta {
                 query_lifecycle_fault: Some(crate::types::QueryLifecycleFaultDirective {
-                    kind: crate::types::QueryLifecycleFaultKind::TerminalOutcomeSuppress,
+                    kind: crate::types::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
                     be_index: 0,
                 }),
                 ..QueryMeta::default()

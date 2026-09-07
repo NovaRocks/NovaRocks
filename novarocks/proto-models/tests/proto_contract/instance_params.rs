@@ -265,42 +265,28 @@ fn instance_params_survives_proto_roundtrip() {
 }
 
 #[test]
-fn stage_fragment_request_carries_native_fields_only() {
-    let request = novarocks::StageFragmentsRequest {
-        participant: Some(novarocks::ParticipantAttemptRef {
-            execution_id: Some(novarocks::QueryExecutionId {
-                query_id: Some(id(1, 2)),
-                attempt_id: 1,
-            }),
-            backend_process_id: Some(novarocks::BackendProcessId {
-                value: vec![0x77; 16],
-            }),
+fn task_fragment_plan_carries_native_fields_only() {
+    let fragment = novarocks::TaskFragmentPlan {
+        plan: Some(plan::PlanFragment::default()),
+        instance_params: Some(novarocks::InstanceParams {
+            query_id: Some(id(1, 2)),
+            fragment_instance_id: Some(id(3, 4)),
+            backend_num: 1,
+            per_node_scan_ranges: HashMap::new(),
+            per_exch_num_senders: HashMap::new(),
+            destinations: vec![destination()],
+            query_options: Some(query_options()),
+            typed_result_sink: true,
         }),
-        fragments: vec![novarocks::StageFragment {
-            plan: Some(plan::PlanFragment::default()),
-            instance_params: Some(novarocks::InstanceParams {
-                query_id: Some(id(1, 2)),
-                fragment_instance_id: Some(id(3, 4)),
-                backend_num: 1,
-                per_node_scan_ranges: HashMap::new(),
-                per_exch_num_senders: HashMap::new(),
-                destinations: vec![destination()],
-                query_options: Some(query_options()),
-                typed_result_sink: true,
-            }),
-        }],
     };
-    let fields = encoded_field_numbers(&request);
+    let fields = encoded_field_numbers(&fragment);
 
+    assert!(fields.contains(&1), "plan must use TaskFragmentPlan tag 1");
     assert!(
-        fields.contains(&6),
-        "participant must use StageFragmentsRequest tag 6"
-    );
-    assert!(
-        fields.contains(&5),
-        "fragments must use StageFragmentsRequest tag 5"
+        fields.contains(&2),
+        "instance_params must use TaskFragmentPlan tag 2"
     );
 
-    let decoded: novarocks::StageFragmentsRequest = roundtrip_message(&request);
-    assert_eq!(request, decoded);
+    let decoded: novarocks::TaskFragmentPlan = roundtrip_message(&fragment);
+    assert_eq!(fragment, decoded);
 }

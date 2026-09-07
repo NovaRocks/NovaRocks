@@ -389,15 +389,13 @@ fn query_lifecycle_fault_preferred_live_index(
     let Some(root) = configured_root() else {
         return Ok(None);
     };
-    let fault_kinds = [
-        QueryLifecycleFaultKind::RestartAfterInitAck,
-        // The task protocol's successor of the entry above. Without it a
-        // single-instance fragment lands on `query_id.low() % backend_count`,
-        // so a fault armed on one backend has a one-in-N chance of being
-        // reached at all -- which is the difference between a scenario that
-        // proves something and one that passes because the fault never fired.
-        QueryLifecycleFaultKind::RestartAfterEstablishContext,
-    ];
+    // The task protocol's successor of the retired `RestartAfterInitAck`.
+    // Without this pinning a single-instance fragment lands on
+    // `query_id.low() % backend_count`, so a fault armed on one backend has a
+    // one-in-N chance of being reached at all -- which is the difference
+    // between a scenario that proves something and one that passes because the
+    // fault never fired.
+    let fault_kinds = [QueryLifecycleFaultKind::RestartAfterEstablishContext];
     let armed = backends
         .entries
         .iter()

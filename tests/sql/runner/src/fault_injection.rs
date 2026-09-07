@@ -1254,16 +1254,16 @@ mod tests {
         let mut server = RecordingServerHandle::default();
         let meta = QueryMeta {
             query_lifecycle_fault: Some(crate::types::QueryLifecycleFaultDirective {
-                kind: crate::types::QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                kind: crate::types::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
                 be_index: 1,
             }),
             query_lifecycle_faults: vec![
                 crate::types::QueryLifecycleFaultDirective {
-                    kind: crate::types::QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                    kind: crate::types::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
                     be_index: 1,
                 },
                 crate::types::QueryLifecycleFaultDirective {
-                    kind: crate::types::QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
+                    kind: crate::types::QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
                     be_index: 1,
                 },
             ],
@@ -1275,8 +1275,8 @@ mod tests {
         assert_eq!(
             server.events,
             vec![
-                "arm-rfo-8r2:terminal-p1-encode-failure:1",
-                "arm-rfo-8r2:terminal-attestation-stream-drop:1",
+                "arm-rfo-8r2:runtime-filter-contribution-ack-drop:1",
+                "arm-rfo-8r2:task-update-terminal-ack-drop:1",
             ]
         );
     }
@@ -1755,5 +1755,4 @@ mod tests {
         );
         assert!(server.events.is_empty());
     }
-
 }

@@ -14,7 +14,7 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
     let _ = expr::Expr::default();
     let _ = filter::LookupRequest::default();
     let _ = plan::PlanFragment::default();
-    let _ = novarocks::StageFragmentsRequest::default();
+    let _ = novarocks::CreateTaskRequest::default();
 
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
@@ -214,53 +214,38 @@ fn write_relation_contracts_are_versioned_append_only_fields() {
     }
 }
 
+/// The catalog contribution travels with a query context, and only there.
+///
+/// It used to be a `ParticipantManifest` field plus an asynchronous load state
+/// reported on the control stream's first frame. Both went with the retired
+/// fragment query lifecycle, so the load-state family is asserted absent
+/// rather than left declared with no carrier: a `Loading` state nothing can
+/// send is a second, unreachable catalog authority.
 #[test]
-fn catalog_lifecycle_contract_is_carried_by_init_and_the_existing_control_stream() {
+fn the_catalog_contribution_is_carried_only_by_a_query_context() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    let manifest = pool
-        .get_message_by_name("novarocks.ParticipantManifest")
-        .expect("ParticipantManifest descriptor");
-    let catalog_set = manifest
-        .get_field_by_name("catalog_set")
-        .expect("catalog contribution field");
-    assert_eq!(catalog_set.number(), 12);
-    assert_eq!(
-        catalog_set
-            .kind()
-            .as_message()
-            .expect("CatalogSet message")
-            .full_name(),
-        "novarocks.catalog.CatalogSet"
-    );
 
-    let ready = pool
-        .get_message_by_name("novarocks.QueryControlReady")
-        .expect("QueryControlReady descriptor");
-    assert_eq!(
-        ready
-            .get_field_by_name("catalog_load_state")
-            .expect("closed catalog state")
-            .number(),
-        1
-    );
-    let response = pool
-        .get_message_by_name("novarocks.QueryControlResponse")
-        .expect("QueryControlResponse descriptor");
-    assert_eq!(
-        response
-            .get_field_by_name("catalog_ready")
-            .expect("cold completion")
-            .number(),
-        9
-    );
-    assert_eq!(
-        response
-            .get_field_by_name("catalog_load_failed")
-            .expect("cold failure")
-            .number(),
-        10
-    );
+    for (message_name, field_number) in [
+        ("novarocks.EstablishQueryContextRequest", 2u32),
+        ("novarocks.QueryContextCatalogDomain", 2),
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        let catalog_set = message
+            .get_field(field_number)
+            .unwrap_or_else(|| panic!("{message_name} catalog contribution field"));
+        assert_eq!(catalog_set.name(), "catalog_set");
+        assert_eq!(
+            catalog_set
+                .kind()
+                .as_message()
+                .expect("CatalogSet message")
+                .full_name(),
+            "novarocks.catalog.CatalogSet"
+        );
+    }
 
     let service = pool
         .get_service_by_name("novarocks.NovaRocksGrpc")
@@ -270,6 +255,23 @@ fn catalog_lifecycle_contract_is_carried_by_init_and_the_existing_control_stream
             .methods()
             .any(|method| method.name() == "PruneCatalogs"),
         "catalog pruning has one explicit best-effort control-plane RPC"
+    );
+
+    for retired in [
+        "novarocks.catalog.CatalogLoadState",
+        "novarocks.catalog.CatalogLoading",
+        "novarocks.catalog.CatalogReady",
+        "novarocks.catalog.CatalogLoadFailed",
+    ] {
+        assert!(
+            pool.get_message_by_name(retired).is_none(),
+            "retired asynchronous catalog load carrier {retired} must not return to the contract"
+        );
+    }
+    assert!(
+        pool.get_enum_by_name("novarocks.catalog.CatalogLoadFailureReason")
+            .is_none(),
+        "retired catalog load failure vocabulary must not return to the contract"
     );
 }
 
@@ -284,9 +286,9 @@ fn native_compatibility_identity_fields_are_exact_and_append_only() {
             5,
         ),
         (
-            "novarocks.ParticipantManifest",
+            "novarocks.EstablishQueryContextRequest",
             "native_compatibility_id",
-            11,
+            7,
         ),
     ] {
         let message = pool
@@ -310,15 +312,14 @@ fn native_compatibility_identity_fields_are_exact_and_append_only() {
         .expect("identity value field");
     assert_eq!(value.number(), 1);
 
-    let outcome = pool
-        .get_enum_by_name("novarocks.QueryInitOutcome")
-        .expect("QueryInitOutcome descriptor");
-    assert_eq!(
-        outcome
-            .get_value_by_name("QUERY_INIT_REJECTED_COMPATIBILITY_MISMATCH")
-            .expect("compatibility mismatch outcome")
-            .number(),
-        10
+    // The retired fragment lifecycle answered a mismatch with its own
+    // `QUERY_INIT_REJECTED_COMPATIBILITY_MISMATCH`. That vocabulary went with
+    // the Init RPC; the identity itself still travels on the establish above,
+    // and a mismatch is refused through the task protocol's own outcome set.
+    assert!(
+        pool.get_enum_by_name("novarocks.QueryInitOutcome")
+            .is_none(),
+        "the retired Init outcome vocabulary must not return to the contract"
     );
 }
 
@@ -472,196 +473,6 @@ fn runtime_filter_membership_contract_is_closed_and_legacy_fields_stay_reserved(
 }
 
 #[test]
-fn retired_terminal_self_attestation_fields_remain_reserved() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-
-    for (message_name, field_numbers, field_names, participant_field) in [
-        (
-            "novarocks.QueryTerminalSnapshot",
-            &[2, 3, 4, 5][..],
-            &["execution_id", "backend", "init_digest", "digest"][..],
-            8,
-        ),
-        (
-            "novarocks.TerminalizationProof",
-            &[2, 3, 4, 5][..],
-            &["execution_id", "backend", "init_digest", "digest"][..],
-            7,
-        ),
-        (
-            "novarocks.NegativeAttestation",
-            &[1, 2, 3, 7][..],
-            &["execution_id", "backend", "init_digest", "digest"][..],
-            8,
-        ),
-        (
-            "novarocks.QueryControlTerminalAck",
-            &[1, 2, 3, 4][..],
-            &[
-                "execution_id",
-                "init_digest",
-                "snapshot_version",
-                "snapshot_digest",
-            ][..],
-            5,
-        ),
-    ] {
-        let message = pool
-            .get_message_by_name(message_name)
-            .unwrap_or_else(|| panic!("{message_name} descriptor"));
-        for field_number in field_numbers {
-            assert!(
-                message
-                    .reserved_ranges()
-                    .any(|range| range.contains(field_number)),
-                "{message_name} field {field_number} must remain reserved"
-            );
-            assert!(
-                message
-                    .fields()
-                    .all(|field| field.number() != *field_number),
-                "{message_name} must not reuse retired tag {field_number}"
-            );
-        }
-        for field_name in field_names {
-            assert!(
-                message.reserved_names().any(|name| name == *field_name),
-                "{message_name} field name {field_name} must remain reserved"
-            );
-            assert!(
-                message.fields().all(|field| field.name() != *field_name),
-                "{message_name} must not reuse retired name {field_name}"
-            );
-        }
-        let participant = message
-            .get_field(participant_field)
-            .unwrap_or_else(|| panic!("{message_name} participant field"));
-        assert_eq!(participant.name(), "participant");
-        assert_eq!(
-            participant
-                .kind()
-                .as_message()
-                .map(|message| message.full_name()),
-            Some("novarocks.ParticipantAttemptRef".into())
-        );
-    }
-}
-
-#[test]
-fn participant_attempt_ref_has_only_allocated_identity_leaves() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    let message = pool
-        .get_message_by_name("novarocks.ParticipantAttemptRef")
-        .expect("ParticipantAttemptRef descriptor");
-    assert_eq!(message.fields().count(), 2);
-    assert_eq!(
-        message.get_field(1).expect("execution field").name(),
-        "execution_id"
-    );
-    assert_eq!(
-        message.get_field(2).expect("process field").name(),
-        "backend_process_id"
-    );
-}
-
-#[test]
-fn nonterminal_lifecycle_carriers_reserve_retired_fences_and_use_participant_refs() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    let exact_ref = |message_name: &str, field_name: &str, field_number: u32| {
-        let message = pool
-            .get_message_by_name(message_name)
-            .unwrap_or_else(|| panic!("{message_name} descriptor"));
-        let field = message
-            .get_field(field_number)
-            .unwrap_or_else(|| panic!("{message_name}.{field_name} field"));
-        assert_eq!(field.name(), field_name);
-        assert_eq!(
-            field.kind().as_message().map(|message| message.full_name()),
-            Some("novarocks.ParticipantAttemptRef".into())
-        );
-    };
-    let reserved = |message_name: &str, field_numbers: &[u32], field_names: &[&str]| {
-        let message = pool
-            .get_message_by_name(message_name)
-            .unwrap_or_else(|| panic!("{message_name} descriptor"));
-        for field_number in field_numbers {
-            assert!(
-                message
-                    .reserved_ranges()
-                    .any(|range| range.contains(field_number)),
-                "{message_name} retired tag {field_number} must remain reserved"
-            );
-            assert!(
-                message
-                    .fields()
-                    .all(|field| field.number() != *field_number)
-            );
-        }
-        for field_name in field_names {
-            assert!(
-                message.reserved_names().any(|name| name == *field_name),
-                "{message_name} retired field {field_name} must remain reserved"
-            );
-            assert!(message.fields().all(|field| field.name() != *field_name));
-        }
-    };
-
-    reserved(
-        "novarocks.StageFragmentsRequest",
-        &[1, 2, 3, 4],
-        &[
-            "execution_id",
-            "init_digest",
-            "stage_digest_version",
-            "stage_digest",
-        ],
-    );
-    exact_ref("novarocks.StageFragmentsRequest", "participant", 6);
-    reserved(
-        "novarocks.StageFragmentsResponse",
-        &[2],
-        &["stage_digest_version"],
-    );
-    reserved(
-        "novarocks.StartPreparedQueryRequest",
-        &[2],
-        &["stage_digest_version"],
-    );
-    reserved(
-        "novarocks.StartPreparedQueryResponse",
-        &[2],
-        &["stage_digest_version"],
-    );
-    reserved("novarocks.AbortQueryRequest", &[1], &["execution_id"]);
-    exact_ref("novarocks.AbortQueryRequest", "participant", 4);
-    reserved(
-        "novarocks.QueryControlAttach",
-        &[1, 2, 3],
-        &["execution_id", "init_digest", "frontend_owner_epoch"],
-    );
-    exact_ref("novarocks.QueryControlAttach", "participant", 4);
-    reserved(
-        "novarocks.FragmentLiveObservation",
-        &[1, 2, 3],
-        &["execution_id", "init_digest", "backend"],
-    );
-    exact_ref("novarocks.FragmentLiveObservation", "participant", 10);
-    reserved(
-        "novarocks.RuntimeFilterFeedbackEvent",
-        &[1, 2, 3],
-        &["execution_id", "init_digest", "backend"],
-    );
-    exact_ref(
-        "novarocks.RuntimeFilterFeedbackEvent",
-        "participant_attempt",
-        10,
-    );
-}
-
-#[test]
 fn retired_request_self_attestation_fields_remain_reserved() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
@@ -669,15 +480,14 @@ fn retired_request_self_attestation_fields_remain_reserved() {
     // Each entry named a digest whose derivation inputs were entirely present in
     // the same message. The receiver derives the identity instead; other
     // messages keep carrying it as a cross-message reference.
-    for (message_name, field_number, field_name) in [
-        ("novarocks.InitQueryRequest", 2, "init_digest"),
-        ("novarocks.StageFragmentsRequest", 4, "stage_digest"),
-        (
-            "novarocks.RuntimeFilterContribution",
-            4,
-            "contribution_digest",
-        ),
-    ] {
+    // The `InitQueryRequest` and `StageFragmentsRequest` entries went with the
+    // retired fragment query lifecycle: a deleted message reserves nothing,
+    // because no carrier can reuse a tag it no longer declares.
+    for (message_name, field_number, field_name) in [(
+        "novarocks.RuntimeFilterContribution",
+        4,
+        "contribution_digest",
+    )] {
         let message = pool
             .get_message_by_name(message_name)
             .unwrap_or_else(|| panic!("{message_name} descriptor"));
@@ -952,19 +762,19 @@ fn runtime_split_assignment_messages_carry_sequence_and_terminal_facts() {
         ]
     );
 
-    let request = pool
-        .get_message_by_name("novarocks.TaskUpdateRequest")
-        .expect("TaskUpdateRequest descriptor");
+    // Split assignments reach an admitted task as a task domain, applied
+    // through `ApplyTaskOperations`. The retired `TaskUpdate` RPC and its
+    // request message carried the same `SplitAssignment` list addressed by
+    // execution id and fragment instance instead.
+    let domain = pool
+        .get_message_by_name("novarocks.TaskSplitAssignmentDomain")
+        .expect("TaskSplitAssignmentDomain descriptor");
     assert_eq!(
-        request
+        domain
             .fields()
             .map(|field| (field.number(), field.name().to_owned()))
             .collect::<Vec<_>>(),
-        vec![
-            (1, "execution_id".to_owned()),
-            (2, "fragment_instance_id".to_owned()),
-            (3, "assignments".to_owned()),
-        ]
+        vec![(1, "assignment".to_owned())]
     );
 
     let service = pool
@@ -973,8 +783,14 @@ fn runtime_split_assignment_messages_carry_sequence_and_terminal_facts() {
     assert!(
         service
             .methods()
-            .any(|method| method.name() == "TaskUpdate"),
-        "the runtime split-assignment RPC must exist"
+            .any(|method| method.name() == "ApplyTaskOperations"),
+        "the runtime split-assignment entry point must exist"
+    );
+    assert!(
+        service
+            .methods()
+            .all(|method| method.name() != "TaskUpdate"),
+        "the retired runtime split-assignment RPC must not return"
     );
 }
 
@@ -1005,46 +821,22 @@ fn the_worker_system_relation_set_stays_closed() {
     );
 }
 
+/// `participant_roles` was a projection its sender mechanically derived from
+/// two other fields of the same message, so the payload became the sole
+/// participant role authority (ADR-0114). The message that carried it has since
+/// been deleted with the fragment query lifecycle; what still has to hold is
+/// that its role vocabulary stays off the wire rather than lingering as a
+/// second, drift-prone authority.
 #[test]
-fn retired_participant_role_projection_remains_reserved() {
+fn the_retired_participant_role_vocabulary_stays_off_the_wire() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
 
-    // `participant_roles` was a projection the sender mechanically derived from
-    // two other fields of the same message: FragmentExecutor followed from a
-    // non-empty `expected_fragment_instance_ids` (field 4) and
-    // RuntimeFilterService from the presence of `runtime_filter` (field 8). Both
-    // derivation inputs travel inside `ParticipantManifest` itself, so the
-    // receiver can rebuild the role set unaided and validating the carried copy
-    // produced no fact it did not already hold. The payload is now the sole
-    // participant role authority (ADR-0114).
-    let manifest = pool
-        .get_message_by_name("novarocks.ParticipantManifest")
-        .expect("ParticipantManifest descriptor");
     assert!(
-        manifest.reserved_ranges().any(|range| range.contains(&3)),
-        "ParticipantManifest field 3 must remain reserved"
+        pool.get_message_by_name("novarocks.ParticipantManifest")
+            .is_none(),
+        "the retired participant manifest must not return to the wire contract"
     );
-    assert!(
-        manifest
-            .reserved_names()
-            .any(|name| name == "participant_roles"),
-        "ParticipantManifest participant_roles name must remain reserved"
-    );
-    assert!(
-        manifest.fields().all(|field| field.number() != 3),
-        "ParticipantManifest must not reuse retired tag 3"
-    );
-    assert!(
-        manifest
-            .fields()
-            .all(|field| field.name() != "participant_roles"),
-        "ParticipantManifest must not reuse retired name participant_roles"
-    );
-
-    // The projection's role vocabulary was retired with it. Nothing else on the
-    // wire names these values, so the enum must stay out of the contract rather
-    // than linger as a second, drift-prone role authority.
     assert!(
         pool.get_enum_by_name("novarocks.QueryParticipantRole")
             .is_none(),
@@ -1170,16 +962,8 @@ fn retired_write_operation_aggregate_fields_remain_reserved() {
     for (message_name, field_number, field_name) in [
         ("novarocks.plan.DataSink", 7, "connector_write"),
         ("novarocks.plan.DataSink", 8, "statistics"),
-        (
-            "novarocks.QueryTerminalFragmentSnapshot",
-            11,
-            "connector_staged_report_frames",
-        ),
-        (
-            "novarocks.QueryTerminalFragmentSnapshot",
-            12,
-            "statistics_payload",
-        ),
+        // The two `QueryTerminalFragmentSnapshot` tags this cut also reserved
+        // are gone with the message: a deleted carrier reserves nothing.
     ] {
         let message = pool
             .get_message_by_name(message_name)
@@ -1227,23 +1011,13 @@ fn retired_write_operation_aggregate_wire_fields_fail_closed() {
         .expect("retired sink field remains decodable as an unknown field");
     assert!(sink.kind.is_none());
 
-    // QueryTerminalFragmentSnapshot field 11, wire type 2: the retired staged
-    // report frame list. It decodes away instead of reviving a staged writer.
-    let snapshot = novarocks::QueryTerminalFragmentSnapshot::decode(&[0x5a, 0x00][..])
-        .expect("retired snapshot field remains decodable as an unknown field");
-    assert_eq!(snapshot.backend_num, 0);
-    assert!(snapshot.tablet_commit_infos.is_empty());
-
-    // DataSink field 8 and terminal snapshot field 12 are the retired
-    // statistics side channels. Unknown tags decode away and cannot revive
-    // either authority.
+    // DataSink field 8 is the retired statistics side channel. Its unknown tag
+    // decodes away and cannot revive that authority. The terminal-snapshot half
+    // of this cut went with the retired fragment query lifecycle: no carrier
+    // declares that message, so there is no decode left to assert on.
     let sink = plan::DataSink::decode(&[0x42, 0x00][..])
         .expect("retired statistics sink remains decodable as an unknown field");
     assert!(sink.kind.is_none());
-    let snapshot = novarocks::QueryTerminalFragmentSnapshot::decode(&[0x62, 0x00][..])
-        .expect("retired statistics payload remains decodable as an unknown field");
-    assert_eq!(snapshot.backend_num, 0);
-    assert!(snapshot.tablet_commit_infos.is_empty());
 }
 
 /// The type-level separation of create from update is the whole reason this

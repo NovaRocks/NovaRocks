@@ -1703,15 +1703,11 @@ mod tests {
 
     type EmptyExchangeStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<proto::ExchangeResponse, Status>> + Send>>;
-    type EmptyControlStream = Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<proto::QueryControlResponse, Status>> + Send>,
-    >;
     type StatusStream = ReceiverStream<Result<proto::TaskStatusStreamEvent, Status>>;
 
     #[tonic::async_trait]
     impl NovaRocksGrpc for TaskWirePeer {
         type ExchangeStream = EmptyExchangeStream;
-        type QueryControlStreamStream = EmptyControlStream;
         type SubscribeTaskStatusStream = StatusStream;
 
         async fn apply_task_operations(
@@ -1872,55 +1868,6 @@ mod tests {
             _request: Request<proto::FetchResultRequest>,
         ) -> Result<Response<proto::FetchResultResponse>, Status> {
             Err(Self::rejected("FetchResult"))
-        }
-
-        async fn init_query(
-            &self,
-            _request: Request<proto::InitQueryRequest>,
-        ) -> Result<Response<proto::InitQueryResponse>, Status> {
-            Err(Self::rejected("InitQuery"))
-        }
-
-        async fn stage_fragments(
-            &self,
-            _request: Request<proto::StageFragmentsRequest>,
-        ) -> Result<Response<proto::StageFragmentsResponse>, Status> {
-            Err(Self::rejected("StageFragments"))
-        }
-
-        async fn start_prepared_query(
-            &self,
-            _request: Request<proto::StartPreparedQueryRequest>,
-        ) -> Result<Response<proto::StartPreparedQueryResponse>, Status> {
-            Err(Self::rejected("StartPreparedQuery"))
-        }
-
-        async fn task_update(
-            &self,
-            _request: Request<proto::TaskUpdateRequest>,
-        ) -> Result<Response<proto::TaskUpdateResponse>, Status> {
-            Err(Self::rejected("TaskUpdate"))
-        }
-
-        async fn abort_query(
-            &self,
-            _request: Request<proto::AbortQueryRequest>,
-        ) -> Result<Response<proto::AbortQueryResponse>, Status> {
-            Err(Self::rejected("AbortQuery"))
-        }
-
-        async fn query_control_stream(
-            &self,
-            _request: Request<tonic::Streaming<proto::QueryControlRequest>>,
-        ) -> Result<Response<Self::QueryControlStreamStream>, Status> {
-            Err(Self::rejected("QueryControlStream"))
-        }
-
-        async fn report_query_terminal(
-            &self,
-            _request: Request<proto::ReportQueryTerminalRequest>,
-        ) -> Result<Response<proto::ReportQueryTerminalResponse>, Status> {
-            Err(Self::rejected("ReportQueryTerminal"))
         }
 
         async fn prune_catalogs(

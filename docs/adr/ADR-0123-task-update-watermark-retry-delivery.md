@@ -18,8 +18,8 @@ code-anchors:
   - "novarocks/backend/src/connector/execution_host.rs (exact-generation execution bundle)"
   - "novarocks/execution/src/connector/scan_queue.rs (SplitQueue::preflight_batch)"
   - "novarocks/frontend/src/query_execution/split_assignment/driver.rs (SplitAssignmentDriver::send_until_confirmed)"
-  - "novarocks/frontend/src/native/transport.rs (GrpcTaskUpdateTransport)"
-  - "novarocks/backend/src/query_lifecycle/rpc.rs (handle_task_update)"
+  - "novarocks/frontend/src/task_execution/split_transport.rs (SplitDeliveryBridge)"
+  - "novarocks/backend/src/task_execution/ingress.rs (apply_task_operations)"
 ---
 
 ## 问题

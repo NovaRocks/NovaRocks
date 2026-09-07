@@ -1852,9 +1852,9 @@ impl Scenario for DistributedWriterRowLevel {
 /// on the second half of the barrier alone. It is deliberately gone rather
 /// than ported, for two independent reasons.
 ///
-/// It has no fault to arm. `TerminalOutcomeSuppress` is claimed only by
-/// `QueryLifecycleRegistry`, which no production query reaches, and the
-/// outcome it suppressed does not exist: `publish_task_round_convergence`
+/// It has no fault to arm. `TerminalOutcomeSuppress` was claimed only by the
+/// retired protocol's backend query-lifecycle registry, and both that fault
+/// kind and the outcome it suppressed are gone: `publish_task_round_convergence`
 /// publishes an empty participant-outcome list because the task protocol's
 /// per-domain receipts and termination latch replaced that funnel (ADR-0135).
 ///
@@ -1912,10 +1912,10 @@ const SEVERED_BACKEND: usize = 2;
 /// The task protocol's evidence that one task really failed on the backend the
 /// fault was armed on.
 ///
-/// It replaces `NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED`, which is
-/// emitted only by `NativeFragmentService`'s Stage/Start ingress: the task
-/// protocol runs its fragments from `NativeTaskExecutionHost`, so no
-/// production query reaches that emitter.
+/// It replaces `NOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED`, which was
+/// emitted only by the retired protocol's Stage/Start fragment ingress: the
+/// task protocol runs its fragments from `NativeTaskExecutionHost`, and that
+/// ingress no longer exists.
 const TASK_EXECUTION_FAILURE: &str = "task-execution-failure";
 const TASK_EXECUTION_FAILURE_INJECTED: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED";
 
@@ -2359,10 +2359,11 @@ fn run_faulted_write(
             // end-of-stream.
             //
             // This replaced `arm_fragment_executor_failure`, whose injection
-            // point is `NativeFragmentService`'s Stage/Start ingress: the task
-            // protocol runs its fragments from `NativeTaskExecutionHost`, so
-            // that trigger is never consumed, the write succeeds untouched,
-            // and the case waits out its budget for a marker with no emitter.
+            // point was the retired protocol's Stage/Start fragment ingress:
+            // the task protocol runs its fragments from
+            // `NativeTaskExecutionHost`, so that trigger was never consumed,
+            // the write succeeded untouched, and the case waited out its
+            // budget for a marker with no emitter.
             // `TaskExecutionFailure` is the successor with the same shape --
             // the task is genuinely admitted and genuinely started before it
             // fails -- and it needs no release, because it is an injection

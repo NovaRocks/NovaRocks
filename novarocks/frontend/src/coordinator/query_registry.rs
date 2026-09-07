@@ -24,7 +24,7 @@ use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
-use novarocks_proto_codec::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::{BackendProcessId, QueryId, QueryProcessNamespace};
 
 type QueryKey = (i64, i64);
@@ -44,7 +44,6 @@ pub(crate) struct QueryLifecycleConvergenceSnapshot {
     pub(crate) execution_id: QueryExecutionId,
     pub(crate) error_source: Option<QueryLifecycleConvergenceErrorSource>,
     pub(crate) primary_error: Option<String>,
-    pub(crate) participant_outcomes: Vec<ParticipantTerminalOutcome>,
     /// Runtime Filter terminal facts are normalized only from a complete set
     /// of participant contributions.  The unavailable variant records why no
     /// such set existed for this attempt.
@@ -487,7 +486,6 @@ mod tests {
                 execution_id,
                 error_source: None,
                 primary_error: None,
-                participant_outcomes: Vec::new(),
                 runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                     RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
                 ),
@@ -499,9 +497,8 @@ mod tests {
             .expect("a published attempt is readable");
         assert_eq!(latest.execution_id, second);
         assert!(
-            latest.participant_outcomes.is_empty(),
-            "the task protocol mints no participant terminal outcome, and none \
-             may be invented for it"
+            latest.primary_error.is_none(),
+            "a published attempt reached this point already linearized as a success"
         );
     }
 

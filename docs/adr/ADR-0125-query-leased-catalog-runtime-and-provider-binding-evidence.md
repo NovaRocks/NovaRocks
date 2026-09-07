@@ -11,7 +11,7 @@ provenance:
   - "implementation: local NID-1 commits pending publication"
 code-anchors:
   - "novarocks/spi/src/connector/provider_binding.rs (ConnectorProviderBindingKey)"
-  - "novarocks/backend/src/query_lifecycle/registry.rs (QueryLifecycleRegistry::catalog_read_execution_for_query)"
+  - "novarocks/backend/src/task_execution/context_host.rs (NativeQueryContextHost::install_catalogs)"
 ---
 
 ## 问题

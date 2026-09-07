@@ -408,30 +408,18 @@ mod tests {
         RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalRollup,
         RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
     };
-    use crate::query_execution::contract::QueryId;
-    use novarocks_proto_codec::lifecycle::{
-        AttemptId, QueryExecutionId, QueryTerminalProfileContributionTelemetry,
-        QueryTerminalSnapshot,
-    };
+    use novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionTelemetry;
     use novarocks_proto_models::{common, novarocks};
 
-    /// Turns one fixture snapshot into the release-acknowledgement pair the
-    /// live rollup consumes.
+    /// Pairs one fixture contribution with the backend that released it, which
+    /// is exactly what the live rollup consumes.
     fn release_contribution(
         participant_seed: u64,
-        snapshot: &QueryTerminalSnapshot,
+        telemetry: QueryTerminalProfileContributionTelemetry,
     ) -> (
         novarocks_types::BackendProcessId,
         QueryTerminalProfileContributionTelemetry,
     ) {
-        let telemetry = QueryTerminalProfileContributionTelemetry::parse(
-            snapshot
-                .as_proto()
-                .profile_contribution
-                .clone()
-                .expect("the fixture carries a contribution"),
-        )
-        .expect("the fixture contribution is valid");
         let bytes: [u8; 16] = test_backend_process_id(participant_seed)
             .value
             .try_into()
@@ -443,18 +431,13 @@ mod tests {
     }
 
     fn rollup_of(
-        participants: impl IntoIterator<Item = (u64, QueryTerminalSnapshot)>,
+        participants: impl IntoIterator<Item = (u64, QueryTerminalProfileContributionTelemetry)>,
     ) -> RuntimeFilterTerminalRollup {
         let contributions = participants
             .into_iter()
-            .map(|(seed, snapshot)| release_contribution(seed, &snapshot))
+            .map(|(seed, telemetry)| release_contribution(seed, telemetry))
             .collect::<Vec<_>>();
         super::rollup_from_release_contributions(&contributions)
-    }
-
-    fn execution_id() -> QueryExecutionId {
-        QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
-            .expect("execution id")
     }
 
     fn test_backend_process_id(participant_seed: u64) -> novarocks::BackendProcessId {
@@ -466,18 +449,13 @@ mod tests {
         novarocks::BackendProcessId { value }
     }
 
-    fn available_snapshot(
+    fn available_contribution(
         participant_seed: u64,
         channel_id: u32,
         transport_sent_count: u64,
-    ) -> QueryTerminalSnapshot {
-        QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
-            version: 1,
-            participant: Some(novarocks::ParticipantAttemptRef {
-                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id())),
-                backend_process_id: Some(test_backend_process_id(participant_seed)),
-            }),
-            profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+    ) -> QueryTerminalProfileContributionTelemetry {
+        QueryTerminalProfileContributionTelemetry::parse(
+            novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
                         novarocks::QueryTerminalProfileContributionV1 {
@@ -547,20 +525,16 @@ mod tests {
                         },
                     ),
                 ),
-            }),
-            ..Default::default()
-        })
-        .expect("terminal snapshot")
+            },
+        )
+        .expect("terminal profile contribution")
     }
 
-    fn unavailable_snapshot(participant_seed: u64) -> QueryTerminalSnapshot {
-        QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
-            version: 1,
-            participant: Some(novarocks::ParticipantAttemptRef {
-                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id())),
-                backend_process_id: Some(test_backend_process_id(participant_seed)),
-            }),
-            profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
+    fn unavailable_contribution(
+        _participant_seed: u64,
+    ) -> QueryTerminalProfileContributionTelemetry {
+        QueryTerminalProfileContributionTelemetry::parse(
+            novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
                         novarocks::TerminalTelemetryUnavailable {
@@ -569,17 +543,16 @@ mod tests {
                         },
                     ),
                 ),
-            }),
-            ..Default::default()
-        })
-        .expect("terminal snapshot")
+            },
+        )
+        .expect("terminal profile contribution")
     }
 
     #[test]
     fn runtime_filter_terminal_rollup_preserves_all_sections_and_checked_totals() {
         let rollup = rollup_of([
-            (1, available_snapshot(1, 101, 1)),
-            (2, available_snapshot(2, 101, 1)),
+            (1, available_contribution(1, 101, 1)),
+            (2, available_contribution(2, 101, 1)),
         ]);
         assert_eq!(rollup.participants.len(), 2);
         assert_eq!(
@@ -623,8 +596,8 @@ mod tests {
     #[test]
     fn runtime_filter_terminal_rollup_keeps_equal_local_ids_from_distinct_participants() {
         let rollup = rollup_of([
-            (1, available_snapshot(1, 101, 1)),
-            (2, available_snapshot(2, 101, 1)),
+            (1, available_contribution(1, 101, 1)),
+            (2, available_contribution(2, 101, 1)),
         ]);
         let mut route_prefixes = rollup
             .participants
@@ -646,8 +619,8 @@ mod tests {
     #[test]
     fn runtime_filter_terminal_rollup_keeps_unavailable_participant_and_hides_partial_totals() {
         let rollup = rollup_of([
-            (1, available_snapshot(1, 101, 1)),
-            (2, unavailable_snapshot(2)),
+            (1, available_contribution(1, 101, 1)),
+            (2, unavailable_contribution(2)),
         ]);
         let RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(unavailable) =
             &rollup.participants[1].telemetry
@@ -666,19 +639,17 @@ mod tests {
 
     #[test]
     fn runtime_filter_terminal_rollup_marks_cross_participant_overflow_unavailable() {
-        let mut first = available_snapshot(1, 101, 1).as_proto().clone();
+        let mut first = available_contribution(1, 101, 1).as_proto().clone();
         let Some(novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
             contribution,
-        )) = first
-            .profile_contribution
-            .as_mut()
-            .and_then(|telemetry| telemetry.telemetry.as_mut())
+        )) = first.telemetry.as_mut()
         else {
             panic!("fixture profile contribution must be available");
         };
         contribution.channels[0].published_count = u64::MAX;
-        let first = QueryTerminalSnapshot::parse(first).expect("maximum valid terminal snapshot");
-        let rollup = rollup_of([(1, first), (2, available_snapshot(2, 102, 1))]);
+        let first = QueryTerminalProfileContributionTelemetry::parse(first)
+            .expect("maximum valid terminal contribution");
+        let rollup = rollup_of([(1, first), (2, available_contribution(2, 102, 1))]);
         assert_eq!(rollup.participants.len(), 2);
         assert_eq!(
             rollup.totals,
@@ -690,21 +661,20 @@ mod tests {
 
     #[test]
     fn runtime_filter_terminal_rollup_accepts_empty_runtime_filter_sections() {
-        let mut snapshot = available_snapshot(1, 101, 1).as_proto().clone();
-        snapshot
-            .profile_contribution
-            .as_mut()
-            .expect("profile contribution")
-            .telemetry = Some(
-            novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
-                novarocks::QueryTerminalProfileContributionV1 {
-                    version: 1,
-                    ..Default::default()
-                },
-            ),
-        );
-        let snapshot = QueryTerminalSnapshot::parse(snapshot).expect("empty terminal snapshot");
-        let rollup = rollup_of([(1, snapshot)]);
+        let empty = QueryTerminalProfileContributionTelemetry::parse(
+            novarocks::QueryTerminalProfileContributionTelemetry {
+                telemetry: Some(
+                    novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
+                        novarocks::QueryTerminalProfileContributionV1 {
+                            version: 1,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            },
+        )
+        .expect("empty terminal contribution");
+        let rollup = rollup_of([(1, empty)]);
         let RuntimeFilterTerminalTotalsTelemetry::Available(totals) = rollup.totals else {
             panic!("empty available contribution must have zero totals");
         };
