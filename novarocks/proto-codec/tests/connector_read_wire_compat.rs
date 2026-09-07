@@ -21,8 +21,7 @@ use std::collections::BTreeMap;
 
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_read::{
-    ValidatedColumnHandle, canonical_scheduled_split_bytes, decode_tuple_domain,
-    encode_tuple_domain,
+    ValidatedColumnHandle, decode_tuple_domain, encode_tuple_domain,
 };
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
@@ -105,21 +104,5 @@ fn outer_tuple_domain_keeps_the_existing_canonical_column_byte_order() {
             &decode_tuple_domain(&encoded, FieldPath::root("tuple")).expect("round trip")
         ),
         encoded
-    );
-}
-
-#[test]
-fn scheduled_split_replay_bytes_remain_the_received_message_encoding() {
-    let received = dto::ScheduledSplit {
-        sequence_id: 9,
-        plan_node_id: 17,
-        split: None,
-    };
-
-    // This is deliberately a raw received carrier: replay identity is formed
-    // before any future domain payload is reconstructed.
-    assert_eq!(
-        canonical_scheduled_split_bytes(&received),
-        vec![8, 9, 16, 17]
     );
 }

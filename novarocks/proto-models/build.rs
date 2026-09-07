@@ -33,9 +33,8 @@ fn main() {
         .collect::<Vec<_>>();
     let mut config = prost_build::Config::new();
     config.file_descriptor_set_path(out_dir.join("novarocks_descriptor.bin"));
-    // Connector-read maps are generated as BTreeMap so a message encodes to the
-    // same bytes every time. Runtime split assignment compares an exact replay
-    // byte for byte, which a hash-ordered map would break.
+    // Connector maps are generated as BTreeMap so map fields retain a
+    // deterministic key order for canonical codecs and structural validation.
     config.btree_map([".novarocks.connector_read", ".novarocks.connector_write"]);
     config
         .compile_protos(&proto_paths, &[PathBuf::from(IDL_DIR)])
