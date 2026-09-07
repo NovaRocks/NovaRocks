@@ -35,8 +35,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mysql_common::scramble::scramble_native;
 use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, ErrorKind, InitWriter, OkResponse, ParamParser,
-    QueryResultWriter, StatementMetaWriter,
+    AsyncMysqlIntermediary, AsyncMysqlShim, ErrorKind, InitWriter, IntermediaryOptions, OkResponse,
+    ParamParser, QueryResultWriter, StatementMetaWriter,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::{TcpListener, TcpStream};
@@ -397,7 +397,8 @@ async fn serve_frontend_mysql_connection(
     );
     let (reader, writer) = stream.into_split();
     let result = {
-        let intermediary = AsyncMysqlIntermediary::run_on(shim, reader, writer);
+        let intermediary =
+            AsyncMysqlIntermediary::run_with_options(shim, reader, writer, &MYSQL_OPTIONS);
         tokio::pin!(intermediary);
         tokio::select! {
             termination = registration.termination_receiver() => {
@@ -629,6 +630,18 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
         outcome
     }
 }
+
+/// `USE ...` arrives as an ordinary COM_QUERY and must reach the typed SQL
+/// parser like every other session statement.  Left at its default, the
+/// protocol library intercepts any query whose text starts with `USE `,
+/// slices the remainder as a raw schema name and routes it to COM_INIT_DB —
+/// which silently accepts malformed input such as `USE db extra` and reports
+/// it as an untyped identifier error instead of a located parse error.
+/// Genuine COM_INIT_DB packets still reach `on_init`.
+const MYSQL_OPTIONS: IntermediaryOptions = IntermediaryOptions {
+    process_use_statement_on_query: true,
+    reject_connection_on_dbname_absence: false,
+};
 
 fn normalize_init_database_schema(schema: &str) -> String {
     schema

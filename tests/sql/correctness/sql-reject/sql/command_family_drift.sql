@@ -39,12 +39,16 @@ REFRESH MATERIALIZED VIEW reject_mv WITH BROKEN;
 -- @expect_error=[sql.parse.unexpected_token] expected unfiltered SHOW MATERIALIZED VIEWS
 SHOW MATERIALIZED VIEWS LIKE 'reject%';
 
+-- Backend membership is owned by external orchestration, so ADD BACKEND and
+-- DROP BACKEND no longer exist as a command family. They are rejected as
+-- recognized-but-unsupported statements rather than by a backend-address
+-- grammar.
 -- @expect_error_tier=drift
--- @expect_error=[sql.parse.unexpected_token] expected quoted backend address
+-- @expect_error=[sql.parse.unsupported_statement] recognized but unsupported statement `ADD`
 ADD BACKEND 127.0.0.1:1234;
 
 -- @expect_error_tier=drift
--- @expect_error=[sql.parse.unexpected_token] expected quoted backend address
+-- @expect_error=[sql.parse.unsupported_statement] recognized but unsupported statement `DROP`
 DROP BACKEND 127.0.0.1:1234;
 
 -- @expect_error_tier=drift
