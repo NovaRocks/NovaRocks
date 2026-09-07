@@ -28,4 +28,3 @@ arrow-array = "58.2.0"
 arrow-schema = "58.2.0"
 datasketches = { workspace = true, features = ["theta"] }
 novarocks-functions = { path = "../../functions" }
-
