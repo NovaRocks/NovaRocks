@@ -27,10 +27,9 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::exec::pipeline::driver::DriverScheduleState;
 use crate::exec::pipeline::schedule::event_scheduler::{DriverKey, EventScheduler};
 pub use crate::runtime::observable::{DeferNotify, Observable, Observer};
 use tracing::debug;
@@ -50,99 +49,53 @@ fn should_log_observer(counter: &AtomicU64) -> bool {
         .is_multiple_of(OBSERVER_LOG_EVERY)
 }
 
-const SOURCE_CHANGE_EVENT: usize = 1;
-const SINK_CHANGE_EVENT: usize = 1 << 1;
-#[allow(dead_code)]
-const CANCEL_EVENT: usize = 1 << 2;
-
 /// Observer registry for dependency/event notifications inside pipeline scheduling.
 pub(crate) struct PipelineObserver {
-    schedule_state: Arc<DriverScheduleState>,
     scheduler: Weak<EventScheduler>,
+    observable: Weak<Observable>,
     key: DriverKey,
     driver_id: i32,
     fragment_instance_id: Option<(i64, i64)>,
-    pending_event_cnt: AtomicUsize,
-    events: AtomicUsize,
 }
 
 impl PipelineObserver {
     pub(crate) fn new(
-        schedule_state: Arc<DriverScheduleState>,
         scheduler: Weak<EventScheduler>,
+        observable: Weak<Observable>,
         key: DriverKey,
         driver_id: i32,
         fragment_instance_id: Option<(i64, i64)>,
     ) -> Self {
         Self {
-            schedule_state,
             scheduler,
+            observable,
             key,
             driver_id,
             fragment_instance_id,
-            pending_event_cnt: AtomicUsize::new(0),
-            events: AtomicUsize::new(0),
         }
     }
 
     pub(crate) fn source_trigger(&self) {
-        self.trigger(SOURCE_CHANGE_EVENT);
+        self.trigger("source");
     }
 
     pub(crate) fn sink_trigger(&self) {
-        self.trigger(SINK_CHANGE_EVENT);
+        self.trigger("sink");
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn cancel_trigger(&self) {
-        self.trigger(CANCEL_EVENT);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn all_trigger(&self) {
-        self.trigger(SOURCE_CHANGE_EVENT | SINK_CHANGE_EVENT);
-    }
-
-    fn trigger(&self, event: usize) {
-        self.events.fetch_or(event, Ordering::AcqRel);
-        self.update();
-    }
-
-    fn update(&self) {
-        if self.pending_event_cnt.fetch_add(1, Ordering::AcqRel) != 0 {
-            return;
-        }
-        loop {
-            let event = self.events.swap(0, Ordering::AcqRel);
-            self.do_update(event);
-            if self.pending_event_cnt.fetch_sub(1, Ordering::AcqRel) == 1 {
-                break;
-            }
-        }
-    }
-
-    fn do_update(&self, event: usize) {
-        let token = self.schedule_state.acquire_schedule_token();
-        if !token.acquired() {
-            self.schedule_state.set_need_check_reschedule(true);
-        }
-        if self.schedule_state.is_in_blocked() {
-            if let Some(scheduler) = self.scheduler.upgrade() {
-                scheduler.enqueue(self.key);
-            } else if should_log_observer(&OBSERVER_NOT_BLOCKED_LOG_COUNT) {
-                debug!(
-                    "Observer update dropped: scheduler already released; finst={:?} driver_id={} event={}",
-                    self.fragment_instance_id, self.driver_id, event
-                );
-            }
-        } else {
-            self.schedule_state.set_need_check_reschedule(true);
-            if should_log_observer(&OBSERVER_NOT_BLOCKED_LOG_COUNT) {
-                debug!(
-                    "Observer update while not blocked: finst={:?} driver_id={} event={}",
-                    self.fragment_instance_id, self.driver_id, event
-                );
-            }
+    fn trigger(&self, event: &'static str) {
+        if let (Some(scheduler), Some(observable)) =
+            (self.scheduler.upgrade(), self.observable.upgrade())
+        {
+            // Notification callbacks are deliberately state-blind. They never
+            // inspect a driver or operator; the worker owns every readiness
+            // decision after the task is requeued.
+            scheduler.enqueue_observable(self.key, &self.observable, observable.generation());
+        } else if should_log_observer(&OBSERVER_NOT_BLOCKED_LOG_COUNT) {
+            debug!(
+                "Observer update dropped: scheduler already released; finst={:?} driver_id={} event={}",
+                self.fragment_instance_id, self.driver_id, event
+            );
         }
     }
 }

@@ -36,15 +36,16 @@ use arrow::array::{
     RecordBatch, StructArray, UInt32Builder, new_null_array,
 };
 use arrow::compute::kernels::zip::zip;
-use arrow::compute::{cast, concat, concat_batches, take};
-use arrow::datatypes::{DataType, Field, Fields};
+use arrow::compute::{cast, concat_batches, take};
+use arrow::datatypes::DataType;
 use arrow_buffer::OffsetBuffer;
 use arrow_buffer::i256;
+use novarocks_functions::AggregateInputBatch;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::agg::{
-    AggScalarValue, AggStateArena, agg_scalar_from_array, build_agg_scalar_array, build_kernel_set,
-    compare_agg_scalar_values,
+    AggScalarValue, AggStateArena, SealedExecutionFunctionSet, agg_scalar_from_array,
+    build_agg_scalar_array, build_kernel_set, compare_agg_scalar_values,
 };
 use crate::exec::expr::decimal::{div_round_i128, div_round_i256, pow10_i128, pow10_i256};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
@@ -53,6 +54,7 @@ use crate::exec::node::analytic::{
     AnalyticOutputColumn, WindowBoundary, WindowFrame, WindowFunctionKind, WindowFunctionSpec,
     WindowType,
 };
+use crate::exec::operators::aggregate::AnalyticAggregateRetainedMemory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
@@ -64,6 +66,11 @@ struct AnalyticState {
     sink_finishing: bool,
     sink_complete: bool,
     computed: bool,
+}
+
+#[derive(Clone)]
+struct PreparedWindowAggregate {
+    kernels: crate::exec::expr::agg::AggKernelSet,
 }
 
 #[derive(Clone)]
@@ -81,6 +88,112 @@ pub(crate) struct AnalyticSharedState {
     observable: Arc<Observable>,
     label: String,
     queue_tracker: Arc<OnceLock<Arc<MemTracker>>>,
+    aggregate_tracker: Arc<OnceLock<Arc<MemTracker>>>,
+    prepared_window_aggregates: Arc<[Option<PreparedWindowAggregate>]>,
+}
+
+fn prepare_window_aggregates(
+    arena: &ExprArena,
+    functions: &[WindowFunctionSpec],
+    function_set: &SealedExecutionFunctionSet,
+) -> Result<Vec<Option<PreparedWindowAggregate>>, String> {
+    functions
+        .iter()
+        .enumerate()
+        .map(|(index, function)| {
+            let window_only = is_window_only_kind(&function.kind);
+            let binding = match (window_only, function.aggregate_binding.as_ref()) {
+                (true, None) => return Ok(None),
+                (true, Some(_)) => {
+                    return Err(format!(
+                        "window-only function #{} must not carry an aggregate binding",
+                        index
+                    ));
+                }
+                (false, None) => {
+                    return Err(format!(
+                        "aggregate window function #{} requires an exact aggregate binding",
+                        index
+                    ));
+                }
+                (false, Some(binding)) => binding,
+            };
+            if function.return_type != binding.resolved.output_type {
+                return Err(format!(
+                    "aggregate window function #{} output type drift: function={:?} binding={:?}",
+                    index, function.return_type, binding.resolved.output_type
+                ));
+            }
+
+            let Some(expected_name) = custom_window_aggregate_name(&function.kind) else {
+                return Ok(None);
+            };
+            if binding.function_name != expected_name {
+                return Err(format!(
+                    "aggregate window function #{} identity drift: kind expects `{expected_name}`, binding names `{}`",
+                    index, binding.function_name
+                ));
+            }
+            let [physical_input] = function.args.as_slice() else {
+                return Err(format!(
+                    "custom aggregate window function #{} requires one packed physical input, got {}",
+                    index,
+                    function.args.len()
+                ));
+            };
+            let evaluated_input_type = arena.data_type(*physical_input).cloned().ok_or_else(|| {
+                format!(
+                    "custom aggregate window function #{} physical input type missing",
+                    index
+                )
+            })?;
+            let aggregate = AggFunction {
+                name: binding.function_name.clone(),
+                inputs: function.args.clone(),
+                types: Some(AggTypeSignature {
+                    input_arg_type: binding.resolved.argument_types.first().cloned(),
+                    intermediate_type: Some(binding.resolved.intermediate_type.clone()),
+                    output_type: Some(binding.resolved.output_type.clone()),
+                }),
+                ..Default::default()
+            };
+            let kernels = build_kernel_set(
+                function_set,
+                &[aggregate],
+                &[Some(evaluated_input_type)],
+                std::slice::from_ref(&binding.resolved),
+            )?;
+            Ok(Some(PreparedWindowAggregate { kernels }))
+        })
+        .collect()
+}
+
+fn is_window_only_kind(kind: &WindowFunctionKind) -> bool {
+    matches!(
+        kind,
+        WindowFunctionKind::RowNumber
+            | WindowFunctionKind::Rank
+            | WindowFunctionKind::DenseRank
+            | WindowFunctionKind::CumeDist
+            | WindowFunctionKind::PercentRank
+            | WindowFunctionKind::Ntile
+            | WindowFunctionKind::FirstValue { .. }
+            | WindowFunctionKind::FirstValueRewrite { .. }
+            | WindowFunctionKind::LastValue { .. }
+            | WindowFunctionKind::Lead { .. }
+            | WindowFunctionKind::Lag { .. }
+            | WindowFunctionKind::SessionNumber
+    )
+}
+
+fn custom_window_aggregate_name(kind: &WindowFunctionKind) -> Option<&'static str> {
+    match kind {
+        WindowFunctionKind::BitmapUnion => Some("bitmap_union"),
+        WindowFunctionKind::BitmapUnionCount => Some("bitmap_union_count"),
+        WindowFunctionKind::MaxBy => Some("max_by"),
+        WindowFunctionKind::MinBy => Some("min_by"),
+        _ => None,
+    }
 }
 
 #[allow(
@@ -100,8 +213,9 @@ impl AnalyticSharedState {
         window: Option<WindowFrame>,
         output_columns: Vec<AnalyticOutputColumn>,
         output_chunk_schema: ChunkSchemaRef,
+        function_set: Arc<SealedExecutionFunctionSet>,
         node_id: i32,
-    ) -> Self {
+    ) -> Result<Self, String> {
         Self::new_with_buffer_limit(
             arena,
             partition_exprs,
@@ -110,6 +224,7 @@ impl AnalyticSharedState {
             window,
             output_columns,
             output_chunk_schema,
+            function_set,
             node_id,
             1,
         )
@@ -124,15 +239,18 @@ impl AnalyticSharedState {
         window: Option<WindowFrame>,
         output_columns: Vec<AnalyticOutputColumn>,
         output_chunk_schema: ChunkSchemaRef,
+        function_set: Arc<SealedExecutionFunctionSet>,
         node_id: i32,
         buffer_limit: usize,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        let prepared_window_aggregates =
+            prepare_window_aggregates(&arena, &functions, &function_set)?;
         let label = if node_id >= 0 {
             format!("analytic_queue_{node_id}")
         } else {
             "analytic_queue".to_string()
         };
-        Self {
+        Ok(Self {
             inner: Arc::new(Mutex::new(AnalyticState {
                 input: Vec::new(),
                 output: VecDeque::new(),
@@ -152,31 +270,35 @@ impl AnalyticSharedState {
             observable: Arc::new(Observable::new()),
             label,
             queue_tracker: Arc::new(OnceLock::new()),
-        }
+            aggregate_tracker: Arc::new(OnceLock::new()),
+            prepared_window_aggregates: prepared_window_aggregates.into(),
+        })
     }
 
-    pub(crate) fn push_input(&self, state: &RuntimeState, mut chunk: Chunk) {
+    pub(crate) fn push_input(&self, state: &RuntimeState, mut chunk: Chunk) -> Result<(), String> {
         if let Some(tracker) = self.queue_mem_tracker(state).as_ref() {
-            chunk.transfer_to(tracker);
+            chunk.try_transfer_to(tracker)?;
         }
         let mut guard = self.inner.lock().expect("analytic state lock");
         if !chunk.is_empty() {
             guard.input.push(chunk);
         }
+        Ok(())
     }
 
     pub(crate) fn finish(&self, state: &RuntimeState) -> Result<(), String> {
         let notify = self.observable.defer_notify();
+        let aggregate_tracker = self.aggregate_mem_tracker(state);
         let mut guard = self.inner.lock().expect("analytic state lock");
         guard.sink_finishing = true;
         if !guard.computed {
             let outputs = self
-                .compute_outputs(&guard.input)
+                .compute_outputs(&guard.input, aggregate_tracker)
                 .map_err(|e| e.to_string())?;
             let mut outputs = outputs;
             if let Some(tracker) = self.queue_mem_tracker(state).as_ref() {
                 for chunk in outputs.iter_mut() {
-                    chunk.transfer_to(tracker);
+                    chunk.try_transfer_to(tracker)?;
                 }
             }
             guard.pending = outputs;
@@ -216,11 +338,7 @@ impl AnalyticSharedState {
                 guard.output.push_back(chunk);
             }
         }
-        let mut chunk = guard.output.pop_front()?;
-        if let Some(tracker) = self.queue_tracker.get() {
-            chunk.transfer_to(tracker);
-        }
-        Some(chunk)
+        guard.output.pop_front()
     }
 
     pub(crate) fn is_done(&self) -> bool {
@@ -228,33 +346,49 @@ impl AnalyticSharedState {
         guard.sink_complete && guard.output.is_empty() && guard.pending.is_empty()
     }
 
-    fn compute_outputs(&self, input: &[Chunk]) -> Result<VecDeque<Chunk>, String> {
+    fn compute_outputs(
+        &self,
+        input: &[Chunk],
+        aggregate_tracker: Option<Arc<MemTracker>>,
+    ) -> Result<VecDeque<Chunk>, String> {
         if input.is_empty() {
             return Ok(VecDeque::new());
         }
 
         let input_schema = input[0].schema();
-        let batches: Vec<RecordBatch> = input.iter().map(|c| c.batch.clone()).collect();
-        let batch = concat_batches(&input_schema, &batches)
-            .map_err(|e| format!("concat_batches: {}", e))?;
-        let total_rows = batch.num_rows();
+        let mut ordered_chunk = if input.len() == 1 {
+            // Preserve the input's existing accounting lease instead of
+            // materializing and charging a duplicate concatenation.
+            input[0].clone()
+        } else {
+            let batches: Vec<RecordBatch> = input.iter().map(|c| c.batch.clone()).collect();
+            let batch = concat_batches(&input_schema, &batches)
+                .map_err(|e| format!("concat_batches: {}", e))?;
+            let mut chunk = Chunk::try_new_with_chunk_schema(batch, input[0].chunk_schema_ref())
+                .map_err(|e| format!("build analytic concat chunk: {e}"))?;
+            if let Some(tracker) = aggregate_tracker.as_ref() {
+                chunk.try_transfer_to(tracker)?;
+            }
+            chunk
+        };
+        let total_rows = ordered_chunk.len();
         if total_rows == 0 {
             return Ok(VecDeque::new());
         }
-
-        let concat_chunk =
-            Chunk::try_new_with_chunk_schema(batch.clone(), input[0].chunk_schema_ref())
-                .map_err(|e| format!("build analytic concat chunk: {e}"))?;
-        let mut ordered_chunk = concat_chunk;
         let mut partition_keys = self.eval_exprs(&ordered_chunk, &self.partition_exprs)?;
         let mut order_keys = self.eval_exprs(&ordered_chunk, &self.order_by_exprs)?;
 
         // Hash-based analytic plans may emit the same partition key in non-contiguous blocks.
         // For partition-only full-frame window aggregates, regroup rows by partition key first.
-        if should_reorder_window_input(&self.functions, &order_keys, self.window.as_ref())?
+        if total_rows > 1
+            && should_reorder_window_input(&self.functions, &order_keys, self.window.as_ref())?
             && !self.partition_exprs.is_empty()
         {
-            ordered_chunk = reorder_chunk_by_partition_keys(&ordered_chunk, &partition_keys)?;
+            let mut reordered = reorder_chunk_by_partition_keys(&ordered_chunk, &partition_keys)?;
+            if let Some(tracker) = aggregate_tracker.as_ref() {
+                reordered.try_transfer_to(tracker)?;
+            }
+            ordered_chunk = reordered;
             partition_keys = self.eval_exprs(&ordered_chunk, &self.partition_exprs)?;
             order_keys = self.eval_exprs(&ordered_chunk, &self.order_by_exprs)?;
         }
@@ -266,8 +400,16 @@ impl AnalyticSharedState {
         let mut func_outputs: Vec<ArrayRef> = Vec::with_capacity(self.functions.len());
         for (func_idx, func) in self.functions.iter().enumerate() {
             let arrays = self.eval_exprs(&ordered_chunk, &func.args)?;
-            let out = compute_window_function(&self.arena, func, &arrays, &window_ctx, total_rows)
-                .map_err(|e| format!("window function #{}: {}", func_idx, e))?;
+            let out = compute_window_function(
+                &self.arena,
+                func,
+                self.prepared_window_aggregates[func_idx].as_ref(),
+                &arrays,
+                &window_ctx,
+                total_rows,
+                aggregate_tracker.clone(),
+            )
+            .map_err(|e| format!("window function #{}: {}", func_idx, e))?;
             func_outputs.push(out);
         }
 
@@ -307,6 +449,14 @@ impl AnalyticSharedState {
         let tracker = self
             .queue_tracker
             .get_or_init(|| MemTracker::new_child(label, &root));
+        Some(Arc::clone(tracker))
+    }
+
+    fn aggregate_mem_tracker(&self, state: &RuntimeState) -> Option<Arc<MemTracker>> {
+        let root = state.mem_tracker()?;
+        let tracker = self
+            .aggregate_tracker
+            .get_or_init(|| MemTracker::new_child(format!("{}_aggregate", self.label), &root));
         Some(Arc::clone(tracker))
     }
 }
@@ -455,9 +605,7 @@ fn should_reorder_window_input(
                 | WindowFunctionKind::BitmapUnion
                 | WindowFunctionKind::BitmapUnionCount
                 | WindowFunctionKind::MaxBy
-                | WindowFunctionKind::MaxByV2
                 | WindowFunctionKind::MinBy
-                | WindowFunctionKind::MinByV2
                 | WindowFunctionKind::VarianceSamp
                 | WindowFunctionKind::StddevSamp
                 | WindowFunctionKind::BoolOr
@@ -702,9 +850,11 @@ fn value_equal_or_both_null(array: &dyn Array, left: usize, right: usize) -> Res
 fn compute_window_function(
     arena: &ExprArena,
     func: &WindowFunctionSpec,
+    prepared_aggregate: Option<&PreparedWindowAggregate>,
     args: &[ArrayRef],
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
+    aggregate_tracker: Option<Arc<MemTracker>>,
 ) -> Result<ArrayRef, String> {
     match &func.kind {
         WindowFunctionKind::RowNumber => compute_row_number(window_ctx.partitions(), total_rows),
@@ -760,46 +910,40 @@ fn compute_window_function(
             compute_min_max(args, window_ctx, false, &func.return_type, total_rows)
         }
         WindowFunctionKind::BitmapUnion => compute_window_custom_aggregate(
+            prepared_aggregate,
             "bitmap_union",
             args,
             window_ctx,
             &func.return_type,
             total_rows,
+            aggregate_tracker.clone(),
         ),
         WindowFunctionKind::BitmapUnionCount => compute_window_custom_aggregate(
+            prepared_aggregate,
             "bitmap_union_count",
             args,
             window_ctx,
             &func.return_type,
             total_rows,
+            aggregate_tracker.clone(),
         ),
         WindowFunctionKind::MaxBy => compute_window_custom_aggregate(
+            prepared_aggregate,
             "max_by",
             args,
             window_ctx,
             &func.return_type,
             total_rows,
-        ),
-        WindowFunctionKind::MaxByV2 => compute_window_custom_aggregate(
-            "max_by_v2",
-            args,
-            window_ctx,
-            &func.return_type,
-            total_rows,
+            aggregate_tracker.clone(),
         ),
         WindowFunctionKind::MinBy => compute_window_custom_aggregate(
+            prepared_aggregate,
             "min_by",
             args,
             window_ctx,
             &func.return_type,
             total_rows,
-        ),
-        WindowFunctionKind::MinByV2 => compute_window_custom_aggregate(
-            "min_by_v2",
-            args,
-            window_ctx,
-            &func.return_type,
-            total_rows,
+            aggregate_tracker,
         ),
         WindowFunctionKind::VarianceSamp => compute_variance_samp(args, window_ctx, total_rows),
         WindowFunctionKind::StddevSamp => compute_stddev_samp(args, window_ctx, total_rows),
@@ -968,65 +1112,64 @@ fn compute_ntile(
 }
 
 fn compute_window_custom_aggregate(
+    prepared: Option<&PreparedWindowAggregate>,
     func_name: &str,
     args: &[ArrayRef],
     window_ctx: &PartitionWindowContext,
     return_type: &DataType,
     total_rows: usize,
+    aggregate_tracker: Option<Arc<MemTracker>>,
 ) -> Result<ArrayRef, String> {
-    let input_array = match args {
-        [] => None,
-        [single] => Some(Arc::clone(single)),
-        many => {
-            let mut fields = Vec::with_capacity(many.len());
-            for (idx, arr) in many.iter().enumerate() {
-                fields.push(Field::new(format!("f{idx}"), arr.data_type().clone(), true));
-            }
-            let packed = StructArray::new(Fields::from(fields), many.to_vec(), None);
-            Some(Arc::new(packed) as ArrayRef)
-        }
+    let [input_array] = args else {
+        return Err(format!(
+            "window aggregate `{func_name}` expected one prepared physical input, got {}",
+            args.len()
+        ));
     };
-
-    let kernels = build_kernel_set(
-        &[AggFunction {
-            name: func_name.to_string(),
-            inputs: Vec::new(),
-            input_is_intermediate: false,
-            types: Some(AggTypeSignature {
-                intermediate_type: None,
-                output_type: Some(return_type.clone()),
-                input_arg_type: input_array.as_ref().map(|a| a.data_type().clone()),
-            }),
-            ..Default::default()
-        }],
-        &[input_array.as_ref().map(|a| a.data_type().clone())],
-    )?;
-    let kernel = kernels
+    let prepared = prepared.ok_or_else(|| {
+        format!("window aggregate `{func_name}` was not prepared during pipeline construction")
+    })?;
+    let kernel = prepared
+        .kernels
         .entries
         .first()
         .ok_or_else(|| format!("missing aggregate kernel for {}", func_name))?;
 
-    let mut out_arrays: Vec<ArrayRef> = Vec::with_capacity(total_rows);
-    let mut state_ptrs = Vec::new();
+    let mut output_values = Vec::with_capacity(total_rows);
+    // Repeating one state pointer does not need a frame-sized heap allocation.
+    // Keep update fanout bounded so very large frames cannot create a second,
+    // untracked O(frame_rows) support buffer beside the aggregate state.
+    const UPDATE_ROWS: usize = 1024;
     let mut state_arena = AggStateArena::new(8 * 1024);
+    let mut retained_memory = AnalyticAggregateRetainedMemory::new();
+    if let Some(tracker) = aggregate_tracker.as_ref() {
+        state_arena.try_set_mem_tracker(Arc::clone(tracker))?;
+        retained_memory.set_tracker(Arc::clone(tracker))?;
+    }
+    let state_ptr =
+        state_arena.try_alloc(prepared.kernels.layout.total_size, kernel.state_align())?;
+    let state_ptrs = [state_ptr; UPDATE_ROWS];
 
     for (part_idx, (_p_start, _p_end)) in window_ctx.partitions().iter().enumerate() {
         for (frame_start, frame_end) in window_ctx.frames(part_idx)?.iter().copied() {
-            let state_ptr = state_arena.alloc(kernels.layout.total_size, kernel.state_align());
-            kernel.init_state(state_ptr);
+            retained_memory.initialize_state(kernel, state_ptr)?;
+            let result = (|| {
+                if frame_start < frame_end {
+                    let mut batch_start = frame_start;
+                    while batch_start < frame_end {
+                        let batch_len = (frame_end - batch_start).min(UPDATE_ROWS);
+                        let frame_input = input_array.slice(batch_start, batch_len);
+                        let input = AggregateInputBatch::try_new(Some(&frame_input), batch_len)
+                            .map_err(|error| error.to_string())?;
+                        retained_memory.update_batch(kernel, &state_ptrs[..batch_len], input)?;
+                        batch_start += batch_len;
+                    }
+                }
+                retained_memory.build_final(kernel, state_ptr)
+            })();
+            retained_memory.drop_initialized_state(kernel, state_ptr);
 
-            if frame_start < frame_end {
-                let frame_len = frame_end - frame_start;
-                let frame_input = input_array
-                    .as_ref()
-                    .map(|array| array.slice(frame_start, frame_len));
-                let view = kernel.build_input_view(&frame_input)?;
-                state_ptrs.clear();
-                state_ptrs.resize(frame_len, state_ptr);
-                kernel.update_batch(&state_ptrs, &view)?;
-            }
-
-            let mut out = kernel.build_array(&[state_ptr], false)?;
+            let mut out = result?;
             if out.data_type() != return_type {
                 let from_type = out.data_type().clone();
                 out = cast(out.as_ref(), return_type).map_err(|e| {
@@ -1036,17 +1179,14 @@ fn compute_window_custom_aggregate(
                     )
                 })?;
             }
-            out_arrays.push(out);
-            kernel.drop_state(state_ptr);
+            output_values.push(agg_scalar_from_array(&out, 0)?);
         }
     }
 
-    if out_arrays.is_empty() {
+    if output_values.is_empty() {
         return Ok(new_null_array(return_type, 0));
     }
-    let out_refs: Vec<&dyn Array> = out_arrays.iter().map(|array| array.as_ref()).collect();
-    concat(out_refs.as_slice())
-        .map_err(|e| format!("concat {} window aggregate outputs: {}", func_name, e))
+    build_agg_scalar_array(return_type, output_values)
 }
 
 fn compute_first_last_value(
@@ -2956,8 +3096,14 @@ fn scalar_f64(array: &dyn Array, row: usize) -> Result<f64, String> {
 mod tests {
     use super::*;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
-    use arrow::array::{Int32Array, Int64Array};
+    use crate::exec::node::analytic::WindowAggregateBinding;
+    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::datatypes::{Field, Fields};
     use novarocks_types::SlotId;
+
+    fn empty_function_set() -> Arc<SealedExecutionFunctionSet> {
+        crate::exec::expr::agg::test_builtin_execution_function_set()
+    }
 
     fn int32_chunk_schema() -> ChunkSchemaRef {
         Arc::new(
@@ -3031,6 +3177,267 @@ mod tests {
         .unwrap()
     }
 
+    fn value_key_chunk_schema() -> ChunkSchemaRef {
+        Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(1),
+                    Field::new("value", DataType::Utf8, true),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(2),
+                    Field::new("key", DataType::Int64, true),
+                    None,
+                    None,
+                ),
+            ])
+            .unwrap(),
+        )
+    }
+
+    fn value_key_chunk(values: &[&str], keys: &[i64]) -> Chunk {
+        Chunk::try_new_with_columns(
+            value_key_chunk_schema(),
+            vec![
+                Arc::new(StringArray::from(values.to_vec())) as ArrayRef,
+                Arc::new(Int64Array::from(keys.to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn window_output_schema(data_type: DataType) -> ChunkSchemaRef {
+        Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(3),
+                Field::new("window_value", data_type, true),
+                None,
+                None,
+            )])
+            .unwrap(),
+        )
+    }
+
+    fn input_and_window_output_schema(window_type: DataType) -> ChunkSchemaRef {
+        Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(1),
+                    Field::new("v", DataType::Int32, true),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(2),
+                    Field::new("window_value", window_type, true),
+                    None,
+                    None,
+                ),
+            ])
+            .unwrap(),
+        )
+    }
+
+    fn aggregate_binding(name: &str, argument_types: &[DataType]) -> WindowAggregateBinding {
+        let function_set = empty_function_set();
+        WindowAggregateBinding {
+            function_name: name.to_string(),
+            resolved: function_set
+                .catalog()
+                .resolve_aggregate_trusted(name, argument_types)
+                .expect("resolve aggregate binding"),
+        }
+    }
+
+    fn value_key_arena() -> (Arc<ExprArena>, ExprId, ExprId, ExprId) {
+        let mut arena = ExprArena::default();
+        let value = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let key = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int64);
+        let packed_type = DataType::Struct(Fields::from(vec![
+            Field::new("value", DataType::Utf8, true),
+            Field::new("key", DataType::Int64, true),
+        ]));
+        let packed = arena.push_typed(
+            ExprNode::StructExpr {
+                fields: vec![value, key],
+            },
+            packed_type,
+        );
+        (Arc::new(arena), value, key, packed)
+    }
+
+    fn runtime_state_with_limit(limit: i64) -> (RuntimeState, Arc<MemTracker>) {
+        let tracker = MemTracker::new_root("analytic_test_root");
+        tracker.install_limit_once(limit).unwrap();
+        let state = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&tracker)),
+            None,
+            None,
+            None,
+            None,
+        );
+        (state, tracker)
+    }
+
+    #[test]
+    fn max_min_by_use_logical_two_arg_binding_with_one_packed_struct_input() {
+        let input = value_key_chunk(&["a", "c", "b"], &[1, 3, 2]);
+        for (kind, name, expected) in [
+            (WindowFunctionKind::MaxBy, "max_by", "c"),
+            (WindowFunctionKind::MinBy, "min_by", "a"),
+        ] {
+            let (arena, _value, _key, packed) = value_key_arena();
+            let binding = aggregate_binding(name, &[DataType::Utf8, DataType::Int64]);
+            assert_eq!(binding.resolved.argument_types.len(), 2);
+            let state = AnalyticSharedState::new(
+                arena,
+                vec![],
+                vec![],
+                vec![WindowFunctionSpec {
+                    kind,
+                    args: vec![packed],
+                    return_type: DataType::Utf8,
+                    aggregate_binding: Some(binding),
+                }],
+                None,
+                vec![AnalyticOutputColumn::Window(0)],
+                window_output_schema(DataType::Utf8),
+                empty_function_set(),
+                1,
+            )
+            .unwrap();
+
+            let output = state
+                .compute_outputs(std::slice::from_ref(&input), None)
+                .unwrap();
+            let values = output[0].columns()[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(values.len(), 3);
+            assert!((0..3).all(|row| values.value(row) == expected));
+        }
+    }
+
+    #[test]
+    fn array_agg_function_order_is_independent_from_over_order() {
+        let input = value_key_chunk(&["a", "b", "c"], &[1, 2, 3]);
+        let (arena, _value, over_order_key, packed) = value_key_arena();
+        let output_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let state = AnalyticSharedState::new(
+            arena,
+            vec![],
+            vec![over_order_key],
+            vec![WindowFunctionSpec {
+                kind: WindowFunctionKind::ArrayAgg {
+                    is_distinct: false,
+                    is_asc_order: vec![false],
+                    nulls_first: vec![false],
+                },
+                args: vec![packed],
+                return_type: output_type.clone(),
+                aggregate_binding: Some(aggregate_binding("array_agg", &[DataType::Utf8])),
+            }],
+            None,
+            vec![AnalyticOutputColumn::Window(0)],
+            window_output_schema(output_type),
+            empty_function_set(),
+            2,
+        )
+        .unwrap();
+
+        let output = state.compute_outputs(&[input], None).unwrap();
+        let lists = output[0].columns()[0]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let final_row = lists.value(2);
+        let final_values = final_row.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            (0..final_values.len())
+                .map(|row| final_values.value(row))
+                .collect::<Vec<_>>(),
+            vec!["c", "b", "a"]
+        );
+    }
+
+    #[test]
+    fn analytic_input_accounting_fails_closed_at_hard_limit() {
+        let (runtime, tracker) = runtime_state_with_limit(1);
+        let state = AnalyticSharedState::new(
+            Arc::new(ExprArena::default()),
+            vec![],
+            vec![],
+            vec![],
+            None,
+            vec![AnalyticOutputColumn::InputSlotId(SlotId::new(1))],
+            int32_chunk_schema(),
+            empty_function_set(),
+            3,
+        )
+        .unwrap();
+
+        let error = state
+            .push_input(&runtime, int32_chunk(vec![Some(1), Some(2)]))
+            .expect_err("input charge must enforce the hard limit");
+        assert!(
+            error.contains("ResourceExhausted"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(tracker.current(), 0, "failed input must release its charge");
+    }
+
+    #[test]
+    fn analytic_output_accounting_fails_closed_while_input_remains_owned() {
+        let input = int32_chunk(vec![Some(1), Some(2), Some(3)]);
+        let input_bytes = i64::try_from(input.logical_bytes()).unwrap();
+        let (runtime, tracker) = runtime_state_with_limit(input_bytes + 1);
+        let state = AnalyticSharedState::new(
+            Arc::new(ExprArena::default()),
+            vec![],
+            vec![],
+            vec![WindowFunctionSpec {
+                kind: WindowFunctionKind::RowNumber,
+                args: vec![],
+                return_type: DataType::Int64,
+                aggregate_binding: None,
+            }],
+            None,
+            vec![
+                AnalyticOutputColumn::InputSlotId(SlotId::new(1)),
+                AnalyticOutputColumn::Window(0),
+            ],
+            input_and_window_output_schema(DataType::Int64),
+            empty_function_set(),
+            4,
+        )
+        .unwrap();
+
+        state.push_input(&runtime, input).unwrap();
+        assert_eq!(tracker.current(), input_bytes);
+        let error = state
+            .finish(&runtime)
+            .expect_err("output charge must enforce the hard limit");
+        assert!(
+            error.contains("ResourceExhausted"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            tracker.current(),
+            input_bytes,
+            "failed output must release its attempted charge while input remains buffered"
+        );
+        drop(state);
+        assert_eq!(tracker.current(), 0);
+    }
+
     #[test]
     fn analytic_output_rejects_descriptor_type_drift() {
         let input = vec![int64_chunk(vec![Some(1), Some(2)])];
@@ -3042,11 +3449,13 @@ mod tests {
             None,
             vec![AnalyticOutputColumn::InputSlotId(SlotId::new(1))],
             binary_output_chunk_schema(),
+            empty_function_set(),
             1,
-        );
+        )
+        .unwrap();
 
         let err = state
-            .compute_outputs(&input)
+            .compute_outputs(&input, None)
             .expect_err("descriptor drift should be rejected");
 
         assert!(
@@ -3095,10 +3504,12 @@ mod tests {
             None,
             vec![AnalyticOutputColumn::InputSlotId(SlotId::new(1))],
             int32_chunk_schema(),
+            empty_function_set(),
             1,
-        );
+        )
+        .unwrap();
 
-        let out = state.compute_outputs(&input).unwrap();
+        let out = state.compute_outputs(&input, None).unwrap();
         let lengths: Vec<usize> = out.iter().map(|chunk| chunk.len()).collect();
         assert_eq!(lengths, vec![2, 3]);
     }

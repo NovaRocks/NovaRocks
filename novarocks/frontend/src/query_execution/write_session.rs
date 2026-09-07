@@ -45,9 +45,9 @@ use novarocks_spi::connector::write_stack::{
     UniqueWriterHandleLedger, WriteRowCountAccumulator, WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorStorageResolver, ConnectorWriteAbortOutcome, ConnectorWriteReceipt,
-    ExternalMutationEvidence, ExternalMutationOutcome,
+    ConnectorError, ConnectorErrorKind, ConnectorRequestContext, ConnectorStorageResolver,
+    ConnectorWriteAbortOutcome, ConnectorWriteReceipt, ExternalMutationEvidence,
+    ExternalMutationOutcome,
 };
 
 use crate::connector::control_host::ConnectorWriteStackLease;
@@ -110,6 +110,9 @@ struct AccumulatedWriteSet {
     rows: WriteRowCountAccumulator,
     ledger: PreparedWriteSetLedger,
     fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
+    statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
+    statistics_body_bytes: usize,
+    statistics_property_bytes: usize,
 }
 
 impl ConnectorWriteSession {
@@ -166,6 +169,7 @@ impl ConnectorWriteSession {
     ///
     /// The dual barrier's whole point is that some outcomes must leave this at
     /// zero, and "zero" is only meaningful if it is observable.
+    #[cfg(test)]
     pub(crate) fn finish_invocations(&self) -> usize {
         self.finish_invocations.load(Ordering::SeqCst)
     }
@@ -181,6 +185,29 @@ impl ConnectorWriteSession {
     /// it. It belongs in the query's Init catalog set beside every typed read's.
     pub(crate) const fn catalog_properties(&self) -> &novarocks_spi::connector::CatalogProperties {
         &self.catalog_properties
+    }
+
+    /// Return the provider-selected aggregate requirements for exactly one
+    /// sealed logical target. SQL resolves these names against the same
+    /// immutable function catalog snapshot that analyzed the write query.
+    pub(crate) fn statistics_requirements(
+        &self,
+        target: WriteTargetOrdinal,
+    ) -> Result<&[novarocks_spi::connector::StatisticsRequiredAggregation], ConnectorError> {
+        self.plan
+            .targets()
+            .iter()
+            .find(|candidate| candidate.ordinal() == target)
+            .map(|candidate| candidate.statistics().requirements())
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "connector write target {} is outside the sealed session",
+                        target.get()
+                    ),
+                )
+            })
     }
 
     pub(crate) fn seal_write_targets(&self) -> Result<SealedWriteTargets, ConnectorError> {
@@ -210,16 +237,6 @@ impl ConnectorWriteSession {
             self.catalog_properties.handle().clone(),
             handles,
         ))
-    }
-
-    /// Turn the canonical fragments the backends reported into provider values
-    /// this generation owns.
-    fn interpret(
-        &self,
-        prepared: DecodedPreparedWriteSet,
-    ) -> Result<ConnectorPreparedWriteSet, ConnectorError> {
-        let row_count = prepared.row_count();
-        self.interpret_parts(row_count, prepared.into_fragments())
     }
 
     /// Turn canonical fragments into provider values this generation owns.
@@ -288,11 +305,92 @@ impl ConnectorWriteSession {
             ));
         }
         let mut accumulated = self.lock_accumulated()?;
-        accumulated.rows.add(prepared.row_count())?;
-        for (target, bytes) in prepared.into_fragments() {
-            accumulated.ledger.reserve_fragment(bytes.len())?;
-            accumulated.fragments.push((target, bytes));
+        let (row_count, fragments, statistics) = prepared.into_parts();
+        let mut next_rows = accumulated.rows;
+        next_rows.add(row_count)?;
+        let mut next_ledger = accumulated.ledger;
+        for (_, bytes) in &fragments {
+            next_ledger.reserve_fragment(bytes.len())?;
         }
+        let expected = self
+            .plan
+            .targets()
+            .iter()
+            .flat_map(|target| {
+                target
+                    .statistics()
+                    .requirements()
+                    .iter()
+                    .map(move |requirement| (target.ordinal(), requirement.artifact().clone()))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut observed = accumulated
+            .statistics
+            .iter()
+            .map(|artifact| (artifact.target(), artifact.draft().identity().clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        if accumulated
+            .statistics
+            .len()
+            .checked_add(statistics.len())
+            .is_none_or(|count| {
+                count > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_ARTIFACTS
+            })
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "write session statistics artifact count exceeded its limit",
+            ));
+        }
+        let mut next_body_bytes = accumulated.statistics_body_bytes;
+        let mut next_property_bytes = accumulated.statistics_property_bytes;
+        for artifact in &statistics {
+            let key = (artifact.target(), artifact.draft().identity().clone());
+            if !expected.contains(&key) || !observed.insert(key) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "write session accumulated an unknown or duplicate statistics artifact",
+                ));
+            }
+            next_body_bytes = next_body_bytes
+                .checked_add(artifact.draft().body().len())
+                .filter(|bytes| {
+                    *bytes <= novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES
+                })
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        "write session statistics body bytes exceeded their limit",
+                    )
+                })?;
+            let property_bytes =
+                artifact
+                    .draft()
+                    .properties()
+                    .iter()
+                    .try_fold(0usize, |total, (key, value)| {
+                        total
+                            .checked_add(key.len())
+                            .and_then(|sum| sum.checked_add(value.len()))
+                    });
+            next_property_bytes = property_bytes
+                .and_then(|bytes| next_property_bytes.checked_add(bytes))
+                .filter(|bytes| {
+                    *bytes <= novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES
+                })
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        "write session statistics property bytes exceeded their limit",
+                    )
+                })?;
+        }
+        accumulated.rows = next_rows;
+        accumulated.ledger = next_ledger;
+        accumulated.fragments.extend(fragments);
+        accumulated.statistics_body_bytes = next_body_bytes;
+        accumulated.statistics_property_bytes = next_property_bytes;
+        accumulated.statistics.extend(statistics);
         Ok(())
     }
 
@@ -307,6 +405,7 @@ impl ConnectorWriteSession {
         &self,
         context: ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        ensure_finish_context_active(&context)?;
         self.claim_terminal(TerminalDecision::Committed)?;
         let outcome = self.commit_accumulated(context);
         // Reconciliation is the one decision that may still follow a commit,
@@ -331,11 +430,12 @@ impl ConnectorWriteSession {
         &self,
         context: ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        let (row_count, fragments) = {
+        let (row_count, fragments, statistics) = {
             let mut accumulated = self.lock_accumulated()?;
             (
                 accumulated.rows.get(),
                 std::mem::take(&mut accumulated.fragments),
+                std::mem::take(&mut accumulated.statistics),
             )
         };
         let prepared = self.interpret_parts(row_count, fragments)?;
@@ -346,6 +446,7 @@ impl ConnectorWriteSession {
             .finish_write(ConnectorWriteFinishRequest {
                 commit: self.plan.commit_handle(),
                 prepared,
+                statistics,
                 context,
             })?;
         if matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. }) {
@@ -356,6 +457,7 @@ impl ConnectorWriteSession {
 
     /// The rows accumulated so far. Report them to a client only after the
     /// external commit is known to have succeeded.
+    #[cfg(test)]
     pub(crate) fn accumulated_row_count(&self) -> Result<u64, ConnectorError> {
         Ok(self.lock_accumulated()?.rows.get())
     }
@@ -398,45 +500,6 @@ impl ConnectorWriteSession {
         // error it drops below, so the session never leaves an orphaned hold.
         self.release_terminal_storage_resolver();
         outcome.map(|outcome| (outcome, terminal_context))
-    }
-
-    #[expect(
-        dead_code,
-        reason = "Retained beside finish_accumulated until every caller moves to the session."
-    )]
-    fn finish_single(
-        &self,
-        prepared: DecodedPreparedWriteSet,
-        context: ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        self.claim_terminal(TerminalDecision::Committed)?;
-        let outcome = self.commit_single(prepared, context);
-        if !self.awaits_reconciliation() {
-            self.release_terminal_storage_resolver();
-        }
-        outcome
-    }
-
-    fn commit_single(
-        &self,
-        prepared: DecodedPreparedWriteSet,
-        context: ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        let context = self.terminal_context(context)?;
-        let prepared = self.interpret(prepared)?;
-        self.finish_invocations.fetch_add(1, Ordering::SeqCst);
-        let outcome = self
-            .lease
-            .session()
-            .finish_write(ConnectorWriteFinishRequest {
-                commit: self.plan.commit_handle(),
-                prepared,
-                context,
-            })?;
-        if matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. }) {
-            self.record_terminal(TerminalDecision::CommitUnknown);
-        }
-        Ok(outcome)
     }
 
     /// Release a session that never reached a complete prepared write set.
@@ -558,7 +621,6 @@ impl ConnectorWriteSession {
                 *terminal = Some(decision);
                 Ok(())
             }
-            Some(existing) if existing == decision => Ok(()),
             Some(existing) => Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 format!(
@@ -584,6 +646,22 @@ impl ConnectorWriteSession {
             )
         })
     }
+}
+
+fn ensure_finish_context_active(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
+    if context.cancellation().is_cancelled() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Cancelled,
+            "connector write commit was cancelled before the terminal decision",
+        ));
+    }
+    if std::time::Instant::now() >= context.deadline() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::DeadlineExceeded,
+            "connector write commit deadline elapsed before the terminal decision",
+        ));
+    }
+    Ok(())
 }
 
 /// Open one distributed write's session on a write stack already pinned to the
@@ -701,13 +779,15 @@ pub(crate) mod tests {
     };
     use novarocks_spi::connector::write_stack::{
         ConnectorCommitFragment, ConnectorWriterHandle, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES,
-        ProviderWriteRuntime, WriteRuntimeAdapter,
+        ProviderWriteRuntime, WriteRuntimeAdapter, WriteStatisticsArtifact,
     };
     use novarocks_spi::connector::{
-        CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
         ConnectorProviderBindingKey, ConnectorProviderId,
         ConnectorWriteControl as LegacyWriteControl, CredentialLeaseId, ResolvedVendedS3Access,
-        StorageAccessDomainId, StorageAccessRequest, StorageCredentialScopePrefix,
+        StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsRequiredAggregation,
+        StatisticsScanColumn, StorageAccessDomainId, StorageAccessRequest,
+        StorageCredentialScopePrefix,
     };
 
     use super::*;
@@ -776,6 +856,7 @@ pub(crate) mod tests {
         pub(crate) finish: usize,
         pub(crate) abort: usize,
         pub(crate) reconcile: usize,
+        pub(crate) statistics: Vec<WriteStatisticsArtifact>,
         /// What the last terminal request could actually read object storage
         /// with. A real provider resolves this before it reloads table metadata
         /// or writes a manifest, so recording it here is recording whether the
@@ -787,6 +868,7 @@ pub(crate) mod tests {
         adapter: WriteRuntimeAdapter<FakeProvider>,
         binding_key: ConnectorProviderBindingKey,
         targets: usize,
+        statistics: bool,
         recorded: Arc<Mutex<Recorded>>,
         finish_outcome: Mutex<Option<ExternalMutationOutcome<ConnectorWriteReceipt>>>,
     }
@@ -807,24 +889,39 @@ pub(crate) mod tests {
                         u32::try_from(index).expect("bounded ordinal"),
                     )?;
                     let handle = self.adapter.wrap_writer_handle(FakeHandle(ordinal.get()));
-                    Ok(ConnectorWriteTargetPlan::new(
-                        ordinal,
-                        handle,
-                        novarocks_spi::connector::ConnectorWriteInputShape::Data {
-                            fields: vec![
-                                novarocks_spi::connector::ConnectorWriteFieldBinding::new(
-                                    novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(
-                                        [1; 32],
-                                    ),
-                                    arrow::datatypes::Field::new(
-                                        "v",
-                                        arrow::datatypes::DataType::Int64,
-                                        true,
-                                    ),
-                                ),
-                            ],
-                        },
-                    ))
+                    let input = novarocks_spi::connector::ConnectorWriteInputShape::Data {
+                        fields: vec![novarocks_spi::connector::ConnectorWriteFieldBinding::new(
+                            novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([1; 32]),
+                            arrow::datatypes::Field::new(
+                                "v",
+                                arrow::datatypes::DataType::Int64,
+                                true,
+                            ),
+                        )],
+                    };
+                    let target = ConnectorWriteTargetPlan::new(ordinal, handle, input.clone());
+                    if !self.statistics {
+                        return Ok(target);
+                    }
+                    let requirement = StatisticsRequiredAggregation::try_new(
+                        StatisticsScanColumn::try_new(
+                            0,
+                            "v",
+                            arrow::datatypes::DataType::Int64,
+                            true,
+                        )?,
+                        "$test_stat",
+                        StatisticsArtifactIdentity::try_new(
+                            vec![i32::try_from(index + 1).expect("bounded field id")],
+                            "test/blob",
+                        )?,
+                    )?;
+                    target.with_statistics_contract(
+                        novarocks_spi::connector::write_stack::WriteStatisticsContract::try_new(
+                            &input,
+                            vec![requirement],
+                        )?,
+                    )
                 })
                 .collect::<Result<Vec<_>, ConnectorError>>()?;
             ConnectorWriteSessionPlan::try_new(commit, targets)
@@ -837,6 +934,7 @@ pub(crate) mod tests {
             {
                 let mut recorded = self.recorded.lock().expect("recorded");
                 recorded.finish += 1;
+                recorded.statistics = request.statistics.clone();
                 recorded.terminal_storage = Some(probe_vended_storage(&request.context));
             }
             self.finish_outcome
@@ -967,6 +1065,7 @@ pub(crate) mod tests {
             adapter: adapter.clone(),
             binding_key,
             targets,
+            statistics: false,
             recorded: Arc::clone(&recorded),
             finish_outcome: Mutex::new(Some(outcome)),
         });
@@ -986,6 +1085,61 @@ pub(crate) mod tests {
                 .expect("begin write"),
         );
         Fixture { session, recorded }
+    }
+
+    fn fixture_with_statistics(targets: usize) -> Fixture {
+        let adapter = adapter();
+        let binding_key = ConnectorProviderBindingKey {
+            instance_id: catalog_handle().catalog_name().clone(),
+            incarnation: novarocks_spi::connector::ProviderBindingEpoch::new(),
+        };
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let session_control = Arc::new(FakeSession {
+            adapter: adapter.clone(),
+            binding_key,
+            targets,
+            statistics: true,
+            recorded: Arc::clone(&recorded),
+            finish_outcome: Mutex::new(Some(ExternalMutationOutcome::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                    "scripted",
+                ),
+            })),
+        });
+        let group = ConnectorControlWriteBinding::new(
+            Arc::new(UnusedLegacyControl),
+            session_control,
+            Arc::new(FakeEncoder { payload_bytes: 16 }),
+            Arc::new(FakeDecoder { adapter }),
+        );
+        let lease = ConnectorWriteStackLease::new(
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
+            group,
+            || {},
+        );
+        let session = Arc::new(
+            ConnectorWriteSession::begin(lease, catalog_properties(), begin_request())
+                .expect("begin write"),
+        );
+        Fixture { session, recorded }
+    }
+
+    fn statistics_artifact(
+        target: u32,
+        field_id: i32,
+        body: &'static [u8],
+    ) -> WriteStatisticsArtifact {
+        WriteStatisticsArtifact::new(
+            WriteTargetOrdinal::try_new(target).expect("target"),
+            StatisticsArtifactDraft::try_new(
+                vec![field_id],
+                "test/blob",
+                bytes::Bytes::from_static(body),
+                std::collections::BTreeMap::new(),
+            )
+            .expect("artifact"),
+        )
     }
 
     fn begin_request() -> ConnectorWriteBeginRequest {
@@ -1534,6 +1688,70 @@ pub(crate) mod tests {
         // One commit for the whole statement, not one per query.
         assert_eq!(fixture.session.finish_invocations(), 1);
         assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+    }
+
+    #[test]
+    fn statistics_artifacts_follow_the_prepared_set_into_the_single_commit() {
+        let fixture = fixture_with_statistics(2);
+        fixture
+            .session
+            .accumulate(DecodedPreparedWriteSet::for_test_with_statistics(
+                4,
+                Vec::new(),
+                vec![statistics_artifact(0, 1, b"zero")],
+            ))
+            .expect("first query statistics");
+        fixture
+            .session
+            .accumulate(DecodedPreparedWriteSet::for_test_with_statistics(
+                6,
+                Vec::new(),
+                vec![statistics_artifact(1, 2, b"one")],
+            ))
+            .expect("second query statistics");
+
+        let _ = fixture.session.finish_accumulated(request_context());
+        let recorded = fixture.recorded.lock().expect("recorded");
+        assert_eq!(recorded.finish, 1);
+        assert_eq!(recorded.statistics.len(), 2);
+        assert_eq!(recorded.statistics[0].target().get(), 0);
+        assert_eq!(recorded.statistics[0].draft().body().as_ref(), b"zero");
+        assert_eq!(recorded.statistics[1].target().get(), 1);
+        assert_eq!(recorded.statistics[1].draft().body().as_ref(), b"one");
+    }
+
+    #[test]
+    fn rejecting_an_unknown_statistics_artifact_is_transactional() {
+        let fixture = fixture_with_statistics(1);
+        let error = fixture
+            .session
+            .accumulate(DecodedPreparedWriteSet::for_test_with_statistics(
+                9,
+                Vec::new(),
+                vec![statistics_artifact(0, 99, b"foreign")],
+            ))
+            .expect_err("foreign artifact identity");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            fixture
+                .session
+                .accumulated_row_count()
+                .expect("unchanged row count"),
+            0
+        );
+
+        fixture
+            .session
+            .accumulate(DecodedPreparedWriteSet::for_test_with_statistics(
+                3,
+                Vec::new(),
+                vec![statistics_artifact(0, 1, b"valid")],
+            ))
+            .expect("valid set after rejection");
+        let _ = fixture.session.finish_accumulated(request_context());
+        let recorded = fixture.recorded.lock().expect("recorded");
+        assert_eq!(recorded.statistics.len(), 1);
+        assert_eq!(recorded.statistics[0].draft().body().as_ref(), b"valid");
     }
 
     #[test]

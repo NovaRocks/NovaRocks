@@ -212,9 +212,14 @@ fn evidence_to_base_statistics(
     };
     let metric_f64 = |observation: Option<&StatisticsMetricObservation>,
                       data_type: Option<&arrow::datatypes::DataType>| {
+        const MAX_CONSERVATIVE_EXACT_INTEGER: u128 = 1_u128 << 53;
         let value = match observation.map(StatisticsMetricObservation::value) {
-            Some(StatisticsMetricValue::U64(value)) => *value as f64,
-            Some(StatisticsMetricValue::I64(value)) => *value as f64,
+            Some(StatisticsMetricValue::U64(value)) => {
+                (u128::from(*value) <= MAX_CONSERVATIVE_EXACT_INTEGER).then_some(*value as f64)?
+            }
+            Some(StatisticsMetricValue::I64(value)) => (value.unsigned_abs() as u128
+                <= MAX_CONSERVATIVE_EXACT_INTEGER)
+                .then_some(*value as f64)?,
             Some(StatisticsMetricValue::F64(value)) => *value,
             Some(StatisticsMetricValue::Bytes(value))
                 if matches!(data_type, Some(arrow::datatypes::DataType::FixedSizeBinary(width)) if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
@@ -222,7 +227,8 @@ fn evidence_to_base_statistics(
                         == usize::try_from(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
                             .ok()? =>
             {
-                novarocks_types::largeint::i128_from_be_bytes(value).ok()? as f64
+                let value = novarocks_types::largeint::i128_from_be_bytes(value).ok()?;
+                (value.unsigned_abs() <= MAX_CONSERVATIVE_EXACT_INTEGER).then_some(value as f64)?
             }
             _ => return None,
         };
@@ -437,12 +443,28 @@ pub fn build_frozen_connector_write_dataflow_plan(
     source: crate::planning::query_execution::FrozenConnectorScanPlan,
     sink: DmlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
-    crate::planner::pipeline::build_sql_write_dataflow_plan_with_settings(
-        source.into_physical(),
+    let physical = source.into_physical();
+    let target_schema =
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
+        &[
+            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
+                target: write_target_ordinal,
+                input_schema: target_schema.as_ref(),
+                requirements: statistics,
+            },
+        ],
+        functions,
+    )?;
+    crate::planner::pipeline::build_sql_write_dataflow_plan_with_auxiliary_settings(
+        physical,
         sink.0,
         write_target_ordinal,
+        &auxiliary,
         settings,
     )
 }
@@ -455,6 +477,7 @@ pub fn compile_connector_write_dataflow_plan(
     request: crate::compiler::SqlOptimizeRequest<'_>,
     sink: DmlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(request)
@@ -462,10 +485,23 @@ pub fn compile_connector_write_dataflow_plan(
         .into_optimized_output()
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
-    crate::planner::pipeline::build_sql_write_dataflow_plan_with_settings(
+    let target_schema =
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
+        &[
+            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
+                target: write_target_ordinal,
+                input_schema: target_schema.as_ref(),
+                requirements: statistics,
+            },
+        ],
+        compiled.function_catalog.as_ref(),
+    )?;
+    crate::planner::pipeline::build_sql_write_dataflow_plan_with_auxiliary_settings(
         physical,
         sink.0,
         write_target_ordinal,
+        &auxiliary,
         settings,
     )
 }
@@ -488,6 +524,7 @@ pub fn compile_query_distributed_plan(
 #[derive(Clone, Debug)]
 pub struct DmlCtasSourcePlan {
     optimized: crate::optimizer::OptimizedOperatorNode,
+    function_catalog: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
 }
 
 /// One source output field exposed to CTAS target admission.
@@ -541,6 +578,7 @@ pub fn compile_ctas_source(
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
     Ok(DmlCtasSourcePlan {
         optimized: compiled.optimized_tree,
+        function_catalog: compiled.function_catalog,
     })
 }
 
@@ -550,10 +588,21 @@ pub fn build_ctas_connector_write_dataflow_plan(
     source: &DmlCtasSourcePlan,
     target_schema: arrow::datatypes::SchemaRef,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
-    crate::planner::pipeline::build_connector_write_dataflow_plan(
+    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
+        &[
+            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
+                target: write_target_ordinal,
+                input_schema: target_schema.as_ref(),
+                requirements: statistics,
+            },
+        ],
+        source.function_catalog.as_ref(),
+    )?;
+    crate::planner::pipeline::build_connector_write_dataflow_plan_with_auxiliary_settings(
         physical,
         crate::planner::distributed::write::sink::ConnectorWritePlanInput {
             target_schema,
@@ -561,6 +610,7 @@ pub fn build_ctas_connector_write_dataflow_plan(
             root_output_exprs: None,
         },
         write_target_ordinal,
+        &auxiliary,
         settings,
     )
 }
@@ -586,6 +636,15 @@ pub struct DmlChangeStreamRoute {
     pub input_fields: Vec<DmlChangeStreamRouteField>,
     pub partition_input_tokens: Vec<novarocks_spi::connector::ConnectorWriteFieldToken>,
     pub sink: DmlWritePlanInput,
+}
+
+/// Provider-selected ordinary aggregate requirements for exactly one routed
+/// change-stream write target. The target key is explicit so SQL can prove
+/// that the requirements cover the same closed target set as the router.
+#[derive(Clone, Debug)]
+pub struct DmlChangeStreamStatisticsTarget {
+    pub write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    pub requirements: Vec<novarocks_spi::connector::StatisticsRequiredAggregation>,
 }
 
 #[derive(Clone, Debug)]
@@ -626,6 +685,7 @@ pub struct DmlChangeStreamCompileRequest<'a> {
     pub optimize_request: crate::compiler::SqlOptimizeRequest<'a>,
     pub kind: DmlChangeStreamKind,
     pub routes: Vec<DmlChangeStreamRoute>,
+    pub statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     pub pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     pub shape: DmlWritePlanShape,
 }
@@ -737,8 +797,10 @@ pub fn compile_dml_change_stream(
     seal_change_stream_producer(
         producer,
         request.routes,
+        request.statistics_targets,
         request.pre_expand_keyed_assert,
         request.shape,
+        compiled.function_catalog.as_ref(),
     )
 }
 
@@ -749,15 +811,19 @@ pub fn compile_dml_change_stream(
 pub(crate) fn seal_change_stream_producer(
     producer: crate::optimizer::OptimizedOperatorNode,
     routes: Vec<DmlChangeStreamRoute>,
+    statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     shape: DmlWritePlanShape,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<DmlChangeStreamPlan, String> {
     seal_change_stream_producer_with_effect_column(
         producer,
         routes,
+        statistics_targets,
         crate::common::ROW_MUTATION_EFFECT_COLUMN,
         pre_expand_keyed_assert,
         shape,
+        functions,
     )
 }
 
@@ -767,10 +833,13 @@ pub(crate) fn seal_change_stream_producer(
 pub(crate) fn seal_change_stream_producer_with_effect_column(
     producer: crate::optimizer::OptimizedOperatorNode,
     routes: Vec<DmlChangeStreamRoute>,
+    statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     effect_output_name: &str,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     shape: DmlWritePlanShape,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<DmlChangeStreamPlan, String> {
+    let auxiliary = plan_change_stream_writer_statistics(&routes, statistics_targets, functions)?;
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_name)?;
     let keyed_assert = pre_expand_keyed_assert.map(|assertion| {
         crate::planner::physical::PreExpandKeyedAssertSpec {
@@ -783,10 +852,11 @@ pub(crate) fn seal_change_stream_producer_with_effect_column(
     let settings = dml_change_stream_optimizer_settings();
     let planned = match shape {
         DmlWritePlanShape::Dataflow => {
-            crate::planner::pipeline::build_sql_change_stream_dataflow_plan_with_settings(
+            crate::planner::pipeline::build_sql_change_stream_dataflow_plan_with_auxiliary_settings(
                 physical,
                 dag,
                 keyed_assert,
+                &auxiliary,
                 &settings,
             )?
         }
@@ -806,6 +876,83 @@ pub(crate) fn seal_change_stream_producer_with_effect_column(
         distributed_plan: planned.distributed_plan,
         writer_routes,
     })
+}
+
+fn plan_change_stream_writer_statistics(
+    routes: &[DmlChangeStreamRoute],
+    statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
+) -> Result<crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let route_targets = routes
+        .iter()
+        .map(|route| route.write_target_ordinal)
+        .collect::<BTreeSet<_>>();
+    if route_targets.len() != routes.len() {
+        return Err("change-stream statistics routes contain a duplicate target ordinal".into());
+    }
+
+    let mut requirements_by_target = BTreeMap::new();
+    for target in statistics_targets {
+        if requirements_by_target
+            .insert(target.write_target_ordinal, target.requirements)
+            .is_some()
+        {
+            return Err(format!(
+                "change-stream statistics repeat write target {}",
+                target.write_target_ordinal.get()
+            ));
+        }
+    }
+    let statistics_target_set = requirements_by_target
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if statistics_target_set != route_targets {
+        let missing = route_targets
+            .difference(&statistics_target_set)
+            .map(|target| target.get())
+            .collect::<Vec<_>>();
+        let extraneous = statistics_target_set
+            .difference(&route_targets)
+            .map(|target| target.get())
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "change-stream statistics target membership differs from routes; missing={missing:?}, extraneous={extraneous:?}"
+        ));
+    }
+
+    let target_schemas = routes
+        .iter()
+        .map(|route| {
+            crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(
+                &route.sink.0,
+            )
+        })
+        .collect::<Vec<_>>();
+    let inputs = routes
+        .iter()
+        .zip(target_schemas.iter())
+        .map(|(route, schema)| {
+            let requirements = requirements_by_target
+                .get(&route.write_target_ordinal)
+                .ok_or_else(|| {
+                    format!(
+                        "change-stream statistics lost write target {} after membership validation",
+                        route.write_target_ordinal.get()
+                    )
+                })?;
+            Ok(
+                crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
+                    target: route.write_target_ordinal,
+                    input_schema: schema.as_ref(),
+                    requirements,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    crate::planner::distributed::write::auxiliary::plan_writer_statistics(&inputs, functions)
 }
 
 fn bind_route_layout(
@@ -1317,7 +1464,7 @@ fn max_physical_column_id(node: &crate::optimizer::OptimizedOperatorNode) -> u32
         .unwrap_or(0)
 }
 
-/// Immutable scan facts used by Core's provider-neutral statistics collector.
+/// Immutable scan facts used by Frontend's ordinary ANALYZE data plane.
 ///
 /// The relation is named, not synthetic: a collection measures one real table
 /// at one exact version, and `version_ordinal` is that version. The binding was
@@ -1330,17 +1477,34 @@ pub struct StatisticsConnectorScan {
     pub namespace: String,
     pub table: String,
     pub version_ordinal: i64,
-    pub columns: Vec<novarocks_types::schema::ColumnDef>,
+    pub columns: Vec<novarocks_spi::connector::StatisticsScanColumn>,
 }
 
-/// Build the SQL-owned physical and distributed statistics program from a
-/// pinned connector scan.  Core retains the encoder, preparation, provider
-/// resolver, and result finalization.
+/// Build the SQL-owned physical and distributed ANALYZE program from a pinned
+/// connector scan and provider-selected ordinary aggregate calls.
+///
+/// This deliberately constructs the complete physical shape directly. An
+/// ANALYZE attempt is not user SQL, so there is no logical aggregate for the
+/// optimizer to discover or provider-specific sink for the distributed
+/// planner to install:
+///
+/// `Scan -> Local Aggregate -> Gather -> Global Aggregate -> Unpivot -> Result`
+///
+/// The long-form Root relation is exactly
+/// `(input_fields List<Int32>, blob_type Utf8, body Binary,
+/// properties Map<Utf8, Utf8>)`. The generic Unpivot constants carry the
+/// frozen identity without giving Execution any statistics semantics.
 pub fn build_statistics_connector_plan(
     scan: StatisticsConnectorScan,
-    metrics: novarocks_spi::connector::StatisticsMetricRequest,
+    required: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
+    if required.is_empty() {
+        return Err(
+            "empty ANALYZE requirements must bypass distributed planning and execution".to_string(),
+        );
+    }
     let mut factory = crate::column_id::ColumnRefFactory::new();
     let scan_columns = scan
         .columns
@@ -1348,26 +1512,45 @@ pub fn build_statistics_connector_plan(
         .map(|column| {
             let column_id = factory.create(
                 None,
-                column.name.clone(),
-                column.data_type.clone(),
-                column.nullable,
+                column.name().to_string(),
+                column.data_type().clone(),
+                column.nullable(),
             );
             crate::analysis::OutputColumn {
                 column_id,
-                name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
+                name: column.name().to_string(),
+                data_type: column.data_type().clone(),
+                nullable: column.nullable(),
                 is_internal: false,
             }
         })
         .collect::<Vec<_>>();
-    let physical = crate::planner::physical::PhysicalPlanNode {
+    let scan_index_by_ordinal = scan
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (column.ordinal(), index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if scan_index_by_ordinal.len() != scan.columns.len() {
+        return Err("ANALYZE scan contains duplicate provider column ordinals".to_string());
+    }
+    let scan = crate::planner::physical::PhysicalPlanNode {
         kind: crate::planner::physical::PhysicalPlanKind::Scan(
             crate::planner::payload::PlanScanNode {
                 database: scan.namespace.clone(),
                 table: crate::planner::table::TableDef {
                     name: scan.table.clone(),
-                    columns: scan.columns,
+                    columns: scan
+                        .columns
+                        .iter()
+                        .map(|column| novarocks_types::schema::ColumnDef {
+                            name: column.name().to_string(),
+                            data_type: column.data_type().clone(),
+                            nullable: column.nullable(),
+                            write_default: None,
+                            logical_type: None,
+                        })
+                        .collect(),
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     source: crate::planner::table::ScanSource::Sql(
                         crate::planner::table::SqlScanSource::new(
@@ -1408,16 +1591,255 @@ pub fn build_statistics_connector_plan(
         },
         probe_runtime_filters: Vec::new(),
     };
-    crate::planner::pipeline::build_statistics_distributed_plan_with_settings(
-        physical, metrics, settings,
-    )
+    let mut calls = Vec::with_capacity(required.len());
+    let mut final_columns = Vec::with_capacity(required.len());
+    let mut partial_columns = Vec::with_capacity(required.len());
+    for (index, requirement) in required.iter().enumerate() {
+        let input = scan
+            .output_columns
+            .get(
+                *scan_index_by_ordinal
+                    .get(&requirement.input().ordinal())
+                    .ok_or_else(|| {
+                        format!(
+                            "ANALYZE aggregate input ordinal {} is absent from its pinned scan",
+                            requirement.input().ordinal()
+                        )
+                    })?,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "ANALYZE aggregate input `{}` is absent from its pinned scan",
+                    requirement.input().name()
+                )
+            })?;
+        if input.data_type != *requirement.input().data_type()
+            || input.nullable != requirement.input().nullable()
+        {
+            return Err(format!(
+                "ANALYZE aggregate input `{}` does not match its pinned scan type",
+                requirement.input().name()
+            ));
+        }
+        let resolved = functions
+            .resolve_aggregate_trusted(
+                requirement.function_name(),
+                std::slice::from_ref(requirement.input().data_type()),
+            )
+            .map_err(|error| {
+                format!(
+                    "resolve trusted ANALYZE aggregate `{}` for {:?}: {error}",
+                    requirement.function_name(),
+                    requirement.input().data_type()
+                )
+            })?;
+        let output_id = factory.create(
+            None,
+            format!("analyze_body_{index}"),
+            resolved.output_type.clone(),
+            true,
+        );
+        let output_name = format!("analyze_body_{index}");
+        final_columns.push(crate::analysis::OutputColumn {
+            column_id: output_id,
+            name: output_name.clone(),
+            data_type: resolved.output_type.clone(),
+            nullable: true,
+            is_internal: true,
+        });
+        partial_columns.push(crate::analysis::OutputColumn {
+            column_id: output_id,
+            name: output_name,
+            data_type: resolved.intermediate_type.clone(),
+            nullable: true,
+            is_internal: true,
+        });
+        calls.push(crate::planner::payload::AggregateCall {
+            name: requirement.function_name().to_string(),
+            args: vec![crate::analysis::TypedExpr {
+                kind: crate::analysis::ExprKind::ColumnRef {
+                    column_id: input.column_id,
+                    qualifier: None,
+                    column: input.name.clone(),
+                },
+                data_type: input.data_type.clone(),
+                nullable: input.nullable,
+            }],
+            distinct: false,
+            result_type: resolved.output_type.clone(),
+            order_by: Vec::new(),
+            output_column_id: output_id,
+            resolved,
+        });
+    }
+
+    let stats = crate::planner::physical::PhysicalPlanStats {
+        output_row_count: 1.0,
+        row_count_confidence: crate::planner::physical::PlannerConfidence::Exact,
+        column_statistics: std::collections::HashMap::new(),
+        cost_estimate: None,
+        broadcast_decision: None,
+    };
+    let local = crate::planner::physical::PhysicalPlanNode {
+        kind: crate::planner::physical::PhysicalPlanKind::HashAggregate(Box::new(
+            crate::planner::physical::PhysicalHashAggregateNode {
+                mode: crate::planner::physical::AggMode::Local,
+                group_by: Vec::new(),
+                aggregates: calls.clone(),
+                is_merge: vec![false; calls.len()],
+                output_layout: crate::planner::physical::AggregateOutputLayout::new(
+                    Vec::new(),
+                    partial_columns.clone(),
+                ),
+                output_columns: partial_columns.clone(),
+                topn_runtime_filter_builds: Vec::new(),
+            },
+        )),
+        children: vec![scan],
+        output_columns: partial_columns.clone(),
+        stats: stats.clone(),
+        probe_runtime_filters: Vec::new(),
+    };
+    let gather = crate::planner::physical::PhysicalPlanNode {
+        kind: crate::planner::physical::PhysicalPlanKind::Redistribute(
+            crate::planner::physical::RedistributeNode {
+                mode: crate::planner::physical::RedistributeMode::Gather,
+                partition_exprs: Vec::new(),
+                output_columns: partial_columns.clone(),
+            },
+        ),
+        children: vec![local],
+        output_columns: partial_columns,
+        stats: stats.clone(),
+        probe_runtime_filters: Vec::new(),
+    };
+    let global = crate::planner::physical::PhysicalPlanNode {
+        kind: crate::planner::physical::PhysicalPlanKind::HashAggregate(Box::new(
+            crate::planner::physical::PhysicalHashAggregateNode {
+                mode: crate::planner::physical::AggMode::Global,
+                group_by: Vec::new(),
+                aggregates: calls,
+                is_merge: vec![true; required.len()],
+                output_layout: crate::planner::physical::AggregateOutputLayout::new(
+                    Vec::new(),
+                    final_columns.clone(),
+                ),
+                output_columns: final_columns.clone(),
+                topn_runtime_filter_builds: Vec::new(),
+            },
+        )),
+        children: vec![gather],
+        output_columns: final_columns.clone(),
+        stats: stats.clone(),
+        probe_runtime_filters: Vec::new(),
+    };
+
+    let input_fields_type = crate::analysis::UnpivotConstant::Int32List(Vec::new()).data_type();
+    let properties_type = crate::analysis::UnpivotConstant::Utf8Map(Vec::new()).data_type();
+    let input_fields = factory.create(
+        None,
+        "input_fields".to_string(),
+        input_fields_type.clone(),
+        false,
+    );
+    let blob_type = factory.create(
+        None,
+        "blob_type".to_string(),
+        arrow::datatypes::DataType::Utf8,
+        false,
+    );
+    let body = factory.create(
+        None,
+        "body".to_string(),
+        arrow::datatypes::DataType::Binary,
+        true,
+    );
+    let properties = factory.create(
+        None,
+        "properties".to_string(),
+        properties_type.clone(),
+        false,
+    );
+    let root_columns = vec![
+        crate::analysis::OutputColumn {
+            column_id: input_fields,
+            name: "input_fields".to_string(),
+            data_type: input_fields_type,
+            nullable: false,
+            is_internal: true,
+        },
+        crate::analysis::OutputColumn {
+            column_id: blob_type,
+            name: "blob_type".to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+            is_internal: true,
+        },
+        crate::analysis::OutputColumn {
+            column_id: body,
+            name: "body".to_string(),
+            data_type: arrow::datatypes::DataType::Binary,
+            nullable: true,
+            is_internal: true,
+        },
+        crate::analysis::OutputColumn {
+            column_id: properties,
+            name: "properties".to_string(),
+            data_type: properties_type,
+            nullable: false,
+            is_internal: true,
+        },
+    ];
+    let value_mappings = required
+        .iter()
+        .zip(final_columns.iter())
+        .map(
+            |(requirement, aggregate)| crate::planner::payload::PlanUnpivotValueMapping {
+                input_value_column_id: aggregate.column_id,
+                constants: vec![
+                    crate::analysis::UnpivotConstant::Int32List(
+                        requirement.artifact().input_fields().to_vec(),
+                    ),
+                    crate::analysis::UnpivotConstant::Scalar(crate::analysis::TypedExpr {
+                        kind: crate::analysis::ExprKind::Literal(
+                            crate::analysis::LiteralValue::String(
+                                requirement.artifact().blob_type().to_string(),
+                            ),
+                        ),
+                        data_type: arrow::datatypes::DataType::Utf8,
+                        nullable: false,
+                    }),
+                    crate::analysis::UnpivotConstant::Utf8Map(Vec::new()),
+                ],
+            },
+        )
+        .collect::<Vec<_>>();
+    let unpivot = crate::planner::payload::PlanUnpivotNode::try_new(
+        &final_columns,
+        Vec::new(),
+        body,
+        vec![input_fields, blob_type, properties],
+        value_mappings,
+        root_columns.clone(),
+        4096,
+        novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
+    )?;
+    let physical = crate::planner::physical::PhysicalPlanNode {
+        kind: crate::planner::physical::PhysicalPlanKind::Unpivot(unpivot),
+        children: vec![global],
+        output_columns: root_columns,
+        stats,
+        probe_runtime_filters: Vec::new(),
+    };
+    crate::planner::pipeline::build_distributed_plan_with_settings(physical, settings)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DmlStatisticsSnapshot, dml_change_stream_optimizer_settings, evidence_to_base_statistics,
-        optimizer_settings_stable_digest_material,
+        DmlChangeStreamRoute, DmlChangeStreamStatisticsTarget, DmlStatisticsSnapshot,
+        DmlWritePlanInput, dml_change_stream_optimizer_settings, evidence_to_base_statistics,
+        optimizer_settings_stable_digest_material, plan_change_stream_writer_statistics,
     };
     use crate::compiler::SessionOptimizerSettings;
     use crate::optimizer::statistics::Confidence;
@@ -1428,6 +1850,140 @@ mod tests {
         StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
         StatisticsNumericNature, StatisticsRowCoverage,
     };
+
+    #[test]
+    fn analyze_statistics_uses_ordinary_two_phase_aggregate_unpivot_and_result_sink() {
+        use crate::planner::distributed::{DistributedNode, DistributedNodeKind};
+        use crate::planner::physical::AggMode;
+        use novarocks_functions::{
+            AggregateOverloadMetadata, EngineFunctionCatalogBuilder, FunctionDefinition,
+            FunctionVisibility, FunctionVolatility,
+        };
+        use novarocks_spi::connector::{
+            StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
+        };
+
+        let definition = FunctionDefinition::try_new_exact_aggregate(
+            "$test_blob_aggregate",
+            FunctionVisibility::Hidden,
+            FunctionVolatility::Immutable,
+            [AggregateOverloadMetadata::try_new(
+                "test/blob-aggregate/i64/v1",
+                [arrow::datatypes::DataType::Int64],
+                arrow::datatypes::DataType::Binary,
+                arrow::datatypes::DataType::Binary,
+                "test/blob-state/v1",
+            )
+            .expect("aggregate overload")],
+        )
+        .expect("aggregate definition");
+        let mut functions = EngineFunctionCatalogBuilder::new();
+        functions.register(definition).expect("register aggregate");
+        let functions = functions.seal().expect("function catalog");
+        let requirement = StatisticsRequiredAggregation::try_new(
+            StatisticsScanColumn::try_new(0, "id", arrow::datatypes::DataType::Int64, true)
+                .expect("scan column"),
+            "$test_blob_aggregate",
+            StatisticsArtifactIdentity::try_new(vec![7], "test-blob-v1")
+                .expect("artifact identity"),
+        )
+        .expect("requirement");
+
+        let plan = super::build_statistics_connector_plan(
+            super::StatisticsConnectorScan {
+                binding: crate::binding::SqlTableBindingId::new_for_test(1),
+                catalog: "iceberg".into(),
+                namespace: "db".into(),
+                table: "t".into(),
+                version_ordinal: 42,
+                columns: vec![
+                    StatisticsScanColumn::try_new(0, "id", arrow::datatypes::DataType::Int64, true)
+                        .expect("scan column"),
+                ],
+            },
+            &[requirement],
+            &functions,
+            &SessionOptimizerSettings::default(),
+        )
+        .expect("ANALYZE plan");
+
+        assert_eq!(plan.fragments().len(), 2);
+        assert!(matches!(
+            plan.fragments()
+                .iter()
+                .find(|fragment| fragment.fragment_id == plan.root_fragment_id())
+                .expect("Root fragment")
+                .sink,
+            crate::planner::distributed::DataSink::Result
+        ));
+        fn visit(
+            node: &DistributedNode,
+            scan: &mut usize,
+            local: &mut usize,
+            exchange: &mut usize,
+            global: &mut usize,
+            unpivot: &mut usize,
+        ) {
+            match &node.payload {
+                DistributedNodeKind::Scan(_) => *scan += 1,
+                DistributedNodeKind::HashAggregate(aggregate) => match aggregate.mode {
+                    AggMode::Local => *local += 1,
+                    AggMode::Global => *global += 1,
+                    _ => {}
+                },
+                DistributedNodeKind::Exchange(_) => *exchange += 1,
+                DistributedNodeKind::Unpivot(node) => {
+                    *unpivot += 1;
+                    assert_eq!(
+                        node.max_output_bytes,
+                        novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
+                    );
+                    assert_eq!(
+                        node.output_columns
+                            .iter()
+                            .map(|column| {
+                                (
+                                    column.name.as_str(),
+                                    column.data_type.clone(),
+                                    column.nullable,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                        vec![
+                            (
+                                "input_fields",
+                                crate::analysis::UnpivotConstant::Int32List(Vec::new()).data_type(),
+                                false,
+                            ),
+                            ("blob_type", arrow::datatypes::DataType::Utf8, false),
+                            ("body", arrow::datatypes::DataType::Binary, true),
+                            (
+                                "properties",
+                                crate::analysis::UnpivotConstant::Utf8Map(Vec::new()).data_type(),
+                                false,
+                            ),
+                        ]
+                    );
+                }
+                _ => {}
+            }
+            for child in &node.children {
+                visit(child, scan, local, exchange, global, unpivot);
+            }
+        }
+        let (mut scan, mut local, mut exchange, mut global, mut unpivot) = (0, 0, 0, 0, 0);
+        for fragment in plan.fragments() {
+            visit(
+                &fragment.root,
+                &mut scan,
+                &mut local,
+                &mut exchange,
+                &mut global,
+                &mut unpivot,
+            );
+        }
+        assert_eq!((scan, local, exchange, global, unpivot), (1, 1, 1, 1, 1));
+    }
 
     fn version(token: &'static [u8]) -> StatisticsDataVersion {
         StatisticsDataVersion::try_new(bytes::Bytes::from_static(token)).expect("data version")
@@ -1639,6 +2195,42 @@ mod tests {
     }
 
     #[test]
+    fn integer_bounds_are_not_silently_rounded_at_the_optimizer_boundary() {
+        let queried = version(b"data-v1");
+        let unsafe_integer = (1_i64 << 53) + 1;
+        let evidence = StatisticsEvidence::try_new(
+            queried.clone(),
+            StatisticsEvidenceRevision::try_new(bytes::Bytes::from_static(b"rev-1"))
+                .expect("revision"),
+            StatisticsRowCoverage::AllVisibleRows,
+            std::collections::BTreeMap::from([(
+                StatisticsMetric::Minimum {
+                    column: std::sync::Arc::from("k"),
+                },
+                observed(
+                    StatisticsMetricValue::I64(unsafe_integer),
+                    queried,
+                    StatisticsNumericNature::Exact,
+                    StatisticsBasisRelation::Identical,
+                ),
+            )]),
+        )
+        .expect("evidence");
+
+        let statistics = evidence_to_base_statistics(&evidence, &[column("k")]);
+        assert_eq!(
+            statistics
+                .columns
+                .get("k")
+                .expect("column statistics")
+                .min_value
+                .known_value(),
+            None,
+            "an exact integer that f64 cannot represent must remain missing"
+        );
+    }
+
+    #[test]
     fn optimizer_settings_digest_material_is_stable_across_rule_order_and_duplicates() {
         let unordered = SessionOptimizerSettings {
             disabled_rules: vec![
@@ -1669,6 +2261,191 @@ mod tests {
         assert_eq!(
             dml_change_stream_optimizer_settings().enable_global_runtime_filter,
             Some(false)
+        );
+    }
+
+    fn statistics_route(target: u32) -> DmlChangeStreamRoute {
+        DmlChangeStreamRoute {
+            route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([
+                u8::try_from(target + 1).expect("small target");
+                32
+            ]),
+            write_target_ordinal:
+                novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(target)
+                    .expect("bounded target"),
+            accepted_effects: vec![
+                novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
+            ],
+            input_fields: Vec::new(),
+            partition_input_tokens: Vec::new(),
+            sink: DmlWritePlanInput(
+                crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
+                    crate::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                ),
+            ),
+        }
+    }
+
+    fn empty_statistics_target(target: u32) -> DmlChangeStreamStatisticsTarget {
+        DmlChangeStreamStatisticsTarget {
+            write_target_ordinal:
+                novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(target)
+                    .expect("bounded target"),
+            requirements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn change_stream_statistics_requires_exact_target_membership() {
+        let functions = crate::functions::builtin_sql_function_catalog();
+
+        let missing = plan_change_stream_writer_statistics(
+            &[statistics_route(0), statistics_route(1)],
+            vec![empty_statistics_target(0)],
+            functions,
+        )
+        .expect_err("missing target must fail");
+        assert!(
+            missing.contains("missing=[1], extraneous=[]"),
+            "unexpected error: {missing}"
+        );
+
+        let duplicate = plan_change_stream_writer_statistics(
+            &[statistics_route(0)],
+            vec![empty_statistics_target(0), empty_statistics_target(0)],
+            functions,
+        )
+        .expect_err("duplicate target must fail");
+        assert!(
+            duplicate.contains("repeat write target 0"),
+            "unexpected error: {duplicate}"
+        );
+
+        let extraneous = plan_change_stream_writer_statistics(
+            &[statistics_route(0)],
+            vec![empty_statistics_target(0), empty_statistics_target(1)],
+            functions,
+        )
+        .expect_err("extraneous target must fail");
+        assert!(
+            extraneous.contains("missing=[], extraneous=[1]"),
+            "unexpected error: {extraneous}"
+        );
+    }
+
+    #[test]
+    fn change_stream_statistics_accepts_explicit_empty_requirements_for_every_route() {
+        let auxiliary = plan_change_stream_writer_statistics(
+            &[statistics_route(0), statistics_route(1)],
+            vec![empty_statistics_target(0), empty_statistics_target(1)],
+            crate::functions::builtin_sql_function_catalog(),
+        )
+        .expect("exact empty requirements are a valid ordinary mutation plan");
+
+        assert!(auxiliary.schema().auxiliary_channels().is_empty());
+        assert!(
+            auxiliary
+                .partial_for(
+                    novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0)
+                        .expect("bounded target")
+                )
+                .expect("known target")
+                .calls()
+                .is_empty()
+        );
+        assert!(auxiliary.final_plan().calls().is_empty());
+        assert!(auxiliary.final_plan().unpivot().is_none());
+    }
+
+    #[test]
+    fn change_stream_statistics_production_helper_plans_nonempty_requirements() {
+        use novarocks_functions::{
+            AggregateOverloadMetadata, EngineFunctionCatalogBuilder, FunctionDefinition,
+            FunctionVisibility, FunctionVolatility,
+        };
+        use novarocks_spi::connector::{
+            StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
+        };
+
+        let definition = FunctionDefinition::try_new_exact_aggregate(
+            "$test_change_stream_blob",
+            FunctionVisibility::Hidden,
+            FunctionVolatility::Immutable,
+            [AggregateOverloadMetadata::try_new(
+                "test/change-stream-blob/i64/v1",
+                [arrow::datatypes::DataType::Int64],
+                arrow::datatypes::DataType::Binary,
+                arrow::datatypes::DataType::Binary,
+                "test/change-stream-blob-state/v1",
+            )
+            .expect("aggregate overload")],
+        )
+        .expect("aggregate definition");
+        let mut functions = EngineFunctionCatalogBuilder::new();
+        functions.register(definition).expect("register aggregate");
+        let functions = functions.seal().expect("function catalog");
+        let requirement = |target: u32| {
+            StatisticsRequiredAggregation::try_new(
+                StatisticsScanColumn::try_new(
+                    0,
+                    "order_id",
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                )
+                .expect("scan column"),
+                "$test_change_stream_blob",
+                StatisticsArtifactIdentity::try_new(
+                    vec![i32::try_from(target + 1).expect("field id")],
+                    "test-change-stream-blob-v1",
+                )
+                .expect("artifact identity"),
+            )
+            .expect("requirement")
+        };
+
+        let auxiliary = plan_change_stream_writer_statistics(
+            &[statistics_route(0), statistics_route(1)],
+            vec![
+                DmlChangeStreamStatisticsTarget {
+                    write_target_ordinal:
+                        novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0)
+                            .expect("target"),
+                    requirements: vec![requirement(0)],
+                },
+                DmlChangeStreamStatisticsTarget {
+                    write_target_ordinal:
+                        novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(1)
+                            .expect("target"),
+                    requirements: vec![requirement(1)],
+                },
+            ],
+            &functions,
+        )
+        .expect("production helper plans routed statistics");
+
+        for target in [0, 1] {
+            assert_eq!(
+                auxiliary
+                    .partial_for(
+                        novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(target)
+                            .expect("target")
+                    )
+                    .expect("known target")
+                    .calls()
+                    .len(),
+                1
+            );
+        }
+        assert_eq!(auxiliary.schema().auxiliary_channels().len(), 1);
+        assert_eq!(auxiliary.final_plan().calls().len(), 1);
+        assert_eq!(
+            auxiliary
+                .final_plan()
+                .unpivot()
+                .expect("artifact unpivot")
+                .mappings()
+                .len(),
+            2
         );
     }
 }

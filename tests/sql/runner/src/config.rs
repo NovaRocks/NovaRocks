@@ -567,6 +567,11 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn iceberg_dml_default_timeout_covers_expensive_boundary_cases() {
+        assert_eq!(suite_default_query_timeout("iceberg-dml"), 120);
+    }
+
+    #[test]
     fn suite_discovery_is_scoped_to_the_selected_physical_lane() {
         let temp = tempdir().expect("temporary repository root");
         let correctness_sql = temp.path().join("tests/sql/correctness/filter/sql");
@@ -671,7 +676,10 @@ oss_endpoint = "http://127.0.0.1:9000"
             Some("sqlb_ssb_stable"),
         );
 
-        assert_eq!(variables.get("run_id"), Some(&"sqlb_ssb_stable".to_string()));
+        assert_eq!(
+            variables.get("run_id"),
+            Some(&"sqlb_ssb_stable".to_string())
+        );
         assert_eq!(
             variables.get("suite_uuid0"),
             Some(&"sqlb_ssb_stable_0".to_string())

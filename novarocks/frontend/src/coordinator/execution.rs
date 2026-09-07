@@ -30,13 +30,12 @@ use crate::common::backend_topology::{
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
 };
 use crate::native::fragment_transport::{
-    ExpectedOutputSchemaView, FetchOutcome, FinalTaskInfoRead, FragmentDispatcher,
-    NativeTaskResultTransport, RootResultOutcome, TaskReadGrace, TaskResultTransport,
+    ExpectedOutputSchemaView, FinalTaskInfoRead, FragmentDispatcher, NativeTaskResultTransport,
+    RootResultOutcome, TaskReadGrace, TaskResultTransport,
 };
 use crate::query_execution::artifact::{
-    PreparedDistributedQuery, RunningNativeExecutionParts,
-    RuntimeFilterDeploymentReadyDistributedQuery, ValidatedFragmentSchedule,
-    ValidatedNativeSubmission,
+    PreparedDistributedQuery, RuntimeFilterDeploymentReadyDistributedQuery,
+    ValidatedFragmentSchedule, ValidatedNativeSubmission,
 };
 use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptReservation};
 use crate::query_execution::contract::{
@@ -46,9 +45,7 @@ use crate::query_execution::contract::{
 };
 #[cfg(test)]
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
-use crate::query_execution::lifecycle_plan::{
-    QueryCredentialLeases, QueryInitOptions, QueryLifecycleLease,
-};
+use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::{RoundSplitSource, TaskUpdateTransport};
@@ -62,16 +59,15 @@ use novarocks_types::{
 };
 
 use super::query_lifecycle::FrontendLifecycleMetrics;
-use super::query_lifecycle::{
-    FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, QueryLifecycleTransport,
-};
+use super::query_lifecycle::{FrontendQueryLifecycleConfig, QueryLifecycleTransport};
 #[cfg(test)]
 use super::query_lifecycle::{
     QueryControlSession, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
 };
 use super::query_registry::{
-    FrontendQueryRegistry, QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot,
-    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
+    FrontendQueryRegistry, QueryFailureCause, QueryLifecycleConvergenceReader,
+    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
+    RuntimeFilterTerminalRollupUnavailable,
 };
 use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
@@ -89,9 +85,7 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::task_transport::AttemptWireFacts;
-use crate::native::transport::{
-    GrpcTaskUpdateTransport, new_fragment_dispatcher, new_query_lifecycle_transport,
-};
+use crate::native::transport::{new_fragment_dispatcher, new_query_lifecycle_transport};
 use crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions;
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
@@ -616,9 +610,6 @@ pub struct FrontendDistributedQueryCoordinator {
     query_ids: Arc<dyn QueryIdSource>,
     registry: Arc<FrontendQueryRegistry>,
     data_runtime: FrontendDataRuntime,
-    /// Validated once at startup from the timeouts the composition root froze;
-    /// query admission consumes it rather than re-reading configuration.
-    lifecycle_config: FrontendQueryLifecycleConfig,
     /// Every bound the task protocol runs one attempt with, frozen at startup.
     ///
     /// Held rather than read per attempt so a deployment's bounds cannot change
@@ -688,23 +679,6 @@ fn build_lifecycle_config(
     .with_participant_fanout_max_inflight(timeouts.participant_fanout_max_inflight)
 }
 
-/// Whether this intent is the one still routed to the old lifecycle.
-///
-/// A named predicate rather than an inline comparison because the two
-/// directions of getting it wrong are not symmetric. Sending Statistics to the
-/// task path fails loudly -- that path refuses the intent outright. Sending
-/// anything else to the lifecycle path is silent: the query would simply run
-/// on the retired stack and succeed, and nothing downstream would say so.
-/// This is the half that needs to be assertable.
-const fn runs_on_query_lifecycle(intent: DistributedQueryIntent) -> bool {
-    match intent {
-        DistributedQueryIntent::Statistics => true,
-        DistributedQueryIntent::Result
-        | DistributedQueryIntent::Write
-        | DistributedQueryIntent::Profile => false,
-    }
-}
-
 impl FrontendDistributedQueryCoordinator {
     #[expect(
         private_interfaces,
@@ -724,7 +698,7 @@ impl FrontendDistributedQueryCoordinator {
     ) -> Result<Self, DistributedQueryError> {
         // Reject an unusable `[runtime]` query-control section at startup rather
         // than on the first query that tries to use it.
-        let lifecycle_config = build_lifecycle_config(query_control_timeouts)?;
+        build_lifecycle_config(query_control_timeouts)?;
         let query_id_source = UniqueQueryIdSource::default();
         let query_namespace = query_id_source.namespace();
         tracing::info!(
@@ -750,7 +724,6 @@ impl FrontendDistributedQueryCoordinator {
             query_ids: Arc::new(query_id_source),
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
             data_runtime,
-            lifecycle_config,
             task_execution_budgets,
             frontend_process_id: FrontendProcessId::new_v7(),
             pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
@@ -828,8 +801,6 @@ impl FrontendDistributedQueryCoordinator {
                 query_id.high() as u64,
             ))),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
-            lifecycle_config: build_lifecycle_config(test_timeouts)
-                .expect("default query-control timeouts validate"),
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
@@ -906,8 +877,6 @@ impl FrontendDistributedQueryCoordinator {
                 query_id.high() as u64,
             ))),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
-            lifecycle_config: build_lifecycle_config(test_timeouts)
-                .expect("default query-control timeouts validate"),
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
@@ -997,12 +966,24 @@ impl FrontendDistributedQueryCoordinator {
         let parts = request.into_parts();
         let write_stack_session = parts.write_stack_session.clone();
         let intent = parts.completion.intent();
+        let write_decoder = parts
+            .write_root_decode_contract
+            .clone()
+            .map(crate::query_execution::write_result::RootWriteResultDecoder::new);
         // Statistics collection enters only with its Core-owned typed program.
         // It never falls through to client-result construction.
         if intent == DistributedQueryIntent::Statistics && parts.statistics_program.is_none() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "statistics execution requires a typed StatisticsCollectionProgram",
+            ));
+        }
+        if (intent == DistributedQueryIntent::Write)
+            != (write_stack_session.is_some() && write_decoder.is_some())
+        {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "distributed write intent, session, and Root decode contract must be present together",
             ));
         }
         self.backend_topology
@@ -1086,6 +1067,10 @@ impl FrontendDistributedQueryCoordinator {
                     .min(i64::MAX as u128) as i64
             })
             .unwrap_or_else(|| parts.options.timeout_ms().max(0));
+        let statistics_decoder = parts
+            .statistics_program
+            .as_ref()
+            .map(|program| program.result_decoder());
         let remaining_budget = statement_deadline.saturating_duration_since(Instant::now());
         if remaining_budget.is_zero() {
             return Err(failed(
@@ -1133,20 +1118,6 @@ impl FrontendDistributedQueryCoordinator {
             }
             None => init_options,
         };
-        // `DistributedQueryIntent::Statistics` is the ONE intent that does not
-        // move onto the task protocol. This branch exists for that single
-        // reason; it is not ordinary intent dispatch, and nothing else may
-        // take the path it selects.
-        //
-        // ANALYZE's payload is produced by the fragment terminal fact and
-        // carried by the old lifecycle's terminal report. The task protocol
-        // has no field for it, deliberately: NCP-8 turns statistics into
-        // ordinary aggregates read over the root result plane, and its own
-        // tasks own both halves of the removal -- NCP-8 T06 moves the payload
-        // onto that plane, NCP-8 T08 deletes `statistics_payload` and this
-        // branch with it. Building a carrier here would be torn out by that
-        // work; deleting the old path before it lands would leave ANALYZE
-        // unavailable in between.
         let handoff = RoundHandoff {
             query_id,
             execution_id,
@@ -1156,10 +1127,10 @@ impl FrontendDistributedQueryCoordinator {
             cancellation: parts.cancellation,
             completion: parts.completion,
             topology: parts.topology,
-            statistics_program: parts.statistics_program,
+            statistics_decoder,
+            write_decoder,
             write_stack_session,
             backend_services,
-            dispatcher,
             retry_boundary,
             runtime_filter_ready,
             init_options,
@@ -1168,365 +1139,7 @@ impl FrontendDistributedQueryCoordinator {
             split_assignment_plan,
             scheduled_backend_ownership,
         };
-        if runs_on_query_lifecycle(intent) {
-            return self.execute_statistics_round_on_query_lifecycle(handoff);
-        }
         self.execute_round_on_task_protocol(handoff)
-    }
-
-    /// The pre-task-protocol execution path, retained only for ANALYZE.
-    ///
-    /// See the branch that selects it: the statistics payload has no carrier
-    /// on the task protocol, and NCP-8 owns both moving it and deleting this.
-    /// Everything here is the code that used to run for every intent.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the retained lifecycle path is moved verbatim so its removal stays a deletion"
-    )]
-    fn execute_statistics_round_on_query_lifecycle(
-        &self,
-        handoff: RoundHandoff<'_>,
-    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let RoundHandoff {
-            query_id,
-            execution_id,
-            statement_deadline,
-            timeout_ms,
-            intent,
-            cancellation,
-            completion,
-            topology,
-            statistics_program,
-            write_stack_session,
-            backend_services,
-            dispatcher,
-            retry_boundary,
-            runtime_filter_ready,
-            init_options,
-            feedback_declaration,
-            feedback_state,
-            split_assignment_plan,
-            scheduled_backend_ownership: _,
-        } = handoff;
-        let lifecycle_barrier = FrontendQueryLifecycleBarrier::new(
-            Arc::clone(&backend_services.lifecycle_transport),
-            Arc::clone(&self.registry),
-            self.lifecycle_config,
-        )
-        .with_cancellation(cancellation.clone())
-        .with_backend_topology(Arc::clone(&self.backend_topology), topology.revision())
-        .with_runtime_filter_feedback(feedback_declaration)
-        .with_runtime_filter_feedback_state(feedback_state);
-        let connector_binding_ready = runtime_filter_ready
-            .initialize_query(init_options, &lifecycle_barrier)
-            .map_err(|error| {
-                reclassify_pre_ready_lifecycle_failure(
-                    self.backend_topology.as_ref(),
-                    &topology,
-                    error,
-                    statement_deadline.min(
-                        Instant::now()
-                            .checked_add(self.lifecycle_config.init_rpc_timeout())
-                            .unwrap_or(statement_deadline),
-                    ),
-                )
-            })?
-            .catalog_ready();
-        if let Some(retry_boundary) = retry_boundary {
-            retry_boundary.close_after_control_ready();
-        }
-        let submission_view = connector_binding_ready.native_submission_view()?;
-        let submission_attachment = encode_native_submission(&submission_view).map_err(failed)?;
-        let stage_prepared = connector_binding_ready.finish_stage(submission_attachment)?;
-        let staged = stage_prepared.stage(&lifecycle_barrier)?;
-        if let Some(retry_boundary) = retry_boundary {
-            retry_boundary.close_after_stage_or_start();
-        }
-        for batch in staged.batches() {
-            self.backend_topology.record_successful_stage(
-                batch.binding().target().backend_idx(),
-                batch.request().fragments().len(),
-            );
-        }
-        let execution = staged.start(&lifecycle_barrier)?;
-        // Started only after Start: a backend admits a task update only while
-        // its attempt is staged or running. The guard owns the pump thread, so
-        // every exit path below closes the sources by dropping it.
-        let mut split_assignment = split_assignment_plan
-            .map(|plan| {
-                GrpcTaskUpdateTransport::new(plan.endpoints(), self.data_runtime.clone())
-                    .map(|transport| (plan, Arc::new(transport)))
-                    .map_err(|error| failed(format!("task update transport: {error}")))
-            })
-            .transpose()?
-            .and_then(|(plan, transport)| {
-                SplitAssignmentRoundGuard::start(
-                    execution_id,
-                    plan,
-                    transport as Arc<dyn TaskUpdateTransport>,
-                )
-            });
-        let RunningNativeExecutionParts {
-            root_fetch,
-            expected_output,
-            query_lifecycle_lease,
-        } = execution.into_parts();
-        let mut query_lifecycle_lease = Some(query_lifecycle_lease);
-        if let Some(message) = self.registry.first_failure(query_id)
-            && intent != DistributedQueryIntent::Write
-        {
-            let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
-            return Err(failed(message));
-        }
-
-        let deadline = statement_deadline;
-        let mut batches = Vec::new();
-        // Recorded rather than inferred. Every other exit from the loop below
-        // returns an error, so "we got here" would imply end of stream -- but a
-        // write commits on the strength of this fact, and a fact that important
-        // should not rest on a future edit preserving a control-flow accident.
-        let mut observed_result_eof = false;
-        if root_fetch.uses_result_buffer() {
-            loop {
-                if cancellation.is_cancelled() {
-                    return Err(self.fail_cancel_then_abort_query_lifecycle(
-                        query_id,
-                        &mut query_lifecycle_lease,
-                        "query cancelled while fetching result",
-                    ));
-                }
-                if let Some(message) = self.registry.first_failure(query_id) {
-                    let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
-                    return Err(failed(message));
-                }
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(self.fail_cancel_then_abort_query_lifecycle(
-                        query_id,
-                        &mut query_lifecycle_lease,
-                        format!("query timed out after {timeout_ms} ms"),
-                    ));
-                }
-                let fetch_wait_ms = deadline
-                    .saturating_duration_since(now)
-                    .as_millis()
-                    .clamp(1, 300) as i64;
-                let fetch = match dispatcher.fetch_result(
-                    root_fetch.backend_idx(),
-                    root_fetch.fragment_instance_id(),
-                    fetch_wait_ms,
-                    Some(expected_output.fetch_view()),
-                ) {
-                    Ok(fetch) => fetch,
-                    Err(error) => {
-                        return Err(self.fail_cancel_then_abort_query_lifecycle(
-                            query_id,
-                            &mut query_lifecycle_lease,
-                            error,
-                        ));
-                    }
-                };
-                match fetch {
-                    FetchOutcome::Ready(batch) => batches.push(batch),
-                    FetchOutcome::NotReady => continue,
-                    FetchOutcome::Eof => {
-                        observed_result_eof = true;
-                        break;
-                    }
-                    FetchOutcome::Err(error) => {
-                        return Err(self.fail_cancel_then_abort_query_lifecycle(
-                            query_id,
-                            &mut query_lifecycle_lease,
-                            error,
-                        ));
-                    }
-                }
-            }
-        }
-
-        if cancellation.is_cancelled() {
-            return Err(self.fail_cancel_then_abort_query_lifecycle(
-                query_id,
-                &mut query_lifecycle_lease,
-                "query cancelled before terminal finalization",
-            ));
-        }
-        if let Some(message) = self.registry.first_failure(query_id) {
-            let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
-            return Err(failed(message));
-        }
-
-        // A successful query must not construct its terminal/profile outcome
-        // while this attempt still owns an unconfirmed TaskUpdate.  On error
-        // the guard's Drop path stops and closes the sources; on success we
-        // join explicitly so every immutable split assignment is either
-        // confirmed or reported as the query failure.
-        let split_assignment_profile = if let Some(assignment) = split_assignment.take() {
-            match assignment.finish() {
-                Ok(profile) => profile,
-                Err(error) => {
-                    return Err(self.fail_cancel_then_abort_query_lifecycle(
-                        query_id,
-                        &mut query_lifecycle_lease,
-                        format!("split assignment did not finish: {error}"),
-                    ));
-                }
-            }
-        } else {
-            novarocks_spi::connector::read_stack::SplitSourceProfile::default()
-        };
-
-        // A connector write reaches its external commit only after this
-        // attempt finalizes: the frontend reloads table metadata and writes
-        // manifests through object storage once every participant has
-        // converged. Retain the attempt's terminal-only storage capability
-        // while the lease still exists and hand it to the session that owns
-        // the commit decision. Taking it is also what tells finalization that
-        // a write still needs the attempt's credential leases; on a
-        // vended-credential deployment they would otherwise be cleared before
-        // the commit could read a single object. A deployment with no vended
-        // lease has no capability to retain and is unaffected.
-        if let Some(session) = write_stack_session.as_ref()
-            && let Some(resolver) = query_lifecycle_lease
-                .as_ref()
-                .and_then(QueryLifecycleLease::retain_terminal_storage_resolver)
-        {
-            session.retain_terminal_storage_resolver(resolver);
-        }
-        let terminal_set = query_lifecycle_lease
-            .take()
-            .expect("query lifecycle lease is present through query completion")
-            .finalize()?;
-        if !terminal_set.is_success() {
-            return Err(failed(
-                "query terminal snapshot set contains a failed, cancelled, or incomplete fragment",
-            ));
-        }
-
-        // A failure recorded after this point cannot invalidate the query. Every
-        // participant already converged on a Succeeded terminal, so the work
-        // finished and a write's commit fragments are all in hand; the
-        // pre-finalize check above is what fails a query that actually failed. Heartbeat
-        // observations keep latching into active queries regardless -- a backend
-        // briefly marked unavailable under load latches into every query
-        // scheduled on it -- and consuming that here turned a completed
-        // statement into `connector write execution ended without a complete
-        // staged-report commit`, a message describing neither the latch nor its
-        // reason, because the latch made the builder emit an abort that this
-        // call site then discarded.
-        if let Some(message) = self.registry.first_failure(query_id) {
-            tracing::warn!(
-                query_id = ?query_id,
-                latched = %message,
-                "query failure recorded after a successful terminal set; the completed \
-                 query is not failed by it",
-            );
-        }
-        let outcome = (|| match intent {
-            DistributedQueryIntent::Result => {
-                completion.result(expected_output.into_query_result(batches)?)
-            }
-            DistributedQueryIntent::Write => {
-                let session = write_stack_session.ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "distributed write execution has no connector write session",
-                    )
-                })?;
-                // The write relation is engine machinery: the client's result
-                // is empty, and the rows are decoded by position against the
-                // frozen relation instead.
-                let mut decoder =
-                    crate::query_execution::write_result::RootWriteResultDecoder::new(
-                        &session.expected_targets(),
-                    )
-                    .map_err(|error| {
-                        DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            error,
-                        )
-                    })?;
-                for batch in batches {
-                    decoder.apply_chunk(&batch.into_chunk()).map_err(|error| {
-                        DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            error,
-                        )
-                    })?;
-                }
-
-                let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
-                // Only an observed end of stream can produce a complete set. A
-                // prefix is not most of a write; it is no write at all.
-                if observed_result_eof {
-                    barrier.observe_prepared_write_set(decoder.finish_at_eof().map_err(
-                        |error| {
-                            DistributedQueryError::new(
-                                DistributedQueryErrorKind::ContractViolation,
-                                error,
-                            )
-                        },
-                    )?);
-                }
-                barrier.observe_execution_terminals(terminal_set.is_success());
-                if cancellation.is_cancelled() {
-                    barrier.observe_cancelled();
-                }
-
-                let prepared = barrier.into_committable().map_err(|blocked| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        blocked.as_str(),
-                    )
-                })?;
-                completion.write_session_outcome(session, prepared)
-            }
-            DistributedQueryIntent::Profile => {
-                let result = expected_output.into_query_result(batches)?;
-                let mut builder = ProfileTerminalBuilder::new();
-                for snapshot in terminal_set.snapshots() {
-                    builder.apply_profile_contribution(snapshot)?;
-                    for fragment in snapshot.fragments() {
-                        builder.apply_terminal(fragment.as_proto())?;
-                    }
-                }
-                builder.apply_split_assignment_profile(split_assignment_profile);
-                completion.profile(result, builder.finish())
-            }
-            DistributedQueryIntent::Statistics => {
-                let program = statistics_program.as_ref().ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "statistics execution lost its typed collection program",
-                    )
-                })?;
-                let result = program.finish_fragment_payloads(
-                    terminal_set
-                        .fragments()
-                        .map(|fragment| fragment.statistics_payload.as_slice()),
-                )?;
-                completion.statistics(program, result)
-            }
-        })();
-        if let Err(error) = &outcome {
-            let _ = self
-                .registry
-                .latch_failure_and_cancel(query_id, error.message().to_string());
-            return Err(DistributedQueryError::new(error.kind(), error.message()));
-        }
-        // A split that never reached its task means this query returned fewer
-        // rows than it should, so an assignment failure fails the query even
-        // though the fetch loop already produced an outcome.
-        if let Some(split_assignment) = split_assignment
-            && let Err(error) = split_assignment.finish()
-        {
-            let message = self.fail_and_cancel(
-                query_id,
-                format!("runtime split assignment failed: {error}"),
-            );
-            return Err(message);
-        }
-        outcome
     }
 
     /// The production execution path: one attempt's tasks on the task protocol.
@@ -1545,6 +1158,7 @@ impl FrontendDistributedQueryCoordinator {
         &self,
         handoff: RoundHandoff<'_>,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let execution_started = Instant::now();
         let RoundHandoff {
             query_id,
             execution_id,
@@ -1554,13 +1168,12 @@ impl FrontendDistributedQueryCoordinator {
             cancellation,
             completion,
             // The captured snapshot is kept: it is what a pre-establish
-            // failure is judged against. A statistics program never reaches
-            // this path at all.
+            // failure is judged against.
             topology: captured_topology,
-            statistics_program: _,
+            mut statistics_decoder,
+            mut write_decoder,
             write_stack_session,
             backend_services,
-            dispatcher: _,
             retry_boundary,
             runtime_filter_ready,
             init_options,
@@ -1648,6 +1261,7 @@ impl FrontendDistributedQueryCoordinator {
         let establish = AttemptEstablishFacts::freeze(
             prepared.catalog_set().as_proto().clone(),
             runtime_filters,
+            *prepared.init_options().query_options().as_proto(),
             prepared.init_options().credential_leases(),
         )
         .map_err(|error| failed(error.to_string()))?;
@@ -1697,7 +1311,6 @@ impl FrontendDistributedQueryCoordinator {
 
         let wake = Arc::new(CondvarWake::default());
         let attempt = AttemptWireFacts {
-            query_options: *prepared.init_options().query_options().as_proto(),
             native_compatibility_id: Some(
                 novarocks_proto_models::novarocks::NativeCompatibilityId {
                     value: self.native_compatibility_id.as_bytes().to_vec(),
@@ -1809,6 +1422,8 @@ impl FrontendDistributedQueryCoordinator {
         // write commits on the strength of this fact.
         let mut observed_result_eof = false;
         let mut last_root_poll = RootResultPoll::default();
+        let mut root_batch_count = 0_u64;
+        let mut root_row_count = 0_u64;
         // Taken before the loop because the polls run beside it: the schema
         // is shared, immutable and only read, while `expected_output` itself
         // is consumed by this attempt's answer.
@@ -1837,15 +1452,15 @@ impl FrontendDistributedQueryCoordinator {
                     &mut round,
                     &split_delivery,
                     classification,
+                    QueryFailureCause::ClientCancellation,
                     "query cancelled while fetching result",
                 ));
             }
             if let Some(message) = self.registry.first_failure(query_id) {
-                break Err(self.fail_task_round(
+                break Err(self.fail_latched_task_round(
                     query_id,
                     &mut round,
                     &split_delivery,
-                    classification,
                     message,
                 ));
             }
@@ -1862,6 +1477,7 @@ impl FrontendDistributedQueryCoordinator {
                     &mut round,
                     &split_delivery,
                     classification,
+                    QueryFailureCause::FrontendExecution,
                     format!("query timed out after {timeout_ms} ms waiting on {waiting_on}"),
                 ));
             }
@@ -1874,6 +1490,7 @@ impl FrontendDistributedQueryCoordinator {
                         &mut round,
                         &split_delivery,
                         classification,
+                        QueryFailureCause::FrontendExecution,
                         format!("task execution did not advance: {error}"),
                     ));
                 }
@@ -1910,6 +1527,7 @@ impl FrontendDistributedQueryCoordinator {
                     &mut round,
                     &split_delivery,
                     classification,
+                    QueryFailureCause::BackendLocalFailure,
                     detail,
                 ));
             }
@@ -1929,6 +1547,7 @@ impl FrontendDistributedQueryCoordinator {
                     &mut round,
                     &split_delivery,
                     classification,
+                    QueryFailureCause::FrontendExecution,
                     detail,
                 ));
             }
@@ -1953,13 +1572,23 @@ impl FrontendDistributedQueryCoordinator {
                     statement_deadline,
                     Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
                 ) {
-                    Ok(polls) => root_result_polls = Some(polls),
+                    Ok(polls) => {
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_poll_enter",
+                            execution_started,
+                            None,
+                        );
+                        root_result_polls = Some(polls);
+                    }
                     Err(error) => {
                         break Err(self.fail_task_round(
                             query_id,
                             &mut round,
                             &split_delivery,
                             classification,
+                            QueryFailureCause::FrontendExecution,
                             error,
                         ));
                     }
@@ -1976,29 +1605,145 @@ impl FrontendDistributedQueryCoordinator {
                     }) => {
                         if let Err(error) = round.consume_root_result_packet(packet_sequence, false)
                         {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_failure",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
                             break Err(self.fail_task_round(
                                 query_id,
                                 &mut round,
                                 &split_delivery,
                                 classification,
+                                QueryFailureCause::FrontendExecution,
                                 format!("root result packet was refused: {error}"),
                             ));
                         }
-                        batches.push(batch);
+                        root_batch_count = root_batch_count.saturating_add(1);
+                        let mut batch_rows = 0;
+                        if let Some(decoder) = statistics_decoder.as_mut() {
+                            let chunk = batch.into_chunk();
+                            batch_rows = chunk.len();
+                            if let Err(error) = decoder.apply_chunk(&chunk) {
+                                emit_distributed_write_phase_marker(
+                                    intent,
+                                    execution_id,
+                                    "root_failure",
+                                    execution_started,
+                                    Some((root_batch_count, root_row_count)),
+                                );
+                                break Err(self.fail_task_round(
+                                    query_id,
+                                    &mut round,
+                                    &split_delivery,
+                                    classification,
+                                    QueryFailureCause::FrontendExecution,
+                                    error,
+                                ));
+                            }
+                        } else if let Some(decoder) = write_decoder.as_mut() {
+                            let chunk = batch.into_chunk();
+                            batch_rows = chunk.len();
+                            if let Err(error) = decoder.apply_chunk(&chunk) {
+                                emit_distributed_write_phase_marker(
+                                    intent,
+                                    execution_id,
+                                    "root_failure",
+                                    execution_started,
+                                    Some((root_batch_count, root_row_count)),
+                                );
+                                break Err(self.fail_task_round(
+                                    query_id,
+                                    &mut round,
+                                    &split_delivery,
+                                    classification,
+                                    QueryFailureCause::FrontendExecution,
+                                    error,
+                                ));
+                            }
+                        } else {
+                            batches.push(batch);
+                        }
+                        root_row_count = root_row_count
+                            .saturating_add(u64::try_from(batch_rows).unwrap_or(u64::MAX));
+                        if root_batch_count == 1 {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_first_packet",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
+                        }
                         last_root_poll = RootResultPoll::Packet(packet_sequence);
                         moved = true;
                     }
                     Ok(RootResultOutcome::EndOfStream { packet_sequence }) => {
                         if let Err(error) = round.consume_root_result_packet(packet_sequence, true)
                         {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_failure",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
                             break Err(self.fail_task_round(
                                 query_id,
                                 &mut round,
                                 &split_delivery,
                                 classification,
+                                QueryFailureCause::FrontendExecution,
                                 format!("root result end of stream was refused: {error}"),
                             ));
                         }
+                        if let Some(decoder) = statistics_decoder.as_mut()
+                            && let Err(error) = decoder.observe_root_eof()
+                        {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_failure",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error,
+                            ));
+                        }
+                        if let Some(decoder) = write_decoder.as_mut()
+                            && let Err(error) = decoder.observe_root_eof()
+                        {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_failure",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error,
+                            ));
+                        }
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_eof",
+                            execution_started,
+                            Some((root_batch_count, root_row_count)),
+                        );
                         observed_result_eof = true;
                         last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
                         moved = true;
@@ -2012,7 +1757,14 @@ impl FrontendDistributedQueryCoordinator {
                         // it.
                         last_root_poll = RootResultPoll::NotReady;
                     }
-                    Ok(RootResultOutcome::Failed(detail)) | Err(detail) => {
+                    Ok(RootResultOutcome::Failed(detail)) => {
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_failure",
+                            execution_started,
+                            Some((root_batch_count, root_row_count)),
+                        );
                         // A refused or failed poll is also how a read ends
                         // when the task it names has already gone. If this
                         // attempt has a failure of its own, that failure is
@@ -2026,6 +1778,26 @@ impl FrontendDistributedQueryCoordinator {
                             &mut round,
                             &split_delivery,
                             classification,
+                            QueryFailureCause::BackendLocalFailure,
+                            detail,
+                        ));
+                    }
+                    Err(detail) => {
+                        let (cause, detail) = round.failure_cause().map_or(
+                            (QueryFailureCause::RemoteTransportObservation, detail),
+                            |task_failure| {
+                                (
+                                    QueryFailureCause::BackendLocalFailure,
+                                    format!("task execution terminated: {task_failure:?}"),
+                                )
+                            },
+                        );
+                        break Err(self.fail_task_round(
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            cause,
                             detail,
                         ));
                     }
@@ -2077,6 +1849,13 @@ impl FrontendDistributedQueryCoordinator {
         // must never be able to take that completion back, so a drain that
         // does not finish inside the statement's own budget is reported rather
         // than turned into a query failure.
+        emit_distributed_write_phase_marker(
+            intent,
+            execution_id,
+            "drain_enter",
+            execution_started,
+            None,
+        );
         drain_task_round(
             &mut round,
             &split_delivery,
@@ -2088,6 +1867,13 @@ impl FrontendDistributedQueryCoordinator {
                 .frontend_queue_residence(),
             execution_id,
             &mut final_task_info,
+        );
+        emit_distributed_write_phase_marker(
+            intent,
+            execution_id,
+            "drain_exit",
+            execution_started,
+            None,
         );
 
         // Read once the drain has ended: a release acknowledgement is the only
@@ -2105,11 +1891,27 @@ impl FrontendDistributedQueryCoordinator {
         // then keeps it from resending.
         let split_assignment_profile = match split_assignment.take() {
             Some(assignment) => {
+                emit_distributed_write_phase_marker(
+                    intent,
+                    execution_id,
+                    "split_finish_enter",
+                    execution_started,
+                    None,
+                );
                 if !assignment.is_finished() {
                     split_delivery.abandon("split assignment round ended with the attempt");
                 }
                 match assignment.finish() {
-                    Ok(profile) => profile,
+                    Ok(profile) => {
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "split_finish_exit",
+                            execution_started,
+                            None,
+                        );
+                        profile
+                    }
                     Err(error) => {
                         return Err(self.fail_and_cancel(
                             query_id,
@@ -2149,51 +1951,62 @@ impl FrontendDistributedQueryCoordinator {
                         "distributed write execution has no write completion tracker",
                     )
                 })?;
-                // The write relation is engine machinery: the client's result
-                // is empty, and the rows are decoded by position against the
-                // frozen relation instead.
-                let mut decoder =
-                    crate::query_execution::write_result::RootWriteResultDecoder::new(
-                        &session.expected_targets(),
+                let mut decoder = write_decoder.take().ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "distributed write execution lost its Root decoder",
                     )
-                    .map_err(|error| {
-                        DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            error,
-                        )
-                    })?;
-                for batch in batches {
-                    decoder.apply_chunk(&batch.into_chunk()).map_err(|error| {
-                        DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            error,
-                        )
-                    })?;
-                }
+                })?;
 
                 let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
-                // Only an observed end of stream can produce a complete set. A
-                // prefix is not most of a write; it is no write at all.
-                if observed_result_eof {
-                    barrier.observe_prepared_write_set(decoder.finish_at_eof().map_err(
-                        |error| {
-                            DistributedQueryError::new(
-                                DistributedQueryErrorKind::ContractViolation,
-                                error,
-                            )
-                        },
-                    )?);
-                }
                 observe_write_statuses(&round, tracker);
-                // The execution half only. The barrier keeps "the prepared
-                // write set is complete" as its own independent fact, and
-                // handing it a verdict that already folded that in would let
-                // one signal stand for both again.
-                barrier.observe_task_execution(
-                    tracker.execution_verdict(round.failure_cause().is_some()),
+                let execution_verdict = tracker.execution_verdict(round.failure_cause().is_some());
+                if execution_verdict.is_complete() {
+                    decoder.observe_execution_success().map_err(|error| {
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_failure",
+                            execution_started,
+                            Some((root_batch_count, root_row_count)),
+                        );
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            error,
+                        )
+                    })?;
+                }
+                emit_distributed_write_phase_marker(
+                    intent,
+                    execution_id,
+                    "write_decoder_finish_enter",
+                    execution_started,
+                    None,
                 );
+                let prepared_write_set = decoder.finish().map_err(|error| {
+                    emit_distributed_write_phase_marker(
+                        intent,
+                        execution_id,
+                        "root_failure",
+                        execution_started,
+                        Some((root_batch_count, root_row_count)),
+                    );
+                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+                })?;
+                emit_distributed_write_phase_marker(
+                    intent,
+                    execution_id,
+                    "write_decoder_finish_exit",
+                    execution_started,
+                    Some((root_batch_count, root_row_count)),
+                );
+                barrier.observe_prepared_write_set(prepared_write_set);
+                barrier.observe_task_execution(execution_verdict);
                 if cancellation.is_cancelled() {
                     barrier.observe_cancelled();
+                }
+                if Instant::now() >= statement_deadline {
+                    barrier.observe_deadline_expired();
                 }
 
                 let prepared_set = barrier.into_committable().map_err(|blocked| {
@@ -2249,17 +2062,43 @@ impl FrontendDistributedQueryCoordinator {
                 builder.apply_split_assignment_profile(split_assignment_profile);
                 completion.profile(result, builder.finish())
             }
-            // Statistics never reaches this path; the branch in `execute_round`
-            // that keeps it on the old lifecycle is the only route it has.
-            DistributedQueryIntent::Statistics => Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "statistics execution does not run on the task protocol",
-            )),
+            DistributedQueryIntent::Statistics => {
+                let all_tasks_finished = round.execution().graph().tasks().all(|task| {
+                    round
+                        .execution()
+                        .task(task.task_id())
+                        .is_some_and(|remote| {
+                            remote.task_state()
+                                == novarocks_execution::task_execution::TaskState::Finished
+                        })
+                });
+                if !all_tasks_finished || round.failure_cause().is_some() {
+                    return Err(DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "statistics execution did not reach all-success on its frozen task set",
+                    ));
+                }
+                let mut decoder = statistics_decoder.take().ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "statistics execution lost its Root decoder",
+                    )
+                })?;
+                decoder.observe_execution_success().map_err(|error| {
+                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+                })?;
+                let artifacts = decoder.finish().map_err(|error| {
+                    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+                })?;
+                completion.statistics(artifacts)
+            }
         })();
         if let Err(error) = &outcome {
-            let _ = self
-                .registry
-                .latch_failure_and_cancel(query_id, error.message().to_string());
+            let _ = self.registry.latch_failure_and_cancel(
+                query_id,
+                QueryFailureCause::FrontendExecution,
+                error.message().to_string(),
+            );
             return Err(DistributedQueryError::new(error.kind(), error.message()));
         }
         outcome
@@ -2338,6 +2177,7 @@ impl FrontendDistributedQueryCoordinator {
         round: &mut TaskRound,
         split_delivery: &SplitDeliveryBridge,
         classification: TaskRoundFailureClassification<'_>,
+        cause: QueryFailureCause,
         message: impl Into<String>,
     ) -> DistributedQueryError {
         let message = message.into();
@@ -2354,8 +2194,26 @@ impl FrontendDistributedQueryCoordinator {
             &message,
         ) {
             Some(classified) => classified,
-            None => self.fail_and_cancel(query_id, message),
+            None => self.fail_and_cancel_with_cause(query_id, cause, message),
         }
+    }
+
+    /// Stands down a task round for a failure the registry already selected.
+    ///
+    /// Relatching that message as a frontend execution failure would discard
+    /// its typed origin and could incorrectly supersede an earlier lifecycle
+    /// observation. The existing registry record remains the single causal
+    /// authority; this helper only performs the task-protocol cleanup.
+    fn fail_latched_task_round(
+        &self,
+        query_id: QueryId,
+        round: &mut TaskRound,
+        split_delivery: &SplitDeliveryBridge,
+        message: String,
+    ) -> DistributedQueryError {
+        split_delivery.abandon(message.clone());
+        abort_task_round(round, &message);
+        failed(self.registry.first_failure(query_id).unwrap_or(message))
     }
 
     fn fail_and_cancel(
@@ -2363,24 +2221,22 @@ impl FrontendDistributedQueryCoordinator {
         query_id: QueryId,
         message: impl Into<String>,
     ) -> DistributedQueryError {
-        match self.registry.latch_failure_and_cancel(query_id, message) {
-            Ok(message) => failed(message),
-            Err(error) => error,
-        }
+        self.fail_and_cancel_with_cause(query_id, QueryFailureCause::FrontendExecution, message)
     }
 
-    fn fail_cancel_then_abort_query_lifecycle(
+    fn fail_and_cancel_with_cause(
         &self,
         query_id: QueryId,
-        lease: &mut Option<QueryLifecycleLease>,
+        cause: QueryFailureCause,
         message: impl Into<String>,
     ) -> DistributedQueryError {
-        let primary = self.fail_and_cancel(query_id, message);
-        let enriched = abort_query_lifecycle(lease, primary.message().to_string());
-        let _ = self
+        match self
             .registry
-            .preserve_failure_context(query_id, enriched.clone());
-        failed(self.registry.first_failure(query_id).unwrap_or(enriched))
+            .latch_failure_and_cancel(query_id, cause, message)
+        {
+            Ok(failure) => failed(failure.message().to_string()),
+            Err(error) => error,
+        }
     }
 }
 
@@ -2664,6 +2520,50 @@ fn statement_deadline_for_request(
         })
 }
 
+fn emit_distributed_write_phase_marker(
+    intent: DistributedQueryIntent,
+    execution_id: QueryExecutionId,
+    phase: &str,
+    started: Instant,
+    root_counts: Option<(u64, u64)>,
+) {
+    if intent != DistributedQueryIntent::Write
+        || !cfg!(debug_assertions)
+        || std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER").is_none()
+    {
+        return;
+    }
+    println!(
+        "{}",
+        distributed_write_phase_marker(
+            execution_id,
+            phase,
+            started.elapsed().as_millis(),
+            root_counts,
+        )
+    );
+}
+
+fn distributed_write_phase_marker(
+    execution_id: QueryExecutionId,
+    phase: &str,
+    elapsed_ms: u128,
+    root_counts: Option<(u64, u64)>,
+) -> String {
+    let query_id = execution_id.query_id();
+    let marker = format!(
+        "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi={} query_lo={} attempt={} phase={} elapsed_ms={}",
+        query_id.high(),
+        query_id.low(),
+        execution_id.attempt_id().get(),
+        phase,
+        elapsed_ms,
+    );
+    root_counts.map_or(marker.clone(), |(batches, rows)| {
+        format!("{marker} root_batches={batches} root_rows={rows}")
+    })
+}
+
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
@@ -2804,16 +2704,6 @@ fn reclassify_pre_ready_lifecycle_failure(
     }
 }
 
-fn abort_query_lifecycle(
-    lease: &mut Option<QueryLifecycleLease>,
-    message: impl Into<String>,
-) -> String {
-    let message = message.into();
-    lease
-        .take()
-        .map_or(message.clone(), |lease| lease.abort_preserving(message))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -2826,7 +2716,7 @@ mod tests {
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
         FrontendReportEndpointBinding, QueryIdSource, ReadyLifecycleTransportForTest,
-        UniqueQueryIdSource, fail_closed_one_shot_topology_retry,
+        UniqueQueryIdSource, distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
         pre_ready_topology_validation_error,
     };
     use crate::common::backend_topology::CoordinatorReportEndpointSink;
@@ -2864,6 +2754,19 @@ mod tests {
         BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace, UniqueId,
     };
     use novarocks_version::native_build_identity;
+
+    #[test]
+    fn write_phase_marker_identifies_attempt_phase_and_bounded_root_counts() {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(7, 11),
+            AttemptId::new(2).expect("nonzero attempt"),
+        )
+        .expect("nonzero execution identity");
+        assert_eq!(
+            distributed_write_phase_marker(execution_id, "root_eof", 37, Some((3, 19))),
+            "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi=7 query_lo=11 attempt=2 phase=root_eof elapsed_ms=37 root_batches=3 root_rows=19"
+        );
+    }
 
     #[test]
     fn missing_captured_process_is_typed_pre_ready_not_eligible() {
@@ -3146,42 +3049,6 @@ mod tests {
             DistributedQueryIntent::Result,
             &execution,
         )
-    }
-
-    /// The pre-establish replan survived the cutover, with a different trigger.
-    ///
-    /// The old lifecycle refused Init on a draining backend and that refusal
-    /// was what a replan rested on. The task protocol has no such refusal, so
-    /// what remains -- and what this asserts -- is the evidence
-    /// `reclassify_pre_ready_lifecycle_failure` always required: the
-    /// membership owner independently proving that an exact captured process
-    /// was replaced. Only the failure that evidence is applied to moved.
-    #[test]
-    fn exactly_one_intent_still_runs_on_the_retired_lifecycle() {
-        // The task protocol is the production path. Statistics is the single
-        // exception, because its payload is produced by the fragment terminal
-        // fact and NCP-8 owns moving it onto the root result plane.
-        //
-        // This asserts over every intent rather than over the exception, so
-        // adding an intent forces a decision here instead of inheriting one.
-        // The dangerous direction is silent: an intent that drifted onto the
-        // lifecycle path would run on the retired stack and succeed, with
-        // nothing downstream reporting it. The other direction is loud -- the
-        // task path refuses Statistics in its own intent match.
-        for intent in [
-            DistributedQueryIntent::Result,
-            DistributedQueryIntent::Write,
-            DistributedQueryIntent::Profile,
-        ] {
-            assert!(
-                !super::runs_on_query_lifecycle(intent),
-                "{intent:?} must run on the task protocol"
-            );
-        }
-        assert!(
-            super::runs_on_query_lifecycle(DistributedQueryIntent::Statistics),
-            "ANALYZE has no carrier on the task protocol until NCP-8 moves it"
-        );
     }
 
     #[test]
@@ -3902,27 +3769,26 @@ impl TaskRoundWaitWitness {
     }
 }
 
-/// Everything both execution paths receive from the shared preamble.
+/// Everything the task-protocol attempt receives from its shared preamble.
 ///
-/// It exists so the two paths take the same frozen inputs rather than
-/// re-deriving any of them: one attempt is scheduled, sealed and budgeted
-/// exactly once, whichever path runs it.
+/// The handoff keeps the inputs move-only: one attempt is scheduled, sealed
+/// and budgeted exactly once before its task graph becomes the lifecycle owner.
 struct RoundHandoff<'a> {
     query_id: QueryId,
     execution_id: QueryExecutionId,
     statement_deadline: Instant,
     timeout_ms: i64,
     intent: DistributedQueryIntent,
-    /// Only the request fields both paths still need: `artifacts` is consumed
+    /// Only the request fields the task round still needs: `artifacts` is consumed
     /// by the preamble that produced `runtime_filter_ready`, so the request
     /// cannot travel whole.
     cancellation: crate::common::query_cancellation::QueryCancellationView,
     completion: crate::query_execution::contract::QueryOutcomeFactory,
     topology: BackendTopologySnapshot,
-    statistics_program: Option<crate::query_execution::statistics::StatisticsCollectionProgram>,
+    statistics_decoder: Option<crate::query_execution::statistics::StatisticsRootResultDecoder>,
+    write_decoder: Option<crate::query_execution::write_result::RootWriteResultDecoder>,
     write_stack_session: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     backend_services: QueryBackendServices,
-    dispatcher: Arc<dyn FragmentDispatcher>,
     retry_boundary: Option<&'a dyn PreReadyRetryBoundary>,
     runtime_filter_ready: RuntimeFilterDeploymentReadyDistributedQuery,
     init_options: QueryInitOptions,

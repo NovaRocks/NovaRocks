@@ -982,6 +982,8 @@ mod tests {
                     name: "row_number".to_string(),
                     args: vec![],
                     distinct: false,
+                    function_order_by: vec![],
+                    aggregate_binding: None,
                     partition_by: vec![column_expr(1, None, "k")],
                     order_by: vec![SortItem {
                         expr: column_expr(1, None, "k"),

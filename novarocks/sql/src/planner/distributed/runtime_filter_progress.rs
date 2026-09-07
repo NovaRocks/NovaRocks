@@ -43,6 +43,7 @@ fn fragment_local_input_closed(kind: &DistributedNodeKind) -> bool {
         DistributedNodeKind::Scan(_)
         | DistributedNodeKind::Filter(_)
         | DistributedNodeKind::Project(_)
+        | DistributedNodeKind::Unpivot(_)
         | DistributedNodeKind::Sort(_)
         | DistributedNodeKind::Values(_)
         | DistributedNodeKind::Repeat(_)

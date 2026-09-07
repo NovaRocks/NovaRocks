@@ -35,6 +35,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::RuntimeState;
 
 use super::distinct_set_shared::{DistinctSetSemantics, DistinctSetSharedState};
@@ -67,6 +68,7 @@ impl<S: DistinctSetSemantics> OperatorFactory for DistinctSetSinkFactory<S> {
             stage: self.stage,
             state: self.state.clone(),
             finished: false,
+            mem_tracker: None,
             _semantics: PhantomData,
         })
     }
@@ -81,12 +83,17 @@ struct DistinctSetSinkOperator<S: DistinctSetSemantics> {
     stage: usize,
     state: DistinctSetSharedState<S>,
     finished: bool,
+    mem_tracker: Option<Arc<MemTracker>>,
     _semantics: PhantomData<S>,
 }
 
 impl<S: DistinctSetSemantics> Operator for DistinctSetSinkOperator<S> {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        self.mem_tracker = Some(tracker);
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -116,7 +123,10 @@ impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSinkOperator<S> {
             return Ok(());
         }
         if self.stage == 0 {
-            self.state.ingest_build(&chunk)?;
+            let tracker = self.mem_tracker.as_ref().ok_or_else(|| {
+                "distinct set key-table memory tracker must be bound before ingestion".to_string()
+            })?;
+            self.state.ingest_build(&chunk, Arc::clone(tracker))?;
         } else {
             self.state.ingest_probe(self.stage, &chunk)?;
         }

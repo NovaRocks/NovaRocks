@@ -22,8 +22,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{DateTime, NaiveDate};
-
-use super::AggKernelEntry;
+use novarocks_functions::AggregateInputBatch;
 
 pub enum AggInputView<'a> {
     None,
@@ -66,32 +65,18 @@ impl<'a> AvgDecimalStateView<'a> {
     }
 }
 
-pub fn build_agg_input_views_from_kernels<'a>(
-    kernels: &[AggKernelEntry],
+pub fn build_agg_input_batches_with_row_count<'a>(
     arrays: &'a [Option<ArrayRef>],
-) -> Result<Vec<AggInputView<'a>>, String> {
-    let mut views = Vec::with_capacity(kernels.len());
-    for (idx, kernel) in kernels.iter().enumerate() {
-        let array = arrays
-            .get(idx)
-            .ok_or_else(|| "aggregate input missing".to_string())?;
-        views.push(kernel.build_input_view(array)?);
+    row_count: usize,
+) -> Result<Vec<AggregateInputBatch<'a>>, String> {
+    let mut batches = Vec::with_capacity(arrays.len());
+    for array in arrays {
+        batches.push(
+            AggregateInputBatch::try_new(array.as_ref(), row_count)
+                .map_err(|error| error.to_string())?,
+        );
     }
-    Ok(views)
-}
-
-pub fn build_agg_merge_views_from_kernels<'a>(
-    kernels: &[AggKernelEntry],
-    arrays: &'a [Option<ArrayRef>],
-) -> Result<Vec<AggInputView<'a>>, String> {
-    let mut views = Vec::with_capacity(kernels.len());
-    for (idx, kernel) in kernels.iter().enumerate() {
-        let array = arrays
-            .get(idx)
-            .ok_or_else(|| "aggregate input missing".to_string())?;
-        views.push(kernel.build_merge_view(array)?);
-    }
-    Ok(views)
+    Ok(batches)
 }
 
 #[derive(Clone, Debug)]
@@ -379,5 +364,44 @@ fn format_decimal(unscaled: i128, scale: i8) -> String {
         } else {
             format!("{}.{}", integer_part, fractional_part)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Fields};
+
+    use super::build_agg_input_batches_with_row_count;
+
+    #[test]
+    fn aggregate_input_batches_keep_zero_argument_row_count() {
+        let batches = build_agg_input_batches_with_row_count(&[None], 7).unwrap();
+        assert_eq!(batches[0].row_count(), 7);
+        assert!(batches[0].values().is_none());
+    }
+
+    #[test]
+    fn aggregate_input_batches_preserve_packed_struct_owner() {
+        let left: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
+        let right: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let packed: ArrayRef = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Field::new("f0", DataType::Int64, true),
+                Field::new("f1", DataType::Utf8, true),
+            ]),
+            vec![left, right],
+            None,
+        ));
+        let arrays = [Some(packed)];
+
+        let batches = build_agg_input_batches_with_row_count(&arrays, 2).unwrap();
+        assert_eq!(batches[0].row_count(), 2);
+        assert!(matches!(
+            batches[0].values().map(|array| array.data_type()),
+            Some(DataType::Struct(fields)) if fields.len() == 2
+        ));
     }
 }

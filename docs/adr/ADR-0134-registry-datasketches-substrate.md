@@ -10,7 +10,7 @@ provenance:
   - "discussion: 2026-09-03 registry DataSketches substrate decision"
   - "PR: pending — backfill the number once the registry cutover merges"
 code-anchors:
-  - "novarocks/connector/iceberg/src/theta_sketch.rs (ThetaSketchHandle)"
+  - "novarocks/connector/iceberg-functions/src/theta.rs (IcebergThetaAggregateFamily)"
   - "novarocks/execution/src/exec/hll.rs (HllHandle allocation admission)"
 ---
 

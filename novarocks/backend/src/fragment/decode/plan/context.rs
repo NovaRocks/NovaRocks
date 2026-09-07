@@ -31,6 +31,7 @@ use novarocks_execution::runtime::exchange::ExchangeKey;
 use novarocks_execution::runtime::fragment::ExchangeInputAssignment;
 use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentInstanceId};
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_functions::EngineFunctionCatalog;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{common, expr};
@@ -206,6 +207,7 @@ pub(crate) struct NativePlanDecodeContext {
     /// Absent for a fragment with no typed connector scan; a typed scan that
     /// finds it absent fails closed rather than inventing a registry.
     typed_scan_runtime: Option<TypedScanRuntime>,
+    function_catalog: Option<Arc<EngineFunctionCatalog>>,
 }
 
 impl Default for NativePlanDecodeContext {
@@ -220,6 +222,7 @@ impl Default for NativePlanDecodeContext {
             fragment_instance_id: FragmentInstanceId::new(novarocks_types::UniqueId::new(0, 0)),
             exchange_wait: Duration::from_millis(120_000),
             typed_scan_runtime: None,
+            function_catalog: None,
         }
     }
 }
@@ -249,12 +252,22 @@ impl NativePlanDecodeContext {
             fragment_instance_id,
             exchange_wait,
             typed_scan_runtime: None,
+            function_catalog: None,
         }
     }
 
     pub(crate) fn with_typed_scan_runtime(mut self, runtime: Option<TypedScanRuntime>) -> Self {
         self.typed_scan_runtime = runtime;
         self
+    }
+
+    pub(crate) fn with_function_catalog(mut self, catalog: Arc<EngineFunctionCatalog>) -> Self {
+        self.function_catalog = Some(catalog);
+        self
+    }
+
+    pub(crate) fn function_catalog(&self) -> Option<&EngineFunctionCatalog> {
+        self.function_catalog.as_deref()
     }
 
     pub(crate) fn typed_scan_runtime(&self) -> Option<&TypedScanRuntime> {

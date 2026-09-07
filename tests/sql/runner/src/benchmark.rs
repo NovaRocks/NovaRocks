@@ -331,10 +331,7 @@ fn run_workload_protocol(
         false,
     )?;
     let target = BenchmarkClusterTarget {
-        host: server
-            .target_host()
-            .unwrap_or("127.0.0.1")
-            .to_owned(),
+        host: server.target_host().unwrap_or("127.0.0.1").to_owned(),
         port: server
             .target_port()
             .context("benchmark cluster did not expose a MySQL port")?
@@ -426,7 +423,12 @@ fn run_workload_protocol(
     let shutdown_result = server.shutdown();
     let residual = server.residual_process_ids();
 
-    match (primary, cleanup_result, shutdown_result, residual.is_empty()) {
+    match (
+        primary,
+        cleanup_result,
+        shutdown_result,
+        residual.is_empty(),
+    ) {
         (Ok(()), Ok(()), Ok(()), true) => Ok(()),
         (Err(primary), Ok(()), Ok(()), true) => Err(primary),
         (primary, cleanup, shutdown, no_residual) => {
@@ -487,6 +489,7 @@ fn run_pass(
         no_verify: !phase_requires_result_verification(phase),
         update_expected: false,
         write_actual_dir: None,
+        failure_artifact_dir: None,
         only: benchmark.only.clone(),
         skip: None,
         limit: None,

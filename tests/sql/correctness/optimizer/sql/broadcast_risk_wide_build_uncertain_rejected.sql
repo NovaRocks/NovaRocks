@@ -19,7 +19,8 @@
 CREATE DATABASE IF NOT EXISTS ${case_db};
 USE ${case_db};
 CREATE TABLE probe_1m_exact (k INT);
-CREATE TABLE build_wide_unanalyzed (k INT, pad VARCHAR(500));
+CREATE TABLE build_wide_unanalyzed (k INT, pad VARCHAR(500))
+TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
 INSERT INTO probe_1m_exact
     SELECT generate_series FROM TABLE(generate_series(1, 1000000));
 INSERT INTO build_wide_unanalyzed

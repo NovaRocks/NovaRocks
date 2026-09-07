@@ -26,7 +26,6 @@ use crate::optimizer::operator::{
 use crate::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::optimizer::scalar_expr;
-use novarocks_types::aggregate::infer_agg_function_types;
 
 pub(crate) struct SplitAggregateRule;
 
@@ -191,30 +190,8 @@ fn local_aggregate_intermediate_type(
     call: &ScalarAggregateSpec,
     source_output: Option<&OutputColumn>,
 ) -> DataType {
-    let effective_name = if call.distinct {
-        match call.name.as_str() {
-            "count" => "multi_distinct_count",
-            "sum" => "multi_distinct_sum",
-            _ => call.name.as_str(),
-        }
-    } else {
-        call.name.as_str()
-    };
-    let mut input_types = call
-        .args
-        .iter()
-        .map(|expr| arena.data_type(*expr).clone())
-        .collect::<Vec<_>>();
-    input_types.extend(
-        call.order_by
-            .iter()
-            .map(|item| arena.data_type(item.expr).clone()),
-    );
-    infer_agg_function_types(effective_name, &input_types, call.distinct)
-        .ok()
-        .and_then(|(_, intermediate)| intermediate)
-        .or_else(|| source_output.map(|output| output.data_type.clone()))
-        .unwrap_or(DataType::Null)
+    let _ = (arena, source_output);
+    call.resolved.intermediate_type.clone()
 }
 
 pub(crate) fn group_key_output_column_id(
@@ -332,6 +309,11 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
+            resolved: crate::functions::test_resolved_aggregate(
+                "count",
+                &[DataType::Int64],
+                distinct,
+            ),
         }
     }
 
@@ -547,6 +529,11 @@ mod tests {
                 args: vec![arg],
                 distinct: false,
                 order_by: vec![],
+                resolved: crate::functions::test_resolved_aggregate(
+                    "sum",
+                    &[DataType::Int64],
+                    false,
+                ),
             }],
             AggregateOutputLayout::new(
                 vec![OutputColumn {
@@ -635,6 +622,7 @@ mod tests {
             result_type: arrow::datatypes::DataType::Float64,
             order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
+            resolved: crate::functions::test_resolved_aggregate("avg", &[DataType::Int64], false),
         }
     }
 

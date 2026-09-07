@@ -65,8 +65,8 @@ pub use clock::{BackendMonotonicClock, ManualClock, ProcessMonotonicClock};
 pub use context_host::NativeQueryContextHost;
 pub use credential_slot::QueryContextCredentialSlot;
 pub use execution_host::{
-    InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, TaskInboundCapabilities,
-    TaskQueryContextFacts,
+    InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, QueryContextOptions,
+    TaskInboundCapabilities, TaskQueryContextFacts,
 };
 pub use host::{
     HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,

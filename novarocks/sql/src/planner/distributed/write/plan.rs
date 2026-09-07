@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::WriterAuxiliaryPlan;
 use super::change_stream::{
     ChangeStreamRoute, ChangeStreamRouterSink, ChangeStreamWriteDagSpec,
     SqlChangeStreamWriteTopology, SqlChangeStreamWriterRoute, route_output_ordinals,
@@ -22,7 +23,7 @@ use super::change_stream::{
 use super::contract::{ConnectorWriteInputBinding, SqlWritePlanInput};
 use super::node::{
     TableFinishNode, TableWriterNode, table_finish_output_columns, table_writer_output_columns,
-    write_relation_output_slot_ids,
+    writer_multiplex_output_slot_ids,
 };
 use super::sink::ConnectorWritePlanInput;
 use crate::analysis::{ExprKind, OutputColumn, TypedExpr};
@@ -32,7 +33,7 @@ use crate::planner::distributed::{
     ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
     PartitionKind, PlanFragment,
 };
-use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+use novarocks_spi::connector::write_stack::{WriteTargetOrdinal, WriterMultiplexSchema};
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlannedSqlChangeStreamDistributedPlan {
@@ -55,29 +56,32 @@ pub(in crate::planner::distributed) struct PlannedSqlChangeStreamDistributedPlan
 // `TableFinish` fragment on the plan root, and emit the query result through the
 // ordinary `DataSink::Result`.
 
-/// Build a distributed plan whose writer is a dataflow `TableWriter` feeding a
-/// single Root `TableFinish` fragment.
-pub(crate) fn build_table_writer_finish_distributed_plan(
+pub(crate) fn build_table_writer_finish_distributed_plan_with_auxiliary(
     physical: &crate::planner::physical::PhysicalPlanNode,
     sink: ConnectorWritePlanInput,
     write_target_ordinal: WriteTargetOrdinal,
+    auxiliary: &WriterAuxiliaryPlan,
 ) -> Result<DistributedPlan, String> {
     let draft = crate::planner::distributed::build::build_distributed_plan_draft(physical)?;
-    let draft = with_table_writer_finish(draft, sink, write_target_ordinal)?;
+    let draft =
+        with_table_writer_finish_with_auxiliary(draft, sink, write_target_ordinal, auxiliary)?;
     crate::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
 }
 
-/// Build a dataflow writer/finish plan from the compiler-owned write contract.
-pub(crate) fn build_sql_table_writer_finish_distributed_plan(
+pub(crate) fn build_sql_table_writer_finish_distributed_plan_with_auxiliary(
     physical: &crate::planner::physical::PhysicalPlanNode,
     sink: SqlWritePlanInput,
     write_target_ordinal: WriteTargetOrdinal,
+    auxiliary: &WriterAuxiliaryPlan,
 ) -> Result<DistributedPlan, String> {
-    build_table_writer_finish_distributed_plan(
-        physical,
+    let draft = crate::planner::distributed::build::build_distributed_plan_draft(physical)?;
+    let draft = with_table_writer_finish_with_auxiliary(
+        draft,
         ConnectorWritePlanInput::from_sql_write_plan_input(sink),
         write_target_ordinal,
-    )
+        auxiliary,
+    )?;
+    crate::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
 }
 
 /// Build a dataflow change-stream write plan: the router root keeps its
@@ -85,12 +89,13 @@ pub(crate) fn build_sql_table_writer_finish_distributed_plan(
 /// fragment, and all of them gather into one Root `TableFinish` fragment.
 ///
 /// Dataflow successor of [`build_sql_change_stream_distributed_plan`].
-pub(crate) fn build_sql_change_stream_table_writer_finish_distributed_plan(
+pub(crate) fn build_sql_change_stream_table_writer_finish_distributed_plan_with_auxiliary(
     physical: &crate::planner::physical::PhysicalPlanNode,
     dag: ChangeStreamWriteDagSpec,
+    auxiliary: &WriterAuxiliaryPlan,
 ) -> Result<PlannedSqlChangeStreamDistributedPlan, String> {
     let draft = crate::planner::distributed::build::build_distributed_plan_draft(physical)?;
-    let planned = with_sql_change_stream_table_writer_finish(draft, dag)?;
+    let planned = with_sql_change_stream_table_writer_finish_with_auxiliary(draft, dag, auxiliary)?;
     let distributed_plan = crate::planner::distributed::seal::seal_draft(planned.distributed_plan)
         .map_err(|error| error.to_string())?;
     Ok(PlannedSqlChangeStreamDistributedPlan {
@@ -124,10 +129,21 @@ pub(in crate::planner::distributed) fn with_sql_table_writer_finish(
 /// -> `TableFinish` -> `DataSink::Result`) becomes the plan root. Even a
 /// single-fragment INSERT gets its own Root finish fragment; there is
 /// deliberately no "the writer fragment is already the root" shortcut.
+#[cfg(any(test, feature = "test-support"))]
 pub(in crate::planner::distributed) fn with_table_writer_finish(
+    plan: DistributedPlanDraft,
+    sink: ConnectorWritePlanInput,
+    write_target_ordinal: WriteTargetOrdinal,
+) -> Result<DistributedPlanDraft, String> {
+    let auxiliary = WriterAuxiliaryPlan::without_requirements([write_target_ordinal])?;
+    with_table_writer_finish_with_auxiliary(plan, sink, write_target_ordinal, &auxiliary)
+}
+
+pub(in crate::planner::distributed) fn with_table_writer_finish_with_auxiliary(
     mut plan: DistributedPlanDraft,
     sink: ConnectorWritePlanInput,
     write_target_ordinal: WriteTargetOrdinal,
+    auxiliary: &WriterAuxiliaryPlan,
 ) -> Result<DistributedPlanDraft, String> {
     let root_fragment_id = plan
         .root_fragment_id
@@ -158,6 +174,8 @@ pub(in crate::planner::distributed) fn with_table_writer_finish(
         write_target_ordinal,
         sink.input,
         output_contract,
+        auxiliary.schema().clone(),
+        auxiliary.partial_for(write_target_ordinal)?,
         &mut ids,
     );
     let writer_stats = writer_fragment.root.stats.clone();
@@ -166,6 +184,8 @@ pub(in crate::planner::distributed) fn with_table_writer_finish(
 
     let (finish_fragment, finish_edges) = build_table_finish_fragment(
         &[(writer_fragment_id, writer_stats, write_target_ordinal)],
+        auxiliary.schema(),
+        auxiliary.final_plan(),
         &mut ids,
     )?;
     plan.root_fragment_id = Some(finish_fragment.fragment_id);
@@ -180,9 +200,21 @@ pub(in crate::planner::distributed) fn with_table_writer_finish(
 /// every writer streams into the same Root `TableFinish` fragment.
 ///
 /// Write target ordinals are dense from 0 in the route order the DAG spec gives.
+#[cfg(any(test, feature = "test-support"))]
 pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finish(
+    plan: DistributedPlanDraft,
+    dag: ChangeStreamWriteDagSpec,
+) -> Result<PlannedSqlChangeStreamDistributedPlanDraft, String> {
+    let auxiliary = WriterAuxiliaryPlan::without_requirements(
+        dag.routes.iter().map(|route| route.write_target_ordinal),
+    )?;
+    with_sql_change_stream_table_writer_finish_with_auxiliary(plan, dag, &auxiliary)
+}
+
+pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finish_with_auxiliary(
     mut plan: DistributedPlanDraft,
     dag: ChangeStreamWriteDagSpec,
+    auxiliary: &WriterAuxiliaryPlan,
 ) -> Result<PlannedSqlChangeStreamDistributedPlanDraft, String> {
     dag.validate()?;
     if dag.routes.is_empty() {
@@ -307,6 +339,8 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finis
             route_write_target_ordinal,
             sink_template.input,
             output_contract,
+            auxiliary.schema().clone(),
+            auxiliary.partial_for(route_write_target_ordinal)?,
             &mut ids,
         );
         writers.push((
@@ -355,7 +389,12 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finis
     plan.fragments.extend(writer_fragments);
     plan.edges.extend(router_edges);
 
-    let (finish_fragment, finish_edges) = build_table_finish_fragment(&writers, &mut ids)?;
+    let (finish_fragment, finish_edges) = build_table_finish_fragment(
+        &writers,
+        auxiliary.schema(),
+        auxiliary.final_plan(),
+        &mut ids,
+    )?;
     plan.root_fragment_id = Some(finish_fragment.fragment_id);
     plan.fragments.push(finish_fragment);
     plan.edges.extend(finish_edges);
@@ -370,7 +409,6 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finis
 ///
 /// The ordinal vocabulary and its bound are owned by SPI; this only projects a
 /// planner-side position into it.
-
 /// One monotonic id source shared by every fragment, node, and tuple the write
 /// overlay creates. Allocating from a single cursor keeps the overlay's ids
 /// globally unique even when it creates several fragments at once.
@@ -417,6 +455,8 @@ fn into_table_writer_fragment(
     write_target_ordinal: WriteTargetOrdinal,
     input: ConnectorWriteInputBinding,
     output_contract: crate::planner::distributed::output::ConnectorWriteOutputContract,
+    writer_schema: WriterMultiplexSchema,
+    partial_aggregate_plan: super::WriterPartialAggregatePlan,
     ids: &mut WriteOverlayIds,
 ) -> PlanFragment {
     let fragment_id = fragment.fragment_id;
@@ -434,10 +474,12 @@ fn into_table_writer_fragment(
             runtime_filter_binding_ids: Vec::new(),
             children: vec![fragment.root],
             stats,
-            payload: DistributedNodeKind::TableWriter(TableWriterNode::new(
+            payload: DistributedNodeKind::TableWriter(TableWriterNode::new_with_aggregate_plan(
                 write_target_ordinal,
                 input,
                 output_contract,
+                writer_schema.clone(),
+                partial_aggregate_plan,
             )),
         },
         data_partition: fragment.data_partition,
@@ -445,7 +487,7 @@ fn into_table_writer_fragment(
         output_partition: DataPartition::unpartitioned(),
         sink: DataSink::Noop,
         output_exprs: None,
-        output_columns: table_writer_output_columns(),
+        output_columns: table_writer_output_columns(&writer_schema),
         cte_id: fragment.cte_id,
         cte_exchange_nodes: fragment.cte_exchange_nodes,
     }
@@ -461,14 +503,16 @@ fn build_table_finish_fragment(
         crate::planner::physical::PhysicalPlanStats,
         WriteTargetOrdinal,
     )],
+    writer_schema: &WriterMultiplexSchema,
+    final_aggregate_plan: &super::WriterFinalAggregatePlan,
     ids: &mut WriteOverlayIds,
 ) -> Result<(PlanFragment, Vec<FragmentEdge>), String> {
     let Some((_, first_stats, _)) = writers.first() else {
         return Err("table finish requires at least one table writer fragment".to_string());
     };
     let finish_fragment_id = ids.alloc_fragment();
-    let writer_columns = table_writer_output_columns();
-    let output_slot_ids = write_relation_output_slot_ids();
+    let writer_columns = table_writer_output_columns(writer_schema);
+    let output_slot_ids = writer_multiplex_output_slot_ids(writer_schema);
 
     let mut children = Vec::with_capacity(writers.len());
     let mut edges = Vec::with_capacity(writers.len());
@@ -518,9 +562,14 @@ fn build_table_finish_fragment(
             runtime_filter_binding_ids: Vec::new(),
             children,
             stats: first_stats.clone(),
-            payload: DistributedNodeKind::TableFinish(TableFinishNode::try_new(
-                expected_target_ordinals,
-            )?),
+            payload: DistributedNodeKind::TableFinish(
+                TableFinishNode::try_new_with_aggregate_plan(
+                    expected_target_ordinals,
+                    writer_schema.clone(),
+                    novarocks_spi::connector::write_stack::RootWriteResultSchema::new(),
+                    final_aggregate_plan.clone(),
+                )?,
+            ),
         },
         data_partition: DataPartition::unpartitioned(),
         output_partition: DataPartition::unpartitioned(),
@@ -707,7 +756,14 @@ fn stream_kind_for_data_partition(partition: &DataPartition) -> FragmentStreamKi
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use novarocks_functions::{
+        AggregateOverloadMetadata, EngineFunctionCatalogBuilder, FunctionDefinition,
+        FunctionVisibility, FunctionVolatility,
+    };
+    use novarocks_spi::connector::{
+        StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
+    };
 
     use super::target_ordinal_for_test;
 
@@ -723,9 +779,12 @@ mod tests {
     };
     use crate::planner::physical::{PhysicalPlanStats, PlannerConfidence};
 
-    use novarocks_spi::connector::write_stack::{root_output_schema, writer_output_schema};
+    use novarocks_spi::connector::write_stack::{root_write_result_schema, writer_output_schema};
 
-    use super::{with_sql_change_stream_table_writer_finish, with_sql_table_writer_finish};
+    use super::{
+        with_sql_change_stream_table_writer_finish,
+        with_sql_change_stream_table_writer_finish_with_auxiliary, with_sql_table_writer_finish,
+    };
 
     fn test_route(
         route_byte: u8,
@@ -875,6 +934,158 @@ mod tests {
     }
 
     #[test]
+    fn regular_change_stream_keeps_an_explicit_empty_auxiliary_plan_shape() {
+        let sealed = change_stream_table_writer_finish_test_plan();
+        let mut writer_count = 0;
+        for fragment in sealed.fragments() {
+            match &fragment.root.payload {
+                DistributedNodeKind::TableWriter(writer) => {
+                    writer_count += 1;
+                    assert!(writer.partial_aggregate_plan.calls().is_empty());
+                    assert!(
+                        writer
+                            .writer_multiplex_schema
+                            .auxiliary_channels()
+                            .is_empty()
+                    );
+                }
+                DistributedNodeKind::TableFinish(finish) => {
+                    assert!(finish.final_aggregate_plan.calls().is_empty());
+                    assert!(finish.final_aggregate_plan.unpivot().is_none());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(writer_count, 2);
+    }
+
+    fn change_stream_auxiliary_plan() -> super::super::WriterAuxiliaryPlan {
+        let definition = FunctionDefinition::try_new_exact_aggregate(
+            "$test_change_stream_blob",
+            FunctionVisibility::Hidden,
+            FunctionVolatility::Immutable,
+            [AggregateOverloadMetadata::try_new(
+                "test/change-stream-blob/i64/v1",
+                [DataType::Int64],
+                DataType::Binary,
+                DataType::Binary,
+                "test/change-stream-blob-state/v1",
+            )
+            .expect("aggregate overload")],
+        )
+        .expect("aggregate definition");
+        let mut functions = EngineFunctionCatalogBuilder::new();
+        functions.register(definition).expect("register aggregate");
+        let functions = functions.seal().expect("function catalog");
+        let requirements = [0, 1].map(|target| {
+            vec![
+                StatisticsRequiredAggregation::try_new(
+                    StatisticsScanColumn::try_new(0, "order_id", DataType::Int64, false)
+                        .expect("scan column"),
+                    "$test_change_stream_blob",
+                    StatisticsArtifactIdentity::try_new(
+                        vec![target + 1],
+                        "test-change-stream-blob-v1",
+                    )
+                    .expect("artifact identity"),
+                )
+                .expect("requirement"),
+            ]
+        });
+        let schemas = [
+            Schema::new(vec![Field::new("order_id", DataType::Int64, false)]),
+            Schema::new(vec![Field::new("order_id", DataType::Int64, false)]),
+        ];
+        super::super::auxiliary::plan_writer_statistics(
+            &[
+                super::super::auxiliary::WriterStatisticsTargetInput {
+                    target: target_ordinal_for_test(0),
+                    input_schema: &schemas[0],
+                    requirements: &requirements[0],
+                },
+                super::super::auxiliary::WriterStatisticsTargetInput {
+                    target: target_ordinal_for_test(1),
+                    input_schema: &schemas[1],
+                    requirements: &requirements[1],
+                },
+            ],
+            &functions,
+        )
+        .expect("change-stream auxiliary plan")
+    }
+
+    #[test]
+    fn change_stream_writers_and_single_finish_share_one_nonempty_auxiliary_plan() {
+        let plan = single_fragment_plan_for_test_with_columns(vec![
+            ("__row_mutation_effect", DataType::Int8),
+            ("delete_id", DataType::Int32),
+            ("replacement", DataType::Int32),
+        ]);
+        let dag = ChangeStreamWriteDagSpec::for_test(
+            0,
+            vec![
+                test_route(
+                    7,
+                    0,
+                    vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
+                    1,
+                    Vec::new(),
+                ),
+                test_route(
+                    8,
+                    1,
+                    vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace],
+                    2,
+                    Vec::new(),
+                ),
+            ],
+        );
+        let auxiliary = change_stream_auxiliary_plan();
+        let planned = with_sql_change_stream_table_writer_finish_with_auxiliary(
+            plan.into_draft(),
+            dag,
+            &auxiliary,
+        )
+        .expect("plan auxiliary change stream");
+        let sealed = crate::planner::distributed::seal::seal_draft(planned.distributed_plan)
+            .expect("auxiliary change stream seals");
+
+        let writers = sealed
+            .fragments()
+            .iter()
+            .filter_map(|fragment| match &fragment.root.payload {
+                DistributedNodeKind::TableWriter(writer) => Some(writer),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(writers.len(), 2);
+        for writer in writers {
+            assert_eq!(writer.partial_aggregate_plan.calls.len(), 1);
+            assert_eq!(writer.writer_multiplex_schema.auxiliary_channels().len(), 1);
+        }
+
+        let finish = sealed
+            .fragments()
+            .iter()
+            .find_map(|fragment| match &fragment.root.payload {
+                DistributedNodeKind::TableFinish(finish) => Some(finish),
+                _ => None,
+            })
+            .expect("single finish");
+        assert_eq!(finish.final_aggregate_plan.calls().len(), 1);
+        assert_eq!(
+            finish
+                .final_aggregate_plan
+                .unpivot()
+                .expect("artifact unpivot")
+                .mappings()
+                .len(),
+            2
+        );
+        assert_eq!(finish.writer_multiplex_schema.auxiliary_channels().len(), 1);
+    }
+
+    #[test]
     fn table_writer_finish_moves_the_result_root_onto_a_new_finish_fragment() {
         let planned = table_writer_finish_test_plan();
 
@@ -918,7 +1129,7 @@ mod tests {
             vec![0]
         );
         assert!(matches!(finish.sink, DataSink::Result));
-        assert_matches_schema(&finish.output_columns, &root_output_schema());
+        assert_matches_schema(&finish.output_columns, &root_write_result_schema());
         // Exchange receiver -> TableFinish.
         assert_eq!(finish.root.children.len(), 1);
         let DistributedNodeKind::Exchange(receiver) = &finish.root.children[0].payload else {
@@ -942,6 +1153,42 @@ mod tests {
             edge.output_partition.kind,
             crate::planner::distributed::PartitionKind::Unpartitioned
         ));
+    }
+
+    #[test]
+    fn seal_rejects_a_writer_multiplex_schema_that_differs_from_finish() {
+        let mut draft = with_sql_table_writer_finish(
+            single_fragment_plan_for_test().into_draft(),
+            test_support::simple_sql_write_plan_input(
+                ConnectorWriteInputBinding::RootOutputByOrdinal,
+            ),
+            target_ordinal_for_test(0),
+        )
+        .expect("attach dataflow table writer");
+        let writer = draft
+            .fragments
+            .iter_mut()
+            .find_map(|fragment| match &mut fragment.root.payload {
+                DistributedNodeKind::TableWriter(writer) => Some(writer),
+                _ => None,
+            })
+            .expect("writer");
+        writer.writer_multiplex_schema =
+            novarocks_spi::connector::write_stack::WriterMultiplexSchema::try_new(vec![
+                novarocks_spi::connector::write_stack::WriterAuxiliaryChannel::try_new(
+                    7,
+                    "generic_aux",
+                    DataType::Int64,
+                )
+                .expect("channel"),
+            ])
+            .expect("schema");
+        let error = crate::planner::distributed::seal::seal_draft(draft)
+            .expect_err("mismatched relation schemas");
+        assert!(
+            error.to_string().contains("multiplex schema differs"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1014,7 +1261,7 @@ mod tests {
                     .fragment_edge_outputs()
                     .fragment_output_columns(finish_fragment_id)
                     .expect("finish fragment output is sealed"),
-                &root_output_schema(),
+                &root_write_result_schema(),
             );
         }
     }

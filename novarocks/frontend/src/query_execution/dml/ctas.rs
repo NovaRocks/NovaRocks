@@ -644,7 +644,7 @@ fn plan_query_for_ctas_source(
         },
         novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
         &catalog_snapshot,
-        novarocks_sql::compiler::builtin_sql_function_catalog(),
+        state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
         novarocks_sql::compiler::SqlCompileControl::new(
@@ -701,10 +701,14 @@ fn prepare_planned_ctas_connector_write(
     let sealed = session
         .seal_write_targets()
         .map_err(|error| error.to_string())?;
+    let write_target_ordinal = sealed.sole_target_ordinal()?;
     let dataflow = novarocks_sql::planning::dml::build_ctas_connector_write_dataflow_plan(
         &planned.source,
         input_schema,
-        sealed.sole_target_ordinal()?,
+        write_target_ordinal,
+        session
+            .statistics_requirements(write_target_ordinal)
+            .map_err(|error| error.to_string())?,
         &planned.optimizer_settings,
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(

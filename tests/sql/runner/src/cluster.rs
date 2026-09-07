@@ -26,8 +26,8 @@ use std::time::Duration;
 
 #[allow(unused_imports)]
 pub(crate) use novarocks_cluster_harness::{
-    BePorts, ClusterProcessRole, CrossProcessRuntime, QueryLifecyclePhase, ServerHandle,
-    build_novarocks_command, render_cross_process_config, startup_timeout_from_env,
+    BePorts, ClusterProcessRole, CrossProcessRuntime, QueryLifecyclePhase, ServerFailureLogSources,
+    ServerHandle, build_novarocks_command, render_cross_process_config, startup_timeout_from_env,
 };
 use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHandle};
 

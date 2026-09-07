@@ -246,18 +246,13 @@ impl FrontendFragmentScheduler {
         }
 
         let root_fragment_id = view.execution_anchor();
-        let root = fragments.get(&root_fragment_id).ok_or_else(|| {
+        fragments.get(&root_fragment_id).ok_or_else(|| {
             DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "execution anchor is not present in scheduling view",
             )
         })?;
-        // A statistics root is an internal fanout terminal: unlike a client
-        // result root it must retain its scan-derived cardinality so every
-        // scheduled backend contributes a bounded partial report.
-        if !root.is_statistics() {
-            counts.insert(root_fragment_id, 1);
-        }
+        counts.insert(root_fragment_id, 1);
 
         let fault_preferred = query_lifecycle_fault_preferred_live_index(&self.backends)?;
         if fault_preferred.is_some_and(|live_index| live_index >= backend_count) {

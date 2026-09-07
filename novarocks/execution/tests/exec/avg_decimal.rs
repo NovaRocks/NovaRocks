@@ -22,6 +22,31 @@ use arrow::datatypes::DataType;
 use novarocks_execution::exec::expr::ExprId;
 use novarocks_execution::exec::expr::agg;
 use novarocks_execution::exec::node::aggregate::{AggFunction, AggTypeSignature};
+use novarocks_functions::AggregateInputBatch;
+
+fn build_builtin_kernel_set(
+    functions: &[AggFunction],
+    input_types: &[Option<DataType>],
+    argument_types: &[Vec<DataType>],
+) -> Result<agg::AggKernelSet, String> {
+    let mut builder = agg::ExecutionFunctionSetBuilder::new();
+    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+        .map_err(|error| error.to_string())?;
+    agg::contribute_builtin_aggregate_implementations(&mut builder)
+        .map_err(|error| error.to_string())?;
+    let function_set = builder.seal().map_err(|error| error.to_string())?;
+    let selected = functions
+        .iter()
+        .zip(argument_types)
+        .map(|(function, argument_types)| {
+            function_set
+                .catalog()
+                .resolve_aggregate_trusted(&function.name, argument_types)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    agg::build_kernel_set(&function_set, functions, input_types, &selected)
+}
 
 #[test]
 fn test_avg_decimal_round_half_up_positive() {
@@ -47,15 +72,21 @@ fn test_avg_decimal_round_half_up_positive() {
 
     let arrays = [Some(input.clone())];
     let input_types = vec![Some(input.data_type().clone())];
-    let kernels = agg::build_kernel_set(&[func], &input_types).unwrap();
+    let kernels =
+        build_builtin_kernel_set(&[func], &input_types, &[vec![input.data_type().clone()]])
+            .unwrap();
 
     let mut arena = agg::AggStateArena::new(64 * 1024);
     let base = arena.alloc(kernels.layout.total_size, kernels.entries[0].state_align());
-    kernels.entries[0].init_state(base);
+    kernels.entries[0].init_state(base).expect("init state");
 
-    let view = kernels.entries[0].build_input_view(&arrays[0]).unwrap();
     let state_ptrs = vec![base; 2];
-    kernels.entries[0].update_batch(&state_ptrs, &view).unwrap();
+    kernels.entries[0]
+        .update_batch(
+            &state_ptrs,
+            AggregateInputBatch::try_new(arrays[0].as_ref(), 2).unwrap(),
+        )
+        .unwrap();
 
     let out = kernels.entries[0].build_array(&[base], false).unwrap();
     let out = out
@@ -90,15 +121,21 @@ fn test_avg_decimal_round_half_up_negative() {
 
     let arrays = [Some(input.clone())];
     let input_types = vec![Some(input.data_type().clone())];
-    let kernels = agg::build_kernel_set(&[func], &input_types).unwrap();
+    let kernels =
+        build_builtin_kernel_set(&[func], &input_types, &[vec![input.data_type().clone()]])
+            .unwrap();
 
     let mut arena = agg::AggStateArena::new(64 * 1024);
     let base = arena.alloc(kernels.layout.total_size, kernels.entries[0].state_align());
-    kernels.entries[0].init_state(base);
+    kernels.entries[0].init_state(base).expect("init state");
 
-    let view = kernels.entries[0].build_input_view(&arrays[0]).unwrap();
     let state_ptrs = vec![base; 2];
-    kernels.entries[0].update_batch(&state_ptrs, &view).unwrap();
+    kernels.entries[0]
+        .update_batch(
+            &state_ptrs,
+            AggregateInputBatch::try_new(arrays[0].as_ref(), 2).unwrap(),
+        )
+        .unwrap();
 
     let out = kernels.entries[0].build_array(&[base], false).unwrap();
     let out = out
@@ -124,8 +161,12 @@ fn test_avg_intermediate_binary_requires_type_signature() {
         order: Default::default(),
     };
 
-    let err = agg::build_kernel_set(&[func], &[Some(DataType::Binary)])
-        .expect_err("expected error without output_type signature");
+    let err = build_builtin_kernel_set(
+        &[func],
+        &[Some(DataType::Binary)],
+        &[vec![DataType::Binary]],
+    )
+    .expect_err("expected error without output_type signature");
 
     assert!(
         err.contains("output_type signature"),
@@ -134,24 +175,29 @@ fn test_avg_intermediate_binary_requires_type_signature() {
 }
 
 #[test]
-fn test_avg_intermediate_binary_with_signature_builds() {
+fn test_avg_intermediate_utf8_with_exact_catalog_signature_builds() {
     let func = AggFunction {
         name: "avg".to_string(),
         inputs: vec![ExprId(0)],
         input_is_intermediate: true,
         types: Some(AggTypeSignature {
-            intermediate_type: Some(DataType::Binary),
-            output_type: Some(DataType::Decimal128(10, 2)),
+            intermediate_type: Some(DataType::Utf8),
+            output_type: Some(DataType::Decimal128(38, 8)),
             input_arg_type: Some(DataType::Decimal128(10, 2)),
         }),
         order: Default::default(),
     };
 
-    let kernels = agg::build_kernel_set(&[func], &[Some(DataType::Binary)]).unwrap();
+    let kernels = build_builtin_kernel_set(
+        &[func],
+        &[Some(DataType::Utf8)],
+        &[vec![DataType::Decimal128(10, 2)]],
+    )
+    .unwrap();
 
     assert_eq!(kernels.entries.len(), 1);
     assert_eq!(
         kernels.entries[0].output_type(false),
-        DataType::Decimal128(10, 2)
+        DataType::Decimal128(38, 8)
     );
 }

@@ -154,10 +154,22 @@ pub enum QueryLifecycleFaultKind {
     /// Fails the single root aggregation at commit-fragment carrier
     /// validation. Like the writer fault it only rejects, never repairs.
     ConnectorWriteRootFailure,
+    /// Rejects an ordinary partial aggregate update inside `TableWriter`.
+    ConnectorWritePartialUpdateFailure,
+    /// Rejects ordinary partial aggregate finalization inside `TableWriter`.
+    ConnectorWritePartialFinalizeFailure,
+    /// Rejects an ordinary final aggregate merge inside `TableFinish`.
+    ConnectorWriteFinalMergeFailure,
+    /// Rejects ordinary final aggregate finalization inside `TableFinish`.
+    ConnectorWriteFinalFinalizeFailure,
+    /// Holds the first append reached by one writer until the owning attempt
+    /// is cancelled. This is a debug-only rendezvous used to prove that a
+    /// query deadline aborts an already-open provider writer.
+    ConnectorWriteAppendHold,
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 40] = [
         Self::InitAckDrop,
         Self::StartAckSuppress,
         Self::RestartAfterInitAck,
@@ -193,6 +205,11 @@ impl QueryLifecycleFaultKind {
         Self::RuntimeFilterFeedbackForeignAttempt,
         Self::ConnectorWriteWriterFailure,
         Self::ConnectorWriteRootFailure,
+        Self::ConnectorWritePartialUpdateFailure,
+        Self::ConnectorWritePartialFinalizeFailure,
+        Self::ConnectorWriteFinalMergeFailure,
+        Self::ConnectorWriteFinalFinalizeFailure,
+        Self::ConnectorWriteAppendHold,
     ];
 
     pub const fn file_stem(self) -> &'static str {
@@ -234,6 +251,13 @@ impl QueryLifecycleFaultKind {
             Self::RuntimeFilterFeedbackForeignAttempt => "runtime-filter-feedback-foreign-attempt",
             Self::ConnectorWriteWriterFailure => "connector-write-writer-failure",
             Self::ConnectorWriteRootFailure => "connector-write-root-failure",
+            Self::ConnectorWritePartialUpdateFailure => "connector-write-partial-update-failure",
+            Self::ConnectorWritePartialFinalizeFailure => {
+                "connector-write-partial-finalize-failure"
+            }
+            Self::ConnectorWriteFinalMergeFailure => "connector-write-final-merge-failure",
+            Self::ConnectorWriteFinalFinalizeFailure => "connector-write-final-finalize-failure",
+            Self::ConnectorWriteAppendHold => "connector-write-append-hold",
         }
     }
 
@@ -253,7 +277,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 30] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 35] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -296,11 +320,15 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 30] = [
     QueryLifecycleFaultKind::CreateTaskReceiptForeignTask,
     QueryLifecycleFaultKind::TaskStatusForeignProcess,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignAttempt,
-    // The write data plane's two faults. Both only ever fail: a writer fault
-    // fires at commit-fragment egress, after the writer already staged, and a
-    // root fault fires at carrier validation. Neither substitutes a value.
+    // The write data plane faults only ever reject at exact execution
+    // boundaries; none substitutes a carrier or aggregate value.
     QueryLifecycleFaultKind::ConnectorWriteWriterFailure,
     QueryLifecycleFaultKind::ConnectorWriteRootFailure,
+    QueryLifecycleFaultKind::ConnectorWritePartialUpdateFailure,
+    QueryLifecycleFaultKind::ConnectorWritePartialFinalizeFailure,
+    QueryLifecycleFaultKind::ConnectorWriteFinalMergeFailure,
+    QueryLifecycleFaultKind::ConnectorWriteFinalFinalizeFailure,
+    QueryLifecycleFaultKind::ConnectorWriteAppendHold,
 ];
 
 pub fn parse_runner_rfo_kind(value: &str) -> Option<QueryLifecycleFaultKind> {
@@ -739,14 +767,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 35);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 40);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 30);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 35);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)
@@ -802,6 +830,26 @@ mod tests {
         assert_eq!(
             parse_runner_rfo_kind("connector-write-root-failure"),
             Some(QueryLifecycleFaultKind::ConnectorWriteRootFailure)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("connector-write-partial-update-failure"),
+            Some(QueryLifecycleFaultKind::ConnectorWritePartialUpdateFailure)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("connector-write-partial-finalize-failure"),
+            Some(QueryLifecycleFaultKind::ConnectorWritePartialFinalizeFailure)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("connector-write-final-merge-failure"),
+            Some(QueryLifecycleFaultKind::ConnectorWriteFinalMergeFailure)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("connector-write-final-finalize-failure"),
+            Some(QueryLifecycleFaultKind::ConnectorWriteFinalFinalizeFailure)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("connector-write-append-hold"),
+            Some(QueryLifecycleFaultKind::ConnectorWriteAppendHold)
         );
         // A generic lifecycle hook stays out of reach of a harness.
         assert_eq!(parse_runner_rfo_kind("init-ack-drop"), None);

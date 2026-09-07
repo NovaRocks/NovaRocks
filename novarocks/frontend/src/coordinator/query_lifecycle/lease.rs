@@ -47,9 +47,9 @@ use super::{
 };
 use crate::coordinator::query_registry::ActiveQueryAttemptBinding;
 use crate::coordinator::query_registry::{
-    ActiveQueryAttemptControl, FrontendQueryRegistry, QueryLifecycleConvergenceErrorSource,
-    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
-    RuntimeFilterTerminalRollupUnavailable,
+    ActiveQueryAttemptControl, FrontendQueryRegistry, LatchedQueryFailure, QueryFailureCause,
+    QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceSnapshot,
+    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
 };
 use crate::runtime_filter::feedback::{RuntimeFilterFeedbackAdmission, RuntimeFilterFeedbackState};
 
@@ -2020,20 +2020,28 @@ impl AttemptControl {
     }
 
     fn supervisor_failed(&self, reason: String, kind: SupervisorFailureKind) {
-        match kind {
-            SupervisorFailureKind::HeartbeatTimeout => self.metrics.heartbeat_timeout(),
-            SupervisorFailureKind::CoordinatorLost => self.metrics.coordinator_lost(),
-            SupervisorFailureKind::LocalFailure => self.metrics.local_failure(),
-        }
+        let cause = match kind {
+            SupervisorFailureKind::HeartbeatTimeout => {
+                self.metrics.heartbeat_timeout();
+                QueryFailureCause::LifecycleHeartbeatTimeout
+            }
+            SupervisorFailureKind::CoordinatorLost => {
+                self.metrics.coordinator_lost();
+                QueryFailureCause::RemoteTransportObservation
+            }
+            SupervisorFailureKind::LocalFailure => {
+                self.metrics.local_failure();
+                QueryFailureCause::BackendLocalFailure
+            }
+        };
         if let Some(registry) = self.registry.upgrade() {
             let query_id = self.execution_id.query_id();
             // A LocalFailure is delivered by the same control-stream reader
-            // that must receive TerminationAccepted. Dispatch cancellation on
-            // a separate thread so abort acknowledgement cannot deadlock
-            // behind its own event handler.
-            std::thread::spawn(move || {
-                let _ = registry.latch_failure_and_cancel(query_id, reason);
-            });
+            // that must receive TerminationAccepted. Record it synchronously,
+            // then dispatch cancellation separately so the causal failure is
+            // ordered before later liveness observations without deadlocking
+            // abort acknowledgement behind this reader.
+            let _ = registry.latch_failure_and_cancel_async(query_id, cause, reason);
         } else {
             let _ = self.abort_preserving(reason);
         }
@@ -2679,10 +2687,14 @@ impl ActiveQueryAttemptControl for AttemptControl {
         self.execution_id
     }
 
-    fn request_abort(&self, reason: String) {
-        let enriched = self.abort_preserving(reason);
+    fn request_abort(&self, failure: LatchedQueryFailure) {
+        let enriched = self.abort_preserving(failure.message().to_string());
         if let Some(registry) = self.registry.upgrade() {
-            let _ = registry.preserve_failure_context(self.execution_id.query_id(), enriched);
+            let _ = registry.preserve_failure_context(
+                self.execution_id.query_id(),
+                failure.id(),
+                enriched,
+            );
         }
     }
 

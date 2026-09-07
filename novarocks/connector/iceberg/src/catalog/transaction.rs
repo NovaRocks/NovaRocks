@@ -1,13 +1,6 @@
-// Part of this file has no production caller: the staging payload, the
-// update-commit dispatch, `adjudicate`, `abort_before_dispatch`, and the
-// existing-table / create-or-replace request shapes. Only the create path is
-// wired today, and it uses admission plus `commit`.
-//
-// This is not a design question -- the receipt shape it was once blocked on is
-// settled, and `CommitProof` carries it. What wires the rest is migrating the
-// `commit/**` layer off `vendored_client()` onto this transaction, which is a
-// bounded follow-up rather than a decision. Every item here is exercised by
-// tests, so this allowance hides unexercised code from nobody.
+// Create-or-replace remains outside the production write path, while existing
+// table publication and create both use this frontier. Every state transition
+// is covered by focused tests.
 #![allow(dead_code)]
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
@@ -62,24 +55,6 @@ use super::error::{
     uncommitted_failure_kind,
 };
 use super::{CatalogCreateIntent, CatalogTableName};
-
-/// Updates a publication will apply, supplied between admission and commit.
-///
-/// Existing-table publications only know what they are writing after the
-/// writer has run, which is the whole reason admission and dispatch are
-/// separate steps: the catalog proves it can publish *before* the source
-/// executes, and the staged result arrives later. Creations stage nothing.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct StagedCommit {
-    pub(crate) updates: Vec<crate::iceberg::TableUpdate>,
-    pub(crate) requirements: Vec<crate::iceberg::TableRequirement>,
-}
-
-impl StagedCommit {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.updates.is_empty()
-    }
-}
 
 /// The exact identity a publication attempt is bound to.
 ///
@@ -195,7 +170,7 @@ pub(crate) trait CatalogCommitDispatch: std::fmt::Debug + Send + Sync {
     /// dispatch question to [`super::error::proves_uncommitted`].
     async fn dispatch_once(
         &self,
-        staged: StagedCommit,
+        staged: Option<crate::iceberg::TableCommit>,
     ) -> Result<CommitProof, crate::iceberg::Error>;
 
     /// Re-read the catalog and report whether this exact publication is
@@ -287,7 +262,7 @@ pub(crate) struct Transaction {
     shape: TransactionShape,
     evidence: CatalogCommitEvidence,
     dispatch: Arc<dyn CatalogCommitDispatch>,
-    staged: StagedCommit,
+    staged: Option<crate::iceberg::TableCommit>,
     admission: AdmissionFacts,
     state: TransactionState,
 }
@@ -306,7 +281,7 @@ impl Transaction {
             shape,
             evidence,
             dispatch,
-            staged: StagedCommit::default(),
+            staged: None,
             admission: AdmissionFacts::default(),
             state: TransactionState::Admitted,
         }
@@ -348,7 +323,10 @@ impl Transaction {
     ///
     /// Refused once the frontier has moved: re-staging after a dispatch would
     /// mean publishing something other than what was admitted.
-    pub(crate) fn stage(&mut self, staged: StagedCommit) -> Result<(), ConnectorError> {
+    pub(crate) fn stage(
+        &mut self,
+        staged: crate::iceberg::TableCommit,
+    ) -> Result<(), ConnectorError> {
         if !matches!(self.state, TransactionState::Admitted) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -358,7 +336,7 @@ impl Transaction {
                 ),
             ));
         }
-        self.staged = staged;
+        self.staged = Some(staged);
         Ok(())
     }
 
@@ -406,7 +384,8 @@ impl Transaction {
             }
         }
 
-        match self.dispatch.dispatch_once(self.staged.clone()).await {
+        let staged = self.staged.take();
+        match self.dispatch.dispatch_once(staged).await {
             Ok(proof) => {
                 self.state = TransactionState::Committed;
                 let effect = proof.effect;
@@ -548,7 +527,10 @@ mod tests {
 
     #[async_trait]
     impl CatalogCommitDispatch for FakeDispatch {
-        async fn dispatch_once(&self, _staged: StagedCommit) -> Result<CommitProof, IcebergError> {
+        async fn dispatch_once(
+            &self,
+            _staged: Option<crate::iceberg::TableCommit>,
+        ) -> Result<CommitProof, IcebergError> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
                 Behavior::Succeed => Ok(CommitProof::applied(Some(41))),
@@ -602,6 +584,33 @@ mod tests {
         assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
         // Cleanup is legitimate here, so abort must succeed.
         tx.abort().await.expect("abort after definite rejection");
+    }
+
+    #[tokio::test]
+    async fn definite_conflict_retry_requires_a_fresh_one_dispatch_frontier() {
+        let first_dispatch = FakeDispatch::new(Behavior::RejectDefinitely);
+        let mut first = transaction(Arc::clone(&first_dispatch));
+        let first_outcome = first.commit().await;
+        assert!(matches!(
+            first_outcome,
+            CatalogOutcome::KnownUncommitted { ref failure }
+                if failure.kind() == ConnectorMutationFailureKind::Conflict
+        ));
+        assert_eq!(first_dispatch.dispatches.load(Ordering::SeqCst), 1);
+
+        let second_dispatch = FakeDispatch::new(Behavior::Succeed);
+        let mut fresh = transaction(Arc::clone(&second_dispatch));
+        assert!(matches!(
+            fresh.commit().await,
+            CatalogOutcome::KnownCommitted { .. }
+        ));
+        assert_eq!(second_dispatch.dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first_dispatch.dispatches.load(Ordering::SeqCst)
+                + second_dispatch.dispatches.load(Ordering::SeqCst),
+            2,
+            "two attempts must mean two distinct one-dispatch frontiers"
+        );
     }
 
     #[tokio::test]

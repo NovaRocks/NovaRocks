@@ -39,7 +39,6 @@ use crate::commit::PositionDeleteGroup;
 use crate::commit::abort::AbortLog;
 use crate::commit::report::IcebergWriterReport;
 use crate::commit::{CommitOpKind, WrittenFile};
-use crate::stats_assembler::FileSketchSet;
 
 #[derive(Default)]
 struct StagedEffectCounters {
@@ -85,11 +84,6 @@ pub struct IcebergCommitCollector {
     /// `op_kind == CommitOpKind::RowDeltaDv`. The `RowDeltaDvCommit` action
     /// drains this channel via [`take_delete_groups`].
     delete_groups: Mutex<Vec<PositionDeleteGroup>>,
-    /// Per-file Theta sketch sets produced by the sink for Iceberg Puffin
-    /// NDV statistics. One entry per written Parquet data file. Optional —
-    /// non-Iceberg sinks and tests that do not exercise stats can leave
-    /// this empty. Drained by [`take_sketch_sets`] at commit time.
-    sketch_sets: Mutex<Vec<FileSketchSet>>,
     /// When set, signals that the engine wrote data files whose `_row_id`
     /// values are already stamped at the reserved field IDs inside the
     /// file (e.g. the OPTIMIZE row-lineage preserve path). The commit
@@ -159,7 +153,6 @@ impl IcebergCommitCollector {
             appended: Mutex::new(Vec::new()),
             staged_effect: Mutex::new(StagedEffectCounters::default()),
             delete_groups: Mutex::new(Vec::new()),
-            sketch_sets: Mutex::new(Vec::new()),
             preserve_row_lineage: AtomicBool::new(false),
             committed: AtomicBool::new(false),
             manifest_cleanup_token: Mutex::new(None),
@@ -236,31 +229,6 @@ impl IcebergCommitCollector {
         std::mem::take(&mut *guard)
     }
 
-    /// Record a per-file Theta sketch set produced by the sink for Iceberg
-    /// Puffin NDV statistics. Used by both the runtime IcebergSink (pipeline
-    /// path) and the standalone iceberg_writer path.
-    pub fn inject_sketch_set(&self, set: FileSketchSet) {
-        self.sketch_sets
-            .lock()
-            .expect("collector sketch_sets lock poisoned")
-            .push(set);
-    }
-
-    /// Drain the per-file sketch sets registered via
-    /// [`inject_sketch_set`] plus any pushed through the runtime
-    /// `sink_commit` side channel for this query's fragment instance.
-    /// Each call is destructive — sketches cannot be cloned, so the
-    /// caller (typically `StatsAssembler::assemble`) consumes them once.
-    pub fn take_sketch_sets(&self) -> Vec<FileSketchSet> {
-        {
-            let mut guard = self
-                .sketch_sets
-                .lock()
-                .expect("collector sketch_sets lock poisoned");
-            std::mem::take(&mut *guard)
-        }
-    }
-
     /// Cumulative `record_count` across every injected [`WrittenFile`] with
     /// `content == Data`. Commit actions may already have drained the concrete
     /// file channel; this accounting evidence remains available to the MV
@@ -312,6 +280,18 @@ impl IcebergCommitCollector {
     /// validated. Each path is recorded in the [`AbortLog`] so abort cleanup
     /// still works.
     pub(crate) fn inject_written_files(&self, files: Vec<WrittenFile>) {
+        self.inject_written_files_inner(files, true);
+    }
+
+    /// Inject immutable session data into a fresh OCC attempt. These paths are
+    /// owned by the session, not by the attempt: a definite conflict may delete
+    /// manifests produced by this attempt but must retain the data for the next
+    /// eager restage.
+    pub(crate) fn inject_reusable_written_files(&self, files: Vec<WrittenFile>) {
+        self.inject_written_files_inner(files, false);
+    }
+
+    fn inject_written_files_inner(&self, files: Vec<WrittenFile>, record_for_abort: bool) {
         use crate::iceberg::spec::DataContentType;
 
         {
@@ -339,7 +319,9 @@ impl IcebergCommitCollector {
             .lock()
             .expect("collector injected lock poisoned");
         for wf in files {
-            self.abort_log.record_data_file(wf.path.clone());
+            if record_for_abort {
+                self.abort_log.record_data_file(wf.path.clone());
+            }
             guard.push(wf);
         }
     }
@@ -442,11 +424,8 @@ impl IcebergCommitCollector {
     /// - Column-stat bounds for field-ids absent from the table schema (e.g.
     ///   stats left behind for a dropped column) are skipped rather than
     ///   decoded, matching the inject path's tolerance for stale stats.
-    /// - Puffin/NDV sketches are not part of `WrittenFile`; they ride the
-    ///   out-of-band sketch channel (`take_sketch_sets` /
-    ///   `runtime::sink_commit::take_sketch_sets`), which is in-process today.
-    ///   Cross-node sketch transport is required only when multi-BE append is
-    ///   cut over and is out of scope for PR-0.
+    /// - Provider statistics artifacts travel in the generic write relation;
+    ///   they are not embedded in `WrittenFile` or carried by this collector.
     pub(crate) fn convert_writer_report(
         &self,
         report: IcebergWriterReport,
@@ -653,4 +632,67 @@ fn i64_map_to_u64(
                 .map(|value| (field_id, value))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod eager_attempt_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::iceberg::spec::{
+        DataContentType, DataFileFormat, NestedField, PartitionSpec, PrimitiveType, Schema, Type,
+    };
+
+    #[test]
+    fn fresh_attempt_reuses_prepared_data_without_claiming_cleanup_ownership() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("schema"),
+        );
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            crate::iceberg::TableIdent::from_strs(["db", "t"]).expect("ident"),
+            None,
+            0,
+            schema.clone(),
+            Arc::new(PartitionSpec::unpartition_spec()),
+            "file:///tmp/staging".to_string(),
+        );
+        let file = WrittenFile {
+            path: "file:///tmp/data.parquet".into(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: crate::iceberg::spec::Struct::empty(),
+            partition_spec_id: 0,
+            record_count: 1,
+            file_size_in_bytes: 1,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        };
+        collector.inject_reusable_written_files(vec![file]);
+        assert!(collector.abort_log.drain_data_files().is_empty());
+        assert_eq!(
+            collector.take_written_files().expect("files")[0].path,
+            "file:///tmp/data.parquet"
+        );
+    }
 }

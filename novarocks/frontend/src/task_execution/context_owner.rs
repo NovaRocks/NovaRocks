@@ -43,13 +43,14 @@ use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
 
 /// The shared facts an establish installs atomically.
 ///
-/// All three are codec-owned content: the frontend can size and pass them
+/// All four are codec-owned content: the frontend can size and pass them
 /// along, and cannot walk them. The credential never reaches a comparable or
 /// printable form at all.
 #[derive(Clone)]
 pub struct ContextEstablishFacts {
     pub catalog_binding: Arc<dyn CodecOwnedContent>,
     pub initial_runtime_filter: Arc<dyn CodecOwnedContent>,
+    pub query_options: Arc<dyn CodecOwnedContent>,
     pub initial_credential: CredentialUpdate,
 }
 
@@ -62,6 +63,7 @@ impl std::fmt::Debug for ContextEstablishFacts {
                 "initial_runtime_filter",
                 &self.initial_runtime_filter.fingerprint(),
             )
+            .field("query_options", &self.query_options.fingerprint())
             .field("initial_credential", &self.initial_credential)
             .finish()
     }
@@ -245,6 +247,7 @@ impl QueryContextOwner {
             self.context,
             facts.catalog_binding,
             facts.initial_runtime_filter,
+            facts.query_options,
             facts.initial_credential,
             valid_for,
         )));

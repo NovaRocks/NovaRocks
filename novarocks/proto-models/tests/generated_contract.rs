@@ -29,6 +29,192 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
 }
 
 #[test]
+fn window_aggregate_exact_binding_and_function_order_are_append_only_fields() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let window = pool
+        .get_message_by_name("novarocks.plan.WindowExpr")
+        .expect("WindowExpr descriptor");
+    let function_order = window
+        .get_field_by_name("function_order_by")
+        .expect("aggregate function ORDER BY field");
+    assert_eq!(function_order.number(), 11);
+    assert!(function_order.is_list());
+    assert_eq!(
+        function_order
+            .kind()
+            .as_message()
+            .expect("SortItem message")
+            .full_name(),
+        "novarocks.expr.SortItem"
+    );
+
+    let binding = window
+        .get_field_by_name("aggregate_binding")
+        .expect("exact aggregate binding field");
+    assert_eq!(binding.number(), 12);
+    assert!(!binding.is_list());
+    assert_eq!(
+        binding
+            .kind()
+            .as_message()
+            .expect("ResolvedAggregateSignature message")
+            .full_name(),
+        "novarocks.plan.ResolvedAggregateSignature"
+    );
+
+    let signature = pool
+        .get_message_by_name("novarocks.plan.ResolvedAggregateSignature")
+        .expect("ResolvedAggregateSignature descriptor");
+    for (name, number) in [
+        ("overload_identity", 1),
+        ("argument_types", 2),
+        ("intermediate_type", 3),
+        ("output_type", 4),
+        ("state_format_identity", 5),
+    ] {
+        assert_eq!(
+            signature
+                .get_field_by_name(name)
+                .unwrap_or_else(|| panic!("ResolvedAggregateSignature.{name}"))
+                .number(),
+            number
+        );
+    }
+}
+
+#[test]
+fn write_relation_contracts_are_versioned_append_only_fields() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let writer = pool
+        .get_message_by_name("novarocks.plan.TableWriterNode")
+        .expect("TableWriterNode descriptor");
+    assert_eq!(
+        writer
+            .get_field_by_name("writer_multiplex_schema")
+            .expect("writer relation schema")
+            .number(),
+        8
+    );
+    let finish = pool
+        .get_message_by_name("novarocks.plan.TableFinishNode")
+        .expect("TableFinishNode descriptor");
+    assert_eq!(
+        finish
+            .get_field_by_name("writer_multiplex_schema")
+            .expect("finish input relation schema")
+            .number(),
+        2
+    );
+    assert_eq!(
+        finish
+            .get_field_by_name("root_result_schema")
+            .expect("finish output relation schema")
+            .number(),
+        3
+    );
+    for message_name in ["WriterMultiplexSchema", "RootWriteResultSchema"] {
+        let full_name = format!("novarocks.plan.{message_name}");
+        let schema = pool
+            .get_message_by_name(&full_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        assert_eq!(
+            schema
+                .get_field_by_name("contract_version")
+                .expect("contract version")
+                .number(),
+            1
+        );
+        let columns = schema.get_field_by_name("columns").expect("columns");
+        assert_eq!(columns.number(), 2);
+        assert!(columns.is_list());
+        assert_eq!(
+            columns
+                .kind()
+                .as_message()
+                .expect("ArrowPhysicalColumn message")
+                .full_name(),
+            "novarocks.plan.ArrowPhysicalColumn"
+        );
+        let metadata = schema
+            .get_field_by_name("schema_metadata")
+            .expect("schema metadata");
+        assert_eq!(metadata.number(), 3);
+        assert!(metadata.is_list());
+    }
+
+    let column = pool
+        .get_message_by_name("novarocks.plan.ArrowPhysicalColumn")
+        .expect("ArrowPhysicalColumn descriptor");
+    assert_eq!(
+        column
+            .get_field_by_name("slot_id")
+            .expect("slot_id")
+            .number(),
+        1
+    );
+    assert_eq!(
+        column.get_field_by_name("field").expect("field").number(),
+        2
+    );
+    assert_eq!(
+        column
+            .get_field_by_name("is_internal")
+            .expect("is_internal")
+            .number(),
+        3
+    );
+
+    let field = pool
+        .get_message_by_name("novarocks.plan.ArrowPhysicalField")
+        .expect("ArrowPhysicalField descriptor");
+    for (name, number) in [
+        ("name", 1),
+        ("nullable", 2),
+        ("type", 3),
+        ("metadata", 4),
+        ("dictionary_id", 5),
+        ("dictionary_is_ordered", 6),
+    ] {
+        assert_eq!(field.get_field_by_name(name).expect(name).number(), number);
+    }
+
+    let physical_type = pool
+        .get_message_by_name("novarocks.plan.ArrowPhysicalType")
+        .expect("ArrowPhysicalType descriptor");
+    let expected = [
+        ("primitive", 1),
+        ("timestamp", 2),
+        ("time32", 3),
+        ("time64", 4),
+        ("duration", 5),
+        ("interval", 6),
+        ("fixed_size_binary", 7),
+        ("decimal32", 8),
+        ("decimal64", 9),
+        ("decimal128", 10),
+        ("decimal256", 11),
+        ("list", 12),
+        ("list_view", 13),
+        ("fixed_size_list", 14),
+        ("large_list", 15),
+        ("large_list_view", 16),
+        ("struct_type", 17),
+        ("union_type", 18),
+        ("dictionary", 19),
+        ("map", 20),
+        ("run_end_encoded", 21),
+    ];
+    for (name, number) in expected {
+        assert_eq!(
+            physical_type.get_field_by_name(name).expect(name).number(),
+            number
+        );
+    }
+}
+
+#[test]
 fn catalog_lifecycle_contract_is_carried_by_init_and_the_existing_control_stream() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
@@ -983,10 +1169,16 @@ fn retired_write_operation_aggregate_fields_remain_reserved() {
 
     for (message_name, field_number, field_name) in [
         ("novarocks.plan.DataSink", 7, "connector_write"),
+        ("novarocks.plan.DataSink", 8, "statistics"),
         (
             "novarocks.QueryTerminalFragmentSnapshot",
             11,
             "connector_staged_report_frames",
+        ),
+        (
+            "novarocks.QueryTerminalFragmentSnapshot",
+            12,
+            "statistics_payload",
         ),
     ] {
         let message = pool
@@ -1017,6 +1209,8 @@ fn retired_write_operation_aggregate_fields_remain_reserved() {
         "novarocks.plan.ConnectorWriterIdentity",
         "novarocks.plan.ConnectorWriterHandleEnvelope",
         "novarocks.plan.ConnectorWriteFragmentSink",
+        "novarocks.plan.StatisticsSink",
+        "novarocks.plan.StatisticsMetric",
         "novarocks.ConnectorStagedReportFrame",
     ] {
         assert!(
@@ -1037,6 +1231,17 @@ fn retired_write_operation_aggregate_wire_fields_fail_closed() {
     // report frame list. It decodes away instead of reviving a staged writer.
     let snapshot = novarocks::QueryTerminalFragmentSnapshot::decode(&[0x5a, 0x00][..])
         .expect("retired snapshot field remains decodable as an unknown field");
+    assert_eq!(snapshot.backend_num, 0);
+    assert!(snapshot.tablet_commit_infos.is_empty());
+
+    // DataSink field 8 and terminal snapshot field 12 are the retired
+    // statistics side channels. Unknown tags decode away and cannot revive
+    // either authority.
+    let sink = plan::DataSink::decode(&[0x42, 0x00][..])
+        .expect("retired statistics sink remains decodable as an unknown field");
+    assert!(sink.kind.is_none());
+    let snapshot = novarocks::QueryTerminalFragmentSnapshot::decode(&[0x62, 0x00][..])
+        .expect("retired statistics payload remains decodable as an unknown field");
     assert_eq!(snapshot.backend_num, 0);
     assert!(snapshot.tablet_commit_infos.is_empty());
 }

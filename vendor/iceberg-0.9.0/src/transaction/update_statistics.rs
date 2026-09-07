@@ -101,15 +101,12 @@ impl TransactionAction for UpdateStatisticsAction {
 mod tests {
     use std::collections::HashMap;
 
-    use as_any::Downcast;
-
     use crate::spec::{BlobMetadata, StatisticsFile};
     use crate::transaction::tests::make_v2_table;
-    use crate::transaction::update_statistics::UpdateStatisticsAction;
     use crate::transaction::{ApplyTransactionAction, Transaction};
 
-    #[test]
-    fn test_update_statistics() {
+    #[tokio::test]
+    async fn test_update_statistics() {
         let table = make_v2_table();
         let tx = Transaction::new(&table);
 
@@ -144,17 +141,11 @@ mod tests {
         };
 
         // set stats1
-        let tx = tx
+        let action = tx
             .update_statistics()
             .set_statistics(statistics_file_1.clone())
             .set_statistics(statistics_file_2.clone())
-            .remove_statistics(3055729675574597004i64) // remove stats1
-            .apply(tx)
-            .unwrap();
-
-        let action = (*tx.actions[0])
-            .downcast_ref::<UpdateStatisticsAction>()
-            .unwrap();
+            .remove_statistics(3055729675574597004i64); // remove stats1
         assert!(
             action
                 .statistics_to_set
@@ -168,12 +159,25 @@ mod tests {
                 .get(&statistics_file_2.snapshot_id)
                 .unwrap()
                 .clone(),
-            Some(statistics_file_2)
+            Some(statistics_file_2.clone())
+        );
+        let tx = action.apply(tx).await.unwrap();
+        assert!(
+            tx.staged_table()
+                .metadata()
+                .statistics_for_snapshot(statistics_file_1.snapshot_id)
+                .is_none()
+        );
+        assert_eq!(
+            tx.staged_table()
+                .metadata()
+                .statistics_for_snapshot(statistics_file_2.snapshot_id),
+            Some(&statistics_file_2)
         );
     }
 
-    #[test]
-    fn test_set_single_statistics() {
+    #[tokio::test]
+    async fn test_set_single_statistics() {
         let table = make_v2_table();
         let tx = Transaction::new(&table);
 
@@ -191,36 +195,25 @@ mod tests {
             .update_statistics()
             .set_statistics(statistics_file.clone())
             .apply(tx)
+            .await
             .unwrap();
 
-        let action = (*tx.actions[0])
-            .downcast_ref::<UpdateStatisticsAction>()
-            .unwrap();
-
-        // Verify that the statistics file is set correctly
         assert_eq!(
-            action
-                .statistics_to_set
-                .get(&statistics_file.snapshot_id)
-                .unwrap()
-                .clone(),
-            Some(statistics_file)
+            tx.staged_table()
+                .metadata()
+                .statistics_for_snapshot(statistics_file.snapshot_id),
+            Some(&statistics_file)
         );
     }
 
-    #[test]
-    fn test_no_statistics_set() {
+    #[tokio::test]
+    async fn test_no_statistics_set() {
         let table = make_v2_table();
         let tx = Transaction::new(&table);
 
         // No statistics are set or removed
-        let tx = tx.update_statistics().apply(tx).unwrap();
+        let tx = tx.update_statistics().apply(tx).await.unwrap();
 
-        let action = (*tx.actions[0])
-            .downcast_ref::<UpdateStatisticsAction>()
-            .unwrap();
-
-        // Verify that no statistics are set
-        assert!(action.statistics_to_set.is_empty());
+        assert!(tx.into_table_commit().take_updates().is_empty());
     }
 }

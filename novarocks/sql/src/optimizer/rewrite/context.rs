@@ -78,6 +78,7 @@ pub(crate) struct RewriteContext {
     /// `None` means the compile path has no execution capability attached, and
     /// constant folding degrades to a no-op.
     constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+    function_catalog: Option<Arc<dyn crate::compiler::SqlFunctionCatalog>>,
 }
 
 impl RewriteContext {
@@ -97,6 +98,7 @@ impl RewriteContext {
             column_ref_factory: None,
             scalar_arena: None,
             constant_evaluator: None,
+            function_catalog: None,
         }
     }
 
@@ -203,6 +205,19 @@ impl RewriteContext {
         &self,
     ) -> Option<&'static dyn crate::compiler::SqlConstantEvaluator> {
         self.constant_evaluator
+    }
+
+    pub(crate) fn set_function_catalog(
+        &mut self,
+        catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    ) {
+        self.function_catalog = Some(catalog);
+    }
+
+    pub(crate) fn function_catalog(&self) -> &dyn crate::compiler::SqlFunctionCatalog {
+        self.function_catalog
+            .as_deref()
+            .expect("function catalog must be set before optimizer rewrite")
     }
 
     pub(crate) fn set_scalar_arena(&mut self, arena: Rc<RefCell<ScalarArena>>) {

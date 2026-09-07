@@ -101,11 +101,6 @@ pub(super) struct F64State {
     pub(super) value: f64,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct Utf8State {
-    pub(super) value: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct CovarState {
     pub(super) mean_x: f64,

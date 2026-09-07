@@ -394,6 +394,8 @@ fn rewrite_window_calls(
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -426,6 +428,8 @@ fn rewrite_window_calls(
                 name: rewritten_name,
                 args: args.clone(),
                 distinct: *distinct,
+                function_order_by: function_order_by.clone(),
+                aggregate_binding: aggregate_binding.clone(),
                 partition_by: partition_by.clone(),
                 order_by: rewritten_order_by,
                 window_frame: rewritten_frame,
@@ -504,6 +508,7 @@ fn rewrite_window_calls(
             args,
             distinct,
             order_by,
+            resolved,
         } => TypedExpr {
             kind: ExprKind::AggregateCall {
                 name: name.clone(),
@@ -528,6 +533,7 @@ fn rewrite_window_calls(
                         nulls_first: item.nulls_first,
                     })
                     .collect(),
+                resolved: resolved.clone(),
             },
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,

@@ -20,8 +20,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 
 use crate::analysis::{ExprKind, LiteralValue, TypedExpr};
-use novarocks_types::largeint;
-use novarocks_types::{canonical_agg_decimal_type, wider_type};
+use novarocks_types::wider_type;
 
 pub(super) fn is_window_only_function(name: &str) -> bool {
     matches!(
@@ -37,6 +36,50 @@ pub(super) fn is_window_only_function(name: &str) -> bool {
             | "first_value"
             | "last_value"
             | "session_number"
+    )
+}
+
+/// Ordinary aggregates with a concrete implementation in the native analytic
+/// operator. Catalog membership alone is not enough to admit `OVER`: the BE
+/// intentionally supports a smaller, explicit set of aggregate window shapes.
+pub(super) fn is_supported_aggregate_window_function(name: &str) -> bool {
+    matches!(
+        name,
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "bitmap_union"
+            | "bitmap_union_count"
+            | "max_by"
+            | "min_by"
+            | "var_samp"
+            | "variance_samp"
+            | "stddev_samp"
+            | "bool_or"
+            | "boolor_agg"
+            | "covar_pop"
+            | "covar_samp"
+            | "corr"
+            | "array_agg"
+            | "array_agg_distinct"
+            | "array_unique_agg"
+            | "approx_top_k"
+    )
+}
+
+pub(super) fn aggregate_window_supports_distinct(name: &str) -> bool {
+    matches!(
+        name,
+        "array_agg" | "array_agg_distinct" | "array_unique_agg"
+    )
+}
+
+pub(super) fn aggregate_window_supports_function_order_by(name: &str) -> bool {
+    matches!(
+        name,
+        "array_agg" | "array_agg_distinct" | "array_unique_agg"
     )
 }
 
@@ -642,115 +685,18 @@ fn sum_map_value_type_name(data_type: &DataType) -> &'static str {
     }
 }
 
-pub(super) fn is_aggregate_function(name: &str) -> bool {
-    // Analyzer-owned aggregate classification used by expression resolution.
-    is_state_combinator_aggregate_function(name)
-        || matches!(
-            name,
-            "count"
-                | "sum"
-                | "avg"
-                | "min"
-                | "max"
-                | "count_if"
-                | "any_value"
-                | "group_concat"
-                | "string_agg"
-                | "bitmap_agg"
-                | "bitmap_union"
-                | "bitmap_union_count"
-                | "bitmap_union_int"
-                | "multi_distinct_count"
-                | "array_agg"
-                | "array_agg_distinct"
-                | "array_unique_agg"
-                | "sum_map"
-                | "map_agg"
-                | "percentile_approx"
-                | "percentile_approx_weighted"
-                | "percentile_cont"
-                | "percentile_disc"
-                | "percentile_disc_lc"
-                | "percentile_union"
-                | "approx_count_distinct"
-                | "approx_count_distinct_hll_sketch"
-                | "approx_top_k"
-                | "ds_hll_accumulate"
-                | "ds_hll_combine"
-                | "ds_hll_estimate"
-                | "ds_hll_count_distinct"
-                | "ds_hll_count_distinct_union"
-                | "ds_hll_count_distinct_merge"
-                | "hll_union"
-                | "hll_union_agg"
-                | "hll_raw_agg"
-                | "ndv"
-                | "variance"
-                | "variance_samp"
-                | "variance_pop"
-                | "var_samp"
-                | "var_pop"
-                | "stddev"
-                | "stddev_samp"
-                | "stddev_pop"
-                | "covar_samp"
-                | "covar_pop"
-                | "corr"
-                | "max_by"
-                | "min_by"
-                | "mann_whitney_u_test"
-                | "bool_or"
-                | "bool_and"
-                | "boolor_agg"
-                | "booland_agg"
-                | "every"
-                | "min_n"
-                | "max_n"
-                | "dict_merge"
-        )
-}
-
-fn is_state_combinator_aggregate_function(name: &str) -> bool {
-    matches!(
-        name,
-        "count_state"
-            | "count_state_signed"
-            | "sum_state"
-            | "sum_state_merge"
-            | "sum_state_signed"
-            | "avg_state"
-            | "avg_state_merge"
-            | "avg_state_signed"
-            | "count_state_merge"
-            | "min_state"
-            | "min_state_merge"
-            | "min_state_signed"
-            | "max_state"
-            | "max_state_merge"
-            | "max_state_signed"
-            | "bool_or_state"
-            | "bool_or_state_merge"
-            | "bool_or_state_signed"
-            | "bool_and_state"
-            | "bool_and_state_merge"
-            | "bool_and_state_signed"
-            | "count_distinct_state"
-            | "count_distinct_state_merge"
-            | "count_distinct_state_signed"
-            | "approx_count_distinct_state"
-            | "approx_count_distinct_state_merge"
-            | "approx_count_distinct_state_signed"
-    )
+pub(super) fn is_aggregate_function(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+) -> bool {
+    function_catalog.contains_aggregate(name)
 }
 
 // ---------------------------------------------------------------------------
 // Scalar function return type inference
 // ---------------------------------------------------------------------------
 
-#[allow(
-    dead_code,
-    reason = "Retained for staged SQL planner migration consumers and test helpers."
-)]
+#[cfg(test)]
 pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> DataType {
     infer_scalar_return_type_with_catalog(
         crate::functions::builtin_sql_function_catalog(),
@@ -1405,23 +1351,6 @@ fn infer_map_constructor_return_type(arg_types: &[DataType]) -> DataType {
     )
 }
 
-fn null_map_type() -> DataType {
-    DataType::Map(
-        Arc::new(arrow::datatypes::Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    Arc::new(arrow::datatypes::Field::new("key", DataType::Null, true)),
-                    Arc::new(arrow::datatypes::Field::new("value", DataType::Null, true)),
-                ]
-                .into(),
-            ),
-            false,
-        )),
-        false,
-    )
-}
-
 fn infer_struct_constructor_return_type(arg_types: &[DataType]) -> DataType {
     let fields = arg_types
         .iter()
@@ -1454,155 +1383,31 @@ fn infer_named_struct_return_type(arg_types: &[DataType]) -> DataType {
     DataType::Struct(arrow::datatypes::Fields::from(fields))
 }
 
-// ---------------------------------------------------------------------------
-// Aggregate function return type inference
-// ---------------------------------------------------------------------------
-
-pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataType {
-    let first_arg = arg_types.first().cloned().unwrap_or(DataType::Null);
-    let float_array = || {
-        DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Float64,
-            true,
-        )))
-    };
-    let approx_top_k_array = |item_type: DataType| {
-        DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Struct(
-                vec![
-                    Arc::new(arrow::datatypes::Field::new("item", item_type, true)),
-                    Arc::new(arrow::datatypes::Field::new("count", DataType::Int64, true)),
-                ]
-                .into(),
-            ),
-            true,
-        )))
-    };
-    let array_output = |item_type: DataType| {
-        DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item", item_type, true,
-        )))
-    };
-    match name {
-        name if is_state_combinator_aggregate_function(name) => DataType::Binary,
-
-        "count"
-        | "count_if"
-        | "bitmap_union_count"
-        | "bitmap_union_int"
-        | "approx_count_distinct"
-        | "approx_count_distinct_hll_sketch"
-        | "ds_hll_count_distinct"
-        | "ds_hll_count_distinct_merge"
-        | "ndv"
-        | "hll_union_agg"
-        | "multi_distinct_count" => DataType::Int64,
-
-        "sum" => match &first_arg {
-            DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64 => DataType::Int64,
-            DataType::Float32 | DataType::Float64 => DataType::Float64,
-            DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
-                DataType::FixedSizeBinary(*width)
-            }
-            DataType::Decimal128(..) => {
-                canonical_agg_decimal_type("sum", &first_arg).expect("sum decimal canonical type")
-            }
-            _ => DataType::Float64,
-        },
-
-        "avg" => match &first_arg {
-            DataType::Decimal128(..) => {
-                canonical_agg_decimal_type("avg", &first_arg).expect("avg decimal canonical type")
-            }
-            _ => DataType::Float64,
-        },
-        "min" | "max" | "any_value" => first_arg,
-        "group_concat" | "string_agg" => DataType::Utf8,
-        "dict_merge" => DataType::Utf8,
-        "mann_whitney_u_test" => DataType::Utf8,
-        "bitmap_agg"
-        | "bitmap_union"
-        | "ds_hll_count_distinct_union"
-        | "hll_union"
-        | "hll_raw_agg" => DataType::Binary,
-        "array_agg" | "array_agg_distinct" => array_output(first_arg),
-        "array_unique_agg" => first_arg,
-        "sum_map" => {
-            if first_arg == DataType::Null {
-                null_map_type()
-            } else {
-                first_arg
-            }
-        }
-        "map_agg" => {
-            let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
-            let value_type = arg_types.get(1).cloned().unwrap_or(DataType::Null);
-            DataType::Map(
-                Arc::new(arrow::datatypes::Field::new(
-                    "entries",
-                    DataType::Struct(
-                        vec![
-                            Arc::new(arrow::datatypes::Field::new("key", key_type, true)),
-                            Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
-            )
-        }
-        "variance" | "variance_samp" | "variance_pop" | "var_samp" | "var_pop" | "stddev"
-        | "stddev_samp" | "stddev_pop" | "covar_samp" | "covar_pop" | "corr" => DataType::Float64,
-        "bool_or" | "bool_and" | "boolor_agg" | "booland_agg" | "every" => DataType::Boolean,
-
-        "percentile_approx" => {
-            if matches!(arg_types.get(1), Some(DataType::List(_))) {
-                float_array()
-            } else {
-                DataType::Float64
-            }
-        }
-        "percentile_approx_weighted" => {
-            if matches!(arg_types.get(2), Some(DataType::List(_))) {
-                float_array()
-            } else {
-                DataType::Float64
-            }
-        }
-        "approx_top_k" => approx_top_k_array(first_arg),
-        "min_n" | "max_n" => array_output(first_arg),
-
-        // Default: same as first arg
-        _ => {
-            if arg_types.is_empty() {
-                DataType::Int64
-            } else {
-                first_arg
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analysis::{ExprKind, LiteralValue, TypedExpr};
+    use novarocks_types::largeint;
+
+    fn resolve_aggregate(name: &str, arg_types: &[DataType]) -> DataType {
+        crate::functions::builtin_engine_function_catalog()
+            .resolve_user(
+                name,
+                novarocks_functions::FunctionKind::Aggregate,
+                arg_types,
+            )
+            .unwrap_or_else(|error| panic!("aggregate {name} must resolve: {error}"))
+            .return_type
+    }
 
     #[test]
-    fn infer_agg_return_type_decimal_is_canonical() {
+    fn aggregate_catalog_decimal_return_type_is_canonical() {
         assert_eq!(
-            infer_agg_return_type("sum", &[DataType::Decimal128(20, 2)]),
+            resolve_aggregate("sum", &[DataType::Decimal128(20, 2)]),
             DataType::Decimal128(38, 2)
         );
         assert_eq!(
-            infer_agg_return_type("avg", &[DataType::Decimal128(10, 3)]),
+            resolve_aggregate("avg", &[DataType::Decimal128(10, 3)]),
             DataType::Decimal128(38, 9)
         );
     }
@@ -2043,9 +1848,12 @@ mod tests {
             )),
             false,
         );
-        assert!(is_aggregate_function("sum_map"));
+        assert!(is_aggregate_function(
+            crate::functions::builtin_sql_function_catalog(),
+            "sum_map"
+        ));
         assert_eq!(
-            infer_agg_return_type("sum_map", std::slice::from_ref(&map_type)),
+            resolve_aggregate("sum_map", std::slice::from_ref(&map_type)),
             map_type
         );
     }
@@ -2055,7 +1863,7 @@ mod tests {
         let largeint_type = DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH);
 
         assert_eq!(
-            infer_agg_return_type("sum", std::slice::from_ref(&largeint_type)),
+            resolve_aggregate("sum", std::slice::from_ref(&largeint_type)),
             largeint_type
         );
     }
@@ -2091,9 +1899,27 @@ mod tests {
             "approx_count_distinct_state_merge",
             "approx_count_distinct_state_signed",
         ] {
-            assert!(is_aggregate_function(name), "{name}");
+            assert!(
+                is_aggregate_function(crate::functions::builtin_sql_function_catalog(), name),
+                "{name}"
+            );
+            let arg_types = if name.ends_with("_signed") {
+                vec![DataType::Struct(
+                    vec![
+                        Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
+                        Arc::new(arrow::datatypes::Field::new(
+                            "change_op",
+                            DataType::Int8,
+                            false,
+                        )),
+                    ]
+                    .into(),
+                )]
+            } else {
+                vec![DataType::Int64]
+            };
             assert_eq!(
-                infer_agg_return_type(name, &[DataType::Int64, DataType::Int8]),
+                resolve_aggregate(name, &arg_types),
                 DataType::Binary,
                 "{name}"
             );

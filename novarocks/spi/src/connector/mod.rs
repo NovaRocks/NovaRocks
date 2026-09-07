@@ -269,15 +269,18 @@ pub use staged_create::{
 };
 pub use statistics::{
     ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
-    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    StatisticsBasisRelation, StatisticsCollection, StatisticsCollectionPlan,
-    StatisticsCollectionRequest, StatisticsCollectionResult, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric,
-    StatisticsMetricError, StatisticsMetricErrorKind, StatisticsMetricObservation,
-    StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
-    StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature,
-    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsRowCoverage, StatisticsScanColumn,
+    MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES, MAX_CONNECTOR_STATISTICS_ARTIFACTS,
+    MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_METRICS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
+    MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES, StatisticsArtifactDraft,
+    StatisticsArtifactIdentity, StatisticsBasisRelation, StatisticsCollection,
+    StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,
+    StatisticsColumnSelection, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsEvidenceRevision, StatisticsInterval, StatisticsMetric, StatisticsMetricError,
+    StatisticsMetricErrorKind, StatisticsMetricObservation, StatisticsMetricRequest,
+    StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
+    StatisticsMissingKind, StatisticsNumericNature, StatisticsReadRequest, StatisticsReader,
+    StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage, StatisticsScanColumn,
 };
 pub use view_metadata::{
     ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,

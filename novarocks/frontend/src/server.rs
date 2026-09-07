@@ -128,6 +128,7 @@ pub fn build_frontend_query_session_factory(
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
     let unified_statistics = Arc::new(crate::connector::UnifiedStatisticsResolver::default());
     let catalog_application = host.catalog_application_port();
+    let function_catalog = host.function_catalog();
     let catalog_projection = host.catalog_runtime_projection();
     let connector_control = host.connector_control_registry();
     // Constructor-supplied, exactly once: query preparation receives the
@@ -155,6 +156,7 @@ pub fn build_frontend_query_session_factory(
         core_capabilities::bind_mv_refresh_provider_activation(
             sink.as_ref(),
             core_capabilities::MvRefreshProviderActivationPorts::new(
+                Arc::clone(&function_catalog),
                 Arc::clone(&catalog_service),
                 Some(Arc::clone(&catalog_application)),
                 Arc::clone(&connector_control),
@@ -199,6 +201,7 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&typed_connector_control),
             topology.clone(),
             query_execution.clone(),
+            Arc::clone(&function_catalog),
             host.lake_publication_runtime_policy()
                 .max_attempt_duration(),
         ),
@@ -206,6 +209,7 @@ pub fn build_frontend_query_session_factory(
     .map_err(FrontendApplicationError::server)?;
 
     let maintenance_ports = core_capabilities::MaintenanceCommandPorts::new(
+        Arc::clone(&function_catalog),
         Arc::clone(&catalog_service),
         Some(Arc::clone(&catalog_application)),
         Arc::clone(&connector_control),
@@ -237,6 +241,7 @@ pub fn build_frontend_query_session_factory(
         && let Err(error) = core_capabilities::bind_mv_background_engine(
             sink.as_ref(),
             core_capabilities::MvBackgroundPorts::new(
+                Arc::clone(&function_catalog),
                 Arc::clone(&catalog_service),
                 Some(Arc::clone(&catalog_application)),
                 Arc::clone(&connector_control),
@@ -260,6 +265,7 @@ pub fn build_frontend_query_session_factory(
 
     let query_compiler =
         core_capabilities::query_compiler(core_capabilities::QueryCompilerPorts::new(
+            Arc::clone(&function_catalog),
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
@@ -295,6 +301,7 @@ pub fn build_frontend_query_session_factory(
     );
     let view_command_executor =
         core_capabilities::view_command_executor(core_capabilities::ViewCommandPorts::new(
+            Arc::clone(&function_catalog),
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
@@ -308,6 +315,7 @@ pub fn build_frontend_query_session_factory(
     );
     let mv_command_executor =
         core_capabilities::mv_command_executor(core_capabilities::MvCommandPorts::new(
+            Arc::clone(&function_catalog),
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
@@ -322,6 +330,7 @@ pub fn build_frontend_query_session_factory(
     let maintenance_read_command_executor =
         core_capabilities::maintenance_read_command_executor(maintenance_service);
     let dml_engines = core_capabilities::dml_engines(core_capabilities::DmlEnginePorts::new(
+        function_catalog,
         Arc::clone(&catalog_service),
         Some(catalog_application),
         connector_control,
@@ -956,6 +965,13 @@ mod tests {
         ))
     }
 
+    fn builtin_function_catalog() -> Arc<novarocks_functions::EngineFunctionCatalog> {
+        Arc::new(
+            novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin function catalog"),
+        )
+    }
+
     #[derive(Debug)]
     struct RecordingHostPort;
 
@@ -981,6 +997,7 @@ mod tests {
                 0,
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
             ),
             backend_open: frontend_backend_open_config(),
             report_bind_host: "127.0.0.1".to_string(),
@@ -1085,6 +1102,7 @@ mod tests {
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
             )
             .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::DynamicStateStore),
             frontend_backend_open_config(),
@@ -1185,6 +1203,7 @@ mod tests {
                 0,
                 std::num::NonZeroUsize::new(1).unwrap(),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
             ),
             frontend_backend_open_config(),
             Vec::new(),
@@ -1235,6 +1254,7 @@ mod tests {
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
             ),
             frontend_backend_open_config(),
             Vec::new(),

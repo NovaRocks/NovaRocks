@@ -22,14 +22,12 @@ use arrow::datatypes::DataType;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::runtime::endpoint::FragmentDestination;
-use novarocks_spi::connector::StatisticsMetricRequest;
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]
 pub enum FragmentSinkProgram {
     Result,
     Noop,
-    Statistics(StatisticsSinkProgram),
     DataStream(DataStreamSinkProgram),
     MultiCastDataStream(MultiCastDataStreamSinkProgram),
     SplitDataStream(SplitDataStreamSinkProgram),
@@ -38,7 +36,7 @@ pub enum FragmentSinkProgram {
 impl FragmentSinkProgram {
     pub fn validate(&self) -> Result<(), ExecPlanBuildError> {
         match self {
-            Self::Result | Self::Noop | Self::Statistics(_) => Ok(()),
+            Self::Result | Self::Noop => Ok(()),
             Self::DataStream(program) => program.validate(),
             Self::MultiCastDataStream(program) => program.validate(),
             Self::SplitDataStream(program) => program.validate(),
@@ -150,23 +148,6 @@ impl DataStreamSinkFactoryInput {
             parsed_output_columns,
             destinations,
         )
-    }
-}
-
-/// Typed metric set for the Core-internal distributed statistics terminal
-/// sink. It deliberately contains no client result format or provider handle.
-#[derive(Clone, Debug)]
-pub struct StatisticsSinkProgram {
-    metrics: StatisticsMetricRequest,
-}
-
-impl StatisticsSinkProgram {
-    pub fn new(metrics: StatisticsMetricRequest) -> Self {
-        Self { metrics }
-    }
-
-    pub fn metrics(&self) -> &StatisticsMetricRequest {
-        &self.metrics
     }
 }
 

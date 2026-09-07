@@ -222,7 +222,7 @@ pub(super) fn encode_node_with_context<'a, F: NativeScanFacts<'a>>(
             write_dataflow::encode_table_writer_node(writer, ctx)?,
         ),
         DistributedNodeKind::TableFinish(finish) => plan::distributed_node::Payload::TableFinish(
-            write_dataflow::encode_table_finish_node(finish),
+            write_dataflow::encode_table_finish_node(finish)?,
         ),
         other => {
             let physical = distributed_kind_to_physical(other);

@@ -74,6 +74,10 @@ fn engine_error_message_body(actual: &str) -> &str {
             rest = stripped.trim_start();
             continue;
         }
+        if let Some(stripped) = strip_statement_failure_context(rest) {
+            rest = stripped.trim_start();
+            continue;
+        }
         if let Some(stripped) = strip_mysql_error_debug_wrapper(rest) {
             rest = stripped.trim_start();
             continue;
@@ -84,6 +88,24 @@ fn engine_error_message_body(actual: &str) -> &str {
         }
         return rest;
     }
+}
+
+fn strip_statement_failure_context(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("statement ")?;
+    let (ordinal, rest) = rest.split_once('/')?;
+    let (count, rest) = rest.split_once(" (sha256=")?;
+    if ordinal.is_empty()
+        || count.is_empty()
+        || !ordinal.bytes().all(|byte| byte.is_ascii_digit())
+        || !count.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let (digest, rest) = rest.split_once("): ")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(rest)
 }
 
 fn strip_runner_error_prefix(message: &str) -> Option<&str> {
@@ -204,6 +226,21 @@ mod tests {
             extract_engine_error_code(actual),
             Some("UnsupportedDistributedDmlShape".to_string())
         );
+    }
+
+    #[test]
+    fn extract_engine_error_code_reads_statement_failure_context() {
+        let actual = "FAIL (0.00s): statement 1/1 (sha256=373d888744767278a2480d0ec9a6cf1de16a3c52ab3c7501ddbd79bf7c34f40e): MySqlError { ERROR 1235 (42000): [UnsupportedDistributedDmlShape] forced failure }";
+        assert_eq!(
+            extract_engine_error_code(actual),
+            Some("UnsupportedDistributedDmlShape".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_rejects_malformed_statement_failure_context() {
+        let actual = "FAIL (0.00s): statement 1/1 (sha256=not-a-digest): MySqlError { ERROR 1235 (42000): [UnsupportedDistributedDmlShape] forced failure }";
+        assert_eq!(extract_engine_error_code(actual), None);
     }
 
     #[test]

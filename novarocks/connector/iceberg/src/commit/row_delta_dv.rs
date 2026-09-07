@@ -57,7 +57,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::fast_append::{commit_empty_iceberg_mv_snapshot, register_puffin_stats};
+use super::fast_append::commit_empty_iceberg_mv_snapshot;
 use super::helpers::{
     OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary,
@@ -71,7 +71,6 @@ use super::row_delta_dv_metadata::{
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, WrittenFile};
 use crate::commit::{DeletionVector, PositionDeleteGroup, write_single_deletion_vector_puffin};
-use crate::stats_assembler::CommitType;
 
 pub struct RowDeltaDvCommit;
 
@@ -107,15 +106,13 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             snapshot_properties: ctx.snapshot_properties.clone(),
         });
 
-        let sketch_sets = ctx.collector.take_sketch_sets();
-        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-        let has_new_data_files = !sketch_sets.is_empty();
         let written_manifest_paths = || {
             manifest_paths_out
                 .lock()
                 .expect("manifest_paths_out poisoned")
                 .clone()
         };
+        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
 
         match submit_occ_action(ctx.catalog, ctx.table, action, "RowDeltaDv", None).await {
             Ok(OccSubmit::Committed(table_after)) => {
@@ -124,23 +121,6 @@ impl IcebergCommitAction for RowDeltaDvCommit {
                     ctx.target_ref,
                     "RowDeltaDv",
                 )?;
-                let new_sequence_number = table_after.metadata().last_sequence_number();
-                // MOR UPDATE writes new data files alongside the DV; treat it as
-                // Append so the new NDV combines prior sketches with new-file
-                // sketches. Pure DELETE emits no statistics entry for this snapshot.
-                if has_new_data_files {
-                    register_puffin_stats(
-                        &table_after,
-                        ctx.catalog,
-                        ctx.file_io,
-                        CommitType::Append,
-                        sketch_sets,
-                        new_snapshot_id,
-                        new_sequence_number,
-                        prev_snapshot_id,
-                    )
-                    .await;
-                }
                 Ok(CommitOutcome {
                     new_snapshot_id,
                     written_manifest_paths: written_manifest_paths(),

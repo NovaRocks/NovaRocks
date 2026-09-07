@@ -45,37 +45,19 @@ pub(crate) fn build_distributed_plan_with_settings(
     crate::planner::distributed::build::build_distributed_plan(&physical)
 }
 
-/// Compile a regular physical query into internal statistics collection work.
-/// Callers must provide a plan whose scan sources were derived from the same
-/// provider table/data-version pin as the statistics collection program.
-pub(crate) fn build_statistics_distributed_plan_with_settings(
-    mut physical: PhysicalPlanNode,
-    metrics: novarocks_spi::connector::StatisticsMetricRequest,
-    settings: &crate::optimizer::options::SessionOptimizerSettings,
-) -> Result<DistributedPlan, String> {
-    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
-        &mut physical,
-        settings,
-    );
-    crate::planner::distributed::build::build_statistics_distributed_plan(&physical, metrics)
-}
-
-/// Build a distributed plan whose writer is an ordinary node emitting the write
-/// relation, with every writer gathering into a single Root finish fragment.
-pub(crate) fn build_connector_write_dataflow_plan(
+pub(crate) fn build_connector_write_dataflow_plan_with_auxiliary_settings(
     mut physical: PhysicalPlanNode,
     sink: crate::planner::distributed::write::sink::ConnectorWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    auxiliary: &crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
     settings: &crate::optimizer::options::SessionOptimizerSettings,
 ) -> Result<DistributedPlan, String> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
     );
-    crate::planner::distributed::write::plan::build_table_writer_finish_distributed_plan(
-        &physical,
-        sink,
-        write_target_ordinal,
+    crate::planner::distributed::write::plan::build_table_writer_finish_distributed_plan_with_auxiliary(
+        &physical, sink, write_target_ordinal, auxiliary,
     )
 }
 
@@ -83,29 +65,72 @@ pub(crate) fn build_connector_write_dataflow_plan(
 /// Provider metadata and writer handles are intentionally absent; application
 /// code resolves those from the request-local binding token after this plan has
 /// been sealed.
+#[cfg(test)]
 pub(crate) fn build_sql_write_dataflow_plan_with_settings(
+    physical: PhysicalPlanNode,
+    sink: crate::planner::distributed::write::contract::SqlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    settings: &crate::optimizer::options::SessionOptimizerSettings,
+) -> Result<DistributedPlan, String> {
+    let auxiliary =
+        crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan::without_requirements(
+            [write_target_ordinal],
+        )?;
+    build_sql_write_dataflow_plan_with_auxiliary_settings(
+        physical,
+        sink,
+        write_target_ordinal,
+        &auxiliary,
+        settings,
+    )
+}
+
+/// Build the same write dataflow with an already-resolved ordinary aggregate
+/// auxiliary plan. Connector descriptors have been erased before this point.
+pub(crate) fn build_sql_write_dataflow_plan_with_auxiliary_settings(
     mut physical: PhysicalPlanNode,
     sink: crate::planner::distributed::write::contract::SqlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    auxiliary: &crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
     settings: &crate::optimizer::options::SessionOptimizerSettings,
 ) -> Result<DistributedPlan, String> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
     );
-    crate::planner::distributed::write::plan::build_sql_table_writer_finish_distributed_plan(
-        &physical,
-        sink,
-        write_target_ordinal,
+    crate::planner::distributed::write::plan::build_sql_table_writer_finish_distributed_plan_with_auxiliary(
+        &physical, sink, write_target_ordinal, auxiliary,
     )
 }
 
 /// Compile a change-stream write into the dataflow writer/finish shape. Every
 /// route's writer gathers into the same single Root finish fragment.
+#[cfg(test)]
 pub(crate) fn build_sql_change_stream_dataflow_plan_with_settings(
+    physical: PhysicalPlanNode,
+    dag: crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    keyed_assert: Option<PreExpandKeyedAssertSpec>,
+    settings: &crate::optimizer::options::SessionOptimizerSettings,
+) -> Result<crate::planner::distributed::write::plan::PlannedSqlChangeStreamDistributedPlan, String>
+{
+    let auxiliary =
+        crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan::without_requirements(
+            dag.routes.iter().map(|route| route.write_target_ordinal),
+        )?;
+    build_sql_change_stream_dataflow_plan_with_auxiliary_settings(
+        physical,
+        dag,
+        keyed_assert,
+        &auxiliary,
+        settings,
+    )
+}
+
+pub(crate) fn build_sql_change_stream_dataflow_plan_with_auxiliary_settings(
     mut physical: PhysicalPlanNode,
     dag: crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     keyed_assert: Option<PreExpandKeyedAssertSpec>,
+    auxiliary: &crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
     settings: &crate::optimizer::options::SessionOptimizerSettings,
 ) -> Result<crate::planner::distributed::write::plan::PlannedSqlChangeStreamDistributedPlan, String>
 {
@@ -116,8 +141,8 @@ pub(crate) fn build_sql_change_stream_dataflow_plan_with_settings(
         &mut physical,
         settings,
     );
-    crate::planner::distributed::write::plan::build_sql_change_stream_table_writer_finish_distributed_plan(
-        &physical, dag,
+    crate::planner::distributed::write::plan::build_sql_change_stream_table_writer_finish_distributed_plan_with_auxiliary(
+        &physical, dag, auxiliary,
     )
 }
 

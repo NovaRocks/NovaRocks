@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::datatypes::DataType;
+use novarocks_functions::ResolvedAggregateSignature;
 
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
@@ -75,9 +76,7 @@ pub enum WindowFunctionKind {
     BitmapUnion,
     BitmapUnionCount,
     MaxBy,
-    MaxByV2,
     MinBy,
-    MinByV2,
     VarianceSamp,
     StddevSamp,
     BoolOr,
@@ -95,8 +94,22 @@ pub enum WindowFunctionKind {
 #[derive(Clone, Debug)]
 pub struct WindowFunctionSpec {
     pub kind: WindowFunctionKind,
+    /// Physical expressions evaluated by the analytic operator. These may be
+    /// packed (for example max_by(value, key) becomes one Struct expression)
+    /// while the exact binding freezes the unpacked executable update channel
+    /// types, including function ORDER BY keys.
     pub args: Vec<ExprId>,
     pub return_type: DataType,
+    /// Exact ordinary aggregate identity selected by FE analysis. Window-only
+    /// functions carry `None`; every aggregate-as-window function carries the
+    /// executable canonical name plus its exact update signature.
+    pub aggregate_binding: Option<WindowAggregateBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowAggregateBinding {
+    pub function_name: String,
+    pub resolved: ResolvedAggregateSignature,
 }
 
 #[derive(Clone, Debug)]

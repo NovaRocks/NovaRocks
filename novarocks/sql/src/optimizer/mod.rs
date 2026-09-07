@@ -78,6 +78,31 @@ use rule::Rule;
 /// rule will surface rather than silently spin.
 const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Query-scoped services shared by every optimizer phase.
+///
+/// Keeping these together makes the optimizer boundary explicit and prevents
+/// each newly installed resolver from becoming another positional entrypoint
+/// argument.
+pub(crate) struct OptimizerEnvironment<'a> {
+    settings: &'a options::SessionOptimizerSettings,
+    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+    function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+}
+
+impl<'a> OptimizerEnvironment<'a> {
+    pub(crate) fn new(
+        settings: &'a options::SessionOptimizerSettings,
+        constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+        function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    ) -> Self {
+        Self {
+            settings,
+            constant_evaluator,
+            function_catalog,
+        }
+    }
+}
+
 /// Main entry point for the Cascades optimizer.
 ///
 /// Takes an optimizer-native logical tree and query-scoped statistics, applies query logical
@@ -90,8 +115,7 @@ pub(crate) fn optimize(
     query_stats: &QueryStatsSnapshot,
     factory: ColumnRefFactory,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
-    settings: &options::SessionOptimizerSettings,
-    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+    environment: OptimizerEnvironment<'_>,
 ) -> Result<OptimizedOperatorNode, String> {
     validate_query_stats_bound(&plan_expr)?;
     let stats_input = OptimizerStatsInput::from_query_stats(query_stats);
@@ -102,8 +126,7 @@ pub(crate) fn optimize(
         factory,
         mv_candidates,
         PhysicalPropertySet::gather(),
-        settings,
-        constant_evaluator,
+        environment,
     )
 }
 
@@ -113,8 +136,7 @@ pub(crate) fn optimize_with_root_distribution(
     query_stats: &QueryStatsSnapshot,
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
-    settings: &options::SessionOptimizerSettings,
-    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+    environment: OptimizerEnvironment<'_>,
 ) -> Result<OptimizedOperatorNode, String> {
     validate_query_stats_bound(&plan_expr)?;
     let root_required = PhysicalPropertySet {
@@ -129,8 +151,7 @@ pub(crate) fn optimize_with_root_distribution(
         factory,
         Vec::new(),
         root_required,
-        settings,
-        constant_evaluator,
+        environment,
     )
 }
 
@@ -154,8 +175,11 @@ pub(crate) fn optimize_with_test_table_statistics(
         factory,
         mv_candidates,
         PhysicalPropertySet::gather(),
-        settings,
-        None,
+        OptimizerEnvironment::new(
+            settings,
+            None,
+            crate::functions::test_function_catalog_snapshot(),
+        ),
     )
 }
 
@@ -181,15 +205,14 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
         factory,
         Vec::new(),
         root_required,
-        settings,
-        None,
+        OptimizerEnvironment::new(
+            settings,
+            None,
+            crate::functions::test_function_catalog_snapshot(),
+        ),
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
-)]
 fn optimize_with_root_property(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
@@ -197,9 +220,13 @@ fn optimize_with_root_property(
     factory: ColumnRefFactory,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     root_required: PhysicalPropertySet,
-    session_settings: &options::SessionOptimizerSettings,
-    constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
+    environment: OptimizerEnvironment<'_>,
 ) -> Result<OptimizedOperatorNode, String> {
+    let OptimizerEnvironment {
+        settings: session_settings,
+        constant_evaluator,
+        function_catalog,
+    } = environment;
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
     // Wrap factory in Rc<RefCell<...>> so it can be shared with RewriteContext
@@ -221,6 +248,7 @@ fn optimize_with_root_property(
     if let Some(evaluator) = constant_evaluator {
         rewrite_ctx.set_constant_evaluator(evaluator);
     }
+    rewrite_ctx.set_function_catalog(Arc::clone(&function_catalog));
     let arena = Rc::new(RefCell::new(scalar_arena));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
     let rewritten_expr =
@@ -260,6 +288,7 @@ fn optimize_with_root_property(
         )
         .into_inner();
     let mut memo = Memo::new();
+    memo.function_catalog = Some(function_catalog);
     memo.factory = factory;
     memo.scalars = arena.borrow().clone();
     let root_group = memo_copy::opt_expr_to_memo(&rewritten_expr, &mut memo);
@@ -1348,8 +1377,11 @@ mod is_known_rule_name_tests {
             &stats,
             ColumnRefFactory::new(),
             vec![candidate],
-            &crate::optimizer::options::SessionOptimizerSettings::default(),
-            None,
+            OptimizerEnvironment::new(
+                &crate::optimizer::options::SessionOptimizerSettings::default(),
+                None,
+                crate::functions::test_function_catalog_snapshot(),
+            ),
         )
         .expect("optimize");
 

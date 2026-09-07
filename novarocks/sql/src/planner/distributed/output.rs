@@ -494,6 +494,7 @@ fn node_execution_output_columns(
             unary_passthrough_output_columns(node, fragment_roots)
         }
         DistributedNodeKind::Project(project) => Ok(project_execution_output_columns(project)),
+        DistributedNodeKind::Unpivot(unpivot) => Ok(unpivot.output_columns.clone()),
         DistributedNodeKind::HashAggregate(aggregate) => {
             // The aggregate's execution output is its visible-or-full output
             // columns with per-mode intermediate aggregate-state types applied
@@ -529,9 +530,11 @@ fn node_execution_output_columns(
         // The NCP-6 write nodes replace their input with the frozen
         // write-result relation, so their execution output never depends on a
         // child. `write::node` is the single definition point of both shapes.
-        DistributedNodeKind::TableWriter(_) => {
-            Ok(crate::planner::distributed::write::node::table_writer_output_columns())
-        }
+        DistributedNodeKind::TableWriter(writer) => Ok(
+            crate::planner::distributed::write::node::table_writer_output_columns(
+                &writer.writer_multiplex_schema,
+            ),
+        ),
         DistributedNodeKind::TableFinish(_) => {
             Ok(crate::planner::distributed::write::node::table_finish_output_columns())
         }
@@ -1346,6 +1349,7 @@ fn wire_node_output_columns(
         DistributedNodeKind::Project(project) => {
             wire_project_output_columns(node, project, fragment_id, node_outputs)
         }
+        DistributedNodeKind::Unpivot(unpivot) => Ok(unpivot.output_columns.clone()),
         DistributedNodeKind::Filter(_)
         | DistributedNodeKind::AssertOneRow(_)
         | DistributedNodeKind::Sort(_)
@@ -1405,9 +1409,11 @@ fn wire_node_output_columns(
         DistributedNodeKind::Exchange(exchange) => Ok(exchange.output_columns.clone()),
         // The NCP-6 write nodes emit the frozen write-result relation on the
         // wire exactly as they emit it at execution.
-        DistributedNodeKind::TableWriter(_) => {
-            Ok(crate::planner::distributed::write::node::table_writer_output_columns())
-        }
+        DistributedNodeKind::TableWriter(writer) => Ok(
+            crate::planner::distributed::write::node::table_writer_output_columns(
+                &writer.writer_multiplex_schema,
+            ),
+        ),
         DistributedNodeKind::TableFinish(_) => {
             Ok(crate::planner::distributed::write::node::table_finish_output_columns())
         }
@@ -1919,7 +1925,7 @@ pub(in crate::planner::distributed) fn build_write_contract_catalog(
                         .insert((fragment.fragment_id, route.route_id), partition);
                 }
             }
-            DataSink::Result | DataSink::Noop | DataSink::Statistics(_) => {}
+            DataSink::Result | DataSink::Noop => {}
         }
     }
 
@@ -2204,6 +2210,7 @@ mod tests {
         arg_types: Vec<DataType>,
         output_id: u32,
     ) -> AggregateCall {
+        let resolved = crate::functions::test_resolved_aggregate(name, &arg_types, distinct);
         AggregateCall {
             name: name.to_string(),
             args: arg_types
@@ -2218,6 +2225,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: Vec::new(),
             output_column_id: ColumnId::new_for_test(output_id),
+            resolved,
         }
     }
 

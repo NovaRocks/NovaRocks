@@ -138,6 +138,26 @@ impl FragmentCutBuilder {
                 let child = self.visit(&node.children[0])?;
                 self.lower_local(node, fragment_id, vec![child])
             }
+            PhysicalPlanKind::Unpivot(unpivot) => {
+                expect_child_count(node, 1)?;
+                unpivot.validate_against(&node.children[0].output_columns)?;
+                if node.output_columns.len() != unpivot.output_columns.len()
+                    || node.output_columns.iter().zip(&unpivot.output_columns).any(
+                        |(left, right)| {
+                            left.column_id != right.column_id
+                                || left.data_type != right.data_type
+                                || left.nullable != right.nullable
+                        },
+                    )
+                {
+                    return Err(
+                        "build_distributed_plan: PhysicalPlanKind::Unpivot output columns do not match its typed payload"
+                            .to_string(),
+                    );
+                }
+                let child = self.visit(&node.children[0])?;
+                self.lower_local(node, fragment_id, vec![child])
+            }
             PhysicalPlanKind::Filter(_) => {
                 expect_child_count(node, 1)?;
                 let child = self.visit(&node.children[0])?;
@@ -913,6 +933,7 @@ fn physical_kind_name(kind: &PhysicalPlanKind) -> &'static str {
         PhysicalPlanKind::Scan(_) => "Scan",
         PhysicalPlanKind::Filter(_) => "Filter",
         PhysicalPlanKind::Project(_) => "Project",
+        PhysicalPlanKind::Unpivot(_) => "Unpivot",
         PhysicalPlanKind::Sort(_) => "Sort",
         PhysicalPlanKind::Limit(_) => "Limit",
         PhysicalPlanKind::Values(_) => "Values",

@@ -27,17 +27,17 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
-
-use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_write::{
     ConnectorWriteCodecError, ConnectorWriteFragmentEncoder, ConnectorWriteHandleDecoder,
     ValidatedWriterHandle,
 };
+use novarocks_proto_codec::{FieldPath, arrow_physical};
 use novarocks_proto_models::connector_write as write_dto;
 use novarocks_proto_models::{catalog as catalog_dto, plan};
 use novarocks_spi::connector::write_stack::{
     ConnectorBatchWriter, ConnectorCommitFragment, ConnectorOpenWriterRequest,
-    ConnectorWriteExecution, ConnectorWriterHandle, ProviderWriteRuntime, WriteRuntimeAdapter,
+    ConnectorWriteExecution, ConnectorWriterHandle, ProviderWriteRuntime, RootWriteResultSchema,
+    WriteRuntimeAdapter, WriterMultiplexSchema,
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, CatalogWriteExecution, ConnectorError, ConnectorErrorKind,
@@ -169,8 +169,9 @@ struct RecordingWriter {
     terminals: Arc<Mutex<WriterTerminals>>,
 }
 
+#[async_trait::async_trait]
 impl ConnectorBatchWriter for RecordingWriter {
-    fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         self.terminals
             .lock()
             .expect("writer terminals")
@@ -178,23 +179,24 @@ impl ConnectorBatchWriter for RecordingWriter {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+    async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
         self.terminals.lock().expect("writer terminals").finished += 1;
         Ok(Vec::new())
     }
 
-    fn abort(&mut self) -> Result<(), ConnectorError> {
+    async fn abort(&mut self) -> Result<(), ConnectorError> {
         self.terminals.lock().expect("writer terminals").aborted += 1;
         Ok(())
     }
 }
 
+#[async_trait::async_trait]
 impl ConnectorWriteExecution for RecordingWriteExecution {
     fn catalog_handle(&self) -> &CatalogHandle {
         &self.catalog_handle
     }
 
-    fn open_writer(
+    async fn open_writer(
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
@@ -378,6 +380,43 @@ pub(crate) fn table_writer_payload(
         writer_ordinal: 0,
         output_exprs: vec![output_expr],
         target_schema,
+        writer_multiplex_schema: Some(writer_multiplex_schema(&WriterMultiplexSchema::empty())),
+        partial_aggregate_plan: Some(plan::WriterPartialAggregatePlan { calls: Vec::new() }),
+    }
+}
+
+pub(crate) fn writer_multiplex_schema(
+    schema: &WriterMultiplexSchema,
+) -> plan::WriterMultiplexSchema {
+    let slot_ids = schema.slot_ids();
+    let (columns, schema_metadata) = arrow_physical::encode_schema(
+        schema.arrow_schema().as_ref(),
+        &slot_ids,
+        true,
+        FieldPath::root("writer_multiplex_schema"),
+    )
+    .expect("fixture relation schema");
+    plan::WriterMultiplexSchema {
+        contract_version: schema.contract_version(),
+        columns,
+        schema_metadata,
+    }
+}
+
+pub(crate) fn root_result_schema(schema: &RootWriteResultSchema) -> plan::RootWriteResultSchema {
+    let slot_ids = schema.slot_ids();
+    let arrow_schema = schema.arrow_schema();
+    let (columns, schema_metadata) = arrow_physical::encode_schema(
+        arrow_schema.as_ref(),
+        &slot_ids,
+        true,
+        FieldPath::root("root_result_schema"),
+    )
+    .expect("fixture relation schema");
+    plan::RootWriteResultSchema {
+        contract_version: schema.contract_version(),
+        columns,
+        schema_metadata,
     }
 }
 
@@ -414,6 +453,14 @@ pub(crate) fn finish_node(
         payload: Some(plan::distributed_node::Payload::TableFinish(
             plan::TableFinishNode {
                 expected_target_ordinals,
+                writer_multiplex_schema: Some(writer_multiplex_schema(
+                    &WriterMultiplexSchema::empty(),
+                )),
+                root_result_schema: Some(root_result_schema(&RootWriteResultSchema::new())),
+                final_aggregate_plan: Some(plan::WriterFinalAggregatePlan {
+                    calls: Vec::new(),
+                    unpivot: None,
+                }),
             },
         )),
     }

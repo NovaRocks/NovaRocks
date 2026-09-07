@@ -153,7 +153,6 @@ impl RuntimeFilterContract {
 pub enum FragmentSinkKind {
     Result,
     Noop,
-    Statistics,
     DataStream,
     MultiCastDataStream,
     SplitDataStream,
@@ -187,7 +186,6 @@ impl FragmentSinkSpec {
         let (kind, assignment_requirement) = match &program {
             FragmentSinkProgram::Result => (FragmentSinkKind::Result, None),
             FragmentSinkProgram::Noop => (FragmentSinkKind::Noop, None),
-            FragmentSinkProgram::Statistics(_) => (FragmentSinkKind::Statistics, None),
             FragmentSinkProgram::DataStream(_) => {
                 (FragmentSinkKind::DataStream, Required(StreamDestinations))
             }
@@ -410,6 +408,7 @@ fn root_plan_node_id(plan: &ExecPlan) -> i32 {
         ExecNodeKind::AssertNumRows(node) => node.node_id,
         ExecNodeKind::Values(node) => node.node_id,
         ExecNodeKind::Project(node) => node.node_id,
+        ExecNodeKind::Unpivot(node) => node.node_id,
         ExecNodeKind::Filter(node) => node.node_id,
         ExecNodeKind::Repeat(node) => node.node_id,
         ExecNodeKind::ChangeEventExpand(node) => node.node_id,

@@ -26,13 +26,17 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
+use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
 use crate::exec::expr::function::mv_state::sum_state_union;
 use crate::exec::mv::state_codec::{
     decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
 };
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
-use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
+use super::super::{
+    AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction, RetainedMemoryPolicy,
+};
 
 pub(in crate::exec::expr::agg::functions) struct SumStateAgg;
 pub(in crate::exec::expr::agg::functions) struct SumStateMergeAgg;
@@ -50,9 +54,19 @@ pub(in crate::exec::expr::agg::functions) struct SumDecimal128State {
     sum: i128,
 }
 
-#[derive(Default)]
 pub(in crate::exec::expr::agg::functions) struct SumStateMergeState {
-    state: Vec<u8>,
+    allocator: AggregateAllocator,
+    state: AggregateVec<u8>,
+}
+
+impl SumStateMergeState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            state: AggregateVec::new_in(allocator.clone()),
+            allocator,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +110,14 @@ impl AggregateFunction for SumStateAgg {
     }
 
     fn drop_state(&self, _spec: &AggSpec, _ptr: *mut u8) {}
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::FixedZero
+    }
 
     fn update_batch(
         &self,
@@ -163,6 +185,14 @@ impl AggregateFunction for SumStateSignedAgg {
     }
 
     fn drop_state(&self, _spec: &AggSpec, _ptr: *mut u8) {}
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::FixedZero
+    }
 
     fn update_batch(
         &self,
@@ -236,10 +266,29 @@ impl AggregateFunction for SumStateMergeAgg {
             unsafe {
                 std::ptr::write(
                     ptr as *mut SumStateMergeState,
-                    SumStateMergeState::default(),
+                    SumStateMergeState::new(process_mem_tracker()),
                 );
             }
         }
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        if !matches!(spec.kind, AggKind::SumStateMerge) {
+            return Err("sum_state_merge tracker initialization kind mismatch".to_string());
+        }
+        let tracker = tracker.ok_or_else(|| {
+            "allocation-tracked sum_state_merge requires a memory tracker".to_string()
+        })?;
+        unsafe {
+            ptr.cast::<SumStateMergeState>()
+                .write(SumStateMergeState::new(tracker));
+        }
+        Ok(())
     }
 
     fn drop_state(&self, spec: &AggSpec, ptr: *mut u8) {
@@ -248,6 +297,14 @@ impl AggregateFunction for SumStateMergeAgg {
                 std::ptr::drop_in_place(ptr as *mut SumStateMergeState);
             }
         }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -824,7 +881,13 @@ fn merge_sum_state_opaque(
             continue;
         }
         let state = unsafe { &mut *state_merge_slot(base, offset) };
-        state.state = sum_state_union(&state.state, array.value(row))?;
+        let merged = sum_state_union(&state.state, array.value(row))?;
+        let mut replacement = AggregateVec::new_in(state.allocator.clone());
+        replacement
+            .try_reserve_exact(merged.len())
+            .map_err(|_| state.allocator.allocation_error("reserve merged sum state"))?;
+        replacement.extend_from_slice(&merged);
+        state.state = replacement;
     }
     Ok(())
 }

@@ -814,6 +814,7 @@ mod tests {
         snapshot: std::sync::Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot>,
     ) -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(std::rc::Rc::new(
             std::cell::RefCell::new(ScalarArena::new()),
         ));
@@ -857,6 +858,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(3),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![output_column(1, "region"), output_column(3, "s")],
                 already_pushed: false,

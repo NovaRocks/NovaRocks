@@ -1881,6 +1881,8 @@ mod cascaded_derivation_tests {
         let window_expr = crate::planner::payload::WindowExpr {
             name: "max".into(),
             args: vec![],
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![col(10)],
             order_by: vec![],
             window_frame: None,

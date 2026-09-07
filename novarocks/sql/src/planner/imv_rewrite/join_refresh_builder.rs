@@ -225,7 +225,10 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     locator_pos_column_id: u32,
     locator_row_id_column_id: u32,
     locator_last_updated_seq_column_id: u32,
+    #[cfg(not(test))] function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<LogicalPlanNode, String> {
+    #[cfg(test)]
+    let function_catalog = crate::functions::builtin_sql_function_catalog();
     desc.validate()?;
     if desc.mode != JoinRefreshMode::Coalesce {
         return Err("join refresh coalesce builder requires coalesce descriptor".to_string());
@@ -311,7 +314,8 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &apply_key_input,
         &action_input,
         &net_column,
-    );
+        function_catalog,
+    )?;
     let payload_checked = build_payload_coalesce_assert_filter(aggregate, &net_column);
     let key_shape_checked = build_key_shape_assert_join(
         payload_checked,
@@ -320,7 +324,8 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &key_shape_apply_key,
         &pending_insert_count,
         &pending_delete_count,
-    );
+        function_catalog,
+    )?;
     let locator_join = build_locator_join_shell(
         key_shape_checked,
         desc,
@@ -359,7 +364,11 @@ fn build_payload_coalesce_aggregate(
     apply_key_input: &OutputColumn,
     action_input: &OutputColumn,
     net_column: &OutputColumn,
-) -> LogicalPlanNode {
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+) -> Result<LogicalPlanNode, String> {
+    let resolved = function_catalog
+        .resolve_aggregate_trusted("sum", std::slice::from_ref(&action_input.data_type))
+        .map_err(|error| format!("failed to resolve join coalesce sum aggregate: {error}"))?;
     let mut group_by = payload_inputs.iter().map(column_ref).collect::<Vec<_>>();
     group_by.push(column_ref(apply_key_input));
     let output_columns = payload_inputs
@@ -367,7 +376,7 @@ fn build_payload_coalesce_aggregate(
         .cloned()
         .chain([apply_key_input.clone(), net_column.clone()])
         .collect::<Vec<_>>();
-    LogicalPlanNode::new(
+    Ok(LogicalPlanNode::new(
         LogicalPlanKind::Aggregate(LogicalAggregateNode {
             group_by,
             aggregates: vec![AggregateCall {
@@ -377,13 +386,14 @@ fn build_payload_coalesce_aggregate(
                 result_type: DataType::Int64,
                 order_by: Vec::new(),
                 output_column_id: net_column.column_id,
+                resolved,
             }],
             output_columns,
             already_pushed: false,
         }),
         vec![branch_union],
         None,
-    )
+    ))
 }
 
 fn validate_generated_column_ids(
@@ -478,7 +488,11 @@ fn build_key_shape_assert_join(
     key_shape_apply_key: &OutputColumn,
     pending_insert_count: &OutputColumn,
     pending_delete_count: &OutputColumn,
-) -> LogicalPlanNode {
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+) -> Result<LogicalPlanNode, String> {
+    let resolved = function_catalog
+        .resolve_aggregate_trusted("sum", &[DataType::Int64])
+        .map_err(|error| format!("failed to resolve join key-shape sum aggregate: {error}"))?;
     let key_shape = LogicalPlanNode::new(
         LogicalPlanKind::Aggregate(LogicalAggregateNode {
             group_by: vec![column_ref(apply_key_output)],
@@ -490,6 +504,7 @@ fn build_key_shape_assert_join(
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: pending_insert_count.column_id,
+                    resolved: resolved.clone(),
                 },
                 AggregateCall {
                     name: "sum".to_string(),
@@ -498,6 +513,7 @@ fn build_key_shape_assert_join(
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: pending_delete_count.column_id,
+                    resolved,
                 },
             ],
             output_columns: vec![
@@ -538,14 +554,14 @@ fn build_key_shape_assert_join(
         BinOp::Eq,
         column_ref(key_shape_apply_key),
     );
-    LogicalPlanNode::new(
+    Ok(LogicalPlanNode::new(
         LogicalPlanKind::Join(LogicalJoinNode {
             join_type: JoinKind::Inner,
             condition: Some(join_condition),
         }),
         vec![payload_checked, checked_key_shape],
         None,
-    )
+    ))
 }
 
 fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {

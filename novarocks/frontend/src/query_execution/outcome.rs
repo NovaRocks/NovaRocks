@@ -21,7 +21,6 @@ use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use crate::query_execution::profile::FragmentProfileTree;
-use crate::query_execution::statistics::StatisticsCollectionProgram;
 use crate::runtime::query_result::QueryResult;
 
 /// Role-neutral execution data assembled by core engine flows before intent
@@ -170,12 +169,12 @@ pub struct ProfileExecutionOutcome {
 /// has no query-result field, preventing statistics sinks from becoming a
 /// second client-row transport.
 pub struct StatisticsExecutionOutcome {
-    result: novarocks_spi::connector::StatisticsCollectionResult,
+    artifacts: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
 }
 
 impl StatisticsExecutionOutcome {
-    pub fn into_collection_result(self) -> novarocks_spi::connector::StatisticsCollectionResult {
-        self.result
+    pub fn into_artifacts(self) -> Vec<novarocks_spi::connector::StatisticsArtifactDraft> {
+        self.artifacts
     }
 }
 
@@ -321,7 +320,7 @@ impl QueryOutcomeFactory {
             }
             DistributedQueryIntent::Statistics => Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
-                "Statistics outcome must be completed through the typed statistics result sink",
+                "Statistics outcome must be completed from the validated Root artifact stream",
             )),
         }
     }
@@ -350,16 +349,11 @@ impl QueryOutcomeFactory {
 
     pub fn statistics(
         self,
-        program: &StatisticsCollectionProgram,
-        result: novarocks_spi::connector::StatisticsCollectionResult,
+        artifacts: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.require_intent(DistributedQueryIntent::Statistics)?;
-        let mut sink = program.result_sink();
-        sink.accept(result)?;
         Ok(DistributedQueryOutcome::Statistics(
-            StatisticsExecutionOutcome {
-                result: sink.finish()?,
-            },
+            StatisticsExecutionOutcome { artifacts },
         ))
     }
 

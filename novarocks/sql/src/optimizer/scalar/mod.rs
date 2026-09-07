@@ -115,6 +115,7 @@ pub(crate) enum ScalarNode {
         args: Vec<ScalarId>,
         distinct: bool,
         order_by: Vec<SortKey>,
+        resolved: novarocks_functions::ResolvedAggregateSignature,
     },
     Cast {
         child: ScalarId,
@@ -155,6 +156,8 @@ pub(crate) enum ScalarNode {
         name: String,
         args: Vec<ScalarId>,
         distinct: bool,
+        function_order_by: Vec<SortKey>,
+        aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
         partition_by: Vec<ScalarId>,
         order_by: Vec<SortKey>,
         window_frame: Option<WindowFrame>,
@@ -995,6 +998,11 @@ mod bridge_tests {
                             args: vec![col(5, DataType::Int64)],
                             distinct: true,
                             order_by: vec![sort(col(6, DataType::Int64), false, true)],
+                            resolved: crate::functions::test_resolved_aggregate(
+                                "sum",
+                                &[DataType::Int64],
+                                true,
+                            ),
                         },
                         DataType::Int64,
                         true,
@@ -1047,6 +1055,8 @@ mod bridge_tests {
                             name: "first_value".to_string(),
                             args: vec![col(9, DataType::Int64)],
                             distinct: false,
+                            function_order_by: vec![],
+                            aggregate_binding: None,
                             partition_by: vec![col(10, DataType::Utf8)],
                             order_by: vec![sort(col(11, DataType::Int64), true, false)],
                             window_frame: Some(WindowFrame {

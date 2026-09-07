@@ -23,9 +23,10 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 
 use crate::exec::expr::function::object::percentile_functions::payload_bytes_at;
-use crate::exec::hll::{self, HllHandle, HllTargetType};
+use crate::exec::hll::{HllHandle, HllTargetType};
 use crate::exec::node::aggregate::AggFunction;
 use crate::exec::sketch_hash::prehash_array_value;
+use crate::runtime::mem_tracker::MemTracker;
 
 use super::super::*;
 use super::AggregateFunction;
@@ -36,77 +37,102 @@ const DEFAULT_TARGET_TYPE: HllTargetType = HllTargetType::Hll6;
 pub(super) struct DsHllAgg;
 
 struct DsHllState {
-    handle: HllHandle,
+    handle: Option<HllHandle>,
+    retained_charge: AggregateRetainedCharge,
+    allocator: AggregateAllocator,
 }
 
-fn state_slot(ptr: *mut u8) -> *mut *mut DsHllState {
-    ptr as *mut *mut DsHllState
-}
-
-unsafe fn get_state<'a>(ptr: *mut u8) -> Option<&'a DsHllState> {
-    let raw = unsafe { *state_slot(ptr) };
-    if raw.is_null() {
-        None
-    } else {
-        Some(unsafe { &*raw })
-    }
-}
-
-unsafe fn get_state_mut<'a>(ptr: *mut u8) -> Option<&'a mut DsHllState> {
-    let raw = unsafe { *state_slot(ptr) };
-    if raw.is_null() {
-        None
-    } else {
-        Some(unsafe { &mut *raw })
-    }
-}
-
-unsafe fn take_state(ptr: *mut u8) -> Option<Box<DsHllState>> {
-    let slot = state_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        None
-    } else {
-        unsafe {
-            *slot = std::ptr::null_mut();
-            Some(Box::from_raw(raw))
+impl DsHllState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            handle: None,
+            retained_charge: AggregateRetainedCharge::new(allocator.clone()),
+            allocator,
         }
     }
+
+    fn ensure_handle(
+        &mut self,
+        log_k: u8,
+        target_type: HllTargetType,
+    ) -> Result<&mut HllHandle, String> {
+        if self.handle.is_none() {
+            let preflight = HllHandle::new_allocation_preflight(log_k, target_type)?;
+            let mut reservation = self.retained_charge.reserve_operation(
+                preflight.bounds().operation_peak_bytes,
+                "reserve ds_hll handle creation",
+            )?;
+            let (handle, outcome) = HllHandle::new_under_reservation(&preflight, &reservation)?;
+            self.retained_charge.reconcile_under_reservation(
+                hll_heap_bytes(outcome.current_bytes),
+                &mut reservation,
+            )?;
+            self.handle = Some(handle);
+        }
+        Ok(self.handle.as_mut().expect("ds_hll handle initialized"))
+    }
+
+    fn ensure_handle_from_payload(&mut self, payload: &[u8]) -> Result<&mut HllHandle, String> {
+        if self.handle.is_none() {
+            let preflight = HllHandle::from_payload_allocation_preflight(payload)?;
+            let mut reservation = self.retained_charge.reserve_operation(
+                preflight.bounds().operation_peak_bytes,
+                "reserve ds_hll payload initialization",
+            )?;
+            let (handle, outcome) =
+                HllHandle::from_payload_under_reservation(payload, &preflight, &reservation)?;
+            self.retained_charge.reconcile_under_reservation(
+                hll_heap_bytes(outcome.current_bytes),
+                &mut reservation,
+            )?;
+            self.handle = Some(handle);
+        }
+        Ok(self.handle.as_mut().expect("ds_hll handle initialized"))
+    }
+
+    fn update_hash(&mut self, hash: u64) -> Result<(), String> {
+        let handle = self
+            .handle
+            .as_mut()
+            .ok_or_else(|| "ds_hll handle is not initialized".to_string())?;
+        let preflight = handle.update_hash_allocation_preflight();
+        let mut reservation = self.retained_charge.reserve_operation(
+            preflight.bounds().additional_headroom_bytes(),
+            "reserve ds_hll update",
+        )?;
+        let outcome = handle.update_hash_under_reservation(hash, &preflight, &reservation)?;
+        self.retained_charge
+            .reconcile_under_reservation(hll_heap_bytes(outcome.current_bytes), &mut reservation)
+    }
+
+    fn merge_payload(&mut self, payload: &[u8]) -> Result<(), String> {
+        if self.handle.is_none() {
+            self.ensure_handle_from_payload(payload)?;
+            return Ok(());
+        }
+        let handle = self.handle.as_mut().expect("ds_hll handle initialized");
+        let preflight = handle.merge_payload_allocation_preflight(payload)?;
+        let mut reservation = self.retained_charge.reserve_operation(
+            preflight.bounds().additional_headroom_bytes(),
+            "reserve ds_hll merge",
+        )?;
+        let outcome = handle.merge_payload_under_reservation(payload, &preflight, &reservation)?;
+        self.retained_charge
+            .reconcile_under_reservation(hll_heap_bytes(outcome.current_bytes), &mut reservation)
+    }
 }
 
-unsafe fn init_state_with_config<'a>(
-    ptr: *mut u8,
-    log_k: u8,
-    target_type: HllTargetType,
-) -> Result<&'a mut DsHllState, String> {
-    if let Some(state) = unsafe { get_state_mut(ptr) } {
-        return Ok(state);
-    }
-    let boxed = Box::new(DsHllState {
-        handle: HllHandle::new_unreserved(log_k, target_type)?,
-    });
-    let raw = Box::into_raw(boxed);
-    unsafe {
-        *state_slot(ptr) = raw;
-        Ok(&mut *raw)
-    }
+fn hll_heap_bytes(current_allocation_bytes: usize) -> usize {
+    current_allocation_bytes.saturating_sub(std::mem::size_of::<HllHandle>())
 }
 
-unsafe fn init_state_from_payload<'a>(
-    ptr: *mut u8,
-    payload: &[u8],
-) -> Result<&'a mut DsHllState, String> {
-    if let Some(state) = unsafe { get_state_mut(ptr) } {
-        return Ok(state);
-    }
-    let boxed = Box::new(DsHllState {
-        handle: HllHandle::from_payload_unreserved(payload)?,
-    });
-    let raw = Box::into_raw(boxed);
-    unsafe {
-        *state_slot(ptr) = raw;
-        Ok(&mut *raw)
-    }
+unsafe fn get_state<'a>(ptr: *const u8) -> &'a DsHllState {
+    unsafe { &*(ptr as *const DsHllState) }
+}
+
+unsafe fn get_state_mut<'a>(ptr: *mut u8) -> &'a mut DsHllState {
+    unsafe { &mut *(ptr as *mut DsHllState) }
 }
 
 fn parse_target_type(value: &str) -> HllTargetType {
@@ -218,8 +244,9 @@ fn update_from_struct(
             continue;
         };
         let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { init_state_with_config(ptr, lg_k, target_type) }?;
-        state.handle.update_hash_unreserved(hash)?;
+        let state = unsafe { get_state_mut(ptr) };
+        state.ensure_handle(lg_k, target_type)?;
+        state.update_hash(hash)?;
     }
     Ok(())
 }
@@ -237,8 +264,9 @@ fn update_from_raw_array(
             continue;
         };
         let ptr = unsafe { (base as *mut u8).add(offset) };
-        let state = unsafe { init_state_with_config(ptr, log_k, target_type) }?;
-        state.handle.update_hash_unreserved(hash)?;
+        let state = unsafe { get_state_mut(ptr) };
+        state.ensure_handle(log_k, target_type)?;
+        state.update_hash(hash)?;
     }
     Ok(())
 }
@@ -250,24 +278,37 @@ fn merge_payload_array(
     context: &str,
 ) -> Result<(), String> {
     for (row, &base) in state_ptrs.iter().enumerate() {
-        let Some(payload) = payload_bytes_for_merge(array, row, context)? else {
+        let ptr = unsafe { (base as *mut u8).add(offset) };
+        let state = unsafe { get_state_mut(ptr) };
+        let Some(payload) = payload_bytes_for_merge(array, row, context, state.allocator.clone())?
+        else {
             continue;
         };
-        let ptr = unsafe { (base as *mut u8).add(offset) };
-        if let Some(state) = unsafe { get_state_mut(ptr) } {
-            state.handle.merge_payload_unreserved(&payload)?;
-        } else {
-            let _ = unsafe { init_state_from_payload(ptr, &payload) }?;
-        }
+        state.merge_payload(payload.as_ref())?;
     }
     Ok(())
 }
 
-fn payload_bytes_for_merge(
-    array: &ArrayRef,
+enum MergePayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(AggregateVec<u8>),
+}
+
+impl AsRef<[u8]> for MergePayload<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value.as_slice(),
+        }
+    }
+}
+
+fn payload_bytes_for_merge<'a>(
+    array: &'a ArrayRef,
     row: usize,
     context: &str,
-) -> Result<Option<Vec<u8>>, String> {
+    allocator: AggregateAllocator,
+) -> Result<Option<MergePayload<'a>>, String> {
     match array.data_type() {
         DataType::Utf8 => {
             let arr = array
@@ -277,7 +318,13 @@ fn payload_bytes_for_merge(
             if arr.is_null(row) {
                 return Ok(None);
             }
-            Ok(Some(arr.value(row).chars().map(|ch| ch as u8).collect()))
+            let value = arr.value(row);
+            let mut payload = AggregateVec::new_in(allocator.clone());
+            payload
+                .try_reserve_exact(value.len())
+                .map_err(|_| allocator.allocation_error("reserve ds_hll string payload"))?;
+            payload.extend(value.chars().map(|ch| ch as u8));
+            Ok(Some(MergePayload::Owned(payload)))
         }
         DataType::LargeUtf8 => {
             let arr = array
@@ -287,9 +334,17 @@ fn payload_bytes_for_merge(
             if arr.is_null(row) {
                 return Ok(None);
             }
-            Ok(Some(arr.value(row).chars().map(|ch| ch as u8).collect()))
+            let value = arr.value(row);
+            let mut payload = AggregateVec::new_in(allocator.clone());
+            payload
+                .try_reserve_exact(value.len())
+                .map_err(|_| allocator.allocation_error("reserve ds_hll string payload"))?;
+            payload.extend(value.chars().map(|ch| ch as u8));
+            Ok(Some(MergePayload::Owned(payload)))
         }
-        _ => payload_bytes_at(array, row, context).map(|payload| payload.map(|v| v.to_vec())),
+        _ => {
+            payload_bytes_at(array, row, context).map(|payload| payload.map(MergePayload::Borrowed))
+        }
     }
 }
 
@@ -341,8 +396,8 @@ impl AggregateFunction for DsHllAgg {
     fn state_layout_for(&self, kind: &AggKind) -> (usize, usize) {
         match kind {
             AggKind::DsHllHash | AggKind::DsHllMerge | AggKind::DsHllCount => (
-                std::mem::size_of::<*mut DsHllState>(),
-                std::mem::align_of::<*mut DsHllState>(),
+                std::mem::size_of::<DsHllState>(),
+                std::mem::align_of::<DsHllState>(),
             ),
             other => unreachable!("unexpected ds_hll agg kind: {:?}", other),
         }
@@ -370,16 +425,37 @@ impl AggregateFunction for DsHllAgg {
         Ok(AggInputView::Any(arr))
     }
 
-    fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
+    fn init_state(&self, _spec: &AggSpec, _ptr: *mut u8) {
+        panic!("allocation-tracked ds_hll requires tracker-aware initialization");
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker.ok_or_else(|| {
+            "allocation-tracked ds_hll requires an aggregate memory tracker".to_string()
+        })?;
         unsafe {
-            std::ptr::write(ptr as *mut *mut DsHllState, std::ptr::null_mut());
+            std::ptr::write(ptr as *mut DsHllState, DsHllState::new(tracker));
         }
+        Ok(())
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
-            let _ = take_state(ptr);
+            std::ptr::drop_in_place(ptr as *mut DsHllState);
         }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -447,7 +523,9 @@ impl AggregateFunction for DsHllAgg {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let state = unsafe { get_state(ptr) };
                     let payload = state
-                        .map(|state| state.handle.serialize())
+                        .handle
+                        .as_ref()
+                        .map(HllHandle::serialize)
                         .transpose()?
                         .unwrap_or_else(|| empty_payload.clone());
                     builder.append_value(payload);
@@ -459,7 +537,9 @@ impl AggregateFunction for DsHllAgg {
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let value = unsafe { get_state(ptr) }
-                        .map(|state| state.handle.estimate())
+                        .handle
+                        .as_ref()
+                        .map(HllHandle::estimate)
                         .transpose()?
                         .unwrap_or(0);
                     builder.append_value(value);
@@ -476,4 +556,58 @@ impl AggregateFunction for DsHllAgg {
 
 fn canonical_agg_name(name: &str) -> &str {
     name.split_once('|').map(|(base, _)| base).unwrap_or(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracked_state_charges_retained_hll_heap_and_releases_on_drop() {
+        let tracker = MemTracker::new_root("ds-hll-retained-test");
+        {
+            let mut state = DsHllState::new(Arc::clone(&tracker));
+            state
+                .ensure_handle(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)
+                .expect("create handle");
+            state.update_hash(11).expect("update handle");
+            assert_eq!(tracker.current(), state.retained_charge.bytes() as i64);
+            assert!(tracker.current() > 0);
+        }
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn sparse_to_dense_growth_is_rejected_before_mutating_the_handle() {
+        let tracker = MemTracker::new_root("ds-hll-admission-test");
+        let mut state = DsHllState::new(Arc::clone(&tracker));
+        state
+            .ensure_handle(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)
+            .expect("create handle");
+        for hash in 0..7 {
+            state.update_hash(hash).expect("sparse update");
+        }
+        let before_estimate = state
+            .handle
+            .as_ref()
+            .expect("handle")
+            .estimate()
+            .expect("estimate");
+        tracker
+            .install_limit_once(tracker.current())
+            .expect("install exact current limit");
+
+        let error = state.update_hash(7).expect_err("dense allocation rejected");
+        assert!(error.contains("ResourceExhausted"));
+        assert_eq!(tracker.current(), state.retained_charge.bytes() as i64);
+        assert_eq!(
+            state
+                .handle
+                .as_ref()
+                .expect("handle")
+                .estimate()
+                .expect("estimate"),
+            before_estimate
+        );
+    }
 }

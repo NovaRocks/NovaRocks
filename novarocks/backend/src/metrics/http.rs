@@ -26,7 +26,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, IntCounter, IntGaugeVec, Opts, Registry, TextEncoder};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 
@@ -40,24 +40,37 @@ pub(crate) struct BackendMetricsRegistry {
 impl BackendMetricsRegistry {
     pub(crate) fn new() -> Result<Self, String> {
         let registry = Registry::new();
-        for collector in [
+        let collectors = [
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES).clone())
                 as Box<dyn prometheus::core::Collector>,
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS).clone()),
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS).clone()),
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINAL).clone()),
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone()),
+            Box::new(Lazy::force(&BACKEND_TASK_EXECUTION_TASKS_CREATED).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_AUTHENTICATION_FAILURES).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_TLS_FAILURES).clone()),
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_OPENS).clone()),
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_TOTALS).clone()),
+            Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_ABORTS).clone()),
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK).clone()),
-        ] {
+            Box::new(Lazy::force(&BACKEND_FRAGMENT_RESULT_TERMINALS).clone()),
+        ];
+        for collector in collectors {
             registry
                 .register(collector)
                 .map_err(|error| format!("register backend metrics collector: {error}"))?;
         }
+        #[cfg(debug_assertions)]
+        registry
+            .register(Box::new(
+                Lazy::force(&BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS).clone(),
+            ))
+            .map_err(|error| format!("register backend debug metrics collector: {error}"))?;
         novarocks_execution::runtime::fragment::io::exchange_metrics::register_exchange_metrics(
+            &registry,
+        )?;
+        novarocks_execution::runtime::table_writer_metrics::register_table_writer_metrics(
             &registry,
         )?;
         Ok(Self { registry })
@@ -228,6 +241,18 @@ static BACKEND_QUERY_EXECUTION_RESOURCES: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("construct novarocks_backend_query_execution_resources")
 });
 
+/// Tasks first accepted by the EES task registry in this backend process.
+///
+/// A task is the EES-owned replacement for one admitted fragment. Idempotent
+/// CreateTask replays do not advance this counter.
+static BACKEND_TASK_EXECUTION_TASKS_CREATED: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(Opts::new(
+        "novarocks_backend_task_execution_tasks_created_total",
+        "Cumulative EES tasks first accepted by this backend.",
+    ))
+    .expect("construct novarocks_backend_task_execution_tasks_created_total")
+});
+
 /// Writer opens attempted by this backend's connector write data plane, by
 /// outcome. One driver opens exactly one writer, so this counts drivers.
 static BACKEND_CONNECTOR_WRITE_WRITER_OPENS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
@@ -254,6 +279,48 @@ static BACKEND_CONNECTOR_WRITE_WRITER_TOTALS: Lazy<prometheus::IntCounterVec> = 
     .expect("construct novarocks_backend_connector_write_writer_totals")
 });
 
+/// Provider writer abort calls completed by this backend, by outcome.
+///
+/// The counter is advanced only after the provider future returns, so
+/// `succeeded` is direct evidence that cancellation crossed the adapter and
+/// settled at the provider boundary rather than merely suppressing commit.
+static BACKEND_CONNECTOR_WRITE_WRITER_ABORTS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_connector_write_writer_aborts_total",
+            "Cumulative completed connector writer abort calls on this backend, by outcome.",
+        ),
+        &["outcome"],
+    )
+    .expect("construct novarocks_backend_connector_write_writer_aborts_total")
+});
+
+/// Debug-only write faults that reached their exact execution boundary.
+#[cfg(debug_assertions)]
+static BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_connector_write_debug_faults_total",
+            "Cumulative debug-only connector write faults that reached their bound attempt.",
+        ),
+        &["kind"],
+    )
+    .expect("construct novarocks_backend_connector_write_debug_faults_total")
+});
+
+/// Native fragment result sessions that reached one accepted terminal.
+/// `finished` is the owner-side publication of successful Root EOF.
+static BACKEND_FRAGMENT_RESULT_TERMINALS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_fragment_result_terminals_total",
+            "Cumulative accepted native fragment result terminals, by terminal.",
+        ),
+        &["terminal"],
+    )
+    .expect("construct novarocks_backend_fragment_result_terminals_total")
+});
+
 /// High-water mark of the prepared write set observed by a root aggregation on
 /// this backend. Bytes and entries are the two frozen budgets the root bounds.
 static BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -266,6 +333,9 @@ static BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
     .expect("construct novarocks_backend_connector_write_root_prepared_set_peak")
 });
+
+static BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+static BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
 static BACKEND_NATIVE_AUTHENTICATION_FAILURES: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
     prometheus::IntCounterVec::new(
@@ -300,6 +370,10 @@ pub(crate) fn record_connector_write_writer_open(outcome: &'static str) {
         .inc();
 }
 
+pub(crate) fn record_task_execution_task_created() {
+    BACKEND_TASK_EXECUTION_TASKS_CREATED.inc();
+}
+
 /// One connector writer finished: it accepted `rows` rows and produced
 /// `fragments` commit fragments.
 pub(crate) fn record_connector_write_writer_finished(rows: u64, fragments: u64) {
@@ -311,16 +385,50 @@ pub(crate) fn record_connector_write_writer_finished(rows: u64, fragments: u64) 
         .inc_by(fragments);
 }
 
+pub(crate) fn record_connector_write_writer_abort(outcome: &'static str) {
+    BACKEND_CONNECTOR_WRITE_WRITER_ABORTS
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn record_connector_write_debug_fault(kind: &'static str) {
+    BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS
+        .with_label_values(&[kind])
+        .inc();
+}
+
+pub(crate) fn record_fragment_result_terminal(terminal: &'static str) {
+    BACKEND_FRAGMENT_RESULT_TERMINALS
+        .with_label_values(&[terminal])
+        .inc();
+}
+
 /// Publish the prepared write set a root aggregation has accepted so far. The
 /// gauge keeps the process-wide high-water mark, so a later, smaller write
 /// never erases the peak an operator needs in order to size the budgets.
 pub(crate) fn publish_connector_write_root_prepared_set_peak(bytes: u64, entries: u64) {
-    for (dimension, value) in [("bytes", bytes), ("entries", entries)] {
+    for (dimension, value, peak) in [
+        ("bytes", bytes, &BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK_BYTES),
+        (
+            "entries",
+            entries,
+            &BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK_ENTRIES,
+        ),
+    ] {
         let gauge = BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK.with_label_values(&[dimension]);
-        let observed = i64::try_from(value).unwrap_or(i64::MAX);
-        if observed > gauge.get() {
-            gauge.set(observed);
-        }
+        publish_monotonic_peak(peak, &gauge, value);
+    }
+}
+
+fn publish_monotonic_peak(peak: &AtomicU64, gauge: &prometheus::IntGauge, value: u64) {
+    let value = value.min(i64::MAX as u64);
+    let previous = peak.fetch_max(value, Ordering::AcqRel);
+    if value > previous {
+        // Every successful maximum advance contributes only its delta. Gauge
+        // addition is atomic, so concurrent advances telescope to the largest
+        // observed value regardless of the order in which the winners publish.
+        gauge.add((value - previous) as i64);
     }
 }
 
@@ -604,9 +712,19 @@ fn ensure_backend_metric_label_families() {
     for resource in ["catalog_query_leases", "catalog_handle_leases"] {
         let _ = BACKEND_QUERY_EXECUTION_RESOURCES.get_metric_with_label_values(&[resource]);
     }
+    for outcome in ["succeeded", "failed"] {
+        let _ = BACKEND_CONNECTOR_WRITE_WRITER_ABORTS.get_metric_with_label_values(&[outcome]);
+    }
+    #[cfg(debug_assertions)]
+    let _ = BACKEND_CONNECTOR_WRITE_DEBUG_FAULTS.get_metric_with_label_values(&["append_hold"]);
+    for terminal in ["finished", "aborted"] {
+        let _ = BACKEND_FRAGMENT_RESULT_TERMINALS.get_metric_with_label_values(&[terminal]);
+    }
 }
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use prometheus::{IntGauge, Opts, Registry};
 
     use super::*;
@@ -644,7 +762,49 @@ mod tests {
         let backend = BackendMetricsRegistry::new().expect("construct Backend registry");
         let rendered = render_metrics(&backend).expect("render Backend metrics");
         assert!(rendered.contains("novarocks_backend_query_lifecycle_entries"));
+        assert!(rendered.contains("novarocks_backend_task_execution_tasks_created_total"));
         assert!(rendered.contains("novarocks_exchange_shuffle_bytes_total"));
         assert!(!rendered.contains("novarocks_frontend_only_fixture"));
+    }
+
+    #[test]
+    fn prepared_set_peak_is_monotonic_under_concurrent_publication() {
+        let peak = Arc::new(AtomicU64::new(0));
+        let gauge = Arc::new(
+            IntGauge::with_opts(Opts::new(
+                "connector_write_root_peak_concurrency_fixture",
+                "Concurrent peak publication fixture.",
+            ))
+            .expect("construct peak fixture"),
+        );
+        publish_monotonic_peak(&peak, &gauge, 73);
+
+        let values = [72_u64, 1, 37, 1_024, 511, 73, 999, 8];
+        let start = Arc::new(Barrier::new(values.len() + 1));
+        let threads = values
+            .into_iter()
+            .map(|value| {
+                let peak = Arc::clone(&peak);
+                let gauge = Arc::clone(&gauge);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    publish_monotonic_peak(&peak, &gauge, value);
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for thread in threads {
+            thread.join().expect("peak publisher");
+        }
+
+        assert_eq!(peak.load(Ordering::Acquire), 1_024);
+        assert_eq!(gauge.get(), 1_024);
+        publish_monotonic_peak(&peak, &gauge, 2);
+        assert_eq!(
+            gauge.get(),
+            1_024,
+            "a late lower value must not erase the peak"
+        );
     }
 }

@@ -82,7 +82,6 @@ fn protocol_execution_id(
 /// split. Known-cost splits use deterministic largest-processing-time
 /// placement; unknown-cost splits retain their source order and balance only
 /// split counts. The returned vectors are restored to source split order so a
-
 static NEXT_HANDOFF_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Opaque identity minted with a sealed prepared handoff. Role crates can
@@ -136,6 +135,12 @@ impl PreparedDistributedQuery {
             handoff_id: self.handoff_id,
             inner: self.prepared.scheduling_view(),
         }
+    }
+
+    pub(crate) fn write_root_targets(
+        &self,
+    ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
+        self.prepared.write_root_targets()
     }
 
     pub fn runtime_filter_artifact_id(&self) -> RuntimeFilterArtifactId {
@@ -956,10 +961,6 @@ impl<'a> SchedulingFragmentView<'a> {
     ) -> Option<novarocks_spi::connector::read_stack::ConnectorReadWorkSource> {
         self.view
             .typed_connector_work_source(self.fragment.fragment_id(), node_id)
-    }
-
-    pub fn is_statistics(self) -> bool {
-        self.fragment.execution_role().is_statistics()
     }
 }
 

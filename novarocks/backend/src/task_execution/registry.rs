@@ -580,6 +580,7 @@ impl TaskExecutionRegistry {
             );
         }
         self.counters.tasks_created.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::record_task_execution_task_created();
         OperationReceipt::acknowledged(operation, OperationOutcome::Accepted, receipt)
     }
 
@@ -1011,6 +1012,7 @@ impl TaskExecutionRegistry {
             context,
             request.catalog_binding(),
             request.initial_runtime_filter(),
+            request.query_options(),
             request.initial_credential(),
         ));
 

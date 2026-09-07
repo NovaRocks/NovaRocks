@@ -140,6 +140,8 @@ mod tests {
         WindowExpr {
             name: "cume_dist".into(),
             args: vec![],
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by,
             order_by: vec![],
             window_frame: None,
@@ -183,6 +185,8 @@ mod tests {
         let window_expr = WindowExpr {
             name: "max".into(),
             args: vec![],
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![col_c0.clone()],
             order_by: vec![],
             window_frame: None,
@@ -209,6 +213,8 @@ mod tests {
         let window_expr = WindowExpr {
             name: "row_number".into(),
             args: vec![],
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![],
             order_by: vec![],
             window_frame: None,
@@ -318,6 +324,8 @@ mod tests {
         let partitioned = WindowExpr {
             name: "cume_dist".into(),
             args: vec![],
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![partition],
             order_by: vec![],
             window_frame: None,
@@ -330,6 +338,8 @@ mod tests {
         let global = WindowExpr {
             name: "percent_rank".into(),
             args: vec![],
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![],
             order_by: vec![],
             window_frame: None,
@@ -362,6 +372,8 @@ mod tests {
         let partitioned = WindowExpr {
             name: "cume_dist".into(),
             args: vec![],
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![partition],
             order_by: vec![],
             window_frame: None,
@@ -374,6 +386,8 @@ mod tests {
         let global = WindowExpr {
             name: "percent_rank".into(),
             args: vec![],
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![],
             order_by: vec![],
             window_frame: None,
@@ -414,6 +428,8 @@ mod tests {
         let window_expr = WindowExpr {
             name: "sum".into(),
             args: vec![],
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![partition],
             order_by: vec![SortItem {
                 expr: order,

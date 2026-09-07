@@ -467,6 +467,7 @@ fn substitute(
             args,
             distinct,
             order_by,
+            resolved,
         } => ScalarNode::AggregateCall {
             name,
             args: args
@@ -481,6 +482,7 @@ fn substitute(
                     key
                 })
                 .collect(),
+            resolved,
         },
         ScalarNode::Cast { child, target } => ScalarNode::Cast {
             child: substitute(scalars, child, subst),
@@ -2798,6 +2800,11 @@ mod tests {
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "sum",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(202),
@@ -2805,6 +2812,11 @@ mod tests {
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "avg",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                 ],
                 output_layout: AggregateOutputLayout::new(
@@ -2900,6 +2912,11 @@ mod tests {
                         args: vec![a_plus_b],
                         distinct: false,
                         order_by: vec![],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "sum",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(202),
@@ -2907,6 +2924,11 @@ mod tests {
                         args: vec![a_plus_b],
                         distinct: false,
                         order_by: vec![],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "avg",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                 ],
                 output_layout: AggregateOutputLayout::new(
@@ -2976,6 +2998,11 @@ mod tests {
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "sum",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(202),
@@ -2983,6 +3010,11 @@ mod tests {
                         args: vec![a_mul_b],
                         distinct: false,
                         order_by: vec![],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "avg",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                 ],
                 output_layout: AggregateOutputLayout::new(
@@ -3034,6 +3066,11 @@ mod tests {
                         args: vec![a],
                         distinct: false,
                         order_by: vec![sort_key(a_mul_b)],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "array_agg",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                     ScalarAggregateSpec {
                         output_column_id: ColumnId::new_for_test(202),
@@ -3041,6 +3078,11 @@ mod tests {
                         args: vec![b],
                         distinct: false,
                         order_by: vec![sort_key(a_mul_b)],
+                        resolved: crate::functions::test_resolved_aggregate(
+                            "array_agg",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     },
                 ],
                 output_layout: AggregateOutputLayout::new(
@@ -3211,6 +3253,8 @@ mod tests {
                     name: "sum".to_string(),
                     args: vec![a_mul_b],
                     distinct: false,
+                    function_order_by: vec![],
+                    aggregate_binding: None,
                     partition_by: vec![a_mul_b],
                     order_by: vec![sort_key(a_mul_b)],
                     window_frame: None,

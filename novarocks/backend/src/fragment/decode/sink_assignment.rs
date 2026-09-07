@@ -85,9 +85,7 @@ pub(crate) fn decode_fragment_sink_assignment(
                 sender_id: None,
             })
         }
-        plan::data_sink::Kind::Result(_)
-        | plan::data_sink::Kind::Noop(_)
-        | plan::data_sink::Kind::Statistics(_) => {
+        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => {
             if instance.destinations.is_empty() {
                 Ok(FragmentSinkAssignment::None)
             } else {

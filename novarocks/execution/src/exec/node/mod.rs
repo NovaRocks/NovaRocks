@@ -33,9 +33,11 @@ pub mod set_op;
 pub mod sort;
 pub mod table_finish;
 pub mod table_function;
+pub mod table_write_aggregate;
 pub mod table_write_relation;
 pub mod table_writer;
 pub mod union_all;
+pub mod unpivot;
 pub mod values;
 
 use crate::exec::chunk::Chunk;
@@ -61,6 +63,7 @@ use crate::exec::node::table_finish::TableFinishNode;
 use crate::exec::node::table_function::TableFunctionNode;
 use crate::exec::node::table_writer::TableWriterNode;
 use crate::exec::node::union_all::UnionAllNode;
+use crate::exec::node::unpivot::UnpivotNode;
 use crate::exec::node::values::ValuesNode;
 
 pub type ExecResult = Result<Chunk, String>;
@@ -78,6 +81,7 @@ pub enum ExecNodeKind {
     AssertNumRows(AssertNumRowsNode),
     Values(ValuesNode),
     Project(ProjectNode),
+    Unpivot(UnpivotNode),
     Filter(FilterNode),
     Repeat(RepeatNode),
     ChangeEventExpand(ChangeEventExpandNode),

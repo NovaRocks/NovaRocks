@@ -74,7 +74,7 @@ pub fn eval_percentile_approx_raw(
         match (payload, quantile) {
             (Some(payload), Some(quantile)) => {
                 let state = percentile::decode_state(payload)?;
-                if let Some(value) = percentile::quantile_from_state(&state, Some(quantile)) {
+                if let Some(value) = percentile::quantile_from_state(&state, Some(quantile))? {
                     builder.append_value(value);
                 } else {
                     builder.append_null();

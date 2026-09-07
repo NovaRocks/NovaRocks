@@ -53,6 +53,20 @@ pub(crate) fn scalar_signatures(name: &str) -> Option<&'static [Signature]> {
         .map(|v| v.as_slice())
 }
 
+pub(crate) fn builtin_scalar_declarations() -> Vec<(String, Vec<String>)> {
+    let mut declarations = SCALAR_FN_SIGNATURES
+        .iter()
+        .map(|(name, signatures)| {
+            (
+                name.clone(),
+                signatures.iter().map(Signature::canonical).collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    declarations.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    declarations
+}
+
 static SCALAR_FN_SIGNATURES: LazyLock<HashMap<String, Vec<Signature>>> = LazyLock::new(|| {
     let mut m: HashMap<String, Vec<Signature>> = HashMap::new();
     register_string_fns(&mut m);
@@ -434,8 +448,12 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
     for name in [
         "now",
         "current_timestamp",
+        "current_time",
+        "curtime",
         "localtimestamp",
         "localtime",
+        "utc_timestamp",
+        "utc_time",
         "curdate",
         "current_date",
         "to_datetime",
@@ -1506,6 +1524,7 @@ fn register_aggregate_in_expr_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "stddev",
         "stddev_pop",
         "stddev_samp",
+        "std",
     ] {
         add(
             m,

@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
-use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    FinishingWait, Operator, ProcessorOperator, forward_observable,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::ExchangeFrameTransmitter;
@@ -148,12 +150,11 @@ impl OperatorFactory for MultiCastDataStreamSinkFactory {
             });
         }
 
-        Box::new(MultiCastDataStreamSinkOperator {
-            name: self.name.clone(),
-            init_error: self.init_error.clone(),
+        Box::new(MultiCastDataStreamSinkOperator::new(
+            self.name.clone(),
+            self.init_error.clone(),
             sinks,
-            finishing: false,
-        })
+        ))
     }
 
     fn is_sink(&self) -> bool {
@@ -171,6 +172,29 @@ struct MultiCastDataStreamSinkOperator {
     init_error: Option<String>,
     sinks: Vec<InnerSinkRuntime>,
     finishing: bool,
+    sink_observable: Arc<Observable>,
+}
+
+impl MultiCastDataStreamSinkOperator {
+    fn new(name: String, init_error: Option<String>, sinks: Vec<InnerSinkRuntime>) -> Self {
+        let sink_observable = Arc::new(Observable::new());
+        for sink in &sinks {
+            if let Some(observable) = sink
+                .op
+                .as_processor_ref()
+                .and_then(ProcessorOperator::sink_observable)
+            {
+                forward_observable(&observable, &sink_observable);
+            }
+        }
+        Self {
+            name,
+            init_error,
+            sinks,
+            finishing: false,
+            sink_observable,
+        }
+    }
 }
 
 impl Operator for MultiCastDataStreamSinkOperator {
@@ -372,21 +396,7 @@ impl ProcessorOperator for MultiCastDataStreamSinkOperator {
         if self.is_finished() {
             return None;
         }
-        // Return the first inner sink's observable unconditionally.
-        // The observable fires when the exchange send queue drains, which is the
-        // correct wakeup signal regardless of which inner sink triggered the block.
-        // Checking need_input() here would be a TOCTOU race: by the time the
-        // scheduler calls sink_observable(), the blocking inner sink may already
-        // be ready again, causing a spurious None and a fragment failure.
-        for sink in &self.sinks {
-            let Some(inner) = sink.op.as_processor_ref() else {
-                continue;
-            };
-            if let Some(obs) = inner.sink_observable() {
-                return Some(obs);
-            }
-        }
-        None
+        Some(Arc::clone(&self.sink_observable))
     }
 }
 
@@ -558,10 +568,10 @@ mod tests {
     fn multi_cast_sink_waits_for_inner_sinks_to_finish() {
         let first_done = Arc::new(AtomicBool::new(false));
         let second_done = Arc::new(AtomicBool::new(false));
-        let mut op = MultiCastDataStreamSinkOperator {
-            name: "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
-            init_error: None,
-            sinks: vec![
+        let mut op = MultiCastDataStreamSinkOperator::new(
+            "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
+            None,
+            vec![
                 InnerSinkRuntime {
                     limit_remaining: None,
                     op: Box::new(PendingFinishSink::new("first", Arc::clone(&first_done))),
@@ -571,8 +581,7 @@ mod tests {
                     op: Box::new(PendingFinishSink::new("second", Arc::clone(&second_done))),
                 },
             ],
-            finishing: false,
-        };
+        );
 
         let state = RuntimeState::default();
         assert!(!op.is_finished());
@@ -596,15 +605,44 @@ mod tests {
     }
 
     #[test]
+    fn multicast_uses_one_identity_and_forwards_non_first_inner_wakes() {
+        let first = PendingFinishSink::new("first", Arc::new(AtomicBool::new(false)));
+        let second = PendingFinishSink::new("second", Arc::new(AtomicBool::new(false)));
+        let second_observable = Arc::clone(&second.observable);
+        let op = MultiCastDataStreamSinkOperator::new(
+            "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
+            None,
+            vec![
+                InnerSinkRuntime {
+                    limit_remaining: None,
+                    op: Box::new(first),
+                },
+                InnerSinkRuntime {
+                    limit_remaining: None,
+                    op: Box::new(second),
+                },
+            ],
+        );
+        let first_identity = op.sink_observable().expect("stable sink observable");
+        let generation = first_identity.generation();
+
+        second_observable.notify_observers();
+
+        let second_identity = op.sink_observable().expect("stable sink observable");
+        assert!(Arc::ptr_eq(&first_identity, &second_identity));
+        assert_eq!(second_identity.generation(), generation + 1);
+    }
+
+    #[test]
     fn one_full_branch_blocks_the_whole_multicast_sink() {
         // One accepting inner and one refusing inner: the multicast operator
         // must stop accepting input entirely. This is the execution fact
         // behind the deployment-side backpressure edges.
         let accepting_done = Arc::new(AtomicBool::new(false));
-        let op = MultiCastDataStreamSinkOperator {
-            name: "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
-            init_error: None,
-            sinks: vec![
+        let op = MultiCastDataStreamSinkOperator::new(
+            "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
+            None,
+            vec![
                 InnerSinkRuntime {
                     limit_remaining: None,
                     op: Box::new(PendingFinishSink::new("accepting", accepting_done)),
@@ -616,8 +654,7 @@ mod tests {
                     }),
                 },
             ],
-            finishing: false,
-        };
+        );
 
         assert!(!op.need_input());
     }
@@ -625,10 +662,10 @@ mod tests {
     #[test]
     fn multicast_binds_runtime_state_to_every_inner_sink() {
         let binds = Arc::new(AtomicUsize::new(0));
-        let mut op = MultiCastDataStreamSinkOperator {
-            name: "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
-            init_error: None,
-            sinks: vec![
+        let mut op = MultiCastDataStreamSinkOperator::new(
+            "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
+            None,
+            vec![
                 InnerSinkRuntime {
                     limit_remaining: None,
                     op: Box::new(BindingSink {
@@ -642,8 +679,7 @@ mod tests {
                     }),
                 },
             ],
-            finishing: false,
-        };
+        );
 
         op.bind_runtime_state(&RuntimeState::default())
             .expect("bind inner sinks");
@@ -747,10 +783,10 @@ mod tests {
         let closed = Arc::new(AtomicBool::new(false));
         let open_sealed = Arc::new(AtomicBool::new(false));
         let closed_sealed = Arc::new(AtomicBool::new(false));
-        let mut op = MultiCastDataStreamSinkOperator {
-            name: "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
-            init_error: None,
-            sinks: vec![
+        let mut op = MultiCastDataStreamSinkOperator::new(
+            "MULTI_CAST_DATA_STREAM_SINK(test)".to_string(),
+            None,
+            vec![
                 InnerSinkRuntime {
                     limit_remaining: None,
                     op: Box::new(GatedFinishSink::new(
@@ -768,8 +804,7 @@ mod tests {
                     )),
                 },
             ],
-            finishing: false,
-        };
+        );
 
         let state = RuntimeState::default();
         op.set_finishing(&state).expect("set finishing");

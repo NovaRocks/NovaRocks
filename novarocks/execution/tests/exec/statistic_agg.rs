@@ -22,6 +22,31 @@ use arrow::datatypes::DataType;
 use novarocks_execution::exec::expr::ExprId;
 use novarocks_execution::exec::expr::agg;
 use novarocks_execution::exec::node::aggregate::{AggFunction, AggTypeSignature};
+use novarocks_functions::AggregateInputBatch;
+
+fn build_builtin_kernel_set(
+    functions: &[AggFunction],
+    input_types: &[Option<DataType>],
+    argument_types: &[Vec<DataType>],
+) -> Result<agg::AggKernelSet, String> {
+    let mut builder = agg::ExecutionFunctionSetBuilder::new();
+    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+        .map_err(|error| error.to_string())?;
+    agg::contribute_builtin_aggregate_implementations(&mut builder)
+        .map_err(|error| error.to_string())?;
+    let function_set = builder.seal().map_err(|error| error.to_string())?;
+    let selected = functions
+        .iter()
+        .zip(argument_types)
+        .map(|(function, argument_types)| {
+            function_set
+                .catalog()
+                .resolve_aggregate_trusted(&function.name, argument_types)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    agg::build_kernel_set(&function_set, functions, input_types, &selected)
+}
 
 fn run_two_phase_i64(name: &str, part1: Vec<Option<i64>>, part2: Vec<Option<i64>>) -> Option<f64> {
     let func = AggFunction {
@@ -43,22 +68,35 @@ fn run_two_phase_i64(name: &str, part1: Vec<Option<i64>>, part2: Vec<Option<i64>
     let arrays1 = [Some(Arc::clone(&input1))];
     let arrays2 = [Some(Arc::clone(&input2))];
     let input_types = vec![Some(DataType::Int64)];
-    let kernels = agg::build_kernel_set(std::slice::from_ref(&func), &input_types).unwrap();
+    let kernels = build_builtin_kernel_set(
+        std::slice::from_ref(&func),
+        &input_types,
+        &[vec![DataType::Int64]],
+    )
+    .unwrap();
     let kernel = &kernels.entries[0];
 
     let mut arena = agg::AggStateArena::new(64 * 1024);
     let base1 = arena.alloc(kernels.layout.total_size, kernel.state_align());
     let base2 = arena.alloc(kernels.layout.total_size, kernel.state_align());
-    kernel.init_state(base1);
-    kernel.init_state(base2);
+    kernel.init_state(base1).expect("init first state");
+    kernel.init_state(base2).expect("init second state");
 
-    let view1 = kernel.build_input_view(&arrays1[0]).unwrap();
     let state_ptrs1 = vec![base1; input1.len()];
-    kernel.update_batch(&state_ptrs1, &view1).unwrap();
+    kernel
+        .update_batch(
+            &state_ptrs1,
+            AggregateInputBatch::try_new(arrays1[0].as_ref(), input1.len()).unwrap(),
+        )
+        .unwrap();
 
-    let view2 = kernel.build_input_view(&arrays2[0]).unwrap();
     let state_ptrs2 = vec![base2; input2.len()];
-    kernel.update_batch(&state_ptrs2, &view2).unwrap();
+    kernel
+        .update_batch(
+            &state_ptrs2,
+            AggregateInputBatch::try_new(arrays2[0].as_ref(), input2.len()).unwrap(),
+        )
+        .unwrap();
 
     // Build intermediate outputs (one row per partition state).
     let intermediate = kernel.build_array(&[base1, base2], true).unwrap();
@@ -70,18 +108,26 @@ fn run_two_phase_i64(name: &str, part1: Vec<Option<i64>>, part2: Vec<Option<i64>
     // Final aggregation merges intermediate states.
     let mut func_merge = func;
     func_merge.input_is_intermediate = true;
-    let kernels_merge =
-        agg::build_kernel_set(&[func_merge], &[Some(intermediate.data_type().clone())]).unwrap();
+    let kernels_merge = build_builtin_kernel_set(
+        &[func_merge],
+        &[Some(intermediate.data_type().clone())],
+        &[vec![DataType::Int64]],
+    )
+    .unwrap();
     let kernel_merge = &kernels_merge.entries[0];
 
     let base_final = arena.alloc(kernels_merge.layout.total_size, kernel_merge.state_align());
-    kernel_merge.init_state(base_final);
+    kernel_merge
+        .init_state(base_final)
+        .expect("init final state");
 
     let merge_input = [Some(Arc::new(intermediate.clone()) as ArrayRef)];
-    let merge_view = kernel_merge.build_merge_view(&merge_input[0]).unwrap();
     let merge_state_ptrs = vec![base_final; intermediate.len()];
     kernel_merge
-        .merge_batch(&merge_state_ptrs, &merge_view)
+        .merge_batch(
+            &merge_state_ptrs,
+            AggregateInputBatch::try_new(merge_input[0].as_ref(), intermediate.len()).unwrap(),
+        )
         .unwrap();
 
     let out = kernel_merge.build_array(&[base_final], false).unwrap();
@@ -161,16 +207,21 @@ fn test_sum_bool_counts_true_as_one() {
     ])) as ArrayRef;
     let arrays = [Some(Arc::clone(&input))];
     let input_types = vec![Some(DataType::Boolean)];
-    let kernels = agg::build_kernel_set(&[func], &input_types).expect("build kernels");
+    let kernels = build_builtin_kernel_set(&[func], &input_types, &[vec![DataType::Boolean]])
+        .expect("build kernels");
     let kernel = &kernels.entries[0];
 
     let mut arena = agg::AggStateArena::new(64 * 1024);
     let base = arena.alloc(kernels.layout.total_size, kernel.state_align());
-    kernel.init_state(base);
+    kernel.init_state(base).expect("init state");
 
-    let view = kernel.build_input_view(&arrays[0]).expect("build view");
     let state_ptrs = vec![base; input.len()];
-    kernel.update_batch(&state_ptrs, &view).expect("update");
+    kernel
+        .update_batch(
+            &state_ptrs,
+            AggregateInputBatch::try_new(arrays[0].as_ref(), input.len()).expect("build input"),
+        )
+        .expect("update");
 
     let out = kernel.build_array(&[base], false).expect("build out");
     let out = out
@@ -197,16 +248,21 @@ fn test_sum_bool_null_when_all_null() {
     let input = Arc::new(BooleanArray::from(vec![None, None])) as ArrayRef;
     let arrays = [Some(Arc::clone(&input))];
     let input_types = vec![Some(DataType::Boolean)];
-    let kernels = agg::build_kernel_set(&[func], &input_types).expect("build kernels");
+    let kernels = build_builtin_kernel_set(&[func], &input_types, &[vec![DataType::Boolean]])
+        .expect("build kernels");
     let kernel = &kernels.entries[0];
 
     let mut arena = agg::AggStateArena::new(64 * 1024);
     let base = arena.alloc(kernels.layout.total_size, kernel.state_align());
-    kernel.init_state(base);
+    kernel.init_state(base).expect("init state");
 
-    let view = kernel.build_input_view(&arrays[0]).expect("build view");
     let state_ptrs = vec![base; input.len()];
-    kernel.update_batch(&state_ptrs, &view).expect("update");
+    kernel
+        .update_batch(
+            &state_ptrs,
+            AggregateInputBatch::try_new(arrays[0].as_ref(), input.len()).expect("build input"),
+        )
+        .expect("update");
 
     let out = kernel.build_array(&[base], false).expect("build out");
     let out = out

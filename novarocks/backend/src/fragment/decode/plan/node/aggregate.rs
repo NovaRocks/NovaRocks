@@ -31,10 +31,13 @@ use novarocks_execution::exec::node::aggregate::{
     AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_functions::{
+    AggregateOverloadIdentity, AggregateStateFormatIdentity, ResolvedAggregateSignature,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;
-use novarocks_types::aggregate::{infer_agg_function_types, mangle_distinct_aggregate_name};
+use novarocks_types::aggregate::mangle_distinct_aggregate_name;
 
 #[expect(
     clippy::too_many_arguments,
@@ -87,16 +90,14 @@ pub(super) fn lower_hash_aggregate_node(
         .clone()
         .field("output_layout")
         .field("aggregate_columns");
-    let mut aggregate_slot_schemas = ctx
-        .decode_output_layout(&output_layout.group_key_columns, group_key_path)?
-        .slot_schemas()
-        .to_vec();
-    aggregate_slot_schemas.extend(
-        ctx.decode_output_layout(&output_layout.aggregate_columns, aggregate_columns_path)?
-            .slot_schemas()
-            .iter()
-            .cloned(),
-    );
+    let decoded_group_key_columns =
+        ctx.decode_output_layout(&output_layout.group_key_columns, group_key_path.clone())?;
+    let decoded_aggregate_columns = ctx.decode_output_layout(
+        &output_layout.aggregate_columns,
+        aggregate_columns_path.clone(),
+    )?;
+    let mut aggregate_slot_schemas = decoded_group_key_columns.slot_schemas().to_vec();
+    aggregate_slot_schemas.extend(decoded_aggregate_columns.slot_schemas().iter().cloned());
     let aggregate_layout =
         Layout::for_slots(aggregate_slot_schemas.iter().map(|slot| slot.slot_id()));
     let aggregate_output_schema = Arc::new(ChunkSchema::try_new(aggregate_slot_schemas).map_err(
@@ -140,12 +141,29 @@ pub(super) fn lower_hash_aggregate_node(
             )
         })
         .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
-    for expr_id in &group_by {
-        if let Some(dt) = arena.data_type(*expr_id)
-            && matches!(dt, DataType::LargeBinary)
-        {
+    for (idx, expr_id) in group_by.iter().enumerate() {
+        let expression_type = arena.data_type(*expr_id).ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("group_by").index(idx),
+                format!("HashAggregateNode group key {idx} has no decoded type"),
+            )
+        })?;
+        let layout_type = decoded_group_key_columns
+            .slot_schemas()
+            .get(idx)
+            .expect("group key output arity was validated")
+            .data_type();
+        if expression_type != layout_type {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                group_key_path.clone().index(idx).field("type"),
+                format!(
+                    "HashAggregateNode group key {idx} output type drift: expression={expression_type:?} output_layout={layout_type:?}"
+                ),
+            ));
+        }
+        if matches!(expression_type, DataType::LargeBinary) {
             return Err(NativeFragmentDecodeError::unsupported(
-                path.clone().field("group_by"),
+                path.clone().field("group_by").index(idx),
                 "VARIANT is not supported in GROUP BY",
             ));
         }
@@ -153,8 +171,18 @@ pub(super) fn lower_hash_aggregate_node(
 
     let need_finalize = matches!(mode, plan::AggMode::Single | plan::AggMode::Global);
     let mut functions = Vec::with_capacity(aggregate.aggregates.len());
+    let mut resolved_aggregates = Vec::with_capacity(aggregate.aggregates.len());
     for (idx, call) in aggregate.aggregates.iter().enumerate() {
         let is_merge = aggregate.is_merge[idx];
+        if call.name.eq_ignore_ascii_case("count_if") && !call.order_by.is_empty() {
+            return Err(NativeFragmentDecodeError::unsupported(
+                path.clone()
+                    .field("aggregates")
+                    .index(idx)
+                    .field("order_by"),
+                format!("HashAggregateNode aggregate {idx} count_if does not support ORDER BY"),
+            ));
+        }
         let output_col = output_layout.aggregate_columns.get(idx).ok_or_else(|| {
             NativeFragmentDecodeError::missing(
                 path.clone()
@@ -181,23 +209,89 @@ pub(super) fn lower_hash_aggregate_node(
             crate::fragment::decode::type_decode::decode_type(result_type),
         )?;
         let function_name = aggregate_function_name(call);
-        let signature_arg_types =
-            aggregate_signature_arg_types(call, path.clone().field("aggregates").index(idx))?;
-        let (semantic_output_type, intermediate_type) =
-            infer_agg_function_types(&function_name, &signature_arg_types, call.distinct).map_err(
-                |err| {
-                    NativeFragmentDecodeError::invalid_value(
-                        path.clone().field("aggregates").index(idx),
-                        format!("HashAggregateNode aggregate {idx} type inference: {err}"),
-                    )
-                },
-            )?;
-        let signature_input_arg_type = signature_arg_types.first().cloned();
-        let signature_output_type = if need_finalize {
-            result_type
+        let call_path = path.clone().field("aggregates").index(idx);
+        let planned = decode_resolved_aggregate_signature(
+            call.resolved_signature.as_ref(),
+            &call.name,
+            call_path.clone().field("resolved_signature"),
+        )?;
+        let logical_arg_types = aggregate_logical_arg_types(call, call_path.clone())?;
+        let update_arg_types = aggregate_signature_arg_types(call, call_path.clone())?;
+        if !is_merge && update_arg_types != planned.argument_types {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                call_path
+                    .clone()
+                    .field("resolved_signature")
+                    .field("argument_types"),
+                format!(
+                    "HashAggregateNode aggregate {idx} update argument type drift: expressions={update_arg_types:?} planned={:?}",
+                    planned.argument_types
+                ),
+            ));
+        }
+        let function_catalog = ctx.function_catalog().ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                call_path.clone(),
+                "HashAggregateNode requires the process engine function catalog",
+            )
+        })?;
+        let selected = if is_merge {
+            function_catalog.resolve_selected_aggregate_update_trusted(
+                &function_name,
+                &planned.overload,
+                &planned.argument_types,
+            )
         } else {
-            semantic_output_type
+            function_catalog.resolve_aggregate_update_trusted(
+                &function_name,
+                &logical_arg_types,
+                &update_arg_types,
+            )
+        }
+        .map_err(|error| {
+            NativeFragmentDecodeError::invalid_value(
+                call_path.clone(),
+                format!("HashAggregateNode aggregate {idx} resolution: {error}"),
+            )
+        })?;
+        if selected != planned {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                call_path.clone().field("resolved_signature"),
+                format!(
+                    "HashAggregateNode aggregate {idx} resolved signature drift: planned={planned:?} catalog={selected:?}"
+                ),
+            ));
+        }
+        if result_type != selected.output_type {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                call_path.clone().field("result_type"),
+                format!(
+                    "HashAggregateNode aggregate {idx} SQL result type drift: wire={result_type:?} expected={:?}",
+                    selected.output_type
+                ),
+            ));
+        }
+        let expected_phase_type = if need_finalize {
+            &selected.output_type
+        } else {
+            &selected.intermediate_type
         };
+        let phase_output_type = decoded_aggregate_columns
+            .slot_schemas()
+            .get(idx)
+            .expect("aggregate output arity was validated")
+            .data_type();
+        if phase_output_type != expected_phase_type {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                aggregate_columns_path.clone().index(idx).field("type"),
+                format!(
+                    "HashAggregateNode aggregate {idx} phase output type drift: output_layout={phase_output_type:?} expected={expected_phase_type:?}"
+                ),
+            ));
+        }
+        let signature_input_arg_type = selected.argument_types.first().cloned();
+        let intermediate_type = Some(selected.intermediate_type.clone());
+        let signature_output_type = selected.output_type.clone();
 
         let raw_args = if is_merge {
             let slot = SlotId::new(output_col.column_id);
@@ -231,6 +325,7 @@ pub(super) fn lower_hash_aggregate_node(
             }),
             order: aggregate_order_spec(call),
         });
+        resolved_aggregates.push(selected);
     }
 
     let input_is_intermediate = functions.iter().all(|f| f.input_is_intermediate);
@@ -241,6 +336,7 @@ pub(super) fn lower_hash_aggregate_node(
                 node_id: node.node_id,
                 group_by,
                 functions,
+                resolved_aggregates,
                 need_finalize,
                 input_is_intermediate,
                 output_chunk_schema: aggregate_output_schema.clone(),
@@ -289,6 +385,71 @@ fn aggregate_function_name(call: &plan::PlanAggregateCall) -> String {
     mangle_distinct_aggregate_name(&call.name, call.distinct)
 }
 
+pub(super) fn decode_resolved_aggregate_signature(
+    signature: Option<&plan::ResolvedAggregateSignature>,
+    function_name: &str,
+    signature_path: FieldPath,
+) -> Result<ResolvedAggregateSignature, NativeFragmentDecodeError> {
+    let signature = signature.ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            signature_path.clone(),
+            format!("aggregate {function_name} exact resolved signature missing"),
+        )
+    })?;
+    let overload =
+        AggregateOverloadIdentity::try_new(&signature.overload_identity).map_err(|error| {
+            NativeFragmentDecodeError::invalid_value(
+                signature_path.clone().field("overload_identity"),
+                error.to_string(),
+            )
+        })?;
+    let argument_types = signature
+        .argument_types
+        .iter()
+        .enumerate()
+        .map(|(idx, data_type)| {
+            NativeFragmentDecodeError::map_invalid(
+                signature_path.clone().field("argument_types").index(idx),
+                crate::fragment::decode::type_decode::decode_type(data_type),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let intermediate_type = signature.intermediate_type.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            signature_path.clone().field("intermediate_type"),
+            format!("aggregate {function_name} intermediate type missing"),
+        )
+    })?;
+    let intermediate_type = NativeFragmentDecodeError::map_invalid(
+        signature_path.clone().field("intermediate_type"),
+        crate::fragment::decode::type_decode::decode_type(intermediate_type),
+    )?;
+    let output_type = signature.output_type.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            signature_path.clone().field("output_type"),
+            format!("aggregate {function_name} output type missing"),
+        )
+    })?;
+    let output_type = NativeFragmentDecodeError::map_invalid(
+        signature_path.clone().field("output_type"),
+        crate::fragment::decode::type_decode::decode_type(output_type),
+    )?;
+    let state_format = AggregateStateFormatIdentity::try_new(&signature.state_format_identity)
+        .map_err(|error| {
+            NativeFragmentDecodeError::invalid_value(
+                signature_path.clone().field("state_format_identity"),
+                error.to_string(),
+            )
+        })?;
+    Ok(ResolvedAggregateSignature {
+        overload,
+        argument_types,
+        intermediate_type,
+        output_type,
+        state_format,
+    })
+}
+
 fn aggregate_signature_arg_types(
     call: &plan::PlanAggregateCall,
     path: FieldPath,
@@ -327,17 +488,38 @@ fn aggregate_signature_arg_types(
                 format!("aggregate {} order_by[{idx}] type missing", call.name),
             )
         })?;
-        let data_type = NativeFragmentDecodeError::map_invalid(
+        types.push(NativeFragmentDecodeError::map_invalid(
             path.clone()
                 .field("order_by")
                 .index(idx)
                 .field("expr")
                 .field("type"),
             crate::fragment::decode::type_decode::decode_type(data_type),
-        )?;
-        types.push(data_type);
+        )?);
     }
     Ok(types)
+}
+
+fn aggregate_logical_arg_types(
+    call: &plan::PlanAggregateCall,
+    path: FieldPath,
+) -> Result<Vec<DataType>, NativeFragmentDecodeError> {
+    call.args
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            let ty = expr.r#type.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    path.clone().field("args").index(idx).field("type"),
+                    format!("aggregate {} argument {idx} type missing", call.name),
+                )
+            })?;
+            NativeFragmentDecodeError::map_invalid(
+                path.clone().field("args").index(idx).field("type"),
+                crate::fragment::decode::type_decode::decode_type(ty),
+            )
+        })
+        .collect()
 }
 
 fn lower_aggregate_update_inputs(
@@ -440,8 +622,16 @@ fn pack_struct_inputs(
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
+    use std::sync::Arc;
 
     use super::super::tests::*;
+
+    fn aggregate_decode_context() -> NativePlanDecodeContext {
+        NativePlanDecodeContext::default().with_function_catalog(Arc::new(
+            novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin function catalog"),
+        ))
+    }
     use super::super::{NativePlanDecodeContext, decode_node};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
@@ -479,6 +669,120 @@ mod tests {
     }
 
     #[test]
+    fn hash_aggregate_rejects_group_key_output_type_drift() {
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: vec![column_ref(1, DataType::Int64)],
+                aggregates: Vec::new(),
+                is_merge: Vec::new(),
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: vec![output_column(1, "id", DataType::Utf8)],
+                    aggregate_columns: Vec::new(),
+                }),
+                output_columns: Vec::new(),
+            }),
+            Vec::new(),
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_node(
+            &aggregate,
+            &mut ExprArena::default(),
+            &aggregate_decode_context(),
+        )
+        .expect_err("group key output type drift must fail");
+        assert!(
+            error.to_string().contains("group key 0 output type drift"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_rejects_a_missing_exact_resolved_signature() {
+        let output_columns = vec![output_column(2, "sum_id", DataType::Int64)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![column_ref(1, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                    resolved_signature: None,
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+        let error = decode_node(
+            &aggregate,
+            &mut ExprArena::default(),
+            &aggregate_decode_context(),
+        )
+        .expect_err("missing resolved signature must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exact resolved signature missing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_rejects_state_format_drift_from_the_process_catalog() {
+        let output_columns = vec![output_column(2, "sum_id", DataType::Int64)];
+        let mut resolved = resolved_aggregate_signature("sum", &[DataType::Int64])
+            .expect("resolved aggregate signature");
+        resolved.state_format_identity = "novarocks/sum/state-v2".to_string();
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Single as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![column_ref(1, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Int64)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                    resolved_signature: Some(resolved),
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+        let error = decode_node(
+            &aggregate,
+            &mut ExprArena::default(),
+            &aggregate_decode_context(),
+        )
+        .expect_err("state format drift must fail");
+        assert!(
+            error.to_string().contains("resolved signature drift"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn hash_aggregate_projects_visible_subset_after_full_layout_output() {
         let group_a = output_column(1, "a", DataType::Int64);
         let group_c = output_column(3, "c", DataType::Int64);
@@ -499,6 +803,7 @@ mod tests {
                     result_type: Some(type_desc(&DataType::Int64)),
                     order_by: Vec::new(),
                     output_column_id: 4,
+                    resolved_signature: resolved_aggregate_signature("sum", &[DataType::Int64]),
                 }],
                 is_merge: vec![false],
                 output_layout: Some(plan::AggregateOutputLayout {
@@ -545,6 +850,7 @@ mod tests {
                     result_type: Some(type_desc(&DataType::Float64)),
                     order_by: Vec::new(),
                     output_column_id: 2,
+                    resolved_signature: resolved_aggregate_signature("avg", &[DataType::Int64]),
                 }],
                 is_merge: vec![false],
                 output_layout: Some(plan::AggregateOutputLayout {
@@ -581,9 +887,10 @@ mod tests {
                     name: "avg".to_string(),
                     args: vec![column_ref(1, DataType::Int64)],
                     distinct: false,
-                    result_type: Some(type_desc(&DataType::Utf8)),
+                    result_type: Some(type_desc(&DataType::Float64)),
                     order_by: Vec::new(),
                     output_column_id: 2,
+                    resolved_signature: resolved_aggregate_signature("avg", &[DataType::Int64]),
                 }],
                 is_merge: vec![false],
                 output_layout: Some(plan::AggregateOutputLayout {
@@ -617,8 +924,146 @@ mod tests {
     }
 
     #[test]
+    fn hash_aggregate_rejects_sql_result_type_drift() {
+        let output_columns = vec![output_column(2, "avg_id", DataType::Utf8)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Local as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_ref(1, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Utf8)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                    resolved_signature: resolved_aggregate_signature("avg", &[DataType::Int64]),
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_node(
+            &aggregate,
+            &mut ExprArena::default(),
+            &aggregate_decode_context(),
+        )
+        .expect_err("SQL result type drift must fail");
+        assert!(
+            error.to_string().contains("SQL result type drift"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_rejects_phase_output_layout_type_drift() {
+        let output_columns = vec![output_column(2, "avg_id", DataType::Float64)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Local as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_ref(1, DataType::Int64)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Float64)),
+                    order_by: Vec::new(),
+                    output_column_id: 2,
+                    resolved_signature: resolved_aggregate_signature("avg", &[DataType::Int64]),
+                }],
+                is_merge: vec![false],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![one_col_values_node(10)],
+        );
+
+        let error = decode_node(
+            &aggregate,
+            &mut ExprArena::default(),
+            &aggregate_decode_context(),
+        )
+        .expect_err("phase output layout type drift must fail");
+        assert!(
+            error.to_string().contains("phase output type drift"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_merge_reuses_the_frozen_update_signature() {
+        let output_columns = vec![output_column(3, "avg_id", DataType::Float64)];
+        let aggregate = physical_node(
+            20,
+            plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
+                mode: plan::AggMode::Global as i32,
+                group_by: Vec::new(),
+                aggregates: vec![plan::PlanAggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![column_ref(2, DataType::Utf8)],
+                    distinct: false,
+                    result_type: Some(type_desc(&DataType::Float64)),
+                    order_by: Vec::new(),
+                    output_column_id: 3,
+                    resolved_signature: resolved_aggregate_signature("avg", &[DataType::Int64]),
+                }],
+                is_merge: vec![true],
+                output_layout: Some(plan::AggregateOutputLayout {
+                    group_key_columns: Vec::new(),
+                    aggregate_columns: output_columns.clone(),
+                }),
+                output_columns: output_columns.clone(),
+            }),
+            output_columns,
+            vec![values_node(10)],
+        );
+
+        let lowered = lower(&aggregate);
+        let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(
+            aggregate.resolved_aggregates[0].argument_types,
+            [DataType::Int64]
+        );
+        assert_eq!(
+            aggregate.functions[0]
+                .types
+                .as_ref()
+                .expect("aggregate type signature")
+                .input_arg_type,
+            Some(DataType::Int64)
+        );
+    }
+
+    #[test]
     fn hash_aggregate_ordered_inputs_pack_order_by_exprs() {
-        let output_columns = vec![output_column(3, "gc", DataType::Utf8)];
+        let resolved_signature = resolved_aggregate_update_signature(
+            "group_concat",
+            &[DataType::Utf8, DataType::Utf8],
+            &[DataType::Utf8, DataType::Utf8, DataType::Int64],
+        );
+        let intermediate_type = crate::fragment::decode::type_decode::decode_type(
+            resolved_signature
+                .as_ref()
+                .and_then(|signature| signature.intermediate_type.as_ref())
+                .expect("catalog intermediate type"),
+        )
+        .expect("decoded intermediate type");
+        let output_columns = vec![output_column(3, "gc", intermediate_type.clone())];
         let aggregate = physical_node(
             20,
             plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {
@@ -631,6 +1076,7 @@ mod tests {
                     result_type: Some(type_desc(&DataType::Utf8)),
                     order_by: vec![sort_item(1)],
                     output_column_id: 3,
+                    resolved_signature,
                 }],
                 is_merge: vec![false],
                 output_layout: Some(plan::AggregateOutputLayout {
@@ -644,7 +1090,7 @@ mod tests {
         );
 
         let mut arena = ExprArena::default();
-        let lowered = decode_node(&aggregate, &mut arena, &NativePlanDecodeContext::default())
+        let lowered = decode_node(&aggregate, &mut arena, &aggregate_decode_context())
             .expect("lower ordered aggregate");
         let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
             panic!("expected Aggregate");
@@ -664,6 +1110,16 @@ mod tests {
         assert_eq!(aggregate.functions[0].order.is_asc_order, vec![true]);
         assert_eq!(aggregate.functions[0].order.nulls_first, vec![false]);
         assert!(aggregate.functions[0].order.is_distinct);
+        assert_eq!(
+            aggregate.resolved_aggregates[0].argument_types,
+            [DataType::Utf8, DataType::Utf8, DataType::Int64]
+        );
+        let DataType::Struct(intermediate_fields) =
+            &aggregate.resolved_aggregates[0].intermediate_type
+        else {
+            panic!("expected group_concat Struct intermediate");
+        };
+        assert_eq!(intermediate_fields.len(), 3);
     }
 
     #[test]
@@ -681,6 +1137,10 @@ mod tests {
                     result_type: Some(type_desc(&DataType::Int64)),
                     order_by: vec![sort_item(1)],
                     output_column_id: 3,
+                    resolved_signature: resolved_aggregate_signature(
+                        "count_if",
+                        &[DataType::Boolean],
+                    ),
                 }],
                 is_merge: vec![false],
                 output_layout: Some(plan::AggregateOutputLayout {
@@ -694,7 +1154,7 @@ mod tests {
         );
 
         let mut arena = ExprArena::default();
-        let err = decode_node(&aggregate, &mut arena, &NativePlanDecodeContext::default())
+        let err = decode_node(&aggregate, &mut arena, &aggregate_decode_context())
             .expect_err("count_if ORDER BY should be rejected before input selection");
         assert!(
             err.contains("count_if does not support ORDER BY"),

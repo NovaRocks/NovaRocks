@@ -34,6 +34,7 @@ use std::sync::Arc;
 use arrow::array::Array;
 use arrow::datatypes::DataType;
 
+use crate::exec::expr::agg::AggregateVec;
 use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
@@ -43,14 +44,12 @@ const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
 const ROW_NONE: u32 = u32::MAX;
 
 pub(crate) enum SerializedRows {
-    Arrow(arrow::row::Rows),
-    Fallback(Vec<Vec<u8>>),
+    Fallback(AggregateVec<AggregateVec<u8>>),
 }
 
 impl SerializedRows {
     fn row_bytes(&self, row: usize) -> Result<&[u8], String> {
         match self {
-            Self::Arrow(rows) => Ok(rows.row(row).data()),
             Self::Fallback(rows) => rows.get(row).map(|v| v.as_slice()).ok_or_else(|| {
                 format!(
                     "fallback join row missing at row={} (rows={})",
@@ -111,7 +110,11 @@ pub(crate) fn row_has_forbidden_null(
 }
 
 impl JoinHashTable {
-    pub(crate) fn new(key_types: Vec<DataType>, null_safe_eq: Vec<bool>) -> Result<Self, String> {
+    pub(crate) fn new_with_tracker(
+        key_types: Vec<DataType>,
+        null_safe_eq: Vec<bool>,
+        tracker: Arc<MemTracker>,
+    ) -> Result<Self, String> {
         if key_types.is_empty() {
             return Err("join hash table requires join keys".to_string());
         }
@@ -122,7 +125,11 @@ impl JoinHashTable {
                 null_safe_eq.len()
             ));
         }
-        let key_table = KeyTable::new(key_types, ENABLE_GROUP_KEY_OPTIMIZATIONS)?;
+        let key_table = KeyTable::new_with_tracker(
+            key_types,
+            ENABLE_GROUP_KEY_OPTIMIZATIONS,
+            MemTracker::new_child("KeyTable", &tracker),
+        )?;
         if key_table.key_strategy() == GroupKeyStrategy::Scalar {
             return Err("join hash table requires join keys".to_string());
         }
@@ -134,7 +141,7 @@ impl JoinHashTable {
             row_count: 0,
             group_offsets: None,
             group_rows: None,
-            mem_tracker: None,
+            mem_tracker: Some(tracker),
             accounted_bytes: 0,
         })
     }
@@ -151,8 +158,9 @@ impl JoinHashTable {
         self.mem_tracker = Some(Arc::clone(&tracker));
         self.accounted_bytes = bytes;
 
-        let key_table = MemTracker::new_child("KeyTable", &tracker);
-        self.key_table.set_mem_tracker(key_table);
+        // KeyTable owns allocation-time checked containers whose allocator is
+        // immutable. Re-parent only this join wrapper's legacy support vectors;
+        // the KeyTable stays on the query-scoped tracker supplied at construction.
     }
 
     pub(crate) fn key_strategy(&self) -> GroupKeyStrategy {
@@ -181,14 +189,9 @@ impl JoinHashTable {
         &self,
         arrays: &[arrow::array::ArrayRef],
     ) -> Result<SerializedRows, String> {
-        match self.key_table.build_rows(arrays) {
-            Ok(rows) => Ok(SerializedRows::Arrow(rows)),
-            Err(err) if err.contains("row converter not initialized") => {
-                let fallback_rows = self.key_table.build_rows_fallback(arrays)?;
-                Ok(SerializedRows::Fallback(fallback_rows))
-            }
-            Err(err) => Err(err),
-        }
+        self.key_table
+            .build_rows_fallback(arrays)
+            .map(SerializedRows::Fallback)
     }
 
     pub(crate) fn group_rows_slice(&self, group_id: usize) -> Result<&[u32], String> {

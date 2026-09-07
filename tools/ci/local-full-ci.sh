@@ -428,6 +428,10 @@ run_cargo_gates() {
     tools/ci/check-connector-role-binding-boundary.py
   run_fail_fast_stage "connector role binding boundary mutations" "connector-role-binding-boundary-test.log" \
     tools/ci/tests/connector-role-binding-boundary-test.sh
+  run_fail_fast_stage "NCP-8 statistics boundary" "ncp8-statistics-boundary.log" \
+    tools/ci/check-ncp8-statistics-boundary.py
+  run_fail_fast_stage "NCP-8 statistics boundary mutations" "ncp8-statistics-boundary-test.log" \
+    tools/ci/tests/ncp8-statistics-boundary-test.sh
   run_fail_fast_stage "legacy branding" "legacy-branding.log" \
     tools/ci/check-legacy-branding.sh
   run_fail_fast_stage "legacy branding tests" "legacy-branding-test.log" \
@@ -906,6 +910,15 @@ ci_sql_suite_status_from_log() {
   printf "PASS\n"
 }
 
+ci_should_use_runner_suite_timeout() {
+  local suite="$1"
+
+  # The prepared-write-set entry-budget case intentionally materializes 16,385
+  # files and can run for roughly 90 seconds. Keep the runner's suite default
+  # authoritative unless the caller explicitly requests a CI-wide override.
+  [ "$suite" = "iceberg-dml" ] && [ -z "${SQL_QUERY_TIMEOUT_SECONDS:-}" ]
+}
+
 run_sql_suites() {
   local failed=0
   local suite
@@ -914,6 +927,7 @@ run_sql_suites() {
   local code
   local duration
   local -a suite_extra_args
+  local -a suite_query_timeout_args
   local query_timeout
   local novarocks_bin
   local suite_cluster_mode
@@ -931,6 +945,7 @@ run_sql_suites() {
     log_path="$CI_RUN_DIR/sql/${suite}.log"
     start="$(ci_epoch)"
     suite_extra_args=()
+    suite_query_timeout_args=()
     query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
     suite_cluster_mode="$(ci_suite_cluster_mode "$suite")"
     suite_cluster_size="$(ci_suite_cluster_size "$suite")"
@@ -942,6 +957,9 @@ run_sql_suites() {
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
         ;;
     esac
+    if ! ci_should_use_runner_suite_timeout "$suite"; then
+      suite_query_timeout_args=(--query-timeout "$query_timeout")
+    fi
     if [ "$RUN_MODE" != "explicit" ]; then
       case "$suite" in
         analytic)
@@ -963,7 +981,7 @@ run_sql_suites() {
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \
-        --query-timeout "$query_timeout" \
+        "${suite_query_timeout_args[@]}" \
         --cluster-mode "$suite_cluster_mode" \
         --cluster-size "$suite_cluster_size" \
         "${suite_extra_args[@]}" \
@@ -1037,6 +1055,7 @@ run_native_cross_process_sql_suites() {
   local suite_cluster_mode
   local suite_cluster_size
   local -a native_cross_process_suites
+  local -a suite_query_timeout_args
   local suites_output
 
   if ! ci_native_cross_process_enabled; then
@@ -1073,6 +1092,7 @@ run_native_cross_process_sql_suites() {
   for suite in "${native_cross_process_suites[@]}"; do
     log_path="$CI_RUN_DIR/sql-native-cross-process/${suite}.log"
     start="$(ci_epoch)"
+    suite_query_timeout_args=()
     query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
     suite_cluster_mode="$(ci_native_cross_process_suite_cluster_mode "$suite")"
     suite_cluster_size="$(ci_native_cross_process_suite_cluster_size "$suite")"
@@ -1087,6 +1107,9 @@ run_native_cross_process_sql_suites() {
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
         ;;
     esac
+    if ! ci_should_use_runner_suite_timeout "$suite"; then
+      suite_query_timeout_args=(--query-timeout "$query_timeout")
+    fi
 
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
@@ -1096,7 +1119,7 @@ run_native_cross_process_sql_suites() {
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \
-        --query-timeout "$query_timeout" \
+        "${suite_query_timeout_args[@]}" \
         --cluster-mode "$suite_cluster_mode" \
         --cluster-size "$suite_cluster_size" \
         -j 1

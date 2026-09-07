@@ -48,6 +48,10 @@ use prost::Message;
 use novarocks_execution::exec::node::table_write_relation::{
     ConnectorCommitFragmentCarrierValidator, ConnectorCommitFragmentEncoder,
 };
+#[cfg(debug_assertions)]
+use novarocks_execution::exec::node::table_write_relation::{
+    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+};
 use novarocks_proto_codec::connector_write::{
     ConnectorWriteFragmentEncoder, ValidatedCommitFragment,
 };
@@ -200,6 +204,56 @@ impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValida
     }
 }
 
+/// Query-scoped rejection guard installed on both halves of the composite
+/// write aggregate. The backend owns binding a runner token to an exact native
+/// attempt; Execution sees only a typed boundary and can neither inspect the
+/// token protocol nor fabricate replacement aggregate data.
+#[cfg(debug_assertions)]
+pub(crate) struct QueryScopedTableWriteAggregateGuard {
+    execution_id: QueryExecutionId,
+    node_id: i32,
+}
+
+#[cfg(debug_assertions)]
+impl QueryScopedTableWriteAggregateGuard {
+    pub(crate) const fn new(execution_id: QueryExecutionId, node_id: i32) -> Self {
+        Self {
+            execution_id,
+            node_id,
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl TableWriteAggregateGuard for QueryScopedTableWriteAggregateGuard {
+    fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
+        let kind = match boundary {
+            TableWriteAggregateBoundary::PartialUpdate => {
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWritePartialUpdateFailure
+            }
+            TableWriteAggregateBoundary::PartialFinalize => {
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWritePartialFinalizeFailure
+            }
+            TableWriteAggregateBoundary::FinalMerge => {
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteFinalMergeFailure
+            }
+            TableWriteAggregateBoundary::FinalFinalize => {
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteFinalFinalizeFailure
+            }
+        };
+        claim_write_fault(self.execution_id, kind).map_or(Ok(()), |token| {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                format!(
+                    "injected connector write {} on node_id={} (token={token})",
+                    kind.file_stem(),
+                    self.node_id
+                ),
+            ))
+        })
+    }
+}
+
 fn carrier_error(target: WriteTargetOrdinal, detail: String) -> ConnectorError {
     ConnectorError::new(
         ConnectorErrorKind::CorruptData,
@@ -253,12 +307,13 @@ impl ObservedConnectorWriteExecution {
     }
 }
 
+#[async_trait::async_trait]
 impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
     fn catalog_handle(&self) -> &CatalogHandle {
         self.inner.catalog_handle()
     }
 
-    fn open_writer(
+    async fn open_writer(
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
@@ -270,7 +325,7 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
             .catalog_name()
             .as_str()
             .to_string();
-        match self.inner.open_writer(request) {
+        match self.inner.open_writer(request).await {
             Ok(writer) => {
                 crate::metrics::record_connector_write_writer_open("opened");
                 tracing::info!(
@@ -329,16 +384,18 @@ struct ObservedConnectorBatchWriter {
     rows: u64,
 }
 
+#[async_trait::async_trait]
 impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
-    fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        writer_append_holdpoint(self.execution_id, self.node_id, self.target).await;
         let rows = batch.num_rows() as u64;
-        self.inner.append(batch)?;
+        self.inner.append(batch).await?;
         self.rows = self.rows.saturating_add(rows);
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
-        match self.inner.finish() {
+    async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+        match self.inner.finish().await {
             Ok(fragments) => {
                 let produced = fragments.len() as u64;
                 crate::metrics::record_connector_write_writer_finished(self.rows, produced);
@@ -378,7 +435,14 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
         }
     }
 
-    fn abort(&mut self) -> Result<(), ConnectorError> {
+    async fn abort(&mut self) -> Result<(), ConnectorError> {
+        let result = self.inner.abort().await;
+        let outcome = if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        crate::metrics::record_connector_write_writer_abort(outcome);
         tracing::info!(
             target: WRITE_EVENT_TARGET,
             role = "be",
@@ -390,10 +454,50 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
             writer_ordinal = self.physical.writer_ordinal(),
             driver_id = self.physical.driver_id(),
             rows = self.rows,
-            "aborted a driver-local connector writer"
+            outcome,
+            "completed a driver-local connector writer abort"
         );
-        self.inner.abort()
+        result
     }
+}
+
+/// Hold one exact attempt inside a live writer append until cancellation drops
+/// the append future. The query-lifecycle fault token is consumed only after
+/// the writer exists and receives input, so its metric is proof that the
+/// deadline did not race ahead of writer execution.
+#[cfg(debug_assertions)]
+async fn writer_append_holdpoint(
+    execution_id: QueryExecutionId,
+    node_id: i32,
+    target: WriteTargetOrdinal,
+) {
+    let Some(token) = claim_write_fault(
+        execution_id,
+        novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold,
+    ) else {
+        return;
+    };
+    crate::metrics::record_connector_write_debug_fault("append_hold");
+    tracing::info!(
+        target: WRITE_EVENT_TARGET,
+        role = "be",
+        event = "connector_write_append_hold",
+        query_id = %execution_id.query_id(),
+        attempt_id = execution_id.attempt_id().get(),
+        node_id,
+        write_target_ordinal = target.get(),
+        token,
+        "holding a driver-local writer append until query cancellation"
+    );
+    std::future::pending::<()>().await;
+}
+
+#[cfg(not(debug_assertions))]
+async fn writer_append_holdpoint(
+    _execution_id: QueryExecutionId,
+    _node_id: i32,
+    _target: WriteTargetOrdinal,
+) {
 }
 
 /// Test-only writer fault, claimed once per armed trigger for this exact
@@ -712,29 +816,31 @@ mod tests {
         rows: Arc<Mutex<u64>>,
     }
 
+    #[async_trait::async_trait]
     impl ConnectorBatchWriter for CountingWriter {
-        fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
             *self.rows.lock().expect("rows") += batch.num_rows() as u64;
             Ok(())
         }
 
-        fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+        async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
             Ok(vec![adapter().wrap_commit_fragment(data_file_fragment(
                 "s3://b/t/a.parquet",
             ))])
         }
 
-        fn abort(&mut self) -> Result<(), ConnectorError> {
+        async fn abort(&mut self) -> Result<(), ConnectorError> {
             Ok(())
         }
     }
 
+    #[async_trait::async_trait]
     impl ConnectorWriteExecution for CountingWriteExecution {
         fn catalog_handle(&self) -> &CatalogHandle {
             &self.catalog_handle
         }
 
-        fn open_writer(
+        async fn open_writer(
             &self,
             request: ConnectorOpenWriterRequest,
         ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
@@ -748,8 +854,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_observed_execution_forwards_its_binding_and_counts_each_open() {
+    #[tokio::test]
+    async fn the_observed_execution_forwards_its_binding_and_counts_each_open() {
         let opened = Arc::new(Mutex::new(Vec::new()));
         let inner = Arc::new(CountingWriteExecution {
             catalog_handle: catalog_handle(),
@@ -768,8 +874,9 @@ mod tests {
                     ),
                     context: request_context(),
                 })
+                .await
                 .expect("open writer");
-            assert_eq!(writer.finish().expect("finish").len(), 1);
+            assert_eq!(writer.finish().await.expect("finish").len(), 1);
         }
         assert_eq!(
             *opened.lock().expect("opened"),

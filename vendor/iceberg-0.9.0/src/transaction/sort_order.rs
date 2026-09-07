@@ -133,15 +133,12 @@ impl TransactionAction for ReplaceSortOrderAction {
 
 #[cfg(test)]
 mod tests {
-    use as_any::Downcast;
-
     use crate::spec::{NullOrder, SortDirection};
-    use crate::transaction::sort_order::{PendingSortField, ReplaceSortOrderAction};
     use crate::transaction::tests::make_v2_table;
     use crate::transaction::{ApplyTransactionAction, Transaction};
 
-    #[test]
-    fn test_replace_sort_order() {
+    #[tokio::test]
+    async fn test_replace_sort_order() {
         let table = make_v2_table();
         let tx = Transaction::new(&table);
         let replace_sort_order = tx.replace_sort_order();
@@ -150,23 +147,14 @@ mod tests {
             .asc("x", NullOrder::First)
             .desc("y", NullOrder::Last)
             .apply(tx)
+            .await
             .unwrap();
 
-        let replace_sort_order = (*tx.actions[0])
-            .downcast_ref::<ReplaceSortOrderAction>()
-            .unwrap();
-
-        assert_eq!(replace_sort_order.pending_sort_fields, vec![
-            PendingSortField {
-                name: String::from("x"),
-                direction: SortDirection::Ascending,
-                null_order: NullOrder::First,
-            },
-            PendingSortField {
-                name: String::from("y"),
-                direction: SortDirection::Descending,
-                null_order: NullOrder::Last,
-            }
-        ]);
+        let fields = &tx.staged_table().metadata().default_sort_order().fields;
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].direction, SortDirection::Ascending);
+        assert_eq!(fields[0].null_order, NullOrder::First);
+        assert_eq!(fields[1].direction, SortDirection::Descending);
+        assert_eq!(fields[1].null_order, NullOrder::Last);
     }
 }

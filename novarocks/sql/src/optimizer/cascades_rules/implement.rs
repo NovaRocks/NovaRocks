@@ -1932,6 +1932,8 @@ mod window_split_tests {
             name: name.into(),
             args: vec![],
             distinct: false,
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: partition,
             order_by: vec![],
             window_frame: None,
@@ -1996,6 +1998,8 @@ mod window_split_tests {
             name: "w".into(),
             args: vec![],
             distinct: false,
+            function_order_by: vec![],
+            aggregate_binding: None,
             partition_by: vec![col("a"), col("b")],
             order_by: vec![SortItem {
                 expr: col("c"),
@@ -2138,6 +2142,11 @@ mod two_phase_agg_tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
+            resolved: crate::functions::test_resolved_aggregate(
+                "count",
+                &[DataType::Int64],
+                distinct,
+            ),
         }
     }
 
@@ -2302,6 +2311,11 @@ mod two_phase_agg_tests {
                     result_type: DataType::Int64,
                     order_by: vec![],
                     output_column_id: ColumnId::new_for_test(6),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "count",
+                        &[DataType::Int64],
+                        true,
+                    ),
                 }],
                 vec![
                     OutputColumn {

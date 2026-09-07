@@ -16,11 +16,36 @@
 // under the License.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read};
-#[cfg(test)]
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+static EXCHANGE_SNAPSHOT_MARKERS_ENABLED: OnceLock<bool> = OnceLock::new();
+static EXCHANGE_SNAPSHOT_MARKER_COUNT: AtomicUsize = AtomicUsize::new(0);
+const MAX_EXCHANGE_SNAPSHOT_MARKERS: usize = 16_384;
+
+pub(crate) fn exchange_snapshot_markers_enabled() -> bool {
+    *EXCHANGE_SNAPSHOT_MARKERS_ENABLED.get_or_init(|| {
+        std::env::var("NOVAROCKS_SQL_TEST_EMIT_EXCHANGE_SNAPSHOT_MARKER")
+            .ok()
+            .is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+    })
+}
+
+pub(crate) fn emit_exchange_snapshot_marker(build: impl FnOnce() -> String) {
+    if !exchange_snapshot_markers_enabled() {
+        return;
+    }
+    let index = EXCHANGE_SNAPSHOT_MARKER_COUNT.fetch_add(1, Ordering::Relaxed);
+    if index < MAX_EXCHANGE_SNAPSHOT_MARKERS {
+        eprintln!("NOVAROCKS_EXCHANGE_SNAPSHOT {}", build());
+    }
+}
 
 use arrow::array::{Array, ArrayRef, Int8Array};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
@@ -489,7 +514,7 @@ impl ExecutionExchangeRegistry {
             }
             st.chunks.extend(chunks);
         }
-        if eos {
+        let eos_snapshot = if eos {
             st.finished.insert((sender_id, be_number));
             debug!(
                 "push_chunks: sender_id={} be_number={} marked as FINISHED, total finished={}/{}",
@@ -498,10 +523,47 @@ impl ExecutionExchangeRegistry {
                 st.finished.len(),
                 st.expected_senders
             );
-        }
+            exchange_snapshot_markers_enabled().then(|| {
+                let mut finished = st.finished.iter().copied().collect::<Vec<_>>();
+                finished.sort_unstable();
+                let queued_rows = st.chunks.iter().map(Chunk::len).sum::<usize>();
+                (
+                    st.expected_senders,
+                    finished,
+                    st.chunks.len(),
+                    queued_rows,
+                    r.observable.generation(),
+                )
+            })
+        } else {
+            None
+        };
         r.cv.notify_all();
         drop(st);
         let hold_time = hold_start.elapsed();
+        if let Some((
+            expected_senders,
+            finished,
+            queued_chunks,
+            queued_rows,
+            receiver_generation_before_notify,
+        )) = eos_snapshot
+        {
+            emit_exchange_snapshot_marker(|| {
+                format!(
+                    "event=push_eos finst={} node_id={} sender_id={} be_number={} expected_senders={} finished_senders={:?} queued_chunks={} queued_rows={} receiver_generation_before_notify={}",
+                    key.finst_uuid(),
+                    key.node_id,
+                    sender_id,
+                    be_number,
+                    expected_senders,
+                    finished,
+                    queued_chunks,
+                    queued_rows,
+                    receiver_generation_before_notify,
+                )
+            });
+        }
         if hold_time >= EXCHANGE_LOCK_HOLD_WARN {
             debug!(
                 "exchange receiver lock HOLD: finst={} node_id={} chunks={} rows={} eos={} hold_ms={}",

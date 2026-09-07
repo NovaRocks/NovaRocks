@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::exec::expr::agg::SealedExecutionFunctionSet;
 use crate::exec::pipeline::global_driver_executor::GlobalDriverExecutor;
 use crate::runtime::exchange::ExecutionExchangeRegistry;
 use crate::runtime::execution_services::ExecutionServices;
@@ -129,6 +130,7 @@ impl ExecutionRuntimeConfig {
 #[derive(Clone)]
 pub struct ExecutionRuntime {
     config: ExecutionRuntimeConfig,
+    function_set: Arc<SealedExecutionFunctionSet>,
     services: Arc<ExecutionServices>,
     mem_root: Arc<MemTracker>,
     exchange_registry: Arc<ExecutionExchangeRegistry>,
@@ -138,7 +140,10 @@ pub struct ExecutionRuntime {
 }
 
 impl ExecutionRuntime {
-    pub fn new(config: ExecutionRuntimeConfig) -> Result<Self, ExecutionRuntimeConfigError> {
+    pub fn new(
+        config: ExecutionRuntimeConfig,
+        function_set: Arc<SealedExecutionFunctionSet>,
+    ) -> Result<Self, ExecutionRuntimeConfigError> {
         config.validate()?;
         let services =
             ExecutionServices::new(&config).map_err(ExecutionRuntimeConfigError::runtime)?;
@@ -154,6 +159,7 @@ impl ExecutionRuntime {
         ));
         Ok(Self {
             config,
+            function_set,
             services: Arc::new(services),
             mem_root: MemTracker::new_root("execution"),
             exchange_registry: Arc::new(ExecutionExchangeRegistry::default()),
@@ -165,6 +171,14 @@ impl ExecutionRuntime {
 
     pub const fn config(&self) -> &ExecutionRuntimeConfig {
         &self.config
+    }
+
+    pub fn function_set(&self) -> &Arc<SealedExecutionFunctionSet> {
+        &self.function_set
+    }
+
+    pub fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
+        self.function_set.catalog()
     }
 
     pub fn services(&self) -> &ExecutionServices {
@@ -190,6 +204,43 @@ impl ExecutionRuntime {
     pub fn exchange_send_queue(&self) -> Arc<ExchangeSendQueue> {
         Arc::clone(&self.exchange_send_queue)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_execution_function_set() -> Arc<SealedExecutionFunctionSet> {
+    crate::exec::expr::agg::test_builtin_execution_function_set()
+}
+
+#[cfg(test)]
+pub(crate) fn test_execution_runtime() -> Arc<ExecutionRuntime> {
+    Arc::new(
+        ExecutionRuntime::new(
+            ExecutionRuntimeConfig {
+                driver_threads: 1,
+                scan_threads: 1,
+                scan_queue_capacity: 8,
+                spill_io_threads: 1,
+                spill_io_queue_capacity: 8,
+                spill_storage: ExecutionSpillStorageConfig::default(),
+                exchange_wait_ms: 120_000,
+                exchange_io_threads: 1,
+                exchange_io_max_inflight_bytes: 1024,
+                exchange_max_transmit_batched_bytes: 1024,
+                operator_buffer_chunks: 1,
+                local_exchange_buffer_mem_limit_per_driver: 1024,
+                local_exchange_max_buffered_rows: 1024,
+                connector_io_tasks_per_scan_operator: 1,
+                scan_submit_fail_max: 1,
+                scan_submit_fail_timeout_ms: 1,
+                runtime_filter_scan_wait_time_ms_override: None,
+                runtime_filter_wait_timeout_ms_override: None,
+                sink_io_worker_threads: 1,
+                sink_io_max_blocking_threads: 1,
+            },
+            test_execution_function_set(),
+        )
+        .expect("test execution runtime"),
+    )
 }
 
 impl fmt::Debug for ExecutionRuntime {
@@ -232,7 +283,10 @@ impl std::error::Error for ExecutionRuntimeConfigError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig};
+    use super::{
+        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+        test_execution_function_set,
+    };
 
     fn config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
@@ -263,7 +317,8 @@ mod tests {
     fn rejects_zero_capacity_before_runtime_construction() {
         let mut config = config();
         config.scan_queue_capacity = 0;
-        let error = ExecutionRuntime::new(config).expect_err("zero queue must be rejected");
+        let error = ExecutionRuntime::new(config, test_execution_function_set())
+            .expect_err("zero queue must be rejected");
         assert_eq!(
             error.to_string(),
             "execution runtime configuration error: scan_queue_capacity must be non-zero"
@@ -273,7 +328,8 @@ mod tests {
     #[test]
     fn retains_frozen_composition_settings() {
         let config = config();
-        let runtime = ExecutionRuntime::new(config.clone()).expect("valid runtime config");
+        let runtime = ExecutionRuntime::new(config.clone(), test_execution_function_set())
+            .expect("valid runtime config");
         assert_eq!(runtime.config(), &config);
     }
 
@@ -281,6 +337,7 @@ mod tests {
     fn accepts_negative_one_for_unbounded_local_exchange_rows() {
         let mut config = config();
         config.local_exchange_max_buffered_rows = -1;
-        ExecutionRuntime::new(config).expect("-1 preserves the unlimited local exchange contract");
+        ExecutionRuntime::new(config, test_execution_function_set())
+            .expect("-1 preserves the unlimited local exchange contract");
     }
 }

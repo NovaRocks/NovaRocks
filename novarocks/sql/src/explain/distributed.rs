@@ -420,6 +420,12 @@ fn format_distributed_shared_plan_node_header(
                 .collect::<Vec<_>>();
             Some(format!("PROJECT [{}]", items.join(", ")))
         }
+        PhysicalPlanKind::Unpivot(node) => Some(format!(
+            "UNPIVOT (mappings={}, max_rows={}, max_bytes={})",
+            node.value_mappings.len(),
+            node.max_output_rows,
+            node.max_output_bytes
+        )),
         PhysicalPlanKind::Sort(node) => {
             let items = format_sort_items(&node.items);
             Some(format!("SORT BY [{}]", items.join(", ")))
@@ -497,6 +503,18 @@ fn format_distributed_node<M>(
         }
         DistributedNodeKind::Project(project) => {
             format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, actuals, out);
+        }
+        DistributedNodeKind::Unpivot(_) => {
+            let header = format_distributed_shared_plan_node_header(
+                &physical_payload(node).expect("Unpivot is a physical explain node"),
+                PlanNodeExplainStage::Distributed,
+            )
+            .expect("Unpivot is a shared explain node");
+            out.push(format!(
+                "{pad}{}{header}{costs_suffix}{stats_suffix}",
+                node_prefix(node)
+            ));
             format_children(node, level, indent, actuals, out);
         }
         DistributedNodeKind::Filter(filter) => {
@@ -646,6 +664,7 @@ fn physical_kind_name(payload: &DistributedNodeKind) -> &'static str {
         DistributedNodeKind::Scan(_) => "Scan",
         DistributedNodeKind::Filter(_) => "Filter",
         DistributedNodeKind::Project(_) => "Project",
+        DistributedNodeKind::Unpivot(_) => "Unpivot",
         DistributedNodeKind::Sort(_) => "Sort",
         DistributedNodeKind::Values(_) => "Values",
         DistributedNodeKind::Repeat(_) => "Repeat",
@@ -2749,6 +2768,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: ColumnId::new_for_test(3),
+            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
         }];
         physical_node_with_scalars(
             Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -2819,6 +2839,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id: ColumnId::new_for_test(4),
+            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
         }];
         physical_node_with_scalars(
             Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {

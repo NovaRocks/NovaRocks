@@ -20,7 +20,9 @@
 -- keeps moving. Previously that made them unreadable the moment a write landed.
 -- This case pins the whole shape: the distinct count survives the advance and
 -- says which snapshot it came from, while the row count tracks the snapshot
--- actually being queried.
+-- actually being queried. Collect-on-write is disabled explicitly so the
+-- append advances the table without publishing a replacement current-snapshot
+-- sketch; collect-on-write current-snapshot union is covered separately.
 
 -- query 1
 -- @skip_result_check=true
@@ -31,7 +33,7 @@ CREATE DATABASE IF NOT EXISTS statistics_hadoop_${suite_uuid0}.nr_ancestor_${sui
 CREATE TABLE statistics_hadoop_${suite_uuid0}.nr_ancestor_${suite_uuid0}.advance_${uuid0} (
     id BIGINT,
     k BIGINT
-);
+) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
 
 -- query 3
 -- @skip_result_check=true

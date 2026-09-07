@@ -47,8 +47,8 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 8
     PARTITION: UNPARTITIONED
 7:LOCAL TOP-N (limit=5, offset=0) [r.payload DESC NULLS LAST] stats={rows=5}
-  6:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=1000}
-    5:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [l.id = r.id]) stats={rows=1000}
+  6:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=1004}
+    5:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [l.id = r.id]) stats={rows=1004}
       2:HASH EXCHANGE stats={rows=100000}
       4:HASH EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 2

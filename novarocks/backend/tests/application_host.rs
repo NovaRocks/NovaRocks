@@ -36,6 +36,18 @@ fn unused_port() -> u16 {
     port
 }
 
+fn test_execution_function_set()
+-> Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet> {
+    let mut builder = novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
+    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+        .expect("builtin function metadata");
+    novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+        &mut builder,
+    )
+    .expect("builtin aggregate implementations");
+    Arc::new(builder.seal().expect("builtin execution function set"))
+}
+
 fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
     BackendServerConfig {
         bind_host: "127.0.0.1".to_string(),
@@ -47,6 +59,7 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         },
         native_trust: test_native_trust(),
         native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        function_set: test_execution_function_set(),
         native_transport: BackendNativeTransport::Plaintext,
         frontend_endpoint: novarocks_types::NativeEndpoint::from_host_port(
             "127.0.0.1",

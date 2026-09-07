@@ -2,9 +2,10 @@
 
 Upstream source: https://crates.io/crates/iceberg/0.9.0
 
-These patches are the minimum required to let NovaRocks implement custom
-Transaction actions for INSERT OVERWRITE and DELETE flows that iceberg-rust 0.9
-does not yet ship as built-in actions (`overwrite_files`, `row_delta`).
+These patches are the minimum required to let NovaRocks use an eagerly staged,
+single-dispatch transaction and implement custom Transaction actions for INSERT
+OVERWRITE and DELETE flows that iceberg-rust 0.9 does not yet ship as built-in
+actions (`overwrite_files`, `row_delta`).
 
 When upstream lands native equivalents — likely in 0.10/0.11 — this whole
 vendor directory and the corresponding `[patch.crates-io]` block in the root
@@ -13,6 +14,44 @@ vendor directory and the corresponding `[patch.crates-io]` block in the root
 should be re-pointed at the upstream actions.
 
 Tracked under spec §0.4 / Plan Task 9.
+
+## Patch 9 — eager transaction staging and side-effect-free commit export
+
+Upstream 0.9 stores actions in `Transaction` and evaluates them only from
+`commit()`. That method reloads the table and transparently replays the whole
+action list on retryable errors. A later action therefore cannot read metadata
+created by an earlier action before catalog publication, and a caller cannot
+give one already-frozen commit to an external publication owner.
+
+This patch changes the generic transaction model rather than adding a
+NovaRocks-specific shadow transaction:
+
+* `ApplyTransactionAction::apply` is asynchronous and evaluates the action
+  immediately against the transaction-local staged table.
+* Each action's updates are applied to that staged table before the next action
+  runs. Action requirements are checked against that stage-local table, then
+  normalized to the equivalent OCC requirement against the transaction's
+  original base before publication. Exact duplicates are collapsed, so two
+  snapshot actions do not export mutually exclusive `assert-ref-snapshot-id`
+  values.
+* `Transaction::staged_table` and `Transaction::staged_snapshot` expose the
+  read-only local result needed to construct a later action.
+* `Transaction::stage_action` and `Transaction::stage_action_commit` are public
+  eager composition points for connector-owned actions and already-assembled
+  provider updates. Both update only transaction-local metadata and perform no
+  catalog I/O.
+* `Transaction::into_table_commit` consumes the transaction and exports the
+  complete `TableCommit` without catalog I/O, refresh, dispatch, or retry.
+* `Transaction` is no longer `Clone`; staging, export, and commit carry one
+  structurally consuming authority rather than permitting the same staged
+  update set to be duplicated.
+* The convenience `Transaction::commit` performs at most one
+  `Catalog::update_table` call. Retryable errors are returned to the caller and
+  never replay actions inside the library.
+* The now-unused `backon` dependency is removed.
+
+Library tests lock down append-then-statistics visibility, zero-effect export,
+and one dispatch for retryable and non-retryable catalog errors.
 
 ## Patch 8 — authoritative REST staged-create initialization updates
 

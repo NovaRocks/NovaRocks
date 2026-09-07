@@ -14,8 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashSet;
-
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Decimal128Array, Decimal256Array,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -24,54 +22,66 @@ use arrow::datatypes::DataType;
 use arrow_buffer::i256;
 
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
 
-type DistinctSet = HashSet<Vec<u8>>;
+struct DistinctSet {
+    allocator: AggregateAllocator,
+    values: AggregateHashSet<AggregateVec<u8>>,
+}
+
+impl DistinctSet {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            values: aggregate_hash_set(allocator.clone()),
+            allocator,
+        }
+    }
+
+    fn insert(&mut self, value: &[u8]) -> Result<(), String> {
+        if self
+            .values
+            .iter()
+            .any(|existing| existing.as_slice() == value)
+        {
+            return Ok(());
+        }
+        self.values
+            .try_reserve(1)
+            .map_err(|_| self.allocator.allocation_error("reserve distinct hash set"))?;
+        let value = aggregate_bytes(self.allocator.clone(), value)?;
+        self.values.insert(value);
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &AggregateVec<u8>> {
+        self.values.iter()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        0
+    }
+}
 
 pub(super) struct MultiDistinctSumAgg;
 
-fn set_slot(ptr: *mut u8) -> *mut *mut DistinctSet {
-    ptr as *mut *mut DistinctSet
+unsafe fn get_set_mut<'a>(ptr: *mut u8) -> &'a mut DistinctSet {
+    unsafe { &mut *(ptr.cast::<DistinctSet>()) }
 }
 
-unsafe fn get_or_init_set<'a>(ptr: *mut u8) -> &'a mut DistinctSet {
-    let slot = set_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        let boxed: Box<DistinctSet> = Box::default();
-        let raw = Box::into_raw(boxed);
-        unsafe {
-            *slot = raw;
-            &mut *raw
-        }
-    } else {
-        unsafe { &mut *raw }
-    }
-}
-
-unsafe fn take_set(ptr: *mut u8) -> Option<Box<DistinctSet>> {
-    let slot = set_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        None
-    } else {
-        unsafe {
-            *slot = std::ptr::null_mut();
-            Some(Box::from_raw(raw))
-        }
-    }
-}
-
-unsafe fn get_set<'a>(ptr: *mut u8) -> Option<&'a DistinctSet> {
-    let slot = set_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        None
-    } else {
-        unsafe { Some(&*raw) }
-    }
+unsafe fn get_set<'a>(ptr: *const u8) -> &'a DistinctSet {
+    unsafe { &*(ptr.cast::<DistinctSet>()) }
 }
 
 fn encode_le<T: Copy>(v: T) -> Vec<u8> {
@@ -87,7 +97,7 @@ fn serialize_set(set: &DistinctSet) -> Vec<u8> {
     for v in set.iter() {
         let len = v.len() as u32;
         out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(v);
+        out.extend_from_slice(v.as_slice());
     }
     out
 }
@@ -147,7 +157,7 @@ fn sum_from_set(
     match output_type {
         DataType::Int64 => {
             let mut sum: i128 = 0;
-            for v in set {
+            for v in set.iter() {
                 let value = match input_type {
                     DataType::Int8 => i8::from_le_bytes(v[..1].try_into().unwrap()) as i128,
                     DataType::Int16 => i16::from_le_bytes(v[..2].try_into().unwrap()) as i128,
@@ -169,7 +179,7 @@ fn sum_from_set(
         }
         DataType::Float64 => {
             let mut sum = 0.0f64;
-            for v in set {
+            for v in set.iter() {
                 let value = match input_type {
                     DataType::Float32 => f32::from_le_bytes(v[..4].try_into().unwrap()) as f64,
                     DataType::Float64 => f64::from_le_bytes(v[..8].try_into().unwrap()),
@@ -186,7 +196,7 @@ fn sum_from_set(
         }
         DataType::Decimal128(precision, scale) => {
             let mut sum: i128 = 0;
-            for v in set {
+            for v in set.iter() {
                 let value = match input_type {
                     DataType::Decimal128(_, _) => i128::from_le_bytes(v[..16].try_into().unwrap()),
                     other => {
@@ -205,7 +215,7 @@ fn sum_from_set(
         }
         DataType::Decimal256(precision, scale) => {
             let mut sum = i256::ZERO;
-            for v in set {
+            for v in set.iter() {
                 let value = match input_type {
                     DataType::Decimal256(_, _) => i256::from_le_bytes(
                         v[..32]
@@ -297,8 +307,8 @@ impl AggregateFunction for MultiDistinctSumAgg {
     fn state_layout_for(&self, kind: &AggKind) -> (usize, usize) {
         match kind {
             AggKind::MultiDistinctSum => (
-                std::mem::size_of::<*mut DistinctSet>(),
-                std::mem::align_of::<*mut DistinctSet>(),
+                std::mem::size_of::<DistinctSet>(),
+                std::mem::align_of::<DistinctSet>(),
             ),
             other => unreachable!("unexpected kind for multi_distinct_sum: {:?}", other),
         }
@@ -332,14 +342,34 @@ impl AggregateFunction for MultiDistinctSumAgg {
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
-            std::ptr::write(ptr as *mut *mut DistinctSet, std::ptr::null_mut());
-        }
+            ptr.cast::<DistinctSet>()
+                .write(DistinctSet::new(process_mem_tracker()))
+        };
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker.ok_or_else(|| {
+            "allocation-tracked multi_distinct_sum state requires a memory tracker".to_string()
+        })?;
+        unsafe { ptr.cast::<DistinctSet>().write(DistinctSet::new(tracker)) };
+        Ok(())
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
-        unsafe {
-            let _ = take_set(ptr);
-        }
+        unsafe { ptr.cast::<DistinctSet>().drop_in_place() };
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, ptr: *const u8) -> usize {
+        unsafe { get_set(ptr).retained_bytes() }
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -427,8 +457,8 @@ impl AggregateFunction for MultiDistinctSumAgg {
                     ));
                 }
             };
-            let set = unsafe { get_or_init_set((base as *mut u8).add(offset)) };
-            set.insert(encoded);
+            let set = unsafe { get_set_mut((base as *mut u8).add(offset)) };
+            set.insert(&encoded)?;
         }
         Ok(())
     }
@@ -448,9 +478,9 @@ impl AggregateFunction for MultiDistinctSumAgg {
                 continue;
             }
             let vals = deserialize_set(arr.value(row))?;
-            let set = unsafe { get_or_init_set((base as *mut u8).add(offset)) };
+            let set = unsafe { get_set_mut((base as *mut u8).add(offset)) };
             for v in vals {
-                set.insert(v);
+                set.insert(&v)?;
             }
         }
         Ok(())
@@ -466,11 +496,7 @@ impl AggregateFunction for MultiDistinctSumAgg {
         if output_intermediate {
             let mut builder = BinaryBuilder::new();
             for &base in group_states {
-                let set = unsafe { get_set((base as *mut u8).add(offset)) };
-                let Some(set) = set else {
-                    builder.append_null();
-                    continue;
-                };
+                let set = unsafe { get_set((base as *const u8).add(offset)) };
                 if set.is_empty() {
                     builder.append_null();
                 } else {
@@ -487,12 +513,8 @@ impl AggregateFunction for MultiDistinctSumAgg {
 
         let mut arrays = Vec::with_capacity(group_states.len());
         for &base in group_states {
-            let set = unsafe { get_set((base as *mut u8).add(offset)) };
-            let array = if let Some(set) = set {
-                sum_from_set(set, input_type, &spec.output_type)?
-            } else {
-                sum_from_set(&HashSet::new(), input_type, &spec.output_type)?
-            };
+            let set = unsafe { get_set((base as *const u8).add(offset)) };
+            let array = sum_from_set(set, input_type, &spec.output_type)?;
             arrays.push(array);
         }
 
@@ -568,7 +590,7 @@ mod tests {
         let values = Arc::new(Int64Array::from(vec![1, 2, 2, 3])) as ArrayRef;
         let input = AggInputView::Any(&values);
 
-        let mut state = MaybeUninit::<*mut DistinctSet>::uninit();
+        let mut state = MaybeUninit::<DistinctSet>::uninit();
         MultiDistinctSumAgg.init_state(&spec, state.as_mut_ptr() as *mut u8);
         let state_ptr = state.as_mut_ptr() as AggStatePtr;
         let state_ptrs = vec![state_ptr; 4];
@@ -582,5 +604,42 @@ mod tests {
 
         let out_arr = out.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(out_arr.value(0), 6);
+    }
+
+    #[test]
+    fn allocation_tracker_fails_before_hash_growth_and_releases_on_drop() {
+        let spec = MultiDistinctSumAgg
+            .build_spec_from_type(
+                &AggFunction {
+                    name: "multi_distinct_sum".to_string(),
+                    types: Some(crate::exec::node::aggregate::AggTypeSignature {
+                        intermediate_type: Some(DataType::Binary),
+                        output_type: Some(DataType::Int64),
+                        input_arg_type: Some(DataType::Int64),
+                    }),
+                    ..Default::default()
+                },
+                Some(&DataType::Int64),
+                false,
+            )
+            .unwrap();
+        let tracker = MemTracker::new_root("multi-distinct-sum");
+        tracker.install_limit_once(1).unwrap();
+        let mut state = MaybeUninit::<DistinctSet>::uninit();
+        MultiDistinctSumAgg
+            .init_state_with_tracker(&spec, state.as_mut_ptr().cast(), Some(Arc::clone(&tracker)))
+            .unwrap();
+        let values = Arc::new(Int64Array::from(vec![7])) as ArrayRef;
+        let input = AggInputView::Any(&values);
+
+        let error = MultiDistinctSumAgg
+            .update_batch(&spec, 0, &[state.as_mut_ptr() as AggStatePtr], &input)
+            .expect_err("hash allocation must be rejected before mutation");
+        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert_eq!(unsafe { state.assume_init_ref() }.retained_bytes(), 0);
+        assert_eq!(tracker.current(), 0);
+
+        MultiDistinctSumAgg.drop_state(&spec, state.as_mut_ptr().cast());
+        assert_eq!(tracker.current(), 0);
     }
 }

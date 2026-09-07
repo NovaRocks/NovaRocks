@@ -17,14 +17,13 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, Int64Array, Int64Builder, LargeBinaryArray,
-    LargeStringArray, StringArray,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, Int64Builder, LargeBinaryArray, LargeStringArray,
+    StringArray,
 };
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::agg::{AggStateArena, build_kernel_set};
+use crate::exec::expr::agg::cardinality_from_serialized_hll;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 use novarocks_types::value::hll::encode_hll_empty;
 
 pub fn eval_hll_empty(
@@ -86,57 +85,30 @@ pub fn eval_hll_cardinality(
     }
 
     let input = arena.eval(args[0], chunk)?;
-    let kernels = build_kernel_set(
-        &[AggFunction {
-            name: "hll_union_agg".to_string(),
-            inputs: vec![args[0]],
-            input_is_intermediate: false,
-            types: Some(AggTypeSignature {
-                intermediate_type: None,
-                output_type: Some(arrow::datatypes::DataType::Int64),
-                input_arg_type: Some(input.data_type().clone()),
-            }),
-            ..Default::default()
-        }],
-        &[Some(input.data_type().clone())],
-    )?;
-    let kernel = kernels
-        .entries
-        .first()
-        .ok_or_else(|| "hll_cardinality failed to build aggregate kernel".to_string())?;
-
-    let mut state_arena = AggStateArena::new(8 * 1024);
-    let mut state_ptrs = Vec::with_capacity(input.len());
-    for _ in 0..input.len() {
-        let ptr = state_arena.alloc(kernels.layout.total_size, kernel.state_align());
-        kernel.init_state(ptr);
-        state_ptrs.push(ptr);
-    }
-
-    let input_opt = Some(input.clone());
-    let view = kernel.build_input_view(&input_opt)?;
-    kernel.update_batch(&state_ptrs, &view)?;
-
-    let raw = kernel.build_array(&state_ptrs, false)?;
-    let raw_int = raw
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "hll_cardinality expected Int64 aggregate output".to_string())?;
-
-    let mut out = Int64Builder::with_capacity(raw_int.len());
-    for row in 0..raw_int.len() {
-        if input.is_null(row) || raw_int.is_null(row) {
+    let mut out = Int64Builder::with_capacity(input.len());
+    for row in 0..input.len() {
+        if input.is_null(row) {
             out.append_null();
         } else {
-            out.append_value(raw_int.value(row));
+            let bytes = serialized_hll_bytes(input.as_ref(), row)?;
+            out.append_value(cardinality_from_serialized_hll(bytes)?);
         }
     }
 
-    for state_ptr in state_ptrs {
-        kernel.drop_state(state_ptr);
-    }
-
     Ok(Arc::new(out.finish()) as ArrayRef)
+}
+
+fn serialized_hll_bytes(array: &dyn Array, row: usize) -> Result<&[u8], String> {
+    if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
+        return Ok(values.value(row));
+    }
+    if let Some(values) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Ok(values.value(row));
+    }
+    Err(format!(
+        "hll_cardinality expects Binary or LargeBinary input, got {:?}",
+        array.data_type()
+    ))
 }
 
 fn copy_as_binary(input: &ArrayRef) -> Result<ArrayRef, String> {

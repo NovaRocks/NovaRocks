@@ -728,12 +728,13 @@ mod tests {
             .cloned()
             .unwrap_or_else(ScalarArena::new);
         let aggregate_calls = vec![AggregateCall {
-            name: "sum".to_string(),
+            name: "max".to_string(),
             args: vec![column_ref(ColumnId::new_for_test(1), "a")],
             distinct: false,
             result_type: DataType::Int32,
             order_by: vec![],
             output_column_id: aggregate_output_id,
+            resolved: crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
         }];
         let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -859,12 +860,13 @@ mod tests {
         let child = values_node(vec![int_col(input_id, "a")]);
         let mut scalars = ScalarArena::new();
         let aggregate_calls = vec![AggregateCall {
-            name: "sum".to_string(),
+            name: "max".to_string(),
             args: vec![column_ref(input_id, "a")],
             distinct: false,
             result_type: DataType::Int32,
             order_by: vec![],
             output_column_id: aggregate_output_id,
+            resolved: crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
         }];
         let mut aggregate = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {

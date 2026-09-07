@@ -1501,14 +1501,17 @@ fn signed_aggregate(
         .iter()
         .map(|call| {
             let call = align_aggregate_call_inputs_to_child(call, &input_columns)?;
-            signed_aggregate_call(&call, action_column)
+            signed_aggregate_call(&call, action_column, ctx.function_catalog())
         })
         .collect::<Result<Vec<_>, String>>()?;
     let hidden_retraction_call = layout.state_columns.iter().any(|column| {
         column.state_role == crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount
     });
     if hidden_retraction_call {
-        signed_calls.push(retraction_count_aggregate_call(action_column));
+        signed_calls.push(retraction_count_aggregate_call(
+            action_column,
+            ctx.function_catalog(),
+        )?);
     }
     let input = if plan_contains_imv_marker(&aggregate_input) {
         thread_delta_action_column(aggregate_input, action_column)?
@@ -1989,8 +1992,14 @@ fn state_shaped_state_data_type(
     }
 }
 
-fn retraction_count_aggregate_call(action_column: ColumnId) -> AggregateCall {
-    AggregateCall {
+fn retraction_count_aggregate_call(
+    action_column: ColumnId,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+) -> Result<AggregateCall, String> {
+    let resolved = function_catalog
+        .resolve_aggregate_trusted("sum", &[DataType::Int8])
+        .map_err(|error| format!("failed to resolve IMV retraction aggregate: {error}"))?;
+    Ok(AggregateCall {
         name: "sum".to_string(),
         args: vec![TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -2005,22 +2014,31 @@ fn retraction_count_aggregate_call(action_column: ColumnId) -> AggregateCall {
         result_type: DataType::Int64,
         order_by: Vec::new(),
         output_column_id: ColumnId::UNSET,
-    }
+        resolved,
+    })
 }
 
 fn signed_aggregate_call(
     call: &AggregateCall,
     action_column: ColumnId,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<AggregateCall, String> {
     let signed_name = signed_state_function(&call.name)?;
     let value = signed_value_arg(call)?;
+    let input = signed_state_input(value, action_column);
+    let resolved = function_catalog
+        .resolve_aggregate_trusted(signed_name, std::slice::from_ref(&input.data_type))
+        .map_err(|error| {
+            format!("failed to resolve IMV signed aggregate `{signed_name}`: {error}")
+        })?;
     Ok(AggregateCall {
         name: signed_name.to_string(),
-        args: vec![signed_state_input(value, action_column)],
+        args: vec![input],
         distinct: false,
         result_type: DataType::Binary,
         order_by: call.order_by.clone(),
         output_column_id: ColumnId::UNSET,
+        resolved,
     })
 }
 
@@ -2210,6 +2228,7 @@ mod tests {
         );
 
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(std::rc::Rc::new(
             std::cell::RefCell::new(ScalarArena::new()),
         ));
@@ -2406,6 +2425,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(3),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![
                     OutputColumn {
@@ -2441,6 +2465,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(3),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![
                     OutputColumn {
@@ -2477,6 +2506,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: Vec::new(),
             output_column_id: ColumnId::new_for_test(4),
+            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
         });
         node.output_columns.push(OutputColumn {
             column_id: ColumnId::new_for_test(4),

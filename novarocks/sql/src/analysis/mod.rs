@@ -28,6 +28,53 @@ use novarocks_parser::ast::{Expr as SqlExpr, Query as SqlQuery};
 
 use crate::column_id::ColumnId;
 pub use crate::common::LiteralValue;
+
+/// A typed constant attached to one generic Unpivot mapping. Scalar values
+/// retain the ordinary typed-expression authority; the nested variants cover
+/// Arrow literals not representable by the scalar expression carrier.
+#[derive(Clone, Debug)]
+pub enum UnpivotConstant {
+    Scalar(TypedExpr),
+    Int32List(Vec<i32>),
+    Utf8Map(Vec<(String, String)>),
+}
+
+impl UnpivotConstant {
+    pub fn data_type(&self) -> arrow::datatypes::DataType {
+        match self {
+            Self::Scalar(expression) => expression.data_type.clone(),
+            Self::Int32List(_) => arrow::datatypes::DataType::List(std::sync::Arc::new(
+                arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Int32, false),
+            )),
+            Self::Utf8Map(_) => arrow::datatypes::DataType::Map(
+                std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "entries",
+                    arrow::datatypes::DataType::Struct(arrow::datatypes::Fields::from(vec![
+                        arrow::datatypes::Field::new(
+                            "key",
+                            arrow::datatypes::DataType::Utf8,
+                            false,
+                        ),
+                        arrow::datatypes::Field::new(
+                            "value",
+                            arrow::datatypes::DataType::Utf8,
+                            false,
+                        ),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+        }
+    }
+
+    pub fn nullable(&self) -> bool {
+        match self {
+            Self::Scalar(expression) => expression.nullable,
+            Self::Int32List(_) | Self::Utf8Map(_) => false,
+        }
+    }
+}
 pub(crate) use crate::common::{
     BinOp, JoinKind, LambdaParam, OutputColumn, UnOp, WindowBound, WindowFrame, WindowFrameType,
 };
@@ -320,10 +367,6 @@ pub enum ExprKind {
         /// Semantics resolved by the request's immutable function catalog.
         /// The optimizer bridge preserves this value instead of reclassifying
         /// by name from ambient process state.
-        #[expect(
-            private_interfaces,
-            reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
-        )]
         volatility: crate::functions::FunctionVolatility,
     },
     /// Higher-order function lambda expression.
@@ -341,6 +384,7 @@ pub enum ExprKind {
         args: Vec<TypedExpr>,
         distinct: bool,
         order_by: Vec<SortItem>,
+        resolved: novarocks_functions::ResolvedAggregateSignature,
     },
     /// CAST expression.
     Cast {
@@ -387,6 +431,13 @@ pub enum ExprKind {
         name: String,
         args: Vec<TypedExpr>,
         distinct: bool,
+        /// ORDER BY owned by the aggregate call itself, for example
+        /// `array_agg(value ORDER BY key)`. This is distinct from the ORDER BY
+        /// in the OVER specification below.
+        function_order_by: Vec<SortItem>,
+        /// Exact ordinary aggregate overload selected during analysis. Window-only
+        /// functions carry `None`; aggregate functions used with OVER carry `Some`.
+        aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
         partition_by: Vec<TypedExpr>,
         order_by: Vec<SortItem>,
         window_frame: Option<WindowFrame>,

@@ -85,6 +85,12 @@ impl AggregateFunction for CountAgg {
 
     fn drop_state(&self, _spec: &AggSpec, _ptr: *mut u8) {}
 
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::FixedZero
+    }
     fn update_batch(
         &self,
         spec: &AggSpec,

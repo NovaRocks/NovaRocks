@@ -14,8 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashSet;
-
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Date32Array, Decimal128Array,
     Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -25,45 +23,59 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
 use super::common::{AggScalarValue, scalar_from_array as scalar_from_any_array};
 
-type DistinctSet = HashSet<Vec<u8>>;
+struct DistinctSet {
+    allocator: AggregateAllocator,
+    values: AggregateHashSet<AggregateVec<u8>>,
+}
+
+impl DistinctSet {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            values: aggregate_hash_set(allocator.clone()),
+            allocator,
+        }
+    }
+
+    fn insert(&mut self, value: Vec<u8>) -> Result<(), String> {
+        if self
+            .values
+            .iter()
+            .any(|existing| existing.as_slice() == value.as_slice())
+        {
+            return Ok(());
+        }
+        self.values
+            .try_reserve(1)
+            .map_err(|_| self.allocator.allocation_error("reserve distinct hash set"))?;
+        let value = aggregate_bytes(self.allocator.clone(), &value)?;
+        self.values.insert(value);
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &AggregateVec<u8>> {
+        self.values.iter()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        0
+    }
+}
 
 pub(super) struct CountDistinctAgg;
 
-fn set_slot(ptr: *mut u8) -> *mut *mut DistinctSet {
-    ptr as *mut *mut DistinctSet
-}
-
 unsafe fn get_or_init_set<'a>(ptr: *mut u8) -> &'a mut DistinctSet {
-    let slot = set_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        let boxed: Box<DistinctSet> = Box::default();
-        let raw = Box::into_raw(boxed);
-        unsafe {
-            *slot = raw;
-            &mut *raw
-        }
-    } else {
-        unsafe { &mut *raw }
-    }
-}
-
-unsafe fn take_set(ptr: *mut u8) -> Option<Box<DistinctSet>> {
-    let slot = set_slot(ptr);
-    let raw = unsafe { *slot };
-    if raw.is_null() {
-        None
-    } else {
-        unsafe {
-            *slot = std::ptr::null_mut();
-            Some(Box::from_raw(raw))
-        }
-    }
+    unsafe { &mut *ptr.cast::<DistinctSet>() }
 }
 
 fn encode_u8(v: u8) -> Vec<u8> {
@@ -253,8 +265,8 @@ impl AggregateFunction for CountDistinctAgg {
     fn state_layout_for(&self, kind: &AggKind) -> (usize, usize) {
         match kind {
             AggKind::CountDistinct => (
-                std::mem::size_of::<*mut DistinctSet>(),
-                std::mem::align_of::<*mut DistinctSet>(),
+                std::mem::size_of::<DistinctSet>(),
+                std::mem::align_of::<DistinctSet>(),
             ),
             other => unreachable!("unexpected kind for count_distinct: {:?}", other),
         }
@@ -288,14 +300,34 @@ impl AggregateFunction for CountDistinctAgg {
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
-            std::ptr::write(ptr as *mut *mut DistinctSet, std::ptr::null_mut());
-        }
+            ptr.cast::<DistinctSet>()
+                .write(DistinctSet::new(process_mem_tracker()))
+        };
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker.ok_or_else(|| {
+            "allocation-tracked count_distinct state requires a memory tracker".to_string()
+        })?;
+        unsafe { ptr.cast::<DistinctSet>().write(DistinctSet::new(tracker)) };
+        Ok(())
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
-        unsafe {
-            let _ = take_set(ptr);
-        }
+        unsafe { ptr.cast::<DistinctSet>().drop_in_place() };
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, ptr: *const u8) -> usize {
+        unsafe { (&*ptr.cast::<DistinctSet>()).retained_bytes() }
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -321,7 +353,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)));
+                    set.insert(encode_le(arr.value(row)))?;
                 }
                 Ok(())
             }
@@ -336,7 +368,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)));
+                    set.insert(encode_le(arr.value(row)))?;
                 }
                 Ok(())
             }
@@ -351,7 +383,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)));
+                    set.insert(encode_le(arr.value(row)))?;
                 }
                 Ok(())
             }
@@ -366,7 +398,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)));
+                    set.insert(encode_le(arr.value(row)))?;
                 }
                 Ok(())
             }
@@ -381,7 +413,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row).to_bits()));
+                    set.insert(encode_le(arr.value(row).to_bits()))?;
                 }
                 Ok(())
             }
@@ -396,7 +428,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row).to_bits()));
+                    set.insert(encode_le(arr.value(row).to_bits()))?;
                 }
                 Ok(())
             }
@@ -411,7 +443,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_u8(arr.value(row) as u8));
+                    set.insert(encode_u8(arr.value(row) as u8))?;
                 }
                 Ok(())
             }
@@ -426,7 +458,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(arr.value(row).as_bytes().to_vec());
+                    set.insert(arr.value(row).as_bytes().to_vec())?;
                 }
                 Ok(())
             }
@@ -441,7 +473,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(arr.value(row).to_vec());
+                    set.insert(arr.value(row).to_vec())?;
                 }
                 Ok(())
             }
@@ -456,7 +488,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_le(arr.value(row)));
+                    set.insert(encode_le(arr.value(row)))?;
                 }
                 Ok(())
             }
@@ -472,7 +504,7 @@ impl AggregateFunction for CountDistinctAgg {
                         }
                         let ptr = unsafe { (base as *mut u8).add(offset) };
                         let set = unsafe { get_or_init_set(ptr) };
-                        set.insert(encode_le(arr.value(row)));
+                        set.insert(encode_le(arr.value(row)))?;
                     }
                     Ok(())
                 }
@@ -489,7 +521,7 @@ impl AggregateFunction for CountDistinctAgg {
                         }
                         let ptr = unsafe { (base as *mut u8).add(offset) };
                         let set = unsafe { get_or_init_set(ptr) };
-                        set.insert(encode_le(arr.value(row)));
+                        set.insert(encode_le(arr.value(row)))?;
                     }
                     Ok(())
                 }
@@ -506,7 +538,7 @@ impl AggregateFunction for CountDistinctAgg {
                         }
                         let ptr = unsafe { (base as *mut u8).add(offset) };
                         let set = unsafe { get_or_init_set(ptr) };
-                        set.insert(encode_le(arr.value(row)));
+                        set.insert(encode_le(arr.value(row)))?;
                     }
                     Ok(())
                 }
@@ -523,7 +555,7 @@ impl AggregateFunction for CountDistinctAgg {
                         }
                         let ptr = unsafe { (base as *mut u8).add(offset) };
                         let set = unsafe { get_or_init_set(ptr) };
-                        set.insert(encode_le(arr.value(row)));
+                        set.insert(encode_le(arr.value(row)))?;
                     }
                     Ok(())
                 }
@@ -539,7 +571,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(arr.value(row).to_le_bytes().to_vec());
+                    set.insert(arr.value(row).to_le_bytes().to_vec())?;
                 }
                 Ok(())
             }
@@ -554,7 +586,7 @@ impl AggregateFunction for CountDistinctAgg {
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(arr.value(row).to_le_bytes().to_vec());
+                    set.insert(arr.value(row).to_le_bytes().to_vec())?;
                 }
                 Ok(())
             }
@@ -570,7 +602,7 @@ impl AggregateFunction for CountDistinctAgg {
 
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_scalar_value(&Some(value)));
+                    set.insert(encode_scalar_value(&Some(value)))?;
                 }
                 Ok(())
             }
@@ -589,7 +621,7 @@ impl AggregateFunction for CountDistinctAgg {
 
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
-                    set.insert(encode_scalar_value(&Some(value)));
+                    set.insert(encode_scalar_value(&Some(value)))?;
                 }
                 Ok(())
             }
@@ -620,7 +652,7 @@ impl AggregateFunction for CountDistinctAgg {
             let ptr = unsafe { (base as *mut u8).add(offset) };
             let set = unsafe { get_or_init_set(ptr) };
             for v in vals {
-                set.insert(v);
+                set.insert(v)?;
             }
         }
         Ok(())
@@ -637,14 +669,9 @@ impl AggregateFunction for CountDistinctAgg {
             let mut builder = BinaryBuilder::new();
             for &base in group_states {
                 let ptr = unsafe { (base as *mut u8).add(offset) };
-                let raw = unsafe { *(ptr as *const *mut DistinctSet) };
-                if raw.is_null() {
-                    builder.append_value(0u32.to_le_bytes());
-                } else {
-                    let set = unsafe { &*raw };
-                    let bytes = serialize_set(set);
-                    builder.append_value(bytes);
-                }
+                let set = unsafe { &*ptr.cast::<DistinctSet>() };
+                let bytes = serialize_set(set);
+                builder.append_value(bytes);
             }
             return Ok(std::sync::Arc::new(builder.finish()));
         }
@@ -652,12 +679,7 @@ impl AggregateFunction for CountDistinctAgg {
         let mut builder = Int64Builder::new();
         for &base in group_states {
             let ptr = unsafe { (base as *mut u8).add(offset) };
-            let raw = unsafe { *(ptr as *const *mut DistinctSet) };
-            let count = if raw.is_null() {
-                0
-            } else {
-                unsafe { (&*raw).len() }
-            };
+            let count = unsafe { (&*ptr.cast::<DistinctSet>()).len() };
             builder.append_value(count as i64);
         }
         Ok(std::sync::Arc::new(builder.finish()))
@@ -674,17 +696,27 @@ mod tests {
     #[cfg(feature = "core-pipeline-integration")]
     use std::time::Duration;
 
-    use arrow::array::{ArrayRef, Int32Array, Int64Array, ListArray, NullArray};
-    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    #[cfg(feature = "core-pipeline-integration")]
+    use arrow::array::Int32Array;
+    use arrow::array::{ArrayRef, Int64Array, ListArray, NullArray};
+    use arrow::datatypes::{DataType, Int32Type};
+    #[cfg(feature = "core-pipeline-integration")]
+    use arrow::datatypes::{Field, Schema};
     #[cfg(feature = "core-pipeline-integration")]
     use arrow::record_batch::RecordBatch;
 
-    use super::{AggregateFunction, CountDistinctAgg, DistinctSet};
+    use super::{AggregateFunction, CountDistinctAgg, DistinctSet, get_or_init_set};
+    #[cfg(feature = "core-pipeline-integration")]
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::agg::{AggInputView, AggStatePtr};
+    #[cfg(feature = "core-pipeline-integration")]
     use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
+    #[cfg(feature = "core-pipeline-integration")]
+    use crate::exec::node::aggregate::AggregateNode;
+    use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+    #[cfg(feature = "core-pipeline-integration")]
     use crate::exec::node::values::ValuesNode;
+    #[cfg(feature = "core-pipeline-integration")]
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     #[cfg(feature = "core-pipeline-integration")]
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
@@ -692,8 +724,10 @@ mod tests {
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
     #[cfg(feature = "core-pipeline-integration")]
     use crate::exec::pipeline::executor::execute_native_plan_with_pipeline;
+    use crate::runtime::mem_tracker::MemTracker;
     #[cfg(feature = "core-pipeline-integration")]
     use crate::runtime::runtime_state::RuntimeState;
+    #[cfg(feature = "core-pipeline-integration")]
     use novarocks_types::SlotId;
 
     #[cfg(feature = "core-pipeline-integration")]
@@ -726,7 +760,7 @@ mod tests {
             .build_spec_from_type(&func, Some(array.data_type()), false)
             .expect("count distinct spec");
 
-        let mut state = MaybeUninit::<*mut DistinctSet>::uninit();
+        let mut state = MaybeUninit::<DistinctSet>::uninit();
         CountDistinctAgg.init_state(&spec, state.as_mut_ptr() as *mut u8);
         let state_ptr = state.as_mut_ptr() as AggStatePtr;
         let state_ptrs = vec![state_ptr; array.len()];
@@ -760,7 +794,7 @@ mod tests {
             .build_spec_from_type(&func, Some(array.data_type()), false)
             .expect("count distinct spec");
 
-        let mut state = MaybeUninit::<*mut DistinctSet>::uninit();
+        let mut state = MaybeUninit::<DistinctSet>::uninit();
         CountDistinctAgg.init_state(&spec, state.as_mut_ptr() as *mut u8);
         let state_ptr = state.as_mut_ptr() as AggStatePtr;
         let state_ptrs = vec![state_ptr; array.len()];
@@ -828,6 +862,12 @@ mod tests {
                         }),
                         ..Default::default()
                     }],
+                    resolved_aggregates: vec![
+                        crate::exec::expr::agg::test_builtin_execution_function_set()
+                            .catalog()
+                            .resolve_aggregate_trusted("multi_distinct_count", &[DataType::Int32])
+                            .expect("resolved builtin aggregate"),
+                    ],
                     need_finalize: true,
                     input_is_intermediate: false,
                     output_chunk_schema,
@@ -888,5 +928,32 @@ mod tests {
         assert_eq!(out.get(&2).copied(), Some(1));
         assert_eq!(out.get(&3).copied(), Some(3));
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn retained_bytes_track_unique_key_capacity_and_drop_clears_slot() {
+        let mut slot = MaybeUninit::<DistinctSet>::uninit();
+        let ptr = slot.as_mut_ptr().cast::<u8>();
+        let tracker = MemTracker::new_root("count-distinct-test");
+        unsafe {
+            ptr.cast::<DistinctSet>()
+                .write(DistinctSet::new(Arc::clone(&tracker)))
+        };
+        let state = unsafe { get_or_init_set(ptr) };
+        state.insert(Vec::with_capacity(32)).unwrap();
+        let first = tracker.current();
+        assert!(first > 0);
+
+        state.insert(Vec::with_capacity(32)).unwrap();
+        assert_eq!(state.values.len(), 1);
+        assert_eq!(tracker.current(), first);
+
+        let func = CountDistinctAgg;
+        let spec = func
+            .build_spec_from_type(&AggFunction::default(), Some(&DataType::Int64), false)
+            .expect("build spec");
+        assert_eq!(func.retained_bytes(&spec, ptr), 0);
+        func.drop_state(&spec, ptr);
+        assert_eq!(tracker.current(), 0);
     }
 }

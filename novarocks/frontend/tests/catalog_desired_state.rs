@@ -657,6 +657,10 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
                 19090,
                 std::num::NonZeroUsize::new(1).expect("one worker"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                std::sync::Arc::new(
+                    novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                        .expect("builtin function catalog"),
+                ),
             )
             .with_catalog_desired_state_source(
                 CatalogDesiredStateSourceInput::ManagedControllerUnsupported,

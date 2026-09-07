@@ -283,12 +283,10 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         let execution = IcebergExecutionBindingFactory::new(self.resources.clone())
             .bind_for_catalog_properties(catalog_properties)
             .map_err(ConnectorMaterializationError::from)?;
-        let typed_write = IcebergCatalogWriteExecutionFactory::new(
-            self.resources.binding().clone(),
-            self.resources.runtime().clone(),
-        )
-        .build(catalog_properties)
-        .map_err(ConnectorMaterializationError::from)?;
+        let typed_write =
+            IcebergCatalogWriteExecutionFactory::new(self.resources.binding().clone())
+                .build(catalog_properties)
+                .map_err(ConnectorMaterializationError::from)?;
         // The write-stack execution and both codec facets are minted from the
         // same immutable catalog generation the read facets above were bound
         // to: one descriptor derived from this exact catalog handle, and one
@@ -299,7 +297,6 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         let write_execution = IcebergWriteStackExecutionFactory::new(
             descriptor.clone(),
             self.resources.binding().clone(),
-            self.resources.runtime().clone(),
         )
         .build(catalog_properties)
         .map_err(ConnectorMaterializationError::from)?;
@@ -422,7 +419,7 @@ mod tests {
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergExecutionRoleBindingFactory::new(
-            IcebergExecutionResources::new(access, runtime.handle().clone()),
+            IcebergExecutionResources::new(access),
             IcebergPageSourceProviderOptions::with_default_budget(),
         );
         let normalized = NormalizedCatalogProperties::try_new(properties())

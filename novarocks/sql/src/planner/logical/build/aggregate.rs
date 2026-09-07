@@ -635,6 +635,7 @@ pub(super) fn rewrite_agg_calls_to_refs(
         args,
         distinct,
         order_by,
+        ..
     } = &expr.kind
         && let Some(call) = agg_calls
             .iter()
@@ -776,6 +777,8 @@ pub(super) fn rewrite_expr_children(
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
@@ -784,6 +787,15 @@ pub(super) fn rewrite_expr_children(
             name: name.clone(),
             args: args.iter().map(&mut rewrite_child).collect(),
             distinct: *distinct,
+            function_order_by: function_order_by
+                .iter()
+                .map(|item| SortItem {
+                    expr: rewrite_child(&item.expr),
+                    asc: item.asc,
+                    nulls_first: item.nulls_first,
+                })
+                .collect(),
+            aggregate_binding: aggregate_binding.clone(),
             partition_by: partition_by.iter().map(&mut rewrite_child).collect(),
             order_by: order_by
                 .iter()
@@ -933,12 +945,14 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 args: left_args,
                 distinct: left_distinct,
                 order_by: left_order_by,
+                ..
             },
             ExprKind::AggregateCall {
                 name: right_name,
                 args: right_args,
                 distinct: right_distinct,
                 order_by: right_order_by,
+                ..
             },
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
@@ -1063,6 +1077,8 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 name: left_name,
                 args: left_args,
                 distinct: left_distinct,
+                function_order_by: left_function_order_by,
+                aggregate_binding: left_aggregate_binding,
                 partition_by: left_partition_by,
                 order_by: left_order_by,
                 window_frame: left_frame,
@@ -1072,6 +1088,8 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 name: right_name,
                 args: right_args,
                 distinct: right_distinct,
+                function_order_by: right_function_order_by,
+                aggregate_binding: right_aggregate_binding,
                 partition_by: right_partition_by,
                 order_by: right_order_by,
                 window_frame: right_frame,
@@ -1080,9 +1098,11 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
                 && left_distinct == right_distinct
+                && left_aggregate_binding == right_aggregate_binding
                 && left_ignore_nulls == right_ignore_nulls
                 && format!("{left_frame:?}") == format!("{right_frame:?}")
                 && typed_expr_slices_semantically_eq(left_args, right_args)
+                && sort_item_slices_semantically_eq(left_function_order_by, right_function_order_by)
                 && typed_expr_slices_semantically_eq(left_partition_by, right_partition_by)
                 && sort_item_slices_semantically_eq(left_order_by, right_order_by)
         }
@@ -1161,6 +1181,7 @@ pub(super) fn collect_aggregates(
             args,
             distinct,
             order_by,
+            resolved,
         } => {
             // Avoid duplicates — compare full aggregate semantics, including
             // ORDER BY metadata for ordered aggregates like
@@ -1191,6 +1212,7 @@ pub(super) fn collect_aggregates(
                     result_type: expr.data_type.clone(),
                     order_by: order_by.clone(),
                     output_column_id,
+                    resolved: resolved.clone(),
                 });
             }
         }

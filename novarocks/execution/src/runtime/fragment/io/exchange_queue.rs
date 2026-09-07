@@ -330,6 +330,17 @@ impl ExchangeSendQueue {
 
     fn enqueue_task(self: &Arc<Self>, task: ExchangeSendTask, reserve_bytes: usize) {
         let key = ExchangeSendKey::from_task(&task);
+        let eos_marker = (task.frame.eos
+            && crate::runtime::exchange::exchange_snapshot_markers_enabled())
+        .then(|| {
+            (
+                task.frame.sender_fragment_instance_id,
+                task.frame.sender_ordinal,
+                task.frame.sender_count,
+                task.frame.backend_number,
+                task.frame.sequence,
+            )
+        });
         let queued = QueuedSendTask {
             task,
             reserve_bytes,
@@ -344,6 +355,27 @@ impl ExchangeSendQueue {
                 guard.insert(key.clone(), VecDeque::new());
                 start_now = Some(queued);
             }
+        }
+
+        if let Some((sender_finst, sender_ordinal, sender_count, be_number, sequence)) = eos_marker
+        {
+            crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
+                format!(
+                    "event=send_eos_enqueued dest={}:{} dest_finst={} node_id={} sender_finst={} sender_id={} sender_ordinal={} sender_count={} be_number={} seq={} reserve_bytes={} started_immediately={}",
+                    key.dest_host,
+                    key.dest_port,
+                    key.finst_id,
+                    key.node_id,
+                    sender_finst,
+                    key.sender_id,
+                    sender_ordinal,
+                    sender_count,
+                    be_number,
+                    sequence,
+                    reserve_bytes,
+                    start_now.is_some(),
+                )
+            });
         }
 
         if let Some(queued) = start_now {
@@ -374,6 +406,9 @@ impl ExchangeSendQueue {
         let sender_fragment_instance_id = frame.sender_fragment_instance_id;
         let destination_node_id = frame.destination_node_id;
         let sender_id = frame.sender_id;
+        let sender_ordinal = frame.sender_ordinal;
+        let sender_count = frame.sender_count;
+        let be_number = frame.backend_number;
         let eos = frame.eos;
         let sequence = frame.sequence;
         let result = transmitter.transmit(frame);
@@ -402,6 +437,23 @@ impl ExchangeSendQueue {
 
         match result {
             Ok(()) => {
+                if eos {
+                    crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
+                        format!(
+                            "event=send_eos_completed result=ok dest={} dest_finst={} node_id={} sender_finst={} sender_id={} sender_ordinal={} sender_count={} be_number={} seq={} bytes={}",
+                            destination,
+                            destination_fragment_instance_id,
+                            destination_node_id,
+                            sender_fragment_instance_id,
+                            sender_id,
+                            sender_ordinal,
+                            sender_count,
+                            be_number,
+                            sequence,
+                            payload_bytes,
+                        )
+                    });
+                }
                 observe_exchange_shuffle_bytes(payload_bytes);
                 debug!(
                     "exchange send completed: dest={} finst={} node_id={} sender_id={} eos={} seq={} bytes={}",
@@ -422,6 +474,23 @@ impl ExchangeSendQueue {
             Err(ExchangeTransmitRejection::DestinationCanceled(reason)) => match edge_gate.as_ref()
             {
                 Some(gate) => {
+                    if eos {
+                        crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
+                            format!(
+                                "event=send_eos_completed result=destination_canceled dest={} dest_finst={} node_id={} sender_finst={} sender_id={} sender_ordinal={} sender_count={} be_number={} seq={} bytes={}",
+                                destination,
+                                destination_fragment_instance_id,
+                                destination_node_id,
+                                sender_fragment_instance_id,
+                                sender_id,
+                                sender_ordinal,
+                                sender_count,
+                                be_number,
+                                sequence,
+                                payload_bytes,
+                            )
+                        });
+                    }
                     let closed_here = gate.close_for_normal_cancellation();
                     let discarded = if closed_here {
                         self.discard_edge(gate.edge_id())
@@ -442,6 +511,23 @@ impl ExchangeSendQueue {
                     );
                 }
                 None => {
+                    if eos {
+                        crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
+                            format!(
+                                "event=send_eos_completed result=ungated_destination_canceled dest={} dest_finst={} node_id={} sender_finst={} sender_id={} sender_ordinal={} sender_count={} be_number={} seq={} bytes={}",
+                                destination,
+                                destination_fragment_instance_id,
+                                destination_node_id,
+                                sender_fragment_instance_id,
+                                sender_id,
+                                sender_ordinal,
+                                sender_count,
+                                be_number,
+                                sequence,
+                                payload_bytes,
+                            )
+                        });
+                    }
                     // With no gated edge there is nothing to attribute the
                     // departure to, so it cannot be told apart from a
                     // failure: fail closed rather than assume a cancellation.
@@ -462,6 +548,24 @@ impl ExchangeSendQueue {
                 }
             },
             Err(ExchangeTransmitRejection::Failed(err)) => {
+                if eos {
+                    crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
+                        format!(
+                            "event=send_eos_completed result=failed dest={} dest_finst={} node_id={} sender_finst={} sender_id={} sender_ordinal={} sender_count={} be_number={} seq={} bytes={} error={}",
+                            destination,
+                            destination_fragment_instance_id,
+                            destination_node_id,
+                            sender_fragment_instance_id,
+                            sender_id,
+                            sender_ordinal,
+                            sender_count,
+                            be_number,
+                            sequence,
+                            payload_bytes,
+                            err,
+                        )
+                    });
+                }
                 error_state.set_error(err.to_string());
                 error!(
                     "exchange send failed: dest={} dest_finst={} sender_finst={} node_id={} sender_id={} seq={} error={}",
@@ -763,6 +867,37 @@ mod tests {
         assert_eq!(frame.payload, vec![10, 11]);
         assert!(error_state.error().is_none());
         assert!(tracker.is_idle());
+    }
+
+    #[test]
+    fn eos_submission_runs_through_the_serial_queue_before_becoming_idle() {
+        let transmitter = Arc::new(RecordingTransmitter::default());
+        let error_state = Arc::new(RuntimeErrorState::default());
+        let tracker = ExchangeSendTracker::new();
+        let queue = Arc::new(ExchangeSendQueue::with_limits(8, 8));
+
+        let outcome = queue
+            .try_submit(
+                exchange_task(
+                    Arc::clone(&transmitter) as Arc<dyn ExchangeFrameTransmitter>,
+                    Arc::clone(&error_state),
+                    Arc::clone(&tracker),
+                ),
+                false,
+            )
+            .expect("submit EOS frame");
+        assert!(matches!(outcome, ExchangeSendEnqueue::Enqueued));
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        while !tracker.is_idle() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            tracker.is_idle(),
+            "completed EOS transmission releases its tracker"
+        );
+        assert_eq!(transmitter.frame_count(), 1);
+        assert!(error_state.error().is_none());
     }
 
     #[test]

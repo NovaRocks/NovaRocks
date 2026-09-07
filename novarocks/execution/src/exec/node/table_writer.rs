@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef};
-use arrow::record_batch::RecordBatch;
 
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::write_stack::{
@@ -36,11 +35,17 @@ use novarocks_spi::connector::write_stack::{
     WriteTargetOrdinal,
 };
 
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::ExecNode;
+use crate::exec::node::table_write_aggregate::WriterPartialAggregatePlan;
 use crate::exec::node::table_write_relation::ConnectorCommitFragmentEncoder;
+#[cfg(debug_assertions)]
+use crate::exec::node::table_write_relation::{
+    AllowTableWriteAggregates, TableWriteAggregateGuard,
+};
+use novarocks_types::SlotId;
 
 /// The attempt-local facts every driver of one `TableWriter` shares.
 ///
@@ -97,6 +102,7 @@ pub struct TableWriterInputProjection {
     arena: ExprArena,
     exprs: Vec<ExprId>,
     schema: SchemaRef,
+    chunk_schema: ChunkSchemaRef,
 }
 
 impl TableWriterInputProjection {
@@ -120,10 +126,28 @@ impl TableWriterInputProjection {
                 ),
             ));
         }
+        let slot_ids = (0..schema.fields().len())
+            .map(|ordinal| {
+                ordinal
+                    .checked_add(1)
+                    .and_then(|slot| u32::try_from(slot).ok())
+                    .map(SlotId::new)
+                    .ok_or_else(|| {
+                        ExecPlanBuildError::new(
+                            ExecPlanInvariant::Schema,
+                            "table writer projected input slot ID overflowed",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slot_ids)
+                .map_err(|error| ExecPlanBuildError::new(ExecPlanInvariant::Schema, error))?;
         Ok(Self {
             arena,
             exprs,
             schema,
+            chunk_schema,
         })
     }
 
@@ -135,7 +159,13 @@ impl TableWriterInputProjection {
         &mut self.arena
     }
 
-    pub fn project(&self, chunk: &Chunk) -> Result<RecordBatch, String> {
+    pub const fn chunk_schema(&self) -> &ChunkSchemaRef {
+        &self.chunk_schema
+    }
+
+    /// Evaluate the projection once and expose the exact same target-typed
+    /// Arrow buffers to both the connector writer and embedded aggregates.
+    pub fn project(&self, chunk: &Chunk) -> Result<Chunk, String> {
         let arrays = self
             .exprs
             .iter()
@@ -167,8 +197,10 @@ impl TableWriterInputProjection {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        RecordBatch::try_new(Arc::clone(&self.schema), arrays)
-            .map_err(|error| format!("build table writer projected batch: {error}"))
+        let batch = arrow::record_batch::RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+            .map_err(|error| format!("build table writer projected batch: {error}"))?;
+        Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.chunk_schema))
+            .map_err(|error| format!("build table writer projected chunk: {error}"))
     }
 }
 
@@ -195,6 +227,10 @@ pub struct TableWriterNode {
     physical_template: TableWriterPhysicalContextTemplate,
     request_context: ConnectorRequestContext,
     fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
+    writer_multiplex_schema: crate::exec::node::table_write_relation::WriterMultiplexRelationSchema,
+    partial_aggregate_plan: WriterPartialAggregatePlan,
+    #[cfg(debug_assertions)]
+    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
 impl TableWriterNode {
@@ -213,6 +249,40 @@ impl TableWriterNode {
         physical_template: TableWriterPhysicalContextTemplate,
         request_context: ConnectorRequestContext,
         fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
+    ) -> Result<Self, ExecPlanBuildError> {
+        Self::try_new_with_relation(
+            input,
+            node_id,
+            handle,
+            target,
+            execution,
+            expected_schema,
+            projection,
+            physical_template,
+            request_context,
+            fragment_encoder,
+            crate::exec::node::table_write_relation::WriterMultiplexRelationSchema::empty(),
+            WriterPartialAggregatePlan::default(),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "A table writer joins independently-owned plan, provider, attempt, codec, and relation facts."
+    )]
+    pub fn try_new_with_relation(
+        input: Box<ExecNode>,
+        node_id: i32,
+        handle: ConnectorWriterHandle,
+        target: WriteTargetOrdinal,
+        execution: Arc<dyn ConnectorWriteExecution>,
+        expected_schema: SchemaRef,
+        projection: TableWriterInputProjection,
+        physical_template: TableWriterPhysicalContextTemplate,
+        request_context: ConnectorRequestContext,
+        fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
+        writer_multiplex_schema: crate::exec::node::table_write_relation::WriterMultiplexRelationSchema,
+        partial_aggregate_plan: WriterPartialAggregatePlan,
     ) -> Result<Self, ExecPlanBuildError> {
         if execution.catalog_handle() != handle.binding().catalog_handle() {
             return Err(ExecPlanBuildError::new(
@@ -237,7 +307,18 @@ impl TableWriterNode {
             physical_template,
             request_context,
             fragment_encoder,
+            writer_multiplex_schema,
+            partial_aggregate_plan,
+            #[cfg(debug_assertions)]
+            aggregate_guard: Arc::new(AllowTableWriteAggregates),
         })
+    }
+
+    /// Bind the application-owned, query-scoped aggregate rejection guard.
+    #[cfg(debug_assertions)]
+    pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
+        self.aggregate_guard = guard;
+        self
     }
 
     pub const fn handle(&self) -> &ConnectorWriterHandle {
@@ -275,6 +356,21 @@ impl TableWriterNode {
 
     pub const fn fragment_encoder(&self) -> &Arc<dyn ConnectorCommitFragmentEncoder> {
         &self.fragment_encoder
+    }
+
+    pub const fn writer_multiplex_schema(
+        &self,
+    ) -> &crate::exec::node::table_write_relation::WriterMultiplexRelationSchema {
+        &self.writer_multiplex_schema
+    }
+
+    pub const fn partial_aggregate_plan(&self) -> &WriterPartialAggregatePlan {
+        &self.partial_aggregate_plan
+    }
+
+    #[cfg(debug_assertions)]
+    pub const fn aggregate_guard(&self) -> &Arc<dyn TableWriteAggregateGuard> {
+        &self.aggregate_guard
     }
 }
 

@@ -16,9 +16,18 @@
 // under the License.
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
+use novarocks_functions::{
+    AggregateImplementationIdentity, AggregateStateFormatIdentity, FunctionKind,
+};
 
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::MemTracker;
 
+use std::sync::Arc;
+
+use super::registry::{
+    ExecutionFunctionSetBuilder, ExecutionFunctionSetError, RetainedMemoryPolicy,
+};
 use super::{AggInputView, AggSpec, AggStatePtr};
 
 #[derive(Clone, Debug)]
@@ -103,10 +112,6 @@ pub(super) enum AggKind {
         nulls_first: Vec<bool>,
     },
     ArrayUniqueAgg,
-    Retention,
-    WindowFunnel,
-    Histogram,
-    HistogramHllNdv,
     MannWhitneyUTest,
     DictMerge,
     BitmapAgg,
@@ -142,9 +147,7 @@ mod count_distinct;
 mod count_if;
 mod dict_merge;
 mod ds_hll;
-mod ds_theta;
 mod group_concat;
-mod histogram;
 pub mod hll_raw;
 mod mann_whitney_u_test;
 mod map_agg;
@@ -155,12 +158,10 @@ mod minmax_n;
 mod multi_distinct_sum;
 mod percentile;
 mod percentile_placeholder;
-mod retention;
 mod state_combinators;
 mod sum;
 mod sum_map;
 mod variance;
-mod window_funnel;
 
 use any_value::AnyValueAgg;
 use approx_top_k::ApproxTopKAgg;
@@ -175,9 +176,7 @@ use count_distinct::CountDistinctAgg;
 use count_if::CountIfAgg;
 use dict_merge::DictMergeAgg;
 use ds_hll::DsHllAgg;
-use ds_theta::DsThetaAgg;
 use group_concat::GroupConcatAgg;
-use histogram::{HistogramAgg, HistogramHllNdvAgg};
 use hll_raw::HllRawAgg;
 use mann_whitney_u_test::MannWhitneyUTestAgg;
 use map_agg::MapAggAgg;
@@ -188,7 +187,6 @@ use minmax_n::MinMaxNAgg;
 use multi_distinct_sum::MultiDistinctSumAgg;
 use percentile::PercentileAgg;
 use percentile_placeholder::PercentilePlaceholderAgg;
-use retention::RetentionAgg;
 use state_combinators::approx_count_distinct::{
     ApproxCountDistinctStateAgg, ApproxCountDistinctStateSignedAgg,
 };
@@ -202,9 +200,8 @@ use state_combinators::sum::{SumStateAgg, SumStateMergeAgg, SumStateSignedAgg};
 use sum::SumAgg;
 use sum_map::SumMapAgg;
 use variance::VarStdAgg;
-use window_funnel::WindowFunnelAgg;
 
-pub(super) trait AggregateFunction {
+pub(super) trait AggregateFunction: Send + Sync {
     fn build_spec_from_type(
         &self,
         func: &AggFunction,
@@ -227,7 +224,36 @@ pub(super) trait AggregateFunction {
     ) -> Result<AggInputView<'a>, String>;
 
     fn init_state(&self, spec: &AggSpec, ptr: *mut u8);
+    fn init_state_with_tracker(
+        &self,
+        spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        if matches!(
+            self.retained_memory_policy(spec),
+            RetainedMemoryPolicy::AllocationTracked
+        ) {
+            return Err(
+                "allocation-tracked aggregate must implement tracker-aware state initialization"
+                    .to_string(),
+            );
+        }
+        let _ = tracker;
+        self.init_state(spec, ptr);
+        Ok(())
+    }
     fn drop_state(&self, spec: &AggSpec, ptr: *mut u8);
+    /// Returns memory retained outside the aggregate arena allocation.
+    ///
+    /// Inline state bytes are already charged by `AggStateArena` and must not
+    /// be included. Pointer-backed states must include the pointed-to state
+    /// body because the arena only contains the pointer slot.
+    fn retained_bytes(&self, spec: &AggSpec, ptr: *const u8) -> usize;
+
+    /// Total memory contract. Every implementation must choose a policy, so a
+    /// new aggregate cannot silently fall back to post-allocation accounting.
+    fn retained_memory_policy(&self, spec: &AggSpec) -> RetainedMemoryPolicy;
 
     fn update_batch(
         &self,
@@ -328,14 +354,9 @@ static MAX_MIN_BY: MaxMinByAgg = MaxMinByAgg;
 static MULTI_DISTINCT_SUM: MultiDistinctSumAgg = MultiDistinctSumAgg;
 static MAP_AGG: MapAggAgg = MapAggAgg;
 static SUM_MAP: SumMapAgg = SumMapAgg;
-static RETENTION: RetentionAgg = RetentionAgg;
-static WINDOW_FUNNEL: WindowFunnelAgg = WindowFunnelAgg;
-static HISTOGRAM: HistogramAgg = HistogramAgg;
-static HISTOGRAM_HLL_NDV: HistogramHllNdvAgg = HistogramHllNdvAgg;
 static MANN_WHITNEY: MannWhitneyUTestAgg = MannWhitneyUTestAgg;
 static DICT_MERGE: DictMergeAgg = DictMergeAgg;
 static DS_HLL: DsHllAgg = DsHllAgg;
-static DS_THETA: DsThetaAgg = DsThetaAgg;
 static BITMAP_UNION_INT: BitmapUnionIntAgg = BitmapUnionIntAgg;
 static PERCENTILE: PercentileAgg = PercentileAgg;
 static PERCENTILE_PLACEHOLDER: PercentilePlaceholderAgg = PercentilePlaceholderAgg;
@@ -343,77 +364,173 @@ static APPROX_TOP_K: ApproxTopKAgg = ApproxTopKAgg;
 static HLL_RAW: HllRawAgg = HllRawAgg;
 static MIN_MAX_N: MinMaxNAgg = MinMaxNAgg;
 
+#[cfg(test)]
 fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction, String> {
-    match canonical_agg_name(func.name.as_str()) {
-        "count" => Ok(&COUNT),
-        "count_state" => Ok(&COUNT_STATE),
-        "count_state_signed" => Ok(&COUNT_STATE_SIGNED),
-        "count_distinct_state" => Ok(&COUNT_DISTINCT_STATE),
-        "count_distinct_state_signed" => Ok(&COUNT_DISTINCT_STATE_SIGNED),
-        "approx_count_distinct_state" => Ok(&APPROX_COUNT_DISTINCT_STATE),
-        "approx_count_distinct_state_signed" => Ok(&APPROX_COUNT_DISTINCT_STATE_SIGNED),
-        "bool_or_state" | "bool_and_state" => Ok(&BOOL_STATE),
-        "bool_or_state_signed" | "bool_and_state_signed" => Ok(&BOOL_STATE_SIGNED),
-        "min_state" | "max_state" => Ok(&MIN_MAX_STATE),
-        "min_state_signed" | "max_state_signed" => Ok(&MIN_MAX_STATE_SIGNED),
-        "count_distinct" | "multi_distinct_count" => Ok(&COUNT_DISTINCT),
-        "count_if" => Ok(&COUNT_IF),
-        "group_concat" | "string_agg" => Ok(&GROUP_CONCAT),
-        "sum" => Ok(&SUM),
-        "count_state_merge" => Ok(&COUNT_STATE_MERGE),
-        "avg_state_merge" => Ok(&AVG_STATE_MERGE),
-        "min_state_merge" => Ok(&MIN_STATE_MERGE),
-        "max_state_merge" => Ok(&MAX_STATE_MERGE),
-        "bool_and_state_merge" => Ok(&BOOL_AND_STATE_MERGE),
-        "bool_or_state_merge" => Ok(&BOOL_OR_STATE_MERGE),
-        "count_distinct_state_merge" => Ok(&COUNT_DISTINCT_STATE_MERGE),
-        "approx_count_distinct_state_merge" => Ok(&APPROX_COUNT_DISTINCT_STATE_MERGE),
-        "sum_state" => Ok(&SUM_STATE),
-        "sum_state_merge" => Ok(&SUM_STATE_MERGE),
-        "sum_state_signed" => Ok(&SUM_STATE_SIGNED),
-        "min" => Ok(&MIN),
-        "max" => Ok(&MAX),
-        "avg" => Ok(&AVG),
-        "avg_state" => Ok(&AVG_STATE),
-        "avg_state_signed" => Ok(&AVG_STATE_SIGNED),
-        "array_agg" | "array_agg_distinct" | "array_unique_agg" => Ok(&ARRAY_AGG),
-        "variance" | "variance_pop" | "var_pop" | "variance_samp" | "var_samp" | "stddev"
-        | "stddev_pop" | "stddev_samp" | "std" => Ok(&VAR_STD),
-        "any_value" => Ok(&ANY_VALUE),
-        "percentile_union" | "percentile_approx" | "percentile_approx_weighted" => Ok(&PERCENTILE),
-        "percentile_disc" | "percentile_cont" | "percentile_disc_lc" => Ok(&PERCENTILE_PLACEHOLDER),
-        "bool_or" | "boolor_agg" => Ok(&BOOL_OR),
-        "bool_and" | "booland_agg" => Ok(&BOOL_AND),
-        "covar_pop" | "covar_samp" | "corr" => Ok(&COVAR_CORR),
-        "max_by" | "min_by" | "max_by_v2" | "min_by_v2" => Ok(&MAX_MIN_BY),
-        "multi_distinct_sum" => Ok(&MULTI_DISTINCT_SUM),
-        "map_agg" => Ok(&MAP_AGG),
-        "sum_map" => Ok(&SUM_MAP),
-        "retention" => Ok(&RETENTION),
-        "window_funnel" => Ok(&WINDOW_FUNNEL),
-        "histogram" => Ok(&HISTOGRAM),
-        "histogram_hll_ndv" => Ok(&HISTOGRAM_HLL_NDV),
-        "mann_whitney_u_test" => Ok(&MANN_WHITNEY),
-        "dict_merge" => Ok(&DICT_MERGE),
-        "bitmap_agg" | "bitmap_union" | "bitmap_union_count" => Ok(&BITMAP_UNION_INT),
-        "bitmap_union_int" => Ok(&BITMAP_UNION_INT),
-        "approx_top_k" => Ok(&APPROX_TOP_K),
-        "min_n" | "max_n" => Ok(&MIN_MAX_N),
-        "ds_theta_count_distinct" => Ok(&DS_THETA),
-        "ds_hll_count_distinct"
-        | "ds_hll_count_distinct_union"
-        | "ds_hll_count_distinct_merge"
-        | "approx_count_distinct_hll_sketch" => Ok(&DS_HLL),
-        "hll_union"
-        | "hll_raw_agg"
-        | "hll_raw"
-        | "hll_union_agg"
-        | "ndv"
-        | "approx_count_distinct" => Ok(&HLL_RAW),
-        other => Err(format!("unsupported agg function: {}", other)),
-    }
+    resolve_by_name(func.name.as_str())
 }
 
+#[derive(Clone, Copy)]
+struct BuiltinAggregateImplementation {
+    canonical_name: &'static str,
+    implementation_contract: &'static str,
+    expected_state_format: &'static str,
+    function: &'static dyn AggregateFunction,
+}
+
+macro_rules! builtin_aggregate {
+    ($name:literal, $function:expr) => {
+        BuiltinAggregateImplementation {
+            canonical_name: $name,
+            implementation_contract: concat!("novarocks/", $name, "/legacy-exec-v1"),
+            expected_state_format: concat!("novarocks/", $name, "/state-v1"),
+            function: $function,
+        }
+    };
+}
+
+// This is the implementation-side closed set. Startup composition enumerates
+// it directly, so adding executable code without matching catalog metadata
+// fails closed instead of remaining invisible to the reverse coverage check.
+static BUILTIN_AGGREGATE_IMPLEMENTATIONS: &[BuiltinAggregateImplementation] = &[
+    builtin_aggregate!("count", &COUNT),
+    builtin_aggregate!("count_state", &COUNT_STATE),
+    builtin_aggregate!("count_state_signed", &COUNT_STATE_SIGNED),
+    builtin_aggregate!("count_distinct_state", &COUNT_DISTINCT_STATE),
+    builtin_aggregate!("count_distinct_state_signed", &COUNT_DISTINCT_STATE_SIGNED),
+    builtin_aggregate!("approx_count_distinct_state", &APPROX_COUNT_DISTINCT_STATE),
+    builtin_aggregate!(
+        "approx_count_distinct_state_signed",
+        &APPROX_COUNT_DISTINCT_STATE_SIGNED
+    ),
+    builtin_aggregate!("bool_or_state", &BOOL_STATE),
+    builtin_aggregate!("bool_and_state", &BOOL_STATE),
+    builtin_aggregate!("bool_or_state_signed", &BOOL_STATE_SIGNED),
+    builtin_aggregate!("bool_and_state_signed", &BOOL_STATE_SIGNED),
+    builtin_aggregate!("min_state", &MIN_MAX_STATE),
+    builtin_aggregate!("max_state", &MIN_MAX_STATE),
+    builtin_aggregate!("min_state_signed", &MIN_MAX_STATE_SIGNED),
+    builtin_aggregate!("max_state_signed", &MIN_MAX_STATE_SIGNED),
+    builtin_aggregate!("multi_distinct_count", &COUNT_DISTINCT),
+    builtin_aggregate!("count_if", &COUNT_IF),
+    builtin_aggregate!("group_concat", &GROUP_CONCAT),
+    builtin_aggregate!("string_agg", &GROUP_CONCAT),
+    builtin_aggregate!("sum", &SUM),
+    builtin_aggregate!("count_state_merge", &COUNT_STATE_MERGE),
+    builtin_aggregate!("avg_state_merge", &AVG_STATE_MERGE),
+    builtin_aggregate!("min_state_merge", &MIN_STATE_MERGE),
+    builtin_aggregate!("max_state_merge", &MAX_STATE_MERGE),
+    builtin_aggregate!("bool_and_state_merge", &BOOL_AND_STATE_MERGE),
+    builtin_aggregate!("bool_or_state_merge", &BOOL_OR_STATE_MERGE),
+    builtin_aggregate!("count_distinct_state_merge", &COUNT_DISTINCT_STATE_MERGE),
+    builtin_aggregate!(
+        "approx_count_distinct_state_merge",
+        &APPROX_COUNT_DISTINCT_STATE_MERGE
+    ),
+    builtin_aggregate!("sum_state", &SUM_STATE),
+    builtin_aggregate!("sum_state_merge", &SUM_STATE_MERGE),
+    builtin_aggregate!("sum_state_signed", &SUM_STATE_SIGNED),
+    builtin_aggregate!("min", &MIN),
+    builtin_aggregate!("max", &MAX),
+    builtin_aggregate!("avg", &AVG),
+    builtin_aggregate!("avg_state", &AVG_STATE),
+    builtin_aggregate!("avg_state_signed", &AVG_STATE_SIGNED),
+    builtin_aggregate!("array_agg", &ARRAY_AGG),
+    builtin_aggregate!("array_agg_distinct", &ARRAY_AGG),
+    builtin_aggregate!("array_unique_agg", &ARRAY_AGG),
+    builtin_aggregate!("variance", &VAR_STD),
+    builtin_aggregate!("variance_pop", &VAR_STD),
+    builtin_aggregate!("var_pop", &VAR_STD),
+    builtin_aggregate!("variance_samp", &VAR_STD),
+    builtin_aggregate!("var_samp", &VAR_STD),
+    builtin_aggregate!("stddev", &VAR_STD),
+    builtin_aggregate!("stddev_pop", &VAR_STD),
+    builtin_aggregate!("stddev_samp", &VAR_STD),
+    builtin_aggregate!("std", &VAR_STD),
+    builtin_aggregate!("any_value", &ANY_VALUE),
+    builtin_aggregate!("percentile_union", &PERCENTILE),
+    builtin_aggregate!("percentile_approx", &PERCENTILE),
+    builtin_aggregate!("percentile_approx_weighted", &PERCENTILE),
+    builtin_aggregate!("percentile_disc", &PERCENTILE_PLACEHOLDER),
+    builtin_aggregate!("percentile_cont", &PERCENTILE_PLACEHOLDER),
+    builtin_aggregate!("percentile_disc_lc", &PERCENTILE_PLACEHOLDER),
+    builtin_aggregate!("bool_or", &BOOL_OR),
+    builtin_aggregate!("boolor_agg", &BOOL_OR),
+    builtin_aggregate!("bool_and", &BOOL_AND),
+    builtin_aggregate!("booland_agg", &BOOL_AND),
+    builtin_aggregate!("covar_pop", &COVAR_CORR),
+    builtin_aggregate!("covar_samp", &COVAR_CORR),
+    builtin_aggregate!("corr", &COVAR_CORR),
+    builtin_aggregate!("max_by", &MAX_MIN_BY),
+    builtin_aggregate!("min_by", &MAX_MIN_BY),
+    builtin_aggregate!("multi_distinct_sum", &MULTI_DISTINCT_SUM),
+    builtin_aggregate!("map_agg", &MAP_AGG),
+    builtin_aggregate!("sum_map", &SUM_MAP),
+    builtin_aggregate!("mann_whitney_u_test", &MANN_WHITNEY),
+    builtin_aggregate!("dict_merge", &DICT_MERGE),
+    builtin_aggregate!("bitmap_agg", &BITMAP_UNION_INT),
+    builtin_aggregate!("bitmap_union", &BITMAP_UNION_INT),
+    builtin_aggregate!("bitmap_union_count", &BITMAP_UNION_INT),
+    builtin_aggregate!("bitmap_union_int", &BITMAP_UNION_INT),
+    builtin_aggregate!("approx_top_k", &APPROX_TOP_K),
+    builtin_aggregate!("min_n", &MIN_MAX_N),
+    builtin_aggregate!("max_n", &MIN_MAX_N),
+    builtin_aggregate!("ds_hll_count_distinct", &DS_HLL),
+    builtin_aggregate!("ds_hll_count_distinct_union", &DS_HLL),
+    builtin_aggregate!("ds_hll_count_distinct_merge", &DS_HLL),
+    builtin_aggregate!("approx_count_distinct_hll_sketch", &DS_HLL),
+    builtin_aggregate!("hll_union", &HLL_RAW),
+    builtin_aggregate!("hll_raw_agg", &HLL_RAW),
+    builtin_aggregate!("hll_union_agg", &HLL_RAW),
+    builtin_aggregate!("ndv", &HLL_RAW),
+    builtin_aggregate!("approx_count_distinct", &HLL_RAW),
+];
+
+#[cfg(test)]
+fn resolve_by_name(name: &str) -> Result<&'static dyn AggregateFunction, String> {
+    let canonical_name = canonical_agg_name(name);
+    BUILTIN_AGGREGATE_IMPLEMENTATIONS
+        .iter()
+        .find(|implementation| implementation.canonical_name == canonical_name)
+        .map(|implementation| implementation.function)
+        .ok_or_else(|| format!("unsupported agg function: {canonical_name}"))
+}
+
+/// Installs the implementation-side aggregate manifest. Both overload and
+/// state-format identities are declared independently from catalog metadata;
+/// sealing compares the two closed sets exactly. Function names are used only
+/// during process composition, and prepared kernels never perform a registry
+/// lookup in the hot path.
+pub fn contribute_builtin_aggregate_implementations(
+    builder: &mut ExecutionFunctionSetBuilder,
+) -> Result<(), ExecutionFunctionSetError> {
+    for implementation in BUILTIN_AGGREGATE_IMPLEMENTATIONS {
+        let _definition = builder
+            .catalog_builder()
+            .definition(implementation.canonical_name, FunctionKind::Aggregate)
+            .ok_or_else(|| {
+                ExecutionFunctionSetError::BuiltinAggregateImplementationWithoutMetadata {
+                    canonical_name: implementation.canonical_name.into(),
+                }
+            })?;
+        // This identity is the implementation-side executable contract. It is
+        // intentionally not copied from catalog metadata: seal must detect a
+        // metadata-only overload instead of fabricating implementation
+        // coverage for it.
+        let overloads = [novarocks_functions::AggregateOverloadIdentity::try_new(
+            format!("builtin/{}/v1", implementation.canonical_name),
+        )?];
+        builder.register_legacy_aggregate(
+            implementation.canonical_name,
+            overloads,
+            AggregateImplementationIdentity::try_new(implementation.implementation_contract)?,
+            AggregateStateFormatIdentity::try_new(implementation.expected_state_format)?,
+            implementation.function,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
     match kind {
         AggKind::Count => &COUNT,
@@ -475,10 +592,6 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::MultiDistinctSum => &MULTI_DISTINCT_SUM,
         AggKind::MapAgg => &MAP_AGG,
         AggKind::SumMap => &SUM_MAP,
-        AggKind::Retention => &RETENTION,
-        AggKind::WindowFunnel => &WINDOW_FUNNEL,
-        AggKind::Histogram => &HISTOGRAM,
-        AggKind::HistogramHllNdv => &HISTOGRAM_HLL_NDV,
         AggKind::MannWhitneyUTest => &MANN_WHITNEY,
         AggKind::DictMerge => &DICT_MERGE,
         AggKind::DsHllHash | AggKind::DsHllMerge | AggKind::DsHllCount => &DS_HLL,
@@ -496,10 +609,12 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
     }
 }
 
+#[cfg(test)]
 fn canonical_agg_name(name: &str) -> &str {
     name.split_once('|').map(|(base, _)| base).unwrap_or(name)
 }
 
+#[cfg(test)]
 pub(super) fn build_spec_from_type(
     func: &AggFunction,
     input_type: Option<&DataType>,
@@ -508,10 +623,15 @@ pub(super) fn build_spec_from_type(
     resolve_by_func(func)?.build_spec_from_type(func, input_type, input_is_intermediate)
 }
 
+#[cfg(test)]
 pub(in crate::exec::expr::agg) fn state_layout_for_kind(kind: &AggKind) -> (usize, usize) {
     resolve_by_kind(kind).state_layout_for(kind)
 }
 
+// Legacy aggregate unit tests exercise individual state implementations
+// without composing a process function set. Keep this bypass test-only so no
+// production path can evade startup sealing or prepared-kernel binding.
+#[cfg(test)]
 pub(in crate::exec::expr::agg) fn build_input_view<'a>(
     spec: &AggSpec,
     array: &'a Option<ArrayRef>,
@@ -519,6 +639,7 @@ pub(in crate::exec::expr::agg) fn build_input_view<'a>(
     resolve_by_kind(&spec.kind).build_input_view(spec, array)
 }
 
+#[cfg(test)]
 pub(in crate::exec::expr::agg) fn build_merge_view<'a>(
     spec: &AggSpec,
     array: &'a Option<ArrayRef>,
@@ -526,14 +647,17 @@ pub(in crate::exec::expr::agg) fn build_merge_view<'a>(
     resolve_by_kind(&spec.kind).build_merge_view(spec, array)
 }
 
+#[cfg(test)]
 pub(in crate::exec::expr::agg) fn init_state(spec: &AggSpec, ptr: *mut u8) {
     resolve_by_kind(&spec.kind).init_state(spec, ptr)
 }
 
+#[cfg(test)]
 pub(in crate::exec::expr::agg) fn drop_state(spec: &AggSpec, ptr: *mut u8) {
     resolve_by_kind(&spec.kind).drop_state(spec, ptr)
 }
 
+#[cfg(test)]
 pub(in crate::exec::expr::agg) fn update_batch(
     spec: &AggSpec,
     offset: usize,
@@ -543,6 +667,7 @@ pub(in crate::exec::expr::agg) fn update_batch(
     resolve_by_kind(&spec.kind).update_batch(spec, offset, state_ptrs, input)
 }
 
+#[cfg(test)]
 pub(in crate::exec::expr::agg) fn merge_batch(
     spec: &AggSpec,
     offset: usize,
@@ -552,6 +677,7 @@ pub(in crate::exec::expr::agg) fn merge_batch(
     resolve_by_kind(&spec.kind).merge_batch(spec, offset, state_ptrs, input)
 }
 
+#[cfg(test)]
 pub(in crate::exec::expr::agg) fn build_array(
     spec: &AggSpec,
     offset: usize,
@@ -559,4 +685,44 @@ pub(in crate::exec::expr::agg) fn build_array(
     output_intermediate: bool,
 ) -> Result<ArrayRef, String> {
     resolve_by_kind(&spec.kind).build_array(spec, offset, group_states, output_intermediate)
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn builtin_implementation_set_is_unique_and_seals_against_sql_metadata() {
+        let names = BUILTIN_AGGREGATE_IMPLEMENTATIONS
+            .iter()
+            .map(|implementation| implementation.canonical_name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), BUILTIN_AGGREGATE_IMPLEMENTATIONS.len());
+        assert_eq!(
+            names.len(),
+            85,
+            "update the executable-policy matrix deliberately"
+        );
+
+        let mut builder = ExecutionFunctionSetBuilder::new();
+        novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+            .unwrap();
+        contribute_builtin_aggregate_implementations(&mut builder).unwrap();
+        builder.seal().unwrap();
+    }
+
+    #[test]
+    fn builtin_implementation_without_metadata_is_not_silently_skipped() {
+        let mut builder = ExecutionFunctionSetBuilder::new();
+        assert!(matches!(
+            contribute_builtin_aggregate_implementations(&mut builder),
+            Err(
+                ExecutionFunctionSetError::BuiltinAggregateImplementationWithoutMetadata {
+                    canonical_name
+                }
+            ) if canonical_name.as_ref() == "count"
+        ));
+    }
 }

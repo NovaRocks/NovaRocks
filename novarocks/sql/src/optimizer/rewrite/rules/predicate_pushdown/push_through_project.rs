@@ -212,6 +212,7 @@ fn remap_scalar(
             args,
             distinct,
             order_by,
+            resolved,
         } => {
             let args = remap_scalar_vec(arena, args, bindings)?;
             let order_by = remap_sort_keys(arena, order_by, bindings)?;
@@ -221,6 +222,7 @@ fn remap_scalar(
                     args,
                     distinct,
                     order_by,
+                    resolved,
                 },
                 data_type,
                 nullable,
@@ -338,12 +340,15 @@ fn remap_scalar(
             name,
             args,
             distinct,
+            function_order_by,
+            aggregate_binding,
             partition_by,
             order_by,
             window_frame,
             ignore_nulls,
         } => {
             let args = remap_scalar_vec(arena, args, bindings)?;
+            let function_order_by = remap_sort_keys(arena, function_order_by, bindings)?;
             let partition_by = remap_scalar_vec(arena, partition_by, bindings)?;
             let order_by = remap_sort_keys(arena, order_by, bindings)?;
             Some(arena.intern(
@@ -351,6 +356,8 @@ fn remap_scalar(
                     name,
                     args,
                     distinct,
+                    function_order_by,
+                    aggregate_binding,
                     partition_by,
                     order_by,
                     window_frame,

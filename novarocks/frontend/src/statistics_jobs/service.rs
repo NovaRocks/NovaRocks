@@ -26,10 +26,7 @@ use uuid::Uuid;
 use super::application;
 use super::model::{StatisticsJob, StatisticsJobCreate, StatisticsJobTarget};
 use super::repository::{StatisticsJobRepository, StatisticsJobRepositoryError};
-use super::worker::{
-    StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
-    StatisticsCollectedAttempt,
-};
+use super::worker::{StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor};
 use crate::workload_lifecycle::FrontendServingLifecycle;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +82,7 @@ pub trait TableStatisticsReader: Send + Sync {
     fn show_table_stats(
         &self,
         target: &StatisticsJobTarget,
+        context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Vec<StatisticsTableStatRow>, String>;
 }
 
@@ -92,6 +90,7 @@ pub trait StatisticsJobTargetResolver: Send + Sync {
     fn capture_table_object(
         &self,
         target: &StatisticsJobTarget,
+        context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<application::StatisticsTargetCapture, String>;
 }
 
@@ -101,6 +100,7 @@ impl StatisticsJobTargetResolver for UnavailableStatisticsJobTargetResolver {
     fn capture_table_object(
         &self,
         _target: &StatisticsJobTarget,
+        _context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<application::StatisticsTargetCapture, String> {
         Err("ANALYZE is unavailable until the frontend statistics target resolver is bound".into())
     }
@@ -118,13 +118,17 @@ impl TableStatisticsReader for StatisticsTableReaderAdapter {
     fn show_table_stats(
         &self,
         target: &StatisticsJobTarget,
+        context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Vec<StatisticsTableStatRow>, String> {
         self.inner
-            .show_table_stats(&application::StatisticsTableTarget {
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-            })
+            .show_table_stats(
+                &application::StatisticsTableTarget {
+                    catalog: target.catalog.clone(),
+                    namespace: target.namespace.clone(),
+                    table: target.table.clone(),
+                },
+                context,
+            )
             .map(|rows| {
                 rows.into_iter()
                     .map(|row| StatisticsTableStatRow {
@@ -146,13 +150,17 @@ impl StatisticsJobTargetResolver for StatisticsTargetResolverAdapter {
     fn capture_table_object(
         &self,
         target: &StatisticsJobTarget,
+        context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<application::StatisticsTargetCapture, String> {
         self.inner
-            .capture_table_object(&application::StatisticsTableTarget {
-                catalog: target.catalog.clone(),
-                namespace: target.namespace.clone(),
-                table: target.table.clone(),
-            })
+            .capture_table_object(
+                &application::StatisticsTableTarget {
+                    catalog: target.catalog.clone(),
+                    namespace: target.namespace.clone(),
+                    table: target.table.clone(),
+                },
+                context,
+            )
             .map_err(|error| error.to_string())
     }
 }
@@ -220,6 +228,7 @@ impl StatisticsApplicationService {
         statement: StatisticsStatement,
         submitted_at_ms: i64,
         table_statistics: &dyn TableStatisticsReader,
+        connector_context: Option<novarocks_spi::connector::ConnectorRequestContext>,
     ) -> Result<StatisticsStatementResult, StatisticsApplicationError> {
         match statement {
             StatisticsStatement::AnalyzeTable(statement) => {
@@ -234,7 +243,14 @@ impl StatisticsApplicationService {
                     })?
                     .clone();
                 let target_capture = resolver
-                    .capture_table_object(&statement.target)
+                    .capture_table_object(
+                        &statement.target,
+                        connector_context.ok_or_else(|| {
+                            StatisticsApplicationError::target_resolution(
+                                "ANALYZE target capture requires an admitted execution context",
+                            )
+                        })?,
+                    )
                     .map_err(StatisticsApplicationError::target_resolution)?;
                 let job = self
                     .repository
@@ -266,10 +282,17 @@ impl StatisticsApplicationService {
                 .await
                 .map(StatisticsStatementResult::JobCancellationRequested)
                 .map_err(StatisticsApplicationError::repository),
-            StatisticsStatement::ShowTableStats(statement) => table_statistics
-                .show_table_stats(&statement.target)
-                .map(StatisticsStatementResult::TableStats)
-                .map_err(StatisticsApplicationError::table_statistics),
+            StatisticsStatement::ShowTableStats(statement) => {
+                let context = connector_context.ok_or_else(|| {
+                    StatisticsApplicationError::table_statistics(
+                        "SHOW TABLE STATS requires an admitted execution context".to_string(),
+                    )
+                })?;
+                table_statistics
+                    .show_table_stats(&statement.target, context)
+                    .map(StatisticsStatementResult::TableStats)
+                    .map_err(StatisticsApplicationError::table_statistics)
+            }
         }
     }
 
@@ -480,6 +503,25 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
         execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     ) -> Result<application::StatisticsApplicationResult, application::StatisticsApplicationError>
     {
+        let connector_context = match (&command, execution) {
+            (application::StatisticsApplicationCommand::AnalyzeTable { .. }, Some(execution)) => {
+                Some(statistics_connector_context(execution, true)?)
+            }
+            (application::StatisticsApplicationCommand::ShowTableStats { .. }, Some(execution)) => {
+                Some(statistics_connector_context(execution, false)?)
+            }
+            (application::StatisticsApplicationCommand::AnalyzeTable { .. }, None) => {
+                return Err(application::StatisticsApplicationError::new(
+                    "ANALYZE requires an admitted execution context",
+                ));
+            }
+            (application::StatisticsApplicationCommand::ShowTableStats { .. }, None) => {
+                return Err(application::StatisticsApplicationError::new(
+                    "SHOW TABLE STATS requires an admitted execution context",
+                ));
+            }
+            _ => None,
+        };
         let statement = match command {
             application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => {
                 StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
@@ -511,10 +553,12 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
             .clone()
             .unwrap_or_else(|| Arc::new(UnboundTableStatisticsReader));
         let result = tokio::task::block_in_place(|| {
-            self.runtime.block_on(
-                self.service
-                    .execute(statement, submitted_at_ms, reader.as_ref()),
-            )
+            self.runtime.block_on(self.service.execute(
+                statement,
+                submitted_at_ms,
+                reader.as_ref(),
+                connector_context,
+            ))
         })
         .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))?;
         if matches!(result, StatisticsStatementResult::JobSubmitted(_))
@@ -541,6 +585,47 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
             (other, _) => other,
         };
         Ok(map_application_result(result))
+    }
+}
+
+fn statistics_connector_context(
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    require_admitted_deadline: bool,
+) -> Result<
+    novarocks_spi::connector::ConnectorRequestContext,
+    application::StatisticsApplicationError,
+> {
+    let deadline = match execution.deadline() {
+        Some(deadline) => deadline,
+        None if require_admitted_deadline => {
+            return Err(application::StatisticsApplicationError::new(
+                "ANALYZE target capture requires an admitted deadline",
+            ));
+        }
+        None => Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .ok_or_else(|| {
+                application::StatisticsApplicationError::new(
+                    "statistics metadata-read deadline overflow",
+                )
+            })?,
+    };
+    novarocks_spi::connector::ConnectorRequestContext::try_new(
+        deadline,
+        Arc::new(StatisticsApplicationCancellation(
+            execution.cancellation().clone(),
+        )),
+        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))
+}
+
+struct StatisticsApplicationCancellation(crate::common::query_cancellation::QueryCancellationView);
+
+impl novarocks_spi::connector::ConnectorCancellation for StatisticsApplicationCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
     }
 }
 
@@ -571,19 +656,6 @@ impl application::StatisticsAttemptExecutorSink for FrontendStatisticsApplicatio
     }
 }
 
-struct StatisticsCollectedAttemptAdapter {
-    inner: Box<dyn application::StatisticsCollectedAttempt>,
-}
-
-impl StatisticsCollectedAttempt for StatisticsCollectedAttemptAdapter {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn basis_data_version(&self) -> &[u8] {
-        self.inner.basis_data_version().as_bytes()
-    }
-}
-
 struct StatisticsAttemptAdapter {
     inner: Arc<dyn application::StatisticsAttemptExecutor>,
 }
@@ -598,21 +670,6 @@ impl StatisticsAttemptAdapter {
             object_id: job.object_id.clone(),
             columns: job.columns.clone(),
         }
-    }
-
-    fn collected(
-        collected: &dyn StatisticsCollectedAttempt,
-    ) -> Result<&dyn application::StatisticsCollectedAttempt, StatisticsAttemptError> {
-        collected
-            .as_any()
-            .downcast_ref::<StatisticsCollectedAttemptAdapter>()
-            .map(|collected| collected.inner.as_ref())
-            .ok_or_else(|| {
-                StatisticsAttemptError::permanent(
-                    super::model::StatisticsJobErrorKind::Internal,
-                    "statistics worker received a collection artifact from another executor",
-                )
-            })
     }
 
     fn map_error(error: application::StatisticsApplicationError) -> StatisticsAttemptError {
@@ -638,37 +695,13 @@ impl StatisticsAttemptAdapter {
 }
 
 impl StatisticsAttemptExecutor for StatisticsAttemptAdapter {
-    fn collect(
+    fn execute(
         &self,
         job: &StatisticsJob,
-    ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError> {
-        self.inner
-            .collect(&Self::request(job))
-            .map(|inner| {
-                Box::new(StatisticsCollectedAttemptAdapter { inner })
-                    as Box<dyn StatisticsCollectedAttempt>
-            })
-            .map_err(Self::map_error)
-    }
-
-    fn prepare_publish(
-        &self,
-        job: &StatisticsJob,
-        collected: &dyn StatisticsCollectedAttempt,
-    ) -> Result<novarocks_spi::connector::ExternalMutationEvidence, StatisticsAttemptError> {
-        self.inner
-            .prepare_publish(&Self::request(job), Self::collected(collected)?)
-            .map_err(Self::map_error)
-    }
-
-    fn publish(
-        &self,
-        job: &StatisticsJob,
-        collected: &dyn StatisticsCollectedAttempt,
-        evidence: &novarocks_spi::connector::ExternalMutationEvidence,
+        cancellation: crate::common::query_cancellation::QueryCancellationView,
     ) -> Result<(), StatisticsAttemptError> {
         self.inner
-            .publish(&Self::request(job), Self::collected(collected)?, evidence)
+            .execute(&Self::request(job), cancellation)
             .map_err(Self::map_error)
     }
 }
@@ -679,6 +712,7 @@ impl TableStatisticsReader for UnboundTableStatisticsReader {
     fn show_table_stats(
         &self,
         _target: &StatisticsJobTarget,
+        _context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Vec<StatisticsTableStatRow>, String> {
         Err(
             "SHOW TABLE STATS is unavailable until the frontend statistics table reader is bound"

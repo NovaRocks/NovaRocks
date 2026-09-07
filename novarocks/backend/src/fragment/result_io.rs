@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::runtime::result_batch::FetchResult;
-use crate::runtime::result_buffer::ResultBufferWriteHandle;
+use crate::runtime::result_buffer::{ResultBufferWriteHandle, ResultPublication};
 use crate::runtime::result_format::build_result_batch;
 use novarocks_execution::runtime::exchange;
 use novarocks_execution::runtime::fragment::io::{
@@ -103,16 +103,42 @@ impl FragmentResultSession for NativeFragmentResultSession {
     }
 
     fn finish(&self) -> Result<(), FragmentIoError> {
-        self.handle.finish().map(|_| ()).map_err(|error| {
-            FragmentIoError::new(
-                FragmentIoOperation::ResultFinish,
-                FragmentIoErrorKind::Internal,
-                error,
-            )
-        })
+        self.handle
+            .finish()
+            .map(|publication| {
+                if publishes_terminal(publication) {
+                    crate::metrics::record_fragment_result_terminal("finished");
+                }
+            })
+            .map_err(|error| {
+                FragmentIoError::new(
+                    FragmentIoOperation::ResultFinish,
+                    FragmentIoErrorKind::Internal,
+                    error,
+                )
+            })
     }
 
     fn abort(&self, reason: ResultAbort) {
-        self.handle.abort(reason);
+        if publishes_terminal(self.handle.abort(reason)) {
+            crate::metrics::record_fragment_result_terminal("aborted");
+        }
+    }
+}
+
+fn publishes_terminal(publication: ResultPublication) -> bool {
+    publication == ResultPublication::TerminalReady
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_terminal_ready_is_a_published_result_terminal() {
+        assert!(publishes_terminal(ResultPublication::TerminalReady));
+        assert!(!publishes_terminal(ResultPublication::DataReady));
+        assert!(!publishes_terminal(ResultPublication::Removed));
+        assert!(!publishes_terminal(ResultPublication::NoChange));
     }
 }

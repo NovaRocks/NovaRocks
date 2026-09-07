@@ -177,6 +177,26 @@ fn incremental_change_stream_routes(
     Ok(routes)
 }
 
+fn incremental_change_stream_statistics_targets(
+    write_session: &ConnectorWriteSession,
+) -> Result<Vec<novarocks_sql::planning::dml::DmlChangeStreamStatisticsTarget>, String> {
+    write_session
+        .targets()
+        .iter()
+        .map(|target| {
+            Ok(
+                novarocks_sql::planning::dml::DmlChangeStreamStatisticsTarget {
+                    write_target_ordinal: target.ordinal(),
+                    requirements: write_session
+                        .statistics_requirements(target.ordinal())
+                        .map_err(|error| error.to_string())?
+                        .to_vec(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Activate a value-only incremental refresh artifact after frontend intent
 /// persistence and exact-lease admission. Core rebuilds only provider-private
 /// scan and writer facts here; it returns a sealed native-assembly carrier and
@@ -292,6 +312,7 @@ fn bind_incremental_write_dataflow(
         target_bindings.as_ref(),
         planning_lease,
     )?;
+    let sealed_statistics_targets = incremental_change_stream_statistics_targets(write_session)?;
     let rewrite_evidence = match evidence {
         MvIncrementalRewriteEvidence::None => RewriteMergeRefreshEvidence::None,
         MvIncrementalRewriteEvidence::Aggregate => RewriteMergeRefreshEvidence::Aggregate,
@@ -351,7 +372,7 @@ fn bind_incremental_write_dataflow(
                         backend_count,
                     },
                     catalog: &catalog,
-                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
@@ -369,6 +390,7 @@ fn bind_incremental_write_dataflow(
             let sealed = novarocks_sql::planning::mv::first_refresh::compile_mv_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
+                sealed_statistics_targets,
                 // Every writer is an ordinary dataflow node whose rows gather
                 // into one Root finish fragment; the session, not a terminal
                 // sink, owns the commit.
@@ -442,7 +464,7 @@ fn bind_incremental_write_dataflow(
                         backend_count,
                     },
                     catalog: &catalog,
-                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
@@ -460,6 +482,7 @@ fn bind_incremental_write_dataflow(
             let sealed = novarocks_sql::planning::mv::first_refresh::compile_join_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
+                sealed_statistics_targets,
                 // Every writer is an ordinary dataflow node whose rows gather
                 // into one Root finish fragment; the session, not a terminal
                 // sink, owns the commit.

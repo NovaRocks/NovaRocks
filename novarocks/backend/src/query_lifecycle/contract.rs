@@ -66,6 +66,17 @@ pub(crate) struct QueryLifecycleError {
     detail: String,
 }
 
+/// Result of observing coordinator liveness on an attached control stream.
+///
+/// Heartbeat is not a lifecycle command. Once the participant has entered its
+/// terminal path, an in-flight heartbeat must yield to the retained terminal
+/// facts instead of converting normal teardown into a transport failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueryHeartbeatDisposition {
+    Acknowledged,
+    TerminalDeliveryPending,
+}
+
 impl QueryLifecycleError {
     pub(crate) fn new(code: QueryLifecycleErrorCode, detail: impl Into<String>) -> Self {
         Self {
@@ -102,7 +113,7 @@ impl From<novarocks_proto_codec::ProtocolError> for QueryLifecycleError {
 }
 
 pub(crate) trait BackendQueryControl: Send + Sync + 'static {
-    fn heartbeat(&self, sequence: u64) -> Result<(), QueryLifecycleError>;
+    fn heartbeat(&self, sequence: u64) -> Result<QueryHeartbeatDisposition, QueryLifecycleError>;
 
     fn abort(&self, reason: String) -> Result<(), QueryLifecycleError>;
 

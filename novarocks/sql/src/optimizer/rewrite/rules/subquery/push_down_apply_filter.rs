@@ -721,6 +721,11 @@ mod tests {
                     result_type: DataType::Int64,
                     order_by: vec![],
                     output_column_id: MAX_RESULT,
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "max",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![OutputColumn {
                     column_id: MAX_RESULT,

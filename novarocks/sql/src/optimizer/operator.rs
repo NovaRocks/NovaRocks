@@ -106,6 +106,7 @@ pub(crate) struct ScalarAggregateSpec {
     pub args: Vec<ScalarId>,
     pub distinct: bool,
     pub order_by: Vec<SortKey>,
+    pub resolved: novarocks_functions::ResolvedAggregateSignature,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +220,8 @@ pub(crate) struct ScalarWindowSpec {
     pub name: String,
     pub args: Vec<ScalarId>,
     pub distinct: bool,
+    pub function_order_by: Vec<SortKey>,
+    pub aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
     pub partition_by: Vec<ScalarId>,
     pub order_by: Vec<SortKey>,
     pub window_frame: Option<WindowFrame>,
@@ -749,6 +752,11 @@ mod aggregate_stage_tests {
             args: vec![scalar_col_ref(arena, 2, "v")],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate(
+                "count",
+                &[arrow::datatypes::DataType::Int64],
+                false,
+            ),
         }
     }
 
@@ -759,6 +767,15 @@ mod aggregate_stage_tests {
             args: vec![],
             distinct: false,
             order_by: vec![],
+            resolved: crate::functions::test_resolved_aggregate(
+                name,
+                if name == "count" {
+                    &[]
+                } else {
+                    &[arrow::datatypes::DataType::Int64]
+                },
+                false,
+            ),
         }
     }
 

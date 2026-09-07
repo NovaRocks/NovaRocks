@@ -20,7 +20,8 @@ use crate::analysis::{OutputColumn, SortItem};
 use crate::column_id::ColumnId;
 use crate::planner::payload::{
     PlanAssertOneRowNode, PlanFilterNode, PlanGenerateSeriesNode, PlanProjectNode, PlanRepeatNode,
-    PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanValuesNode, PlanWindowNode,
+    PlanScanNode, PlanSortNode, PlanTableFunctionNode, PlanUnpivotNode, PlanValuesNode,
+    PlanWindowNode,
 };
 use crate::planner::physical::PhysicalPlanStats;
 use crate::planner::physical::{
@@ -84,6 +85,7 @@ pub enum DistributedNodeKind {
     Scan(PlanScanNode),
     Filter(PlanFilterNode),
     Project(PlanProjectNode),
+    Unpivot(PlanUnpivotNode),
     Sort(PlanSortNode),
     Values(PlanValuesNode),
     Repeat(PlanRepeatNode),
@@ -118,6 +120,7 @@ impl DistributedNodeKind {
             "Scan",
             "Filter",
             "Project",
+            "Unpivot",
             "Sort",
             "Values",
             "Repeat",
@@ -151,6 +154,7 @@ pub(crate) fn distributed_kind_from_physical(
         PhysicalPlanKind::Scan(node) => Ok(DistributedNodeKind::Scan(node)),
         PhysicalPlanKind::Filter(node) => Ok(DistributedNodeKind::Filter(node)),
         PhysicalPlanKind::Project(node) => Ok(DistributedNodeKind::Project(node)),
+        PhysicalPlanKind::Unpivot(node) => Ok(DistributedNodeKind::Unpivot(node)),
         PhysicalPlanKind::Sort(node) => Ok(DistributedNodeKind::Sort(node)),
         PhysicalPlanKind::Limit(_) => Err(non_distributable_payload("Limit")),
         PhysicalPlanKind::Values(node) => Ok(DistributedNodeKind::Values(node)),
@@ -183,6 +187,7 @@ pub fn distributed_kind_to_physical(kind: &DistributedNodeKind) -> PhysicalPlanK
         DistributedNodeKind::Scan(node) => PhysicalPlanKind::Scan(node.clone()),
         DistributedNodeKind::Filter(node) => PhysicalPlanKind::Filter(node.clone()),
         DistributedNodeKind::Project(node) => PhysicalPlanKind::Project(node.clone()),
+        DistributedNodeKind::Unpivot(node) => PhysicalPlanKind::Unpivot(node.clone()),
         DistributedNodeKind::Sort(node) => PhysicalPlanKind::Sort(node.clone()),
         DistributedNodeKind::Values(node) => PhysicalPlanKind::Values(node.clone()),
         DistributedNodeKind::Repeat(node) => PhysicalPlanKind::Repeat(node.clone()),

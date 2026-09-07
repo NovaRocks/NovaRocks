@@ -24,7 +24,6 @@ use crate::exec::operators::{
     DataStreamSinkFactory, MultiCastDataStreamSinkFactory, NoopSinkFactory,
     ResultBufferSinkFactory, SplitDataStreamSinkFactory,
 };
-use crate::exec::operators::{StatisticsSinkFactory, StatisticsSinkHandle};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::fragment::error::{
@@ -49,13 +48,9 @@ pub(crate) fn materialize_fragment_sink(
         .map(|materialized| materialized.factory)
 }
 
-/// Runtime-owned result of materializing a fragment sink. Statistics is the
-/// only sink that has a terminal side-channel; its handle is process-local and
-/// consumed exactly once by the fragment host when it freezes the terminal
-/// fact.
+/// Runtime-owned result of materializing a fragment sink.
 pub(crate) struct MaterializedFragmentSink {
     pub(crate) factory: Box<dyn OperatorFactory>,
-    pub(crate) statistics_handle: Option<StatisticsSinkHandle>,
 }
 
 pub(crate) fn materialize_fragment_sink_with_result(
@@ -65,9 +60,8 @@ pub(crate) fn materialize_fragment_sink_with_result(
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
     edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
 ) -> Result<MaterializedFragmentSink, FragmentLaunchError> {
-    materialize_fragment_sink_components_with_result_and_statistics(
+    materialize_fragment_sink_components_impl(
         program.sink(),
-        Some(program.plan()),
         instance.sink_assignment(),
         instance.fragment_instance_id().get(),
         instance.runtime_options().typed_result_sink(),
@@ -115,9 +109,8 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
-    materialize_fragment_sink_components_with_result_and_statistics(
+    materialize_fragment_sink_components_impl(
         program,
-        None,
         assignment,
         fragment_instance_id,
         typed_result_sink,
@@ -129,13 +122,8 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
     .map(|materialized| materialized.factory)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Sink materialization joins independently-owned plan, assignment, transport, and result services."
-)]
-fn materialize_fragment_sink_components_with_result_and_statistics(
+fn materialize_fragment_sink_components_impl(
     program: &FragmentSinkSpec,
-    root_plan: Option<&crate::exec::node::ExecPlan>,
     assignment: &FragmentSinkAssignment,
     fragment_instance_id: novarocks_types::UniqueId,
     _typed_result_sink: bool,
@@ -151,33 +139,11 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             })?;
             Ok(MaterializedFragmentSink {
                 factory: Box::new(ResultBufferSinkFactory::new(session, None)),
-                statistics_handle: None,
             })
         }
         (FragmentSinkProgram::Noop, FragmentSinkAssignment::None) => Ok(MaterializedFragmentSink {
             factory: Box::new(NoopSinkFactory::new()),
-            statistics_handle: None,
         }),
-        (FragmentSinkProgram::Statistics(statistics), FragmentSinkAssignment::None) => {
-            let root_plan = root_plan.ok_or_else(|| {
-                materialization_error("STATISTICS_SINK requires a fragment root plan")
-            })?;
-            let schema =
-                crate::exec::pipeline::builder::output_chunk_schema_for_node(&root_plan.root)
-                    .ok_or_else(|| {
-                        materialization_error("STATISTICS_SINK requires a root output schema")
-                    })?;
-            let (factory, statistics_handle) = StatisticsSinkFactory::try_new(
-                schema.arrow_schema_ref(),
-                statistics.metrics().clone(),
-                Some(plan_node_id),
-            )
-            .map_err(materialization_error)?;
-            Ok(MaterializedFragmentSink {
-                factory: Box::new(factory),
-                statistics_handle: Some(statistics_handle),
-            })
-        }
         (
             FragmentSinkProgram::DataStream(stream),
             FragmentSinkAssignment::StreamDestinations {
@@ -202,7 +168,6 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             };
             Ok(MaterializedFragmentSink {
                 factory: Box::new(factory),
-                statistics_handle: None,
             })
         }
         (
@@ -217,10 +182,7 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             std::sync::Arc::clone(&transmitter),
             edge_gates.clone(),
         )
-        .map(|factory| MaterializedFragmentSink {
-            factory,
-            statistics_handle: None,
-        }),
+        .map(|factory| MaterializedFragmentSink { factory }),
         (
             FragmentSinkProgram::SplitDataStream(split),
             FragmentSinkAssignment::DestinationGroups { groups, sender_id },
@@ -233,10 +195,7 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             std::sync::Arc::clone(&transmitter),
             edge_gates.clone(),
         )
-        .map(|factory| MaterializedFragmentSink {
-            factory,
-            statistics_handle: None,
-        }),
+        .map(|factory| MaterializedFragmentSink { factory }),
         (static_program, dynamic_assignment) => Err(materialization_error(format!(
             "sink {} cannot be materialized with assignment {}",
             sink_program_name(static_program),
@@ -364,7 +323,6 @@ fn sink_program_name(program: &FragmentSinkProgram) -> &'static str {
     match program {
         FragmentSinkProgram::Result => "result",
         FragmentSinkProgram::Noop => "noop",
-        FragmentSinkProgram::Statistics(_) => "statistics",
         FragmentSinkProgram::DataStream(_) => "data_stream",
         FragmentSinkProgram::MultiCastDataStream(_) => "multi_cast_data_stream",
         FragmentSinkProgram::SplitDataStream(_) => "split_data_stream",
@@ -489,9 +447,6 @@ mod tests {
         // What was missing is the step before that: nothing supplied the gates,
         // so every frozen edge was effectively open and the closed state meant
         // nothing. This pins the supply for all three push sink shapes.
-        use crate::exec::operators::{
-            DataStreamSinkFactory, MultiCastDataStreamSinkFactory, SplitDataStreamSinkFactory,
-        };
         use crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates;
 
         let gates = ExchangeEdgeGates::try_new(std::iter::empty()).expect("an empty gate set");

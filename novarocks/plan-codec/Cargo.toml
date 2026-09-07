@@ -26,6 +26,7 @@ doctest = false
 [dependencies]
 arrow = { version = "58.2.0" }
 arrow-buffer = "58.2.0"
+novarocks-functions = { path = "../functions" }
 novarocks-proto-codec = { path = "../proto-codec" }
 novarocks-proto-models = { path = "../proto-models" }
 novarocks-spi = { path = "../spi" }

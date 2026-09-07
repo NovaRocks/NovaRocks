@@ -79,9 +79,6 @@ version = "0.3.2"
 [dependencies.async-trait]
 version = "0.1.89"
 
-[dependencies.backon]
-version = "1.5.1"
-
 [dependencies.base64]
 version = "0.22.1"
 

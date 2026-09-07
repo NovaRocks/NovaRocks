@@ -36,7 +36,15 @@ use novarocks_spi::connector::write_stack::{WriteTargetOrdinal, validate_query_t
 
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::ExecNode;
-use crate::exec::node::table_write_relation::ConnectorCommitFragmentCarrierValidator;
+use crate::exec::node::table_write_aggregate::WriterFinalAggregatePlan;
+#[cfg(debug_assertions)]
+use crate::exec::node::table_write_relation::{
+    AllowTableWriteAggregates, TableWriteAggregateGuard,
+};
+use crate::exec::node::table_write_relation::{
+    ConnectorCommitFragmentCarrierValidator, RootWriteResultRelationSchema,
+    WriterMultiplexRelationSchema,
+};
 
 /// The bounded aggregation stage of one distributed write.
 #[derive(Clone)]
@@ -45,6 +53,11 @@ pub struct TableFinishNode {
     pub node_id: i32,
     expected_targets: Arc<Vec<WriteTargetOrdinal>>,
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
+    writer_multiplex_schema: WriterMultiplexRelationSchema,
+    root_result_schema: RootWriteResultRelationSchema,
+    final_aggregate_plan: WriterFinalAggregatePlan,
+    #[cfg(debug_assertions)]
+    aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
 impl TableFinishNode {
@@ -53,6 +66,26 @@ impl TableFinishNode {
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
         fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
+    ) -> Result<Self, ExecPlanBuildError> {
+        Self::try_new_with_relations(
+            inputs,
+            node_id,
+            expected_targets,
+            fragment_validator,
+            WriterMultiplexRelationSchema::empty(),
+            RootWriteResultRelationSchema::fixed(),
+            WriterFinalAggregatePlan::default(),
+        )
+    }
+
+    pub fn try_new_with_relations(
+        inputs: Vec<ExecNode>,
+        node_id: i32,
+        expected_targets: Vec<WriteTargetOrdinal>,
+        fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
+        writer_multiplex_schema: WriterMultiplexRelationSchema,
+        root_result_schema: RootWriteResultRelationSchema,
+        final_aggregate_plan: WriterFinalAggregatePlan,
     ) -> Result<Self, ExecPlanBuildError> {
         if inputs.is_empty() {
             return Err(ExecPlanBuildError::new(
@@ -78,7 +111,19 @@ impl TableFinishNode {
             node_id,
             expected_targets: Arc::new(expected_targets),
             fragment_validator,
+            writer_multiplex_schema,
+            root_result_schema,
+            final_aggregate_plan,
+            #[cfg(debug_assertions)]
+            aggregate_guard: Arc::new(AllowTableWriteAggregates),
         })
+    }
+
+    /// Bind the application-owned, query-scoped aggregate rejection guard.
+    #[cfg(debug_assertions)]
+    pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
+        self.aggregate_guard = guard;
+        self
     }
 
     pub fn expected_targets(&self) -> &Arc<Vec<WriteTargetOrdinal>> {
@@ -96,6 +141,23 @@ impl TableFinishNode {
 
     pub const fn fragment_validator(&self) -> &Arc<dyn ConnectorCommitFragmentCarrierValidator> {
         &self.fragment_validator
+    }
+
+    pub const fn writer_multiplex_schema(&self) -> &WriterMultiplexRelationSchema {
+        &self.writer_multiplex_schema
+    }
+
+    pub const fn root_result_schema(&self) -> &RootWriteResultRelationSchema {
+        &self.root_result_schema
+    }
+
+    pub const fn final_aggregate_plan(&self) -> &WriterFinalAggregatePlan {
+        &self.final_aggregate_plan
+    }
+
+    #[cfg(debug_assertions)]
+    pub const fn aggregate_guard(&self) -> &Arc<dyn TableWriteAggregateGuard> {
+        &self.aggregate_guard
     }
 }
 

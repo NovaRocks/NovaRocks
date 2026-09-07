@@ -416,7 +416,6 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
                     ),
                 ),
             }),
-            statistics_payload: Vec::new(),
         }],
         profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
             telemetry: Some(

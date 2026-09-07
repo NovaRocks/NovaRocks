@@ -167,6 +167,7 @@ pub struct FrontendApplicationHost {
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
 }
 
 /// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
@@ -215,6 +216,7 @@ pub struct FrontendExecutionConfig {
     configured_report_port: u16,
     runtime_filter_worker_count: NonZeroUsize,
     native_compatibility_id: NativeCompatibilityId,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     mv_scheduler: FrontendMvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
     /// Cost budget frozen from `[runtime]` and handed to statement admission.
@@ -255,12 +257,14 @@ impl FrontendExecutionConfig {
         configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
+        function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     ) -> Self {
         Self {
             advertised_report_host: advertised_report_host.into(),
             configured_report_port,
             runtime_filter_worker_count,
             native_compatibility_id,
+            function_catalog,
             mv_scheduler: FrontendMvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
@@ -296,6 +300,10 @@ impl FrontendExecutionConfig {
 
     pub(crate) const fn native_compatibility_id(&self) -> NativeCompatibilityId {
         self.native_compatibility_id
+    }
+
+    pub(crate) fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
+        Arc::clone(&self.function_catalog)
     }
 
     pub fn with_query_control_timeouts(mut self, timeouts: FrontendQueryControlTimeouts) -> Self {
@@ -504,6 +512,7 @@ impl FrontendApplicationHost {
             topology: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
+            function_catalog: execution.function_catalog(),
         };
 
         if let Some(state_store) = state_store
@@ -933,6 +942,10 @@ impl FrontendApplicationHost {
 
     pub fn lake_publication_runtime_policy(&self) -> LakePublicationRuntimePolicy {
         self.lake_publication_runtime_policy
+    }
+
+    pub fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
+        Arc::clone(&self.function_catalog)
     }
 
     pub fn connector_control_registry(
@@ -1365,6 +1378,10 @@ mod tests {
                 0,
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                std::sync::Arc::new(
+                    novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                        .expect("builtin function catalog"),
+                ),
             ),
             backend,
             Vec::new(),

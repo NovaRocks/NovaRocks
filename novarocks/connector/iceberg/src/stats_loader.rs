@@ -27,12 +27,17 @@
 //! "Error handling and graceful degradation".
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::iceberg::io::FileIO;
 use crate::iceberg::puffin::{APACHE_DATASKETCHES_THETA_V1, PuffinReader};
-use crate::iceberg::spec::TableMetadata;
+use crate::iceberg::spec::{StatisticsFile, TableMetadata};
+use novarocks_connector_iceberg_functions::validate_compact_theta;
 
-use crate::theta_sketch::ThetaSketchHandle;
+/// Standard Puffin property carrying the estimate represented by a Theta body.
+pub const NDV_PROPERTY: &str = "ndv";
+
+static THETA_BODY_READS: AtomicU64 = AtomicU64::new(0);
 
 /// Loader for Iceberg Puffin statistics. Produces a `field_id → NDV` map.
 pub struct StatsLoader;
@@ -57,80 +62,95 @@ impl StatsLoader {
         let Some(stats_file) = table_metadata.statistics_for_snapshot(snapshot_id) else {
             return HashMap::new();
         };
-        match Self::load_ndv_inner(stats_file.statistics_path.as_str(), file_io).await {
+        let _ = file_io;
+        match Self::load_ndv_from_metadata(stats_file) {
             Ok(map) => map,
-            Err(err) => {
-                tracing::warn!(
-                    snapshot_id,
-                    puffin_path = %stats_file.statistics_path,
-                    error = %err,
-                    "iceberg puffin stats load failed; falling back to manifest heuristics",
-                );
+            Err(error) => {
+                tracing::warn!(snapshot_id, error = %error, "iceberg statistics metadata is unusable");
                 HashMap::new()
             }
         }
     }
 
-    /// Reads one statistics file's Theta blobs into `field_id -> NDV`.
-    ///
-    /// Exposed for the ancestor walk, which resolves statistics files itself
-    /// and must distinguish "this ancestor has no usable file" from "this
-    /// ancestor has statistics for some other column".
-    pub(crate) async fn load_ndv_from_file(
-        puffin_path: &str,
-        file_io: &FileIO,
+    /// Read ordinary optimizer NDV without opening the Puffin object. Iceberg
+    /// copies blob properties into `StatisticsFile.blob_metadata`, so this is
+    /// both the cheapest path and the authoritative metadata contract.
+    pub fn load_ndv_from_metadata(
+        statistics: &StatisticsFile,
     ) -> Result<HashMap<i32, f64>, String> {
-        Self::load_ndv_inner(puffin_path, file_io).await
+        let mut ndv = HashMap::new();
+        for blob in &statistics.blob_metadata {
+            if blob.r#type != APACHE_DATASKETCHES_THETA_V1 {
+                continue;
+            }
+            let [field_id] = blob.fields.as_slice() else {
+                return Err("Theta blob metadata must name exactly one field".to_string());
+            };
+            let rendered = blob.properties.get(NDV_PROPERTY).ok_or_else(|| {
+                format!("Theta blob metadata for field {field_id} is missing ndv")
+            })?;
+            let value = rendered.parse::<f64>().map_err(|error| {
+                format!("Theta ndv for field {field_id} is not numeric: {error}")
+            })?;
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "Theta ndv for field {field_id} must be finite and non-negative"
+                ));
+            }
+            if ndv.insert(*field_id, value).is_some() {
+                return Err(format!(
+                    "statistics metadata contains duplicate Theta blobs for field {field_id}"
+                ));
+            }
+        }
+        Ok(ndv)
     }
 
-    async fn load_ndv_inner(
+    pub fn theta_body_reads() -> u64 {
+        THETA_BODY_READS.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn reset_theta_body_reads_for_test() {
+        THETA_BODY_READS.store(0, Ordering::Relaxed);
+    }
+
+    /// Load compact bodies only for parent union/rewrite. Ordinary optimizer
+    /// reads must use `load_ndv_from_metadata` and never call this method.
+    pub(crate) async fn load_theta_bodies_from_file(
         puffin_path: &str,
         file_io: &FileIO,
-    ) -> Result<HashMap<i32, f64>, String> {
+    ) -> Result<HashMap<i32, Vec<u8>>, String> {
         let input_file = file_io
             .new_input(puffin_path)
-            .map_err(|e| format!("open puffin {puffin_path}: {e}"))?;
+            .map_err(|error| format!("open Puffin {puffin_path}: {error}"))?;
         let reader = PuffinReader::new(input_file);
-        let file_metadata = reader
+        let metadata = reader
             .file_metadata()
             .await
-            .map_err(|e| format!("read puffin metadata: {e}"))?;
-
-        let mut ndv_map: HashMap<i32, f64> = HashMap::new();
-        for blob_metadata in file_metadata.blobs() {
+            .map_err(|error| format!("read Puffin metadata: {error}"))?;
+        let mut bodies = HashMap::new();
+        for blob_metadata in metadata.blobs() {
             if blob_metadata.blob_type() != APACHE_DATASKETCHES_THETA_V1 {
                 continue;
             }
-            let Some(&field_id) = blob_metadata.fields().first() else {
-                // Theta blob without a field id has no consumer in the
-                // optimizer — skip it rather than producing a phantom entry.
-                continue;
+            let [field_id] = blob_metadata.fields() else {
+                return Err("Theta blob metadata must name exactly one field".to_string());
             };
-            let blob = match reader.blob(blob_metadata).await {
-                Ok(b) => b,
-                Err(err) => {
-                    tracing::warn!(
-                        field_id,
-                        error = %err,
-                        "iceberg puffin theta blob read failed; skipping field",
-                    );
-                    continue;
-                }
-            };
-            match ThetaSketchHandle::deserialize(blob.data()) {
-                Ok(sketch) => {
-                    ndv_map.insert(field_id, sketch.estimate().max(0.0));
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        field_id,
-                        error = %err,
-                        "iceberg puffin theta blob deserialize failed; skipping field",
-                    );
-                }
+            THETA_BODY_READS.fetch_add(1, Ordering::Relaxed);
+            let blob = reader
+                .blob(blob_metadata)
+                .await
+                .map_err(|error| format!("read Theta blob for field {field_id}: {error}"))?;
+            validate_compact_theta(blob.data())
+                .map_err(|error| format!("validate Theta blob for field {field_id}: {error}"))?;
+            if bodies.insert(*field_id, blob.data().to_vec()).is_some() {
+                return Err(format!(
+                    "Puffin contains duplicate Theta blobs for field {field_id}"
+                ));
             }
         }
-        Ok(ndv_map)
+        Ok(bodies)
     }
 }
 
@@ -138,136 +158,44 @@ impl StatsLoader {
 mod tests {
     use super::*;
     use std::collections::HashMap as Map;
-    use std::sync::Arc;
 
-    use crate::iceberg::puffin::{Blob, CompressionCodec, PuffinWriter};
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
-    use tempfile::tempdir;
-
-    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
-        let runtime = tokio::runtime::Handle::current();
-        crate::access_binding::IcebergReadBinding::new(
-            None,
-            FsAccessResolver::new(),
-            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime)),
-        )
-    }
-
-    /// Build a tiny Puffin file via `PuffinWriter` for round-trip tests.
-    /// The file lives under a temp directory on the local filesystem so it
-    /// can be re-opened via `FileIO`.
-    async fn write_puffin_file(path: &str, sketches: &[(i32, &ThetaSketchHandle, i64)]) -> FileIO {
-        let file_io = crate::fs_io::build_file_io_for_location(path, local_test_binding());
-        let output = file_io.new_output(path).expect("new output");
-        let mut writer = PuffinWriter::new(&output, Map::new(), false)
-            .await
-            .expect("puffin writer");
-        for (field_id, sketch, snapshot_id) in sketches {
-            let blob = Blob::builder()
-                .r#type(APACHE_DATASKETCHES_THETA_V1.to_string())
-                .fields(vec![*field_id])
-                .snapshot_id(*snapshot_id)
-                .sequence_number(1)
-                .data(sketch.serialize())
-                .properties(Map::new())
-                .build();
-            writer
-                .add(blob, CompressionCodec::None)
-                .await
-                .expect("write blob");
+    fn metadata_with_ndv(field_id: i32, ndv: &str) -> StatisticsFile {
+        StatisticsFile {
+            snapshot_id: 7,
+            statistics_path: "file:///must-not-be-opened.puffin".to_string(),
+            file_size_in_bytes: 1,
+            file_footer_size_in_bytes: 1,
+            key_metadata: None,
+            blob_metadata: vec![crate::iceberg::spec::BlobMetadata {
+                r#type: APACHE_DATASKETCHES_THETA_V1.to_string(),
+                snapshot_id: 7,
+                sequence_number: 1,
+                fields: vec![field_id],
+                properties: Map::from([(NDV_PROPERTY.to_string(), ndv.to_string())]),
+            }],
         }
-        writer.close().await.expect("close puffin writer");
-        file_io
     }
 
-    fn build_sketch(values: i64) -> ThetaSketchHandle {
-        let mut s = ThetaSketchHandle::new(12).expect("theta sketch");
-        for i in 0..values {
-            s.update(i).expect("theta update");
-        }
-        s
+    #[test]
+    fn optimizer_ndv_reads_only_registered_blob_metadata() {
+        StatsLoader::reset_theta_body_reads_for_test();
+        let ndv = StatsLoader::load_ndv_from_metadata(&metadata_with_ndv(11, "42.5"))
+            .expect("metadata NDV");
+        assert_eq!(ndv, Map::from([(11, 42.5)]));
+        assert_eq!(StatsLoader::theta_body_reads(), 0);
     }
 
-    #[tokio::test]
-    async fn loads_ndv_from_local_puffin() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("stats.puffin");
-        let path_str = format!("file://{}", path.display());
+    #[test]
+    fn metadata_ndv_rejects_missing_invalid_and_duplicate_values() {
+        let mut missing = metadata_with_ndv(11, "42");
+        missing.blob_metadata[0].properties.clear();
+        assert!(StatsLoader::load_ndv_from_metadata(&missing).is_err());
+        assert!(StatsLoader::load_ndv_from_metadata(&metadata_with_ndv(11, "NaN")).is_err());
 
-        let sketch_a = build_sketch(1_000);
-        let sketch_b = build_sketch(500);
-        let file_io =
-            write_puffin_file(&path_str, &[(1, &sketch_a, 100), (2, &sketch_b, 100)]).await;
-
-        let map = StatsLoader::load_ndv_inner(&path_str, &file_io)
-            .await
-            .expect("load_ndv_inner");
-        assert_eq!(map.len(), 2);
-        let ndv1 = map.get(&1).copied().unwrap_or(0.0);
-        let ndv2 = map.get(&2).copied().unwrap_or(0.0);
-        assert!(
-            (900.0..1100.0).contains(&ndv1),
-            "field 1 NDV {ndv1} should be ~1000"
-        );
-        assert!(
-            (450.0..550.0).contains(&ndv2),
-            "field 2 NDV {ndv2} should be ~500"
-        );
-    }
-
-    #[tokio::test]
-    async fn returns_empty_on_missing_puffin_file() {
-        let missing = "file:///definitely/missing.puffin";
-        let file_io = crate::fs_io::build_file_io_for_location(missing, local_test_binding());
-        let map = StatsLoader::load_ndv_inner(missing, &file_io).await;
-        assert!(map.is_err());
-    }
-
-    #[tokio::test]
-    async fn skips_non_theta_blobs() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("mixed.puffin");
-        let path_str = format!("file://{}", path.display());
-        let file_io = crate::fs_io::build_file_io_for_location(&path_str, local_test_binding());
-
-        let output = file_io.new_output(&path_str).expect("new output");
-        let mut writer = PuffinWriter::new(&output, Map::new(), false)
-            .await
-            .expect("puffin writer");
-        // A non-theta blob — should be ignored by the loader.
-        let other_blob = Blob::builder()
-            .r#type("something-else".to_string())
-            .fields(vec![10])
-            .snapshot_id(7)
-            .sequence_number(1)
-            .data(vec![1, 2, 3, 4])
-            .properties(Map::new())
-            .build();
-        writer
-            .add(other_blob, CompressionCodec::None)
-            .await
-            .expect("write");
-        // A theta blob — should be picked up.
-        let sketch = build_sketch(200);
-        let theta_blob = Blob::builder()
-            .r#type(APACHE_DATASKETCHES_THETA_V1.to_string())
-            .fields(vec![3])
-            .snapshot_id(7)
-            .sequence_number(1)
-            .data(sketch.serialize())
-            .properties(Map::new())
-            .build();
-        writer
-            .add(theta_blob, CompressionCodec::None)
-            .await
-            .expect("write");
-        writer.close().await.expect("close");
-
-        let map = StatsLoader::load_ndv_inner(&path_str, &file_io)
-            .await
-            .expect("load ndv");
-        assert_eq!(map.len(), 1, "only theta blob should be loaded: {map:?}");
-        assert!(map.contains_key(&3));
+        let mut duplicate = metadata_with_ndv(11, "42");
+        duplicate
+            .blob_metadata
+            .push(duplicate.blob_metadata[0].clone());
+        assert!(StatsLoader::load_ndv_from_metadata(&duplicate).is_err());
     }
 }

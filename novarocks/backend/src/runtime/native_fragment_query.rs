@@ -123,6 +123,7 @@ impl NativeFragmentQueryRuntime {
         fragment_instance_id: UniqueId,
         delivery_expire: Duration,
         query_expire: Duration,
+        exec_mem_limit: Option<i64>,
         runtime_filter: Option<RuntimeFilterSessionRef>,
     ) -> Result<NativeFragmentAdmissionResources, String> {
         let execution = execution_key(execution_id);
@@ -136,6 +137,9 @@ impl NativeFragmentQueryRuntime {
             .manager
             .query_mem_tracker_execution(execution)
             .ok_or_else(|| "QueryContext missing mem_tracker".to_string())?;
+        if let Some(limit) = exec_mem_limit {
+            query_mem_tracker.install_limit_once(limit)?;
+        }
         let fragment_label = format!(
             "fragment_{:x}_{:x}",
             fragment_instance_id.high(),
@@ -379,7 +383,55 @@ mod tests {
 
     use super::NativeFragmentQueryRuntime;
     use crate::runtime::query_context::{QueryContextManager, QueryId};
+    use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::UniqueId;
+
+    #[test]
+    fn native_admission_installs_one_query_memory_limit() {
+        let manager = QueryContextManager::new_for_test();
+        let runtime = NativeFragmentQueryRuntime {
+            manager: manager.clone(),
+        };
+        let query_id = QueryId::new(91_101, 91_102);
+        let execution_id =
+            QueryExecutionId::new(query_id, AttemptId::new(1).expect("nonzero attempt"))
+                .expect("valid execution id");
+
+        let first = runtime
+            .prepare_admission_execution(
+                execution_id,
+                UniqueId::new(91_103, 1),
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Some(1024),
+                None,
+            )
+            .expect("first fragment installs limit");
+        assert_eq!(first.query_mem_tracker().limit(), 1024);
+
+        runtime
+            .prepare_admission_execution(
+                execution_id,
+                UniqueId::new(91_103, 2),
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Some(1024),
+                None,
+            )
+            .expect("same query contract is idempotent");
+        let error = runtime
+            .prepare_admission_execution(
+                execution_id,
+                UniqueId::new(91_103, 3),
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Some(2048),
+                None,
+            )
+            .err()
+            .expect("query memory limit drift must fail");
+        assert!(error.contains("already has limit 1024"), "{error}");
+    }
 
     #[test]
     fn pre_start_registration_lease_drop_rolls_back_only_its_fragment() {

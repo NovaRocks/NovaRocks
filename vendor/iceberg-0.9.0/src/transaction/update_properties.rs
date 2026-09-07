@@ -106,17 +106,12 @@ impl TransactionAction for UpdatePropertiesAction {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
-
-    use as_any::Downcast;
-
     use crate::transaction::Transaction;
     use crate::transaction::action::ApplyTransactionAction;
     use crate::transaction::tests::make_v2_table;
-    use crate::transaction::update_properties::UpdatePropertiesAction;
 
-    #[test]
-    fn test_update_table_property() {
+    #[tokio::test]
+    async fn test_update_table_property() {
         let table = make_v2_table();
         let tx = Transaction::new(&table);
         let tx = tx
@@ -124,18 +119,13 @@ mod tests {
             .set("a".to_string(), "b".to_string())
             .remove("b".to_string())
             .apply(tx)
+            .await
             .unwrap();
 
-        assert_eq!(tx.actions.len(), 1);
-
-        let action = (*tx.actions[0])
-            .downcast_ref::<UpdatePropertiesAction>()
-            .unwrap();
         assert_eq!(
-            action.updates,
-            HashMap::from([("a".to_string(), "b".to_string())])
+            tx.staged_table().metadata().properties().get("a"),
+            Some(&"b".to_string())
         );
-
-        assert_eq!(action.removals, HashSet::from(["b".to_string()]));
+        assert!(!tx.staged_table().metadata().properties().contains_key("b"));
     }
 }

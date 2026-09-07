@@ -29,6 +29,7 @@ use crate::column_id::{ColumnId, ColumnRefFactory};
 use crate::common::CteId;
 use crate::common::OutputColumn;
 use crate::optimizer::scalar::ScalarArena;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Core type aliases
@@ -86,6 +87,7 @@ pub(crate) struct Memo {
     /// memo operators store only `ScalarId` handles into this arena instead of
     /// owning deep `TypedExpr` trees.
     pub(crate) scalars: ScalarArena,
+    pub(crate) function_catalog: Option<Arc<dyn crate::compiler::SqlFunctionCatalog>>,
 }
 
 impl Memo {
@@ -97,7 +99,14 @@ impl Memo {
             join_group_index: HashMap::new(),
             reorder_owned_groups: HashSet::new(),
             scalars: ScalarArena::new(),
+            function_catalog: None,
         }
+    }
+
+    pub(crate) fn function_catalog(&self) -> &dyn crate::compiler::SqlFunctionCatalog {
+        self.function_catalog
+            .as_deref()
+            .expect("function catalog must be installed before optimizer exploration")
     }
 
     /// Create a new group containing a single expression. Returns the new GroupId.

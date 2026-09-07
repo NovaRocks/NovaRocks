@@ -41,6 +41,8 @@ pub(crate) struct ImvRewriteInput {
     pub disabled_rules: Vec<String>,
     pub deadline: Option<Instant>,
     pub column_ref_factory: Rc<RefCell<ColumnRefFactory>>,
+    #[cfg(not(test))]
+    pub function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
 }
 
 #[derive(Debug)]
@@ -57,6 +59,8 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         disabled_rules,
         deadline,
         column_ref_factory,
+        #[cfg(not(test))]
+        function_catalog,
     } = input;
 
     reserve_existing_plan_column_ids(&column_ref_factory, &plan);
@@ -67,6 +71,9 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         },
     );
     ctx_rw.set_column_ref_factory(Rc::clone(&column_ref_factory));
+    #[cfg(test)]
+    let function_catalog = crate::functions::test_function_catalog_snapshot();
+    ctx_rw.set_function_catalog(function_catalog);
     ctx_rw.set_extension::<ImvExtension>(ImvExtension {
         snapshot,
         annotation: ImvPlanAnnotation::default(),
@@ -650,12 +657,13 @@ pub(crate) mod tests {
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![normalization_column_ref(&g1), normalization_column_ref(&g2)],
                 aggregates: vec![AggregateCall {
-                    name: "sum".to_string(),
+                    name: "count".to_string(),
                     args: Vec::new(),
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: sum_output.column_id,
+                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
                 }],
                 output_columns: vec![g1, g2, sum_output],
                 already_pushed: false,
@@ -690,12 +698,13 @@ pub(crate) mod tests {
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![normalization_column_ref(&group_output)],
                 aggregates: vec![AggregateCall {
-                    name: "sum".to_string(),
+                    name: "count".to_string(),
                     args: Vec::new(),
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: aggregate_output.column_id,
+                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
                 }],
                 output_columns: vec![group_output.clone(), aggregate_output.clone()],
                 already_pushed: false,
@@ -1168,6 +1177,11 @@ pub(crate) mod tests {
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: ColumnId(3),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![
                     OutputColumn {
@@ -1306,6 +1320,11 @@ pub(crate) mod tests {
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: ColumnId(12),
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        false,
+                    ),
                 }],
                 output_columns: vec![
                     OutputColumn {
@@ -2850,6 +2869,8 @@ pub(crate) mod tests {
                 disabled_rules: vec!["InjectTargetLocatorJoin".to_string()],
                 deadline: None,
                 column_ref_factory: Rc::clone(&factory_cell),
+                #[cfg(not(test))]
+                function_catalog: crate::functions::test_function_catalog_snapshot(),
             })
             .expect("join projection IMV pipeline must rewrite and validate");
             let descriptor = outcome
@@ -2870,6 +2891,8 @@ pub(crate) mod tests {
                     202,
                     203,
                     204,
+                    #[cfg(not(test))]
+                    crate::functions::builtin_sql_function_catalog(),
                 )
             }
             .expect("join projection coalesce plan");

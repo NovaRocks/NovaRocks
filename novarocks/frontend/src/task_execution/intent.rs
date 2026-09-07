@@ -121,6 +121,7 @@ impl OperationIntent {
                 UpdateQueryContext::Establish(request) => {
                     request.catalog_binding().encoded_len()
                         + request.initial_runtime_filter().encoded_len()
+                        + request.query_options().encoded_len()
                         + request.initial_credential().material().encoded_len()
                 }
                 UpdateQueryContext::AdvanceDomain(request) => {

@@ -62,18 +62,22 @@ use novarocks_execution::runtime::fragment::{
 };
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_execution::task_execution::descriptor::{
     ExchangeSource, IngressRejection, TaskDescriptor,
 };
-use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_execution::task_execution::domain::{
+    CodecOwnedContent, ContentFingerprint, DomainVersion,
+};
 use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::operation::TaskDomainUpdate;
 use novarocks_execution::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
 };
 use novarocks_proto_codec::connector_read::{MAX_ASSIGNMENT_RETAINED_BYTES, SplitAssignment};
-use novarocks_proto_codec::task_execution::domain::stored_message;
+use novarocks_proto_codec::task_execution::domain::{WireContent, stored_message};
+use novarocks_proto_codec::task_execution::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
 use novarocks_proto_models::connector_read as connector_dto;
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorStorageResolver, read_stack::ConnectorSession,
@@ -104,7 +108,42 @@ use super::status::TaskStatusReporter;
 /// depend on the lifecycle owner's admission permit. Here they are one
 /// injected port, implemented by the query-context half of execution, so the
 /// task side holds no query-wide authority of its own.
+#[derive(Clone, Debug)]
+pub struct QueryContextOptions {
+    runtime: Arc<QueryOptions>,
+    fingerprint: ContentFingerprint,
+}
+
+fn query_options_fingerprint(
+    wire: novarocks_proto_models::novarocks::QueryOptions,
+) -> ContentFingerprint {
+    WireContent::new(ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG, wire).fingerprint()
+}
+
+impl QueryContextOptions {
+    pub(super) const fn new(runtime: Arc<QueryOptions>, fingerprint: ContentFingerprint) -> Self {
+        Self {
+            runtime,
+            fingerprint,
+        }
+    }
+
+    pub fn runtime(&self) -> &Arc<QueryOptions> {
+        &self.runtime
+    }
+
+    pub const fn fingerprint(&self) -> ContentFingerprint {
+        self.fingerprint
+    }
+}
+
 pub trait TaskQueryContextFacts: Send + Sync {
+    /// The immutable execution options installed by this query context.
+    fn query_options(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Result<QueryContextOptions, HostRejection>;
+
     /// The runtime-filter session this query installed on this backend.
     ///
     /// `None` is the ordinary answer for a query with no filter participant.
@@ -755,6 +794,19 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         }
 
         let wire = fragment_plan(descriptor.plan().as_ref())?;
+        let context_options = self.context_facts.query_options(execution)?;
+        let task_query_options = wire
+            .instance_params()
+            .query_options
+            .as_ref()
+            .expect("a validated task fragment plan carries query options");
+        let task_options_fingerprint = query_options_fingerprint(task_query_options.clone());
+        if task_options_fingerprint != context_options.fingerprint() {
+            return Err(protocol(format!(
+                "task {identity} query options conflict with its established query context"
+            )));
+        }
+
         let attempt = TaskAttemptKey::new(execution, kernel_key);
         let splits = self.split_queues.open_attempt(
             attempt,
@@ -762,9 +814,10 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 max_queued_bytes: MAX_ASSIGNMENT_RETAINED_BYTES,
             },
         );
-        // The queue set is opened before decode so a scan can start and block
-        // before its first split arrives, which means every refusal below has
-        // to close it again. The lease does that structurally.
+        // The queue set is opened before full decode so a scan can start and
+        // block before its first split arrives. Query-wide options have already
+        // passed their exact witness check, and every later refusal is rolled
+        // back by this structural lease.
         let mut lease = SplitQueueLease::held(&self.split_queues, attempt);
         let read_context = Arc::new(TypedReadAttemptContext::new());
         let typed_runtime = self.typed_scan_runtime(
@@ -774,13 +827,15 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             Arc::clone(&splits),
         )?;
 
-        let request = NativeFragmentRequest::try_decode_with_runtime(
+        let request = NativeFragmentRequest::try_decode_with_context_options(
             execution,
             wire.plan().clone(),
             wire.instance_params().clone(),
+            context_options.runtime().as_ref().clone(),
             self.queries.connector_cancellation_for_execution(execution),
             Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
             Some(typed_runtime),
+            Arc::clone(self.execution_runtime.function_catalog()),
         )
         .map_err(|error| protocol(format!("task {identity} plan is not decodable: {error}")))?;
 
@@ -795,12 +850,17 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             )));
         }
         let expects_bindings = request.has_runtime_filter_bindings();
-        let (delivery_expire, query_expire) = request.query_expire_durations();
+        let (delivery_expire, query_expire) =
+            novarocks_execution::runtime::query_options::query_expire_durations(Some(
+                context_options.runtime().as_ref(),
+            ));
+        let exec_mem_limit = context_options.runtime().exec_mem_limit();
         // Profiling is the query's decision, exactly as it is on the
         // fragment-based path. Without it there is no per-operator counter to
         // read, and this task's final info reports no operator statistics
         // rather than reporting zeroes it never measured.
-        let profiler = request
+        let profiler = context_options
+            .runtime()
             .enable_profile()
             .then(|| fragment_root_profiler(request.root_plan_node_id()));
         let submission = request.into_submission();
@@ -845,6 +905,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 kernel_key,
                 delivery_expire,
                 query_expire,
+                exec_mem_limit,
                 runtime_filter,
             )
             .map_err(|error| {
@@ -1392,9 +1453,9 @@ fn resource_exhausted(detail: impl AsRef<str>) -> HostRejection {
 mod tests {
     use super::{
         CompositeFragmentEventSink, ExchangeRouteClaim, ExchangeRouteQuery, FragmentStandDown,
-        InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, StandDown,
-        TaskInboundCapabilities, TaskOperatorStatisticsSink, TaskQueryContextFacts,
-        report_terminal,
+        InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, QueryContextOptions,
+        StandDown, TaskInboundCapabilities, TaskOperatorStatisticsSink, TaskQueryContextFacts,
+        query_options_fingerprint, report_terminal,
     };
 
     use std::num::{NonZeroU32, NonZeroUsize};
@@ -1416,6 +1477,7 @@ mod tests {
         FragmentTerminalFact,
     };
     use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
     use novarocks_execution::task_execution::descriptor::{
         ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource, ExchangeTopology,
@@ -1428,7 +1490,7 @@ mod tests {
     use novarocks_execution::task_execution::identity::TaskIdentity;
     use novarocks_execution::task_execution::operation::TaskDomainUpdate;
     use novarocks_execution::task_execution::status::{
-        AbortCause, CancelReason, TaskOutputFacts, TaskState,
+        AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
@@ -1478,7 +1540,7 @@ mod tests {
         kernel_key: UniqueId,
         pipeline_dop: i32,
     ) -> Arc<dyn PhysicalFragmentPlan> {
-        wire_plan_with_profile(query, kernel_key, pipeline_dop, false)
+        wire_plan_with_profile(query, kernel_key, pipeline_dop, false, 0)
     }
 
     fn wire_plan_with_profile(
@@ -1486,6 +1548,24 @@ mod tests {
         kernel_key: UniqueId,
         pipeline_dop: i32,
         enable_profile: bool,
+        query_mem_limit: i64,
+    ) -> Arc<dyn PhysicalFragmentPlan> {
+        wire_plan_with_query_options(
+            query,
+            kernel_key,
+            proto::QueryOptions {
+                pipeline_dop,
+                enable_profile,
+                query_mem_limit,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn wire_plan_with_query_options(
+        query: QueryId,
+        kernel_key: UniqueId,
+        query_options: proto::QueryOptions,
     ) -> Arc<dyn PhysicalFragmentPlan> {
         let wire = WireFragmentPlan::parse(
             proto::TaskFragmentPlan {
@@ -1523,11 +1603,7 @@ mod tests {
                         lo: kernel_key.low(),
                     }),
                     backend_num: 3,
-                    query_options: Some(proto::QueryOptions {
-                        pipeline_dop,
-                        enable_profile,
-                        ..Default::default()
-                    }),
+                    query_options: Some(query_options),
                     ..Default::default()
                 }),
             },
@@ -1627,8 +1703,9 @@ mod tests {
 
     /// A context host that answers every query-scoped question with the
     /// smallest legal value, and counts what it was asked.
-    #[derive(Default)]
     struct StubContextFacts {
+        query_options: Mutex<QueryOptions>,
+        query_options_fingerprint: Mutex<ContentFingerprint>,
         filter_sessions_requested: AtomicUsize,
         dynamic_filters_delivered: AtomicUsize,
         /// Every task this host offered as the context's feedback carrier.
@@ -1639,7 +1716,44 @@ mod tests {
         feedback_carriers: Mutex<Vec<TaskIdentity>>,
     }
 
+    impl Default for StubContextFacts {
+        fn default() -> Self {
+            let wire = proto::QueryOptions {
+                pipeline_dop: 1,
+                ..proto::QueryOptions::default()
+            };
+            Self {
+                query_options: Mutex::new(QueryOptions {
+                    pipeline_dop: Some(1),
+                    ..QueryOptions::default()
+                }),
+                query_options_fingerprint: Mutex::new(query_options_fingerprint(wire)),
+                filter_sessions_requested: AtomicUsize::new(0),
+                dynamic_filters_delivered: AtomicUsize::new(0),
+                feedback_carriers: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
     impl TaskQueryContextFacts for StubContextFacts {
+        fn query_options(
+            &self,
+            _execution: QueryExecutionId,
+        ) -> Result<QueryContextOptions, HostRejection> {
+            Ok(QueryContextOptions::new(
+                Arc::new(
+                    self.query_options
+                        .lock()
+                        .expect("stub query options")
+                        .clone(),
+                ),
+                *self
+                    .query_options_fingerprint
+                    .lock()
+                    .expect("stub query options fingerprint"),
+            ))
+        }
+
         fn runtime_filter_session(
             &self,
             _execution: QueryExecutionId,
@@ -1727,29 +1841,41 @@ mod tests {
     }
 
     fn test_execution_runtime() -> Arc<ExecutionRuntime> {
+        let mut function_set =
+            novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
+        novarocks_sql::compiler::contribute_builtin_functions(function_set.catalog_builder_mut())
+            .expect("builtin function metadata");
+        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+            &mut function_set,
+        )
+        .expect("builtin aggregate implementations");
+        let function_set = Arc::new(function_set.seal().expect("builtin execution function set"));
         Arc::new(
-            ExecutionRuntime::new(ExecutionRuntimeConfig {
-                driver_threads: 1,
-                scan_threads: 1,
-                scan_queue_capacity: 1,
-                spill_io_threads: 1,
-                spill_io_queue_capacity: 1,
-                spill_storage: ExecutionSpillStorageConfig::default(),
-                exchange_wait_ms: 120_000,
-                exchange_io_threads: 1,
-                exchange_io_max_inflight_bytes: 1,
-                exchange_max_transmit_batched_bytes: 1,
-                operator_buffer_chunks: 1,
-                local_exchange_buffer_mem_limit_per_driver: 1,
-                local_exchange_max_buffered_rows: 1,
-                connector_io_tasks_per_scan_operator: 1,
-                scan_submit_fail_max: 1,
-                scan_submit_fail_timeout_ms: 1,
-                runtime_filter_scan_wait_time_ms_override: None,
-                runtime_filter_wait_timeout_ms_override: None,
-                sink_io_worker_threads: 1,
-                sink_io_max_blocking_threads: 1,
-            })
+            ExecutionRuntime::new(
+                ExecutionRuntimeConfig {
+                    driver_threads: 1,
+                    scan_threads: 1,
+                    scan_queue_capacity: 1,
+                    spill_io_threads: 1,
+                    spill_io_queue_capacity: 1,
+                    spill_storage: ExecutionSpillStorageConfig::default(),
+                    exchange_wait_ms: 120_000,
+                    exchange_io_threads: 1,
+                    exchange_io_max_inflight_bytes: 1,
+                    exchange_max_transmit_batched_bytes: 1,
+                    operator_buffer_chunks: 1,
+                    local_exchange_buffer_mem_limit_per_driver: 1,
+                    local_exchange_max_buffered_rows: 1,
+                    connector_io_tasks_per_scan_operator: 1,
+                    scan_submit_fail_max: 1,
+                    scan_submit_fail_timeout_ms: 1,
+                    runtime_filter_scan_wait_time_ms_override: None,
+                    runtime_filter_wait_timeout_ms_override: None,
+                    sink_io_worker_threads: 1,
+                    sink_io_max_blocking_threads: 1,
+                },
+                function_set,
+            )
             .expect("test execution runtime"),
         )
     }
@@ -2283,6 +2409,104 @@ mod tests {
     }
 
     #[test]
+    fn query_timeout_zero_and_negative_one_are_distinct_wire_contracts() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let task = identity(45, 1, 1);
+        let kernel_key = UniqueId::new(145, 146);
+        let descriptor = descriptor_with(
+            task,
+            kernel_key,
+            1,
+            ExchangeTopology::default(),
+            wire_plan_with_query_options(
+                task.query_execution_id().query_id(),
+                kernel_key,
+                proto::QueryOptions {
+                    pipeline_dop: 1,
+                    query_timeout: -1,
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let rejection = host
+            .install_receiver(&descriptor)
+            .expect_err("normalized-equivalent wire options must still conflict");
+        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+        assert!(
+            rejection
+                .detail()
+                .as_str()
+                .contains("query options conflict"),
+            "{rejection}"
+        );
+        assert_eq!(
+            facts.filter_sessions_requested.load(Ordering::SeqCst),
+            0,
+            "the exact witness check must precede downstream fragment construction"
+        );
+    }
+
+    #[test]
+    fn task_memory_limit_admission_is_independent_of_task_order() {
+        for (query, limits) in [(43, [2048, 1024]), (44, [1024, 2048])] {
+            let facts = Arc::new(StubContextFacts::default());
+            facts
+                .query_options
+                .lock()
+                .expect("stub query options")
+                .exec_mem_limit = Some(1024);
+            *facts
+                .query_options_fingerprint
+                .lock()
+                .expect("stub query options fingerprint") =
+                query_options_fingerprint(proto::QueryOptions {
+                    pipeline_dop: 1,
+                    query_mem_limit: 1024,
+                    ..Default::default()
+                });
+            let host = host(Arc::clone(&facts));
+
+            for (offset, limit) in limits.into_iter().enumerate() {
+                let task = identity(query, 1, u32::try_from(offset + 1).expect("small task id"));
+                let kernel_key = UniqueId::new(query * 10, i64::from(limit));
+                let descriptor = descriptor_with(
+                    task,
+                    kernel_key,
+                    1,
+                    ExchangeTopology::default(),
+                    wire_plan_with_profile(
+                        task.query_execution_id().query_id(),
+                        kernel_key,
+                        1,
+                        false,
+                        limit,
+                    ),
+                );
+
+                if limit == 1024 {
+                    host.install_receiver(&descriptor)
+                        .expect("the task matches its context contract");
+                    host.remove_receiver(&descriptor);
+                } else {
+                    let rejection = host
+                        .install_receiver(&descriptor)
+                        .expect_err("task-local options cannot replace the query context contract");
+                    assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+                    assert!(
+                        rejection
+                            .detail()
+                            .as_str()
+                            .contains("query options conflict"),
+                        "{rejection}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_domain_update_for_a_task_that_was_never_installed_is_refused() {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
@@ -2696,7 +2920,6 @@ mod tests {
             UniqueId::new(3, 4),
             outcome,
             None,
-            Vec::new(),
         )
     }
 
@@ -2954,6 +3177,20 @@ mod tests {
     #[test]
     fn a_profiled_task_reports_its_operator_statistics_in_its_final_info() {
         let facts = Arc::new(StubContextFacts::default());
+        facts
+            .query_options
+            .lock()
+            .expect("stub query options")
+            .enable_profile = true;
+        *facts
+            .query_options_fingerprint
+            .lock()
+            .expect("stub query options fingerprint") =
+            query_options_fingerprint(proto::QueryOptions {
+                pipeline_dop: 1,
+                enable_profile: true,
+                ..Default::default()
+            });
         let host = host(Arc::clone(&facts));
         let task = identity(42, 1, 1);
         let kernel_key = UniqueId::new(271, 272);
@@ -2962,7 +3199,7 @@ mod tests {
             kernel_key,
             1,
             ExchangeTopology::default(),
-            wire_plan_with_profile(task.query_execution_id().query_id(), kernel_key, 1, true),
+            wire_plan_with_profile(task.query_execution_id().query_id(), kernel_key, 1, true, 0),
         );
         let (owner, reporter) = reporter_for(task);
 

@@ -417,6 +417,38 @@ impl TableCommit {
         take(&mut self.updates)
     }
 
+    /// Add a requirement to this staged commit if it is not already present.
+    ///
+    /// This keeps provider-owned publication frontiers on the vendor commit
+    /// type while allowing them to add admission requirements before the
+    /// single catalog dispatch.
+    pub fn add_requirement(&mut self, requirement: TableRequirement) {
+        if !self.requirements.contains(&requirement) {
+            self.requirements.push(requirement);
+        }
+    }
+
+    /// Return whether this staged commit carries no metadata updates.
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_empty()
+    }
+
+    /// Return the final snapshot id this commit assigns to `ref_name`, if it
+    /// assigns that ref at all.
+    ///
+    /// Metadata-only commits deliberately return `None`: their catalog proof
+    /// must not manufacture a snapshot effect merely because the table already
+    /// has a current snapshot.
+    pub fn updated_ref_snapshot_id(&self, ref_name: &str) -> Option<i64> {
+        self.updates.iter().rev().find_map(|update| match update {
+            TableUpdate::SetSnapshotRef {
+                ref_name: updated_ref,
+                reference,
+            } if updated_ref == ref_name => Some(reference.snapshot_id),
+            _ => None,
+        })
+    }
+
     /// Applies this [`TableCommit`] to the given [`Table`] as part of a catalog update.
     /// Typically used by [`Catalog::update_table`] to validate requirements and apply metadata updates.
     ///

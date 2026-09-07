@@ -50,9 +50,9 @@ use super::entry::{
     ImmutableQueryTerminalRecord, QueryCatalogLoadState, QueryLifecycleEntry, QueryLifecyclePhase,
 };
 use super::{
-    BackendQueryControl, CatalogPruneOutcome, QueryControlAttachment, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminalFallbackTransport,
-    QueryTerminalFallbackTransportError,
+    BackendQueryControl, CatalogPruneOutcome, QueryControlAttachment, QueryHeartbeatDisposition,
+    QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
+    QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
 use crate::BackendDataRuntime;
 use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
@@ -426,10 +426,6 @@ fn participant_attempt_ref(
     .map_err(protocol_contract_error)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The sealed terminal-fragment carrier has one parameter per required protocol field."
-)]
 fn terminal_fragment_snapshot(
     fragment_instance_id: UniqueId,
     backend_num: i32,
@@ -438,7 +434,6 @@ fn terminal_fragment_snapshot(
     error_detail: String,
     sink: SinkCommitReportSnapshot,
     profile: Option<RuntimeProfileTree>,
-    statistics_payload: Vec<u8>,
 ) -> Result<FragmentTerminalSnapshot, QueryLifecycleError> {
     use novarocks_proto_codec::lifecycle::terminal::FragmentTerminalSnapshot as ProtocolFragment;
     use novarocks_proto_models::novarocks as wire;
@@ -481,7 +476,6 @@ fn terminal_fragment_snapshot(
             filtered_rows: sink.load_stats.filtered_rows,
         }),
         profile: Some(profile),
-        statistics_payload,
     })
     .map_err(protocol_contract_error)
 }
@@ -978,6 +972,18 @@ struct QueryLifecycleRegistryState {
     terminal_fallback_rejected: u64,
 }
 
+#[derive(Clone, Copy)]
+struct HeartbeatTimeoutObservation {
+    generation: u64,
+    last_heartbeat: Instant,
+    sweep_now: Instant,
+}
+
+enum QueryLifecycleExpiration {
+    PreStart,
+    Heartbeat(HeartbeatTimeoutObservation),
+}
+
 struct PreInitTombstone {
     participant: ParticipantAttemptRef,
     digest: ParticipantManifestDigest,
@@ -1069,7 +1075,6 @@ fn fragment_snapshot_from_outcome(
         detail,
         SinkCommitReportSnapshot::default(),
         None,
-        Vec::new(),
     )
 }
 
@@ -2099,6 +2104,10 @@ impl QueryLifecycleRegistry {
             }
             state.phase = QueryLifecyclePhase::ControlAttached;
             state.last_heartbeat = Some(self.clock.now());
+            state.heartbeat_generation = state
+                .heartbeat_generation
+                .checked_add(1)
+                .expect("heartbeat generation must not wrap");
             state.events = Some(events_tx.clone());
             state.observations = Some(observations_tx);
             state.local_drained_event_permit = Some(local_drained_event_permit);
@@ -2974,6 +2983,24 @@ impl QueryLifecycleRegistry {
     }
 
     pub(crate) fn sweep_expired(&self, now: Instant) {
+        self.sweep_expired_inner(now, || {});
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sweep_expired_with_heartbeat_timeout_hook_for_test<F>(
+        &self,
+        now: Instant,
+        before_timeout_commit: F,
+    ) where
+        F: FnMut(),
+    {
+        self.sweep_expired_inner(now, before_timeout_commit);
+    }
+
+    fn sweep_expired_inner<F>(&self, now: Instant, mut before_timeout_commit: F)
+    where
+        F: FnMut(),
+    {
         let entries = {
             let mut state = self.state.lock().expect("query lifecycle registry lock");
             self.clean_tombstones_locked(&mut state, now, 64);
@@ -3006,11 +3033,7 @@ impl QueryLifecycleRegistry {
                     .pre_start_deadline
                     .is_some_and(|deadline| now >= deadline)
                 {
-                    (
-                        None,
-                        Some(QueryTerminationReason::QueryTerminationPreStartTimeout),
-                        false,
-                    )
+                    (None, Some(QueryLifecycleExpiration::PreStart), false)
                 } else if matches!(
                     state.phase,
                     QueryLifecyclePhase::ControlAttached
@@ -3020,9 +3043,18 @@ impl QueryLifecycleRegistry {
                 ) && state.last_heartbeat.is_some_and(|heartbeat| {
                     now.saturating_duration_since(heartbeat) >= self.config.heartbeat_timeout
                 }) {
+                    let last_heartbeat = state
+                        .last_heartbeat
+                        .expect("heartbeat expiration requires an observed heartbeat");
                     (
                         None,
-                        Some(QueryTerminationReason::QueryTerminationCoordinatorHeartbeatTimeout),
+                        Some(QueryLifecycleExpiration::Heartbeat(
+                            HeartbeatTimeoutObservation {
+                                generation: state.heartbeat_generation,
+                                last_heartbeat,
+                                sweep_now: now,
+                            },
+                        )),
                         false,
                     )
                 } else {
@@ -3036,8 +3068,23 @@ impl QueryLifecycleRegistry {
                 }
                 continue;
             }
-            if let Some(reason) = expiration {
-                self.request_termination(entry, reason);
+            if let Some(expiration) = expiration {
+                match expiration {
+                    QueryLifecycleExpiration::PreStart => {
+                        self.request_termination(
+                            entry,
+                            QueryTerminationReason::QueryTerminationPreStartTimeout,
+                        );
+                    }
+                    QueryLifecycleExpiration::Heartbeat(observation) => {
+                        // The observation and claim are deliberately separate
+                        // so sweeping never holds the entry lock across later
+                        // termination work.  Revalidate under the same lock as
+                        // the first-wins latch before committing the timeout.
+                        before_timeout_commit();
+                        self.request_heartbeat_timeout_if_current(entry, observation);
+                    }
+                }
                 continue;
             }
             if terminal_retention_expired {
@@ -3101,6 +3148,39 @@ impl QueryLifecycleRegistry {
         terminal_event: Option<QueryControlEvent>,
         detail: String,
     ) -> QueryTerminationReason {
+        self.try_request_termination_with_detail(
+            entry,
+            requested_reason,
+            terminal_event,
+            detail,
+            None,
+        )
+        .expect("unconditional termination request must produce a reason")
+    }
+
+    fn request_heartbeat_timeout_if_current(
+        &self,
+        entry: Arc<QueryLifecycleEntry>,
+        observation: HeartbeatTimeoutObservation,
+    ) {
+        let reason = QueryTerminationReason::QueryTerminationCoordinatorHeartbeatTimeout;
+        let _ = self.try_request_termination_with_detail(
+            entry,
+            reason,
+            None,
+            termination_detail(reason),
+            Some(observation),
+        );
+    }
+
+    fn try_request_termination_with_detail(
+        &self,
+        entry: Arc<QueryLifecycleEntry>,
+        requested_reason: QueryTerminationReason,
+        terminal_event: Option<QueryControlEvent>,
+        detail: String,
+        heartbeat_timeout: Option<HeartbeatTimeoutObservation>,
+    ) -> Option<QueryTerminationReason> {
         let already_terminated = {
             let state = entry.state.lock().expect("query lifecycle entry lock");
             state
@@ -3126,7 +3206,7 @@ impl QueryLifecycleRegistry {
                 };
                 let _ = events.try_send(termination_accepted_event(acknowledgement));
             }
-            return reason;
+            return Some(reason);
         }
         let (
             execution_id,
@@ -3141,7 +3221,23 @@ impl QueryLifecycleRegistry {
             // The early check above handles the normal idempotent case. A
             // racing caller can only observe the same first-wins reason.
             if let Some(reason) = state.termination_reason {
-                return reason;
+                return Some(reason);
+            }
+            if heartbeat_timeout.is_some_and(|observation| {
+                !matches!(
+                    state.phase,
+                    QueryLifecyclePhase::ControlAttached
+                        | QueryLifecyclePhase::Staging
+                        | QueryLifecyclePhase::Staged
+                        | QueryLifecyclePhase::Running
+                ) || state.heartbeat_generation != observation.generation
+                    || state.last_heartbeat != Some(observation.last_heartbeat)
+                    || observation
+                        .sweep_now
+                        .saturating_duration_since(observation.last_heartbeat)
+                        < self.config.heartbeat_timeout
+            }) {
+                return None;
             }
             state.termination_reason = Some(requested_reason);
             let initializing = state.phase == QueryLifecyclePhase::Initializing;
@@ -3231,7 +3327,7 @@ impl QueryLifecycleRegistry {
                 };
             self.schedule_failed_terminal_drain(entry, drain_timeout);
         }
-        requested_reason
+        Some(requested_reason)
     }
 
     #[allow(
@@ -3286,7 +3382,6 @@ impl QueryLifecycleRegistry {
             detail,
             sink,
             fact.profile().cloned(),
-            fact.statistics_payload().to_vec(),
         ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -3467,7 +3562,6 @@ impl QueryLifecycleRegistry {
                         detail,
                         SinkCommitReportSnapshot::default(),
                         None,
-                        Vec::new(),
                     ) {
                         Ok(snapshot) => snapshot,
                         Err(error) => {
@@ -4531,24 +4625,41 @@ impl QueryLifecycleRegistry {
         &self,
         execution_id: QueryExecutionId,
         sequence: u64,
-    ) -> Result<(), QueryLifecycleError> {
+    ) -> Result<QueryHeartbeatDisposition, QueryLifecycleError> {
         let entry = self.active_entry(execution_id)?;
         let events = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if state.termination_reason.is_some()
+                || matches!(
+                    state.phase,
+                    QueryLifecyclePhase::Terminating
+                        | QueryLifecyclePhase::TerminalRetained
+                        | QueryLifecyclePhase::Tombstone
+                )
+            {
+                // request_termination publishes correctness events after
+                // releasing this lock. A heartbeat can therefore observe the
+                // terminal phase just before LocalFailure/TerminalOutcome is
+                // enqueued. Preserve the stream so that retained event wins.
+                return Ok(QueryHeartbeatDisposition::TerminalDeliveryPending);
+            }
             if !matches!(
                 state.phase,
                 QueryLifecyclePhase::ControlAttached
                     | QueryLifecyclePhase::Staging
                     | QueryLifecyclePhase::Staged
                     | QueryLifecyclePhase::Running
-            ) || state.termination_reason.is_some()
-            {
+            ) {
                 return Err(QueryLifecycleError::new(
                     QueryLifecycleErrorCode::Terminated,
                     "query control is not active",
                 ));
             }
             state.last_heartbeat = Some(self.clock.now());
+            state.heartbeat_generation = state
+                .heartbeat_generation
+                .checked_add(1)
+                .expect("heartbeat generation must not wrap");
             state.events.clone()
         };
         if let Some(events) = events {
@@ -4561,7 +4672,7 @@ impl QueryLifecycleRegistry {
                     )
                 })?;
         }
-        Ok(())
+        Ok(QueryHeartbeatDisposition::Acknowledged)
     }
 
     fn prepare_credential_lease(
@@ -5033,6 +5144,12 @@ impl Drop for StageBuildPermit {
 }
 
 impl FragmentAdmissionPermit {
+    pub(crate) fn query_mem_limit(&self) -> Option<i64> {
+        let options = validated(self.entry.manifest.query_options());
+        let limit = options.as_proto().query_mem_limit;
+        (limit > 0).then_some(limit)
+    }
+
     #[cfg(test)]
     pub(crate) fn entry_for_test(&self) -> Arc<QueryLifecycleEntry> {
         Arc::clone(&self.entry)
@@ -5147,7 +5264,7 @@ impl Drop for FragmentAdmissionPermit {
 }
 
 impl BackendQueryControl for RegistryQueryControl {
-    fn heartbeat(&self, sequence: u64) -> Result<(), QueryLifecycleError> {
+    fn heartbeat(&self, sequence: u64) -> Result<QueryHeartbeatDisposition, QueryLifecycleError> {
         self.registry
             .upgrade()
             .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?

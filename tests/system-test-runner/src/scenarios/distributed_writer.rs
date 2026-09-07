@@ -48,9 +48,13 @@
 
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{CrossProcessChildEnvironment, ServerHandle};
+use novarocks_connector_iceberg::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
+use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -62,7 +66,11 @@ use super::connector::{
 
 const WRITER_OPENS: &str = "novarocks_backend_connector_write_writer_opens_total";
 const WRITER_TOTALS: &str = "novarocks_backend_connector_write_writer_totals";
+const WRITER_ABORTS: &str = "novarocks_backend_connector_write_writer_aborts_total";
+const WRITE_DEBUG_FAULTS: &str = "novarocks_backend_connector_write_debug_faults_total";
 const ROOT_PEAK: &str = "novarocks_backend_connector_write_root_prepared_set_peak";
+const RESULT_TERMINALS: &str = "novarocks_backend_fragment_result_terminals_total";
+const WRITER_PARTIAL_TOTALS: &str = "novarocks_table_writer_partial_totals";
 
 /// `LakePublicationFamily::Write` — INSERT and INSERT OVERWRITE.
 const WRITE_FAMILY: &str = "write";
@@ -80,6 +88,11 @@ const SEED_FILES: i64 = 6;
 const SEED_ROWS: i64 = SEED_ROWS_PER_FILE * SEED_FILES;
 /// `SEED_ROWS * (SEED_ROWS + 1) / 2`, the sum of `1..=SEED_ROWS`.
 const SEED_SUM: i64 = SEED_ROWS * (SEED_ROWS + 1) / 2;
+const WIDE_STATISTICS_CHANNELS: usize = 1_024;
+const WIDE_SEED_FILES: i64 = 12;
+const WIDE_ROWS_PER_FILE: i64 = 4;
+const WIDE_ROWS: i64 = WIDE_ROWS_PER_FILE * WIDE_SEED_FILES;
+const STATISTICS_PACKET_BYTES: usize = 320 * 1024;
 
 /// One sleeping row per file for the abort case's source, and how long each
 /// row sleeps.
@@ -95,6 +108,7 @@ const ABORT_DELAY_S: i64 = 5;
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedWriterDataflow),
+        Box::new(DistributedStatisticsDataflow),
         Box::new(DistributedWriterOverwrite),
         Box::new(DistributedWriterRowLevel),
         Box::new(DistributedWriterFaults),
@@ -107,6 +121,11 @@ struct WriteCounters {
     opens: f64,
     rows: f64,
     commit_fragments: f64,
+    abort_succeeded: f64,
+    abort_failed: f64,
+    append_holds: f64,
+    result_finished: f64,
+    result_aborted: f64,
     root_peak_entries: f64,
 }
 
@@ -120,6 +139,36 @@ fn write_counters(context: &mut ScenarioContext, index: usize) -> Result<WriteCo
             WRITER_TOTALS,
             "unit",
             "commit_fragments",
+        )?,
+        abort_succeeded: handle.backend_connector_write_metric(
+            index,
+            WRITER_ABORTS,
+            "outcome",
+            "succeeded",
+        )?,
+        abort_failed: handle.backend_connector_write_metric(
+            index,
+            WRITER_ABORTS,
+            "outcome",
+            "failed",
+        )?,
+        append_holds: handle.backend_connector_write_metric(
+            index,
+            WRITE_DEBUG_FAULTS,
+            "kind",
+            "append_hold",
+        )?,
+        result_finished: handle.backend_connector_write_metric(
+            index,
+            RESULT_TERMINALS,
+            "terminal",
+            "finished",
+        )?,
+        result_aborted: handle.backend_connector_write_metric(
+            index,
+            RESULT_TERMINALS,
+            "terminal",
+            "aborted",
         )?,
         root_peak_entries: handle.backend_connector_write_metric(
             index,
@@ -137,12 +186,68 @@ fn all_write_counters(context: &mut ScenarioContext) -> Result<Vec<WriteCounters
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct WriterPartialCounters {
+    batches: f64,
+    rows: f64,
+    bytes: f64,
+    non_null_channels: f64,
+    sparse_rows: f64,
+}
+
+fn writer_partial_counters(
+    context: &mut ScenarioContext,
+    index: usize,
+) -> Result<WriterPartialCounters> {
+    let handle = context.handle();
+    let metric =
+        |unit| handle.backend_connector_write_metric(index, WRITER_PARTIAL_TOTALS, "unit", unit);
+    Ok(WriterPartialCounters {
+        batches: metric("batches")?,
+        rows: metric("rows")?,
+        bytes: metric("bytes")?,
+        non_null_channels: metric("non_null_channels")?,
+        sparse_rows: metric("sparse_rows")?,
+    })
+}
+
+fn all_writer_partial_counters(
+    context: &mut ScenarioContext,
+) -> Result<Vec<WriterPartialCounters>> {
+    let count = context.handle().be_count();
+    (0..count)
+        .map(|index| writer_partial_counters(context, index))
+        .collect()
+}
+
+fn writer_partial_delta(
+    before: &[WriterPartialCounters],
+    after: &[WriterPartialCounters],
+) -> Vec<WriterPartialCounters> {
+    before
+        .iter()
+        .zip(after)
+        .map(|(before, after)| WriterPartialCounters {
+            batches: after.batches - before.batches,
+            rows: after.rows - before.rows,
+            bytes: after.bytes - before.bytes,
+            non_null_channels: after.non_null_channels - before.non_null_channels,
+            sparse_rows: after.sparse_rows - before.sparse_rows,
+        })
+        .collect()
+}
+
 /// What one statement did to the write data plane, per backend.
 #[derive(Debug)]
 struct WriteDelta {
     opens: Vec<f64>,
     rows: f64,
     commit_fragments: f64,
+    abort_succeeded: f64,
+    abort_failed: f64,
+    append_holds: Vec<f64>,
+    result_finished: f64,
+    result_aborted: f64,
     /// Backends whose writer-open counter moved. A row count alone cannot
     /// distinguish a distributed write from one backend doing all of it.
     writing_backends: Vec<usize>,
@@ -164,6 +269,31 @@ fn write_delta(before: &[WriteCounters], after: &[WriteCounters]) -> WriteDelta 
             .iter()
             .zip(after)
             .map(|(before, after)| after.commit_fragments - before.commit_fragments)
+            .sum(),
+        abort_succeeded: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.abort_succeeded - before.abort_succeeded)
+            .sum(),
+        abort_failed: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.abort_failed - before.abort_failed)
+            .sum(),
+        append_holds: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.append_holds - before.append_holds)
+            .collect(),
+        result_finished: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.result_finished - before.result_finished)
+            .sum(),
+        result_aborted: before
+            .iter()
+            .zip(after)
+            .map(|(before, after)| after.result_aborted - before.result_aborted)
             .sum(),
         writing_backends: before
             .iter()
@@ -658,6 +788,598 @@ impl Scenario for DistributedWriterDataflow {
         await_resource_convergence(context, &baseline, "distributed writer dataflow")?;
         Ok(())
     }
+}
+
+/// Native acceptance for the ordinary-aggregate statistics data plane.
+///
+/// This intentionally combines a full-table ANALYZE with a collect-on-write
+/// INSERT in one fresh cluster. ANALYZE proves that an ordinary scan/aggregate
+/// plan reaches every backend. The INSERT then proves that rows written by all
+/// three backend processes contribute to one current-snapshot Theta artifact,
+/// while exactly one root aggregates the prepared set and the frontend records
+/// exactly one provider publication.
+///
+/// The Hadoop catalog's version hint is part of the external catalog format.
+/// Requiring it to advance by one is the process-independent assertion that
+/// data and SetStatistics were committed by one catalog transaction rather
+/// than by a data commit followed by a statistics commit.
+struct DistributedStatisticsDataflow;
+
+impl Scenario for DistributedStatisticsDataflow {
+    fn name(&self) -> &'static str {
+        "statistics/native-aggregate-and-collect-on-write"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut config = connector_launch_config();
+        let backend = config.config_overlay.be.get_or_insert_with(String::new);
+        let runtime_cache = backend.find("[runtime.cache]").ok_or_else(|| {
+            anyhow::anyhow!("connector backend overlay has no runtime cache table")
+        })?;
+        backend.insert_str(
+            runtime_cache,
+            &format!("exchange_max_transmit_batched_bytes = {STATISTICS_PACKET_BYTES}\n"),
+        );
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect native statistics control session")?,
+        )?;
+
+        const CATALOG: &str = "native_statistics";
+        const DATABASE: &str = "native_statistics_db";
+        const SOURCE: &str = "native_statistics_source";
+        const TABLE: &str = "native_statistics_target";
+        let warehouse = create_warehouse(context, "native-statistics-dataflow")?;
+        let source = format!("{CATALOG}.{DATABASE}.{SOURCE}");
+        let target = format!("{CATALOG}.{DATABASE}.{TABLE}");
+
+        context.action("seed six source files for a three-backend statistics scan");
+        create_catalog(&mut control, CATALOG, &warehouse)?;
+        control
+            .query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+            .context("create native statistics database")?;
+        control
+            .query_drop(format!(
+                "CREATE TABLE {source} (v BIGINT) TBLPROPERTIES \
+                 ('novarocks.statistics.collect-on-write' = 'false')"
+            ))
+            .context("create native statistics source")?;
+        for file in 0..SEED_FILES {
+            let low = file * SEED_ROWS_PER_FILE + 1;
+            let high = (file + 1) * SEED_ROWS_PER_FILE;
+            control
+                .query_drop(format!(
+                    "INSERT INTO {source} SELECT generate_series FROM \
+                     TABLE(generate_series({low}, {high}))"
+                ))
+                .with_context(|| format!("seed native statistics rows {low}..{high}"))?;
+        }
+
+        let source_root = hadoop_table_root(&warehouse, DATABASE, SOURCE);
+        let source_metadata_before = hadoop_metadata_version(&source_root)?;
+        let source_snapshots_before = snapshot_count(&mut control, &source)?;
+        let analyze_tasks_before = task_admission_counts(context)?;
+
+        context.action("run ordinary ANALYZE across all three backend processes");
+        control
+            .query_drop(format!("ANALYZE TABLE {source}"))
+            .context("run native distributed ANALYZE")?;
+
+        let analyze_tasks_after = task_admission_counts(context)?;
+        let analyze_task_delta = assert_every_backend_accepted_task(
+            &analyze_tasks_before,
+            &analyze_tasks_after,
+            "native distributed ANALYZE",
+        )?;
+        let source_metadata_after = hadoop_metadata_version(&source_root)?;
+        if source_metadata_after != source_metadata_before + 1 {
+            bail!(
+                "ANALYZE advanced Hadoop metadata from v{source_metadata_before} to \
+                 v{source_metadata_after}; one statistics publication must create exactly one \
+                 metadata version"
+            );
+        }
+        let source_snapshots_after = snapshot_count(&mut control, &source)?;
+        if source_snapshots_after != source_snapshots_before {
+            bail!(
+                "ANALYZE changed {source} snapshot count from {source_snapshots_before} to \
+                 {source_snapshots_after}; statistics publication must attach to the existing \
+                 snapshot"
+            );
+        }
+        let analyze_ndv = assert_current_theta_metadata(
+            &source_root,
+            SEED_ROWS as f64,
+            "native distributed ANALYZE",
+        )?;
+        assert_show_theta_statistics(
+            &mut control,
+            &source,
+            "v",
+            SEED_ROWS as f64,
+            "native distributed ANALYZE",
+        )?;
+
+        control
+            .query_drop(format!(
+                "CREATE TABLE {target} (v BIGINT) TBLPROPERTIES \
+                 ('novarocks.statistics.collect-on-write' = 'true')"
+            ))
+            .context("create collect-on-write target")?;
+        let target_root = hadoop_table_root(&warehouse, DATABASE, TABLE);
+        let metadata_before = hadoop_metadata_version(&target_root)?;
+        let snapshots_before = snapshot_count(&mut control, &target)?;
+        let before = all_write_counters(context)?;
+        let ceiling = peak_ceiling(&before);
+        let terminals_before = publication_terminals(context, WRITE_FAMILY)?;
+        let tasks_before = task_admission_counts(context)?;
+
+        context.action("collect statistics from the same pages written on all three backends");
+        control
+            .query_drop(format!("INSERT INTO {target} SELECT v FROM {source}"))
+            .context("run native collect-on-write INSERT")?;
+
+        let after = all_write_counters(context)?;
+        let delta = write_delta(&before, &after);
+        if delta.writing_backends.len() != 3 {
+            bail!(
+                "collect-on-write opened writers on {:?}; native 1FE+3BE acceptance requires \
+                 all three backends",
+                delta.writing_backends
+            );
+        }
+        if (delta.rows - SEED_ROWS as f64).abs() > f64::EPSILON {
+            bail!(
+                "collect-on-write writers accepted {} rows; expected {SEED_ROWS}",
+                delta.rows
+            );
+        }
+        if delta.commit_fragments < 3.0 {
+            bail!(
+                "collect-on-write produced {} commit fragments across three writing backends",
+                delta.commit_fragments
+            );
+        }
+        let root = identify_root(
+            &after,
+            ceiling,
+            delta.commit_fragments,
+            "native collect-on-write",
+        )?;
+        if !delta.writing_backends.iter().any(|&index| index != root) {
+            bail!(
+                "collect-on-write root BE[{root}] was also the only writer; no writer result \
+                 crossed a process boundary"
+            );
+        }
+        let tasks_after = task_admission_counts(context)?;
+        let write_task_delta = assert_every_backend_accepted_task(
+            &tasks_before,
+            &tasks_after,
+            "native collect-on-write INSERT",
+        )?;
+
+        let terminals_after = publication_terminals(context, WRITE_FAMILY)?;
+        assert_committed_once(terminals_before, terminals_after, "native collect-on-write")?;
+        let snapshots_after = snapshot_count(&mut control, &target)?;
+        if snapshots_after != snapshots_before + 1 {
+            bail!(
+                "collect-on-write moved {target} from {snapshots_before} to {snapshots_after} \
+                 snapshots; data and statistics must publish as one snapshot"
+            );
+        }
+        let metadata_after = hadoop_metadata_version(&target_root)?;
+        if metadata_after != metadata_before + 1 {
+            bail!(
+                "collect-on-write advanced Hadoop metadata from v{metadata_before} to \
+                 v{metadata_after}; data and SetStatistics must share one catalog commit"
+            );
+        }
+        let write_ndv = assert_current_theta_metadata(
+            &target_root,
+            SEED_ROWS as f64,
+            "native collect-on-write",
+        )?;
+        assert_show_theta_statistics(
+            &mut control,
+            &target,
+            "v",
+            SEED_ROWS as f64,
+            "native collect-on-write",
+        )?;
+        let rows = row_count(&mut control, &target)?;
+        if rows != SEED_ROWS {
+            bail!("collect-on-write target contains {rows} rows; expected {SEED_ROWS}");
+        }
+
+        const WIDE_SOURCE: &str = "native_statistics_wide_source";
+        const WIDE_TARGET: &str = "native_statistics_wide_target";
+        let wide_source = format!("{CATALOG}.{DATABASE}.{WIDE_SOURCE}");
+        let wide_target = format!("{CATALOG}.{DATABASE}.{WIDE_TARGET}");
+        let wide_schema = (0..WIDE_STATISTICS_CHANNELS)
+            .map(|index| format!("v{index} BIGINT"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let wide_column_names = (0..WIDE_STATISTICS_CHANNELS)
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let wide_values = (0..WIDE_STATISTICS_CHANNELS)
+            .map(|index| format!("generate_series + {}", index * 1_000_000))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        context.action("seed a 1024-field source with twelve independently splittable files");
+        control
+            .query_drop(format!(
+                "CREATE TABLE {wide_source} ({wide_schema}) TBLPROPERTIES \
+                 ('novarocks.statistics.collect-on-write' = 'false')"
+            ))
+            .context("create wide native statistics source")?;
+        for file in 0..WIDE_SEED_FILES {
+            let low = file * WIDE_ROWS_PER_FILE + 1;
+            let high = (file + 1) * WIDE_ROWS_PER_FILE;
+            control
+                .query_drop(format!(
+                    "INSERT INTO {wide_source} SELECT {wide_values} FROM \
+                     TABLE(generate_series({low}, {high}))"
+                ))
+                .with_context(|| format!("seed wide native statistics rows {low}..{high}"))?;
+        }
+        control
+            .query_drop(format!(
+                "CREATE TABLE {wide_target} ({wide_schema}) TBLPROPERTIES \
+                 ('novarocks.statistics.collect-on-write' = 'true')"
+            ))
+            .context("create wide collect-on-write target")?;
+
+        let wide_target_root = hadoop_table_root(&warehouse, DATABASE, WIDE_TARGET);
+        let wide_metadata_before = hadoop_metadata_version(&wide_target_root)?;
+        let wide_snapshots_before = snapshot_count(&mut control, &wide_target)?;
+        let wide_write_before = all_write_counters(context)?;
+        let wide_peak_ceiling = peak_ceiling(&wide_write_before);
+        let wide_partial_before = all_writer_partial_counters(context)?;
+        let wide_terminals_before = publication_terminals(context, WRITE_FAMILY)?;
+
+        context.action(
+            "collect 1024 writer aggregates through sparse multi-batch output on all backends",
+        );
+        control
+            .query_drop(format!(
+                "INSERT INTO {wide_target} SELECT {wide_column_names} FROM {wide_source}"
+            ))
+            .context("run wide native collect-on-write INSERT")?;
+
+        let wide_write_after = all_write_counters(context)?;
+        let wide_write_delta = write_delta(&wide_write_before, &wide_write_after);
+        if wide_write_delta.writing_backends.len() != 3 {
+            bail!(
+                "wide collect-on-write opened writers on {:?}; expected all three backends",
+                wide_write_delta.writing_backends
+            );
+        }
+        if (wide_write_delta.rows - WIDE_ROWS as f64).abs() > f64::EPSILON {
+            bail!(
+                "wide collect-on-write writers accepted {} rows; expected {WIDE_ROWS}",
+                wide_write_delta.rows
+            );
+        }
+        let wide_root = identify_root(
+            &wide_write_after,
+            wide_peak_ceiling,
+            wide_write_delta.commit_fragments,
+            "wide native collect-on-write",
+        )?;
+
+        let wide_partial_after = all_writer_partial_counters(context)?;
+        let wide_partial_delta = writer_partial_delta(&wide_partial_before, &wide_partial_after);
+        assert_wide_writer_partials(&wide_write_delta.opens, &wide_partial_delta)?;
+
+        let wide_terminals_after = publication_terminals(context, WRITE_FAMILY)?;
+        assert_committed_once(
+            wide_terminals_before,
+            wide_terminals_after,
+            "wide native collect-on-write",
+        )?;
+        let wide_snapshots_after = snapshot_count(&mut control, &wide_target)?;
+        if wide_snapshots_after != wide_snapshots_before + 1 {
+            bail!(
+                "wide collect-on-write moved {wide_target} from {wide_snapshots_before} to \
+                 {wide_snapshots_after} snapshots; expected one"
+            );
+        }
+        let wide_metadata_after = hadoop_metadata_version(&wide_target_root)?;
+        if wide_metadata_after != wide_metadata_before + 1 {
+            bail!(
+                "wide collect-on-write advanced Hadoop metadata from v{wide_metadata_before} to \
+                 v{wide_metadata_after}; data and 1024 statistics artifacts must share one commit"
+            );
+        }
+        assert_current_theta_metadata_count(
+            &wide_target_root,
+            WIDE_ROWS as f64,
+            WIDE_STATISTICS_CHANNELS,
+            "wide native collect-on-write",
+        )?;
+        let wide_rows = row_count(&mut control, &wide_target)?;
+        if wide_rows != WIDE_ROWS {
+            bail!("wide collect-on-write target contains {wide_rows} rows; expected {WIDE_ROWS}");
+        }
+
+        println!(
+            "native-statistics-dataflow topology=1FE+3BE \
+             analyze_task_delta={analyze_task_delta:?} analyze_ndv={analyze_ndv} \
+             write_task_delta={write_task_delta:?} writing_backends={:?} root_be={} \
+             commit_fragments={} write_ndv={} metadata_versions={}=>{} \
+             wide_channels={} wide_root_be={} wide_partial_delta={wide_partial_delta:?}",
+            delta.writing_backends,
+            root,
+            delta.commit_fragments,
+            write_ndv,
+            metadata_before,
+            metadata_after,
+            WIDE_STATISTICS_CHANNELS,
+            wide_root,
+        );
+
+        await_frontend_attempts_drained(context, "the native statistics dataflow")?;
+        await_resource_convergence(context, &baseline, "native statistics dataflow")?;
+        Ok(())
+    }
+}
+
+type TableStatisticsRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+fn assert_show_theta_statistics(
+    control: &mut mysql::Conn,
+    table: &str,
+    column: &str,
+    expected_ndv: f64,
+    label: &str,
+) -> Result<()> {
+    let rows: Vec<TableStatisticsRow> = control
+        .query(format!("SHOW TABLE STATS {table}"))
+        .with_context(|| format!("read {label} statistics through the provider"))?;
+    let metric = format!("theta_ndv:{column}");
+    let Some((_, value, status, basis_version, source, numeric_nature, basis_relation)) =
+        rows.into_iter().find(|row| row.0 == metric)
+    else {
+        bail!("{label} did not expose {metric} through SHOW TABLE STATS");
+    };
+    let value = value
+        .with_context(|| format!("{label} {metric} is AVAILABLE but has no scalar value"))?
+        .parse::<f64>()
+        .with_context(|| format!("parse {label} {metric} value"))?;
+    assert_theta_estimate(value, expected_ndv, label)?;
+    if status != "AVAILABLE"
+        || basis_version != "SAME"
+        || source != "PROVIDER_ARTIFACT"
+        || numeric_nature != "APPROXIMATE"
+        || basis_relation != "IDENTICAL"
+    {
+        bail!(
+            "{label} {metric} has unexpected provider evidence: status={status:?} \
+             basis_version={basis_version:?} source={source:?} \
+             numeric_nature={numeric_nature:?} basis_relation={basis_relation:?}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_wide_writer_partials(
+    writer_opens: &[f64],
+    partials: &[WriterPartialCounters],
+) -> Result<()> {
+    if writer_opens.len() != 3 || partials.len() != 3 {
+        bail!("wide writer partial evidence is not from exactly three backends");
+    }
+    for (index, (opens, partial)) in writer_opens.iter().zip(partials).enumerate() {
+        if *opens <= 0.0 {
+            bail!("wide collect-on-write opened no writer on BE[{index}]");
+        }
+        let expected_channels = *opens * WIDE_STATISTICS_CHANNELS as f64;
+        if partial.non_null_channels != expected_channels {
+            bail!(
+                "BE[{index}] emitted {} non-null writer partial channels for {opens} writers; \
+                 expected {expected_channels}",
+                partial.non_null_channels
+            );
+        }
+        if partial.batches != partial.rows || partial.rows <= *opens {
+            bail!(
+                "BE[{index}] writer partial delta is {partial:?}; the {opens} writers must each \
+                 split their 1024 channels into more than one single-row batch"
+            );
+        }
+        if partial.sparse_rows <= 0.0 || partial.sparse_rows > partial.rows {
+            bail!(
+                "BE[{index}] writer partial delta is {partial:?}; at least one row must be sparse \
+                 under the {STATISTICS_PACKET_BYTES}-byte packet budget"
+            );
+        }
+        if partial.bytes <= 0.0 {
+            bail!("BE[{index}] emitted writer partial rows without encoded bytes");
+        }
+    }
+    Ok(())
+}
+
+fn hadoop_table_root(warehouse: &Path, database: &str, table: &str) -> std::path::PathBuf {
+    warehouse.join(database).join(table)
+}
+
+fn hadoop_metadata_version(table_root: &Path) -> Result<u32> {
+    let hint = table_root.join("metadata/version-hint.text");
+    std::fs::read_to_string(&hint)
+        .with_context(|| format!("read Hadoop version hint {}", hint.display()))?
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("parse Hadoop version hint {}", hint.display()))
+}
+
+fn assert_current_theta_metadata(table_root: &Path, expected_ndv: f64, label: &str) -> Result<f64> {
+    let values = assert_current_theta_metadata_count(table_root, expected_ndv, 1, label)?;
+    Ok(values[0])
+}
+
+fn assert_current_theta_metadata_count(
+    table_root: &Path,
+    expected_ndv: f64,
+    expected_blobs: usize,
+    label: &str,
+) -> Result<Vec<f64>> {
+    let version = hadoop_metadata_version(table_root)?;
+    let path = table_root
+        .join("metadata")
+        .join(format!("v{version}.metadata.json"));
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read {label} metadata {}", path.display()))?;
+    let metadata: TableMetadata = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode {label} Iceberg metadata {}", path.display()))?;
+    let current = metadata
+        .current_snapshot()
+        .with_context(|| format!("{label} table has no current snapshot"))?;
+    let statistics = metadata
+        .statistics_iter()
+        .filter(|statistics| statistics.snapshot_id == current.snapshot_id())
+        .collect::<Vec<_>>();
+    let [statistics] = statistics.as_slice() else {
+        bail!(
+            "{label} has {} StatisticsFiles for current snapshot {}; expected exactly one",
+            statistics.len(),
+            current.snapshot_id()
+        );
+    };
+    let theta = statistics
+        .blob_metadata
+        .iter()
+        .filter(|blob| blob.r#type == APACHE_DATASKETCHES_THETA_V1)
+        .collect::<Vec<_>>();
+    if theta.len() != expected_blobs {
+        bail!(
+            "{label} current StatisticsFile has {} Theta blobs; expected {expected_blobs}",
+            theta.len(),
+        );
+    }
+    let mut fields = BTreeSet::new();
+    let mut values = Vec::with_capacity(theta.len());
+    for blob in theta {
+        if blob.snapshot_id != current.snapshot_id()
+            || blob.sequence_number != current.sequence_number()
+            || blob.fields.len() != 1
+        {
+            bail!(
+                "{label} Theta provenance does not match the current snapshot: \
+                 snapshot={} sequence={} fields={:?}, expected snapshot={} sequence={}",
+                blob.snapshot_id,
+                blob.sequence_number,
+                blob.fields,
+                current.snapshot_id(),
+                current.sequence_number()
+            );
+        }
+        if !fields.insert(blob.fields[0]) {
+            bail!("{label} repeats Theta field identity {}", blob.fields[0]);
+        }
+        let ndv = blob
+            .properties
+            .get("ndv")
+            .with_context(|| format!("{label} Theta blob has no ndv property"))?
+            .parse::<f64>()
+            .with_context(|| format!("parse {label} Theta ndv property"))?;
+        assert_theta_estimate(ndv, expected_ndv, label)?;
+        values.push(ndv);
+    }
+    let puffin_location = statistics
+        .statistics_path
+        .strip_prefix("file://")
+        .ok_or_else(|| {
+            anyhow!(
+                "{label} expected a local file URI for Puffin verification, got {}",
+                statistics.statistics_path
+            )
+        })?;
+    let puffin_path = Path::new(puffin_location);
+    if !puffin_path.is_file() || statistics.file_size_in_bytes <= 0 {
+        bail!(
+            "{label} published missing or empty Puffin file {} (metadata size={})",
+            puffin_path.display(),
+            statistics.file_size_in_bytes
+        );
+    }
+    Ok(values)
+}
+
+fn assert_theta_estimate(actual: f64, expected: f64, label: &str) -> Result<()> {
+    // The default nominal entries give a much tighter interval at this scale;
+    // 15% deliberately avoids freezing one DataSketches sampling realization
+    // while still rejecting the loss of any one of three balanced BE inputs.
+    let tolerance = expected * 0.15;
+    if (actual - expected).abs() > tolerance {
+        bail!(
+            "{label} Theta NDV {actual} is outside {expected} +/- {tolerance}; a current-snapshot \
+             artifact must include the disjoint values written or scanned by every backend"
+        );
+    }
+    Ok(())
+}
+
+fn task_admission_counts(context: &mut ScenarioContext) -> Result<Vec<f64>> {
+    (0..context.handle().be_count())
+        .map(|index| {
+            context
+                .handle()
+                .backend_task_execution_tasks_created(index)
+                .with_context(|| format!("read accepted EES tasks on BE[{index}]"))
+        })
+        .collect()
+}
+
+fn assert_every_backend_accepted_task(
+    before: &[f64],
+    after: &[f64],
+    label: &str,
+) -> Result<Vec<f64>> {
+    if before.len() != 3 || after.len() != 3 {
+        bail!("{label} task-admission evidence is not from exactly three backends");
+    }
+    let mut delta = Vec::with_capacity(before.len());
+    for (index, (before, after)) in before.iter().zip(after).enumerate() {
+        if after < before {
+            bail!(
+                "{label} BE[{index}] EES task-admission metric regressed from {before} to \
+                 {after}; backend restart or metric-owner loss invalidates the evidence"
+            );
+        }
+        delta.push(after - before);
+    }
+    if delta.iter().any(|count| *count == 0.0) {
+        bail!(
+            "{label} accepted-task deltas are {delta:?}; every backend in native 1FE+3BE \
+             must accept at least one EES task from this statement"
+        );
+    }
+    Ok(delta)
 }
 
 /// The same dataflow claims for a full-table overwrite.
@@ -1158,6 +1880,17 @@ enum WriteFault {
     WriterEgress,
     /// The root rejects a commit-fragment carrier at validation.
     RootValidation,
+    /// One writer rejects the ordinary partial aggregate update for its input
+    /// page, after writer capacity was reserved but before either side accepts
+    /// the page.
+    PartialAggregateUpdate,
+    /// One writer rejects ordinary partial aggregate finalization at EOS.
+    PartialAggregateFinalize,
+    /// The single root rejects merging a writer partial into its ordinary
+    /// final aggregate.
+    FinalAggregateMerge,
+    /// The single root rejects ordinary final aggregate finalization at EOS.
+    FinalAggregateFinalize,
     /// One backend's participant task is failed after it published RUNNING.
     /// Its writers were already opened while the task was prepared, but the
     /// drivers never run, so the stream it owes the root aggregation never
@@ -1166,6 +1899,10 @@ enum WriteFault {
     /// The frontend's attempt is aborted while its tasks are running, so it
     /// never fetches the root's complete prepared write set.
     FetchAbort,
+    /// The session's own deadline fires after every backend has entered a live
+    /// writer append. Cancellation must abort those provider writers and must
+    /// not publish a successful Root EOF.
+    DeadlineAbort,
 }
 
 /// The backend the severed-stream case arms. Fixed so the scenario can name
@@ -1213,6 +1950,10 @@ impl WriteFault {
                 .be_log_count(index, marker)
                 .with_context(|| format!("count {marker} on BE[{index}]")),
             InjectionEvidence::EveryBackend(marker) => backend_marker_total(context, marker),
+            InjectionEvidence::AppendHolds => Ok(all_write_counters(context)?
+                .iter()
+                .map(|counters| counters.append_holds as usize)
+                .sum()),
         }
     }
 
@@ -1225,6 +1966,18 @@ impl WriteFault {
             Self::RootValidation => InjectionEvidence::Frontend(
                 "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-root-failure ",
             ),
+            Self::PartialAggregateUpdate => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-partial-update-failure ",
+            ),
+            Self::PartialAggregateFinalize => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-partial-finalize-failure ",
+            ),
+            Self::FinalAggregateMerge => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-final-merge-failure ",
+            ),
+            Self::FinalAggregateFinalize => InjectionEvidence::Frontend(
+                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-final-finalize-failure ",
+            ),
             Self::SeveredWriterStream => {
                 InjectionEvidence::Backend(SEVERED_BACKEND, TASK_EXECUTION_FAILURE_INJECTED)
             }
@@ -1235,6 +1988,7 @@ impl WriteFault {
             // the alternative -- a client error with no abort behind it -- is
             // exactly what a timeout looks like.
             Self::FetchAbort => InjectionEvidence::EveryBackend(TASK_CONTEXT_ABORT_APPLIED),
+            Self::DeadlineAbort => InjectionEvidence::AppendHolds,
         }
     }
 
@@ -1245,6 +1999,19 @@ impl WriteFault {
         match self {
             Self::WriterEgress => Some("injected connector write writer failure"),
             Self::RootValidation => Some("injected connector write root failure"),
+            Self::PartialAggregateUpdate => {
+                Some("injected connector write connector-write-partial-update-failure")
+            }
+            Self::PartialAggregateFinalize => {
+                Some("injected connector write connector-write-partial-finalize-failure")
+            }
+            Self::FinalAggregateMerge => {
+                Some("injected connector write connector-write-final-merge-failure")
+            }
+            Self::FinalAggregateFinalize => {
+                Some("injected connector write connector-write-final-finalize-failure")
+            }
+            Self::DeadlineAbort => Some("query timed out after"),
             Self::SeveredWriterStream | Self::FetchAbort => None,
         }
     }
@@ -1253,9 +2020,14 @@ impl WriteFault {
     const fn statement<'a>(&self, statements: &WriteStatements<'a>) -> &'a str {
         match self {
             Self::FetchAbort => statements.delayed,
-            Self::WriterEgress | Self::RootValidation | Self::SeveredWriterStream => {
-                statements.full
-            }
+            Self::WriterEgress
+            | Self::RootValidation
+            | Self::PartialAggregateUpdate
+            | Self::PartialAggregateFinalize
+            | Self::FinalAggregateMerge
+            | Self::FinalAggregateFinalize
+            | Self::SeveredWriterStream
+            | Self::DeadlineAbort => statements.full,
         }
     }
 
@@ -1274,7 +2046,63 @@ impl WriteFault {
                 }
                 Ok(())
             }
-            Self::WriterEgress | Self::RootValidation | Self::FetchAbort => Ok(()),
+            Self::DeadlineAbort => {
+                if delta.append_holds.len() != 3
+                    || delta.append_holds.iter().any(|holds| *holds != 1.0)
+                {
+                    bail!(
+                        "{case}: the query-scoped append hold must fire exactly once on each BE; \
+                         holds={:?}",
+                        delta.append_holds
+                    );
+                }
+                for (index, (opens, holds)) in
+                    delta.opens.iter().zip(&delta.append_holds).enumerate()
+                {
+                    if *opens < *holds {
+                        bail!(
+                            "{case}: BE[{index}] fired {holds} append hold(s) after opening only \
+                             {opens} writer(s)"
+                        );
+                    }
+                }
+                let held = delta.append_holds.iter().sum::<f64>();
+                if delta.abort_succeeded < held {
+                    bail!(
+                        "{case}: {held} live provider writers were held but only {} provider abort \
+                         calls completed successfully",
+                        delta.abort_succeeded
+                    );
+                }
+                if delta.abort_failed != 0.0 {
+                    bail!(
+                        "{case}: {} provider writer abort call(s) failed",
+                        delta.abort_failed
+                    );
+                }
+                if delta.result_finished != 0.0 {
+                    bail!(
+                        "{case}: the native Root result owner published {} successful EOF \
+                         terminal(s) after the deadline",
+                        delta.result_finished
+                    );
+                }
+                if delta.result_aborted != 1.0 {
+                    bail!(
+                        "{case}: the native Root result owner published {} abort terminal(s); \
+                         expected exactly one",
+                        delta.result_aborted
+                    );
+                }
+                Ok(())
+            }
+            Self::WriterEgress
+            | Self::RootValidation
+            | Self::PartialAggregateUpdate
+            | Self::PartialAggregateFinalize
+            | Self::FinalAggregateMerge
+            | Self::FinalAggregateFinalize
+            | Self::FetchAbort => Ok(()),
         }
     }
 
@@ -1282,8 +2110,13 @@ impl WriteFault {
         match self {
             Self::WriterEgress => "a writer that fails at commit-fragment egress",
             Self::RootValidation => "a root that rejects a commit-fragment carrier",
+            Self::PartialAggregateUpdate => "a writer partial aggregate that rejects input",
+            Self::PartialAggregateFinalize => "a writer partial aggregate that rejects EOS",
+            Self::FinalAggregateMerge => "a root final aggregate that rejects a partial",
+            Self::FinalAggregateFinalize => "a root final aggregate that rejects EOS",
             Self::SeveredWriterStream => "a writer stream that never reaches the root aggregation",
             Self::FetchAbort => "an aborted attempt that never fetches the root's result",
+            Self::DeadlineAbort => "a deadline that fires after provider writers enter append",
         }
     }
 }
@@ -1297,6 +2130,8 @@ enum InjectionEvidence {
     /// Anywhere across the backends, summed, because which backends the
     /// marker reaches is a property of the plan rather than of the cluster.
     EveryBackend(&'static str),
+    /// The provider-owned append-hold counter across every backend.
+    AppendHolds,
 }
 
 /// The two write statements the fault matrix runs.
@@ -1367,7 +2202,8 @@ impl Scenario for DistributedWriterFaults {
         seed_delay_source_files(&mut control, CATALOG, DATABASE, DELAY_SOURCE)?;
         control
             .query_drop(format!(
-                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
+                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT) \
+                 TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'true')"
             ))
             .context("create distributed writer fault table")?;
 
@@ -1390,8 +2226,13 @@ impl Scenario for DistributedWriterFaults {
         for fault in [
             WriteFault::WriterEgress,
             WriteFault::RootValidation,
+            WriteFault::PartialAggregateUpdate,
+            WriteFault::PartialAggregateFinalize,
+            WriteFault::FinalAggregateMerge,
+            WriteFault::FinalAggregateFinalize,
             WriteFault::SeveredWriterStream,
             WriteFault::FetchAbort,
+            WriteFault::DeadlineAbort,
         ] {
             let case = fault.case();
             context.action(format!("inject {case} and require no snapshot"));
@@ -1416,8 +2257,16 @@ impl Scenario for DistributedWriterFaults {
             let commits = assert_commit_never_invoked(before_terminals, after_terminals, case)?;
             println!(
                 "distributed-writer-faults case={case:?} commit_invocations={commits} \
-                 writer_opens_delta={:?} commit_fragments_delta={}",
-                delta.opens, delta.commit_fragments
+                 writer_opens_delta={:?} commit_fragments_delta={} append_holds_delta={:?} \
+                 provider_abort_succeeded_delta={} provider_abort_failed_delta={} \
+                 root_result_finished_delta={} root_result_aborted_delta={}",
+                delta.opens,
+                delta.commit_fragments,
+                delta.append_holds,
+                delta.abort_succeeded,
+                delta.abort_failed,
+                delta.result_finished,
+                delta.result_aborted
             );
             let after_injections = fault.injection_marker_count(context)?;
             if after_injections <= before_injections {
@@ -1476,10 +2325,20 @@ fn run_faulted_write(
     let case = fault.case();
     let insert = fault.statement(statements);
     match fault {
-        WriteFault::WriterEgress | WriteFault::RootValidation => {
+        WriteFault::WriterEgress
+        | WriteFault::RootValidation
+        | WriteFault::PartialAggregateUpdate
+        | WriteFault::PartialAggregateFinalize
+        | WriteFault::FinalAggregateMerge
+        | WriteFault::FinalAggregateFinalize => {
             let kind = match fault {
                 WriteFault::WriterEgress => "connector-write-writer-failure",
-                _ => "connector-write-root-failure",
+                WriteFault::RootValidation => "connector-write-root-failure",
+                WriteFault::PartialAggregateUpdate => "connector-write-partial-update-failure",
+                WriteFault::PartialAggregateFinalize => "connector-write-partial-finalize-failure",
+                WriteFault::FinalAggregateMerge => "connector-write-final-merge-failure",
+                WriteFault::FinalAggregateFinalize => "connector-write-final-finalize-failure",
+                _ => unreachable!("aggregate/egress fault match is exhaustive"),
             };
             for index in 0..context.handle().be_count() {
                 context
@@ -1572,6 +2431,49 @@ fn run_faulted_write(
                 .map_err(|_| anyhow::anyhow!("aborted write session thread panicked"))??;
             Ok(outcome)
         }
+        WriteFault::DeadlineAbort => {
+            const QUERY_TIMEOUT_SECS: u64 = 10;
+            let writer_baseline = all_write_counters(context)?;
+            for index in 0..context.handle().be_count() {
+                context
+                    .handle()
+                    .arm_query_lifecycle_fault(index, "connector-write-append-hold")
+                    .with_context(|| format!("arm writer append hold on BE[{index}]"))?;
+            }
+            let write =
+                start_deadline_write_on_own_connection(user, port, insert, QUERY_TIMEOUT_SECS)?;
+            let _connection_id = write
+                .connection_id
+                .recv_timeout(context.remaining("await deadline write session setup")?)
+                .context("deadline write session ended before applying query_timeout")?;
+            await_append_holds(context, &writer_baseline)?;
+            match write.done.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {}
+                Ok(outcome) => {
+                    bail!(
+                        "deadline write became terminal before its three live append holds: \
+                         {outcome:?}"
+                    );
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    bail!("deadline write actor disconnected before its own deadline")
+                }
+            }
+            let outcome = write
+                .done
+                .recv_timeout(context.remaining("await the deadline write result")?)
+                .context("deadline write session did not finish")?;
+            write
+                .thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("deadline write session thread panicked"))??;
+            await_deadline_abort_terminals(context, &writer_baseline)?;
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("clear writer append hold tokens")?;
+            Ok(outcome)
+        }
     }
 }
 
@@ -1631,6 +2533,40 @@ fn start_write_on_own_connection(user: &str, port: u16, insert: &str) -> Result<
     })
 }
 
+fn start_deadline_write_on_own_connection(
+    user: &str,
+    port: u16,
+    insert: &str,
+    query_timeout_secs: u64,
+) -> Result<PendingWrite> {
+    let (id_tx, connection_id) = mpsc::sync_channel(1);
+    let (done_tx, done) = mpsc::sync_channel(1);
+    let user = user.to_string();
+    let insert = insert.to_string();
+    let thread = thread::Builder::new()
+        .name("distributed-writer-deadline".to_string())
+        .spawn(move || -> Result<()> {
+            let mut connection =
+                mysql_actor::connect_for_cancellation(&user, port, Duration::from_secs(30))?;
+            connection
+                .query_drop(format!("SET query_timeout = {query_timeout_secs}"))
+                .context("set the deadline write session query_timeout")?;
+            id_tx
+                .send(connection.connection_id())
+                .context("publish the deadline write session readiness")?;
+            let outcome = connection.query_drop(insert);
+            done_tx
+                .send(outcome)
+                .context("publish the deadline write result")
+        })
+        .context("start the deadline write session")?;
+    Ok(PendingWrite {
+        thread,
+        connection_id,
+        done,
+    })
+}
+
 /// How many times `marker` appears across every Backend log.
 ///
 /// Summed rather than counted per Backend: which Backends an attempt reaches
@@ -1662,6 +2598,63 @@ fn await_backend_marker_above(
         }
         if Instant::now() >= deadline {
             bail!("timed out waiting for {subject}: {marker} stayed at {baseline}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn await_append_holds(context: &mut ScenarioContext, baseline: &[WriteCounters]) -> Result<()> {
+    let deadline = context.deadline();
+    loop {
+        let current = all_write_counters(context)?;
+        if current.len() == baseline.len()
+            && current
+                .iter()
+                .zip(baseline)
+                .all(|(current, before)| current.append_holds > before.append_holds)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let observed = current
+                .iter()
+                .zip(baseline)
+                .map(|(current, before)| current.append_holds - before.append_holds)
+                .collect::<Vec<_>>();
+            bail!(
+                "timed out waiting for one query-scoped writer append hold on every BE; \
+                 deltas={observed:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn await_deadline_abort_terminals(
+    context: &mut ScenarioContext,
+    baseline: &[WriteCounters],
+) -> Result<()> {
+    let deadline = context.deadline();
+    loop {
+        let current = all_write_counters(context)?;
+        let abort_succeeded = current
+            .iter()
+            .zip(baseline)
+            .map(|(current, before)| current.abort_succeeded - before.abort_succeeded)
+            .sum::<f64>();
+        let result_aborted = current
+            .iter()
+            .zip(baseline)
+            .map(|(current, before)| current.result_aborted - before.result_aborted)
+            .sum::<f64>();
+        if abort_succeeded >= baseline.len() as f64 && result_aborted >= 1.0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for deadline cleanup at its real owners; \
+                 provider_abort_succeeded={abort_succeeded} root_result_aborted={result_aborted}"
+            );
         }
         thread::sleep(Duration::from_millis(20));
     }

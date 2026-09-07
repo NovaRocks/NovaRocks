@@ -11,14 +11,17 @@ path = "src/main.rs"
 novarocks-backend = { path = "../novarocks/backend" }
 novarocks-connector-binding = { path = "../novarocks/connector-binding" }
 novarocks-connector-iceberg = { path = "../novarocks/connector/iceberg" }
+novarocks-connector-iceberg-functions = { path = "../novarocks/connector/iceberg-functions" }
 novarocks-connector-starrocks = { path = "../novarocks/connector/starrocks" }
 novarocks-execution = { path = "../novarocks/execution" }
 novarocks-failpoint = { path = "../novarocks/failpoint", default-features = false }
 novarocks-frontend = { path = "../novarocks/frontend" }
+novarocks-functions = { path = "../novarocks/functions" }
 novarocks-fs = { path = "../novarocks/fs" }
 novarocks-native-trust = { path = "../novarocks/native-trust" }
 novarocks-secret = { path = "../novarocks/secret" }
 novarocks-spi = { path = "../novarocks/spi" }
+novarocks-sql = { path = "../novarocks/sql" }
 novarocks-state-store-sqlite = { path = "../novarocks/state-store/sqlite" }
 novarocks-types = { path = "../novarocks/types" }
 novarocks-version = { path = "../novarocks/version" }
@@ -27,6 +30,7 @@ atty = "0.2"
 chrono = "0.4"
 libc = "0.2"
 futures = "0.3"
+hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"

@@ -264,11 +264,11 @@ fn validate_structure(
         if fragment.fragment_id == root_fragment_id {
             let root_sink_supported = matches!(
                 fragment.sink,
-                DataSink::Result | DataSink::Statistics(_) | DataSink::ChangeStreamRouter(_)
+                DataSink::Result | DataSink::ChangeStreamRouter(_)
             );
             if !root_sink_supported {
                 return Err(format!(
-                    "lower_distributed_plan root fragment id={} must use result, statistics, or change-stream router sink",
+                    "lower_distributed_plan root fragment id={} must use result or change-stream router sink",
                     fragment.fragment_id
                 ));
             }
@@ -362,12 +362,14 @@ fn validate_dataflow_write_shape(
     edges: &[FragmentEdge],
 ) -> Result<(), String> {
     let mut writer_ordinals_by_fragment: BTreeMap<FragmentId, u32> = BTreeMap::new();
+    let mut writer_schemas_by_fragment = BTreeMap::new();
     let mut finish_fragments: Vec<FragmentId> = Vec::new();
     for (fragment_id, fragment) in fragments_by_id {
         validate_dataflow_write_node_placement(*fragment_id, &fragment.root, true)?;
         match &fragment.root.payload {
             DistributedNodeKind::TableWriter(writer) => {
                 writer_ordinals_by_fragment.insert(*fragment_id, writer.write_target_ordinal.get());
+                writer_schemas_by_fragment.insert(*fragment_id, &writer.writer_multiplex_schema);
             }
             DistributedNodeKind::TableFinish(_) => finish_fragments.push(*fragment_id),
             _ => {}
@@ -467,6 +469,13 @@ fn validate_dataflow_write_shape(
             "lower_distributed_plan TableFinish fragment id={finish_fragment_id} lost its TableFinish root"
         ));
     };
+    for (writer_fragment_id, writer_schema) in writer_schemas_by_fragment {
+        if writer_schema != &finish.writer_multiplex_schema {
+            return Err(format!(
+                "lower_distributed_plan TableWriter fragment id={writer_fragment_id} multiplex schema differs from TableFinish fragment id={finish_fragment_id}"
+            ));
+        }
+    }
     let observed: BTreeSet<u32> = writer_ordinals_by_fragment.values().copied().collect();
     if observed.len() != writer_ordinals_by_fragment.len() {
         return Err(format!(

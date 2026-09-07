@@ -279,7 +279,6 @@ pub(in crate::planner::distributed) fn build_boundary_catalog(
                 });
             }
             DataSink::Noop => {}
-            DataSink::Statistics(_) => {}
             DataSink::ChangeStreamRouter(_) => {
                 contracts.push(BoundaryContract {
                     fragment_id: fragment.fragment_id,
@@ -915,7 +914,7 @@ mod tests {
             .iter()
             .map(|contract| contract.columns.len())
             .sum();
-        assert_eq!(total_columns, 17);
+        assert_eq!(total_columns, 21);
 
         // The single allocator's final state is stored in the sealed plan: its
         // next id is one past the last boundary occurrence. CGO-9C resumes from

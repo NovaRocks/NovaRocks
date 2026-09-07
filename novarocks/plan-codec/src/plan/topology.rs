@@ -161,45 +161,11 @@ fn encode_data_sink<F>(
         kind: Some(match src {
             DataSink::Result => Kind::Result(true),
             DataSink::Noop => Kind::Noop(true),
-            DataSink::Statistics(metrics) => Kind::Statistics(encode_statistics_sink(metrics)),
             DataSink::ChangeStreamRouter(sink) => {
                 Kind::ChangeStreamRouter(encode_change_stream_router_sink(sink, fragment_id, ctx)?)
             }
         }),
     })
-}
-
-fn encode_statistics_sink(
-    metrics: &novarocks_spi::connector::StatisticsMetricRequest,
-) -> plan::StatisticsSink {
-    use novarocks_spi::connector::StatisticsMetric;
-
-    plan::StatisticsSink {
-        metrics: metrics
-            .metrics()
-            .iter()
-            .map(|metric| plan::StatisticsMetric {
-                kind: Some(match metric {
-                    StatisticsMetric::RowCount => plan::statistics_metric::Kind::RowCount(true),
-                    StatisticsMetric::NullCount { column } => {
-                        plan::statistics_metric::Kind::NullCountColumn(column.to_string())
-                    }
-                    StatisticsMetric::Minimum { column } => {
-                        plan::statistics_metric::Kind::MinimumColumn(column.to_string())
-                    }
-                    StatisticsMetric::Maximum { column } => {
-                        plan::statistics_metric::Kind::MaximumColumn(column.to_string())
-                    }
-                    StatisticsMetric::AverageSize { column } => {
-                        plan::statistics_metric::Kind::AverageSizeColumn(column.to_string())
-                    }
-                    StatisticsMetric::ThetaNdv { column } => {
-                        plan::statistics_metric::Kind::ThetaNdvColumn(column.to_string())
-                    }
-                }),
-            })
-            .collect(),
-    }
 }
 
 pub(super) fn encode_fragment_edge(src: &FragmentEdge) -> Result<plan::FragmentEdge, String> {

@@ -543,9 +543,8 @@ message QueryTerminalFragmentSnapshot {
   // message tree was removed with the write-operation aggregate; the write
   // stack reports staged artifacts as commit fragments in the write relation.
   reserved "connector_staged_report_frames";
-  // Bounded, opaque statistics collection state. It is internal to the
-  // native lifecycle and never encoded as a client result row.
-  bytes statistics_payload = 12;
+  reserved 12;
+  reserved "statistics_payload"; // former terminal statistics side channel.
   // Diagnostic text may be bounded to retain a fixed P0 terminalization proof.
   bool error_detail_truncated = 13;
 }

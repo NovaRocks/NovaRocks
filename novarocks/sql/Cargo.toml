@@ -33,6 +33,7 @@ bytes = "1"
 chrono = "0.4"
 hex = "0.4"
 novarocks-parser = { path = "../parser" }
+novarocks-functions = { path = "../functions" }
 novarocks-spi = { path = "../spi" }
 novarocks-types = { path = "../types" }
 novarocks-user-error = { path = "../user-error" }

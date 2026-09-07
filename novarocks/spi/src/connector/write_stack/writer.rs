@@ -17,10 +17,11 @@
 
 //! Backend-local writer execution contract.
 //!
-//! One pipeline driver owns exactly one [`ConnectorBatchWriter`] for its whole
-//! lifetime: it opens it, appends to it, and either finishes or aborts it. No
-//! writer is shared between drivers, so the append path holds no cross-driver
-//! lock and there is no "last driver finishes" protocol.
+//! One pipeline driver's asynchronous owner task exclusively owns exactly one
+//! [`ConnectorBatchWriter`] for its whole lifetime: it opens it, appends to it,
+//! and either finishes or aborts it. No writer is shared between drivers, so
+//! the append path holds no cross-driver lock and there is no "last driver
+//! finishes" protocol.
 
 use std::sync::Arc;
 
@@ -93,23 +94,25 @@ pub struct ConnectorOpenWriterRequest {
     pub context: ConnectorRequestContext,
 }
 
-/// A driver-local writer.
+/// A driver-local asynchronous writer.
 ///
-/// `finish` returns zero or more independent commit fragments — one per written
+/// Every lifecycle future is polled by the writer's single-owner I/O task, never
+/// by the pipeline driver. `finish` returns zero or more independent commit fragments — one per written
 /// artifact — instead of a single opaque report document. A writer that fails
 /// any step must leave no committed external effect; the frontend is the only
 /// owner of external commit.
+#[async_trait::async_trait]
 pub trait ConnectorBatchWriter: Send {
-    fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError>;
+    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError>;
 
     /// Close this writer and describe every artifact it staged. A writer that
     /// staged nothing returns an empty vector; that is a legal outcome and is
     /// not the same as a failure.
-    fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError>;
+    async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError>;
 
     /// Best-effort local cleanup after a failure or cancellation. It never
     /// reaches external catalog metadata.
-    fn abort(&mut self) -> Result<(), ConnectorError>;
+    async fn abort(&mut self) -> Result<(), ConnectorError>;
 }
 
 /// The backend-local write capability of one exact catalog generation.
@@ -117,10 +120,16 @@ pub trait ConnectorBatchWriter: Send {
 /// It can open writers and nothing else. There is deliberately no begin,
 /// finish, abort, or reconcile here: a backend never holds a commit handle and
 /// never mutates catalog metadata.
+#[async_trait::async_trait]
 pub trait ConnectorWriteExecution: Send + Sync {
     fn catalog_handle(&self) -> &CatalogHandle;
 
-    fn open_writer(
+    /// Construct one driver-local writer without publishing or staging any
+    /// external effect before returning it. The future must be cancellation
+    /// safe: dropping it may abandon construction and there is no writer value
+    /// available to receive `abort`. All staged effects begin in lifecycle
+    /// calls on the returned writer and are cleaned by that writer's `abort`.
+    async fn open_writer(
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError>;

@@ -151,6 +151,11 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) terminal_outcome: Option<ParticipantTerminalOutcome>,
     pub(crate) pre_start_deadline: Option<Instant>,
     pub(crate) last_heartbeat: Option<Instant>,
+    /// Monotonic attempt-local identity for the heartbeat observation.  The
+    /// sweeper compares this generation while holding the lifecycle lock so
+    /// an expiration decision cannot terminate an entry refreshed after the
+    /// decision was observed.
+    pub(crate) heartbeat_generation: u64,
     pub(crate) events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
     /// Best-effort terminal runtime-filter feedback has its own bounded queue
     /// and is retained only by the attached attempt, never by the participant.
@@ -228,6 +233,7 @@ impl QueryLifecycleEntry {
                 terminal_outcome: None,
                 pre_start_deadline: None,
                 last_heartbeat: None,
+                heartbeat_generation: 0,
                 events: None,
                 frontend_feedback_sink: None,
                 observations: None,

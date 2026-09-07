@@ -7,3 +7,8 @@ id	value
 -- query 7
 n
 3
+
+-- query 10
+id	k
+2	20
+3	30

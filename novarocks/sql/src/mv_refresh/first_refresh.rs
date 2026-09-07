@@ -329,12 +329,14 @@ pub fn analyze_mv_first_refresh_connector_write(
 pub fn compile_mv_first_refresh_connector_write_dataflow(
     analyzed: SqlMvFirstRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     crate::planning::dml::compile_connector_write_dataflow_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
         analyzed.sink,
         write_target_ordinal,
+        required_aggregations,
         &analyzed.settings,
     )
 }
@@ -427,7 +429,8 @@ pub fn analyze_join_first_refresh_connector_write(
         context.environment,
         Some(context.constant_evaluator),
         context.control,
-    );
+    )
+    .with_function_catalog(context.functions.snapshot());
     let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)
         .map_err(|error| error.to_string())?
         .into_pending()
@@ -442,12 +445,14 @@ pub fn analyze_join_first_refresh_connector_write(
 pub fn compile_join_first_refresh_connector_write_dataflow(
     analyzed: SqlMvJoinFirstRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     crate::planning::dml::compile_connector_write_dataflow_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
         analyzed.sink,
         write_target_ordinal,
+        required_aggregations,
         &analyzed.settings,
     )
 }
@@ -537,6 +542,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
         context.join_mode,
         logical,
         logical_output.factory,
+        context.functions,
     )?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
@@ -550,7 +556,8 @@ pub fn analyze_join_incremental_refresh_change_stream(
         crate::compiler::SqlPlanningEnvironment::NotApplicable,
         Some(context.constant_evaluator),
         context.control,
-    );
+    )
+    .with_function_catalog(context.functions.snapshot());
     let analyzed = crate::compiler::SqlCompiler::analyze(logical_request)
         .map_err(|error| error.to_string())?
         .into_pending()
@@ -566,6 +573,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
 pub fn compile_join_incremental_refresh_change_stream(
     analyzed: SqlMvJoinIncrementalRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
     shape: crate::planning::dml::DmlWritePlanShape,
 ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(
@@ -576,6 +584,7 @@ pub fn compile_join_incremental_refresh_change_stream(
     .map_err(|_| {
         "join incremental logical input did not produce an optimized SQL plan".to_string()
     })?;
+    let function_catalog = std::sync::Arc::clone(&compiled.function_catalog);
     let change_stream = analyzed
         .change_stream_override
         .unwrap_or(compiled.change_stream);
@@ -587,9 +596,11 @@ pub fn compile_join_incremental_refresh_change_stream(
     crate::planning::dml::seal_change_stream_producer_with_effect_column(
         producer,
         analyzed.routes,
+        statistics_targets,
         JOIN_INCREMENTAL_EFFECT_COLUMN,
         None,
         shape,
+        function_catalog.as_ref(),
     )
 }
 
@@ -663,6 +674,7 @@ pub fn analyze_mv_incremental_refresh_change_stream(
 pub fn compile_mv_incremental_refresh_change_stream(
     analyzed: SqlMvIncrementalRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
     shape: crate::planning::dml::DmlWritePlanShape,
 ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(
@@ -673,6 +685,7 @@ pub fn compile_mv_incremental_refresh_change_stream(
     .map_err(|_| {
         "canonical incremental MV intent did not produce an optimized SQL plan".to_string()
     })?;
+    let function_catalog = std::sync::Arc::clone(&compiled.function_catalog);
     let producer = add_join_incremental_change_stream_effect(
         compiled.optimized_tree,
         &compiled.change_stream,
@@ -681,9 +694,11 @@ pub fn compile_mv_incremental_refresh_change_stream(
     crate::planning::dml::seal_change_stream_producer_with_effect_column(
         producer,
         analyzed.routes,
+        statistics_targets,
         JOIN_INCREMENTAL_EFFECT_COLUMN,
         None,
         shape,
+        function_catalog.as_ref(),
     )
 }
 
@@ -846,11 +861,13 @@ fn validate_join_incremental_snapshot(
     Ok(())
 }
 
+#[cfg_attr(test, allow(unused_variables))]
 fn build_join_incremental_refresh_logical_plan(
     snapshot: &Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot>,
     mode: SqlMvJoinIncrementalRefreshMode,
     plan: crate::planner::logical::LogicalPlanNode,
     factory: crate::column_id::ColumnRefFactory,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<
     (
         crate::planner::logical::LogicalPlanNode,
@@ -868,6 +885,8 @@ fn build_join_incremental_refresh_logical_plan(
             disabled_rules: join_incremental_disabled_rules(is_aggregate_refresh),
             deadline: None,
             column_ref_factory: Rc::clone(&factory_cell),
+            #[cfg(not(test))]
+            function_catalog: functions.snapshot(),
         },
     )
     .map_err(|error| format!("join refresh logical rewrite: {error}"))?;
@@ -914,6 +933,8 @@ fn build_join_incremental_refresh_logical_plan(
                 locator_columns.pos,
                 locator_columns.row_id,
                 locator_columns.last_updated_sequence_number,
+                #[cfg(not(test))]
+                functions,
             )
             .map_err(|error| format!("build join refresh coalesce logical plan: {error}"))?
         }
@@ -2621,14 +2642,41 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct CanonicalFunctions;
 
     impl crate::compiler::SqlFunctionCatalog for CanonicalFunctions {
+        fn snapshot(&self) -> Arc<dyn crate::compiler::SqlFunctionCatalog> {
+            Arc::new(Self)
+        }
+
         fn resolve_scalar_signature(
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
         ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError>
+        {
+            panic!("plain canonical request construction must not resolve functions")
+        }
+
+        fn contains_aggregate(&self, _name: &str) -> bool {
+            panic!("plain canonical request construction must not classify functions")
+        }
+
+        fn resolve_aggregate_signature(
+            &self,
+            _name: &str,
+            _arg_types: &[arrow::datatypes::DataType],
+        ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
+        {
+            panic!("plain canonical request construction must not resolve functions")
+        }
+
+        fn resolve_aggregate_trusted(
+            &self,
+            _name: &str,
+            _arg_types: &[arrow::datatypes::DataType],
+        ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
         {
             panic!("plain canonical request construction must not resolve functions")
         }
@@ -2664,6 +2712,7 @@ mod tests {
         let _: fn(
             SqlMvJoinFirstRefreshAnalyzed,
             &crate::planning::dml::DmlStatisticsSnapshot,
+            &[novarocks_spi::connector::StatisticsRequiredAggregation],
             novarocks_spi::connector::write_stack::WriteTargetOrdinal,
         ) -> Result<crate::plan_read::DistributedPlan, String> =
             compile_join_first_refresh_connector_write_dataflow;
@@ -2695,6 +2744,7 @@ mod tests {
         let _: fn(
             SqlMvJoinIncrementalRefreshAnalyzed,
             &crate::planning::dml::DmlStatisticsSnapshot,
+            Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
             crate::planning::dml::DmlWritePlanShape,
         ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> =
             compile_join_incremental_refresh_change_stream;
@@ -2737,6 +2787,7 @@ mod tests {
         let _: fn(
             SqlMvIncrementalRefreshAnalyzed,
             &crate::planning::dml::DmlStatisticsSnapshot,
+            Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
             crate::planning::dml::DmlWritePlanShape,
         ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> =
             compile_mv_incremental_refresh_change_stream;

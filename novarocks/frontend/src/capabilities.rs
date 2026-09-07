@@ -64,6 +64,7 @@ use crate::query::compiler::FrontendQueryCompiler;
 /// no command execution, durable job, or maintenance capability.
 #[derive(Clone)]
 pub struct QueryCompilerPorts {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -81,6 +82,7 @@ pub struct QueryCompilerPorts {
 impl QueryCompilerPorts {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -95,6 +97,7 @@ impl QueryCompilerPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -114,6 +117,7 @@ impl QueryCompilerPorts {
 /// Build the closed query-preparation capability from query-domain leaf ports.
 pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler {
     let query = domain::QueryPreparationKernel::new(
+        Arc::clone(&ports.functions),
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
         Arc::clone(&ports.connector_control),
@@ -124,6 +128,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.exchange_port,
     );
     let view = domain::ViewExecutionKernel::new(
+        Arc::clone(&ports.functions),
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
         Arc::clone(&ports.connector_control),
@@ -136,6 +141,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         Arc::clone(&ports.mv_readiness),
     );
     FrontendQueryCompiler::new(
+        ports.functions,
         query,
         view,
         system_tables,
@@ -147,6 +153,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
 /// Leaf ports shared by the closed foreground DML engines.
 #[derive(Clone)]
 pub struct DmlEnginePorts {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -161,6 +168,7 @@ pub struct DmlEnginePorts {
 impl DmlEnginePorts {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -171,6 +179,7 @@ impl DmlEnginePorts {
         lake_publication_runtime_policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -184,7 +193,10 @@ impl DmlEnginePorts {
 
     fn kernel(&self) -> domain::DmlExecutionKernel {
         domain::DmlExecutionKernel::new(
-            Arc::clone(&self.catalog_service),
+            domain::DmlPlanningServices::new(
+                Arc::clone(&self.functions),
+                Arc::clone(&self.catalog_service),
+            ),
             self.catalog_application.clone(),
             Arc::clone(&self.connector_control),
             Arc::clone(&self.typed_connector_control),
@@ -330,6 +342,7 @@ pub fn iceberg_ref_command_executor(
 /// Leaf ports for foreground table-maintenance commands.
 #[derive(Clone)]
 pub struct MaintenanceCommandPorts {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -342,6 +355,7 @@ pub struct MaintenanceCommandPorts {
 impl MaintenanceCommandPorts {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -351,6 +365,7 @@ impl MaintenanceCommandPorts {
         service: Arc<dyn TableMaintenanceService>,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -363,6 +378,7 @@ impl MaintenanceCommandPorts {
 
     fn kernel(&self) -> domain::MaintenanceExecutionKernel {
         domain::MaintenanceExecutionKernel::new(
+            Arc::clone(&self.functions),
             Arc::clone(&self.catalog_service),
             self.catalog_application.clone(),
             Arc::clone(&self.connector_control),
@@ -378,6 +394,7 @@ pub fn maintenance_command_executor(
     ports: MaintenanceCommandPorts,
 ) -> maintenance_command::MaintenanceCommandExecutor {
     maintenance_command::MaintenanceCommandExecutor::new(domain::MaintenanceExecutionKernel::new(
+        ports.functions,
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
@@ -399,6 +416,7 @@ pub fn maintenance_read_command_executor(
 /// Leaf ports for MV metadata and refresh execution.
 #[derive(Clone)]
 pub struct MvCommandPorts {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -417,6 +435,7 @@ pub struct MvCommandPorts {
 impl MvCommandPorts {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -427,6 +446,7 @@ impl MvCommandPorts {
         query_execution: QueryExecutionService,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -442,6 +462,7 @@ impl MvCommandPorts {
 
 pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecutor {
     let iceberg_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
+        Arc::clone(&ports.functions),
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
         Arc::clone(&ports.connector_control),
@@ -464,6 +485,7 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
 /// Leaf ports for external-view commands.
 #[derive(Clone)]
 pub struct ViewCommandPorts {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -472,12 +494,14 @@ pub struct ViewCommandPorts {
 
 impl ViewCommandPorts {
     pub fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         view_service: Arc<dyn ViewService>,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -488,6 +512,7 @@ impl ViewCommandPorts {
 
 pub(crate) fn view_command_executor(ports: ViewCommandPorts) -> ViewCommandExecutor {
     ViewCommandExecutor::new(domain::ViewExecutionKernel::new(
+        ports.functions,
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
@@ -551,6 +576,7 @@ pub fn bind_catalog_runtime_projection(
 /// capability: durable refresh activation must not acquire a command router.
 #[derive(Clone)]
 pub(crate) struct MvRefreshProviderActivationPorts {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -567,6 +593,7 @@ pub(crate) struct MvRefreshProviderActivationPorts {
 impl MvRefreshProviderActivationPorts {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -580,6 +607,7 @@ impl MvRefreshProviderActivationPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -602,6 +630,7 @@ pub(crate) fn mv_refresh_provider_activation(
     ports: MvRefreshProviderActivationPorts,
 ) -> Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation> {
     let query_kernel = domain::QueryPreparationKernel::new(
+        Arc::clone(&ports.functions),
         Arc::clone(&ports.catalog_service),
         ports.catalog_application.clone(),
         Arc::clone(&ports.connector_control),
@@ -612,6 +641,7 @@ pub(crate) fn mv_refresh_provider_activation(
         ports.exchange_port,
     );
     let mv_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
+        ports.functions,
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
@@ -667,6 +697,7 @@ pub struct StatisticsAttemptExecutorPorts {
     typed_connector_control: Arc<crate::connector::ConnectorControlHost>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     attempt_timeout: Duration,
 }
 
@@ -677,6 +708,7 @@ impl StatisticsAttemptExecutorPorts {
         typed_connector_control: Arc<crate::connector::ConnectorControlHost>,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,
+        function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         attempt_timeout: Duration,
     ) -> Self {
         Self {
@@ -685,6 +717,7 @@ impl StatisticsAttemptExecutorPorts {
             typed_connector_control,
             backend_topology,
             query_execution,
+            function_catalog,
             attempt_timeout,
         }
     }
@@ -702,6 +735,7 @@ pub fn statistics_attempt_executor(
                 ports.typed_connector_control,
                 ports.backend_topology,
                 ports.query_execution,
+                ports.function_catalog,
                 ports.attempt_timeout,
             ),
         ),
@@ -762,6 +796,7 @@ pub fn background_maintenance_attempt(
 /// Leaf ports for the Frontend-owned MV background worker.
 #[derive(Clone)]
 pub(crate) struct MvBackgroundPorts {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -772,6 +807,7 @@ pub(crate) struct MvBackgroundPorts {
 
 impl MvBackgroundPorts {
     pub(crate) fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -780,6 +816,7 @@ impl MvBackgroundPorts {
         storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -797,6 +834,7 @@ pub(crate) fn mv_background_bindings(
     table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
 ) -> crate::mv::background::MvBackgroundBindings {
     let iceberg_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
+        ports.functions,
         ports.catalog_service,
         ports.catalog_application,
         Arc::clone(&ports.connector_control),

@@ -64,6 +64,7 @@ pub(crate) fn prepare_fragments(
         novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
     let runtime_filter_facts =
         novarocks_sql::planning::query_execution::project_runtime_filter_facts(plan)?;
+    let write_root_targets = project_write_root_targets(plan)?;
     let sealed_ids = plan
         .fragments()
         .iter()
@@ -165,12 +166,7 @@ pub(crate) fn prepare_fragments(
             }
         }
         let scan_node_ids = scan_nodes.into_iter().map(|(node_id, _)| node_id).collect();
-        let execution_role = if matches!(
-            &fragment.sink,
-            novarocks_sql::plan_read::DataSink::Statistics(_)
-        ) {
-            PreparedFragmentRole::Statistics
-        } else if result_fragment_id == Some(fragment.fragment_id) {
+        let execution_role = if result_fragment_id == Some(fragment.fragment_id) {
             PreparedFragmentRole::Result
         } else {
             PreparedFragmentRole::NonTerminal
@@ -242,7 +238,26 @@ pub(crate) fn prepare_fragments(
         execution_anchor_fragment_id,
         plan.edges().to_vec(),
         runtime_filter_facts,
+        write_root_targets,
     ))
+}
+
+fn project_write_root_targets(
+    plan: &novarocks_sql::plan_read::DistributedPlan,
+) -> Result<Option<Vec<novarocks_spi::connector::write_stack::WriteTargetOrdinal>>, String> {
+    let mut projected = None;
+    for fragment in plan.fragments() {
+        let novarocks_sql::plan_read::DistributedNodeKind::TableFinish(finish) =
+            &fragment.root.payload
+        else {
+            continue;
+        };
+        if projected.is_some() {
+            return Err("sealed distributed plan contains more than one TableFinish root".into());
+        }
+        projected = Some(finish.expected_target_ordinals().to_vec());
+    }
+    Ok(projected)
 }
 
 pub(crate) fn prepared_fragment_set_for_native_encode_test(
@@ -257,15 +272,11 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
             runtime_filter_facts,
             Vec::new(),
         )?;
+    let write_root_targets = project_write_root_targets(plan)?;
     let result_fragment_id = preparation_facts.result_fragment_id();
     let mut by_fragment = BTreeMap::new();
     for fragment in plan.fragments() {
-        let role = if matches!(
-            &fragment.sink,
-            novarocks_sql::plan_read::DataSink::Statistics(_)
-        ) {
-            PreparedFragmentRole::Statistics
-        } else if result_fragment_id == Some(fragment.fragment_id) {
+        let role = if result_fragment_id == Some(fragment.fragment_id) {
             PreparedFragmentRole::Result
         } else {
             PreparedFragmentRole::NonTerminal
@@ -293,6 +304,7 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
         preparation_facts.execution_anchor_fragment_id(),
         plan.edges().to_vec(),
         runtime_filter_facts,
+        write_root_targets,
     ))
 }
 

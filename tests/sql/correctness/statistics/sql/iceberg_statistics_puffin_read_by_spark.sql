@@ -46,7 +46,7 @@ printf 'SPARK_STATISTICS_SOURCE_READY\n'
 -- query 2
 -- ANALYZE is synchronous: collection has completed before this statement
 -- returns, so the 1FE+3BE evidence belongs to this step rather than SHOW.
--- @be_log_be_count_at_least=NOVAROCKS_STATISTICS_FRAGMENT_COLLECTED,3
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @skip_result_check=true
 ANALYZE TABLE statistics_cat_${suite_uuid0}.nr_statistics_${suite_uuid0}.puffin_spark_${uuid0};
 

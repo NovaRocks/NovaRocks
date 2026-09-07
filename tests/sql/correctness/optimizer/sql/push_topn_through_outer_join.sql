@@ -32,6 +32,8 @@ INSERT INTO ${case_db}.topn_outer_left
 INSERT INTO ${case_db}.topn_outer_right
     SELECT generate_series, generate_series * 10
     FROM TABLE(generate_series(1, 1000));
+-- This case deliberately plans with persisted ANALYZE statistics. NDV is a
+-- deterministic Theta estimate, so cardinality text need not equal exact NDV.
 ANALYZE TABLE ${case_db}.topn_outer_left;
 ANALYZE TABLE ${case_db}.topn_outer_right;
 

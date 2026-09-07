@@ -16,6 +16,8 @@
 // under the License.
 
 //! Exact-generation Iceberg statistics capability.
+//!
+//! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -23,19 +25,29 @@ use std::time::Instant;
 
 use arrow::datatypes::DataType;
 use bytes::Bytes;
+use novarocks_connector_iceberg_functions::{
+    ICEBERG_THETA_AGGREGATE_NAME, estimate_compact_theta, supports_theta_input_type,
+    validate_compact_theta,
+};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorStatistics, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsBasisRelation,
-    StatisticsCollection, StatisticsCollectionPlan, StatisticsCollectionRequest,
-    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric,
-    StatisticsMetricObservation, StatisticsMetricSource, StatisticsMetricState,
-    StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature,
-    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsRowCoverage, StatisticsScanColumn,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsArtifactDraft,
+    StatisticsArtifactIdentity, StatisticsBasisRelation, StatisticsCollection,
+    StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,
+    StatisticsColumnSelection, StatisticsDataVersion, StatisticsEvidence,
+    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
+    StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
+    StatisticsMissingKind, StatisticsNumericNature, StatisticsReadRequest, StatisticsReader,
+    StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage, StatisticsScanColumn,
 };
 use sha2::{Digest, Sha256};
 
+use crate::catalog::error::CatalogOutcome;
+use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
+use crate::catalog::{CatalogTableName, CatalogTransactionStart};
+use crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
+use crate::iceberg::spec::{PrimitiveType, Type};
 use crate::manifest::{DataFileWithStats, extract_data_files_with_stats_at};
 use crate::metadata::{IcebergMetadata, IcebergTablePayload};
 use crate::reconcile_payload::{
@@ -43,23 +55,14 @@ use crate::reconcile_payload::{
 };
 use crate::statistics_ancestry::{AncestorNdv, resolve_ancestor_ndv};
 use crate::statistics_basis::basis_relation;
-use crate::statistics_codec::{
-    encode_provider_statistics, ensure_publishable_visible_row_evidence, statistics_data_version,
-    statistics_metric_column,
-};
-use crate::stats_assembler::{
-    StatisticsCoverageMark, puffin_path_for_statistics_operation,
-    write_puffin_with_provider_statistics,
-};
-use crate::theta_sketch::ThetaSketchHandle;
+use crate::statistics_codec::{statistics_data_version, statistics_metric_column};
+use crate::stats_assembler::{puffin_path_for_statistics_operation, write_puffin_artifacts};
 
 const STATISTICS_OPERATION_KIND: &str = "statistics-publish";
-const VISIBLE_ROW_ARTIFACT_VERSION: u8 = 1;
-const THETA_PARTIAL_WIRE_VERSION: u8 = 2;
-const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 2;
-const MAX_THETA_RETAINED_HASHES: usize = 1 << 12;
-const MAX_THETA_PARTIAL_WIRE_BYTES: usize =
-    THETA_PARTIAL_WIRE_HEADER_BYTES + 24 + MAX_THETA_RETAINED_HASHES * 8;
+
+#[cfg(test)]
+static STATISTICS_TRANSACTION_ADMISSIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl StatisticsReader for IcebergMetadata {
     fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
@@ -285,6 +288,7 @@ fn manifest_numeric_nature(
     has_deletes: bool,
 ) -> StatisticsNumericNature {
     match metric {
+        StatisticsMetric::AverageSize { .. } => StatisticsNumericNature::TwoSidedApproximate,
         _ if !has_deletes => StatisticsNumericNature::Exact,
         StatisticsMetric::RowCount
         | StatisticsMetric::NullCount { .. }
@@ -292,9 +296,7 @@ fn manifest_numeric_nature(
         StatisticsMetric::Minimum { .. } => StatisticsNumericNature::LowerBound,
         // A ratio of two sums that deletes shrink independently; neither
         // direction is provable. NDV never reaches here.
-        StatisticsMetric::AverageSize { .. } | StatisticsMetric::ThetaNdv { .. } => {
-            StatisticsNumericNature::TwoSidedApproximate
-        }
+        StatisticsMetric::ThetaNdv { .. } => StatisticsNumericNature::TwoSidedApproximate,
     }
 }
 
@@ -332,269 +334,766 @@ impl StatisticsCollection for IcebergMetadata {
         self.incarnation()
     }
 
-    fn prepare_collection(
+    fn begin_collection(
         &self,
-        request: StatisticsCollectionRequest,
-    ) -> Result<StatisticsCollectionPlan, ConnectorError> {
+        request: StatisticsCollectionStartRequest,
+    ) -> Result<StatisticsCollectionStart, ConnectorError> {
         validate_context(&request.context)?;
-        let table = self.table_payload(&request.table)?;
-        let table_info = base_table_info(&table, "statistics collection")?;
-        let expected = pinned_data_version(table_info)?;
-        if request.data_version != expected {
+        let table_payload = self.table_payload(&request.table)?;
+        let info = base_table_info(&table_payload, "statistics collection")?;
+        let expected_version = pinned_data_version(info)?;
+        if request.data_version != expected_version {
             return Err(invalid(
                 "Iceberg statistics collection does not match its resolved table pin",
             ));
         }
-        let mut projection = request
-            .metrics
-            .metrics()
-            .iter()
-            .filter_map(statistics_metric_column)
-            .map(|column| {
-                table_info
-                    .schema
-                    .fields
-                    .iter()
-                    .position(|field| field.name.eq_ignore_ascii_case(column))
-                    .ok_or_else(|| {
-                        invalid(format!(
-                            "Iceberg statistics column `{column}` is absent from the pinned schema"
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        projection.sort_unstable();
-        projection.dedup();
-        let revision = StatisticsEvidenceRevision::try_new(Bytes::from(format!(
-            "iceberg/v1/{}/{}/collection/{}",
-            table_info
-                .table_uuid
-                .as_deref()
-                .expect("pinned data version requires a table UUID"),
-            table_info.current_snapshot_id.unwrap_or_default(),
-            uuid::Uuid::from_bytes(request.operation_id.to_bytes())
-        )))?;
-        let columns = statistics_scan_layout(&table, &projection)?;
-        let provider_payload = request.table.payload().clone();
-        // The snapshot the pinned data version names, restated as the neutral
-        // ordinal a typed scan can be pinned to. It is the same snapshot the
-        // evidence is stamped with, so the collection cannot measure one
-        // version and publish it under another. A table with no snapshot has
-        // no ordinal, and the engine refuses the collection rather than
-        // silently measuring the catalog's current version.
-        let base_version_ordinal = table_info.current_snapshot_id;
-        StatisticsCollectionPlan::try_new(
-            request.table,
-            request.data_version,
-            revision,
-            base_version_ordinal,
-            request.metrics,
-            columns,
-            provider_payload,
-        )
-    }
 
-    fn prepare_publish(
-        &self,
-        request: StatisticsPublishPreparationRequest,
-    ) -> Result<ExternalMutationEvidence, ConnectorError> {
-        validate_context(&request.context)?;
-        let table = self.table_payload(&request.table)?;
-        let info = base_table_info(&table, "statistics publication")?;
-        let expected = pinned_data_version(info)?;
-        if *request.result.evidence.data_version() != expected {
+        let physical = self
+            .runtime()
+            .load_table_for_request(
+                &table_payload.namespace,
+                &table_payload.table,
+                &request.context,
+            )
+            .map_err(unavailable)?;
+        let expected_uuid = info
+            .table_uuid
+            .as_deref()
+            .ok_or_else(|| corrupt("Iceberg table payload is missing its table UUID"))?;
+        if physical.table.metadata().uuid().to_string() != expected_uuid {
             return Err(invalid(
-                "Iceberg statistics publication does not match its resolved table pin",
+                "Iceberg statistics collection resolved a different physical table UUID",
             ));
         }
-        let physical = self
-            .runtime()
-            .load_table_for_request(&table.namespace, &table.table, &request.context)
-            .map_err(unavailable)?;
-        // The path is derived from the snapshot the collection measured, not
-        // from whatever is current now, so a table that advances between
-        // preparation and publication still produces the same evidence.
-        let snapshot_id = info
-            .current_snapshot_id
-            .ok_or_else(|| invalid("cannot publish statistics for a table without a snapshot"))?;
-        let path = puffin_path_for_statistics_operation(
-            physical.table.metadata(),
-            snapshot_id,
-            request.operation_id.to_bytes(),
-        );
-        statistics_evidence(self, request.operation_id, &table, &expected, &path)
-    }
 
-    fn publish_statistics(
-        &self,
-        request: StatisticsPublishRequest,
-    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
-        validate_context(&request.context)?;
-        let table = self.table_payload(&request.table)?;
-        let info = match base_table_info(&table, "statistics publication") {
-            Ok(info) => info,
-            Err(error) => return Ok(known_uncommitted(error)),
-        };
-        let expected = pinned_data_version(info)?;
-        if *request.result.evidence.data_version() != expected {
-            return Ok(known_uncommitted(invalid(
-                "Iceberg statistics publication does not match its resolved table pin",
-            )));
-        }
-        // Publishable means "this measurement saw every visible row of the
-        // pinned table", not "every number is exact" — the collection always
-        // carries a Theta sketch, which is never exact.
-        if let Err(error) = ensure_publishable_visible_row_evidence(&request.result.evidence) {
-            return Ok(known_uncommitted(error));
-        }
-        let (artifact_version, theta) =
-            decode_visible_row_artifact(request.result.provider_payload())?;
-        if artifact_version != expected {
-            return Ok(known_uncommitted(invalid(
-                "statistics collection artifact does not match its resolved table pin",
-            )));
-        }
-
-        let physical = self
-            .runtime()
-            .load_table_for_request(&table.namespace, &table.table, &request.context)
-            .map_err(unavailable)?;
-        let metadata = physical.table.metadata();
-        // Statistics belong to the snapshot they measured. Requiring that
-        // snapshot to still be current is what made ANALYZE fail on any table
-        // that took a write while it ran; the ancestry walk on the read side is
-        // what makes an older target readable.
-        let snapshot_id = info.current_snapshot_id.ok_or_else(|| {
-            invalid("cannot publish statistics for a table without a current snapshot")
-        })?;
-        let Some(snapshot) = metadata.snapshot_by_id(snapshot_id) else {
-            // The measured snapshot expired while the collection ran; there is
-            // nothing left to attach the result to.
-            return Ok(known_uncommitted(invalid(
-                "the snapshot these statistics measured is no longer present in table metadata",
-            )));
-        };
-        let sequence_number = snapshot.sequence_number();
-        let measured_schema = snapshot.schema(metadata).map_err(|error| {
-            corrupt(format!(
-                "resolve the schema of the measured Iceberg snapshot: {error}"
-            ))
-        })?;
-        let field_ids = measured_schema
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| (field.name.to_ascii_lowercase(), field.id))
-            .collect::<HashMap<_, _>>();
-        let provider_statistics = encode_provider_statistics(&request.result.evidence, &field_ids)?;
-        let mut sketches = HashMap::new();
-        for (column, sketch) in theta {
-            let field_id = field_ids.get(&column.to_ascii_lowercase()).ok_or_else(|| {
-                invalid(format!(
-                    "statistics artifact column `{column}` is absent from the pinned Iceberg schema"
-                ))
-            })?;
-            sketches.insert(*field_id, sketch);
-        }
-        let path = puffin_path_for_statistics_operation(
-            metadata,
-            snapshot_id,
-            request.operation_id.to_bytes(),
-        );
-        let expected_evidence =
-            statistics_evidence(self, request.operation_id, &table, &expected, &path)?;
-        if request.evidence != expected_evidence {
-            return Ok(known_uncommitted(invalid(
-                "Iceberg statistics evidence does not match its pinned operation",
-            )));
-        }
-
-        let file_io = physical.table.file_io().clone();
-        let path_for_write = path.clone();
-        let written = self
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                write_puffin_with_provider_statistics(
-                    &file_io,
-                    &path_for_write,
-                    snapshot_id,
-                    sequence_number,
-                    &sketches,
-                    Some(&provider_statistics),
-                    // ANALYZE scanned every visible row, which is what gives it
-                    // precedence over an incremental entry on the same snapshot.
-                    StatisticsCoverageMark::AllVisibleRows,
-                )
-                .await
-            })
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
-        let Some(statistics_file) = written else {
-            return statistics_receipt(
-                self,
-                request.operation_id,
-                expected,
-                request.result.evidence.evidence_revision().clone(),
-                Bytes::from(path),
-                ExternalMutationEffect::NoOp,
-            );
-        };
-        let table_for_commit = physical.table.clone();
-        let catalog = self.runtime().novarocks_catalog().vendored_client();
-        let committed = self
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                crate::commit::statistics::commit_statistics_file(
-                    &table_for_commit,
-                    catalog.as_ref(),
-                    statistics_file,
-                    StatisticsCoverageMark::AllVisibleRows,
-                )
-                .await
-            });
-        match committed {
-            Ok(Ok(outcome)) => {
-                self.runtime()
-                    .control_state()
-                    .invalidate_table(&table.namespace, &table.table);
-                let effect = match outcome {
-                    crate::commit::statistics::StatisticsCommitOutcome::Registered => {
-                        ExternalMutationEffect::Applied
-                    }
-                    // A fuller entry already covers this snapshot. Nothing was
-                    // written, and nothing needed to be.
-                    crate::commit::statistics::StatisticsCommitOutcome::YieldedToFullerCoverage => {
-                        ExternalMutationEffect::NoOp
-                    }
-                };
-                statistics_receipt(
-                    self,
-                    request.operation_id,
-                    expected,
-                    request.result.evidence.evidence_revision().clone(),
-                    Bytes::from(path),
-                    effect,
+        let (snapshot_id, sequence_number, requirements) = match info.current_snapshot_id {
+            Some(snapshot_id) => {
+                let snapshot = physical
+                    .table
+                    .metadata()
+                    .snapshot_by_id(snapshot_id)
+                    .ok_or_else(|| {
+                        invalid(
+                            "the snapshot selected for statistics is no longer present in table metadata",
+                        )
+                    })?;
+                let schema = snapshot
+                    .schema(physical.table.metadata())
+                    .map_err(|error| {
+                        corrupt(format!(
+                            "resolve the schema of the measured Iceberg snapshot: {error}"
+                        ))
+                    })?;
+                let requirements = collection_requirements(&schema, &request.selection)?;
+                (
+                    Some(snapshot_id),
+                    Some(snapshot.sequence_number()),
+                    requirements,
                 )
             }
-            Ok(Err(error)) => Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Internal,
-                    format!("commit Iceberg statistics: {error}"),
-                ),
-                evidence: request.evidence,
-            }),
-            Err(error) => Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Internal,
-                    format!("commit Iceberg statistics: {error}"),
-                ),
-                evidence: request.evidence,
-            }),
+            None => (None, None, Vec::new()),
+        };
+        let expectations = requirements
+            .iter()
+            .map(|requirement| requirement.artifact().clone())
+            .collect();
+        // A table with no eligible fields has no publication effect. Keep that
+        // path a real no-op instead of requiring transaction support merely to
+        // discover at finish time that there is nothing to publish.
+        let frontier = if requirements.is_empty() {
+            None
+        } else {
+            Some(begin_statistics_frontier(
+                self,
+                &table_payload,
+                request.operation_id,
+                0,
+                info.current_snapshot_id,
+                expected_uuid,
+            )?)
+        };
+        let session = IcebergStatisticsCollectionSession {
+            provider: self.clone(),
+            operation_id: request.operation_id,
+            table_payload,
+            data_version: request.data_version.clone(),
+            physical_table: physical.table,
+            snapshot_id,
+            sequence_number,
+            expectations,
+            context: request.context,
+            frontier,
+        };
+        StatisticsCollectionStart::try_new(
+            request.table,
+            request.data_version,
+            snapshot_id,
+            requirements,
+            Box::new(session),
+        )
+    }
+}
+
+struct IcebergStatisticsCollectionSession {
+    provider: IcebergMetadata,
+    operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+    table_payload: IcebergTablePayload,
+    data_version: StatisticsDataVersion,
+    physical_table: crate::iceberg::table::Table,
+    snapshot_id: Option<i64>,
+    sequence_number: Option<i64>,
+    expectations: Vec<StatisticsArtifactIdentity>,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    frontier: Option<Box<crate::catalog::transaction::Transaction>>,
+}
+
+impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
+    fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
+        self.provider.descriptor()
+    }
+
+    fn incarnation(&self) -> novarocks_spi::connector::ProviderBindingEpoch {
+        self.provider.incarnation()
+    }
+
+    fn operation_id(&self) -> novarocks_spi::connector::ConnectorMutationOperationId {
+        self.operation_id
+    }
+
+    fn expectations(&self) -> &[StatisticsArtifactIdentity] {
+        &self.expectations
+    }
+
+    fn finish(
+        self: Box<Self>,
+        artifacts: Vec<StatisticsArtifactDraft>,
+    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
+        let mut this = *self;
+        if let Err(error) = validate_context(&this.context) {
+            return Err(abort_pending_statistics_frontier(&mut this, error));
         }
+        let artifacts = match validate_artifacts(&this.expectations, artifacts) {
+            Ok(artifacts) => artifacts,
+            Err(error) => return Err(abort_pending_statistics_frontier(&mut this, error)),
+        };
+        let revision =
+            match collection_revision(&this.data_version, this.operation_id, &this.expectations) {
+                Ok(revision) => revision,
+                Err(error) => return Err(abort_pending_statistics_frontier(&mut this, error)),
+            };
+
+        if artifacts.is_empty() {
+            return statistics_receipt(
+                &this.provider,
+                this.operation_id,
+                this.data_version,
+                revision,
+                Bytes::new(),
+                ExternalMutationEffect::NoOp,
+            );
+        }
+        let snapshot_id = match this.snapshot_id {
+            Some(snapshot_id) => snapshot_id,
+            None => {
+                let error = corrupt("a statistics session with artifacts has no measured snapshot");
+                return Err(abort_pending_statistics_frontier(&mut this, error));
+            }
+        };
+        let sequence_number = match this.sequence_number {
+            Some(sequence_number) => sequence_number,
+            None => {
+                let error =
+                    corrupt("a statistics session with artifacts has no measured sequence number");
+                return Err(abort_pending_statistics_frontier(&mut this, error));
+            }
+        };
+        let expected_uuid = this.physical_table.metadata().uuid();
+
+        const MAX_ATTEMPTS: u8 = 3;
+        for attempt in 0..MAX_ATTEMPTS {
+            if let Err(error) = validate_context(&this.context) {
+                return Err(abort_pending_statistics_frontier(&mut this, error));
+            }
+            if attempt > 0 {
+                let physical = this
+                    .provider
+                    .runtime()
+                    .load_table_for_request(
+                        &this.table_payload.namespace,
+                        &this.table_payload.table,
+                        &this.context,
+                    )
+                    .map_err(unavailable)?;
+                if physical.table.metadata().uuid() != expected_uuid {
+                    return Ok(known_uncommitted(invalid(
+                        "Iceberg statistics conflict retry resolved a different physical table UUID",
+                    )));
+                }
+                if physical
+                    .table
+                    .metadata()
+                    .snapshot_by_id(snapshot_id)
+                    .is_none()
+                {
+                    return Ok(known_uncommitted(invalid(
+                        "the measured snapshot expired before statistics publication",
+                    )));
+                }
+                this.physical_table = physical.table;
+            }
+            let mut frontier = if attempt == 0 {
+                this.frontier
+                    .take()
+                    .expect("statistics session owns its initial frontier")
+            } else {
+                begin_statistics_frontier(
+                    &this.provider,
+                    &this.table_payload,
+                    this.operation_id,
+                    attempt,
+                    this.physical_table
+                        .metadata()
+                        .current_snapshot()
+                        .map(|snapshot| snapshot.snapshot_id()),
+                    &expected_uuid.to_string(),
+                )?
+            };
+
+            let attempt_identity = statistics_attempt_identity(this.operation_id, attempt);
+            let path = puffin_path_for_statistics_operation(
+                this.physical_table.metadata(),
+                snapshot_id,
+                attempt_identity,
+            );
+            let file_io = this.physical_table.file_io().clone();
+            let path_for_write = path.clone();
+            let artifacts_for_write = artifacts.clone();
+            let write_result = this
+                .provider
+                .runtime()
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    write_puffin_artifacts(
+                        &file_io,
+                        &path_for_write,
+                        snapshot_id,
+                        sequence_number,
+                        &artifacts_for_write,
+                    )
+                    .await
+                });
+            let statistics_file = match write_result {
+                Ok(Ok(Some(statistics_file))) => statistics_file,
+                Ok(Ok(None)) => {
+                    let error = abort_statistics_frontier(
+                        &this.provider,
+                        frontier,
+                        corrupt("non-empty statistics artifacts produced no Puffin file"),
+                    );
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
+                    return Err(error);
+                }
+                Ok(Err(error)) => {
+                    let error =
+                        abort_statistics_frontier(&this.provider, frontier, unavailable(error));
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
+                    return Err(error);
+                }
+                Err(error) => {
+                    let error =
+                        abort_statistics_frontier(&this.provider, frontier, unavailable(error));
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
+                    return Err(error);
+                }
+            };
+
+            let table_for_stage = this.physical_table.clone();
+            let staged_result = this
+                .provider
+                .runtime()
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    crate::commit::statistics::stage_statistics_file(
+                        &table_for_stage,
+                        statistics_file,
+                    )
+                    .await
+                });
+            let mut staged = match staged_result {
+                Ok(Ok(staged)) => staged,
+                Ok(Err(error)) => {
+                    let error = abort_statistics_frontier(&this.provider, frontier, corrupt(error));
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
+                    return Err(error);
+                }
+                Err(error) => {
+                    let error =
+                        abort_statistics_frontier(&this.provider, frontier, unavailable(error));
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
+                    return Err(error);
+                }
+            };
+            staged.add_requirement(crate::iceberg::TableRequirement::UuidMatch {
+                uuid: expected_uuid,
+            });
+            if let Err(error) = frontier.stage(staged) {
+                let error = abort_statistics_frontier(&this.provider, frontier, error);
+                cleanup_uncommitted_statistics_file(
+                    &this.provider,
+                    this.physical_table.file_io().clone(),
+                    path.clone(),
+                );
+                return Err(error);
+            }
+            if let Err(error) = validate_context(&this.context) {
+                let error = abort_statistics_frontier(&this.provider, frontier, error);
+                cleanup_uncommitted_statistics_file(
+                    &this.provider,
+                    this.physical_table.file_io().clone(),
+                    path.clone(),
+                );
+                return Err(error);
+            }
+            let commit_result = this
+                .provider
+                .runtime()
+                .resources()
+                .catalog_runtime()
+                .block_on(async move { frontier.commit().await });
+            let outcome = match commit_result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Ok(ExternalMutationOutcome::CommitUnknown {
+                        failure: ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::Unavailable,
+                            format!("Iceberg statistics commit runtime bridge: {error}"),
+                        ),
+                        evidence: statistics_evidence(
+                            &this.provider,
+                            this.operation_id,
+                            &this.table_payload,
+                            &this.data_version,
+                            &path,
+                        )?,
+                    });
+                }
+            };
+            match outcome {
+                CatalogOutcome::KnownCommitted { effect, .. } => {
+                    this.provider
+                        .runtime()
+                        .control_state()
+                        .invalidate_table(&this.table_payload.namespace, &this.table_payload.table);
+                    return statistics_receipt(
+                        &this.provider,
+                        this.operation_id,
+                        this.data_version,
+                        revision,
+                        Bytes::from(path),
+                        effect,
+                    );
+                }
+                CatalogOutcome::KnownUncommitted { failure } => {
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
+                    let Some(next_attempt) =
+                        next_statistics_attempt(&failure, attempt, MAX_ATTEMPTS)
+                    else {
+                        return Ok(ExternalMutationOutcome::KnownUncommitted { failure });
+                    };
+                    statistics_conflict_backoff(&this.provider, &this.context, next_attempt)?;
+                    continue;
+                }
+                CatalogOutcome::Unsupported(unsupported) => {
+                    cleanup_uncommitted_statistics_file(
+                        &this.provider,
+                        this.physical_table.file_io().clone(),
+                        path,
+                    );
+                    return Ok(ExternalMutationOutcome::KnownUncommitted {
+                        failure: ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::Unsupported,
+                            unsupported.message(),
+                        ),
+                    });
+                }
+                CatalogOutcome::CommitUnknown { failure, .. } => {
+                    return Ok(ExternalMutationOutcome::CommitUnknown {
+                        failure,
+                        evidence: statistics_evidence(
+                            &this.provider,
+                            this.operation_id,
+                            &this.table_payload,
+                            &this.data_version,
+                            &path,
+                        )?,
+                    });
+                }
+            }
+        }
+        unreachable!("statistics publication attempt loop always returns")
+    }
+}
+
+fn abort_pending_statistics_frontier(
+    session: &mut IcebergStatisticsCollectionSession,
+    error: ConnectorError,
+) -> ConnectorError {
+    match session.frontier.take() {
+        Some(frontier) => abort_statistics_frontier(&session.provider, frontier, error),
+        None => error,
+    }
+}
+
+fn abort_statistics_frontier(
+    provider: &IcebergMetadata,
+    mut frontier: Box<crate::catalog::transaction::Transaction>,
+    mut error: ConnectorError,
+) -> ConnectorError {
+    let abort = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { frontier.abort().await });
+    match abort {
+        Ok(Ok(())) => {}
+        Ok(Err(abort_error)) => {
+            error = error.with_cleanup_context(format!(
+                "statistics transaction abort failed: {abort_error}"
+            ));
+        }
+        Err(abort_error) => {
+            error = error.with_cleanup_context(format!(
+                "statistics transaction abort runtime bridge failed: {abort_error}"
+            ));
+        }
+    }
+    error
+}
+
+fn cleanup_uncommitted_statistics_file(
+    provider: &IcebergMetadata,
+    file_io: crate::iceberg::io::FileIO,
+    path: String,
+) {
+    let cleanup_path = path.clone();
+    let cleanup = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { file_io.delete(&cleanup_path).await });
+    match cleanup {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(path = %path, source = ?error, "statistics Puffin cleanup failed");
+        }
+        Err(error) => {
+            tracing::warn!(path = %path, source = ?error, "statistics Puffin cleanup runtime bridge failed");
+        }
+    }
+}
+
+fn collection_requirements(
+    schema: &crate::iceberg::spec::Schema,
+    selection: &StatisticsColumnSelection,
+) -> Result<Vec<StatisticsRequiredAggregation>, ConnectorError> {
+    let arrow_schema = crate::iceberg::arrow::schema_to_arrow_schema(schema)
+        .map_err(|error| corrupt(format!("convert measured Iceberg schema: {error}")))?;
+    let explicit = match selection {
+        StatisticsColumnSelection::Default => None,
+        StatisticsColumnSelection::Explicit(columns) => Some(
+            columns
+                .iter()
+                .map(|column| column.to_ascii_lowercase())
+                .collect::<BTreeSet<_>>(),
+        ),
+    };
+    let fields = schema.as_struct().fields();
+    let mut requirements = Vec::new();
+    let mut matched = BTreeSet::new();
+    for (ordinal, iceberg_field) in fields.iter().enumerate() {
+        let normalized = iceberg_field.name.to_ascii_lowercase();
+        if explicit
+            .as_ref()
+            .is_some_and(|columns| !columns.contains(&normalized))
+        {
+            continue;
+        }
+        let Some(primitive) = (match iceberg_field.field_type.as_ref() {
+            Type::Primitive(primitive) => Some(primitive),
+            _ => None,
+        }) else {
+            if explicit.is_some() {
+                return Err(unsupported_column(
+                    &iceberg_field.name,
+                    &iceberg_field.field_type,
+                ));
+            }
+            continue;
+        };
+        let arrow_field = arrow_schema.fields().get(ordinal).ok_or_else(|| {
+            corrupt("Iceberg and Arrow statistics schemas have different field counts")
+        })?;
+        // UUID is an Iceberg physical 16-byte value. Its aggregate input is
+        // declared from the Iceberg type itself, never guessed from an Utf8
+        // field emitted by another schema adapter.
+        let data_type = if matches!(primitive, PrimitiveType::Uuid) {
+            DataType::FixedSizeBinary(16)
+        } else {
+            arrow_field.data_type().clone()
+        };
+        if !supports_theta_input_type(&data_type) {
+            if explicit.is_some() {
+                return Err(unsupported_column(
+                    &iceberg_field.name,
+                    &iceberg_field.field_type,
+                ));
+            }
+            continue;
+        }
+        let input = StatisticsScanColumn::try_new(
+            ordinal,
+            Arc::<str>::from(iceberg_field.name.as_str()),
+            data_type,
+            !iceberg_field.required,
+        )?;
+        let artifact = StatisticsArtifactIdentity::try_new(
+            vec![iceberg_field.id],
+            APACHE_DATASKETCHES_THETA_V1,
+        )?;
+        requirements.push(StatisticsRequiredAggregation::try_new(
+            input,
+            ICEBERG_THETA_AGGREGATE_NAME,
+            artifact,
+        )?);
+        matched.insert(normalized);
+    }
+    if let Some(explicit) = explicit
+        && let Some(missing) = explicit.difference(&matched).next()
+    {
+        return Err(invalid(format!(
+            "Iceberg statistics column `{missing}` is absent from the measured schema"
+        )));
+    }
+    Ok(requirements)
+}
+
+fn unsupported_column(name: &str, data_type: &Type) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        format!("Iceberg statistics do not support column `{name}` of type {data_type}"),
+    )
+}
+
+fn validate_artifacts(
+    expectations: &[StatisticsArtifactIdentity],
+    artifacts: Vec<StatisticsArtifactDraft>,
+) -> Result<Vec<StatisticsArtifactDraft>, ConnectorError> {
+    if artifacts.len() != expectations.len() {
+        return Err(invalid(
+            "statistics artifact count does not match the session expectation set",
+        ));
+    }
+    let expected = expectations.iter().cloned().collect::<BTreeSet<_>>();
+    let mut observed = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        if !expected.contains(artifact.identity()) || !observed.insert(artifact.identity().clone())
+        {
+            return Err(invalid(
+                "statistics artifacts contain an unknown or duplicate identity",
+            ));
+        }
+        validate_compact_theta(artifact.body()).map_err(|error| corrupt(error.to_string()))?;
+        let estimate =
+            estimate_compact_theta(artifact.body()).map_err(|error| corrupt(error.to_string()))?;
+        let (identity, body, mut properties) = artifact.into_parts();
+        if properties
+            .keys()
+            .any(|property| property != crate::stats_loader::NDV_PROPERTY)
+        {
+            return Err(invalid(
+                "Theta statistics artifacts contain an unsupported property",
+            ));
+        }
+        if let Some(rendered) = properties.get(crate::stats_loader::NDV_PROPERTY) {
+            let supplied = rendered
+                .parse::<f64>()
+                .map_err(|_| invalid("statistics artifact ndv property is not numeric"))?;
+            if !supplied.is_finite() || supplied < 0.0 || supplied.to_bits() != estimate.to_bits() {
+                return Err(invalid(
+                    "statistics artifact ndv property does not match its Theta body",
+                ));
+            }
+        } else {
+            properties.insert(
+                crate::stats_loader::NDV_PROPERTY.to_string(),
+                estimate.to_string(),
+            );
+        }
+        normalized.push(StatisticsArtifactDraft::try_new(
+            identity.input_fields().to_vec(),
+            identity.blob_type(),
+            body,
+            properties,
+        )?);
+    }
+    if observed != expected {
+        return Err(invalid(
+            "statistics artifacts do not exactly match the session expectation set",
+        ));
+    }
+    normalized.sort_by(|left, right| left.identity().cmp(right.identity()));
+    Ok(normalized)
+}
+
+fn begin_statistics_frontier(
+    provider: &IcebergMetadata,
+    table: &IcebergTablePayload,
+    operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+    attempt: u8,
+    base_snapshot_id: Option<i64>,
+    expected_uuid: &str,
+) -> Result<Box<crate::catalog::transaction::Transaction>, ConnectorError> {
+    #[cfg(test)]
+    STATISTICS_TRANSACTION_ADMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let expected_uuid = Arc::<str>::from(expected_uuid);
+    let request = TransactionRequest {
+        identity: TransactionIdentity::new(
+            "statistics-attempt",
+            statistics_attempt_identity(operation_id, attempt),
+        ),
+        target: CatalogTableName::new(table.namespace.as_str(), table.table.as_str()),
+        target_ref: Arc::from("main"),
+        base_snapshot_id,
+        expected_table_uuid: Some(expected_uuid),
+        marker: None,
+    };
+    let catalog = Arc::clone(provider.runtime().novarocks_catalog());
+    let start = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { catalog.new_transaction(request).await })
+        .map_err(unavailable)?;
+    match start {
+        CatalogTransactionStart::Ready(frontier) => Ok(frontier),
+        CatalogTransactionStart::Unsupported(unsupported) => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            unsupported.message(),
+        )),
+        CatalogTransactionStart::KnownUncommitted { failure } => Err(ConnectorError::new(
+            connector_kind(failure.kind()),
+            failure.message(),
+        )),
+        CatalogTransactionStart::CommitUnknown { failure, .. } => Err(ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            format!("statistics transaction admission outcome is unknown: {failure}"),
+        )),
+    }
+}
+
+fn statistics_attempt_identity(
+    operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+    attempt: u8,
+) -> [u8; 16] {
+    let mut digest = Sha256::new();
+    digest.update(operation_id.to_bytes());
+    digest.update([attempt]);
+    digest.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix has a fixed width")
+}
+
+fn next_statistics_attempt(
+    failure: &ConnectorMutationFailure,
+    attempt: u8,
+    max_attempts: u8,
+) -> Option<u8> {
+    let next_attempt = attempt.checked_add(1)?;
+    (failure.kind() == ConnectorMutationFailureKind::Conflict && next_attempt < max_attempts)
+        .then_some(next_attempt)
+}
+
+fn statistics_conflict_backoff(
+    provider: &IcebergMetadata,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    next_attempt: u8,
+) -> Result<(), ConnectorError> {
+    validate_context(context)?;
+    let delay = std::time::Duration::from_millis(20 * u64::from(next_attempt));
+    if context.deadline().saturating_duration_since(Instant::now()) <= delay {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::DeadlineExceeded,
+            "statistics publication deadline does not permit another conflict attempt",
+        ));
+    }
+    provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { tokio::time::sleep(delay).await })
+        .map_err(unavailable)?;
+    validate_context(context)
+}
+
+fn collection_revision(
+    data_version: &StatisticsDataVersion,
+    operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
+    expectations: &[StatisticsArtifactIdentity],
+) -> Result<StatisticsEvidenceRevision, ConnectorError> {
+    let mut digest = Sha256::new();
+    digest.update(data_version.as_bytes());
+    digest.update(operation_id.to_bytes());
+    for expectation in expectations {
+        for field in expectation.input_fields() {
+            digest.update(field.to_be_bytes());
+        }
+        digest.update(expectation.blob_type().as_bytes());
+    }
+    StatisticsEvidenceRevision::try_new(Bytes::copy_from_slice(&digest.finalize()[..16]))
+}
+
+fn connector_kind(kind: ConnectorMutationFailureKind) -> ConnectorErrorKind {
+    match kind {
+        ConnectorMutationFailureKind::InvalidRequest
+        | ConnectorMutationFailureKind::AlreadyExists
+        | ConnectorMutationFailureKind::Conflict => ConnectorErrorKind::InvalidRequest,
+        ConnectorMutationFailureKind::NotFound => ConnectorErrorKind::NotFound,
+        ConnectorMutationFailureKind::Unauthenticated
+        | ConnectorMutationFailureKind::PermissionDenied => ConnectorErrorKind::PermissionDenied,
+        ConnectorMutationFailureKind::Unsupported => ConnectorErrorKind::Unsupported,
+        ConnectorMutationFailureKind::Cancelled => ConnectorErrorKind::Cancelled,
+        ConnectorMutationFailureKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
+        ConnectorMutationFailureKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
+        ConnectorMutationFailureKind::Unavailable => ConnectorErrorKind::Unavailable,
+        ConnectorMutationFailureKind::CorruptData => ConnectorErrorKind::CorruptData,
+        ConnectorMutationFailureKind::Internal => ConnectorErrorKind::Internal,
     }
 }
 
@@ -629,49 +1128,6 @@ fn pinned_data_version(
             .ok_or_else(|| corrupt("Iceberg table payload is missing its table UUID"))?,
         info.current_snapshot_id,
     )
-}
-
-fn statistics_scan_layout(
-    table: &IcebergTablePayload,
-    projection: &[usize],
-) -> Result<Vec<StatisticsScanColumn>, ConnectorError> {
-    let info = base_table_info(table, "statistics collection")?;
-    let serialized = info.serialized_metadata.as_deref().ok_or_else(|| {
-        corrupt("Iceberg statistics collection payload is missing serialized pinned metadata")
-    })?;
-    let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
-        .map_err(|error| corrupt(format!("decode pinned Iceberg metadata: {error}")))?;
-    if metadata.current_schema_id() != info.schema_id {
-        return Err(corrupt(
-            "Iceberg statistics metadata does not match its pinned schema ID",
-        ));
-    }
-    let schema = crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
-        .map_err(|error| corrupt(format!("convert pinned Iceberg schema: {error}")))?;
-    projection
-        .iter()
-        .map(|&ordinal| {
-            let field = schema.fields().get(ordinal).ok_or_else(|| {
-                invalid(format!(
-                    "Iceberg statistics projection index {ordinal} is outside the pinned schema"
-                ))
-            })?;
-            let data_type = match table
-                .logical_type_columns
-                .get(&field.name().to_ascii_lowercase())
-                .map(String::as_str)
-            {
-                Some("bitmap") | Some("hll") => DataType::Binary,
-                _ => field.data_type().clone(),
-            };
-            StatisticsScanColumn::try_new(
-                ordinal,
-                Arc::<str>::from(field.name().as_str()),
-                data_type,
-                field.is_nullable(),
-            )
-        })
-        .collect()
 }
 
 fn manifest_metric(
@@ -740,19 +1196,15 @@ fn manifest_metric(
                 } else {
                     stats.upper_bound.as_deref()?
                 };
-                decode_bound_to_f64(bytes, data_type).filter(|value| value.is_finite())
+                decode_bound(bytes, data_type)
             });
-            let reduced = values.try_fold(None, |state: Option<f64>, value| match (state, value) {
+            let reduced = values.try_fold(None, |state, value| match (state, value) {
                 (None, Some(value)) => Some(Some(value)),
-                (Some(current), Some(value)) => Some(Some(if lower {
-                    current.min(value)
-                } else {
-                    current.max(value)
-                })),
+                (Some(current), Some(value)) => compare_bound(current, value, lower).map(Some),
                 _ => None,
             });
             match reduced.flatten() {
-                Some(value) => available(StatisticsMetricValue::F64(value)),
+                Some(value) => available(value),
                 None => missing_column(column),
             }
         }
@@ -774,131 +1226,61 @@ fn column_stats<'a>(
         .find_map(|(name, stats)| name.eq_ignore_ascii_case(column).then_some(stats))
 }
 
-fn decode_bound_to_f64(bytes: &[u8], data_type: &DataType) -> Option<f64> {
+fn decode_bound(bytes: &[u8], data_type: &DataType) -> Option<StatisticsMetricValue> {
     match data_type {
         DataType::Boolean => match bytes {
-            [0] => Some(0.0),
-            [1] => Some(1.0),
+            [0] => Some(StatisticsMetricValue::I64(0)),
+            [1] => Some(StatisticsMetricValue::I64(1)),
             _ => None,
         },
         DataType::Int8
         | DataType::Int16
         | DataType::Int32
         | DataType::Date32
-        | DataType::Time32(_) => Some(i32::from_le_bytes(bytes.try_into().ok()?) as f64),
+        | DataType::Time32(_) => Some(StatisticsMetricValue::I64(i64::from(i32::from_le_bytes(
+            bytes.try_into().ok()?,
+        )))),
         DataType::Int64
         | DataType::Date64
         | DataType::Timestamp(_, _)
         | DataType::Time64(_)
-        | DataType::Duration(_) => Some(i64::from_le_bytes(bytes.try_into().ok()?) as f64),
-        DataType::Float32 => Some(f32::from_le_bytes(bytes.try_into().ok()?) as f64),
-        DataType::Float64 => Some(f64::from_le_bytes(bytes.try_into().ok()?)),
-        DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) => {
-            if bytes.is_empty() || bytes.len() > 16 {
-                return None;
-            }
-            let mut padded = [if bytes[0] & 0x80 != 0 { 0xff } else { 0 }; 16];
-            padded[16 - bytes.len()..].copy_from_slice(bytes);
-            Some(i128::from_be_bytes(padded) as f64 / 10_f64.powi(*scale as i32))
-        }
+        | DataType::Duration(_) => Some(StatisticsMetricValue::I64(i64::from_le_bytes(
+            bytes.try_into().ok()?,
+        ))),
+        DataType::Float32 => Some(StatisticsMetricValue::F64(f64::from(f32::from_le_bytes(
+            bytes.try_into().ok()?,
+        )))),
+        DataType::Float64 => Some(StatisticsMetricValue::F64(f64::from_le_bytes(
+            bytes.try_into().ok()?,
+        ))),
         _ => None,
     }
 }
 
-fn decode_visible_row_artifact(
-    bytes: &[u8],
-) -> Result<(StatisticsDataVersion, BTreeMap<String, ThetaSketchHandle>), ConnectorError> {
-    let mut cursor = 0usize;
-    let version = take(bytes, &mut cursor, 1)?[0];
-    if version != VISIBLE_ROW_ARTIFACT_VERSION {
-        return Err(corrupt(
-            "statistics visible-row artifact has an unsupported version",
-        ));
-    }
-    let data_version_len = u16::from_be_bytes(
-        take(bytes, &mut cursor, 2)?
-            .try_into()
-            .expect("fixed field width"),
-    ) as usize;
-    let data_version = StatisticsDataVersion::try_new(Bytes::copy_from_slice(take(
-        bytes,
-        &mut cursor,
-        data_version_len,
-    )?))?;
-    let count = u16::from_be_bytes(
-        take(bytes, &mut cursor, 2)?
-            .try_into()
-            .expect("fixed field width"),
-    ) as usize;
-    let mut sketches = BTreeMap::new();
-    for _ in 0..count {
-        let name_len = u16::from_be_bytes(
-            take(bytes, &mut cursor, 2)?
-                .try_into()
-                .expect("fixed field width"),
-        ) as usize;
-        let name = std::str::from_utf8(take(bytes, &mut cursor, name_len)?)
-            .map_err(|_| corrupt("statistics artifact column is not UTF-8"))?;
-        if name.is_empty() {
-            return Err(corrupt("statistics artifact column name is empty"));
+fn compare_bound(
+    current: StatisticsMetricValue,
+    candidate: StatisticsMetricValue,
+    lower: bool,
+) -> Option<StatisticsMetricValue> {
+    match (current, candidate) {
+        (StatisticsMetricValue::I64(current), StatisticsMetricValue::I64(candidate)) => {
+            Some(StatisticsMetricValue::I64(if lower {
+                current.min(candidate)
+            } else {
+                current.max(candidate)
+            }))
         }
-        let sketch_len = u32::from_be_bytes(
-            take(bytes, &mut cursor, 4)?
-                .try_into()
-                .expect("fixed field width"),
-        ) as usize;
-        let sketch = decode_theta_partial(take(bytes, &mut cursor, sketch_len)?)?;
-        if sketches.insert(name.to_string(), sketch).is_some() {
-            return Err(corrupt(
-                "statistics artifact contains a duplicate Theta column",
-            ));
+        (StatisticsMetricValue::F64(current), StatisticsMetricValue::F64(candidate))
+            if current.is_finite() && candidate.is_finite() =>
+        {
+            Some(StatisticsMetricValue::F64(if lower {
+                current.min(candidate)
+            } else {
+                current.max(candidate)
+            }))
         }
+        _ => None,
     }
-    if cursor != bytes.len() {
-        return Err(corrupt(
-            "statistics visible-row artifact has trailing bytes",
-        ));
-    }
-    Ok((data_version, sketches))
-}
-
-fn decode_theta_partial(bytes: &[u8]) -> Result<ThetaSketchHandle, ConnectorError> {
-    if bytes.len() < THETA_PARTIAL_WIRE_HEADER_BYTES {
-        return Err(corrupt("statistics Theta state is truncated"));
-    }
-    if bytes.len() > MAX_THETA_PARTIAL_WIRE_BYTES {
-        return Err(corrupt("statistics Theta state exceeds the size limit"));
-    }
-    if bytes[0] != THETA_PARTIAL_WIRE_VERSION {
-        return Err(corrupt("statistics Theta state has an unsupported version"));
-    }
-    let lg_k = bytes[1];
-    if !(5..=12).contains(&lg_k) {
-        return Err(corrupt("statistics Theta state has an invalid lg_k"));
-    }
-    let sketch =
-        ThetaSketchHandle::deserialize_with_lg_k(&bytes[THETA_PARTIAL_WIRE_HEADER_BYTES..], lg_k)
-            .map_err(corrupt)?;
-    if !sketch.is_ordered() {
-        return Err(corrupt("statistics Theta compact body must be ordered"));
-    }
-    if sketch.num_retained() > MAX_THETA_RETAINED_HASHES {
-        return Err(corrupt(
-            "statistics Theta state exceeds the retained-hash limit",
-        ));
-    }
-    Ok(sketch)
-}
-
-fn take<'a>(bytes: &'a [u8], cursor: &mut usize, count: usize) -> Result<&'a [u8], ConnectorError> {
-    let end = cursor
-        .checked_add(count)
-        .ok_or_else(|| corrupt("statistics artifact length overflow"))?;
-    let value = bytes
-        .get(*cursor..end)
-        .ok_or_else(|| corrupt("statistics artifact is truncated"))?;
-    *cursor = end;
-    Ok(value)
 }
 
 fn statistics_evidence(
@@ -1022,15 +1404,217 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use novarocks_spi::connector::{
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
-        ConnectorProviderId, ProviderBindingEpoch,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
+        ConnectorMutationOperationId, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+        ProviderBindingEpoch,
     };
+    use serde::{Deserialize, Serialize};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::access_binding::IcebergReadBinding;
+    use crate::catalog::error::CatalogCommitEvidence;
+    use crate::catalog::transaction::{
+        CatalogCommitDispatch, CommitProof, Transaction, TransactionShape,
+    };
     use crate::catalog_control::IcebergCatalogControlState;
+    use crate::iceberg::io::{
+        FileIO, FileIOBuilder, FileMetadata, FileRead, FileWrite, InputFile, MemoryStorage,
+        OutputFile, Storage, StorageConfig, StorageFactory,
+    };
+    use crate::iceberg::spec::{
+        FormatVersion, Operation, PartitionSpec, Snapshot, SortOrder, Summary, TableMetadataBuilder,
+    };
+    use crate::iceberg::table::Table;
+    use crate::iceberg::{Error as IcebergError, TableIdent};
     use crate::metadata_context::IcebergMetadataContext;
     use crate::resources::IcebergMetadataResources;
+
+    struct NeverCancelled;
+
+    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct CancelOnCheck {
+        checks: AtomicUsize,
+        cancel_on: usize,
+    }
+
+    impl novarocks_spi::connector::ConnectorCancellation for CancelOnCheck {
+        fn is_cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.cancel_on
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DispatchBehavior {
+        Commit,
+        Conflict,
+        RejectDefinitely,
+        LoseResponse,
+        PanicAfterDispatch,
+    }
+
+    #[derive(Debug)]
+    struct CountingDispatch {
+        behavior: DispatchBehavior,
+        dispatches: AtomicUsize,
+        aborts: AtomicUsize,
+    }
+
+    impl CountingDispatch {
+        fn new(behavior: DispatchBehavior) -> Arc<Self> {
+            Arc::new(Self {
+                behavior,
+                dispatches: AtomicUsize::new(0),
+                aborts: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CatalogCommitDispatch for CountingDispatch {
+        async fn dispatch_once(
+            &self,
+            _staged: Option<crate::iceberg::TableCommit>,
+        ) -> Result<CommitProof, IcebergError> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                DispatchBehavior::Commit => Ok(CommitProof::applied(Some(7))),
+                DispatchBehavior::Conflict => Err(IcebergError::new(
+                    crate::iceberg::ErrorKind::CatalogCommitConflicts,
+                    "injected statistics conflict",
+                )),
+                DispatchBehavior::RejectDefinitely => Err(IcebergError::new(
+                    crate::iceberg::ErrorKind::DataInvalid,
+                    "injected definite statistics rejection",
+                )),
+                DispatchBehavior::LoseResponse => Err(IcebergError::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    "injected lost statistics response",
+                )),
+                DispatchBehavior::PanicAfterDispatch => {
+                    panic!("injected catalog runtime bridge panic after dispatch")
+                }
+            }
+        }
+
+        async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
+            Ok(None)
+        }
+
+        async fn abort_before_dispatch(&self) -> Result<(), ConnectorError> {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailAfterCloseTrace {
+        complete_before_failure: AtomicUsize,
+        deletes: AtomicUsize,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct FailAfterCloseStorage {
+        inner: MemoryStorage,
+        #[serde(skip, default)]
+        trace: Arc<FailAfterCloseTrace>,
+    }
+
+    #[typetag::serde(name = "ncp8-statistics-fail-after-close-storage")]
+    #[async_trait]
+    impl Storage for FailAfterCloseStorage {
+        async fn exists(&self, path: &str) -> crate::iceberg::Result<bool> {
+            self.inner.exists(path).await
+        }
+
+        async fn list_directories(&self, path: &str) -> crate::iceberg::Result<Vec<String>> {
+            self.inner.list_directories(path).await
+        }
+
+        async fn metadata(&self, path: &str) -> crate::iceberg::Result<FileMetadata> {
+            if path.ends_with(".puffin") {
+                assert!(
+                    self.inner.exists(path).await?,
+                    "the injected metadata failure must happen after close published the object"
+                );
+                self.trace
+                    .complete_before_failure
+                    .fetch_add(1, Ordering::SeqCst);
+                return Err(IcebergError::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    "injected Puffin metadata failure after close",
+                ));
+            }
+            self.inner.metadata(path).await
+        }
+
+        async fn read(&self, path: &str) -> crate::iceberg::Result<Bytes> {
+            self.inner.read(path).await
+        }
+
+        async fn reader(&self, path: &str) -> crate::iceberg::Result<Box<dyn FileRead>> {
+            self.inner.reader(path).await
+        }
+
+        async fn write(&self, path: &str, bytes: Bytes) -> crate::iceberg::Result<()> {
+            self.inner.write(path, bytes).await
+        }
+
+        async fn writer(&self, path: &str) -> crate::iceberg::Result<Box<dyn FileWrite>> {
+            self.inner.writer(path).await
+        }
+
+        async fn delete(&self, path: &str) -> crate::iceberg::Result<()> {
+            self.trace.deletes.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(path).await
+        }
+
+        async fn delete_prefix(&self, path: &str) -> crate::iceberg::Result<()> {
+            self.inner.delete_prefix(path).await
+        }
+
+        fn new_input(&self, path: &str) -> crate::iceberg::Result<InputFile> {
+            Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+
+        fn new_output(&self, path: &str) -> crate::iceberg::Result<OutputFile> {
+            Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct FailAfterCloseStorageFactory {
+        inner: MemoryStorage,
+        #[serde(skip, default)]
+        trace: Arc<FailAfterCloseTrace>,
+    }
+
+    #[typetag::serde(name = "ncp8-statistics-fail-after-close-storage-factory")]
+    impl StorageFactory for FailAfterCloseStorageFactory {
+        fn build(&self, _config: &StorageConfig) -> crate::iceberg::Result<Arc<dyn Storage>> {
+            Ok(Arc::new(FailAfterCloseStorage {
+                inner: self.inner.clone(),
+                trace: Arc::clone(&self.trace),
+            }))
+        }
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + std::time::Duration::from_secs(5),
+            Arc::new(NeverCancelled),
+            1024 * 1024,
+            1024 * 1024,
+        )
+        .expect("context")
+    }
 
     fn provider() -> (tokio::runtime::Runtime, tempfile::TempDir, IcebergMetadata) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
@@ -1087,51 +1671,508 @@ mod tests {
         }
     }
 
-    #[test]
-    fn theta_carrier_v2_keeps_the_standard_body_opaque_and_bounded() {
-        let mut standard = ThetaSketchHandle::new(12).expect("theta sketch");
-        standard.update(9_u64).expect("theta update");
-        let mut bytes = vec![THETA_PARTIAL_WIRE_VERSION, 12];
-        bytes.extend_from_slice(&standard.serialize());
-        assert_eq!(
-            decode_theta_partial(&bytes).expect("carrier").estimate(),
-            1.0
-        );
-
-        bytes[0] = 1;
-        assert!(decode_theta_partial(&bytes).is_err());
-        bytes[0] = THETA_PARTIAL_WIRE_VERSION;
-        bytes[1] = 13;
-        assert!(decode_theta_partial(&bytes).is_err());
-        assert!(decode_theta_partial(&vec![0; MAX_THETA_PARTIAL_WIRE_BYTES + 1]).is_err());
+    fn table_with_snapshot(file_io: FileIO) -> Table {
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(7)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1)
+            .with_manifest_list("memory://warehouse/db/t/metadata/snap-7.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(0)
+            .build();
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://warehouse/db/t".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .set_branch_snapshot(snapshot, "main")
+        .expect("current snapshot")
+        .build()
+        .expect("metadata")
+        .metadata;
+        Table::builder()
+            .identifier(TableIdent::from_strs(["db", "t"]).expect("identifier"))
+            .metadata(metadata)
+            .file_io(file_io)
+            .build()
+            .expect("table")
     }
 
-    #[test]
-    fn theta_carrier_accepts_shared_tck_ordered_v3_body() {
-        let body = include_bytes!(
+    fn nonempty_statistics_session(
+        provider: IcebergMetadata,
+        physical_table: Table,
+        operation_id: ConnectorMutationOperationId,
+        context: ConnectorRequestContext,
+        dispatch: Arc<CountingDispatch>,
+    ) -> (
+        IcebergStatisticsCollectionSession,
+        StatisticsArtifactDraft,
+        String,
+    ) {
+        let path = puffin_path_for_statistics_operation(
+            physical_table.metadata(),
+            7,
+            statistics_attempt_identity(operation_id, 0),
+        );
+        let frontier = Transaction::new(
+            TransactionIdentity::new("statistics-cleanup-test", [9; 16]),
+            CatalogTableName::new("db", "t"),
+            TransactionShape::Existing,
+            CatalogCommitEvidence::for_target("db.t"),
+            dispatch,
+        );
+        let identity = StatisticsArtifactIdentity::try_new(vec![1], APACHE_DATASKETCHES_THETA_V1)
+            .expect("identity");
+        let body = Bytes::from_static(include_bytes!(
             "../../../../../tests/datasketches-tck/fixtures/theta/rust_quickselect_n1000_ordered_v3.sk"
-        );
-        let mut wire = vec![THETA_PARTIAL_WIRE_VERSION, 12];
-        wire.extend_from_slice(body);
-
-        let sketch = decode_theta_partial(&wire).expect("decode shared TCK carrier");
-        assert_eq!(sketch.serialize(), body);
-        assert_eq!(sketch.estimate(), 1000.0);
+        ));
+        let artifact = StatisticsArtifactDraft::try_new(
+            identity.input_fields().to_vec(),
+            identity.blob_type(),
+            body,
+            BTreeMap::new(),
+        )
+        .expect("artifact");
+        (
+            IcebergStatisticsCollectionSession {
+                provider,
+                operation_id,
+                table_payload: table_payload(),
+                data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-7"))
+                    .expect("data version"),
+                physical_table,
+                snapshot_id: Some(7),
+                sequence_number: Some(1),
+                expectations: vec![identity],
+                context,
+                frontier: Some(Box::new(frontier)),
+            },
+            artifact,
+            path,
+        )
     }
 
     #[test]
-    fn theta_carrier_rejects_shared_tck_unordered_body() {
-        let body = include_bytes!(
-            "../../../../../tests/datasketches-tck/fixtures/theta/java62_quickselect_n1000_unordered_v3.sk"
+    fn cancellation_after_puffin_stage_vetoes_statistics_dispatch_and_cleans_attempt_file() {
+        let (executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let operation_id = ConnectorMutationOperationId::new();
+        let cancellation = Arc::new(CancelOnCheck {
+            checks: AtomicUsize::new(0),
+            cancel_on: 3,
+        });
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + std::time::Duration::from_secs(5),
+            cancellation.clone(),
+            1024 * 1024,
+            1024 * 1024,
+        )
+        .expect("context");
+        let dispatch = CountingDispatch::new(DispatchBehavior::Commit);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            operation_id,
+            context,
+            Arc::clone(&dispatch),
         );
-        let mut wire = vec![THETA_PARTIAL_WIRE_VERSION, 12];
-        wire.extend_from_slice(body);
 
-        let error = match decode_theta_partial(&wire) {
-            Ok(_) => panic!("unordered compact body must fail"),
-            Err(error) => error,
+        let error = Box::new(session)
+            .finish(vec![artifact])
+            .expect_err("late cancellation must veto catalog dispatch");
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(cancellation.checks.load(Ordering::SeqCst), 3);
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 1);
+        assert!(
+            !executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect attempt Puffin"),
+            "the known-uncommitted attempt must clean its Puffin file"
+        );
+    }
+
+    #[test]
+    fn puffin_failure_after_close_aborts_frontier_and_removes_complete_object() {
+        let (_executor, _warehouse, provider) = provider();
+        let trace = Arc::new(FailAfterCloseTrace::default());
+        let file_io = FileIOBuilder::new(Arc::new(FailAfterCloseStorageFactory {
+            inner: MemoryStorage::new(),
+            trace: Arc::clone(&trace),
+        }))
+        .build();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let dispatch = CountingDispatch::new(DispatchBehavior::Commit);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            ConnectorMutationOperationId::new(),
+            context(),
+            Arc::clone(&dispatch),
+        );
+
+        let error = Box::new(session)
+            .finish(vec![artifact])
+            .expect_err("post-close metadata failure must abort publication");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+        assert_eq!(trace.complete_before_failure.load(Ordering::SeqCst), 1);
+        assert_eq!(trace.deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 1);
+        assert!(
+            !_executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect failed Puffin attempt"),
+            "the complete but uncommitted Puffin must be removed"
+        );
+    }
+
+    #[test]
+    fn invalid_artifacts_abort_the_admitted_frontier_before_any_dispatch() {
+        let (_executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io);
+        let dispatch = CountingDispatch::new(DispatchBehavior::Commit);
+        let (session, _artifact, _path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            ConnectorMutationOperationId::new(),
+            context(),
+            Arc::clone(&dispatch),
+        );
+
+        let error = Box::new(session)
+            .finish(Vec::new())
+            .expect_err("missing required artifact must fail before publication");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn terminal_known_uncommitted_statistics_attempt_cleans_its_puffin() {
+        let (executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let dispatch = CountingDispatch::new(DispatchBehavior::RejectDefinitely);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            ConnectorMutationOperationId::new(),
+            context(),
+            Arc::clone(&dispatch),
+        );
+
+        let outcome = Box::new(session)
+            .finish(vec![artifact])
+            .expect("definite catalog rejection");
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownUncommitted { ref failure }
+                if failure.kind() == ConnectorMutationFailureKind::InvalidRequest
+        ));
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
+        assert!(
+            !executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect rejected attempt Puffin"),
+            "a definitely uncommitted attempt must clean its Puffin file"
+        );
+    }
+
+    #[test]
+    fn conflict_cleans_attempt_puffin_before_fresh_base_reload() {
+        let (executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let dispatch = CountingDispatch::new(DispatchBehavior::Conflict);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            ConnectorMutationOperationId::new(),
+            context(),
+            Arc::clone(&dispatch),
+        );
+
+        Box::new(session)
+            .finish(vec![artifact])
+            .expect_err("the synthetic provider has no fresh catalog base");
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
+        assert!(
+            !executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect conflicted attempt Puffin"),
+            "a conflicted attempt must clean its Puffin before fresh-base retry"
+        );
+    }
+
+    #[test]
+    fn commit_unknown_statistics_attempt_retains_its_puffin() {
+        let (executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let dispatch = CountingDispatch::new(DispatchBehavior::LoseResponse);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            ConnectorMutationOperationId::new(),
+            context(),
+            Arc::clone(&dispatch),
+        );
+
+        let outcome = Box::new(session)
+            .finish(vec![artifact])
+            .expect("lost response is a typed outcome");
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
+        assert!(
+            executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect unknown attempt Puffin"),
+            "unknown publication may have referenced its Puffin, so cleanup is forbidden"
+        );
+    }
+
+    #[test]
+    fn catalog_runtime_bridge_failure_after_dispatch_is_commit_unknown_and_retains_puffin() {
+        let (executor, _warehouse, provider) = provider();
+        let file_io = FileIO::new_with_memory();
+        let physical_table = table_with_snapshot(file_io.clone());
+        let dispatch = CountingDispatch::new(DispatchBehavior::PanicAfterDispatch);
+        let (session, artifact, path) = nonempty_statistics_session(
+            provider,
+            physical_table,
+            ConnectorMutationOperationId::new(),
+            context(),
+            Arc::clone(&dispatch),
+        );
+
+        let outcome = Box::new(session)
+            .finish(vec![artifact])
+            .expect("bridge failure is a typed unknown outcome");
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::CommitUnknown { ref failure, .. }
+                if failure.kind() == ConnectorMutationFailureKind::Unavailable
+        ));
+        assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 0);
+        assert!(
+            executor
+                .block_on(file_io.exists(&path))
+                .expect("inspect bridge-unknown Puffin"),
+            "a bridge failure after possible dispatch must retain its Puffin"
+        );
+    }
+
+    #[test]
+    fn empty_collection_bypasses_catalog_transaction_admission() {
+        let (executor, _warehouse, provider) = provider();
+        let catalog = provider.runtime().novarocks_catalog().vendored_client();
+        executor.block_on(async move {
+            let namespace = crate::iceberg::NamespaceIdent::new("empty_stats".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create namespace");
+            let schema = crate::iceberg::spec::Schema::builder()
+                .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("schema");
+            catalog
+                .create_table(
+                    &namespace,
+                    crate::iceberg::TableCreation::builder()
+                        .name("t".to_string())
+                        .schema(schema)
+                        .format_version(crate::iceberg::spec::FormatVersion::V2)
+                        .build(),
+                )
+                .await
+                .expect("create table");
+        });
+        let identity = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: Arc::from("empty_stats"),
+            table: Arc::from("t"),
         };
-        assert!(error.message().contains("must be ordered"));
+        let metadata = provider
+            .load_table(ConnectorTableRequest {
+                table: identity,
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context(),
+            })
+            .expect("load empty table");
+        let data_version = metadata
+            .statistics_data_version
+            .expect("statistics data version");
+
+        STATISTICS_TRANSACTION_ADMISSIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let start = StatisticsCollection::begin_collection(
+            &provider,
+            StatisticsCollectionStartRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                table: metadata.table,
+                data_version,
+                selection: StatisticsColumnSelection::Default,
+                context: context(),
+            },
+        )
+        .expect("begin empty collection");
+        assert!(start.required_aggregations().is_empty());
+        assert_eq!(
+            STATISTICS_TRANSACTION_ADMISSIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let (_, _, _, _, session) = start.into_parts();
+        let outcome = session.finish(Vec::new()).expect("finish empty collection");
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                ..
+            }
+        ));
+        assert_eq!(
+            STATISTICS_TRANSACTION_ADMISSIONS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn uuid_collection_input_is_explicitly_fixed_size_binary() {
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::optional(
+                7,
+                "u",
+                Type::Primitive(PrimitiveType::Uuid),
+            ))])
+            .build()
+            .expect("schema");
+        let requirements = collection_requirements(
+            &schema,
+            &StatisticsColumnSelection::Explicit(vec![Arc::from("u")]),
+        )
+        .expect("UUID requirement");
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(
+            requirements[0].input().data_type(),
+            &DataType::FixedSizeBinary(16)
+        );
+    }
+
+    #[test]
+    fn explicit_unsupported_field_fails_while_default_omits_it() {
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::optional(
+                7,
+                "v",
+                Type::Primitive(PrimitiveType::Variant),
+            ))])
+            .build()
+            .expect("schema");
+        assert!(
+            collection_requirements(
+                &schema,
+                &StatisticsColumnSelection::Explicit(vec![Arc::from("v")]),
+            )
+            .is_err()
+        );
+        assert!(
+            collection_requirements(&schema, &StatisticsColumnSelection::Default)
+                .expect("default selection")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn artifact_validation_is_exact_and_adds_only_standard_ndv_metadata() {
+        let body = Bytes::from_static(include_bytes!(
+            "../../../../../tests/datasketches-tck/fixtures/theta/rust_quickselect_n1000_ordered_v3.sk"
+        ));
+        let identity = StatisticsArtifactIdentity::try_new(vec![7], APACHE_DATASKETCHES_THETA_V1)
+            .expect("identity");
+        let drafts = validate_artifacts(
+            std::slice::from_ref(&identity),
+            vec![
+                StatisticsArtifactDraft::try_new(
+                    vec![7],
+                    APACHE_DATASKETCHES_THETA_V1,
+                    body,
+                    BTreeMap::new(),
+                )
+                .expect("draft"),
+            ],
+        )
+        .expect("validated artifacts");
+        assert_eq!(drafts[0].identity(), &identity);
+        assert_eq!(
+            drafts[0]
+                .properties()
+                .get(crate::stats_loader::NDV_PROPERTY),
+            Some(&"1000".to_string())
+        );
+        assert!(validate_artifacts(std::slice::from_ref(&identity), Vec::new()).is_err());
+
+        let error = validate_artifacts(
+            std::slice::from_ref(&identity),
+            vec![
+                StatisticsArtifactDraft::try_new(
+                    vec![7],
+                    APACHE_DATASKETCHES_THETA_V1,
+                    drafts[0].body().clone(),
+                    BTreeMap::from([("private".to_string(), "value".to_string())]),
+                )
+                .expect("draft"),
+            ],
+        )
+        .expect_err("provider-private artifact properties must be rejected");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn publication_retries_only_a_definite_conflict_with_remaining_budget() {
+        let conflict = ConnectorMutationFailure::new(
+            ConnectorMutationFailureKind::Conflict,
+            "concurrent table update",
+        );
+        assert_eq!(next_statistics_attempt(&conflict, 0, 3), Some(1));
+        assert_eq!(next_statistics_attempt(&conflict, 1, 3), Some(2));
+        assert_eq!(next_statistics_attempt(&conflict, 2, 3), None);
+
+        for kind in [
+            ConnectorMutationFailureKind::Unavailable,
+            ConnectorMutationFailureKind::DeadlineExceeded,
+            ConnectorMutationFailureKind::InvalidRequest,
+        ] {
+            let failure = ConnectorMutationFailure::new(kind, "definite failure");
+            assert_eq!(next_statistics_attempt(&failure, 0, 3), None);
+        }
     }
 
     fn manifest_file(
@@ -1281,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn without_delete_files_every_manifest_metric_is_exact() {
+    fn without_delete_files_manifest_counts_and_bounds_are_exact() {
         let column: Arc<str> = Arc::from("k");
         for metric in [
             StatisticsMetric::RowCount,
@@ -1294,9 +2335,6 @@ mod tests {
             StatisticsMetric::Maximum {
                 column: Arc::clone(&column),
             },
-            StatisticsMetric::AverageSize {
-                column: Arc::clone(&column),
-            },
         ] {
             assert_eq!(
                 manifest_nature(&metric, false),
@@ -1304,6 +2342,16 @@ mod tests {
                 "{metric:?} is exact when no rows are hidden by delete files"
             );
         }
+        assert_eq!(
+            manifest_nature(
+                &StatisticsMetric::AverageSize {
+                    column: Arc::clone(&column)
+                },
+                false
+            ),
+            Some(StatisticsNumericNature::TwoSidedApproximate),
+            "a ratio materialized as f64 must not claim exact numeric identity"
+        );
         // NDV is not a manifest fact at all: it lives in Puffin and is resolved
         // from the snapshot ancestry, so asking the manifest for it yields
         // nothing rather than a value.

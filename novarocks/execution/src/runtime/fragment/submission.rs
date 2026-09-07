@@ -116,6 +116,7 @@ fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32,
             collect_incremental_scan_contracts(&value.input, output)
         }
         ExecNodeKind::Project(value) => collect_incremental_scan_contracts(&value.input, output),
+        ExecNodeKind::Unpivot(value) => collect_incremental_scan_contracts(&value.input, output),
         ExecNodeKind::Filter(value) => collect_incremental_scan_contracts(&value.input, output),
         ExecNodeKind::Repeat(value) => collect_incremental_scan_contracts(&value.input, output),
         ExecNodeKind::ChangeEventExpand(value) => {
@@ -188,6 +189,7 @@ impl ProgramInventory {
             ExecNodeKind::AssertNumRows(node) => self.visit(&node.input),
             ExecNodeKind::Values(_) => Ok(()),
             ExecNodeKind::Project(node) => self.visit(&node.input),
+            ExecNodeKind::Unpivot(node) => self.visit(&node.input),
             ExecNodeKind::Filter(node) => self.visit(&node.input),
             ExecNodeKind::Repeat(node) => self.visit(&node.input),
             ExecNodeKind::ChangeEventExpand(node) => self.visit(&node.input),

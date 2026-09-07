@@ -33,7 +33,7 @@ compare_generated() {
     name=$(basename "$generated")
     cmp "$generated" "$fixture_root/$family/$name"
     count=$((count + 1))
-  done < <(find "$generated_root" -type f -name '*.sk' | sort)
+  done < <(find "$generated_root" -type f \( -name '*.sk' -o -name '*.tsv' \) | sort)
   test "$count" -gt 0
   echo "$count"
 }

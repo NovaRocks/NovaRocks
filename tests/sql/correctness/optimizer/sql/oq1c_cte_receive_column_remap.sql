@@ -16,11 +16,13 @@
 -- under the License.
 
 DROP TABLE IF EXISTS ${case_db}.oq1c_cte_src;
+-- This case isolates CTE column remapping; write-time NDV must not alter the
+-- exchange/cardinality golden that is incidental to that plan-shape contract.
 CREATE TABLE ${case_db}.oq1c_cte_src (
     k INT,
     v INT,
     payload INT
-);
+) TBLPROPERTIES ('novarocks.statistics.collect-on-write' = 'false');
 INSERT INTO ${case_db}.oq1c_cte_src VALUES
     (1, 10, 100),
     (2, 20, 200),

@@ -40,58 +40,53 @@
 
 use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::write_stack::{
-    WRITE_RELATION_COLUMN_COUNT, WriteTargetOrdinal, root_output_schema,
-    validate_query_target_ordinals, writer_output_schema,
+    RootWriteResultSchema, WriteTargetOrdinal, WriterMultiplexSchema,
+    validate_query_target_ordinals,
 };
 
 use crate::analysis::OutputColumn;
 use crate::column_id::ColumnId;
 use crate::planner::distributed::output::ConnectorWriteOutputContract;
 
+use super::auxiliary::{WriterFinalAggregatePlan, WriterPartialAggregatePlan};
 use super::contract::ConnectorWriteInputBinding;
-
-/// The planner [`ColumnId`] of the write relation column at `index`.
-///
-/// The number itself is frozen by the write contract, not chosen here: the same
-/// value is the execution slot id, because the exchange edge carrying this
-/// relation is where the two must agree.
-pub(crate) const fn write_relation_column_id(index: usize) -> ColumnId {
-    ColumnId(novarocks_spi::connector::write_stack::write_relation_column_id(index))
-}
 
 /// The `TableWriter` output relation, as planner output columns.
 ///
 /// Schema facts (names, types, nullability) come from
 /// [`writer_output_schema`]; only the [`ColumnId`]s are planner-owned.
-pub(crate) fn table_writer_output_columns() -> Vec<OutputColumn> {
-    write_relation_output_columns(&writer_output_schema())
+pub(crate) fn table_writer_output_columns(schema: &WriterMultiplexSchema) -> Vec<OutputColumn> {
+    relation_output_columns(schema.arrow_schema(), &schema.slot_ids())
 }
 
 /// The `TableFinish` output relation, as planner output columns. Schema facts
 /// come from [`root_output_schema`].
 pub(crate) fn table_finish_output_columns() -> Vec<OutputColumn> {
-    write_relation_output_columns(&root_output_schema())
+    let schema = RootWriteResultSchema::new();
+    relation_output_columns(&schema.arrow_schema(), &schema.slot_ids())
 }
 
 /// The stream-edge `output_slot_ids` of the write relations, in field order.
 /// The reserved column ids fit `i32` by construction, so this cannot overflow
 /// the wire slot-id space.
-pub(crate) fn write_relation_output_slot_ids() -> Vec<i32> {
-    (0..WRITE_RELATION_COLUMN_COUNT)
-        .map(|index| {
-            i32::try_from(write_relation_column_id(index).0)
-                .expect("reserved write relation column ids fit the wire slot id space")
+pub(crate) fn writer_multiplex_output_slot_ids(schema: &WriterMultiplexSchema) -> Vec<i32> {
+    schema
+        .slot_ids()
+        .into_iter()
+        .map(|slot_id| {
+            i32::try_from(slot_id).expect("validated writer slot ids fit the wire slot id space")
         })
         .collect()
 }
 
-fn write_relation_output_columns(schema: &SchemaRef) -> Vec<OutputColumn> {
+fn relation_output_columns(schema: &SchemaRef, slot_ids: &[u32]) -> Vec<OutputColumn> {
+    debug_assert_eq!(schema.fields().len(), slot_ids.len());
     schema
         .fields()
         .iter()
-        .enumerate()
-        .map(|(index, field)| OutputColumn {
-            column_id: write_relation_column_id(index),
+        .zip(slot_ids)
+        .map(|(field, slot_id)| OutputColumn {
+            column_id: ColumnId(*slot_id),
             name: field.name().clone(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
@@ -113,18 +108,24 @@ pub struct TableWriterNode {
     pub(crate) write_target_ordinal: WriteTargetOrdinal,
     pub(crate) input: ConnectorWriteInputBinding,
     pub(crate) output_contract: ConnectorWriteOutputContract,
+    pub(crate) writer_multiplex_schema: WriterMultiplexSchema,
+    pub(crate) partial_aggregate_plan: WriterPartialAggregatePlan,
 }
 
 impl TableWriterNode {
-    pub(crate) fn new(
+    pub(crate) fn new_with_aggregate_plan(
         write_target_ordinal: WriteTargetOrdinal,
         input: ConnectorWriteInputBinding,
         output_contract: ConnectorWriteOutputContract,
+        writer_multiplex_schema: WriterMultiplexSchema,
+        partial_aggregate_plan: WriterPartialAggregatePlan,
     ) -> Self {
         Self {
             write_target_ordinal,
             input,
             output_contract,
+            writer_multiplex_schema,
+            partial_aggregate_plan,
         }
     }
 }
@@ -145,6 +146,9 @@ impl TableWriterNode {
 #[derive(Clone, Debug)]
 pub struct TableFinishNode {
     pub(crate) expected_target_ordinals: Vec<WriteTargetOrdinal>,
+    pub(crate) writer_multiplex_schema: WriterMultiplexSchema,
+    pub(crate) root_result_schema: RootWriteResultSchema,
+    pub(crate) final_aggregate_plan: WriterFinalAggregatePlan,
 }
 
 impl TableFinishNode {
@@ -153,8 +157,11 @@ impl TableFinishNode {
     /// duplication are checked by the SPI owner of the ordinal vocabulary and
     /// not restated here; the ascending listing below is this encoding's own
     /// determinism rule.
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_with_aggregate_plan(
         expected_target_ordinals: Vec<WriteTargetOrdinal>,
+        writer_multiplex_schema: WriterMultiplexSchema,
+        root_result_schema: RootWriteResultSchema,
+        final_aggregate_plan: WriterFinalAggregatePlan,
     ) -> Result<Self, String> {
         validate_query_target_ordinals(&expected_target_ordinals)
             .map_err(|error| format!("table finish write target ordinals rejected: {error}"))?;
@@ -169,6 +176,9 @@ impl TableFinishNode {
         }
         Ok(Self {
             expected_target_ordinals,
+            writer_multiplex_schema,
+            root_result_schema,
+            final_aggregate_plan,
         })
     }
 }
@@ -179,32 +189,47 @@ mod tests {
 
     use super::*;
 
+    fn finish(ordinals: Vec<WriteTargetOrdinal>) -> Result<TableFinishNode, String> {
+        TableFinishNode::try_new_with_aggregate_plan(
+            ordinals,
+            WriterMultiplexSchema::empty(),
+            RootWriteResultSchema::new(),
+            WriterFinalAggregatePlan::empty(),
+        )
+    }
+
     #[test]
     fn planner_output_columns_mirror_the_spi_write_relations() {
-        let writer = table_writer_output_columns();
+        let writer_schema = WriterMultiplexSchema::empty();
+        let writer = table_writer_output_columns(&writer_schema);
         let finish = table_finish_output_columns();
 
-        assert_eq!(writer.len(), WRITE_RELATION_COLUMN_COUNT);
-        assert_eq!(finish.len(), WRITE_RELATION_COLUMN_COUNT);
+        assert_eq!(writer.len(), writer_schema.arrow_schema().fields().len());
+        assert_eq!(finish.len(), RootWriteResultSchema::new().slot_ids().len());
 
         for (index, (column, field)) in writer
             .iter()
-            .zip(writer_output_schema().fields())
+            .zip(writer_schema.arrow_schema().fields())
             .enumerate()
         {
             assert_eq!(column.name, *field.name());
             assert_eq!(column.data_type, *field.data_type());
             assert_eq!(column.nullable, field.is_nullable());
-            assert_eq!(column.column_id, write_relation_column_id(index));
+            assert_eq!(column.column_id.0, writer_schema.slot_ids()[index]);
             assert!(column.is_internal);
         }
-        for (index, (column, field)) in finish.iter().zip(root_output_schema().fields()).enumerate()
+        for (index, (column, field)) in finish
+            .iter()
+            .zip(RootWriteResultSchema::new().arrow_schema().fields())
+            .enumerate()
         {
             assert_eq!(column.name, *field.name());
             assert_eq!(column.data_type, *field.data_type());
             assert_eq!(column.nullable, field.is_nullable());
-            // Both relations share one planner column id per position.
-            assert_eq!(column.column_id, writer[index].column_id);
+            assert_eq!(
+                column.column_id.0,
+                RootWriteResultSchema::new().slot_ids()[index]
+            );
         }
 
         // Only the writer-ordinal nullability differs between the two relations.
@@ -220,7 +245,7 @@ mod tests {
                 .iter()
                 .map(|column| column.nullable)
                 .collect::<Vec<_>>(),
-            vec![false, true, true, true]
+            vec![false, true, true, true, true, true, true, true]
         );
         // Signed primitives: the FE/BE native `TypeDesc` mapping names only
         // `Int8..Int64`, so an unsigned relation column could not be encoded.
@@ -240,26 +265,47 @@ mod tests {
 
     #[test]
     fn write_relation_column_ids_fit_the_wire_slot_id_space() {
-        let slots = write_relation_output_slot_ids();
-        assert_eq!(slots.len(), WRITE_RELATION_COLUMN_COUNT);
+        let slots = writer_multiplex_output_slot_ids(&WriterMultiplexSchema::empty());
+        assert_eq!(slots.len(), 4);
         assert!(slots.iter().all(|slot| *slot > 0));
         assert_eq!(slots.last().copied(), Some(i32::MAX));
     }
 
     #[test]
+    fn planner_uses_the_frozen_auxiliary_slot_instead_of_prefix_arithmetic() {
+        let schema = WriterMultiplexSchema::try_new(vec![
+            novarocks_spi::connector::write_stack::WriterAuxiliaryChannel::try_new(
+                7,
+                "partial",
+                DataType::Binary,
+            )
+            .expect("channel"),
+        ])
+        .expect("schema");
+        let columns = table_writer_output_columns(&schema);
+        assert_eq!(columns.last().unwrap().column_id, ColumnId(7));
+        assert_eq!(writer_multiplex_output_slot_ids(&schema).last(), Some(&7));
+        assert_eq!(
+            table_finish_output_columns()
+                .iter()
+                .map(|column| column.column_id.0)
+                .collect::<Vec<_>>(),
+            RootWriteResultSchema::new().slot_ids()
+        );
+    }
+
+    #[test]
     fn table_finish_rejects_an_empty_repeated_or_unordered_write_target_set() {
         let ordinal = |value: u32| WriteTargetOrdinal::try_new(value).expect("bounded ordinal");
-        assert!(TableFinishNode::try_new(vec![ordinal(0), ordinal(1), ordinal(2)]).is_ok());
+        assert!(finish(vec![ordinal(0), ordinal(1), ordinal(2)]).is_ok());
 
-        let error = TableFinishNode::try_new(Vec::new()).expect_err("empty ordinals");
+        let error = finish(Vec::new()).expect_err("empty ordinals");
         assert!(error.contains("rejected"), "unexpected error: {error}");
 
-        let error =
-            TableFinishNode::try_new(vec![ordinal(1), ordinal(1)]).expect_err("repeated ordinal");
+        let error = finish(vec![ordinal(1), ordinal(1)]).expect_err("repeated ordinal");
         assert!(error.contains("rejected"), "unexpected error: {error}");
 
-        let error = TableFinishNode::try_new(vec![ordinal(1), ordinal(0)])
-            .expect_err("descending ordinals");
+        let error = finish(vec![ordinal(1), ordinal(0)]).expect_err("descending ordinals");
         assert!(
             error.contains("strictly ascending order"),
             "unexpected error: {error}"
@@ -273,9 +319,34 @@ mod tests {
     #[test]
     fn table_finish_accepts_a_single_writer_query_at_a_non_zero_ordinal() {
         let ordinal = |value: u32| WriteTargetOrdinal::try_new(value).expect("bounded ordinal");
-        let node = TableFinishNode::try_new(vec![ordinal(2)]).expect("single non-zero target");
+        let node = finish(vec![ordinal(2)]).expect("single non-zero target");
         assert_eq!(node.expected_target_ordinals, vec![ordinal(2)]);
         // A gap between two targets is the same kind of fact.
-        assert!(TableFinishNode::try_new(vec![ordinal(0), ordinal(2)]).is_ok());
+        assert!(finish(vec![ordinal(0), ordinal(2)]).is_ok());
+    }
+
+    #[test]
+    fn table_finish_preserves_the_plan_frozen_typed_writer_tail() {
+        let ordinal = |value: u32| WriteTargetOrdinal::try_new(value).expect("bounded ordinal");
+        let writer_schema = WriterMultiplexSchema::try_new(vec![
+            novarocks_spi::connector::write_stack::WriterAuxiliaryChannel::try_new(
+                7,
+                "generic_aux",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    arrow::datatypes::Field::new("value", DataType::Utf8, true),
+                ])),
+            )
+            .expect("channel"),
+        ])
+        .expect("writer schema");
+        let finish = TableFinishNode::try_new_with_aggregate_plan(
+            vec![ordinal(0)],
+            writer_schema.clone(),
+            RootWriteResultSchema::new(),
+            WriterFinalAggregatePlan::empty(),
+        )
+        .expect("finish");
+        assert_eq!(finish.writer_multiplex_schema, writer_schema);
+        assert_eq!(finish.root_result_schema, RootWriteResultSchema::new());
     }
 }

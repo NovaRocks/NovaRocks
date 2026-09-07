@@ -16,12 +16,15 @@
 // under the License.
 use arrow::datatypes::DataType;
 
+#[cfg(test)]
 use crate::exec::chunk::type_compatibility::check_exact;
 use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
+#[cfg(test)]
 use super::functions;
 use super::functions::AggKind;
 
+#[cfg(test)]
 pub(super) fn build_spec_from_type(
     func: &AggFunction,
     input_type: Option<&DataType>,
@@ -40,6 +43,7 @@ pub(super) fn agg_type_signature(func: &AggFunction) -> Option<&AggTypeSignature
     func.types.as_ref()
 }
 
+#[cfg(test)]
 fn apply_type_signature(
     spec: AggSpec,
     func: &AggFunction,
@@ -91,6 +95,7 @@ fn apply_type_signature(
     Ok(out)
 }
 
+#[cfg(test)]
 fn validate_state_combinator_binary_signature(
     kind: &AggKind,
     output_type: &DataType,
@@ -167,6 +172,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 fn is_opaque_state_combinator_kind(kind: &AggKind) -> bool {
     matches!(
         kind,

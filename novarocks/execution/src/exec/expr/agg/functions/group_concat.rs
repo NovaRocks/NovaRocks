@@ -22,45 +22,41 @@ use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Fields};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 
+use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, RetainedMemoryPolicy};
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::MemTracker;
 
 use super::super::*;
 use super::AggregateFunction;
 use super::common::{
-    AggScalarValue, build_scalar_array, compare_scalar_values, scalar_from_array, scalar_to_string,
+    AggScalarValue, TrackedAggScalarValue, aggregate_vec_with_capacity, build_scalar_array,
+    compare_tracked_scalar_values, scalar_to_string, tracked_scalar_from_array,
+    tracked_scalar_to_output,
 };
 
 pub(super) struct GroupConcatAgg;
 
 const DEFAULT_SEPARATOR: &str = ",";
 
-#[derive(Clone, Debug, Default)]
 struct GroupConcatState {
-    arg_types: Option<Vec<DataType>>,
-    rows: Vec<Vec<Option<AggScalarValue>>>,
+    allocator: AggregateAllocator,
+    rows: AggregateVec<AggregateVec<Option<TrackedAggScalarValue>>>,
 }
 
 impl GroupConcatState {
-    fn ensure_arg_types(&mut self, arg_types: &[DataType]) -> Result<(), String> {
-        if let Some(existing) = &self.arg_types {
-            if existing.len() != arg_types.len() {
-                return Err(format!(
-                    "group_concat argument count mismatch: expected {}, got {}",
-                    existing.len(),
-                    arg_types.len()
-                ));
-            }
-            for (idx, (left, right)) in existing.iter().zip(arg_types.iter()).enumerate() {
-                if left != right {
-                    return Err(format!(
-                        "group_concat argument type mismatch at {}: expected {:?}, got {:?}",
-                        idx, left, right
-                    ));
-                }
-            }
-        } else {
-            self.arg_types = Some(arg_types.to_vec());
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            rows: AggregateVec::new_in(allocator.clone()),
+            allocator,
         }
+    }
+
+    fn push_row(&mut self, row: AggregateVec<Option<TrackedAggScalarValue>>) -> Result<(), String> {
+        self.rows
+            .try_reserve(1)
+            .map_err(|_| self.allocator.allocation_error("reserve group_concat row"))?;
+        self.rows.push(row);
         Ok(())
     }
 }
@@ -194,6 +190,18 @@ fn validate_intermediate_type(ty: &DataType) -> Result<&Fields, String> {
     Ok(fields)
 }
 
+fn intermediate_arg_types(spec: &AggSpec) -> Result<Vec<DataType>, String> {
+    validate_intermediate_type(&spec.intermediate_type)?
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::List(item) => Ok(item.data_type().clone()),
+            other => Err(format!(
+                "group_concat intermediate field must be ARRAY type, got {other:?}"
+            )),
+        })
+        .collect()
+}
+
 fn extract_input_columns(array: &ArrayRef) -> Result<Vec<ArrayRef>, String> {
     match array.data_type() {
         DataType::Struct(_) => {
@@ -211,10 +219,12 @@ fn read_row_values(
     columns: &[ArrayRef],
     row: usize,
     output_col_num: usize,
-) -> Result<Option<Vec<Option<AggScalarValue>>>, String> {
-    let mut values = Vec::with_capacity(columns.len());
+    allocator: &AggregateAllocator,
+) -> Result<Option<AggregateVec<Option<TrackedAggScalarValue>>>, String> {
+    let mut values =
+        aggregate_vec_with_capacity(allocator, columns.len(), "reserve group_concat row values")?;
     for (idx, col) in columns.iter().enumerate() {
-        let value = scalar_from_array(col, row)?;
+        let value = tracked_scalar_from_array(col, row, allocator)?;
         if idx < output_col_num && value.is_none() {
             return Ok(None);
         }
@@ -224,8 +234,8 @@ fn read_row_values(
 }
 
 fn compare_optional_scalar(
-    left: &Option<AggScalarValue>,
-    right: &Option<AggScalarValue>,
+    left: &Option<TrackedAggScalarValue>,
+    right: &Option<TrackedAggScalarValue>,
     asc: bool,
     nulls_first: bool,
 ) -> Result<Ordering, String> {
@@ -246,7 +256,7 @@ fn compare_optional_scalar(
             }
         }
         (Some(left), Some(right)) => {
-            let ord = compare_scalar_values(left, right)?;
+            let ord = compare_tracked_scalar_values(left, right)?;
             if asc { ord } else { ord.reverse() }
         }
     };
@@ -254,7 +264,7 @@ fn compare_optional_scalar(
 }
 
 fn sort_indices(
-    rows: &[Vec<Option<AggScalarValue>>],
+    rows: &[AggregateVec<Option<TrackedAggScalarValue>>],
     layout: GroupConcatLayout,
     is_asc_order: &[bool],
     nulls_first: &[bool],
@@ -294,15 +304,15 @@ fn sort_indices(
 }
 
 fn rows_equal_on_output(
-    left: &[Option<AggScalarValue>],
-    right: &[Option<AggScalarValue>],
+    left: &[Option<TrackedAggScalarValue>],
+    right: &[Option<TrackedAggScalarValue>],
     layout: GroupConcatLayout,
 ) -> Result<bool, String> {
     for col in 0..layout.output_col_num {
         match (&left[col], &right[col]) {
             (None, None) => {}
             (Some(left), Some(right)) => {
-                if compare_scalar_values(left, right)? != Ordering::Equal {
+                if compare_tracked_scalar_values(left, right)? != Ordering::Equal {
                     return Ok(false);
                 }
             }
@@ -313,7 +323,7 @@ fn rows_equal_on_output(
 }
 
 fn mark_duplicated_rows(
-    rows: &[Vec<Option<AggScalarValue>>],
+    rows: &[AggregateVec<Option<TrackedAggScalarValue>>],
     sorted_indices: &[usize],
     layout: GroupConcatLayout,
     is_distinct: bool,
@@ -334,7 +344,7 @@ fn mark_duplicated_rows(
 }
 
 fn separator_for_row(
-    row: &[Option<AggScalarValue>],
+    row: &[Option<TrackedAggScalarValue>],
     arg_types: &[DataType],
     layout: GroupConcatLayout,
 ) -> Result<String, String> {
@@ -344,7 +354,7 @@ fn separator_for_row(
             .ok_or_else(|| "group_concat separator index out of bounds".to_string())?
             .as_ref()
         {
-            scalar_to_string(separator, &arg_types[sep_idx])
+            scalar_to_string(&tracked_scalar_to_output(separator)?, &arg_types[sep_idx])
         } else {
             Ok(String::new())
         }
@@ -378,23 +388,17 @@ fn build_intermediate_array(
             continue;
         }
 
-        let state_types = state
-            .arg_types
-            .as_ref()
-            .ok_or_else(|| "group_concat state missing argument types".to_string())?;
-        if state_types.len() != field_num {
-            return Err(format!(
-                "group_concat intermediate field count mismatch: expected {}, got {}",
-                field_num,
-                state_types.len()
-            ));
-        }
         for row in &state.rows {
             if row.len() != field_num {
                 return Err("group_concat state row width mismatch".to_string());
             }
             for idx in 0..field_num {
-                flat_values[idx].push(row[idx].clone());
+                flat_values[idx].push(
+                    row[idx]
+                        .as_ref()
+                        .map(tracked_scalar_to_output)
+                        .transpose()?,
+                );
             }
         }
         current_len += i64::try_from(state.rows.len())
@@ -533,15 +537,38 @@ impl AggregateFunction for GroupConcatAgg {
     }
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
+        let _ = ptr;
+        panic!("allocation-tracked group_concat requires tracker-aware initialization");
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker.ok_or_else(|| {
+            "allocation-tracked group_concat requires an aggregate memory tracker".to_string()
+        })?;
         unsafe {
-            std::ptr::write(ptr as *mut GroupConcatState, GroupConcatState::default());
+            std::ptr::write(ptr as *mut GroupConcatState, GroupConcatState::new(tracker));
         }
+        Ok(())
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             std::ptr::drop_in_place(ptr as *mut GroupConcatState);
         }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, ptr: *const u8) -> usize {
+        let _ = ptr;
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -557,18 +584,31 @@ impl AggregateFunction for GroupConcatAgg {
         let (_, is_asc_order, _, _) = group_concat_kind(spec)?;
         let columns = extract_input_columns(array)?;
         let layout = GroupConcatLayout::infer(columns.len(), is_asc_order.len())?;
-        let arg_types = columns
-            .iter()
-            .map(|c| c.data_type().clone())
-            .collect::<Vec<_>>();
+        let arg_types = intermediate_arg_types(spec)?;
+        if columns.len() != arg_types.len() {
+            return Err(format!(
+                "group_concat argument count mismatch: expected {}, got {}",
+                arg_types.len(),
+                columns.len()
+            ));
+        }
+        for (index, (column, expected)) in columns.iter().zip(&arg_types).enumerate() {
+            if column.data_type() != expected {
+                return Err(format!(
+                    "group_concat argument type mismatch at {index}: expected {expected:?}, got {:?}",
+                    column.data_type()
+                ));
+            }
+        }
 
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut GroupConcatState) };
-            state.ensure_arg_types(&arg_types)?;
-            let Some(row_values) = read_row_values(&columns, row, layout.output_col_num)? else {
+            let Some(row_values) =
+                read_row_values(&columns, row, layout.output_col_num, &state.allocator)?
+            else {
                 continue;
             };
-            state.rows.push(row_values);
+            state.push_row(row_values)?;
         }
         Ok(())
     }
@@ -616,7 +656,12 @@ impl AggregateFunction for GroupConcatAgg {
                 continue;
             }
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut GroupConcatState) };
-            state.ensure_arg_types(&arg_types)?;
+            let expected_types = intermediate_arg_types(spec)?;
+            if arg_types != expected_types {
+                return Err(format!(
+                    "group_concat merge argument types mismatch: expected {expected_types:?}, got {arg_types:?}"
+                ));
+            }
 
             let mut output_list_is_null = false;
             for list_col in list_columns.iter().take(layout.output_col_num) {
@@ -655,11 +700,19 @@ impl AggregateFunction for GroupConcatAgg {
             }
 
             for idx in 0..row_count {
-                let mut row_values = Vec::with_capacity(field_num);
+                let mut row_values = aggregate_vec_with_capacity(
+                    &state.allocator,
+                    field_num,
+                    "reserve group_concat merge row",
+                )?;
                 let mut has_null_output = false;
                 for col_idx in 0..field_num {
                     let start = offsets[col_idx][row] as usize;
-                    let value = scalar_from_array(&value_columns[col_idx], start + idx)?;
+                    let value = tracked_scalar_from_array(
+                        &value_columns[col_idx],
+                        start + idx,
+                        &state.allocator,
+                    )?;
                     if col_idx < layout.output_col_num && value.is_none() {
                         has_null_output = true;
                         break;
@@ -667,7 +720,7 @@ impl AggregateFunction for GroupConcatAgg {
                     row_values.push(value);
                 }
                 if !has_null_output {
-                    state.rows.push(row_values);
+                    state.push_row(row_values)?;
                 }
             }
         }
@@ -694,10 +747,7 @@ impl AggregateFunction for GroupConcatAgg {
                 continue;
             }
 
-            let arg_types = state
-                .arg_types
-                .as_ref()
-                .ok_or_else(|| "group_concat state missing argument types".to_string())?;
+            let arg_types = intermediate_arg_types(spec)?;
             let layout = GroupConcatLayout::infer(arg_types.len(), is_asc_order.len())?;
 
             let sorted_indices = sort_indices(&state.rows, layout, is_asc_order, nulls_first)?;
@@ -727,7 +777,7 @@ impl AggregateFunction for GroupConcatAgg {
                     })?;
                     if append_with_limit(
                         &mut out,
-                        &scalar_to_string(value, &arg_types[col])?,
+                        &scalar_to_string(&tracked_scalar_to_output(value)?, &arg_types[col])?,
                         max_len,
                     ) {
                         reached_limit = true;
@@ -740,7 +790,7 @@ impl AggregateFunction for GroupConcatAgg {
                 if pos != last_unique_pos
                     && append_with_limit(
                         &mut out,
-                        &separator_for_row(row, arg_types, layout)?,
+                        &separator_for_row(row, &arg_types, layout)?,
                         max_len,
                     )
                 {
@@ -799,7 +849,13 @@ mod tests {
     fn run_update_then_finalize(spec: &AggSpec, input: ArrayRef) -> String {
         let view = AggInputView::Any(&input);
         let mut state = MaybeUninit::<GroupConcatState>::uninit();
-        GroupConcatAgg.init_state(spec, state.as_mut_ptr() as *mut u8);
+        GroupConcatAgg
+            .init_state_with_tracker(
+                spec,
+                state.as_mut_ptr() as *mut u8,
+                Some(MemTracker::new_root("group-concat-test")),
+            )
+            .unwrap();
         let state_ptr = state.as_mut_ptr() as AggStatePtr;
         let ptrs = vec![state_ptr; input.len()];
         GroupConcatAgg
@@ -965,7 +1021,13 @@ mod tests {
         )) as ArrayRef;
         let view = AggInputView::Any(&input);
         let mut state = MaybeUninit::<GroupConcatState>::uninit();
-        GroupConcatAgg.init_state(&spec, state.as_mut_ptr() as *mut u8);
+        GroupConcatAgg
+            .init_state_with_tracker(
+                &spec,
+                state.as_mut_ptr() as *mut u8,
+                Some(MemTracker::new_root("group-concat-test")),
+            )
+            .unwrap();
         let state_ptr = state.as_mut_ptr() as AggStatePtr;
 
         GroupConcatAgg
@@ -1081,7 +1143,13 @@ mod tests {
         let view = AggInputView::Any(&input);
 
         let mut left_state = MaybeUninit::<GroupConcatState>::uninit();
-        GroupConcatAgg.init_state(&spec, left_state.as_mut_ptr() as *mut u8);
+        GroupConcatAgg
+            .init_state_with_tracker(
+                &spec,
+                left_state.as_mut_ptr() as *mut u8,
+                Some(MemTracker::new_root("group-concat-left-test")),
+            )
+            .unwrap();
         let left_ptr = left_state.as_mut_ptr() as AggStatePtr;
         GroupConcatAgg
             .update_batch(&spec, 0, &vec![left_ptr; input.len()], &view)
@@ -1102,7 +1170,13 @@ mod tests {
             .unwrap();
         let merge_view = AggInputView::Any(&intermediate);
         let mut right_state = MaybeUninit::<GroupConcatState>::uninit();
-        GroupConcatAgg.init_state(&merge_spec, right_state.as_mut_ptr() as *mut u8);
+        GroupConcatAgg
+            .init_state_with_tracker(
+                &merge_spec,
+                right_state.as_mut_ptr() as *mut u8,
+                Some(MemTracker::new_root("group-concat-right-test")),
+            )
+            .unwrap();
         let right_ptr = right_state.as_mut_ptr() as AggStatePtr;
         GroupConcatAgg
             .merge_batch(&merge_spec, 0, &[right_ptr], &merge_view)

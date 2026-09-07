@@ -37,6 +37,7 @@ use crate::runtime::runtime_state::RuntimeState;
 use arrow::datatypes::DataType;
 use novarocks_types::SlotId;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// The execution engine uses cooperative scheduling.
@@ -52,6 +53,27 @@ pub enum BlockedReason {
     OutputFull,
     /// Blocked on a dependency object (e.g. build-side ready).
     Dependency(DependencyHandle),
+}
+
+/// Worker-frozen deadline that may invalidate one event-blocked decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DriverBlockDeadline {
+    at: Instant,
+    token: u64,
+}
+
+impl DriverBlockDeadline {
+    pub(crate) fn new(at: Instant, token: u64) -> Self {
+        Self { at, token }
+    }
+
+    pub(crate) fn at(self) -> Instant {
+        self.at
+    }
+
+    pub(crate) fn token(self) -> u64 {
+        self.token
+    }
 }
 
 /// Base operator contract implemented by source/processor/sink operator implementations.
@@ -193,14 +215,47 @@ pub trait ProcessorOperator: Operator {
     }
 
     /// Observable for source-side readiness (has_output becomes true).
+    ///
+    /// The observable identity is part of the operator's scheduling contract:
+    /// while the operator is not finished, every `Some` returned for this
+    /// readiness direction must be the same `Arc` identity. Composite operators
+    /// must therefore expose an operator-owned observable and forward every
+    /// underlying readiness transition to it. A callback used for forwarding
+    /// must retain the composite observable weakly so an underlying observable
+    /// cannot extend the composite operator's lifetime.
     fn source_observable(&self) -> Option<Arc<Observable>> {
         None
     }
 
+    /// Arm or return the deadline for the current confirmed source-idle block.
+    /// Called only by the driver worker after `has_output` returned false.
+    fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
+        None
+    }
+
     /// Observable for sink-side readiness (need_input becomes true).
+    ///
+    /// The same lifetime-stable identity and weak-forwarding requirements as
+    /// [`ProcessorOperator::source_observable`] apply to this direction.
     fn sink_observable(&self) -> Option<Arc<Observable>> {
         None
     }
+}
+
+/// Forwards readiness transitions without retaining the target observable.
+///
+/// Composite operators use this once during construction to keep their public
+/// observable identity stable while covering every child readiness source.
+pub(crate) fn forward_observable(source: &Arc<Observable>, target: &Arc<Observable>) {
+    if Arc::ptr_eq(source, target) {
+        return;
+    }
+    let target = Arc::downgrade(target);
+    source.add_observer(Arc::new(move || {
+        if let Some(target) = target.upgrade() {
+            target.notify_observers();
+        }
+    }));
 }
 
 /// Hydrate a chunk for delivery to `downstream`, keeping only the columns the
@@ -266,9 +321,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        Chunk, Operator, ProcessorOperator, dictionary_carrier_stats, hydrate_for_downstream,
+        Chunk, Operator, ProcessorOperator, dictionary_carrier_stats, forward_observable,
+        hydrate_for_downstream,
     };
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use crate::exec::pipeline::schedule::observer::Observable;
     use crate::runtime::runtime_state::RuntimeState;
     use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type};
@@ -494,5 +551,18 @@ mod tests {
         assert_eq!(stats.hydrated_rows, 4);
         assert_eq!(stats.hydrated_columns, 1);
         assert_eq!(stats.unsupported_columns, 1);
+    }
+
+    #[test]
+    fn observable_forwarding_does_not_retain_the_target() {
+        let source = Arc::new(Observable::new());
+        let target = Arc::new(Observable::new());
+        let target_weak = Arc::downgrade(&target);
+        forward_observable(&source, &target);
+
+        drop(target);
+        source.notify_observers();
+
+        assert!(target_weak.upgrade().is_none());
     }
 }

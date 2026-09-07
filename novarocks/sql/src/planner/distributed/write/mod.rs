@@ -15,12 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod auxiliary;
 pub(crate) mod change_stream;
 pub(crate) mod contract;
 pub(crate) mod node;
 pub(crate) mod plan;
 pub(crate) mod sink;
 
+pub(crate) use auxiliary::WriterAuxiliaryPlan;
+#[allow(
+    unused_imports,
+    reason = "T08 exposes the lowering entrypoint for the later write-session integration task."
+)]
+pub use auxiliary::{
+    WriteUnpivotMapping, WriterFinalAggregateCall, WriterFinalAggregatePlan,
+    WriterPartialAggregateCall, WriterPartialAggregatePlan, WriterStatisticsTargetInput,
+    WriterUnpivotPlan, plan_writer_statistics,
+};
 pub use change_stream::ChangeStreamRouterSink;
 pub use contract::ConnectorWriteInputBinding;
 pub use node::{TableFinishNode, TableWriterNode};

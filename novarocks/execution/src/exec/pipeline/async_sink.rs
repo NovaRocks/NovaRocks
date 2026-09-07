@@ -377,29 +377,32 @@ mod tests {
 
     fn test_runtime_state() -> RuntimeState {
         let runtime = std::sync::Arc::new(
-            crate::runtime::ExecutionRuntime::new(crate::runtime::ExecutionRuntimeConfig {
-                driver_threads: 1,
-                scan_threads: 1,
-                scan_queue_capacity: 8,
-                spill_io_threads: 1,
-                spill_io_queue_capacity: 8,
-                spill_storage:
-                    crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
-                exchange_wait_ms: 120_000,
-                exchange_io_threads: 1,
-                exchange_io_max_inflight_bytes: 1024,
-                exchange_max_transmit_batched_bytes: 1024,
-                operator_buffer_chunks: 1,
-                local_exchange_buffer_mem_limit_per_driver: 1024,
-                local_exchange_max_buffered_rows: 1024,
-                connector_io_tasks_per_scan_operator: 1,
-                scan_submit_fail_max: 1,
-                scan_submit_fail_timeout_ms: 1,
-                runtime_filter_scan_wait_time_ms_override: None,
-                runtime_filter_wait_timeout_ms_override: None,
-                sink_io_worker_threads: 1,
-                sink_io_max_blocking_threads: 1,
-            })
+            crate::runtime::ExecutionRuntime::new(
+                crate::runtime::ExecutionRuntimeConfig {
+                    driver_threads: 1,
+                    scan_threads: 1,
+                    scan_queue_capacity: 8,
+                    spill_io_threads: 1,
+                    spill_io_queue_capacity: 8,
+                    spill_storage:
+                        crate::runtime::execution_runtime::ExecutionSpillStorageConfig::default(),
+                    exchange_wait_ms: 120_000,
+                    exchange_io_threads: 1,
+                    exchange_io_max_inflight_bytes: 1024,
+                    exchange_max_transmit_batched_bytes: 1024,
+                    operator_buffer_chunks: 1,
+                    local_exchange_buffer_mem_limit_per_driver: 1024,
+                    local_exchange_max_buffered_rows: 1024,
+                    connector_io_tasks_per_scan_operator: 1,
+                    scan_submit_fail_max: 1,
+                    scan_submit_fail_timeout_ms: 1,
+                    runtime_filter_scan_wait_time_ms_override: None,
+                    runtime_filter_wait_timeout_ms_override: None,
+                    sink_io_worker_threads: 1,
+                    sink_io_max_blocking_threads: 1,
+                },
+                crate::runtime::execution_runtime::test_execution_function_set(),
+            )
             .expect("test execution runtime"),
         );
         RuntimeState::new(

@@ -50,8 +50,9 @@ use super::registry::{
     QueryLifecycleRegistryConfig, StageBuildDecision,
 };
 use super::{
-    CatalogPruneOutcome, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+    CatalogPruneOutcome, QueryControlAttachment, QueryHeartbeatDisposition, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminalFallbackTransport,
+    QueryTerminalFallbackTransportError,
 };
 use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::rpc::runtime::test_backend_data_runtime;
@@ -2441,12 +2442,27 @@ fn fragment_failure_emits_query_local_failure() {
         )),
     );
 
+    assert_eq!(
+        attachment
+            .control
+            .heartbeat(1)
+            .expect("in-flight heartbeat yields to terminal delivery"),
+        QueryHeartbeatDisposition::TerminalDeliveryPending
+    );
+
     assert!(matches!(
         try_recv_event(&mut attachment).expect("LocalFailure event").event,
         Some(proto_novarocks::query_control_response::Event::LocalFailure(ref failure))
             if failure.code == "FRAGMENT_EXECUTION_FAILED"
                 && failure.detail == "fragment execution error (pipeline): pipeline worker failed"
     ));
+    assert_eq!(
+        attachment
+            .control
+            .heartbeat(2)
+            .expect("terminal phase keeps the correctness stream authoritative"),
+        QueryHeartbeatDisposition::TerminalDeliveryPending
+    );
     assert_eq!(
         registry.termination_reason(execution_id),
         Some(QueryTerminationReason::QueryTerminationLocalFailure)
@@ -3696,6 +3712,55 @@ fn query_lifecycle_heartbeat_timeout_terminates_control_attached_entry() {
             .expect("terminations")
             .len(),
         1
+    );
+}
+
+#[test]
+fn query_lifecycle_heartbeat_refresh_invalidates_observed_timeout() {
+    let runtime = RecordingLocalRuntime::default();
+    let clock = Arc::new(ManualClock::default());
+    let registry = registry_with_clock(runtime.clone(), 8, Arc::clone(&clock));
+    let request = fragment_init_request_fixture(991, &[UniqueId::new(991, 1)]);
+    let execution_id = request.manifest().execution_id();
+    assert_eq!(
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
+        QueryInitOutcome::QueryInitApplied
+    );
+    let control = attach_control(&registry, &request);
+
+    clock.advance(Duration::from_millis(5_001));
+    registry.sweep_expired_with_heartbeat_timeout_hook_for_test(clock.now(), || {
+        // Preserve the same manual-clock timestamp to prove the generation,
+        // rather than timestamp resolution, invalidates the stale decision.
+        control
+            .control
+            .heartbeat(1)
+            .expect("heartbeat refresh wins before timeout commit");
+    });
+
+    assert_eq!(
+        registry.phase(execution_id),
+        Some(QueryLifecyclePhase::ControlAttached)
+    );
+    assert_eq!(registry.termination_reason(execution_id), None);
+    assert_eq!(registry.metrics_snapshot().heartbeat_timeouts, 0);
+    assert!(
+        runtime
+            .state
+            .terminations
+            .lock()
+            .expect("terminations")
+            .is_empty()
+    );
+
+    clock.advance(Duration::from_millis(5_001));
+    registry.sweep_expired(clock.now());
+    assert_eq!(
+        registry.termination_reason(execution_id),
+        Some(QueryTerminationReason::QueryTerminationCoordinatorHeartbeatTimeout)
     );
 }
 

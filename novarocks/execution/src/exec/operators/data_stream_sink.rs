@@ -122,7 +122,9 @@ mod data_stream_sink_hash_partition {
     use arrow::datatypes::{DataType, Int32Type, TimeUnit};
     use std::sync::Arc;
 
-    use crate::exec::hash_table::key_builder::encode_group_key_row;
+    use crate::exec::hash_table::key_builder::{
+        canonical_group_key_crc32_hash, canonical_group_key_fnv_hash,
+    };
     use novarocks_types::largeint;
 
     // FNV hash constants (from StarRocks BE)
@@ -137,6 +139,24 @@ mod data_stream_sink_hash_partition {
             hash = hash.wrapping_mul(FNV_PRIME);
         }
         hash
+    }
+
+    fn crc32_update(mut crc: u32, value: &[u8]) -> u32 {
+        for &byte in value {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb88320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc
+    }
+
+    fn crc32_hash_value(value: &[u8]) -> u32 {
+        crc32_update(0xffff_ffff, value) ^ 0xffff_ffff
     }
 
     fn fnv_hash_list_utf8_row(list: &ListArray, values: &StringArray, row: usize) -> u64 {
@@ -553,9 +573,9 @@ mod data_stream_sink_hash_partition {
             }
             DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _) => {
                 for (row, hash_value) in hash_values.iter_mut().enumerate().take(len) {
-                    match encode_group_key_row(array, row)? {
-                        Some(encoded) => {
-                            *hash_value ^= fnv_hash_value(&encoded);
+                    match canonical_group_key_fnv_hash(array, row)? {
+                        Some(row_hash) => {
+                            *hash_value ^= row_hash;
                             *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                         }
                         None => {
@@ -582,21 +602,6 @@ mod data_stream_sink_hash_partition {
     fn compute_crc32_hash_array(array: &ArrayRef) -> Result<Vec<u32>, String> {
         let len = array.len();
         let mut hash_values = vec![0u32; len];
-
-        fn crc32_hash_value(value: &[u8]) -> u32 {
-            let mut crc: u32 = 0xffffffff;
-            for &byte in value {
-                crc ^= byte as u32;
-                for _ in 0..8 {
-                    if crc & 1 != 0 {
-                        crc = (crc >> 1) ^ 0xedb88320;
-                    } else {
-                        crc >>= 1;
-                    }
-                }
-            }
-            crc ^ 0xffffffff
-        }
 
         match array.data_type() {
             DataType::Boolean => {
@@ -841,17 +846,19 @@ mod data_stream_sink_hash_partition {
                     let offsets = list.value_offsets();
                     let start = offsets[i] as usize;
                     let end = offsets[i + 1] as usize;
-                    let mut encoded = Vec::new();
-                    encoded.extend_from_slice(&(end.saturating_sub(start) as u64).to_le_bytes());
+                    let mut crc = crc32_update(
+                        0xffff_ffff,
+                        &(end.saturating_sub(start) as u64).to_le_bytes(),
+                    );
                     for idx in start..end {
                         if values.is_null(idx) {
-                            encoded.push(0);
+                            crc = crc32_update(crc, &[0]);
                         } else {
-                            encoded.push(1);
-                            encoded.extend_from_slice(values.value(idx).as_bytes());
+                            crc = crc32_update(crc, &[1]);
+                            crc = crc32_update(crc, values.value(idx).as_bytes());
                         }
                     }
-                    *hash_value = crc32_hash_value(&encoded);
+                    *hash_value = crc ^ 0xffff_ffff;
                 }
             }
             DataType::List(field) if matches!(field.data_type(), DataType::Int32) => {
@@ -871,23 +878,25 @@ mod data_stream_sink_hash_partition {
                     let offsets = list.value_offsets();
                     let start = offsets[i] as usize;
                     let end = offsets[i + 1] as usize;
-                    let mut encoded = Vec::new();
-                    encoded.extend_from_slice(&(end.saturating_sub(start) as u64).to_le_bytes());
+                    let mut crc = crc32_update(
+                        0xffff_ffff,
+                        &(end.saturating_sub(start) as u64).to_le_bytes(),
+                    );
                     for idx in start..end {
                         if values.is_null(idx) {
-                            encoded.push(0);
+                            crc = crc32_update(crc, &[0]);
                         } else {
-                            encoded.push(1);
-                            encoded.extend_from_slice(&values.value(idx).to_le_bytes());
+                            crc = crc32_update(crc, &[1]);
+                            crc = crc32_update(crc, &values.value(idx).to_le_bytes());
                         }
                     }
-                    *hash_value = crc32_hash_value(&encoded);
+                    *hash_value = crc ^ 0xffff_ffff;
                 }
             }
             DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _) => {
                 for (row, hash_value) in hash_values.iter_mut().enumerate().take(len) {
-                    if let Some(encoded) = encode_group_key_row(array, row)? {
-                        *hash_value = crc32_hash_value(&encoded);
+                    if let Some(row_hash) = canonical_group_key_crc32_hash(array, row)? {
+                        *hash_value = row_hash;
                     }
                 }
             }

@@ -57,7 +57,8 @@ use super::graph::{
     FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, build_task_graph,
 };
 use super::intent::{
-    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationSink,
+    AckPayload, DispatchBatch, OPERATION_FIXED_BYTES, OperationAcknowledgement, OperationIntent,
+    TaskOperationSink,
 };
 use super::remote_task::RemoteTaskState;
 use super::split_domain::{assignment_targets, delivery_action};
@@ -188,6 +189,7 @@ impl ContextEstablishSource for FakeEstablish {
         Ok(ContextEstablishFacts {
             catalog_binding: FakeContent::new(0xa1, 64),
             initial_runtime_filter: FakeContent::new(0xa2, 32),
+            query_options: FakeContent::new(0xa3, 48),
             initial_credential: CredentialUpdate::new(
                 CredentialLeaseId::new(7),
                 CredentialEpoch::FIRST,
@@ -1755,6 +1757,29 @@ fn assert_bounds(
             );
         }
     }
+}
+
+#[test]
+fn an_establish_accounts_for_its_query_options_payload() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let mut owner = QueryContextOwner::new(context, 0);
+    let facts = FakeEstablish
+        .facts_for(context)
+        .expect("the fake source has facts");
+    let intent = owner
+        .establish_intent(facts, MonotonicInstant::ORIGIN)
+        .expect("an establish is produced")
+        .expect("the establish intent exists");
+
+    assert_eq!(
+        intent.queued_bytes(),
+        OPERATION_FIXED_BYTES + 64 + 32 + 48 + 32,
+        "the bounded queue must account for every establish payload"
+    );
 }
 
 #[test]

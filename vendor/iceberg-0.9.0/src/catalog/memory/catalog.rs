@@ -1865,6 +1865,7 @@ pub(crate) mod tests {
             .update_table_properties()
             .set("key".to_string(), "value".to_string())
             .apply(tx)
+            .await
             .unwrap()
             .commit(&catalog)
             .await
@@ -1901,6 +1902,7 @@ pub(crate) mod tests {
             .update_table_properties()
             .set("key".to_string(), "value".to_string())
             .apply(tx)
+            .await
             .unwrap()
             .commit(&catalog)
             .await

@@ -123,6 +123,9 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
     };
     let fault = match fault.trim() {
         "before-dispatch" => PublicationCatalogFault::BeforeDispatch,
+        "before-dispatch-hold-for-concurrent-shell" => {
+            PublicationCatalogFault::BeforeDispatchHoldForConcurrentShell
+        }
         "after-commit-before-response" => PublicationCatalogFault::AfterCommitBeforeResponse,
         "after-commit-hold-for-frontend-kill" => {
             PublicationCatalogFault::AfterCommitHoldForFrontendKill
@@ -130,7 +133,7 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
         "incomplete-discovery" => PublicationCatalogFault::IncompleteDiscovery,
         "corrupt-package" => PublicationCatalogFault::CorruptPackage,
         other => anyhow::bail!(
-            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
+            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, before-dispatch-hold-for-concurrent-shell, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
         ),
     };
     let compatible = matches!(
@@ -140,6 +143,9 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
             PublicationCatalogFault::BeforeDispatch
                 | PublicationCatalogFault::AfterCommitBeforeResponse
                 | PublicationCatalogFault::AfterCommitHoldForFrontendKill
+        ) | (
+            PublicationCatalogAction::TableCommit,
+            PublicationCatalogFault::BeforeDispatchHoldForConcurrentShell
         ) | (
             PublicationCatalogAction::NamespaceList,
             PublicationCatalogFault::IncompleteDiscovery
@@ -491,6 +497,12 @@ fn parse_meta_with_sql_error_descriptors(
             "publication_catalog_fault" => {
                 meta.publication_catalog_fault = Some(parse_publication_catalog_fault(&raw_value)?);
             }
+            "publication_catalog_concurrent_shell" => {
+                if raw_value.is_empty() {
+                    bail!("publication_catalog_concurrent_shell must not be empty");
+                }
+                meta.publication_catalog_concurrent_shell = Some(raw_value);
+            }
             "kill_fe_after_mv_known_committed_before_projector_cas" => {
                 meta.kill_fe_after_mv_known_committed_before_projector_cas =
                     parse_bool(&raw_value)?;
@@ -840,6 +852,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         publication_catalog_fault: override_meta
             .publication_catalog_fault
             .or(base.publication_catalog_fault),
+        publication_catalog_concurrent_shell: override_meta
+            .publication_catalog_concurrent_shell
+            .clone()
+            .or_else(|| base.publication_catalog_concurrent_shell.clone()),
         kill_query_after_be_log_contains: override_meta
             .kill_query_after_be_log_contains
             .clone()
@@ -1347,6 +1363,41 @@ mod opt5_directive_tests {
                 action: PublicationCatalogAction::TableCommit,
                 fault: PublicationCatalogFault::AfterCommitHoldForFrontendKill,
             })
+        );
+    }
+
+    #[test]
+    fn parse_meta_pairs_before_dispatch_hold_with_concurrent_shell() {
+        let re = meta_re();
+        let meta = parse_meta(
+            &[
+                "-- @publication_catalog_fault=table-commit,before-dispatch-hold-for-concurrent-shell".to_string(),
+                "-- @publication_catalog_concurrent_shell=printf 'advance table\\n'".to_string(),
+            ],
+            &re,
+        )
+        .expect("parse concurrent publication hold");
+
+        assert_eq!(
+            meta.publication_catalog_fault,
+            Some(PublicationCatalogFaultDirective {
+                action: PublicationCatalogAction::TableCommit,
+                fault: PublicationCatalogFault::BeforeDispatchHoldForConcurrentShell,
+            })
+        );
+        assert_eq!(
+            meta.publication_catalog_concurrent_shell.as_deref(),
+            Some("printf 'advance table\\n'")
+        );
+
+        let error = parse_meta(
+            &["-- @publication_catalog_fault=stage-create,before-dispatch-hold-for-concurrent-shell".to_string()],
+            &re,
+        )
+        .expect_err("concurrent mutation hold is valid only for an existing table commit");
+        assert!(
+            error.to_string().contains("action/fault combination"),
+            "{error:#}"
         );
     }
 

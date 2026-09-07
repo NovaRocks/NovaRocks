@@ -32,7 +32,7 @@ use std::thread;
 use std::time::Duration;
 
 const REQUIRED_BACKENDS: usize = 3;
-const ACK_DROP_TARGET_BACKEND: usize = 1;
+const ACK_DROP_FAULT_KIND: &str = "runtime-filter-contribution-ack-drop";
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE: &str = "native_query_active_fragments";
 
@@ -215,17 +215,42 @@ fn run_accepted_after_ack_drop(context: &mut ScenarioContext) -> Result<()> {
         "typed terminal oracle verified a multi-backend Runtime Filter contribution candidate",
     );
     let before_execution_id = candidate_snapshot.execution_id.clone();
-
-    arm_target_backend(context, "runtime-filter-contribution-ack-drop")?;
+    let baseline = resource_snapshot(context)?;
+    let created_baseline = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
+    arm_all_backends(context, ACK_DROP_FAULT_KIND)?;
     context.action(
-        "armed an Accepted-after-ACK-drop Runtime Filter fault for the targeted native backend",
+        "armed one Accepted-after-ACK-drop Runtime Filter fault for every native participant",
     );
 
-    let rows: Vec<i64> = control
-        .query(runtime_filter_count_query(&tables))
+    let target = start_held_runtime_filter_count_query(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.remaining("connect held Runtime Filter retry query actor")?,
+        runtime_filter_held_count_query(&tables),
+    )?;
+    target
+        .ready
+        .recv_timeout(context.remaining("receive held Runtime Filter retry connection id")?)
+        .context(
+            "held Runtime Filter retry query terminated before publishing its connection id",
+        )?;
+    context.action("started a held Runtime Filter retry query through public MySQL");
+    await_ack_drop_while_query_active(context, &baseline, &created_baseline, &target.done)?;
+    context.action(
+        "observed the Accepted ACK-drop token consumed while the Runtime Filter query remained active",
+    );
+
+    let rows = target
+        .done
+        .recv_timeout(context.remaining("await held Runtime Filter retry query completion")?)
+        .context("held Runtime Filter retry query did not complete before scenario deadline")?
         .context("execute native partitioned Runtime Filter query with ACK-drop fault")?;
+    target
+        .thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("held Runtime Filter retry query actor panicked"))??;
     ensure!(
-        rows == [30],
+        rows == [(30, true)],
         "Runtime Filter retry query returned unexpected rows: {rows:?}"
     );
     context.action("completed the partitioned Runtime Filter query with expected row count");
@@ -270,7 +295,6 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
     require_three_backends(context)?;
     let mut control = connect_control(context, "connect cancellation scenario control session")?;
     let tables = create_runtime_filter_tables(context, &mut control, "cancel")?;
-    configure_broadcast_runtime_filter(&mut control)?;
     let baseline = resource_snapshot(context)?;
     // Captured before the query under test starts, so every count below is this
     // query's own. The fixture setup above already ran distributed statements.
@@ -284,6 +308,10 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
         .arm_query_lifecycle_fault(0, TASK_UPDATE_TERMINAL_ACK_DROP)
         .context("arm terminal task-update ACK drop for the targeted backend")?;
     context.action("armed a terminal task-update ACK-drop replay fault for BE[0]");
+    arm_all_backends(context, ACK_DROP_FAULT_KIND)?;
+    context.action(
+        "armed one contribution Accepted-after-ACK-drop readiness probe for every native participant",
+    );
 
     let target = start_blocking_runtime_filter_query(
         context.mysql_user(),
@@ -296,9 +324,9 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
         .recv_timeout(context.remaining("receive Runtime Filter query connection id")?)
         .context("Runtime Filter query terminated before publishing its connection id")?;
     context.action("started an in-flight native Runtime Filter query through public MySQL");
-    await_runtime_filter_activity(context, &baseline, &created_baseline)?;
+    await_ack_drop_while_query_active(context, &baseline, &created_baseline, &target.done)?;
     context.action(
-        "observed an admitted task on more than one backend and an active native fragment through the typed resource oracle",
+        "observed a receiver-Accepted Runtime Filter contribution while the EES task query remained active",
     );
     await_total_advanced(
         context,
@@ -851,6 +879,13 @@ fn runtime_filter_blocking_query(tables: &RuntimeFilterTables) -> String {
     )
 }
 
+fn runtime_filter_held_count_query(tables: &RuntimeFilterTables) -> String {
+    format!(
+        "SELECT completed_join.matched_rows, sleep(completed_join.matched_rows - completed_join.matched_rows + 3) AS hold_complete FROM (SELECT COUNT(*) AS matched_rows FROM ({join}) filtered) completed_join WHERE completed_join.matched_rows > 0",
+        join = runtime_filter_counting_join(tables),
+    )
+}
+
 fn runtime_filter_counting_join(tables: &RuntimeFilterTables) -> String {
     format!(
         "SELECT p.id FROM {catalog}.{database}.{probe} p JOIN {catalog}.{database}.{build} b ON p.k = b.k WHERE b.flag = 'Y'",
@@ -868,11 +903,14 @@ fn latest_execution_id(context: &mut ScenarioContext) -> Result<Option<String>> 
         .and_then(|snapshot| snapshot.execution_id))
 }
 
-fn arm_target_backend(context: &mut ScenarioContext, kind: &'static str) -> Result<()> {
-    context
-        .handle()
-        .arm_query_lifecycle_fault(ACK_DROP_TARGET_BACKEND, kind)
-        .with_context(|| format!("arm {kind} fault for BE[{ACK_DROP_TARGET_BACKEND}]"))
+fn arm_all_backends(context: &mut ScenarioContext, kind: &'static str) -> Result<()> {
+    for backend in 0..context.handle().be_count() {
+        context
+            .handle()
+            .arm_query_lifecycle_fault(backend, kind)
+            .with_context(|| format!("arm {kind} fault for BE[{backend}]"))?;
+    }
+    Ok(())
 }
 
 fn await_terminal_snapshot(
@@ -971,54 +1009,123 @@ fn await_backends_advanced(
     }
 }
 
-/// Waits until the query under test is really running distributed.
-///
-/// Both halves are needed. `NOVAROCKS_TASK_CREATE_APPLIED` newly emitted on
-/// more than one backend is the task protocol's own statement that this attempt
-/// was admitted past a single process; the active-fragment gauge is the
-/// statement that work is in flight right now, which a log line -- never
-/// retracted -- cannot make. The retired protocol's `control_ready` count and
-/// its `native_runtime_filter_services` gauge are both published only by the
-/// lifecycle chain, so neither can gate anything on the task path.
-fn await_runtime_filter_activity(
+fn await_ack_drop_while_query_active<T: std::fmt::Debug>(
     context: &mut ScenarioContext,
     baseline: &QueryExecutionResourceSnapshot,
     created_baseline: &[usize],
+    done: &mpsc::Receiver<std::result::Result<Vec<T>, mysql::Error>>,
 ) -> Result<()> {
+    let fault_root = context.runtime_dir().join("query-lifecycle-faults");
+    let backend_count = context.handle().be_count();
+    let arms = (0..backend_count)
+        .map(|backend| fault_root.join(format!("be-{backend}.{ACK_DROP_FAULT_KIND}.arm")))
+        .collect::<Vec<_>>();
+    let triggers = (0..backend_count)
+        .map(|backend| fault_root.join(format!("be-{backend}.{ACK_DROP_FAULT_KIND}.trigger")))
+        .collect::<Vec<_>>();
+    let mut latest = None;
     loop {
+        match done.try_recv() {
+            Ok(result) => bail!(
+                "Runtime Filter retry query reached terminal before the Accepted ACK-drop was observed: {result:?}; baseline={baseline:?}; latest={latest:?}"
+            ),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                bail!("Runtime Filter retry query actor disconnected before ACK-drop observation")
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
         let current = resource_snapshot(context)?;
-        let native_fragment_active =
-            current
-                .backends
-                .iter()
-                .zip(&baseline.backends)
-                .any(|(current, baseline)| {
-                    current
+        let armed_count = arms.iter().filter(|path| path.exists()).count();
+        let trigger_count = triggers.iter().filter(|path| path.exists()).count();
+        let query_active =
+            task_query_activity_observed(context, baseline, &current, created_baseline)?;
+        latest = Some((armed_count, trigger_count, query_active, current));
+        if armed_count == 0 && trigger_count < backend_count && query_active {
+            match done.try_recv() {
+                Ok(result) => bail!(
+                    "Runtime Filter retry query reached terminal during the Accepted ACK-drop observation: {result:?}; baseline={baseline:?}; latest={latest:?}"
+                ),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    bail!(
+                        "Runtime Filter retry query actor disconnected during ACK-drop observation"
+                    )
+                }
+                Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            }
+        }
+        let remaining = context.remaining(
+            "observe Accepted ACK-drop consumption while the Runtime Filter query remains active",
+        )?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+fn task_query_activity_observed(
+    context: &mut ScenarioContext,
+    baseline: &QueryExecutionResourceSnapshot,
+    current: &QueryExecutionResourceSnapshot,
+    created_baseline: &[usize],
+) -> Result<bool> {
+    let native_fragment_active =
+        current
+            .backends
+            .iter()
+            .zip(&baseline.backends)
+            .any(|(current, baseline)| {
+                current
+                    .resources
+                    .get(NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE)
+                    .copied()
+                    .unwrap_or_default()
+                    > baseline
                         .resources
                         .get(NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE)
                         .copied()
                         .unwrap_or_default()
-                        > baseline
-                            .resources
-                            .get(NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE)
-                            .copied()
-                            .unwrap_or_default()
-                });
-        let created = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
-        if native_fragment_active && backends_advanced(created_baseline, &created) >= 2 {
-            return Ok(());
-        }
-        let remaining = context.remaining(
-            "observe an admitted task on more than one backend and an active fragment",
-        )?;
-        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
-    }
+            });
+    let created = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
+    Ok(native_fragment_active && backends_advanced(created_baseline, &created) >= 2)
 }
 
 struct BlockingQuery {
     ready: mpsc::Receiver<u32>,
     done: mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
     thread: thread::JoinHandle<Result<()>>,
+}
+
+struct HeldCountQuery {
+    ready: mpsc::Receiver<u32>,
+    done: mpsc::Receiver<std::result::Result<Vec<(i64, bool)>, mysql::Error>>,
+    thread: thread::JoinHandle<Result<()>>,
+}
+
+fn start_held_runtime_filter_count_query(
+    user: &str,
+    port: u16,
+    connect_timeout: Duration,
+    query: String,
+) -> Result<HeldCountQuery> {
+    let (ready_tx, ready) = mpsc::sync_channel(1);
+    let (done_tx, done) = mpsc::sync_channel(1);
+    let user = user.to_string();
+    let thread = thread::spawn(move || -> Result<()> {
+        let mut connection = mysql_actor::connect_for_cancellation(&user, port, connect_timeout)
+            .context("connect held Runtime Filter count query actor")?;
+        configure_partitioned_runtime_filter(&mut connection)
+            .context("configure held Runtime Filter count query actor")?;
+        ready_tx
+            .send(connection.connection_id())
+            .context("publish held Runtime Filter count query connection id")?;
+        done_tx
+            .send(connection.query::<(i64, bool), _>(query))
+            .context("publish held Runtime Filter count query result")?;
+        Ok(())
+    });
+    Ok(HeldCountQuery {
+        ready,
+        done,
+        thread,
+    })
 }
 
 fn start_blocking_runtime_filter_query(
@@ -1033,6 +1140,8 @@ fn start_blocking_runtime_filter_query(
     let thread = thread::spawn(move || -> Result<()> {
         let mut connection = mysql_actor::connect_for_cancellation(&user, port, connect_timeout)
             .context("connect blocking Runtime Filter query actor")?;
+        configure_partitioned_runtime_filter(&mut connection)
+            .context("configure blocking Runtime Filter query actor")?;
         ready_tx
             .send(connection.connection_id())
             .context("publish blocking Runtime Filter query connection id")?;

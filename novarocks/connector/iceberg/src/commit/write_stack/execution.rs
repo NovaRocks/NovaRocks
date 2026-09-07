@@ -60,7 +60,6 @@ use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::commit::{DeletionVector, write_single_deletion_vector_puffin};
 use crate::commit::{PositionDeleteGroup, write_position_delete_files};
 use crate::delete_file::IcebergFileFormat;
-use crate::resources::IcebergExecutionRuntime;
 use crate::write_descriptor::encode_partition_descriptor;
 
 fn error(kind: ConnectorErrorKind, message: impl Into<String>) -> ConnectorError {
@@ -72,7 +71,6 @@ pub struct IcebergWriteStackExecution {
     catalog_handle: CatalogHandle,
     adapter: IcebergWriteAdapter,
     binding: IcebergReadBinding,
-    runtime: IcebergExecutionRuntime,
 }
 
 impl IcebergWriteStackExecution {
@@ -80,23 +78,22 @@ impl IcebergWriteStackExecution {
         catalog_handle: CatalogHandle,
         adapter: IcebergWriteAdapter,
         binding: IcebergReadBinding,
-        runtime: IcebergExecutionRuntime,
     ) -> Self {
         Self {
             catalog_handle,
             adapter,
             binding,
-            runtime,
         }
     }
 }
 
+#[async_trait::async_trait]
 impl ConnectorWriteExecution for IcebergWriteStackExecution {
     fn catalog_handle(&self) -> &CatalogHandle {
         &self.catalog_handle
     }
 
-    fn open_writer(
+    async fn open_writer(
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
@@ -133,19 +130,13 @@ impl ConnectorWriteExecution for IcebergWriteStackExecution {
 pub struct IcebergWriteStackExecutionFactory {
     descriptor: ConnectorInstanceDescriptor,
     binding: IcebergReadBinding,
-    runtime: IcebergExecutionRuntime,
 }
 
 impl IcebergWriteStackExecutionFactory {
-    pub fn new(
-        descriptor: ConnectorInstanceDescriptor,
-        binding: IcebergReadBinding,
-        runtime: IcebergExecutionRuntime,
-    ) -> Self {
+    pub fn new(descriptor: ConnectorInstanceDescriptor, binding: IcebergReadBinding) -> Self {
         Self {
             descriptor,
             binding,
-            runtime,
         }
     }
 }
@@ -171,7 +162,6 @@ impl ConnectorWriteExecutionFactory for IcebergWriteStackExecutionFactory {
             catalog_handle,
             adapter,
             binding,
-            self.runtime.clone(),
         )))
     }
 }
@@ -238,7 +228,6 @@ fn ensure_live(
 /// The per-driver data-file writer.
 struct IcebergDataStackWriter {
     adapter: IcebergWriteAdapter,
-    runtime: IcebergExecutionRuntime,
     context: StagedWriteContext,
     request_context: ConnectorRequestContext,
     fragments: Vec<ConnectorCommitFragment>,
@@ -280,7 +269,6 @@ impl IcebergDataStackWriter {
                 .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
         Ok(Self {
             adapter: execution.adapter.clone(),
-            runtime: execution.runtime.clone(),
             context,
             request_context: request.context,
             fragments: Vec::new(),
@@ -323,7 +311,7 @@ impl IcebergDataStackWriter {
                 file.partition_spec_id,
                 descriptor,
             )?;
-            let (report, _) = staged_data_file_to_writer_report(
+            let report = staged_data_file_to_writer_report(
                 &file,
                 IcebergPartitionReport {
                     partition_path,
@@ -368,25 +356,20 @@ impl IcebergDataStackWriter {
     }
 }
 
+#[async_trait::async_trait]
 impl ConnectorBatchWriter for IcebergDataStackWriter {
-    fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         ensure_live(self.terminal, &self.request_context, "data")?;
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let staged = self
-            .runtime
-            .block_on(write_record_batches(
-                &self.context,
-                [batch],
-                &StagedWriteOptions::default(),
-            ))
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+        let staged = write_record_batches(&self.context, [batch], &StagedWriteOptions::default())
+            .await
             .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         self.record(staged)
     }
 
-    fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+    async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
         ensure_live(self.terminal, &self.request_context, "data")?;
         self.terminal = true;
         // A writer that staged nothing returns an empty vector; that is a
@@ -394,12 +377,11 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
         Ok(std::mem::take(&mut self.fragments))
     }
 
-    fn abort(&mut self) -> Result<(), ConnectorError> {
+    async fn abort(&mut self) -> Result<(), ConnectorError> {
         if !self.staged_paths.is_empty() {
             let paths = std::mem::take(&mut self.staged_paths);
-            self.runtime
-                .block_on(cleanup_staged_files(&self.context, &paths))
-                .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+            cleanup_staged_files(&self.context, &paths)
+                .await
                 .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         }
         self.fragments.clear();
@@ -416,7 +398,6 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
 struct IcebergDeleteStackWriter {
     adapter: IcebergWriteAdapter,
     binding: IcebergReadBinding,
-    runtime: IcebergExecutionRuntime,
     handle: IcebergWriterHandle,
     physical: ConnectorWriterPhysicalContext,
     request_context: ConnectorRequestContext,
@@ -439,7 +420,6 @@ impl IcebergDeleteStackWriter {
         Ok(Self {
             adapter: execution.adapter.clone(),
             binding: execution.binding.clone(),
-            runtime: execution.runtime.clone(),
             handle,
             physical: request.physical,
             request_context: request.context,
@@ -455,7 +435,7 @@ impl IcebergDeleteStackWriter {
         self.handle.branch().as_str()
     }
 
-    fn stage_position_delete(
+    async fn stage_position_delete(
         &mut self,
         data_file: &str,
         positions: &roaring::RoaringTreemap,
@@ -491,23 +471,21 @@ impl IcebergDeleteStackWriter {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let written = self
-            .runtime
-            .block_on(write_position_delete_files(
-                &self.file_io,
-                &staging_dir,
-                vec![PositionDeleteGroup {
-                    referenced_data_file: data_file.to_string(),
-                    partition_spec_id: partition.partition_spec_id(),
-                    // The backend never reconstructs partition values; the
-                    // frontend decodes them from the frozen descriptor against
-                    // the real table metadata at commit.
-                    partition_values: crate::iceberg::spec::Struct::empty(),
-                    positions: ordered,
-                }],
-            ))
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+        let written = write_position_delete_files(
+            &self.file_io,
+            &staging_dir,
+            vec![PositionDeleteGroup {
+                referenced_data_file: data_file.to_string(),
+                partition_spec_id: partition.partition_spec_id(),
+                // The backend never reconstructs partition values; the
+                // frontend decodes them from the frozen descriptor against
+                // the real table metadata at commit.
+                partition_values: crate::iceberg::spec::Struct::empty(),
+                positions: ordered,
+            }],
+        )
+        .await
+        .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         let [file] = written.as_slice() else {
             return Err(error(
                 ConnectorErrorKind::Internal,
@@ -531,7 +509,7 @@ impl IcebergDeleteStackWriter {
         Ok(IcebergCommitFragment::position_delete_file(artifact))
     }
 
-    fn stage_deletion_vector(
+    async fn stage_deletion_vector(
         &mut self,
         data_file: &str,
         positions: &roaring::RoaringTreemap,
@@ -562,15 +540,8 @@ impl IcebergDeleteStackWriter {
             sequence,
             "puffin",
         );
-        let written = self
-            .runtime
-            .block_on(write_single_deletion_vector_puffin(
-                &self.file_io,
-                &path,
-                data_file,
-                &vector,
-            ))
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+        let written = write_single_deletion_vector_puffin(&self.file_io, &path, data_file, &vector)
+            .await
             .map_err(|write_error| {
                 error(
                     ConnectorErrorKind::Internal,
@@ -596,29 +567,27 @@ impl IcebergDeleteStackWriter {
         Ok(IcebergCommitFragment::deletion_vector(artifact))
     }
 
-    fn cleanup(&mut self) -> Result<(), ConnectorError> {
+    async fn cleanup(&mut self) -> Result<(), ConnectorError> {
         if self.staged_paths.is_empty() {
             return Ok(());
         }
         let paths = std::mem::take(&mut self.staged_paths);
         let file_io = self.file_io.clone();
-        self.runtime
-            .block_on(async move {
-                for path in &paths {
-                    file_io.delete(path).await.map_err(|delete_error| {
-                        format!("cleanup staged Iceberg delete artifact {path}: {delete_error}")
-                    })?;
-                }
-                Ok::<(), String>(())
-            })
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+        for path in &paths {
+            file_io.delete(path).await.map_err(|delete_error| {
+                error(
+                    ConnectorErrorKind::Internal,
+                    format!("cleanup staged Iceberg delete artifact {path}: {delete_error}"),
+                )
+            })?;
+        }
         Ok(())
     }
 }
 
+#[async_trait::async_trait]
 impl ConnectorBatchWriter for IcebergDeleteStackWriter {
-    fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         ensure_live(self.terminal, &self.request_context, self.branch_name())?;
         if batch.num_rows() == 0 {
             return Ok(());
@@ -694,7 +663,7 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+    async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
         ensure_live(self.terminal, &self.request_context, self.branch_name())?;
         self.terminal = true;
         let pending = std::mem::take(&mut self.pending);
@@ -723,10 +692,12 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
             }
             let fragment = match self.handle.branch() {
                 IcebergWriteBranch::DeletionVector => {
-                    self.stage_deletion_vector(&data_file, &positions, merged_references)?
+                    self.stage_deletion_vector(&data_file, &positions, merged_references)
+                        .await?
                 }
                 IcebergWriteBranch::PositionDelete => {
-                    self.stage_position_delete(&data_file, &positions, merged_references)?
+                    self.stage_position_delete(&data_file, &positions, merged_references)
+                        .await?
                 }
                 IcebergWriteBranch::Data | IcebergWriteBranch::EqualityDelete => {
                     return Err(error(
@@ -743,9 +714,9 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
         Ok(fragments)
     }
 
-    fn abort(&mut self) -> Result<(), ConnectorError> {
+    async fn abort(&mut self) -> Result<(), ConnectorError> {
         self.pending.clear();
-        self.cleanup()?;
+        self.cleanup().await?;
         self.terminal = true;
         Ok(())
     }
@@ -761,7 +732,6 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
 /// disagreement between them is a refusal rather than a coercion.
 struct IcebergEqualityDeleteStackWriter {
     adapter: IcebergWriteAdapter,
-    runtime: IcebergExecutionRuntime,
     handle: IcebergWriterHandle,
     request_context: ConnectorRequestContext,
     file_io: crate::iceberg::io::FileIO,
@@ -810,7 +780,6 @@ impl IcebergEqualityDeleteStackWriter {
         )?;
         Ok(Self {
             adapter: execution.adapter.clone(),
-            runtime: execution.runtime.clone(),
             handle,
             request_context: request.context,
             file_io,
@@ -824,25 +793,21 @@ impl IcebergEqualityDeleteStackWriter {
         })
     }
 
-    fn cleanup(&mut self) -> Result<(), ConnectorError> {
+    async fn cleanup(&mut self) -> Result<(), ConnectorError> {
         if self.staged_paths.is_empty() {
             return Ok(());
         }
         let paths = std::mem::take(&mut self.staged_paths);
         let file_io = self.file_io.clone();
-        self.runtime
-            .block_on(async move {
-                for path in &paths {
-                    file_io.delete(path).await.map_err(|delete_error| {
-                        format!(
-                            "cleanup staged Iceberg equality-delete file {path}: {delete_error}"
-                        )
-                    })?;
-                }
-                Ok::<(), String>(())
-            })
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))
+        for path in &paths {
+            file_io.delete(path).await.map_err(|delete_error| {
+                error(
+                    ConnectorErrorKind::Internal,
+                    format!("cleanup staged Iceberg equality-delete file {path}: {delete_error}"),
+                )
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -894,23 +859,22 @@ fn resolve_equality_columns(
         .collect()
 }
 
+#[async_trait::async_trait]
 impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
-    fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+    async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         ensure_live(self.terminal, &self.request_context, "equality-delete")?;
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let written = self
-            .runtime
-            .block_on(crate::commit::write_equality_delete_file(
-                &self.file_io,
-                &self.staging_dir,
-                self.handle.table().default_partition_spec_id(),
-                self.columns.clone(),
-                batch,
-            ))
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
-            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+        let written = crate::commit::write_equality_delete_file(
+            &self.file_io,
+            &self.staging_dir,
+            self.handle.table().default_partition_spec_id(),
+            self.columns.clone(),
+            batch,
+        )
+        .await
+        .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         let Some(written) = written else {
             return Ok(());
         };
@@ -934,14 +898,14 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+    async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
         ensure_live(self.terminal, &self.request_context, "equality-delete")?;
         self.terminal = true;
         Ok(std::mem::take(&mut self.fragments))
     }
 
-    fn abort(&mut self) -> Result<(), ConnectorError> {
-        self.cleanup()?;
+    async fn abort(&mut self) -> Result<(), ConnectorError> {
+        self.cleanup().await?;
         self.fragments.clear();
         self.terminal = true;
         Ok(())

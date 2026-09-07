@@ -236,6 +236,8 @@ pub struct DistributedQueryRequest {
     /// The NCP-6 write session, present exactly when this query's plan carries
     /// the dataflow write shape.
     write_stack_session: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
+    write_root_decode_contract:
+        Option<crate::query_execution::write_result::RootWriteDecodeContract>,
     statistics_program: Option<StatisticsCollectionProgram>,
 }
 
@@ -264,12 +266,6 @@ impl DistributedQueryRequest {
         self.deadline
     }
 
-    pub(crate) fn write_stack_session(
-        &self,
-    ) -> Option<&Arc<crate::query_execution::write_session::ConnectorWriteSession>> {
-        self.write_stack_session.as_ref()
-    }
-
     pub fn statistics_program(&self) -> Option<&StatisticsCollectionProgram> {
         self.statistics_program.as_ref()
     }
@@ -283,6 +279,7 @@ impl DistributedQueryRequest {
             cancellation: self.cancellation,
             completion: self.completion,
             write_stack_session: self.write_stack_session,
+            write_root_decode_contract: self.write_root_decode_contract,
             statistics_program: self.statistics_program,
         }
     }
@@ -297,8 +294,10 @@ pub struct DistributedQueryRequestParts {
     pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,
-    pub write_stack_session:
+    pub(crate) write_stack_session:
         Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
+    pub(crate) write_root_decode_contract:
+        Option<crate::query_execution::write_result::RootWriteDecodeContract>,
     pub statistics_program: Option<StatisticsCollectionProgram>,
 }
 
@@ -326,6 +325,7 @@ pub(crate) fn build_distributed_query_request_with_execution(
         cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(intent),
         write_stack_session: None,
+        write_root_decode_contract: None,
         statistics_program: None,
     })
 }
@@ -349,6 +349,7 @@ pub(crate) fn build_statistics_query_request_with_execution(
         cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(DistributedQueryIntent::Statistics),
         write_stack_session: None,
+        write_root_decode_contract: None,
         statistics_program: Some(program),
     }
 }
@@ -374,7 +375,21 @@ pub(crate) fn with_connector_write_session(
             "distributed query already has a connector write session",
         ));
     }
+    let query_targets = request.artifacts.write_root_targets().ok_or_else(|| {
+        DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "distributed write plan has no query-local TableFinish target contract",
+        )
+    })?;
+    let decode_contract = crate::query_execution::write_result::RootWriteDecodeContract::try_new(
+        query_targets,
+        session.targets(),
+    )
+    .map_err(|error| {
+        DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+    })?;
     request.write_stack_session = Some(session);
+    request.write_root_decode_contract = Some(decode_contract);
     Ok(request)
 }
 

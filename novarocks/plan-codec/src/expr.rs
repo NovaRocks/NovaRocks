@@ -102,6 +102,7 @@ fn encode_expr_kind(e: &SqlExpressionRead) -> Result<expr::expr::Kind, String> {
             args,
             distinct,
             order_by,
+            resolved: _,
         } => Kind::AggregateCall(expr::AggregateCall {
             function_name: name.clone(),
             args: encode_exprs(args)?,
@@ -186,23 +187,11 @@ fn encode_expr_kind(e: &SqlExpressionRead) -> Result<expr::expr::Kind, String> {
         SqlExpressionReadKind::Nested(inner) => Kind::Nested(Box::new(expr::NestedExpr {
             inner: Some(Box::new(encode_expr(inner)?)),
         })),
-        SqlExpressionReadKind::WindowCall {
-            name,
-            args,
-            distinct,
-            partition_by,
-            order_by,
-            window_frame,
-            ignore_nulls,
-        } => Kind::WindowCall(expr::WindowCall {
-            function_name: name.clone(),
-            args: encode_exprs(args)?,
-            distinct: *distinct,
-            partition_by: encode_exprs(partition_by)?,
-            order_by: encode_sort_items(order_by)?,
-            frame: window_frame.as_ref().map(encode_window_frame).transpose()?,
-            ignore_nulls: *ignore_nulls,
-        }),
+        SqlExpressionReadKind::WindowCall { name, .. } => {
+            return Err(format!(
+                "window call `{name}` must be extracted into a physical Window node before native expression encoding"
+            ));
+        }
         SqlExpressionReadKind::SubqueryPlaceholder { id } => {
             return Err(format!(
                 "unexpected SubqueryPlaceholder (id={id}) in FE proto expression encoder"

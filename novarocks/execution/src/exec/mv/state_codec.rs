@@ -169,6 +169,47 @@ pub fn decode_multiset_with_key_type(
     Ok(entries)
 }
 
+/// Visits a validated multiset without materializing an intermediate entry
+/// vector. The key slice is borrowed from `bytes` and is valid only for the
+/// duration of the callback. This is the allocation-free decode path used by
+/// aggregate states whose owned copies must be created with a query tracker.
+pub fn visit_multiset_with_key_type(
+    bytes: &[u8],
+    key_dtype: &DataType,
+    mut visit: impl FnMut(&[u8], i64) -> Result<(), String>,
+) -> Result<(), String> {
+    if is_empty_state(bytes) {
+        return Ok(());
+    }
+    if bytes.first().copied() != Some(STATE_VERSION_V1) {
+        return Err("state_codec: multiset unsupported version byte".to_string());
+    }
+    let Some((&key_type_tag, rest)) = bytes[1..].split_first() else {
+        return Err("state_codec: multiset missing key type tag".to_string());
+    };
+    if !key_type_tag_matches_data_type(key_type_tag, key_dtype) {
+        return Err(format!(
+            "state_codec: multiset key type tag {key_type_tag} does not match expected {key_dtype:?}"
+        ));
+    }
+    let mut cursor = rest;
+    let num_entries = read_uleb128(&mut cursor)?;
+    if num_entries == 0 {
+        return Err("state_codec: multiset zero entry count must use empty state".to_string());
+    }
+    for _ in 0..num_entries {
+        let before_key = cursor;
+        read_key(&mut cursor, key_dtype)?;
+        let key_len = before_key.len() - cursor.len();
+        let count = read_sleb128(&mut cursor)?;
+        visit(&before_key[..key_len], count)?;
+    }
+    if !cursor.is_empty() {
+        return Err("state_codec: multiset trailing bytes after entries".to_string());
+    }
+    Ok(())
+}
+
 pub fn decode_multiset_self_describing(
     bytes: &[u8],
 ) -> Result<(DataType, Vec<MultisetEntry>), String> {
@@ -365,6 +406,35 @@ pub enum KeyValue {
 }
 
 pub fn write_key_at(out: &mut Vec<u8>, array: &ArrayRef, idx: usize) -> Result<(), String> {
+    visit_key_bytes_at(array, idx, |bytes| out.extend_from_slice(bytes))
+}
+
+/// Emits the canonical key encoding as borrowed byte fragments. Fixed-width
+/// values emit one fragment; strings emit the length prefix and payload. The
+/// callback form lets allocator-aware callers copy directly into their owned
+/// storage without a temporary global-allocator `Vec`.
+pub fn visit_key_bytes_at(
+    array: &ArrayRef,
+    idx: usize,
+    mut visit: impl FnMut(&[u8]),
+) -> Result<(), String> {
+    fn emit_uleb128(mut value: u64, visit: &mut impl FnMut(&[u8])) {
+        let mut bytes = [0_u8; 10];
+        let mut len = 0;
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            bytes[len] = byte;
+            len += 1;
+            if value == 0 {
+                visit(&bytes[..len]);
+                return;
+            }
+        }
+    }
     if idx >= array.len() {
         return Err(format!(
             "state_codec: key index {idx} out of bounds for len {}",
@@ -378,67 +448,67 @@ pub fn write_key_at(out: &mut Vec<u8>, array: &ArrayRef, idx: usize) -> Result<(
     match array.data_type() {
         DataType::Boolean => {
             let arr = downcast_array::<BooleanArray>(array, "BooleanArray")?;
-            out.push(u8::from(arr.value(idx)));
+            visit(&[u8::from(arr.value(idx))]);
             Ok(())
         }
         DataType::Int8 => {
             let arr = downcast_array::<Int8Array>(array, "Int8Array")?;
-            out.extend_from_slice(&arr.value(idx).to_le_bytes());
+            visit(&arr.value(idx).to_le_bytes());
             Ok(())
         }
         DataType::Int16 => {
             let arr = downcast_array::<Int16Array>(array, "Int16Array")?;
-            out.extend_from_slice(&arr.value(idx).to_le_bytes());
+            visit(&arr.value(idx).to_le_bytes());
             Ok(())
         }
         DataType::Int32 => {
             let arr = downcast_array::<Int32Array>(array, "Int32Array")?;
-            out.extend_from_slice(&arr.value(idx).to_le_bytes());
+            visit(&arr.value(idx).to_le_bytes());
             Ok(())
         }
         DataType::Int64 => {
             let arr = downcast_array::<Int64Array>(array, "Int64Array")?;
-            out.extend_from_slice(&arr.value(idx).to_le_bytes());
+            visit(&arr.value(idx).to_le_bytes());
             Ok(())
         }
         DataType::Float32 => {
             let arr = downcast_array::<Float32Array>(array, "Float32Array")?;
-            out.extend_from_slice(&canonical_f32_bits(arr.value(idx)).to_le_bytes());
+            visit(&canonical_f32_bits(arr.value(idx)).to_le_bytes());
             Ok(())
         }
         DataType::Float64 => {
             let arr = downcast_array::<Float64Array>(array, "Float64Array")?;
-            out.extend_from_slice(&canonical_f64_bits(arr.value(idx)).to_le_bytes());
+            visit(&canonical_f64_bits(arr.value(idx)).to_le_bytes());
             Ok(())
         }
         DataType::Decimal128(_, _) => {
             let arr = downcast_array::<Decimal128Array>(array, "Decimal128Array")?;
-            out.extend_from_slice(&arr.value(idx).to_le_bytes());
+            visit(&arr.value(idx).to_le_bytes());
             Ok(())
         }
         DataType::Date32 => {
             let arr = downcast_array::<Date32Array>(array, "Date32Array")?;
-            out.extend_from_slice(&arr.value(idx).to_le_bytes());
+            visit(&arr.value(idx).to_le_bytes());
             Ok(())
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let arr =
                 downcast_array::<TimestampMicrosecondArray>(array, "TimestampMicrosecondArray")?;
-            out.extend_from_slice(&arr.value(idx).to_le_bytes());
+            visit(&arr.value(idx).to_le_bytes());
             Ok(())
         }
         DataType::Utf8 => {
             let arr = downcast_array::<StringArray>(array, "StringArray")?;
             let bytes = arr.value(idx).as_bytes();
-            write_uleb128(out, bytes.len() as u64);
-            out.extend_from_slice(bytes);
+            emit_uleb128(bytes.len() as u64, &mut visit);
+            visit(bytes);
             Ok(())
         }
         DataType::LargeUtf8 => {
             let arr = downcast_array::<LargeStringArray>(array, "LargeStringArray")?;
             let bytes = arr.value(idx).as_bytes();
-            write_uleb128(out, bytes.len() as u64);
-            out.extend_from_slice(bytes);
+            emit_uleb128(bytes.len() as u64, &mut visit);
+            visit(bytes);
             Ok(())
         }
         other => Err(format!("state_codec: unsupported key type {other:?}")),

@@ -18,7 +18,6 @@ pub const QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1: u32 = 1;
 pub const QUERY_TERMINAL_FRAGMENT_OUTCOME_CODE_MAX_BYTES: usize = 128;
 pub const QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES: usize = 4096;
 pub const QUERY_TERMINAL_PROFILE_SECTION_MAX_ENTRIES: usize = 16_384;
-pub const QUERY_TERMINAL_STATISTICS_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
 
 const TERMINALIZATION_PROOF_VERSION_V1: u32 = 1;
 
@@ -769,13 +768,6 @@ fn validate_fragment_snapshot(
         )?,
         path.field("profile"),
     )?;
-    if raw.statistics_payload.len() > QUERY_TERMINAL_STATISTICS_PAYLOAD_MAX_BYTES {
-        return Err(error(
-            path.field("statistics_payload"),
-            ProtocolErrorKind::Capacity,
-            "terminal fragment statistics payload exceeds the connector statistics limit",
-        ));
-    }
     Ok(())
 }
 

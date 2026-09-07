@@ -239,10 +239,11 @@ mod tests {
                 vec![
                     ScalarAggregateSpec {
                         output_column_id: id_sum,
-                        name: "sum".to_string(),
+                        name: "count".to_string(),
                         args: vec![],
                         distinct: false,
                         order_by: vec![],
+                        resolved: crate::functions::test_resolved_aggregate("count", &[], false),
                     },
                     ScalarAggregateSpec {
                         output_column_id: id_count,
@@ -250,6 +251,7 @@ mod tests {
                         args: vec![],
                         distinct: false,
                         order_by: vec![],
+                        resolved: crate::functions::test_resolved_aggregate("count", &[], false),
                     },
                 ],
                 layout,
@@ -299,10 +301,11 @@ mod tests {
                 vec![],
                 vec![ScalarAggregateSpec {
                     output_column_id: id_sum,
-                    name: "sum".to_string(),
+                    name: "count".to_string(),
                     args: vec![],
                     distinct: false,
                     order_by: vec![],
+                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
                 }],
                 layout,
                 vec![group.clone(), sum.clone()],
@@ -340,10 +343,11 @@ mod tests {
                 vec![],
                 vec![ScalarAggregateSpec {
                     output_column_id: id_sum,
-                    name: "sum".to_string(),
+                    name: "count".to_string(),
                     args: vec![],
                     distinct: false,
                     order_by: vec![],
+                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
                 }],
                 layout,
                 vec![group.clone()],
@@ -377,10 +381,11 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![ScalarAggregateSpec {
                     output_column_id: id_sum,
-                    name: "sum".to_string(),
+                    name: "count".to_string(),
                     args: vec![],
                     distinct: false,
                     order_by: vec![],
+                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
                 }],
                 output_layout: AggregateOutputLayout::new(
                     vec![],
@@ -407,10 +412,11 @@ mod tests {
                 vec![],
                 vec![ScalarAggregateSpec {
                     output_column_id: id_sum,
-                    name: "sum".to_string(),
+                    name: "count".to_string(),
                     args: vec![],
                     distinct: false,
                     order_by: vec![],
+                    resolved: crate::functions::test_resolved_aggregate("count", &[], false),
                 }],
                 AggregateOutputLayout::new(vec![], vec![sum.clone()]),
                 vec![sum],

@@ -134,10 +134,6 @@ fn sole_publication_write_target(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Binding a first-refresh dataflow needs each independently frozen catalog, target, and session fact."
-)]
 fn bind_first_refresh_write_dataflow(
     query_kernel: &QueryPreparationKernel,
     ports: &IcebergMvCorePorts,
@@ -207,7 +203,7 @@ fn bind_first_refresh_write_dataflow(
                         backend_count,
                     },
                     catalog: &catalog,
-                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
@@ -226,6 +222,9 @@ fn bind_first_refresh_write_dataflow(
             let distributed_plan = compile_mv_first_refresh_connector_write_dataflow(
                 analyzed,
                 &statistics,
+                write_session
+                    .statistics_requirements(write_target_ordinal)
+                    .map_err(|error| error.to_string())?,
                 write_target_ordinal,
             )?;
             prepare_sealed_iceberg_write_native_assembly(
@@ -309,7 +308,7 @@ fn bind_first_refresh_write_dataflow(
                         backend_count,
                     },
                     catalog: &catalog,
-                    functions: novarocks_sql::compiler::builtin_sql_function_catalog(),
+                    functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
                     control: novarocks_sql::compiler::SqlCompileControl::new(
                         execution.deadline(),
@@ -327,6 +326,9 @@ fn bind_first_refresh_write_dataflow(
             let distributed_plan = compile_join_first_refresh_connector_write_dataflow(
                 analyzed,
                 &statistics,
+                write_session
+                    .statistics_requirements(write_target_ordinal)
+                    .map_err(|error| error.to_string())?,
                 write_target_ordinal,
             )?;
             prepare_sealed_iceberg_write_native_assembly(

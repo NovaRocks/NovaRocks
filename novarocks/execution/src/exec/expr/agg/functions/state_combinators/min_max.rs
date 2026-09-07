@@ -17,26 +17,40 @@
 
 //! Minimum/maximum state combinator aggregate functions.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, Int8Array, StructArray};
 use arrow::datatypes::DataType;
 
 use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
+use crate::exec::expr::agg::{
+    AggregateAllocator, AggregateHashMap, AggregateVec, RetainedMemoryPolicy, aggregate_bytes,
+    aggregate_hash_map,
+};
 use crate::exec::mv::state_codec::{
-    MultisetEntry, decode_multiset_with_key_type, encode_multiset, write_key_at,
+    MultisetEntry, encode_multiset, visit_key_bytes_at, visit_multiset_with_key_type,
 };
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::MemTracker;
 
 use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
 
 pub(in crate::exec::expr::agg::functions) struct MinMaxStateAgg;
 pub(in crate::exec::expr::agg::functions) struct MinMaxStateSignedAgg;
 
-#[derive(Default)]
 struct MinMaxState {
-    counts: BTreeMap<Vec<u8>, i64>,
+    allocator: AggregateAllocator,
+    counts: AggregateHashMap<AggregateVec<u8>, i64>,
+}
+
+impl MinMaxState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            counts: aggregate_hash_map(allocator.clone()),
+            allocator,
+        }
+    }
 }
 
 impl AggregateFunction for MinMaxStateAgg {
@@ -70,11 +84,30 @@ impl AggregateFunction for MinMaxStateAgg {
     }
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
-        init_min_max_state(ptr);
+        let _ = ptr;
+        panic!("allocation-tracked min/max state requires tracker-aware initialization");
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        init_min_max_state(ptr, tracker)
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         drop_min_max_state(ptr);
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, ptr: *const u8) -> usize {
+        let _ = ptr;
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -151,11 +184,30 @@ impl AggregateFunction for MinMaxStateSignedAgg {
     }
 
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
-        init_min_max_state(ptr);
+        let _ = ptr;
+        panic!("allocation-tracked min/max state requires tracker-aware initialization");
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        init_min_max_state(ptr, tracker)
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         drop_min_max_state(ptr);
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, ptr: *const u8) -> usize {
+        let _ = ptr;
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -355,10 +407,14 @@ fn build_min_max_state_merge_view<'a>(
     Ok(AggInputView::Binary(binary))
 }
 
-fn init_min_max_state(ptr: *mut u8) {
+fn init_min_max_state(ptr: *mut u8, tracker: Option<Arc<MemTracker>>) -> Result<(), String> {
+    let tracker = tracker.ok_or_else(|| {
+        "allocation-tracked min/max state requires an aggregate memory tracker".to_string()
+    })?;
     unsafe {
-        std::ptr::write(ptr as *mut MinMaxState, MinMaxState::default());
+        std::ptr::write(ptr as *mut MinMaxState, MinMaxState::new(tracker));
     }
+    Ok(())
 }
 
 fn drop_min_max_state(ptr: *mut u8) {
@@ -395,18 +451,20 @@ fn update_min_max_state_unsigned(
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
 ) -> Result<(), String> {
+    if state_ptrs.is_empty() {
+        return Ok(());
+    }
     let AggInputView::Any(array) = input else {
         return Err(format!("{name} batch input type mismatch"));
     };
-    let mut staged = BTreeMap::<usize, BTreeMap<Vec<u8>, i64>>::new();
+    let mut staged = new_staging_map(state_ptrs, offset, name)?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         if array.is_null(row) {
             continue;
         }
-        let mut key_bytes = Vec::new();
-        write_key_at(&mut key_bytes, array, row).map_err(|err| format!("{name}: {err}"))?;
-        let state = staged_state(&mut staged, base, offset);
-        add_count_to_map(state, key_bytes, 1, name)?;
+        let state = staged_state(&mut staged, base, offset, name)?;
+        let key_bytes = tracked_key_at(&state.allocator, array, row, name)?;
+        add_count_to_map(&mut state.counts, key_bytes, 1, name, &state.allocator)?;
     }
     commit_staged(staged);
     Ok(())
@@ -418,8 +476,11 @@ fn update_min_max_state_signed(
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
 ) -> Result<(), String> {
+    if state_ptrs.is_empty() {
+        return Ok(());
+    }
     let (struct_arr, value_arr, op_arr) = signed_parts(name, input)?;
-    let mut staged = BTreeMap::<usize, BTreeMap<Vec<u8>, i64>>::new();
+    let mut staged = new_staging_map(state_ptrs, offset, name)?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         if struct_arr.is_null(row) || value_arr.is_null(row) {
             continue;
@@ -428,10 +489,9 @@ fn update_min_max_state_signed(
             Some(delta) => delta,
             None => continue,
         };
-        let mut key_bytes = Vec::new();
-        write_key_at(&mut key_bytes, value_arr, row).map_err(|err| format!("{name}: {err}"))?;
-        let state = staged_state(&mut staged, base, offset);
-        add_count_to_map(state, key_bytes, delta, name)?;
+        let state = staged_state(&mut staged, base, offset, name)?;
+        let key_bytes = tracked_key_at(&state.allocator, value_arr, row, name)?;
+        add_count_to_map(&mut state.counts, key_bytes, delta, name, &state.allocator)?;
     }
     commit_staged(staged);
     Ok(())
@@ -479,35 +539,98 @@ fn signed_delta(name: &str, op_arr: &Int8Array, row: usize) -> Result<Option<i64
     }
 }
 
-fn staged_state(
-    staged: &mut BTreeMap<usize, BTreeMap<Vec<u8>, i64>>,
+fn staged_state<'a>(
+    staged: &'a mut AggregateHashMap<usize, MinMaxState>,
     base: AggStatePtr,
     offset: usize,
-) -> &mut BTreeMap<Vec<u8>, i64> {
+    _context: &str,
+) -> Result<&'a mut MinMaxState, String> {
     let ptr = state_slot(base, offset);
-    staged
-        .entry(ptr as usize)
-        .or_insert_with(|| unsafe { (*ptr).counts.clone() })
+    if !staged.contains_key(&(ptr as usize)) {
+        let copy = clone_state(unsafe { &*ptr })?;
+        staged.try_reserve(1).map_err(|_| {
+            copy.allocator
+                .allocation_error("reserve min/max staging state")
+        })?;
+        staged.insert(ptr as usize, copy);
+    }
+    Ok(staged
+        .get_mut(&(ptr as usize))
+        .expect("staging state inserted above"))
+}
+
+fn new_staging_map(
+    state_ptrs: &[AggStatePtr],
+    offset: usize,
+    context: &str,
+) -> Result<AggregateHashMap<usize, MinMaxState>, String> {
+    let first = state_ptrs
+        .first()
+        .ok_or_else(|| format!("{context} staging requires at least one state"))?;
+    let state = unsafe { &*state_slot(*first, offset) };
+    Ok(aggregate_hash_map(state.allocator.clone()))
+}
+
+fn clone_state(state: &MinMaxState) -> Result<MinMaxState, String> {
+    let mut counts = aggregate_hash_map(state.allocator.clone());
+    counts.try_reserve(state.counts.len()).map_err(|_| {
+        state
+            .allocator
+            .allocation_error("reserve min/max state clone")
+    })?;
+    for (key, count) in &state.counts {
+        counts.insert(aggregate_bytes(state.allocator.clone(), key)?, *count);
+    }
+    Ok(MinMaxState {
+        allocator: state.allocator.clone(),
+        counts,
+    })
+}
+
+fn tracked_key_at(
+    allocator: &AggregateAllocator,
+    array: &ArrayRef,
+    row: usize,
+    context: &str,
+) -> Result<AggregateVec<u8>, String> {
+    let mut len = 0usize;
+    visit_key_bytes_at(array, row, |bytes| {
+        len = len.saturating_add(bytes.len());
+    })
+    .map_err(|error| format!("{context}: {error}"))?;
+    let mut output = AggregateVec::new_in(allocator.clone());
+    output
+        .try_reserve_exact(len)
+        .map_err(|_| allocator.allocation_error("reserve min/max canonical key"))?;
+    visit_key_bytes_at(array, row, |bytes| output.extend_from_slice(bytes))
+        .map_err(|error| format!("{context}: {error}"))?;
+    Ok(output)
 }
 
 fn add_count_to_map(
-    counts: &mut BTreeMap<Vec<u8>, i64>,
-    key_bytes: Vec<u8>,
+    counts: &mut AggregateHashMap<AggregateVec<u8>, i64>,
+    key_bytes: AggregateVec<u8>,
     delta: i64,
     context: &str,
+    allocator: &AggregateAllocator,
 ) -> Result<(), String> {
     let current = *counts.get(&key_bytes).unwrap_or(&0);
     let next = current
         .checked_add(delta)
         .ok_or_else(|| format!("{context} overflow while adding multiset count"))?;
+    if !counts.contains_key(&key_bytes) {
+        counts
+            .try_reserve(1)
+            .map_err(|_| allocator.allocation_error("reserve min/max multiset entry"))?;
+    }
     counts.insert(key_bytes, next);
     Ok(())
 }
 
-fn commit_staged(staged: BTreeMap<usize, BTreeMap<Vec<u8>, i64>>) {
-    for (ptr, counts) in staged {
+fn commit_staged(staged: AggregateHashMap<usize, MinMaxState>) {
+    for (ptr, state) in staged {
         unsafe {
-            (*(ptr as *mut MinMaxState)).counts = counts;
+            *(ptr as *mut MinMaxState) = state;
         }
     }
 }
@@ -519,6 +642,9 @@ fn merge_min_max_state(
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
 ) -> Result<(), String> {
+    if state_ptrs.is_empty() {
+        return Ok(());
+    }
     let AggInputView::Binary(array) = input else {
         return Err(format!("{name} merge input type mismatch"));
     };
@@ -529,19 +655,17 @@ fn merge_min_max_state(
         .ok_or_else(|| format!("{name} merge requires original logical input type"))?;
     validate_key_type(name, key_type)?;
 
-    let mut staged = BTreeMap::<usize, BTreeMap<Vec<u8>, i64>>::new();
+    let mut staged = new_staging_map(state_ptrs, offset, name)?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         if array.is_null(row) {
             continue;
         }
-        let ptr = state_slot(base, offset);
-        let state = staged
-            .entry(ptr as usize)
-            .or_insert_with(|| unsafe { (*ptr).counts.clone() });
-        for entry in decode_multiset_with_key_type(array.value(row), key_type)? {
-            add_count_to_map(state, entry.key_bytes, entry.count, name)
-                .map_err(|_| format!("{name} overflow while merging multiset count"))?;
-        }
+        let state = staged_state(&mut staged, base, offset, name)?;
+        visit_multiset_with_key_type(array.value(row), key_type, |key, count| {
+            let key = aggregate_bytes(state.allocator.clone(), key)?;
+            add_count_to_map(&mut state.counts, key, count, name, &state.allocator)
+                .map_err(|_| format!("{name} overflow while merging multiset count"))
+        })?;
     }
 
     commit_staged(staged);
@@ -576,16 +700,17 @@ fn build_min_max_state_array(
     let mut builder = BinaryBuilder::new();
     for &base in group_states {
         let state = unsafe { &*state_slot(base, offset) };
-        let entries: Vec<_> = state
+        let mut entries: Vec<_> = state
             .counts
             .iter()
             .filter_map(|(key_bytes, &count)| {
                 (count != 0).then_some(MultisetEntry {
-                    key_bytes: key_bytes.clone(),
+                    key_bytes: key_bytes.to_vec(),
                     count,
                 })
             })
             .collect();
+        entries.sort_by(|left, right| left.key_bytes.cmp(&right.key_bytes));
         builder.append_value(encode_multiset(&entries, key_type)?);
     }
     Ok(Arc::new(builder.finish()))
@@ -677,7 +802,14 @@ mod tests {
         fn new(spec: AggSpec) -> Self {
             let mut cell = Box::new(MaybeUninit::<super::MinMaxState>::uninit());
             let agg = super::super::super::resolve_by_kind(&spec.kind);
-            agg.init_state(&spec, cell.as_mut_ptr() as *mut u8);
+            agg.init_state_with_tracker(
+                &spec,
+                cell.as_mut_ptr() as *mut u8,
+                Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                    "min-max-state-test",
+                )),
+            )
+            .unwrap();
             Self { spec, cell }
         }
 

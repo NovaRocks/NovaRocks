@@ -37,7 +37,6 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::fast_append::register_puffin_stats;
 use super::helpers::{
     OccSubmit, debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
@@ -47,7 +46,6 @@ use super::helpers::{
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, WrittenFile};
-use crate::stats_assembler::CommitType;
 
 // `Eq` is intentionally omitted: `appended_files: Vec<WrittenFile>` and
 // `WrittenFile` is `PartialEq`-only (it carries stats fields not suited to `Eq`).
@@ -113,14 +111,13 @@ impl IcebergCommitAction for CowUpdateCommit {
             snapshot_properties: ctx.snapshot_properties.clone(),
         });
 
-        let sketch_sets = ctx.collector.take_sketch_sets();
-        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
         let written_manifest_paths = || {
             manifest_paths_out
                 .lock()
                 .expect("manifest_paths_out poisoned")
                 .clone()
         };
+        let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
 
         match submit_occ_action(ctx.catalog, ctx.table, action, "CowUpdate", None).await {
             Ok(OccSubmit::Committed(table_after)) => {
@@ -129,21 +126,6 @@ impl IcebergCommitAction for CowUpdateCommit {
                     ctx.target_ref,
                     "CowUpdate",
                 )?;
-                let new_sequence_number = table_after.metadata().last_sequence_number();
-                // CowUpdate replaces touched data files with rewritten ones; the
-                // un-touched files remain live. Treat as Append so the new NDV is
-                // an upper bound combining previous aggregate + new file sketches.
-                register_puffin_stats(
-                    &table_after,
-                    ctx.catalog,
-                    ctx.file_io,
-                    CommitType::Append,
-                    sketch_sets,
-                    new_snapshot_id,
-                    new_sequence_number,
-                    prev_snapshot_id,
-                )
-                .await;
                 Ok(CommitOutcome {
                     new_snapshot_id,
                     written_manifest_paths: written_manifest_paths(),

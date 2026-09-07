@@ -214,6 +214,10 @@ mod tests {
         args: Vec<TypedExpr>,
         distinct: bool,
     ) -> AggregateCall {
+        let argument_types = args
+            .iter()
+            .map(|arg| arg.data_type.clone())
+            .collect::<Vec<_>>();
         AggregateCall {
             name: name.to_string(),
             args,
@@ -221,6 +225,7 @@ mod tests {
             result_type: DataType::Int64,
             order_by: vec![],
             output_column_id,
+            resolved: crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
         }
     }
 

@@ -22,9 +22,13 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder};
 use arrow::datatypes::DataType;
 
+use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
 use crate::exec::node::aggregate::AggFunction;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
-use super::super::{AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction};
+use super::super::{
+    AggInputView, AggKind, AggSpec, AggStatePtr, AggregateFunction, RetainedMemoryPolicy,
+};
 
 type StateUnionFn = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
 
@@ -34,9 +38,19 @@ pub(in crate::exec::expr::agg::functions) struct OpaqueStateMergeAgg {
     union: StateUnionFn,
 }
 
-#[derive(Default)]
 struct OpaqueStateMergeState {
-    state: Vec<u8>,
+    allocator: AggregateAllocator,
+    state: AggregateVec<u8>,
+}
+
+impl OpaqueStateMergeState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        let allocator = AggregateAllocator::new(tracker);
+        Self {
+            state: AggregateVec::new_in(allocator.clone()),
+            allocator,
+        }
+    }
 }
 
 impl OpaqueStateMergeAgg {
@@ -103,15 +117,42 @@ impl AggregateFunction for OpaqueStateMergeAgg {
         unsafe {
             std::ptr::write(
                 ptr as *mut OpaqueStateMergeState,
-                OpaqueStateMergeState::default(),
+                OpaqueStateMergeState::new(process_mem_tracker()),
             );
         }
+    }
+
+    fn init_state_with_tracker(
+        &self,
+        _spec: &AggSpec,
+        ptr: *mut u8,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> Result<(), String> {
+        let tracker = tracker.ok_or_else(|| {
+            format!(
+                "allocation-tracked {} state requires a memory tracker",
+                self.name
+            )
+        })?;
+        unsafe {
+            ptr.cast::<OpaqueStateMergeState>()
+                .write(OpaqueStateMergeState::new(tracker));
+        }
+        Ok(())
     }
 
     fn drop_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             std::ptr::drop_in_place(ptr as *mut OpaqueStateMergeState);
         }
+    }
+
+    fn retained_bytes(&self, _spec: &AggSpec, _ptr: *const u8) -> usize {
+        0
+    }
+
+    fn retained_memory_policy(&self, _spec: &AggSpec) -> RetainedMemoryPolicy {
+        RetainedMemoryPolicy::AllocationTracked
     }
 
     fn update_batch(
@@ -172,7 +213,15 @@ impl OpaqueStateMergeAgg {
                 continue;
             }
             let state = unsafe { &mut *state_slot(base, offset) };
-            state.state = (self.union)(&state.state, array.value(row))?;
+            let merged = (self.union)(&state.state, array.value(row))?;
+            let mut replacement = AggregateVec::new_in(state.allocator.clone());
+            replacement.try_reserve_exact(merged.len()).map_err(|_| {
+                state
+                    .allocator
+                    .allocation_error("reserve merged opaque state")
+            })?;
+            replacement.extend_from_slice(&merged);
+            state.state = replacement;
         }
         Ok(())
     }

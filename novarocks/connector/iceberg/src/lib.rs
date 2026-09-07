@@ -72,7 +72,6 @@ pub mod stats_assembler;
 pub mod stats_loader;
 pub mod storage_inspector;
 pub mod table_definition;
-pub mod theta_sketch;
 pub mod typed_boundary;
 pub mod typed_provider_factory;
 pub mod typed_read;

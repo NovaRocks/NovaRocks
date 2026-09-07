@@ -29,6 +29,7 @@
 
 pub(crate) mod final_domain;
 pub(crate) mod native_runtime_filter;
+mod retained;
 pub(crate) mod streaming_sink;
 pub(crate) mod streaming_source;
 pub(crate) mod streaming_state;
@@ -40,6 +41,7 @@ use crate::runtime_filter as execution;
 use crate::runtime_filter::RuntimeFilterProducerFailure;
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use novarocks_functions::{AggregateInputBatch, ResolvedAggregateSignature};
 
 use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
@@ -61,12 +63,79 @@ use crate::runtime::runtime_state::RuntimeState;
 use self::native_runtime_filter::{
     AggregateTopNProducerSession, AggregateTopNProducerSessionFactory,
 };
+use self::retained::{
+    AggregateOperatorVectorsMemory, AggregateRetainedMemory, AggregateStatePointers,
+    TouchedAggregateStates,
+};
 use self::topn_boundary::{
     AggregateTopNBoundaryBinding, build_topn_boundary_bindings, observe_key_table_group,
     validate_topn_boundary_specs,
 };
 
+/// Narrow analytic-window facade over the aggregate operator's retained-memory
+/// policy manager. Window execution uses the same reservation, bounded-batch,
+/// allocation-tracked, and cleanup semantics as ordinary aggregation instead
+/// of maintaining a second post-mutation reconciliation scheme.
+pub(crate) struct AnalyticAggregateRetainedMemory {
+    retained: AggregateRetainedMemory,
+    touched: TouchedAggregateStates,
+}
+
+impl AnalyticAggregateRetainedMemory {
+    pub(crate) const fn new() -> Self {
+        Self {
+            retained: AggregateRetainedMemory::new(),
+            touched: TouchedAggregateStates::new(),
+        }
+    }
+
+    pub(crate) fn set_tracker(&mut self, tracker: Arc<MemTracker>) -> Result<(), String> {
+        self.retained.set_tracker(Arc::clone(&tracker))?;
+        self.touched.set_tracker(tracker)
+    }
+
+    pub(crate) fn initialize_state(
+        &mut self,
+        kernel: &agg::AggKernelEntry,
+        state: agg::AggStatePtr,
+    ) -> Result<(), String> {
+        self.retained.initialize_state(kernel, state)
+    }
+
+    pub(crate) fn update_batch(
+        &mut self,
+        kernel: &agg::AggKernelEntry,
+        state_ptrs: &[agg::AggStatePtr],
+        input: AggregateInputBatch<'_>,
+    ) -> Result<(), String> {
+        self.retained
+            .run_bounded_batch(&mut self.touched, kernel, state_ptrs, input, false)
+    }
+
+    pub(crate) fn build_final(
+        &mut self,
+        kernel: &agg::AggKernelEntry,
+        state: agg::AggStatePtr,
+    ) -> Result<ArrayRef, String> {
+        self.retained
+            .around(kernel, &[state], || kernel.build_array(&[state], false))
+    }
+
+    pub(crate) fn drop_initialized_state(
+        &mut self,
+        kernel: &agg::AggKernelEntry,
+        state: agg::AggStatePtr,
+    ) {
+        self.retained.drop_initialized_state(kernel, state);
+    }
+}
+
 pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
+
+#[cfg(test)]
+pub(super) fn empty_execution_function_set() -> Arc<agg::SealedExecutionFunctionSet> {
+    agg::test_builtin_execution_function_set()
+}
 
 /// Factory-owned capability for binding one final hash-aggregate driver per local partition.
 ///
@@ -172,27 +241,48 @@ impl Drop for AggregateFinalDomainSessionBuilder {
     }
 }
 
-pub(super) fn build_agg_views<'a>(
-    kernels: &[agg::AggKernelEntry],
-    functions: &[AggFunction],
+pub(super) fn build_agg_batches<'a>(
     arrays: &'a [Option<ArrayRef>],
-) -> Result<Vec<agg::AggInputView<'a>>, String> {
-    if arrays.len() != kernels.len() || arrays.len() != functions.len() {
-        return Err("aggregate arrays length mismatch".to_string());
-    }
-    let mut views = Vec::with_capacity(kernels.len());
-    for idx in 0..kernels.len() {
-        let array = arrays
-            .get(idx)
-            .ok_or_else(|| "aggregate input missing".to_string())?;
-        let view = if functions[idx].input_is_intermediate {
-            kernels[idx].build_merge_view(array)?
-        } else {
-            kernels[idx].build_input_view(array)?
+    row_count: usize,
+) -> Result<Vec<AggregateInputBatch<'a>>, String> {
+    agg::build_agg_input_batches_with_row_count(arrays, row_count)
+}
+
+pub(super) fn expected_agg_input_types(
+    arena: &ExprArena,
+    functions: &[AggFunction],
+) -> Result<Vec<Option<DataType>>, String> {
+    let mut types = Vec::with_capacity(functions.len());
+    for func in functions {
+        if func.input_is_intermediate
+            && let Some(sig) = func.types.as_ref()
+            && let Some(intermediate) = sig.intermediate_type.as_ref()
+        {
+            if matches!(intermediate, DataType::Null) {
+                return Err("aggregate intermediate type is null".to_string());
+            }
+            types.push(Some(intermediate.clone()));
+            continue;
+        }
+        let data_type = match func.inputs.as_slice() {
+            [] => None,
+            [expr] => Some(
+                arena
+                    .data_type(*expr)
+                    .ok_or_else(|| "aggregate input type missing".to_string())?
+                    .clone(),
+            ),
+            _ => {
+                return Err(format!(
+                    "aggregate inputs must be packed into a single struct expression: {} has {} inputs",
+                    func.name,
+                    func.inputs.len()
+                ));
+            }
         };
-        views.push(view);
+        types.push(data_type);
     }
-    Ok(views)
+    Ok(types)
 }
 
 pub(super) fn align_schema_with_arrays(
@@ -378,6 +468,7 @@ pub struct AggregateProcessorFactory {
     arena: Arc<ExprArena>,
     group_by: Vec<ExprId>,
     functions: Vec<AggFunction>,
+    kernels: agg::AggKernelSet,
     output_intermediate: bool,
     direct_input: bool,
     output_chunk_schema: ChunkSchemaRef,
@@ -404,6 +495,8 @@ impl AggregateProcessorFactory {
         arena: Arc<ExprArena>,
         group_by: Vec<ExprId>,
         functions: Vec<AggFunction>,
+        function_set: Arc<agg::SealedExecutionFunctionSet>,
+        resolved_aggregates: Vec<ResolvedAggregateSignature>,
         output_intermediate: bool,
         direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
@@ -479,11 +572,19 @@ impl AggregateProcessorFactory {
                 local_partition_count,
             )?))
         };
+        let expected_agg_types = expected_agg_input_types(&arena, &functions)?;
+        let kernels = agg::build_kernel_set(
+            &function_set,
+            &functions,
+            &expected_agg_types,
+            &resolved_aggregates,
+        )?;
         Ok(Self {
             name,
             arena,
             group_by,
             functions,
+            kernels,
             output_intermediate,
             direct_input,
             output_chunk_schema,
@@ -537,9 +638,9 @@ impl OperatorFactory for AggregateProcessorFactory {
             functions: self.functions.clone(),
             key_table: None,
             state_arena: agg::AggStateArena::new(64 * 1024),
-            group_states: Vec::new(),
-            state_ptrs: Vec::new(),
-            kernels: None,
+            group_states: AggregateStatePointers::new(),
+            state_ptrs: AggregateStatePointers::new(),
+            kernels: Some(self.kernels.clone()),
             output_intermediate: self.output_intermediate,
             direct_input: self.direct_input,
             initialized: false,
@@ -554,6 +655,10 @@ impl OperatorFactory for AggregateProcessorFactory {
             profile_initialized: false,
             profiles: None,
             key_table_mem_tracker: None,
+            aggregate_retained_memory: AggregateRetainedMemory::new(),
+            touched_aggregate_states: TouchedAggregateStates::new(),
+            operator_vectors_memory: AggregateOperatorVectorsMemory::new(),
+            memory_bind_error: None,
             runtime_filter_execution: self.runtime_filter_execution.clone(),
             topn_rf_rows_since_publish: 0,
             topn_boundary_bindings: Vec::new(),
@@ -584,8 +689,8 @@ struct AggregateProcessorOperator {
     functions: Vec<AggFunction>,
     key_table: Option<KeyTable>,
     state_arena: agg::AggStateArena,
-    group_states: Vec<agg::AggStatePtr>,
-    state_ptrs: Vec<agg::AggStatePtr>,
+    group_states: AggregateStatePointers,
+    state_ptrs: AggregateStatePointers,
     kernels: Option<agg::AggKernelSet>,
     output_intermediate: bool,
     direct_input: bool,
@@ -601,6 +706,10 @@ struct AggregateProcessorOperator {
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     key_table_mem_tracker: Option<Arc<MemTracker>>,
+    aggregate_retained_memory: AggregateRetainedMemory,
+    touched_aggregate_states: TouchedAggregateStates,
+    operator_vectors_memory: AggregateOperatorVectorsMemory,
+    memory_bind_error: Option<String>,
     runtime_filter_execution: AggregateRuntimeFilterExecution,
     topn_rf_rows_since_publish: usize,
     topn_boundary_bindings: Vec<AggregateTopNBoundaryBinding>,
@@ -621,13 +730,32 @@ impl Operator for AggregateProcessorOperator {
 
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         let arena = MemTracker::new_child("AggStateArena", &tracker);
-        self.state_arena.set_mem_tracker(Arc::clone(&arena));
+        if let Err(error) = self.state_arena.try_set_mem_tracker(Arc::clone(&arena)) {
+            self.memory_bind_error = Some(error);
+        }
 
         let key_table = MemTracker::new_child("KeyTable", &tracker);
-        if let Some(table) = self.key_table.as_mut() {
-            table.set_mem_tracker(Arc::clone(&key_table));
-        }
         self.key_table_mem_tracker = Some(key_table);
+
+        if let Err(error) = self
+            .aggregate_retained_memory
+            .set_tracker(MemTracker::new_child("AggregateRetainedHeap", &tracker))
+        {
+            self.memory_bind_error = Some(error);
+        }
+        if let Err(error) = self
+            .touched_aggregate_states
+            .set_tracker(MemTracker::new_child("AggregateTouchedStates", &tracker))
+        {
+            self.memory_bind_error = Some(error);
+        }
+        if let Err(error) = self.operator_vectors_memory.set_tracker(
+            &mut self.group_states,
+            &mut self.state_ptrs,
+            MemTracker::new_child("AggregateOperatorVectors", &tracker),
+        ) {
+            self.memory_bind_error = Some(error);
+        }
     }
 
     fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
@@ -635,6 +763,11 @@ impl Operator for AggregateProcessorOperator {
     }
 
     fn prepare(&mut self) -> Result<(), String> {
+        if let Some(error) = self.memory_bind_error.clone() {
+            return Err(error);
+        }
+        self.operator_vectors_memory
+            .ensure_bound(&mut self.group_states, &mut self.state_ptrs)?;
         if let Some(error) = self.final_domain_bind_error.clone() {
             self.fail_final_domain();
             return Err(error);
@@ -757,6 +890,10 @@ impl AggregateProcessorOperator {
         if self.finished {
             return Ok(None);
         }
+        self.aggregate_retained_memory.ensure_available()?;
+        self.touched_aggregate_states.ensure_available()?;
+        self.operator_vectors_memory.ensure_available()?;
+        self.state_arena.ensure_available()?;
         self.init_profile_if_needed();
 
         if chunk.is_empty() && chunk.schema().fields().is_empty() {
@@ -802,28 +939,35 @@ impl AggregateProcessorOperator {
                 .first()
                 .ok_or_else(|| "aggregate scalar state missing".to_string())?;
             self.state_ptrs.clear();
+            self.operator_vectors_memory.reserve_state_ptrs(
+                &self.group_states,
+                &mut self.state_ptrs,
+                num_rows,
+            )?;
             self.state_ptrs.resize(num_rows, state_ptr);
             let kernels = self
                 .kernels
                 .as_ref()
                 .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
-            let agg_views = build_agg_views(&kernels.entries, &self.functions, &agg_arrays)
-                .map_err(|e| e.to_string())?;
-            for (idx, (kernel, view)) in kernels.entries.iter().zip(agg_views.iter()).enumerate() {
-                if self
+            let agg_batches = build_agg_batches(&agg_arrays, num_rows)?;
+            for (idx, (kernel, batch)) in kernels
+                .entries
+                .iter()
+                .zip(agg_batches.iter().copied())
+                .enumerate()
+            {
+                let merge = self
                     .functions
                     .get(idx)
                     .map(|f| f.input_is_intermediate)
-                    .unwrap_or(false)
-                {
-                    kernel
-                        .merge_batch(&self.state_ptrs, view)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    kernel
-                        .update_batch(&self.state_ptrs, view)
-                        .map_err(|e| e.to_string())?;
-                }
+                    .unwrap_or(false);
+                self.aggregate_retained_memory.run_bounded_batch(
+                    &mut self.touched_aggregate_states,
+                    kernel,
+                    &self.state_ptrs,
+                    batch,
+                    merge,
+                )?;
             }
             return Ok(None);
         }
@@ -837,35 +981,19 @@ impl AggregateProcessorOperator {
             let mut group_ids = Vec::with_capacity(num_rows);
             match key_table.key_strategy() {
                 GroupKeyStrategy::Serialized => {
-                    let rows_result = key_table.build_rows(&group_arrays);
-                    let fallback_rows = match &rows_result {
-                        Ok(_) => None,
-                        Err(err) if err.contains("row converter not initialized") => Some(
-                            key_table
-                                .build_rows_fallback(&group_arrays)
-                                .map_err(|e| e.to_string())?,
-                        ),
-                        Err(err) => return Err(err.to_string()),
-                    };
-                    let rows = rows_result.ok();
+                    let rows = key_table
+                        .build_rows_fallback(&group_arrays)
+                        .map_err(|e| e.to_string())?;
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
                         .map_err(|e| e.to_string())?;
                     for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
-                        let row_bytes = if let Some(rows) = rows.as_ref() {
-                            rows.row(row).data()
-                        } else {
-                            fallback_rows
-                                .as_ref()
-                                .and_then(|all| all.get(row))
-                                .map(|v| v.as_slice())
-                                .ok_or_else(|| {
-                                    format!(
-                                        "fallback serialized group row missing at row={} (rows={})",
-                                        row, num_rows
-                                    )
-                                })?
-                        };
+                        let row_bytes = rows.get(row).map(|v| v.as_slice()).ok_or_else(|| {
+                            format!(
+                                "canonical serialized group row missing at row={} (rows={})",
+                                row, num_rows
+                            )
+                        })?;
                         let lookup = key_table
                             .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                             .map_err(|e| e.to_string())?;
@@ -945,12 +1073,15 @@ impl AggregateProcessorOperator {
                             if rows_opt.is_none() {
                                 rows_opt = Some(
                                     key_table
-                                        .build_rows(&group_arrays)
+                                        .build_rows_fallback(&group_arrays)
                                         .map_err(|e| e.to_string())?,
                                 );
                             }
                             let rows = rows_opt.as_ref().expect("group rows");
-                            let row_bytes = rows.row(row).data();
+                            let row_bytes =
+                                rows.get(row).map(|row| row.as_slice()).ok_or_else(|| {
+                                    "canonical compressed fallback row missing".to_string()
+                                })?;
                             key_table
                                 .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                                 .map_err(|e| e.to_string())?
@@ -967,7 +1098,11 @@ impl AggregateProcessorOperator {
             }
 
             self.state_ptrs.clear();
-            self.state_ptrs.reserve(num_rows);
+            self.operator_vectors_memory.reserve_state_ptrs(
+                &self.group_states,
+                &mut self.state_ptrs,
+                num_rows,
+            )?;
             for &group_id in &group_ids {
                 let state_ptr = *self
                     .group_states
@@ -979,23 +1114,25 @@ impl AggregateProcessorOperator {
                 .kernels
                 .as_ref()
                 .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
-            let agg_views = build_agg_views(&kernels.entries, &self.functions, &agg_arrays)
-                .map_err(|e| e.to_string())?;
-            for (idx, (kernel, view)) in kernels.entries.iter().zip(agg_views.iter()).enumerate() {
-                if self
+            let agg_batches = build_agg_batches(&agg_arrays, num_rows)?;
+            for (idx, (kernel, batch)) in kernels
+                .entries
+                .iter()
+                .zip(agg_batches.iter().copied())
+                .enumerate()
+            {
+                let merge = self
                     .functions
                     .get(idx)
                     .map(|f| f.input_is_intermediate)
-                    .unwrap_or(false)
-                {
-                    kernel
-                        .merge_batch(&self.state_ptrs, view)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    kernel
-                        .update_batch(&self.state_ptrs, view)
-                        .map_err(|e| e.to_string())?;
-                }
+                    .unwrap_or(false);
+                self.aggregate_retained_memory.run_bounded_batch(
+                    &mut self.touched_aggregate_states,
+                    kernel,
+                    &self.state_ptrs,
+                    batch,
+                    merge,
+                )?;
             }
             Ok(())
         })();
@@ -1069,11 +1206,11 @@ impl AggregateProcessorOperator {
             }
         }
         for kernel in &kernels.entries {
-            arrays.push(
-                kernel
-                    .build_array(&self.group_states, self.output_intermediate)
-                    .map_err(|e| e.to_string())?,
-            );
+            arrays.push(self.aggregate_retained_memory.around(
+                kernel,
+                &self.group_states,
+                || kernel.build_array(&self.group_states, self.output_intermediate),
+            )?);
         }
         let schema = align_schema_with_arrays(&schema, &arrays, "aggregate finalize output")?;
 
@@ -1388,17 +1525,29 @@ impl AggregateProcessorOperator {
             .map_err(|error| error.to_string())?;
 
         let expected_group_types = self.expected_group_types()?;
-        let expected_agg_types = self.expected_agg_input_types()?;
 
         if !expected_group_types.is_empty() {
-            self.key_table = Some(KeyTable::new(
-                expected_group_types.clone(),
-                ENABLE_GROUP_KEY_OPTIMIZATIONS,
-            )?);
+            let key_table = match self.key_table_mem_tracker.as_ref() {
+                Some(tracker) => KeyTable::new_with_tracker(
+                    expected_group_types.clone(),
+                    ENABLE_GROUP_KEY_OPTIMIZATIONS,
+                    Arc::clone(tracker),
+                )?,
+                #[cfg(test)]
+                None => {
+                    KeyTable::new(expected_group_types.clone(), ENABLE_GROUP_KEY_OPTIMIZATIONS)?
+                }
+                #[cfg(not(test))]
+                None => {
+                    return Err(
+                        "aggregate key table memory tracker must be bound before initialization"
+                            .to_string(),
+                    );
+                }
+            };
+            self.key_table = Some(key_table);
         }
 
-        let kernels = agg::build_kernel_set(&self.functions, &expected_agg_types)?;
-        self.kernels = Some(kernels);
         if self.kernels.is_some() {
             self.rebuild_output_schema(None)?;
         }
@@ -1492,46 +1641,7 @@ impl AggregateProcessorOperator {
     }
 
     fn expected_agg_input_types(&self) -> Result<Vec<Option<DataType>>, String> {
-        let mut types = Vec::with_capacity(self.functions.len());
-        for func in &self.functions {
-            if func.input_is_intermediate {
-                // Merge aggregates consume *intermediate state* produced by a previous aggregation
-                // stage. In StarRocks plans, the input SlotRef for that intermediate column may
-                // still carry the *final output type* (e.g. avg(decimal) has ret_type DECIMAL but
-                // intermediate_type VARBINARY), so relying on the expression type can be wrong.
-                //
-                // Prefer FE-provided type signature (TFunction.aggregate_fn.intermediate_type)
-                // when available to build the correct merge view and kernel spec.
-                if let Some(sig) = func.types.as_ref()
-                    && let Some(intermediate) = sig.intermediate_type.as_ref()
-                {
-                    if matches!(intermediate, DataType::Null) {
-                        return Err("aggregate intermediate type is null".to_string());
-                    }
-                    types.push(Some(intermediate.clone()));
-                    continue;
-                }
-            }
-            let data_type = match (func.name.as_str(), func.inputs.as_slice()) {
-                ("count", []) => None,
-                (_, [expr]) => Some(
-                    self.arena
-                        .data_type(*expr)
-                        .ok_or_else(|| "aggregate input type missing".to_string())?
-                        .clone(),
-                ),
-                (_, []) => return Err("aggregate input missing".to_string()),
-                (_, _) => {
-                    return Err(format!(
-                        "aggregate inputs must be packed into a single struct expression: {} has {} inputs",
-                        func.name,
-                        func.inputs.len()
-                    ));
-                }
-            };
-            types.push(data_type);
-        }
-        Ok(types)
+        expected_agg_input_types(&self.arena, &self.functions)
     }
 
     fn validate_group_array_types(
@@ -1654,25 +1764,46 @@ impl AggregateProcessorOperator {
             .map(|entry| entry.state_align())
             .max()
             .unwrap_or(1);
-        let state_ptr = self.state_arena.alloc(kernels.layout.total_size, align);
-        for kernel in &kernels.entries {
-            kernel.init_state(state_ptr);
+        self.operator_vectors_memory.reserve_group_states(
+            &mut self.group_states,
+            &self.state_ptrs,
+            1,
+        )?;
+        let state_ptr = self
+            .state_arena
+            .try_alloc(kernels.layout.total_size, align)?;
+        for (initialized, kernel) in kernels.entries.iter().enumerate() {
+            if let Err(error) = self
+                .aggregate_retained_memory
+                .initialize_state(kernel, state_ptr)
+            {
+                for initialized_kernel in kernels.entries[..initialized].iter().rev() {
+                    self.aggregate_retained_memory
+                        .drop_initialized_state(initialized_kernel, state_ptr);
+                }
+                return Err(error);
+            }
         }
         self.group_states.push(state_ptr);
         Ok(())
     }
 
     fn drop_group_states(&mut self) {
+        if !self.group_states.is_bound() {
+            return;
+        }
         let Some(kernels) = self.kernels.as_ref() else {
             self.group_states.clear();
             return;
         };
-        for &state in &self.group_states {
+        for &state in self.group_states.iter() {
             for kernel in &kernels.entries {
-                kernel.drop_state(state);
+                self.aggregate_retained_memory
+                    .drop_initialized_state(kernel, state);
             }
         }
         self.group_states.clear();
+        self.aggregate_retained_memory.release_all();
     }
 }
 
@@ -1696,6 +1827,13 @@ fn aggregate_topn_test_operator(
         arena: Arc::new(ExprArena::default()),
         group_by: Vec::new(),
         functions: Vec::new(),
+        kernels: agg::AggKernelSet {
+            entries: Vec::new(),
+            layout: agg::AggStateLayout {
+                total_size: 1,
+                descs: Vec::new(),
+            },
+        },
         output_intermediate: false,
         direct_input: false,
         output_chunk_schema: Arc::new(ChunkSchema::empty()),
@@ -1722,8 +1860,8 @@ mod tests {
 
     use super::{
         AggregateFinalDomainSessionBuilder, AggregateProcessorFactory,
-        is_compatible_aggregate_data_type, is_compatible_aggregate_group_data_type,
-        normalize_aggregate_group_arrays,
+        empty_execution_function_set, is_compatible_aggregate_data_type,
+        is_compatible_aggregate_group_data_type, normalize_aggregate_group_arrays,
     };
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
@@ -1962,6 +2100,8 @@ mod tests {
             Arc::new(arena),
             vec![group_expr],
             Vec::new(),
+            empty_execution_function_set(),
+            Vec::new(),
             false,
             true,
             output_schema,
@@ -1993,6 +2133,8 @@ mod tests {
             7,
             Arc::new(arena),
             vec![group_expr],
+            Vec::new(),
+            empty_execution_function_set(),
             Vec::new(),
             output_intermediate,
             direct_input,

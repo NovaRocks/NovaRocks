@@ -48,9 +48,6 @@ use novarocks_connector_iceberg::commit::variant_write::{
     transform_variant_columns_for_write, variant_field_indices,
 };
 use novarocks_connector_iceberg::delete_file::IcebergFileContent;
-use novarocks_connector_iceberg::theta_sketch::{
-    ThetaSketchHandle, compute_theta_sketches_for_batch,
-};
 
 type IcebergDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
@@ -109,14 +106,12 @@ pub enum StagedContent {
 
 #[derive(Clone, Debug)]
 pub struct StagedWriteOptions {
-    pub collect_theta_sketches: bool,
     pub content: StagedContent,
 }
 
 impl Default for StagedWriteOptions {
     fn default() -> Self {
         Self {
-            collect_theta_sketches: false,
             content: StagedContent::Data,
         }
     }
@@ -126,7 +121,6 @@ pub struct StagedDataFile {
     pub data_file: DataFile,
     pub metadata: Arc<TableMetadata>,
     pub partition_spec_id: i32,
-    pub theta_sketches: Option<HashMap<i32, ThetaSketchHandle>>,
 }
 
 pub struct StagedDataFileWriter {
@@ -348,7 +342,6 @@ pub async fn write_record_batches(
             .build(None)
             .await
             .map_err(|e| format!("build iceberg data file writer failed: {e}"))?;
-        let mut batch_sketches = Vec::new();
         for batch in batches {
             if batch.num_rows() == 0 {
                 continue;
@@ -364,9 +357,6 @@ pub async fn write_record_batches(
                 )?
             };
             let annotated = annotate_batch(&staged, &ctx.annotated_schema)?;
-            if let Some(sketches) = maybe_collect_sketches(opts, &annotated)? {
-                batch_sketches.push(sketches);
-            }
             for offset in
                 (0..annotated.num_rows()).step_by(write_batch_rows.min(annotated.num_rows()))
             {
@@ -381,11 +371,6 @@ pub async fn write_record_batches(
             .close()
             .await
             .map_err(|e| format!("iceberg data file writer close failed: {e}"))?;
-        let combined_sketches = if batch_sketches.is_empty() {
-            None
-        } else {
-            Some(merge_theta_sketches(batch_sketches)?)
-        };
         return data_files
             .into_iter()
             .map(|data_file| {
@@ -396,10 +381,6 @@ pub async fn write_record_batches(
                     )?,
                     metadata: Arc::clone(&ctx.metadata),
                     partition_spec_id: ctx.partition_spec_id(),
-                    theta_sketches: combined_sketches
-                        .as_ref()
-                        .map(clone_theta_sketches)
-                        .transpose()?,
                 })
             })
             .collect();
@@ -430,7 +411,6 @@ pub async fn write_record_batches(
             .split(&annotated)
             .map_err(|e| format!("split iceberg batch by partition spec failed: {e}"))?;
         for (partition_key, partition_batch) in partitioned {
-            let theta_sketches = maybe_collect_sketches(opts, &partition_batch)?;
             let mut writer = data_file_builder
                 .build(Some(partition_key))
                 .await
@@ -456,10 +436,6 @@ pub async fn write_record_batches(
                     )?,
                     metadata: Arc::clone(&ctx.metadata),
                     partition_spec_id: ctx.partition_spec_id(),
-                    theta_sketches: theta_sketches
-                        .as_ref()
-                        .map(clone_theta_sketches)
-                        .transpose()?,
                 });
             }
         }
@@ -498,13 +474,7 @@ pub fn staged_data_file_to_writer_report(
     partition: iceberg_report::IcebergPartitionReport,
     format: String,
     content: IcebergFileContent,
-) -> Result<
-    (
-        iceberg_report::IcebergWriterReport,
-        Option<novarocks_connector_iceberg::stats_assembler::FileSketchSet>,
-    ),
-    String,
-> {
+) -> Result<iceberg_report::IcebergWriterReport, String> {
     let df = &staged.data_file;
     let report = iceberg_report::IcebergWriterReport {
         file: iceberg_report::IcebergWrittenFileReport {
@@ -527,16 +497,7 @@ pub fn staged_data_file_to_writer_report(
         is_overwrite: None,
         is_rewrite: None,
     };
-    let sketch_set = match staged.theta_sketches.as_ref() {
-        Some(sketches) => Some(
-            novarocks_connector_iceberg::stats_assembler::FileSketchSet {
-                file_path: df.file_path().to_string(),
-                sketches: clone_theta_sketches(sketches)?,
-            },
-        ),
-        None => None,
-    };
-    Ok((report, sketch_set))
+    Ok(report)
 }
 
 fn iceberg_data_file_to_report_column_stats(
@@ -596,45 +557,6 @@ fn datum_bounds_to_bytes(
                 .map_err(|e| {
                     format!("convert iceberg datum bound {field}[{field_id}] to bytes failed: {e}")
                 })
-        })
-        .collect()
-}
-
-fn maybe_collect_sketches(
-    opts: &StagedWriteOptions,
-    batch: &RecordBatch,
-) -> Result<Option<HashMap<i32, ThetaSketchHandle>>, String> {
-    if !opts.collect_theta_sketches {
-        return Ok(None);
-    }
-    compute_theta_sketches_for_batch(batch)
-}
-
-fn merge_theta_sketches(
-    sketches: Vec<HashMap<i32, ThetaSketchHandle>>,
-) -> Result<HashMap<i32, ThetaSketchHandle>, String> {
-    let mut by_field = HashMap::<i32, Vec<ThetaSketchHandle>>::new();
-    for batch_sketches in sketches {
-        for (field_id, sketch) in batch_sketches {
-            by_field.entry(field_id).or_default().push(sketch);
-        }
-    }
-    by_field
-        .into_iter()
-        .map(|(field_id, field_sketches)| {
-            let refs = field_sketches.iter().collect::<Vec<_>>();
-            ThetaSketchHandle::union(&refs).map(|sketch| (field_id, sketch))
-        })
-        .collect()
-}
-
-fn clone_theta_sketches(
-    sketches: &HashMap<i32, ThetaSketchHandle>,
-) -> Result<HashMap<i32, ThetaSketchHandle>, String> {
-    sketches
-        .iter()
-        .map(|(field_id, sketch)| {
-            ThetaSketchHandle::union(&[sketch]).map(|cloned| (*field_id, cloned))
         })
         .collect()
 }
@@ -1512,7 +1434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_record_batches_unpartitioned_produces_one_file_with_stats() {
+    async fn write_record_batches_unpartitioned_produces_one_file() {
         let table = build_unpartitioned_test_table("kernel_unpart").await;
         let ctx = StagedWriteContext::from_table(&table).expect("ctx");
         let staged = write_record_batches(
@@ -1525,10 +1447,6 @@ mod tests {
         assert_eq!(staged.len(), 1, "one file for unpartitioned batches");
         assert_eq!(staged[0].data_file.record_count(), 3);
         assert!(staged[0].data_file.file_size_in_bytes() > 0);
-        assert!(
-            staged[0].theta_sketches.is_none(),
-            "sketches off by default"
-        );
         let path = staged[0].data_file.file_path().to_string();
         assert!(
             ctx.file_io().exists(&path).await.expect("exists"),
@@ -1559,38 +1477,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn theta_sketches_collected_only_when_requested() {
-        let table = build_unpartitioned_test_table("kernel_sketch").await;
-        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let opts = StagedWriteOptions {
-            collect_theta_sketches: true,
-            content: StagedContent::Data,
-        };
-        let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 2, 3])], &opts)
-            .await
-            .expect("write");
-        assert_eq!(staged.len(), 1);
-        let sketches = staged[0].theta_sketches.as_ref().expect("sketches present");
-        assert!(
-            sketches.contains_key(&1),
-            "theta sketch for field id 1 (id column)"
-        );
-
-        let staged_off = write_record_batches(
-            &ctx,
-            vec![test_batch(&[1, 2])],
-            &StagedWriteOptions::default(),
-        )
-        .await
-        .expect("write off");
-        assert!(staged_off[0].theta_sketches.is_none());
-    }
-
-    #[tokio::test]
     async fn staged_data_file_writer_rejects_position_delete_content() {
         let table = build_unpartitioned_test_table("kernel_position_delete_content").await;
         let opts = StagedWriteOptions {
-            collect_theta_sketches: false,
             content: StagedContent::PositionDeletes,
         };
 
@@ -1635,13 +1524,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_data_file_to_writer_report_maps_fields_and_sketches() {
+    async fn staged_data_file_to_writer_report_maps_fields() {
         let table = build_unpartitioned_test_table("kernel_commit").await;
         let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let opts = StagedWriteOptions {
-            collect_theta_sketches: true,
-            content: StagedContent::Data,
-        };
+        let opts = StagedWriteOptions::default();
         let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 2, 3])], &opts)
             .await
             .expect("write");
@@ -1652,7 +1538,7 @@ mod tests {
         let expected_size =
             u64_to_i64(s.data_file.file_size_in_bytes(), "file_size_in_bytes").expect("file size");
 
-        let (report, sketch_set) = staged_data_file_to_writer_report(
+        let report = staged_data_file_to_writer_report(
             s,
             iceberg_report::IcebergPartitionReport {
                 partition_path: String::new(),
@@ -1703,10 +1589,6 @@ mod tests {
             datum_bounds_to_bytes(s.data_file.upper_bounds(), "upper_bounds")
                 .expect("upper bounds")
         );
-
-        let sketch_set = sketch_set.expect("sketch set");
-        assert_eq!(sketch_set.file_path, report.file.path);
-        assert!(sketch_set.sketches.contains_key(&1));
     }
 
     #[test]
@@ -1883,10 +1765,6 @@ mod tests {
         record_counts.sort_unstable();
         assert_eq!(record_counts, vec![2, 2]);
         for staged_file in &staged {
-            assert!(
-                staged_file.theta_sketches.is_none(),
-                "sketches off by default"
-            );
             let path = staged_file.data_file.file_path().to_string();
             assert!(
                 ctx.file_io().exists(&path).await.expect("exists"),

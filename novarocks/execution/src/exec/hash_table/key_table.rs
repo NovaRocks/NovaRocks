@@ -16,16 +16,18 @@
 // under the License.
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::DataType;
-use arrow::row::{RowConverter, Rows, SortField};
 use hashbrown::raw::RawTable;
+#[cfg(test)]
+use std::mem::{align_of, size_of};
 use std::sync::Arc;
 
+use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
 use crate::exec::hash_table::hash::seed_from_hasher;
 use crate::exec::hash_table::key_builder::{
     GroupKeyArrayView, build_compressed_flags, build_group_key_hashes, build_one_number_hashes,
-    encode_group_key_row,
+    encode_group_key_row_tracked,
 };
-use crate::exec::hash_table::key_column::{KeyColumn, key_column_from_type};
+use crate::exec::hash_table::key_column::{KeyColumn, key_column_from_type_in};
 use crate::exec::hash_table::key_layout::{CompressedKeyContext, build_compressed_key_context};
 use crate::exec::hash_table::key_storage::{RowKey, RowStorage};
 use crate::exec::hash_table::key_strategy::{GroupKeyStrategy, pick_group_key_strategy};
@@ -38,21 +40,35 @@ struct KeyEntry {
     hash: u64,
 }
 
-#[derive(Default)]
 struct DictKeyMap {
     values_ptr: Option<usize>,
-    code_to_group: Vec<Option<usize>>,
+    code_to_group: AggregateVec<Option<usize>>,
 }
 
 impl DictKeyMap {
-    fn reset_for(&mut self, values_ptr: usize, values_len: usize) {
+    fn new_in(allocator: AggregateAllocator) -> Self {
+        Self {
+            values_ptr: None,
+            code_to_group: AggregateVec::new_in(allocator),
+        }
+    }
+
+    fn reset_for(&mut self, values_ptr: usize, values_len: usize) -> Result<(), String> {
         if self.values_ptr != Some(values_ptr) {
             self.values_ptr = Some(values_ptr);
             self.code_to_group.clear();
         }
         if self.code_to_group.len() < values_len {
+            let additional = values_len - self.code_to_group.len();
+            if self.code_to_group.try_reserve(additional).is_err() {
+                return Err(self
+                    .code_to_group
+                    .allocator()
+                    .allocation_error("reserve dictionary group-key map"));
+            }
             self.code_to_group.resize(values_len, None);
         }
+        Ok(())
     }
 }
 
@@ -63,67 +79,76 @@ pub struct KeyLookup {
 
 pub struct KeyTable {
     key_strategy: GroupKeyStrategy,
-    key_types: Vec<DataType>,
-    key_columns: Vec<KeyColumn>,
-    varlen_table: RawTable<KeyEntry>,
-    fixed_size_table: RawTable<KeyEntry>,
-    compressed_table: RawTable<KeyEntry>,
-    one_number_table: RawTable<KeyEntry>,
+    key_types: AggregateVec<DataType>,
+    key_columns: AggregateVec<KeyColumn>,
+    varlen_table: RawTable<KeyEntry, AggregateAllocator>,
+    fixed_size_table: RawTable<KeyEntry, AggregateAllocator>,
+    compressed_table: RawTable<KeyEntry, AggregateAllocator>,
+    one_number_table: RawTable<KeyEntry, AggregateAllocator>,
     one_string_null: Option<usize>,
     dict_key_map: DictKeyMap,
     row_storage: RowStorage,
-    varlen_keys: Vec<RowKey>,
+    varlen_keys: AggregateVec<RowKey>,
     compressed_ctx: Option<CompressedKeyContext>,
-    row_converter: Option<RowConverter>,
+    key_columns_retained_bytes: usize,
+    memory_limit_exceeded: bool,
     hash_seed: u64,
 }
 
 impl KeyTable {
+    #[cfg(test)]
     pub fn new(key_types: Vec<DataType>, enable_optimizations: bool) -> Result<Self, String> {
+        let tracker = MemTracker::new_child(
+            "KeyTableTest",
+            &crate::runtime::mem_tracker::process_mem_tracker(),
+        );
+        Self::new_with_tracker(key_types, enable_optimizations, tracker)
+    }
+
+    pub fn new_with_tracker(
+        key_types: Vec<DataType>,
+        enable_optimizations: bool,
+        tracker: Arc<MemTracker>,
+    ) -> Result<Self, String> {
         let mut key_strategy = pick_group_key_strategy(&key_types);
         if !enable_optimizations {
             key_strategy = GroupKeyStrategy::Serialized;
         }
-        let mut key_columns = Vec::with_capacity(key_types.len());
-        for data_type in &key_types {
-            key_columns.push(key_column_from_type(data_type)?);
+        let allocator = AggregateAllocator::new(Arc::clone(&tracker));
+        let mut tracked_key_types = AggregateVec::new_in(allocator.clone());
+        tracked_key_types
+            .try_reserve_exact(key_types.len())
+            .map_err(|_| allocator.allocation_error("reserve group-key types"))?;
+        tracked_key_types.extend(key_types);
+        let mut key_columns = AggregateVec::new_in(allocator.clone());
+        key_columns
+            .try_reserve_exact(tracked_key_types.len())
+            .map_err(|_| allocator.allocation_error("reserve group-key columns"))?;
+        for data_type in &tracked_key_types {
+            key_columns.push(key_column_from_type_in(data_type, allocator.clone())?);
         }
-        let mut row_converter = None;
-        if matches!(
-            key_strategy,
-            GroupKeyStrategy::Serialized | GroupKeyStrategy::CompressedFixed
-        ) && !key_types.is_empty()
-        {
-            let fields = key_types
-                .iter()
-                .cloned()
-                .map(SortField::new)
-                .collect::<Vec<_>>();
-            match RowConverter::new(fields) {
-                Ok(converter) => {
-                    row_converter = Some(converter);
-                }
-                Err(_) => {
-                    // Nested key types are not supported by Arrow RowConverter. Keep serialized
-                    // strategy and use fallback row-byte encoding at call sites.
-                    key_strategy = GroupKeyStrategy::Serialized;
-                }
-            }
-        }
+        let key_columns_retained_bytes = key_columns
+            .iter()
+            .map(KeyColumn::retained_bytes)
+            .fold(0usize, usize::saturating_add);
         Ok(Self {
             key_strategy,
-            key_types,
+            key_types: tracked_key_types,
             key_columns,
-            varlen_table: RawTable::new(),
-            fixed_size_table: RawTable::new(),
-            compressed_table: RawTable::new(),
-            one_number_table: RawTable::new(),
+            varlen_table: RawTable::new_in(allocator.clone()),
+            fixed_size_table: RawTable::new_in(allocator.clone()),
+            compressed_table: RawTable::new_in(allocator.clone()),
+            one_number_table: RawTable::new_in(allocator.clone()),
             one_string_null: None,
-            dict_key_map: DictKeyMap::default(),
-            row_storage: RowStorage::new(64 * 1024),
-            varlen_keys: Vec::new(),
+            dict_key_map: DictKeyMap::new_in(allocator.clone()),
+            row_storage: RowStorage::new_with_tracker(
+                64 * 1024,
+                MemTracker::new_child("RowStorage", &tracker),
+            ),
+            varlen_keys: AggregateVec::new_in(allocator),
             compressed_ctx: None,
-            row_converter,
+            key_columns_retained_bytes,
+            memory_limit_exceeded: false,
             hash_seed: seed_from_hasher(&DefaultHashBuilder::default()),
         })
     }
@@ -136,20 +161,15 @@ impl KeyTable {
         &self.key_types
     }
 
-    pub fn key_columns(&self) -> &[KeyColumn] {
+    pub(crate) fn key_columns(&self) -> &[KeyColumn] {
         &self.key_columns
-    }
-
-    pub fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
-        let row_storage = MemTracker::new_child("RowStorage", &tracker);
-        self.row_storage.set_mem_tracker(row_storage);
     }
 
     pub fn hash_seed(&self) -> u64 {
         self.hash_seed
     }
 
-    pub fn compressed_ctx(&self) -> Option<&CompressedKeyContext> {
+    pub(crate) fn compressed_ctx(&self) -> Option<&CompressedKeyContext> {
         self.compressed_ctx.as_ref()
     }
 
@@ -159,16 +179,25 @@ impl KeyTable {
     }
 
     pub fn ensure_compressed_ctx(&mut self, views: &[GroupKeyArrayView<'_>]) -> Result<(), String> {
+        self.ensure_memory_available()?;
         if self.key_strategy != GroupKeyStrategy::CompressedFixed {
             return Ok(());
         }
         if self.compressed_ctx.is_some() {
             return Ok(());
         }
-        match build_compressed_key_context(views, &self.key_types) {
+        match build_compressed_key_context(
+            views,
+            &self.key_types,
+            self.compressed_table.allocator().clone(),
+        ) {
             Ok(ctx) => {
                 self.compressed_ctx = Some(ctx);
                 Ok(())
+            }
+            Err(error) if error.contains("ResourceExhausted") => {
+                self.memory_limit_exceeded = true;
+                Err(error)
             }
             Err(_) => {
                 self.key_strategy = GroupKeyStrategy::Serialized;
@@ -177,17 +206,13 @@ impl KeyTable {
         }
     }
 
-    pub fn build_rows(&self, arrays: &[ArrayRef]) -> Result<Rows, String> {
-        let converter = self
-            .row_converter
-            .as_ref()
-            .ok_or_else(|| "row converter not initialized".to_string())?;
-        converter.convert_columns(arrays).map_err(|e| e.to_string())
-    }
-
-    pub fn build_rows_fallback(&self, arrays: &[ArrayRef]) -> Result<Vec<Vec<u8>>, String> {
+    pub(crate) fn build_rows_fallback(
+        &self,
+        arrays: &[ArrayRef],
+    ) -> Result<AggregateVec<AggregateVec<u8>>, String> {
+        let allocator = self.varlen_table.allocator().clone();
         let Some(first) = arrays.first() else {
-            return Ok(Vec::new());
+            return Ok(AggregateVec::new_in(allocator));
         };
         let num_rows = first.len();
         for (idx, array) in arrays.iter().enumerate() {
@@ -200,13 +225,26 @@ impl KeyTable {
                 ));
             }
         }
-        let mut rows = Vec::with_capacity(num_rows);
+        let mut rows = AggregateVec::new_in(allocator.clone());
+        rows.try_reserve_exact(num_rows)
+            .map_err(|_| allocator.allocation_error("reserve fallback group-key rows"))?;
         for row in 0..num_rows {
-            let mut encoded = Vec::new();
+            let mut encoded = AggregateVec::new_in(allocator.clone());
             for array in arrays {
-                match encode_group_key_row(array, row)? {
-                    None => encoded.push(0),
+                match encode_group_key_row_tracked(array, row, allocator.clone())? {
+                    None => {
+                        encoded.try_reserve(1).map_err(|_| {
+                            allocator.allocation_error("grow fallback group-key row")
+                        })?;
+                        encoded.push(0);
+                    }
                     Some(value) => {
+                        let additional = 5usize
+                            .checked_add(value.len())
+                            .ok_or_else(|| "fallback group row length overflow".to_string())?;
+                        encoded.try_reserve(additional).map_err(|_| {
+                            allocator.allocation_error("grow fallback group-key row")
+                        })?;
                         encoded.push(1);
                         let len = u32::try_from(value.len()).map_err(|_| {
                             "fallback group row encoded value length overflow".to_string()
@@ -221,6 +259,95 @@ impl KeyTable {
         Ok(rows)
     }
 
+    /// Returns all heap retained by the table, including row bytes, in O(1).
+    #[cfg(test)]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.own_retained_bytes()
+            .saturating_add(self.row_storage.retained_bytes())
+    }
+
+    #[cfg(test)]
+    fn own_retained_bytes(&self) -> usize {
+        let raw_tables = raw_table_retained_bytes(&self.varlen_table)
+            .saturating_add(raw_table_retained_bytes(&self.fixed_size_table))
+            .saturating_add(raw_table_retained_bytes(&self.compressed_table))
+            .saturating_add(raw_table_retained_bytes(&self.one_number_table));
+        let compressed = self
+            .compressed_ctx
+            .as_ref()
+            .map(compressed_context_retained_bytes)
+            .unwrap_or(0);
+        self.key_types
+            .capacity()
+            .saturating_mul(size_of::<DataType>())
+            .saturating_add(
+                self.key_columns
+                    .capacity()
+                    .saturating_mul(size_of::<KeyColumn>()),
+            )
+            .saturating_add(raw_tables)
+            .saturating_add(self.key_columns_retained_bytes)
+            .saturating_add(
+                self.varlen_keys
+                    .capacity()
+                    .saturating_mul(size_of::<RowKey>()),
+            )
+            .saturating_add(
+                self.dict_key_map
+                    .code_to_group
+                    .capacity()
+                    .saturating_mul(size_of::<Option<usize>>()),
+            )
+            .saturating_add(compressed)
+    }
+
+    fn ensure_memory_available(&self) -> Result<(), String> {
+        if self.memory_limit_exceeded {
+            Err("key table memory limit was previously exceeded".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn push_column_value(
+        &mut self,
+        column_index: usize,
+        view: &GroupKeyArrayView<'_>,
+        row: usize,
+    ) -> Result<(), String> {
+        self.ensure_memory_available()?;
+        let column = self
+            .key_columns
+            .get_mut(column_index)
+            .ok_or_else(|| "group key column missing".to_string())?;
+        // Capture the cached baseline before reserve: a successful reserve may
+        // grow one of the tracked backing vectors even though the logical push
+        // has not happened yet.
+        let before = column.retained_bytes();
+        if let Err(error) = column.try_reserve_value_from_view(view, row) {
+            self.memory_limit_exceeded = true;
+            return Err(error);
+        }
+        let result = column.push_value_from_view(view, row);
+        let after = column.retained_bytes();
+        self.key_columns_retained_bytes = self
+            .key_columns_retained_bytes
+            .checked_sub(before)
+            .expect("key column retained-memory cache underflow")
+            .saturating_add(after);
+        result
+    }
+
+    fn alloc_row_copy(&mut self, bytes: &[u8]) -> Result<RowKey, String> {
+        match self.row_storage.alloc_copy(bytes) {
+            Ok(key) => Ok(key),
+            Err(error) => {
+                self.memory_limit_exceeded = true;
+                Err(error)
+            }
+        }
+    }
+
     pub fn find_or_insert_from_row(
         &mut self,
         views: &[GroupKeyArrayView<'_>],
@@ -228,6 +355,12 @@ impl KeyTable {
         row_bytes: &[u8],
         hash: u64,
     ) -> Result<KeyLookup, String> {
+        self.ensure_memory_available()?;
+        if let Err(error) = reserve_raw_table(&mut self.varlen_table, "serialized group-key table")
+        {
+            self.memory_limit_exceeded = true;
+            return Err(error);
+        }
         let mut error = None;
         let result = {
             let keys = &self.varlen_keys;
@@ -254,11 +387,11 @@ impl KeyTable {
                 is_new: false,
             }),
             Err(slot) => {
-                for (col, view) in self.key_columns.iter_mut().zip(views.iter()) {
-                    col.push_value_from_view(view, row)?;
+                for (column_index, view) in views.iter().enumerate().take(self.key_columns.len()) {
+                    self.push_column_value(column_index, view, row)?;
                 }
                 let group_id = self.alloc_group()?;
-                let stored_key = self.row_storage.alloc_copy(row_bytes);
+                let stored_key = self.alloc_row_copy(row_bytes)?;
                 if let Some(slot_key) = self.varlen_keys.get_mut(group_id) {
                     *slot_key = stored_key;
                 } else {
@@ -282,6 +415,13 @@ impl KeyTable {
         row: usize,
         hash: u64,
     ) -> Result<KeyLookup, String> {
+        self.ensure_memory_available()?;
+        if let Err(error) =
+            reserve_raw_table(&mut self.one_number_table, "one-number group-key table")
+        {
+            self.memory_limit_exceeded = true;
+            return Err(error);
+        }
         let mut error = None;
         let result = {
             let key_columns = &self.key_columns;
@@ -317,11 +457,10 @@ impl KeyTable {
                 is_new: false,
             }),
             Err(slot) => {
-                let col = self
-                    .key_columns
-                    .get_mut(0)
-                    .ok_or_else(|| "one number key column missing".to_string())?;
-                col.push_value_from_view(view, row)?;
+                if self.key_columns.is_empty() {
+                    return Err("one number key column missing".to_string());
+                }
+                self.push_column_value(0, view, row)?;
                 let group_id = self.alloc_group()?;
                 let entry = KeyEntry { group_id, hash };
                 let table = &mut self.one_number_table;
@@ -343,6 +482,7 @@ impl KeyTable {
         key: Option<&str>,
         hash: u64,
     ) -> Result<KeyLookup, String> {
+        self.ensure_memory_available()?;
         if !matches!(view, GroupKeyArrayView::Utf8(_)) {
             return Err("one string key expects Utf8 view".to_string());
         }
@@ -355,6 +495,7 @@ impl KeyTable {
         row: usize,
         hash: u64,
     ) -> Result<KeyLookup, String> {
+        self.ensure_memory_available()?;
         match view {
             GroupKeyArrayView::Utf8(arr) => {
                 let key = (!arr.is_null(row)).then(|| arr.value(row));
@@ -364,8 +505,13 @@ impl KeyTable {
                 let Some(code) = dict.code_at(row)? else {
                     return self.find_or_insert_one_string_value(view, row, None, hash);
                 };
-                self.dict_key_map
-                    .reset_for(dict.values_ptr(), dict.values_len());
+                if let Err(error) = self
+                    .dict_key_map
+                    .reset_for(dict.values_ptr(), dict.values_len())
+                {
+                    self.memory_limit_exceeded = true;
+                    return Err(error);
+                }
                 if let Some(Some(group_id)) = self.dict_key_map.code_to_group.get(code).copied() {
                     let col = self
                         .key_columns
@@ -399,6 +545,7 @@ impl KeyTable {
         key: Option<&str>,
         hash: u64,
     ) -> Result<KeyLookup, String> {
+        self.ensure_memory_available()?;
         let row_is_null = match view {
             GroupKeyArrayView::Utf8(arr) => arr.is_null(row),
             GroupKeyArrayView::Dictionary(dict) => dict.is_null(row),
@@ -421,11 +568,10 @@ impl KeyTable {
                         is_new: false,
                     });
                 }
-                let col = self
-                    .key_columns
-                    .get_mut(0)
-                    .ok_or_else(|| "one string key column missing".to_string())?;
-                col.push_value_from_view(view, row)?;
+                if self.key_columns.is_empty() {
+                    return Err("one string key column missing".to_string());
+                }
+                self.push_column_value(0, view, row)?;
                 let group_id = self.alloc_group()?;
                 self.one_string_null = Some(group_id);
                 Ok(KeyLookup {
@@ -443,6 +589,11 @@ impl KeyTable {
         key: &str,
         hash: u64,
     ) -> Result<KeyLookup, String> {
+        self.ensure_memory_available()?;
+        if let Err(error) = reserve_raw_table(&mut self.varlen_table, "string group-key table") {
+            self.memory_limit_exceeded = true;
+            return Err(error);
+        }
         let mut error = None;
         let key_bytes = key.as_bytes();
         let result = {
@@ -469,13 +620,12 @@ impl KeyTable {
                 is_new: false,
             }),
             Err(slot) => {
-                let col = self
-                    .key_columns
-                    .get_mut(0)
-                    .ok_or_else(|| "one string key column missing".to_string())?;
-                col.push_value_from_view(view, row)?;
+                if self.key_columns.is_empty() {
+                    return Err("one string key column missing".to_string());
+                }
+                self.push_column_value(0, view, row)?;
                 let group_id = self.alloc_group()?;
-                let stored_key = self.row_storage.alloc_copy(key_bytes);
+                let stored_key = self.alloc_row_copy(key_bytes)?;
                 if let Some(slot_key) = self.varlen_keys.get_mut(group_id) {
                     *slot_key = stored_key;
                 } else {
@@ -499,6 +649,13 @@ impl KeyTable {
         row: usize,
         hash: u64,
     ) -> Result<KeyLookup, String> {
+        self.ensure_memory_available()?;
+        if let Err(error) =
+            reserve_raw_table(&mut self.fixed_size_table, "fixed-size group-key table")
+        {
+            self.memory_limit_exceeded = true;
+            return Err(error);
+        }
         let mut error = None;
         let result = {
             let key_columns = &self.key_columns;
@@ -525,8 +682,8 @@ impl KeyTable {
                 is_new: false,
             }),
             Err(slot) => {
-                for (col, view) in self.key_columns.iter_mut().zip(views.iter()) {
-                    col.push_value_from_view(view, row)?;
+                for (column_index, view) in views.iter().enumerate().take(self.key_columns.len()) {
+                    self.push_column_value(column_index, view, row)?;
                 }
                 let group_id = self.alloc_group()?;
                 let entry = KeyEntry { group_id, hash };
@@ -548,6 +705,13 @@ impl KeyTable {
         row: usize,
         hash: u64,
     ) -> Result<KeyLookup, String> {
+        self.ensure_memory_available()?;
+        if let Err(error) =
+            reserve_raw_table(&mut self.compressed_table, "compressed group-key table")
+        {
+            self.memory_limit_exceeded = true;
+            return Err(error);
+        }
         let mut error = None;
         let result = {
             let key_columns = &self.key_columns;
@@ -574,8 +738,8 @@ impl KeyTable {
                 is_new: false,
             }),
             Err(slot) => {
-                for (col, view) in self.key_columns.iter_mut().zip(views.iter()) {
-                    col.push_value_from_view(view, row)?;
+                for (column_index, view) in views.iter().enumerate().take(self.key_columns.len()) {
+                    self.push_column_value(column_index, view, row)?;
                 }
                 let group_id = self.alloc_group()?;
                 let entry = KeyEntry { group_id, hash };
@@ -735,9 +899,93 @@ impl KeyTable {
 
     fn alloc_group(&mut self) -> Result<usize, String> {
         let group_id = self.varlen_keys.len();
+        if self.varlen_keys.try_reserve(1).is_err() {
+            self.memory_limit_exceeded = true;
+            return Err(self
+                .varlen_keys
+                .allocator()
+                .allocation_error("reserve group-key row pointers"));
+        }
         self.varlen_keys.push(RowKey::empty());
         Ok(group_id)
     }
+}
+
+#[cfg(test)]
+fn compressed_context_retained_bytes(ctx: &CompressedKeyContext) -> usize {
+    ctx.bases
+        .capacity()
+        .saturating_mul(size_of::<i128>())
+        .saturating_add(ctx.used_bits.capacity().saturating_mul(size_of::<u8>()))
+        .saturating_add(ctx.null_offsets.capacity().saturating_mul(size_of::<u16>()))
+        .saturating_add(
+            ctx.value_offsets
+                .capacity()
+                .saturating_mul(size_of::<u16>()),
+        )
+}
+
+fn reserve_raw_table(
+    table: &mut RawTable<KeyEntry, AggregateAllocator>,
+    owner: &str,
+) -> Result<(), String> {
+    let allocator = table.allocator().clone();
+    table
+        .try_reserve(1, |entry| entry.hash)
+        .map_err(|_| allocator.allocation_error(&format!("reserve {owner}")))
+}
+
+#[cfg(test)]
+fn raw_table_retained_bytes<T, A: allocator_api2::alloc::Allocator>(
+    table: &RawTable<T, A>,
+) -> usize {
+    if table.capacity() == 0 {
+        return 0;
+    }
+
+    // Mirrors hashbrown 0.14's RawTable allocation layout: all buckets,
+    // alignment padding, one control byte per bucket, and one cloned SIMD
+    // control group. This is allocator-requested capacity, not live entries.
+    #[cfg(all(
+        target_feature = "sse2",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        not(miri)
+    ))]
+    const GROUP_WIDTH: usize = 16;
+    #[cfg(all(
+        not(all(
+            target_feature = "sse2",
+            any(target_arch = "x86", target_arch = "x86_64"),
+            not(miri)
+        )),
+        target_arch = "aarch64",
+        target_feature = "neon",
+        target_endian = "little",
+        not(miri)
+    ))]
+    const GROUP_WIDTH: usize = 8;
+    #[cfg(not(any(
+        all(
+            target_feature = "sse2",
+            any(target_arch = "x86", target_arch = "x86_64"),
+            not(miri)
+        ),
+        all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            target_endian = "little",
+            not(miri)
+        )
+    )))]
+    const GROUP_WIDTH: usize = size_of::<usize>();
+
+    let buckets = table.buckets();
+    let ctrl_align = align_of::<T>().max(GROUP_WIDTH);
+    let bucket_bytes = size_of::<T>().saturating_mul(buckets);
+    let ctrl_offset = bucket_bytes.saturating_add(ctrl_align - 1) & !(ctrl_align - 1);
+    ctrl_offset
+        .saturating_add(buckets)
+        .saturating_add(GROUP_WIDTH)
 }
 
 fn keys_equal(
@@ -761,8 +1009,10 @@ fn keys_equal(
 mod tests {
     use super::*;
     use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
-    use arrow::array::{ArrayRef, DictionaryArray};
-    use arrow::datatypes::{DataType, Int32Type};
+    use arrow::array::{Array, ArrayRef, DictionaryArray, Int64Array, ListArray, UInt32Array};
+    use arrow::compute::take;
+    use arrow::datatypes::{DataType, Field, Int32Type};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
     use std::sync::Arc;
 
     fn dict_utf8(values: Vec<Option<&str>>) -> ArrayRef {
@@ -856,7 +1106,15 @@ mod tests {
             panic!("expected dictionary view");
         };
         table.dict_key_map.values_ptr = Some(dict.values_ptr());
-        table.dict_key_map.code_to_group = vec![Some(a.group_id), Some(b.group_id)];
+        table
+            .dict_key_map
+            .code_to_group
+            .try_reserve_exact(2)
+            .expect("reserve test dictionary map");
+        table
+            .dict_key_map
+            .code_to_group
+            .extend([Some(a.group_id), Some(b.group_id)]);
 
         let b_again = table
             .find_or_insert_one_string_like(&second_views[0], 0, second_hashes[0])
@@ -889,5 +1147,230 @@ mod tests {
         assert_eq!(null_again.group_id, null.group_id);
         assert!(!null_again.is_new);
         assert_eq!(table.group_count(), 2);
+    }
+
+    #[test]
+    fn raw_table_resize_is_rejected_before_allocation() {
+        let query = MemTracker::new_root("query");
+        {
+            let mut table =
+                KeyTable::new_with_tracker(vec![DataType::Int64], true, Arc::clone(&query))
+                    .expect("table");
+            let baseline = table.retained_bytes();
+            assert_eq!(query.current(), baseline as i64);
+            query
+                .install_limit_once((baseline + 1) as i64)
+                .expect("install limit");
+
+            let arrays = [Arc::new(Int64Array::from(vec![Some(7)])) as ArrayRef];
+            let views = build_group_key_views(&arrays).expect("views");
+            let hashes = table.build_one_number_hashes(&views[0], 1).expect("hash");
+            let error = table
+                .find_or_insert_one_number(&views[0], 0, hashes[0])
+                .err()
+                .expect("raw table allocation must cross the limit");
+            assert!(error.contains("ResourceExhausted"), "{error}");
+
+            assert_eq!(table.retained_bytes(), baseline);
+            assert_eq!(query.current(), baseline as i64);
+            assert_eq!(table.group_count(), 0);
+
+            let current = query.current();
+            let retry_error = table
+                .find_or_insert_one_number(&views[0], 0, hashes[0])
+                .err()
+                .expect("limit failure must be latched");
+            assert!(retry_error.contains("previously exceeded"), "{retry_error}");
+            assert_eq!(query.current(), current);
+        }
+        assert_eq!(query.current(), 0);
+    }
+
+    #[test]
+    fn key_column_growth_is_rejected_before_allocation() {
+        let query = MemTracker::new_root("query");
+        {
+            let mut table =
+                KeyTable::new_with_tracker(vec![DataType::Int64], true, Arc::clone(&query))
+                    .expect("table");
+            let baseline = table.retained_bytes();
+            assert_eq!(query.current(), baseline as i64);
+            query
+                .install_limit_once((baseline + 1) as i64)
+                .expect("install limit");
+
+            let arrays = [Arc::new(Int64Array::from(vec![Some(7)])) as ArrayRef];
+            let views = build_group_key_views(&arrays).expect("views");
+            let error = table
+                .push_column_value(0, &views[0], 0)
+                .expect_err("key-column vector growth must cross the limit");
+            assert!(error.contains("ResourceExhausted"), "{error}");
+            assert_eq!(table.retained_bytes(), baseline);
+            assert_eq!(query.current(), baseline as i64);
+
+            let retry = table
+                .push_column_value(0, &views[0], 0)
+                .expect_err("limit rejection must latch the key table");
+            assert!(retry.contains("previously exceeded"), "{retry}");
+            assert_eq!(query.current(), baseline as i64);
+        }
+        assert_eq!(query.current(), 0);
+    }
+
+    #[test]
+    fn dictionary_reset_growth_is_limit_checked_without_untracked_capacity() {
+        let query = MemTracker::new_root("query");
+        {
+            let mut table =
+                KeyTable::new_with_tracker(vec![DataType::Utf8], true, Arc::clone(&query))
+                    .expect("table");
+            let baseline = table.retained_bytes();
+            query
+                .install_limit_once((baseline + 1) as i64)
+                .expect("install limit");
+
+            let dict = dict_utf8(vec![Some("A"), Some("B")]);
+            let arrays = [dict];
+            let views = build_group_key_views(&arrays).expect("views");
+            let hashes = table.build_group_hashes(&views, 2).expect("hashes");
+            let error = table
+                .find_or_insert_one_string_like(&views[0], 0, hashes[0])
+                .err()
+                .expect("dictionary cache growth must cross the limit");
+            assert!(error.contains("ResourceExhausted"), "{error}");
+            assert_eq!(table.dict_key_map.code_to_group.capacity(), 0);
+            assert_eq!(table.group_count(), 0);
+            assert_eq!(query.current(), table.retained_bytes() as i64);
+        }
+        assert_eq!(query.current(), 0);
+    }
+
+    #[test]
+    fn successful_string_insert_tracks_all_owned_capacity_and_releases_on_drop() {
+        let query = MemTracker::new_root("query");
+        {
+            let mut table =
+                KeyTable::new_with_tracker(vec![DataType::Utf8], true, Arc::clone(&query))
+                    .expect("table");
+            let baseline = table.retained_bytes();
+
+            let array = Arc::new(arrow::array::StringArray::from(vec![Some(
+                "a retained variable-length key",
+            )])) as ArrayRef;
+            let arrays = [array];
+            let views = build_group_key_views(&arrays).expect("views");
+            let hashes = table.build_group_hashes(&views, 1).expect("hashes");
+            table
+                .find_or_insert_one_string_like(&views[0], 0, hashes[0])
+                .expect("insert string key");
+
+            assert_eq!(table.group_count(), 1);
+            assert!(table.retained_bytes() > baseline);
+            assert_eq!(query.current(), table.retained_bytes() as i64);
+        }
+        assert_eq!(query.current(), 0);
+    }
+
+    #[test]
+    fn key_column_retained_cache_matches_columns_after_multi_column_insert() {
+        let mut table = KeyTable::new(vec![DataType::Int64, DataType::Utf8], false).expect("table");
+        let arrays = [
+            Arc::new(Int64Array::from(vec![Some(7)])) as ArrayRef,
+            Arc::new(arrow::array::StringArray::from(vec![Some("retained-key")])) as ArrayRef,
+        ];
+        let views = build_group_key_views(&arrays).expect("views");
+        let rows = table.build_rows_fallback(&arrays).expect("rows");
+        let hashes = table.build_group_hashes(&views, 1).expect("hashes");
+        table
+            .find_or_insert_from_row(&views, 0, rows[0].as_slice(), hashes[0])
+            .expect("insert key");
+
+        let scanned = table
+            .key_columns
+            .iter()
+            .map(KeyColumn::retained_bytes)
+            .fold(0usize, usize::saturating_add);
+        assert_eq!(table.key_columns_retained_bytes, scanned);
+    }
+
+    fn complex_list_array() -> ArrayRef {
+        Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            OffsetBuffer::new(vec![0, 2, 4, 5, 5].into()),
+            Arc::new(Int64Array::from(vec![
+                Some(1),
+                None,
+                Some(1),
+                None,
+                Some(2),
+            ])),
+            Some(NullBuffer::from(vec![true, true, true, false])),
+        ))
+    }
+
+    #[test]
+    fn complex_key_lookup_output_and_drop_are_exact_tracked() {
+        let query = MemTracker::new_root("query");
+        {
+            let array = complex_list_array();
+            let arrays = [Arc::clone(&array)];
+            let views = build_group_key_views(&arrays).expect("views");
+            let mut table = KeyTable::new_with_tracker(
+                vec![array.data_type().clone()],
+                false,
+                Arc::clone(&query),
+            )
+            .expect("table");
+            let rows = table.build_rows_fallback(&arrays).expect("fallback rows");
+            let hashes = table
+                .build_group_hashes(&views, array.len())
+                .expect("hashes");
+            let mut lookups = Vec::new();
+            for row in 0..array.len() {
+                lookups.push(
+                    table
+                        .find_or_insert_from_row(&views, row, rows[row].as_slice(), hashes[row])
+                        .expect("lookup"),
+                );
+            }
+            assert_eq!(lookups[0].group_id, lookups[1].group_id);
+            assert!(!lookups[1].is_new);
+            assert_ne!(lookups[0].group_id, lookups[2].group_id);
+            assert_ne!(lookups[2].group_id, lookups[3].group_id);
+
+            let output = table.key_columns()[0].to_array().expect("output keys");
+            let expected = take(
+                array.as_ref(),
+                &UInt32Array::from(vec![0_u32, 2_u32, 3_u32]),
+                None,
+            )
+            .expect("take expected rows");
+            assert_eq!(output.as_ref(), expected.as_ref());
+        }
+        assert_eq!(query.current(), 0);
+    }
+
+    #[test]
+    fn fallback_row_scratch_rejects_before_allocation() {
+        let query = MemTracker::new_root("query");
+        {
+            let array = complex_list_array();
+            let table = KeyTable::new_with_tracker(
+                vec![array.data_type().clone()],
+                false,
+                Arc::clone(&query),
+            )
+            .expect("table");
+            let baseline = query.current();
+            query
+                .install_limit_once(baseline.saturating_add(1))
+                .expect("install limit");
+            let error = table
+                .build_rows_fallback(&[array])
+                .expect_err("fallback scratch must be rejected before allocation");
+            assert!(error.contains("ResourceExhausted"), "{error}");
+            assert_eq!(query.current(), baseline);
+        }
+        assert_eq!(query.current(), 0);
     }
 }

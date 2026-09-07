@@ -17,9 +17,9 @@
 
 //! The production query-context side of execution.
 //!
-//! One establish installs three shared facts on this backend — catalog
-//! runtimes, a runtime-filter participant, and the query's vended credentials —
-//! and one release takes all three back. This is the only place that owns that
+//! One establish installs four shared facts on this backend — query options,
+//! catalog runtimes, a runtime-filter participant, and the query's vended
+//! credentials — and one release takes all four back. This is the only place that owns that
 //! pairing, and it owns nothing else: the owner in [`super::registry`] decides
 //! *whether* a context establishes, advances, or retires, and this host only
 //! carries out the decision it was handed.
@@ -53,6 +53,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use novarocks_connector_binding::ConnectorMaterializationErrorClass;
+use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_execution::task_execution::domain::ContentFingerprint;
 use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution::task_execution::operation::QueryContextDomainUpdate;
 use novarocks_execution::task_execution::status::TaskFailureCategory;
@@ -65,9 +67,12 @@ use novarocks_types::QueryExecutionId;
 use tracing::error;
 
 use super::credential_slot::QueryContextCredentialSlot;
+use super::execution_host::QueryContextOptions;
 use super::feedback::TaskRuntimeFilterFeedbackEgress;
 use super::host::{HostRejection, QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
-use super::shared_facts::{catalog_bindings, credential_material, runtime_filter_install};
+use super::shared_facts::{
+    catalog_bindings, credential_material, query_options, runtime_filter_install,
+};
 use super::status::TaskStatusReporter;
 use crate::BackendDataRuntime;
 use crate::connector::ConnectorExecutionRoleBinding;
@@ -98,6 +103,8 @@ struct ContextFacts {
     /// deadline of its own, because the owner's `SharedFactsRequest` carries
     /// none.
     released: bool,
+    /// The immutable query contract every task must match before preparation.
+    query_options: Option<QueryContextOptions>,
     /// `None` either because the query installs no runtime filter on this
     /// backend, or because the side that tore the context down already took it.
     participant: Option<Arc<RuntimeFilterParticipant>>,
@@ -132,6 +139,7 @@ impl InstalledContext {
             credentials: Arc::new(QueryContextCredentialSlot::new()),
             facts: Mutex::new(ContextFacts {
                 released: true,
+                query_options: None,
                 participant: None,
                 feedback: None,
             }),
@@ -414,6 +422,7 @@ impl NativeQueryContextHost {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             facts.released = true;
+            facts.query_options = None;
             // Dropped with the participant: it is the only strong reference to
             // the feedback sink, so releasing the context is what makes a late
             // publication find nothing to publish through.
@@ -450,6 +459,8 @@ impl NativeQueryContextHost {
         installed: &InstalledContext,
         catalogs: Vec<CatalogProperties>,
         contribution: &proto::RuntimeFilterContribution,
+        options: QueryOptions,
+        options_fingerprint: ContentFingerprint,
         material: &WireCredential,
     ) -> Result<(), HostRejection> {
         let execution_id = context.query_execution_id();
@@ -459,6 +470,20 @@ impl NativeQueryContextHost {
         // binding that may reach for it.
         installed.credentials.install(material)?;
         self.still_establishing(installed)?;
+
+        {
+            let mut facts = installed
+                .facts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if facts.released {
+                return Err(cancelled_establish());
+            }
+            facts.query_options = Some(QueryContextOptions::new(
+                Arc::new(options),
+                options_fingerprint,
+            ));
+        }
 
         if let Some(decoded) = decoded_contribution(execution_id, contribution)? {
             let participant = self
@@ -585,6 +610,7 @@ impl NativeQueryContextHost {
 impl QueryContextHost for NativeQueryContextHost {
     fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
         let context = request.context();
+        let options_fingerprint = request.query_options().fingerprint();
 
         // Every payload is projected before anything is installed. A request
         // this process cannot read back is not half an establish: refusing it
@@ -596,10 +622,11 @@ impl QueryContextHost for NativeQueryContextHost {
         // establish in a map that lives as long as the process.
         let projected = catalog_bindings(request.catalog_binding().as_ref()).and_then(|catalogs| {
             let contribution = runtime_filter_install(request.initial_runtime_filter().as_ref())?;
+            let options = query_options(request.query_options().as_ref())?;
             let material = credential_material(request.initial_credential())?;
-            Ok((catalogs, contribution, material))
+            Ok((catalogs, contribution, options, material))
         });
-        let (catalogs, contribution, material) = match projected {
+        let (catalogs, contribution, options, material) = match projected {
             Ok(projected) => projected,
             Err(error) => {
                 self.discard_released_marker(context);
@@ -635,7 +662,15 @@ impl QueryContextHost for NativeQueryContextHost {
             }
         };
 
-        match self.install_shared_facts(context, &installed, catalogs, contribution, material) {
+        match self.install_shared_facts(
+            context,
+            &installed,
+            catalogs,
+            contribution,
+            options,
+            options_fingerprint,
+            material,
+        ) {
             Ok(()) => Ok(()),
             Err(rejection) => {
                 // Undo here as well as in `release`. The owner does call
@@ -1162,6 +1197,13 @@ mod tests {
         Arc::new(WireContent::new(b"catalog", set.as_proto().clone()))
     }
 
+    fn query_options_payload() -> Arc<dyn CodecOwnedContent> {
+        Arc::new(WireContent::new(
+            b"query-options",
+            proto::QueryOptions::default(),
+        ))
+    }
+
     /// A binding factory whose behaviour the test drives.
     struct ScriptedFactory {
         fail: AtomicBool,
@@ -1414,10 +1456,29 @@ mod tests {
             contribution: proto::RuntimeFilterContribution,
             credential: &CredentialUpdate,
         ) -> Result<(), super::HostRejection> {
+            self.establish_with_options(
+                context,
+                catalogs,
+                contribution,
+                proto::QueryOptions::default(),
+                credential,
+            )
+        }
+
+        fn establish_with_options(
+            &self,
+            context: QueryContextRef,
+            catalogs: Vec<CatalogProperties>,
+            contribution: proto::RuntimeFilterContribution,
+            query_options: proto::QueryOptions,
+            credential: &CredentialUpdate,
+        ) -> Result<(), super::HostRejection> {
             let catalog = catalog_payload(catalogs);
             let filter = filter_payload(contribution);
+            let options: Arc<dyn CodecOwnedContent> =
+                Arc::new(WireContent::new(b"query-options", query_options));
             self.host.materialize(SharedFactsRequest::new(
-                context, &catalog, &filter, credential,
+                context, &catalog, &filter, &options, credential,
             ))
         }
 
@@ -1463,6 +1524,41 @@ mod tests {
                 .resolve_vended_s3(&storage_request("s3://bucket/a/file.parquet"))
                 .is_ok(),
             "the installed credential must serve its own scope"
+        );
+    }
+
+    #[test]
+    fn an_establish_installs_the_query_options_for_every_task() {
+        let fixture = Fixture::new();
+        let context = context(1);
+        fixture
+            .establish_with_options(
+                context,
+                vec![catalog_properties()],
+                no_contribution(),
+                proto::QueryOptions {
+                    query_mem_limit: 8192,
+                    pipeline_dop: 3,
+                    ..proto::QueryOptions::default()
+                },
+                &credential(1, SECRET_SENTINEL, live_until()),
+            )
+            .expect("a complete establish");
+
+        let options = fixture
+            .host
+            .query_options(context.query_execution_id())
+            .expect("the active context owns its query options");
+        assert_eq!(options.runtime().exec_mem_limit(), Some(8192));
+        assert_eq!(options.runtime().pipeline_dop(), Some(3));
+
+        fixture.host.release(context);
+        assert!(
+            fixture
+                .host
+                .query_options(context.query_execution_id())
+                .is_err(),
+            "released contexts cannot supply query options"
         );
     }
 
@@ -1732,12 +1828,14 @@ mod tests {
         // A catalog payload where the runtime filter belongs: well-formed, and
         // not what this domain asked for, so the projection refuses.
         let wrong_domain = catalog_payload(vec![catalog_properties()]);
+        let options = query_options_payload();
         let refusal = fixture
             .host
             .materialize(SharedFactsRequest::new(
                 context,
                 &wrong_domain,
                 &wrong_domain,
+                &options,
                 &credential(1, SECRET_SENTINEL, live_until()),
             ))
             .expect_err("a payload of the wrong domain is refused");
@@ -1842,6 +1940,7 @@ mod tests {
         // A catalog set where the runtime filter belongs.
         let catalog = catalog_payload(vec![catalog_properties()]);
         let filter = catalog_payload(vec![]);
+        let options = query_options_payload();
         let credential = credential(1, SECRET_SENTINEL, live_until());
         let rejection = fixture
             .host
@@ -1849,6 +1948,7 @@ mod tests {
                 context,
                 &catalog,
                 &filter,
+                &options,
                 &credential,
             ))
             .expect_err("a catalog set is not a participant contribution");
@@ -2348,6 +2448,35 @@ use crate::task_execution::execution_host::TaskQueryContextFacts;
 use novarocks_spi::connector::CatalogHandle;
 
 impl TaskQueryContextFacts for NativeQueryContextHost {
+    fn query_options(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Result<QueryContextOptions, HostRejection> {
+        let context = self.context_for_execution(execution).ok_or_else(|| {
+            HostRejection::new(
+                TaskFailureCategory::Execution,
+                format!("task of {execution:?} has no established query context"),
+            )
+        })?;
+        let installed = self.active_context(context)?;
+        let facts = installed
+            .facts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if facts.released {
+            return Err(HostRejection::new(
+                TaskFailureCategory::Execution,
+                "the query context released its query options before task preparation",
+            ));
+        }
+        facts.query_options.clone().ok_or_else(|| {
+            HostRejection::new(
+                TaskFailureCategory::Internal,
+                "active query context has no installed query options",
+            )
+        })
+    }
+
     fn runtime_filter_session(
         &self,
         execution: QueryExecutionId,

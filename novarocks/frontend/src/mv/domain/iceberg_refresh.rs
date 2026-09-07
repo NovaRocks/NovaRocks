@@ -166,6 +166,7 @@ trait IcebergMvRefreshSource:
 /// constructor so a frontend composition must name every dependency.
 #[derive(Clone)]
 pub struct IcebergMvCorePorts {
+    functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -179,6 +180,7 @@ impl IcebergMvCorePorts {
     /// Iceberg MV backend. Frontend composition must provide every leaf; this
     /// value deliberately has no application-facade constructor.
     pub(crate) fn new(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -187,6 +189,7 @@ impl IcebergMvCorePorts {
         storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
+            functions,
             catalog_service,
             catalog_application,
             connector_control,
@@ -194,6 +197,10 @@ impl IcebergMvCorePorts {
             readiness,
             storage_observation,
         }
+    }
+
+    pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
+        &self.functions
     }
 
     pub(crate) fn repository(&self) -> &Arc<dyn MvRepository> {
@@ -976,6 +983,7 @@ fn prepare_iceberg_mv_create_with_ports(
         &provider,
         current_database,
         &canonical_select_query,
+        ports.function_catalog().as_ref(),
     )?;
     let refresh_contract = derive_imv_refresh_contract(&analysis)?;
     let partition_fields = partition_fields_for_create(stmt.partition_by.as_ref());

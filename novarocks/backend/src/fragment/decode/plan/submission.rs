@@ -67,6 +67,7 @@ pub(crate) fn decode_fragment_submission(
     connector_cancellation: Arc<dyn ConnectorCancellation>,
     exchange_wait: Duration,
     typed_scan_runtime: Option<super::context::TypedScanRuntime>,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let root_path = FieldPath::root("plan_fragment").field("root");
     let root = require_root(fragment).map_err(NativeFragmentDecodeError::from)?;
@@ -102,7 +103,8 @@ pub(crate) fn decode_fragment_submission(
         instance.fragment_instance_id,
         exchange_wait,
     )
-    .with_typed_scan_runtime(typed_scan_runtime);
+    .with_typed_scan_runtime(typed_scan_runtime)
+    .with_function_catalog(function_catalog);
     let mut ledger = NativeRuntimeFilterDecodeLedger::decode(
         fragment.fragment_id,
         fragment.runtime_filter_bindings.as_ref(),
@@ -274,6 +276,10 @@ mod tests {
             Arc::new(NeverCancelled),
             Duration::from_secs(1),
             None,
+            Arc::new(
+                novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                    .expect("builtin function catalog"),
+            ),
         )
     }
 

@@ -417,7 +417,7 @@ impl ChunkSchema {
             .zip(slot_ids.iter().copied())
             .map(|(field, slot_id)| Self::slot_schema_from_arrow_field(slot_id, field.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        Self::try_new(slots).map(Arc::new)
+        Self::try_new_with_schema_metadata(slots, schema.metadata().clone()).map(Arc::new)
     }
 
     pub fn slot(&self, slot_id: SlotId) -> Option<&ChunkSlotSchema> {
@@ -554,6 +554,7 @@ pub(super) fn align_chunk_schema_to_columns(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow::array::{
@@ -587,6 +588,20 @@ mod tests {
         ])
         .expect_err("duplicate slot ids should fail");
         assert!(err.contains("duplicate slot id"), "err={}", err);
+    }
+
+    #[test]
+    fn schema_and_field_metadata_survive_slot_binding() {
+        let schema = Schema::new_with_metadata(
+            vec![
+                Field::new("value", DataType::Int32, false)
+                    .with_metadata(HashMap::from([("field".to_string(), "exact".to_string())])),
+            ],
+            HashMap::from([("schema".to_string(), "exact".to_string())]),
+        );
+        let chunk = ChunkSchema::try_ref_from_schema_and_slot_ids(&schema, &[SlotId::new(7)])
+            .expect("bind schema");
+        assert_eq!(chunk.arrow_schema_ref().as_ref(), &schema);
     }
 
     #[test]
