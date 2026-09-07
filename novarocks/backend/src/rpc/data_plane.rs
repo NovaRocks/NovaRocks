@@ -110,10 +110,6 @@ impl BackendDataPlane {
         )
     }
 
-    pub fn lookup(&self, request: proto::filter::LookupRequest) -> proto::filter::LookupResponse {
-        data_plane_handlers::handle_lookup(request)
-    }
-
     pub fn fetch_result(
         &self,
         request: proto::novarocks::FetchResultRequest,

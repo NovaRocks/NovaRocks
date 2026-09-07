@@ -20,9 +20,7 @@ use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId
 
 use crate::BackendDataRuntime;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
-use crate::fragment::{
-    grpc_exchange_transmitter, grpc_fragment_lookup_client, native_result_writer,
-};
+use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
 use crate::rpc::client::BackendRpcClient;
 use crate::rpc::runtime::BackendNativeTransport;
@@ -567,7 +565,6 @@ fn compose_backend_application_services(
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::TaskQueryContextFacts>,
         Arc::clone(&inbound_capabilities),
         grpc_exchange_transmitter(data_runtime.clone()),
-        grpc_fragment_lookup_client(data_runtime.clone()),
         native_result_writer(),
         Arc::clone(&exchange_receiver_port),
         Arc::new(

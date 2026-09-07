@@ -18,10 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
-    CatalogProperties, ConnectorBatchBudget, ConnectorControlPlanningLease,
-    ConnectorFrozenRewriteGroup, ConnectorInstanceId, ConnectorPinnedFileSet,
-    ConnectorPredicateDisposition, ConnectorProviderBinding, ConnectorScan, ConnectorSplit,
-    ConnectorSplitPlanningMetrics, ConnectorStaticPredicate,
+    CatalogProperties, ConnectorControlPlanningLease, ConnectorFrozenRewriteGroup,
+    ConnectorInstanceId, ConnectorPinnedFileSet,
 };
 
 use crate::catalog_application::query_bindings::QueryScanMaterialization;
@@ -191,37 +189,6 @@ pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScan
     }
 }
 
-/// Provider-neutral result of planning an executable connector read.  Its
-/// handles remain opaque to core: preparation owns only declaration delivery,
-/// scheduling hints, and native-carrier assembly.
-#[derive(Clone)]
-pub(crate) struct PlannedConnectorRead {
-    pub(crate) declaration: ConnectorProviderBinding,
-    pub(crate) scan: ConnectorScan,
-    /// Stable provider field ordinals aligned 1:1 with `scan.output_schema`.
-    /// These are frozen with the exact FE read and are the only authority for
-    /// Scan-domain target encoding for pre-reader evaluation.
-    pub(crate) provider_field_ordinals: Vec<u32>,
-    pub(crate) splits: Vec<ConnectorSplit>,
-    /// Provider split-planning evidence retained only in FE preparation.
-    pub(crate) planning_metrics: ConnectorSplitPlanningMetrics,
-    /// Submitted predicate requests and their normalized provider response.
-    pub(crate) static_predicates: Vec<ConnectorStaticPredicate>,
-    pub(crate) predicate_dispositions: Vec<ConnectorPredicateDisposition>,
-    /// Ordered Core residuals after removing only negotiated `Exact` IDs.
-    pub(crate) residual_predicates: Vec<TypedExpr>,
-    pub(crate) batch: ConnectorBatchBudget,
-    /// Keeps the exact FE control generation alive through the BE ensure
-    /// barrier. It is never encoded into a fragment carrier.
-    #[allow(
-        dead_code,
-        reason = "The lease is retained for its drop-time ownership release through BE admission."
-    )]
-    pub(crate) planning_lease: ConnectorControlPlanningLease,
-    /// FE-local remote read ownership. This never enters a native carrier.
-    pub(crate) read_session: Option<novarocks_spi::connector::ConnectorReadSessionLease>,
-}
-
 /// One SQL scan lowered onto the typed connector read stack.
 ///
 /// It deliberately carries no split. Enumeration is lazy and owned by the
@@ -367,7 +334,6 @@ impl ResolvedScanBinding {
 pub(crate) struct ScanExecutionBindings {
     by_node_id: BTreeMap<i32, ResolvedScanBinding>,
     scan_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<ScanRangeParams>>>,
-    connector_reads: BTreeMap<(FragmentId, i32), PlannedConnectorRead>,
     typed_scans: BTreeMap<(FragmentId, i32), PreparedTypedConnectorScan>,
 }
 
@@ -486,70 +452,6 @@ impl ScanExecutionBindings {
         self.typed_scans
             .iter()
             .map(|(&(fragment_id, node_id), scan)| (fragment_id, node_id, scan))
-    }
-
-    #[allow(
-        dead_code,
-        reason = "The opaque connector carrier has no producer left in preparation; its readers (query_execution::read_session, query_execution::artifact) are outside this cut."
-    )]
-    pub(crate) fn insert_connector_read(
-        &mut self,
-        fragment_id: FragmentId,
-        node_id: i32,
-        read: PlannedConnectorRead,
-    ) -> Result<(), String> {
-        if self.connector_reads.contains_key(&(fragment_id, node_id)) {
-            return Err(format!(
-                "duplicate connector read fragment_id={fragment_id} node_id={node_id}"
-            ));
-        }
-        let declaration_key =
-            novarocks_spi::connector::ConnectorProviderBindingKey::from(&read.declaration);
-        if read.scan.handle().owner() != &declaration_key.instance_id {
-            return Err(format!(
-                "connector read fragment_id={fragment_id} node_id={node_id} has a scan handle owned by another instance"
-            ));
-        }
-        if read.provider_field_ordinals.len() != read.scan.output_schema().fields().len() {
-            return Err(format!(
-                "connector read fragment_id={fragment_id} node_id={node_id} provider ordinal count {} does not match output schema field count {}",
-                read.provider_field_ordinals.len(),
-                read.scan.output_schema().fields().len(),
-            ));
-        }
-        let mut provider_ordinals = BTreeSet::new();
-        if read
-            .provider_field_ordinals
-            .iter()
-            .any(|ordinal| !provider_ordinals.insert(*ordinal))
-        {
-            return Err(format!(
-                "connector read fragment_id={fragment_id} node_id={node_id} has duplicate provider field ordinals"
-            ));
-        }
-        if read
-            .splits
-            .iter()
-            .any(|split| split.owner() != &declaration_key.instance_id)
-        {
-            return Err(format!(
-                "connector read fragment_id={fragment_id} node_id={node_id} has a split owned by another instance"
-            ));
-        }
-        self.connector_reads.insert((fragment_id, node_id), read);
-        Ok(())
-    }
-
-    pub(crate) fn connector_read(
-        &self,
-        fragment_id: FragmentId,
-        node_id: i32,
-    ) -> Option<&PlannedConnectorRead> {
-        self.connector_reads.get(&(fragment_id, node_id))
-    }
-
-    pub(crate) fn connector_reads(&self) -> impl Iterator<Item = &PlannedConnectorRead> {
-        self.connector_reads.values()
     }
 }
 

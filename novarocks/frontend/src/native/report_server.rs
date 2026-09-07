@@ -720,13 +720,6 @@ impl NovaRocksGrpc for FrontendReportService {
         Err(Self::rejected("TransmitRuntimeFilterEnvelope"))
     }
 
-    async fn lookup(
-        &self,
-        _request: tonic::Request<filter::LookupRequest>,
-    ) -> Result<tonic::Response<filter::LookupResponse>, tonic::Status> {
-        Err(Self::rejected("Lookup"))
-    }
-
     async fn fetch_result(
         &self,
         _request: tonic::Request<proto::FetchResultRequest>,

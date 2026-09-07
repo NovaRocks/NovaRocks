@@ -1140,7 +1140,7 @@ impl TestQueryCompiler {
                     TableLookupMode::SchemaOnly,
                     self.query.catalog_application().map(Arc::as_ref),
                 );
-                let (assembly, _, _) = prepare_query_with_sql_compiler_kernel_with_ports(
+                let (assembly, _) = prepare_query_with_sql_compiler_kernel_with_ports(
                     &prepared,
                     &analyzer_provider,
                     current_catalog,
@@ -1192,31 +1192,29 @@ impl TestQueryCompiler {
             self.query.catalog_application().map(Arc::as_ref),
         );
         let planning_start = std::time::Instant::now();
-        let (assembly, distributed_plan, connector_static_planning) =
-            prepare_query_with_sql_compiler_kernel_with_ports(
-                &query,
-                &analyzer_provider,
-                current_catalog,
-                current_database,
-                &self.query,
-                self.system_tables.mv_readiness().as_ref(),
-                self.mv_storage_observation.as_ref(),
-                connector_context,
-                Some(query_options_for_explain_analyze(query_opts)),
-                execution,
-                novarocks_sql::compiler::SqlCompileIntent::Explain {
-                    level: novarocks_sql::compiler::ExplainLevel::Analyze,
-                    analyze: true,
-                },
-                true,
-            )?;
+        let (assembly, distributed_plan) = prepare_query_with_sql_compiler_kernel_with_ports(
+            &query,
+            &analyzer_provider,
+            current_catalog,
+            current_database,
+            &self.query,
+            self.system_tables.mv_readiness().as_ref(),
+            self.mv_storage_observation.as_ref(),
+            connector_context,
+            Some(query_options_for_explain_analyze(query_opts)),
+            execution,
+            novarocks_sql::compiler::SqlCompileIntent::Explain {
+                level: novarocks_sql::compiler::ExplainLevel::Analyze,
+                analyze: true,
+            },
+            true,
+        )?;
         Ok(TestPreparedQueryOperation::Distributed {
             assembly,
             completion: PreparedQueryCompletion::profile(
                 distributed_plan,
                 planning_start.elapsed(),
                 std::time::Instant::now(),
-                connector_static_planning,
             ),
         })
     }
@@ -1431,16 +1429,6 @@ pub(crate) fn typed_connector_session()
         std::time::SystemTime::now(),
     )
     .map_err(|error| format!("typed connector scan session: {error}"))
-}
-
-pub(crate) fn connector_static_planning_metrics(
-    prepared: &crate::query_execution::preparation::PreparedFragmentSet,
-) -> Result<crate::query_execution::profile::ConnectorStaticPlanningMetrics, String> {
-    let mut metrics = crate::query_execution::profile::ConnectorStaticPlanningMetrics::default();
-    for read in prepared.scan_bindings().connector_reads() {
-        metrics.record(read.planning_metrics)?;
-    }
-    Ok(metrics)
 }
 
 #[cfg(test)]
@@ -2074,7 +2062,6 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     (
         PreparedDistributedQueryAssembly,
         novarocks_sql::plan_read::DistributedPlan,
-        crate::query_execution::profile::ConnectorStaticPlanningMetrics,
     ),
     TestQueryCompilerError,
 > {
@@ -2160,14 +2147,13 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
             execution,
         )?,
     )?;
-    let connector_static_planning = connector_static_planning_metrics(&prepared)?;
     let assembly = PreparedDistributedQueryAssembly::new(
         NativeFragmentEncodingInput::new(distributed_plan.clone(), prepared),
         query_opts,
         distributed_intent,
         execution.clone(),
     );
-    Ok((assembly, distributed_plan, connector_static_planning))
+    Ok((assembly, distributed_plan))
 }
 
 #[allow(clippy::too_many_arguments)]

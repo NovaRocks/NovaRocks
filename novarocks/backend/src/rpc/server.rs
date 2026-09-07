@@ -231,15 +231,6 @@ impl NovaRocksGrpc for BackendRpcService {
         Ok(tonic::Response::new(response))
     }
 
-    async fn lookup(
-        &self,
-        request: tonic::Request<filter::LookupRequest>,
-    ) -> Result<tonic::Response<filter::LookupResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
-            self.data_plane.lookup(request.into_inner()),
-        ))
-    }
-
     async fn fetch_result(
         &self,
         request: tonic::Request<proto::FetchResultRequest>,

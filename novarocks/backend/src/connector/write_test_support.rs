@@ -40,8 +40,8 @@ use novarocks_spi::connector::write_stack::{
     WriteRuntimeAdapter, WriterMultiplexSchema,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, CatalogWriteExecution, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+    CatalogHandle, CatalogVersion, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorProviderId,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
 
@@ -207,26 +207,10 @@ impl ConnectorWriteExecution for RecordingWriteExecution {
     }
 }
 
-/// The catalog-scoped capability member of the role binding. It carries the
-/// handle and nothing else; a write binding is a complete group by
-/// construction.
-struct UnusedCatalogWriteExecution {
-    catalog_handle: CatalogHandle,
-}
-
-impl CatalogWriteExecution for UnusedCatalogWriteExecution {
-    fn catalog_handle(&self) -> &CatalogHandle {
-        &self.catalog_handle
-    }
-}
-
 pub(crate) fn test_write_binding(
     execution: Arc<RecordingWriteExecution>,
 ) -> ConnectorExecutionWriteBinding {
     ConnectorExecutionWriteBinding::new(
-        Arc::new(UnusedCatalogWriteExecution {
-            catalog_handle: test_write_catalog_handle(),
-        }),
         execution,
         Arc::new(StubHandleDecoder {
             adapter: test_write_adapter(),

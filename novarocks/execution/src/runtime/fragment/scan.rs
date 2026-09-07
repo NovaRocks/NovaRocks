@@ -64,9 +64,7 @@ fn visit(
             }
             Ok(())
         }
-        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) | ExecNodeKind::LookUp(_) => {
-            Ok(())
-        }
+        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) => Ok(()),
         ExecNodeKind::AssertNumRows(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Project(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Unpivot(node) => visit(&node.input, instance, bindings),
@@ -75,7 +73,6 @@ fn visit(
         ExecNodeKind::ChangeEventExpand(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::UnionAll(node) => visit_inputs(&node.inputs, instance, bindings),
         ExecNodeKind::Limit(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::Fetch(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Aggregate(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::Join(node) => {
             visit(&node.left, instance, bindings)?;

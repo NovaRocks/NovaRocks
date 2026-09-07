@@ -24,10 +24,10 @@ use std::time::Instant;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
     CatalogRuntimeMaterializer, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBinding, ConnectorInstanceId, ConnectorOpenReaderRequest,
-    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
-    ConnectorPreparedScanUnitSet, ConnectorProviderBindingKey, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
+    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
+    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
+    ConnectorProviderBindingKey, ConnectorReadExecution, ConnectorRequestContext,
+    ConnectorScanUnitDomainFacts, ConnectorSplit,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -42,18 +42,6 @@ use crate::file_reader::execution_payload::{
 };
 use crate::metadata_batch_reader::open_metadata_connector_reader;
 use crate::resources::IcebergExecutionResources;
-
-const PROVIDER_ID: &str = "iceberg";
-
-/// Startup-composed local factory for exact Iceberg BE execution generations.
-///
-/// Its declaration selects only a named, startup-provided access binding;
-/// cloud properties, catalog handles and runtimes are never carried over the
-/// FE/BE wire.
-pub struct IcebergExecutionBindingFactory {
-    provider_id: ConnectorProviderId,
-    resources: IcebergExecutionResources,
-}
 
 /// Startup-composed materializer for immutable catalog properties received by
 /// a BE query lifecycle.  The filesystem binding is process-local and is
@@ -111,58 +99,6 @@ impl CatalogRuntimeMaterializer for IcebergCatalogRuntimeMaterializer {
         }))
     }
 }
-
-impl IcebergExecutionBindingFactory {
-    pub fn new(resources: IcebergExecutionResources) -> Self {
-        Self {
-            provider_id: ConnectorProviderId::parse(PROVIDER_ID)
-                .expect("static Iceberg provider ID is valid"),
-            resources,
-        }
-    }
-
-    /// Build generic execution facets for one exact catalog definition without
-    /// consulting a request or opening a remote client.
-    pub(crate) fn bind_for_catalog_properties(
-        &self,
-        properties: &CatalogProperties,
-    ) -> Result<ConnectorExecutionBinding, ConnectorError> {
-        if properties.provider_kind() != CatalogProviderKind::Iceberg {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg execution binding received another provider kind",
-            ));
-        }
-        let mut incarnation = [0_u8; 16];
-        incarnation.copy_from_slice(&properties.handle().version().as_bytes()[..16]);
-        let key = ConnectorProviderBindingKey {
-            instance_id: properties.handle().catalog_name().clone(),
-            incarnation: novarocks_spi::connector::ProviderBindingEpoch::from_bytes(incarnation),
-        };
-        let binding = self.resources.binding().bind_catalog(properties)?;
-        ConnectorExecutionBinding::try_new_capabilities(
-            self.provider_id.clone(),
-            key.clone(),
-            Some(Arc::new(IcebergReadOnlyConnectorInstance {
-                key: key.clone(),
-                binding: binding.clone(),
-            })),
-            // Writers are opened through the write stack's own execution
-            // binding, which the role binding publishes alongside this one.
-            // The slot stays occupied because the role binding requires the
-            // generic and typed write groups to agree about whether this
-            // provider writes at all.
-            Some(Arc::new(IcebergWriteCapability)),
-        )
-    }
-}
-
-/// The generic write capability marker. It exists so the execution role
-/// binding can see that this provider writes (ADR-0130); writers themselves are
-/// opened through the write stack's own execution binding.
-struct IcebergWriteCapability;
-
-impl novarocks_spi::connector::ConnectorWriteExecution for IcebergWriteCapability {}
 
 /// Materializes only FE-frozen membership into local read units. Catalog
 /// access and all planning remain outside this BE execution object.

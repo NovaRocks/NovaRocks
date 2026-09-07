@@ -78,7 +78,6 @@ pub mod typed_read;
 pub mod write_codec;
 pub mod write_descriptor;
 
-pub use commit::write_execution::IcebergCatalogWriteExecutionFactory;
 pub use file_reader::execution_installer::IcebergCatalogRuntimeMaterializer;
 pub use role_binding::{IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory};
 

@@ -44,8 +44,8 @@ use novarocks_spi::connector::{
 
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::data_writer::{
-    StagedDataFile, StagedWriteContext, StagedWriteOptions, cleanup_staged_files,
-    staged_data_file_to_writer_report, write_record_batches,
+    StagedDataFile, StagedWriteContext, cleanup_staged_files, staged_data_file_to_writer_report,
+    write_record_batches,
 };
 use crate::commit::frozen_write::{FrozenDataWriteFacts, staged_write_context_from_frozen_facts};
 use crate::commit::report::{IcebergPartitionReport, partition_path_from_struct};
@@ -363,7 +363,7 @@ impl ConnectorBatchWriter for IcebergDataStackWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let staged = write_record_batches(&self.context, [batch], &StagedWriteOptions::default())
+        let staged = write_record_batches(&self.context, [batch])
             .await
             .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
         self.record(staged)

@@ -1309,7 +1309,7 @@ mod tests {
                     "scripted catalog materialization failure",
                 ));
             }
-            ConnectorExecutionRoleBinding::try_new(properties.clone(), None, None, None)
+            ConnectorExecutionRoleBinding::try_new(properties.clone(), None, None)
                 .map_err(Into::into)
         }
     }

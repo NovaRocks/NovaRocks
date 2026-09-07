@@ -227,7 +227,6 @@ impl OperatorFactory for ScanSourceFactory {
             first_submit_failure_at: Mutex::new(None),
             backend_num: AtomicI32::new(-1),
             dispatch_observers_registered: AtomicBool::new(false),
-            row_position_registered: false,
             incremental_registered: false,
             scan_executor: None,
         })
@@ -266,38 +265,11 @@ struct ScanSourceOperator {
     first_submit_failure_at: Mutex<Option<Instant>>,
     backend_num: AtomicI32,
     dispatch_observers_registered: AtomicBool,
-    row_position_registered: bool,
     incremental_registered: bool,
     scan_executor: Option<Arc<ScanExecutor>>,
 }
 
 impl ScanSourceOperator {
-    fn register_row_position(&mut self, state: &RuntimeState) -> Result<(), String> {
-        if self.row_position_registered {
-            return Ok(());
-        }
-        let Some(spec) = self.scan.row_position() else {
-            self.row_position_registered = true;
-            return Ok(());
-        };
-        if let Some(lookup) = self.scan.connector_row_position_lookup() {
-            let query_id = state
-                .query_id()
-                .ok_or_else(|| "row position requires query_id".to_string())?;
-            let registration = state
-                .scan_registration()
-                .ok_or_else(|| "row position requires scan registration port".to_string())?;
-            registration.register_row_position_lookup(
-                query_id,
-                spec.row_source_slot,
-                lookup.clone(),
-            )?;
-            self.row_position_registered = true;
-            return Ok(());
-        }
-        Err("row position requires a connector read binding".to_string())
-    }
-
     fn register_incremental_dispatch(&mut self, state: &RuntimeState) -> Result<(), String> {
         if self.incremental_registered {
             return Ok(());
@@ -748,7 +720,6 @@ impl ProcessorOperator for ScanSourceOperator {
     fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
         self.ensure_dispatch_initialized()?;
         self.register_incremental_dispatch(state)?;
-        self.register_row_position(state)?;
         self.async_state.ensure_mem_tracker(state);
         let chunk = self.async_state.pop_chunk()?;
         self.maybe_start_async_scan();

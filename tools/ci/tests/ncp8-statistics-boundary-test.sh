@@ -36,7 +36,7 @@ write_package() {
 write_fixture() {
   local root="$1"
   mkdir -p "$root/novarocks/connector" "$root/novarocks-server/src" \
-    "$root/idl/novarocks" "$root/novarocks/proto-models/tests"
+    "$root/idl/novarocks"
   write_package "$root" "novarocks/execution" "novarocks-execution"
   write_package "$root" "novarocks/functions" "novarocks-functions"
   write_package "$root" "novarocks/connector/iceberg-functions" "novarocks-connector-iceberg-functions"
@@ -102,14 +102,6 @@ novarocks-connector-iceberg = { path = "../novarocks/connector/iceberg" }
 novarocks-connector-iceberg-functions = { path = "../novarocks/connector/iceberg-functions" }
 EOF
 
-  cat >"$root/idl/novarocks/service.proto" <<'EOF'
-syntax = "proto3";
-message QueryTerminalFragmentSnapshot {
-  reserved 12;
-  reserved "statistics_payload";
-  bool ok = 13;
-}
-EOF
   cat >"$root/idl/novarocks/plan.proto" <<'EOF'
 syntax = "proto3";
 message DataSink {
@@ -117,15 +109,6 @@ message DataSink {
   reserved "statistics";
   bool result = 1;
 }
-EOF
-  cat >"$root/novarocks/proto-models/tests/generated_contract.rs" <<'EOF'
-#[test]
-fn retired_write_operation_aggregate_fields_remain_reserved() {
-    let _ = "novarocks.plan.StatisticsSink";
-    let _ = "statistics_payload";
-}
-#[test]
-fn retired_write_operation_aggregate_wire_fields_fail_closed() {}
 EOF
 }
 
@@ -166,16 +149,17 @@ valid="$fixture_root/valid"
 write_fixture "$valid"
 "$CHECKER" --repo-root "$valid" --manifest-path "$valid/Cargo.toml"
 
-legacy="$fixture_root/legacy"
-cp -R "$valid" "$legacy"
-printf 'pub struct StatisticsSink;\n' >>"$legacy/novarocks/frontend/src/lib.rs"
-assert_rejected "$legacy" "retired/provider-specific production identifiers found"
+sink_tag="$fixture_root/sink-tag"
+cp -R "$valid" "$sink_tag"
+replace_once "$sink_tag/idl/novarocks/plan.proto" \
+  'reserved 8;' 'bool statistics = 8;'
+assert_rejected "$sink_tag" "DataSink must reserve field number 8"
 
-terminal="$fixture_root/terminal"
-cp -R "$valid" "$terminal"
-replace_once "$terminal/idl/novarocks/service.proto" \
-  'reserved "statistics_payload";' 'bytes statistics_payload = 12;'
-assert_rejected "$terminal" "statistics_payload"
+sink_name="$fixture_root/sink-name"
+cp -R "$valid" "$sink_name"
+replace_once "$sink_name/idl/novarocks/plan.proto" \
+  'reserved "statistics";' 'bool statistics = 9;'
+assert_rejected "$sink_name" "DataSink must reserve field name statistics"
 
 role="$fixture_root/role"
 cp -R "$valid" "$role"
@@ -254,22 +238,5 @@ cat >>"$indirect_sketch/novarocks/execution/Cargo.toml" <<'EOF'
 path = "../../helper"
 EOF
 assert_rejected "$indirect_sketch" "normal closure has indirect datasketches owners"
-
-provider_symbol="$fixture_root/provider-symbol"
-cp -R "$valid" "$provider_symbol"
-printf 'pub struct Puffin;\n' >>"$provider_symbol/novarocks/execution/src/lib.rs"
-assert_rejected "$provider_symbol" "Puffin"
-
-missing_witness="$fixture_root/missing-witness"
-cp -R "$valid" "$missing_witness"
-replace_once "$missing_witness/novarocks/proto-models/tests/generated_contract.rs" \
-  $'    let _ = "novarocks.plan.StatisticsSink";\n' ''
-assert_rejected "$missing_witness" "generated compatibility witness is missing"
-
-retired_file="$fixture_root/retired-file"
-cp -R "$valid" "$retired_file"
-mkdir -p "$retired_file/novarocks/execution/src/exec"
-: >"$retired_file/novarocks/execution/src/exec/statistics.rs"
-assert_rejected "$retired_file" "retired execution source path exists"
 
 echo "ncp8-statistics-boundary-test: PASS"

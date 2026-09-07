@@ -19,8 +19,6 @@ use std::collections::HashMap;
 
 use arrow::datatypes::Field;
 
-use novarocks_execution::exec::row_position::RowPositionDescriptor;
-use novarocks_execution::exec::row_position::RowPositionType;
 use novarocks_types::SlotId;
 
 #[allow(
@@ -270,28 +268,6 @@ impl DescriptorSnapshot {
             (!location.is_empty()).then_some((table.id, location))
         })
     }
-
-    pub(crate) fn lookup_output_slots(
-        &self,
-        tuple_id: i32,
-        row_pos_desc: &RowPositionDescriptor,
-    ) -> Vec<SlotId> {
-        let mut out = Vec::new();
-        for slot_id in self.tuple_slots(tuple_id) {
-            if *slot_id == row_pos_desc.row_source_slot
-                || row_pos_desc.fetch_ref_slots.contains(slot_id)
-                || row_pos_desc.lookup_ref_slots.contains(slot_id)
-            {
-                continue;
-            }
-            out.push(*slot_id);
-        }
-        out
-    }
-}
-
-pub(crate) fn is_iceberg_v3_row_position(row_position_type: RowPositionType) -> bool {
-    row_position_type == RowPositionType::Iceberg
 }
 
 #[cfg(test)]
@@ -301,7 +277,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
 
     use super::*;
-    use novarocks_execution::exec::row_position::{RowPositionDescriptor, RowPositionType};
     use novarocks_types::SlotId;
 
     fn descriptor_slot(tuple_id: i32, slot_id: u32, name: &str) -> DescriptorSlot {
@@ -336,17 +311,6 @@ mod tests {
         assert_eq!(
             snapshot.slot(2, SlotId::new(8)).expect("slot").name,
             "payload"
-        );
-
-        let row_pos = RowPositionDescriptor {
-            row_position_type: RowPositionType::Iceberg,
-            row_source_slot: SlotId::new(3),
-            fetch_ref_slots: vec![SlotId::new(5)],
-            lookup_ref_slots: vec![SlotId::new(1)],
-        };
-        assert_eq!(
-            snapshot.lookup_output_slots(2, &row_pos),
-            vec![SlotId::new(8)]
         );
     }
 

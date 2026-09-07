@@ -186,7 +186,7 @@ impl ConnectorExecutionRoleBindingFactory for StarRocksExecutionRoleBindingFacto
         properties: &NormalizedCatalogProperties,
     ) -> Result<ConnectorExecutionRoleBinding, ConnectorMaterializationError> {
         ensure_starrocks(properties.as_catalog_properties())?;
-        ConnectorExecutionRoleBinding::try_new(properties.clone(), None, None, None)
+        ConnectorExecutionRoleBinding::try_new(properties.clone(), None, None)
             .map_err(ConnectorMaterializationError::from)
     }
 }
@@ -508,7 +508,6 @@ mod tests {
             .expect("StarRocks has an explicit capability-free local binding");
 
         assert_eq!(binding.properties(), &normalized);
-        assert!(binding.execution().is_none());
         assert!(binding.read().is_none());
         assert!(binding.write().is_none());
     }

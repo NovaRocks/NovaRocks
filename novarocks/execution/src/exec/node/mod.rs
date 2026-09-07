@@ -19,11 +19,9 @@ pub mod analytic;
 pub mod assert;
 pub mod change_event_expand;
 pub mod exchange_source;
-pub mod fetch;
 pub mod filter;
 pub mod join;
 pub mod limit;
-pub mod lookup;
 pub mod nljoin;
 pub mod project;
 pub mod repeat;
@@ -48,11 +46,9 @@ use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::AssertNumRowsNode;
 use crate::exec::node::change_event_expand::ChangeEventExpandNode;
 use crate::exec::node::exchange_source::ExchangeSourceNode;
-use crate::exec::node::fetch::FetchNode;
 use crate::exec::node::filter::FilterNode;
 use crate::exec::node::join::JoinNode;
 use crate::exec::node::limit::LimitNode;
-use crate::exec::node::lookup::LookUpNode;
 use crate::exec::node::nljoin::NestedLoopJoinNode;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::repeat::RepeatNode;
@@ -89,8 +85,6 @@ pub enum ExecNodeKind {
     Limit(LimitNode),
     ExchangeSource(ExchangeSourceNode),
     Scan(ScanNode),
-    Fetch(FetchNode),
-    LookUp(LookUpNode),
     Aggregate(AggregateNode),
     Join(JoinNode),
     NestedLoopJoin(NestedLoopJoinNode),

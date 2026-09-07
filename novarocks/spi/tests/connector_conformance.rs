@@ -29,8 +29,8 @@ use novarocks_spi::connector::{
     ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBinding, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
     ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPredicateDisposition,
     ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
     ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderBinding,
@@ -629,41 +629,6 @@ fn descriptor(instance_id: &str) -> ConnectorInstanceDescriptor {
         provider_id: ConnectorProviderId::parse("file").expect("provider ID"),
         instance_id: ConnectorInstanceId::parse(instance_id).expect("instance ID"),
     }
-}
-
-#[test]
-fn execution_bindings_are_valid_without_control_capabilities() {
-    let key = ConnectorProviderBindingKey {
-        instance_id: ConnectorInstanceId::parse("file").expect("instance ID"),
-        incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
-    };
-    let binding = ConnectorExecutionBinding::try_new(
-        ConnectorProviderId::parse("file").expect("provider ID"),
-        key.clone(),
-        Arc::new(OwnerExecution::new("file")),
-    )
-    .expect("read-only execution binding");
-
-    assert_eq!(binding.key(), &key);
-}
-
-#[test]
-fn execution_binding_rejects_a_read_capability_owned_by_another_generation() {
-    let key = ConnectorProviderBindingKey {
-        instance_id: ConnectorInstanceId::parse("file").expect("instance ID"),
-        incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
-    };
-    assert_eq!(
-        ConnectorExecutionBinding::try_new(
-            ConnectorProviderId::parse("file").expect("provider ID"),
-            key,
-            Arc::new(OwnerExecution::new("foreign")),
-        )
-        .err()
-        .expect("a host must not attach a foreign read capability")
-        .kind(),
-        ConnectorErrorKind::InvalidRequest
-    );
 }
 
 #[test]

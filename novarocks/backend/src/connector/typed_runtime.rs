@@ -2102,15 +2102,8 @@ mod tests {
         );
         let op = bind(&source);
         assert!(
-            op.execute_iter(
-                ScanMorsel::ConnectorScanUnit {
-                    index: 0,
-                    row_position: None,
-                },
-                None,
-                None,
-            )
-            .is_err()
+            op.execute_iter(ScanMorsel::ConnectorScanUnit { index: 0 }, None, None,)
+                .is_err()
         );
         assert!(
             op.build_incremental_morsels(&[IncrementalScanRange::Empty { has_more: None }])

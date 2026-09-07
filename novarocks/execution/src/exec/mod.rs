@@ -25,7 +25,6 @@ pub mod failpoint;
 pub mod fragment;
 pub mod hash_table;
 pub mod hll;
-pub mod lookup;
 pub mod min_max_predicate;
 pub mod mv;
 pub mod node;

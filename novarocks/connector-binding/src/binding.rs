@@ -32,8 +32,7 @@ use novarocks_spi::connector::write_stack::{
     ConnectorWriteExecution as ConnectorWriteStackExecution,
 };
 use novarocks_spi::connector::{
-    CatalogProviderKind, CatalogWriteExecution, ConnectorControlBinding, ConnectorError,
-    ConnectorExecutionBinding, ConnectorWriteControl,
+    CatalogProviderKind, ConnectorControlBinding, ConnectorError, ConnectorWriteControl,
 };
 
 use crate::{ConnectorMaterializationError, MaterializationContext, NormalizedCatalogProperties};
@@ -258,7 +257,6 @@ impl ConnectorExecutionReadBinding {
 /// the fragments it produces, and it is given no commit authority at all.
 #[derive(Clone)]
 pub struct ConnectorExecutionWriteBinding {
-    write: Arc<dyn CatalogWriteExecution>,
     execution: Arc<dyn ConnectorWriteStackExecution>,
     handle_decoder: Arc<dyn ConnectorWriteHandleDecoder>,
     fragment_encoder: Arc<dyn ConnectorWriteFragmentEncoder>,
@@ -266,21 +264,15 @@ pub struct ConnectorExecutionWriteBinding {
 
 impl ConnectorExecutionWriteBinding {
     pub fn new(
-        write: Arc<dyn CatalogWriteExecution>,
         execution: Arc<dyn ConnectorWriteStackExecution>,
         handle_decoder: Arc<dyn ConnectorWriteHandleDecoder>,
         fragment_encoder: Arc<dyn ConnectorWriteFragmentEncoder>,
     ) -> Self {
         Self {
-            write,
             execution,
             handle_decoder,
             fragment_encoder,
         }
-    }
-
-    pub fn write(&self) -> Arc<dyn CatalogWriteExecution> {
-        Arc::clone(&self.write)
     }
 
     /// Opens one writer per driver. It has no begin, finish, abort, or
@@ -303,7 +295,6 @@ impl ConnectorExecutionWriteBinding {
 // Design: ADR-0130 (docs/adr/ADR-0130-connector-role-binding-generation-ownership.md)
 pub struct ConnectorExecutionRoleBinding {
     properties: NormalizedCatalogProperties,
-    execution: Option<ConnectorExecutionBinding>,
     read: Option<ConnectorExecutionReadBinding>,
     write: Option<ConnectorExecutionWriteBinding>,
 }
@@ -311,45 +302,11 @@ pub struct ConnectorExecutionRoleBinding {
 impl ConnectorExecutionRoleBinding {
     pub fn try_new(
         properties: NormalizedCatalogProperties,
-        execution: Option<ConnectorExecutionBinding>,
         read: Option<ConnectorExecutionReadBinding>,
         write: Option<ConnectorExecutionWriteBinding>,
     ) -> Result<Self, ConnectorError> {
-        if let Some(execution) = execution.as_ref() {
-            if execution.key().instance_id != *properties.handle().catalog_name()
-                || execution.provider_id().as_str() != properties.provider_kind().provider_id()
-            {
-                return Err(ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                    "execution role binding owner does not match normalized catalog properties",
-                ));
-            }
-        }
-        if read.is_some()
-            != execution
-                .as_ref()
-                .and_then(ConnectorExecutionBinding::read)
-                .is_some()
-        {
-            return Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                "execution role binding read group does not match generic execution capability",
-            ));
-        }
-        if write.is_some()
-            != execution
-                .as_ref()
-                .and_then(ConnectorExecutionBinding::write)
-                .is_some()
-        {
-            return Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                "execution role binding write group does not match generic execution capability",
-            ));
-        }
         Ok(Self {
             properties,
-            execution,
             read,
             write,
         })
@@ -357,10 +314,6 @@ impl ConnectorExecutionRoleBinding {
 
     pub const fn properties(&self) -> &NormalizedCatalogProperties {
         &self.properties
-    }
-
-    pub const fn execution(&self) -> Option<&ConnectorExecutionBinding> {
-        self.execution.as_ref()
     }
 
     pub const fn read(&self) -> Option<&ConnectorExecutionReadBinding> {

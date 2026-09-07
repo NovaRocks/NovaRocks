@@ -18,14 +18,6 @@ use super::{
     inconsistent, missing, nest, out_of_range,
 };
 
-/// Canonical bytes of one scheduled split.
-///
-/// Connector-read maps are generated as `BTreeMap`, and prost emits fields in
-/// tag order, so this encoding is stable for a given message value.
-pub fn canonical_scheduled_split_bytes(split: &dto::ScheduledSplit) -> Vec<u8> {
-    split.encode_to_vec()
-}
-
 /// One structurally validated split placed in one task's plan-node queue.
 #[derive(Clone, Debug)]
 pub struct ScheduledSplit {

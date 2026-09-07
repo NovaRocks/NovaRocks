@@ -54,7 +54,7 @@ use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkK
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeEdgeGates, ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort,
-    FragmentEvent, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
+    FragmentEvent, FragmentEventSink, FragmentResultWriter,
 };
 use novarocks_execution::runtime::fragment::{
     DormantFragmentHandle, FragmentCancelReason, FragmentOutcome, FragmentTerminalFact,
@@ -369,7 +369,6 @@ pub struct NativeTaskExecutionHost {
     context_facts: Arc<dyn TaskQueryContextFacts>,
     capabilities: Arc<TaskInboundCapabilities>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-    lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     commit_port: Arc<dyn FragmentCommitPort>,
@@ -540,7 +539,6 @@ impl NativeTaskExecutionHost {
         context_facts: Arc<dyn TaskQueryContextFacts>,
         capabilities: Arc<TaskInboundCapabilities>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         commit_port: Arc<dyn FragmentCommitPort>,
@@ -551,7 +549,6 @@ impl NativeTaskExecutionHost {
             context_facts,
             capabilities,
             exchange_transmitter,
-            lookup_client,
             result_writer,
             exchange_receiver_port,
             commit_port,
@@ -915,7 +912,6 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .into_prepare_context(
                 profiler,
                 Arc::clone(&self.exchange_transmitter),
-                Arc::clone(&self.lookup_client),
                 Arc::clone(&self.result_writer),
                 event_sink,
             )
@@ -1886,8 +1882,7 @@ mod tests {
             NativeFragmentQueryRuntime::global(),
             facts,
             TaskInboundCapabilities::new(),
-            crate::fragment::grpc_exchange_transmitter(data_runtime.clone()),
-            crate::fragment::grpc_fragment_lookup_client(data_runtime),
+            crate::fragment::grpc_exchange_transmitter(data_runtime),
             crate::fragment::native_result_writer(),
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(crate::runtime::sink_commit::BackendSinkCommitPort),

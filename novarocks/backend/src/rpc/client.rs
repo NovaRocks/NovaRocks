@@ -212,27 +212,6 @@ impl BackendRpcClient {
             Ok(())
         })
     }
-
-    pub(crate) fn lookup(
-        &self,
-        request: filter::LookupRequest,
-    ) -> Result<filter::LookupResponse, String> {
-        let endpoint = self.endpoint.clone();
-        let mut client = self
-            .make_client()
-            .map_err(|error| format!("lookup connect failed: dest={endpoint} error={error}"))?;
-        self.runtime
-            .block_on(async move {
-                client
-                    .lookup(request)
-                    .await
-                    .map(|response| response.into_inner())
-                    .map_err(|error| {
-                        format!("lookup request failed: dest={endpoint} error={error}")
-                    })
-            })
-            .map_err(|error| format!("lookup runtime execution failed: {error}"))
-    }
 }
 
 fn channel_endpoint(

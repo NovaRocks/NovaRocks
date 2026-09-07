@@ -46,10 +46,6 @@ service NovaRocksGrpc {
   // Native runtime-filter envelope propagation.
   rpc TransmitRuntimeFilterEnvelope(novarocks.filter.RuntimeFilterEnvelope)
       returns (novarocks.filter.RuntimeFilterEnvelopeResponse);
-  // Point lookup (fetch-by-key).
-  rpc Lookup(novarocks.filter.LookupRequest)
-      returns (novarocks.filter.LookupResponse);
-
   // Coordinator polls a fragment instance for result batches.
   rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
   // Coordinator publishes one complete catalog reachability snapshot. This is
