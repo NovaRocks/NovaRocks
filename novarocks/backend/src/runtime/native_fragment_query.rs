@@ -31,19 +31,16 @@ use crate::runtime::query_context::{
     QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
 };
 use crate::runtime::sink_commit::BackendSinkCommitPort;
-use novarocks_execution::exec::node::scan::ConnectorRowPositionLookup;
 use novarocks_execution::exec::node::scan::ScanOp;
 use novarocks_execution::exec::operators::scan::ScanDispatchState;
 use novarocks_execution::runtime::fragment::FragmentPrepareContext;
 use novarocks_execution::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentLookupClient, FragmentResultWriter,
-    ScanRegistrationPort,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter, ScanRegistrationPort,
 };
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_types::SlotId;
 use novarocks_types::UniqueId;
 
 #[derive(Clone)]
@@ -56,16 +53,6 @@ struct QueryContextScanRegistrationPort {
 }
 
 impl ScanRegistrationPort for QueryContextScanRegistrationPort {
-    fn register_row_position_lookup(
-        &self,
-        query_id: QueryId,
-        row_source_slot: SlotId,
-        lookup: ConnectorRowPositionLookup,
-    ) -> Result<(), String> {
-        self.manager
-            .register_connector_glm(query_id, row_source_slot, lookup)
-    }
-
     fn register_incremental_scan(
         &self,
         fragment_instance_id: UniqueId,
@@ -358,7 +345,6 @@ impl NativeFragmentAdmissionResources {
         self,
         profiler: Option<Profiler>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> FragmentPrepareContext {
@@ -367,7 +353,6 @@ impl NativeFragmentAdmissionResources {
             Some(self.fragment_mem_tracker),
             self.runtime_filter,
             exchange_transmitter,
-            lookup_client,
             result_writer,
             event_sink,
         )

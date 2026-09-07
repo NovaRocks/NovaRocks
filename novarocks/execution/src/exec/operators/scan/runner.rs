@@ -30,7 +30,7 @@
 
 use super::dispatch::ScanDispatchState;
 use super::types::{NATIVE_ORDERED_LATE_PRUNED_UNITS, PushResult, ScanAsyncState};
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema, hydrate_dictionary_columns_except};
+use crate::exec::chunk::{Chunk, hydrate_dictionary_columns_except};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::failpoint;
 use crate::exec::node::BoxedExecIter;
@@ -40,15 +40,13 @@ use crate::exec::operators::runtime_filter::{
     NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet,
 };
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::exec::row_position::RowPositionSpec;
 use crate::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime_filter::scan_domain::{
     RuntimeFilterScanUnitDecision, RuntimeFilterScanUnitInput, evaluate_scan_unit,
 };
-use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array};
+use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -134,13 +132,7 @@ pub(super) struct ScanAsyncRunner {
     current_morsel: Option<ScanMorsel>,
     driver_id: i32,
     backend_num: i32,
-    row_position_state: Option<RowPositionState>,
     late_pruned_units: u64,
-}
-
-struct RowPositionState {
-    spec: RowPositionSpec,
-    scan_range_id: i32,
 }
 
 #[allow(
@@ -185,7 +177,6 @@ impl ScanAsyncRunner {
             current_morsel: None,
             driver_id,
             backend_num,
-            row_position_state: None,
             late_pruned_units: 0,
         }
     }
@@ -213,7 +204,6 @@ impl ScanAsyncRunner {
                 let Some(morsel) = morsel else {
                     self.finished = true;
                     self.current_morsel = None;
-                    self.row_position_state = None;
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
@@ -231,7 +221,6 @@ impl ScanAsyncRunner {
                     continue;
                 }
                 self.current_morsel = Some(morsel.clone());
-                self.row_position_state = self.build_row_position_state(&morsel)?;
                 let start = Instant::now();
                 // An `Empty` morsel means there is nothing to read, and is
                 // answered without touching the operator. `OperatorDriven`
@@ -267,7 +256,6 @@ impl ScanAsyncRunner {
                         failpoint::SCAN_CHUNK_SLEEP_AFTER_READ,
                         Duration::from_millis(25),
                     );
-                    let chunk = self.append_row_position_columns(chunk)?;
                     let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
                         continue;
                     };
@@ -326,7 +314,6 @@ impl ScanAsyncRunner {
                 None => {
                     self.morsel_iter = None;
                     self.current_morsel = None;
-                    self.row_position_state = None;
                     self.last_progress = Instant::now();
                     continue;
                 }
@@ -424,107 +411,6 @@ impl ScanAsyncRunner {
             return Ok(None);
         }
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
-    }
-
-    fn build_row_position_state(
-        &self,
-        morsel: &ScanMorsel,
-    ) -> Result<Option<RowPositionState>, String> {
-        let Some(spec) = self.scan.row_position() else {
-            return Ok(None);
-        };
-        if let Some(position) = morsel.connector_row_position() {
-            return Ok(Some(RowPositionState {
-                spec: spec.clone(),
-                scan_range_id: position.scan_range_id,
-            }));
-        }
-        Err("row position requires a connector split with provider-owned row identity".to_string())
-    }
-
-    fn append_row_position_columns(&mut self, chunk: Chunk) -> Result<Chunk, String> {
-        let Some(state) = self.row_position_state.as_mut() else {
-            return Ok(chunk);
-        };
-        let row_count = chunk.len();
-        if row_count == 0 {
-            return Ok(chunk);
-        }
-        let backend_id = self.backend_num;
-        if backend_id < 0 {
-            return Err("backend number is not set for row position".to_string());
-        }
-
-        let row_source_array = Arc::new(Int32Array::from(vec![backend_id; row_count])) as ArrayRef;
-        let scan_range_array =
-            Arc::new(Int32Array::from(vec![state.scan_range_id; row_count])) as ArrayRef;
-
-        let row_id_array = chunk.column_by_slot_id(state.spec.row_id_slot)?;
-        if row_id_array.data_type() != state.spec.row_id_field.data_type() {
-            return Err(format!(
-                "connector row id type {:?} does not match {:?}",
-                row_id_array.data_type(),
-                state.spec.row_id_field.data_type()
-            ));
-        }
-
-        let mut field_map = HashMap::new();
-        let chunk_schema = chunk.schema();
-        for (idx, slot_schema) in chunk.chunk_schema().slots().iter().enumerate() {
-            let field = chunk_schema.field(idx);
-            field_map.insert(slot_schema.slot_id(), (field, slot_schema.clone()));
-        }
-
-        let output_chunk_schema = self.scan.output_chunk_schema();
-        let output_slots = output_chunk_schema.slot_ids();
-        let mut fields = Vec::with_capacity(output_slots.len());
-        let mut columns = Vec::with_capacity(output_slots.len());
-        let mut slot_schemas = Vec::with_capacity(output_slots.len());
-        for slot_id in output_slots {
-            if *slot_id == state.spec.row_source_slot {
-                fields.push(state.spec.row_source_field.clone());
-                columns.push(row_source_array.clone());
-                slot_schemas.push(ChunkSlotSchema::new_with_field(
-                    *slot_id,
-                    state.spec.row_source_field.clone(),
-                    None,
-                    None,
-                ));
-                continue;
-            }
-            if *slot_id == state.spec.scan_range_slot {
-                fields.push(state.spec.scan_range_field.clone());
-                columns.push(scan_range_array.clone());
-                slot_schemas.push(ChunkSlotSchema::new_with_field(
-                    *slot_id,
-                    state.spec.scan_range_field.clone(),
-                    None,
-                    None,
-                ));
-                continue;
-            }
-            if *slot_id == state.spec.row_id_slot {
-                fields.push(state.spec.row_id_field.clone());
-                columns.push(row_id_array.clone());
-                slot_schemas.push(ChunkSlotSchema::new_with_field(
-                    *slot_id,
-                    state.spec.row_id_field.clone(),
-                    None,
-                    None,
-                ));
-                continue;
-            }
-            let (field, slot_schema) = field_map
-                .get(slot_id)
-                .ok_or_else(|| format!("missing field for slot_id {} in scan chunk", slot_id))?;
-            let column = chunk.column_by_slot_id(*slot_id)?;
-            fields.push(field.as_ref().clone());
-            columns.push(column);
-            slot_schemas.push(slot_schema.clone());
-        }
-
-        let _ = fields;
-        Chunk::try_new_with_columns(Arc::new(ChunkSchema::try_new(slot_schemas)?), columns)
     }
 
     fn maybe_log_stall(&mut self, mode: &str) {
@@ -683,7 +569,7 @@ mod tests {
         RuntimeFilterType, RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter,
     };
     use crate::runtime::profile::{OperatorProfiles, Profiler};
-    use arrow::array::{Array, DictionaryArray, Int32Array, Int64Array, StringArray};
+    use arrow::array::{Array, ArrayRef, DictionaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use novarocks_types::SlotId;

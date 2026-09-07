@@ -18,9 +18,7 @@
 pub(crate) mod decode;
 pub(crate) mod ingress;
 mod io;
-mod lookup_io;
 mod result_io;
 
 pub(crate) use io::grpc_exchange_transmitter;
-pub(crate) use lookup_io::grpc_fragment_lookup_client;
 pub(crate) use result_io::native_result_writer;

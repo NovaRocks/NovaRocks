@@ -19,12 +19,10 @@ use std::collections::HashMap;
 
 use prost::Message;
 
-use novarocks_proto_models::{common, expr, filter, novarocks, plan};
+use novarocks_proto_models::{common, expr, novarocks, plan};
 
 const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
-const LOOKUP_REQUEST_FIXTURE_HEX: &str = "0a04080110021021182c220a083710041a0400010203";
-const LOOKUP_RESPONSE_FIXTURE_HEX: &str = "0a0412024f4b120a083710041a0403020100";
 const PLAN_FRAGMENT_FIXTURE_HEX: &str = "0801128b03080a10011a010a28ffffffffffffffffff01426c080b10011a010b28ffffffffffffffffff0152580a0c0801120269641a040a02080552480a047470636812160a086c696e656974656d120a0a02696412040a0208051a086c696e656974656d220c0801120269641a040a0208052a0c0a040a0208015a040a021001320269644256080c10011a010c28ffffffffffffffffff015a42080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791802220c0801120269641a040a0208052a0672656d6f74653202080152b0010a0c0801120269641a040a020805c2019e01080112480a220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b657912220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657920022802324c084d12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657928021a26080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792226080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792a02080132220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65793a0c0801120269641a040a020805";
 const EXPR_FIXTURE_HEX: &str = "0a040a0208016234080a12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a0c0a040a0208055a040a02180a";
 
@@ -362,33 +360,6 @@ fn release_fetch_result_response() -> novarocks::FetchResultResponse {
     }
 }
 
-fn release_lookup_request() -> filter::LookupRequest {
-    filter::LookupRequest {
-        query_id: Some(id(1, 2)),
-        lookup_node_id: 33,
-        request_tuple_id: 44,
-        request_columns: vec![filter::Column {
-            slot_id: 55,
-            data_size: 4,
-            data: vec![0, 1, 2, 3],
-        }],
-    }
-}
-
-fn release_lookup_response() -> filter::LookupResponse {
-    filter::LookupResponse {
-        status: Some(common::Status {
-            code: 0,
-            message: "OK".to_string(),
-        }),
-        columns: vec![filter::Column {
-            slot_id: 55,
-            data_size: 4,
-            data: vec![3, 2, 1, 0],
-        }],
-    }
-}
-
 fn release_expr() -> expr::Expr {
     expr::Expr {
         r#type: Some(scalar_type(common::PrimitiveType::Boolean)),
@@ -422,8 +393,6 @@ fn print_fixture<M: Message>(name: &str, message: &M) {
 fn print_release_fixture_hex() {
     print_fixture("TASK_FRAGMENT_PLAN", &release_task_fragment_plan());
     print_fixture("FETCH_RESULT_RESPONSE", &release_fetch_result_response());
-    print_fixture("LOOKUP_REQUEST", &release_lookup_request());
-    print_fixture("LOOKUP_RESPONSE", &release_lookup_response());
     print_fixture("PLAN_FRAGMENT", &release_plan_fragment());
     print_fixture("EXPR", &release_expr());
 }
@@ -574,24 +543,6 @@ fn release_fetch_result_response_fixture_decodes() {
     assert_eq!(response.result_arrow_ipc, b"NRX1-fixture");
     assert_eq!(response.packet_seq, 9);
     assert!(response.eos, "FetchResultResponse fixture eos");
-}
-
-#[test]
-fn release_lookup_fixtures_decode() {
-    let request: filter::LookupRequest =
-        decode_fixture("LookupRequest", LOOKUP_REQUEST_FIXTURE_HEX);
-    assert_eq!(request.query_id.as_ref().expect("lookup query_id").hi, 1);
-    assert_eq!(request.lookup_node_id, 33);
-    assert_eq!(request.request_tuple_id, 44);
-    assert_eq!(request.request_columns.len(), 1);
-    assert_eq!(request.request_columns[0].slot_id, 55);
-    assert_eq!(request.request_columns[0].data, vec![0, 1, 2, 3]);
-
-    let response: filter::LookupResponse =
-        decode_fixture("LookupResponse", LOOKUP_RESPONSE_FIXTURE_HEX);
-    assert_eq!(response.status.as_ref().expect("lookup status").code, 0);
-    assert_eq!(response.columns.len(), 1);
-    assert_eq!(response.columns[0].data, vec![3, 2, 1, 0]);
 }
 
 #[test]

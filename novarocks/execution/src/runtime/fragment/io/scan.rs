@@ -17,11 +17,8 @@
 
 use std::sync::Arc;
 
-use crate::exec::node::scan::ConnectorRowPositionLookup;
 use crate::exec::node::scan::ScanOp;
 use crate::exec::operators::scan::ScanDispatchState;
-use novarocks_types::QueryId;
-use novarocks_types::SlotId;
 use novarocks_types::UniqueId;
 
 /// Host-owned registration capability needed by scan operators.
@@ -30,13 +27,6 @@ use novarocks_types::UniqueId;
 /// kernel. Backend admission supplies this narrow port for the two scan
 /// registrations that must remain visible to the query owner.
 pub trait ScanRegistrationPort: Send + Sync + 'static {
-    fn register_row_position_lookup(
-        &self,
-        query_id: QueryId,
-        row_source_slot: SlotId,
-        lookup: ConnectorRowPositionLookup,
-    ) -> Result<(), String>;
-
     fn register_incremental_scan(
         &self,
         fragment_instance_id: UniqueId,
@@ -50,15 +40,6 @@ pub trait ScanRegistrationPort: Send + Sync + 'static {
 pub struct UnavailableScanRegistrationPort;
 
 impl ScanRegistrationPort for UnavailableScanRegistrationPort {
-    fn register_row_position_lookup(
-        &self,
-        _query_id: QueryId,
-        _row_source_slot: SlotId,
-        _lookup: ConnectorRowPositionLookup,
-    ) -> Result<(), String> {
-        Err("scan registration port is unavailable".to_string())
-    }
-
     fn register_incremental_scan(
         &self,
         _fragment_instance_id: UniqueId,

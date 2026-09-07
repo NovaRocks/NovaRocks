@@ -56,10 +56,7 @@ pub use catalog::{
     MAX_CATALOG_PROPERTY_KEY_BYTES, MAX_CATALOG_PROPERTY_VALUE_BYTES, MAX_CATALOG_SET_BYTES,
     MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES, MAX_REACHABLE_CATALOGS_PER_PRUNE,
 };
-pub use catalog_runtime::{
-    CatalogRuntime, CatalogRuntimeMaterializer, CatalogWriteExecution, CatalogWriteExecutionBundle,
-    CatalogWriteExecutionBundleFactory,
-};
+pub use catalog_runtime::{CatalogRuntime, CatalogRuntimeMaterializer};
 pub use cleanup_maintenance::{
     BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
     CandidatePage, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,
@@ -137,9 +134,9 @@ pub use domain_facts::{
 };
 pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
 pub use execution::{
-    ConnectorExecutionBinding, ConnectorExecutionResolver, ConnectorPrepareSplitRequest,
-    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
-    ConnectorReadExecution, MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorReadExecution,
+    MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
 };
 pub use handle::{
     ConnectorPinnedFileSet, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
@@ -299,12 +296,11 @@ pub use write::{
     ConnectorStagedPublicationBaseFact, ConnectorWriteAbortOutcome, ConnectorWriteActivationIntent,
     ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
     ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteCohortDescriptor,
-    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteExecution,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
-    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteReceipt,
-    ConnectorWriteTargetRef, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
+    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
+    ConnectorWriteFieldRequest, ConnectorWriteFieldToken, ConnectorWriteInputRequest,
+    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
+    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    ConnectorWriteReceipt, ConnectorWriteTargetRef, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
     DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES, MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTIES,
     MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTY_BYTES, MAX_CONNECTOR_MANAGED_DESCRIPTOR_TOTAL_BYTES,
     MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS,

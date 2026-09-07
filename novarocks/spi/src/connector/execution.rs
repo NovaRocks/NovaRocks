@@ -22,9 +22,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
-    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
-    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsSummary, ConnectorSplit,
-    ConnectorWriteExecution,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
+    ConnectorScanUnitFactsSummary, ConnectorSplit,
 };
 
 /// A hard bound on the independently schedulable physical leaves carried by
@@ -426,75 +425,4 @@ pub trait ConnectorReadExecution: Send + Sync {
         unit: &ConnectorPreparedScanUnit,
         request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError>;
-}
-
-/// Startup-composed BE execution binding. The provider ID is retained only to
-/// validate installer output and for redacted diagnostics; it never travels in
-/// a fragment carrier.
-pub struct ConnectorExecutionBinding {
-    provider_id: ConnectorProviderId,
-    key: ConnectorProviderBindingKey,
-    read: Option<Arc<dyn ConnectorReadExecution>>,
-    write: Option<Arc<dyn ConnectorWriteExecution>>,
-}
-
-impl ConnectorExecutionBinding {
-    pub fn try_new(
-        provider_id: ConnectorProviderId,
-        key: ConnectorProviderBindingKey,
-        read: Arc<dyn ConnectorReadExecution>,
-    ) -> Result<Self, ConnectorError> {
-        Self::try_new_capabilities(provider_id, key, Some(read), None)
-    }
-
-    pub fn try_new_capabilities(
-        provider_id: ConnectorProviderId,
-        key: ConnectorProviderBindingKey,
-        read: Option<Arc<dyn ConnectorReadExecution>>,
-        write: Option<Arc<dyn ConnectorWriteExecution>>,
-    ) -> Result<Self, ConnectorError> {
-        if read.is_none() && write.is_none() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector execution binding requires at least one capability",
-            ));
-        }
-        if read.as_ref().is_some_and(|read| read.binding_key() != &key) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector read execution owner does not match its execution binding",
-            ));
-        }
-        Ok(Self {
-            provider_id,
-            key,
-            read,
-            write,
-        })
-    }
-
-    pub fn provider_id(&self) -> &ConnectorProviderId {
-        &self.provider_id
-    }
-
-    pub fn key(&self) -> &ConnectorProviderBindingKey {
-        &self.key
-    }
-
-    pub fn read(&self) -> Option<&Arc<dyn ConnectorReadExecution>> {
-        self.read.as_ref()
-    }
-
-    pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteExecution>> {
-        self.write.as_ref()
-    }
-}
-
-/// A resolver scoped to one admitted BE query. Generic native decode receives
-/// only this interface and therefore cannot install or select providers.
-pub trait ConnectorExecutionResolver: Send + Sync {
-    fn resolve(
-        &self,
-        key: &ConnectorProviderBindingKey,
-    ) -> Result<Arc<ConnectorExecutionBinding>, ConnectorError>;
 }

@@ -210,8 +210,6 @@ pub fn prepare_compiled_distributed_query(
             execution,
         )?,
     )?;
-    let connector_static_planning =
-        crate::query_execution::compiler::connector_static_planning_metrics(&prepared)?;
     let distributed_intent = match &completion_intent {
         PostCompileIntent::Result => {
             crate::query_execution::contract::DistributedQueryIntent::Result
@@ -229,7 +227,6 @@ pub fn prepare_compiled_distributed_query(
             distributed_plan.clone(),
             planning_elapsed,
             execution_started_at,
-            connector_static_planning,
         ),
     };
     let assembly = PreparedDistributedQueryAssembly::new(

@@ -314,7 +314,6 @@ struct PreparedProfileFormatter {
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,
     planning_elapsed: std::time::Duration,
     execution_started_at: std::time::Instant,
-    connector_static_planning: crate::query_execution::profile::ConnectorStaticPlanningMetrics,
 }
 
 impl PreparedQueryCompletion {
@@ -328,14 +327,12 @@ impl PreparedQueryCompletion {
         distributed_plan: novarocks_sql::plan_read::DistributedPlan,
         planning_elapsed: std::time::Duration,
         execution_started_at: std::time::Instant,
-        connector_static_planning: crate::query_execution::profile::ConnectorStaticPlanningMetrics,
     ) -> Self {
         Self {
             formatter: PreparedQueryFormatter::Profile(PreparedProfileFormatter {
                 distributed_plan,
                 planning_elapsed,
                 execution_started_at,
-                connector_static_planning,
             }),
         }
     }
@@ -406,9 +403,6 @@ fn complete_profile(
         )
     {
         lines.push(apply.to_string());
-    }
-    if !formatter.connector_static_planning.is_empty() {
-        lines.push(formatter.connector_static_planning.to_string());
     }
     for (names, label) in [
         (

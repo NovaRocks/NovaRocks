@@ -2,7 +2,7 @@ use prost::Message;
 use prost_reflect::DescriptorPool;
 
 use novarocks_proto_models::{
-    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, catalog, common, expr, filter, novarocks, plan,
+    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, catalog, common, expr, novarocks, plan,
 };
 
 #[test]
@@ -12,7 +12,6 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
     let _ = common::UniqueId::default();
     let _ = catalog::CatalogSet::default();
     let _ = expr::Expr::default();
-    let _ = filter::LookupRequest::default();
     let _ = plan::PlanFragment::default();
     let _ = novarocks::CreateTaskRequest::default();
 

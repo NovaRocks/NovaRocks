@@ -23,8 +23,6 @@
 mod common;
 #[path = "proto_contract/expr.rs"]
 mod expr;
-#[path = "proto_contract/filter.rs"]
-mod filter;
 #[path = "proto_contract/instance_params.rs"]
 mod instance_params;
 #[path = "proto_contract/plan.rs"]

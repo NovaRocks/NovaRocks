@@ -14,19 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::BoxedExecIter;
-use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::runtime::cache::ExternalDataCacheRangeOptions;
 use crate::runtime::profile::RuntimeProfile;
-use novarocks_spi::connector::{
-    ConnectorExecutionBinding, ConnectorPreparedScanUnit, ConnectorSplit,
-};
+use novarocks_spi::connector::ConnectorPreparedScanUnit;
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -43,7 +39,6 @@ pub enum ScanMorsel {
     /// payload appears in the core morsel contract.
     ConnectorScanUnit {
         index: usize,
-        row_position: Option<ConnectorRowPosition>,
     },
     Schema {
         table_name: String,
@@ -75,54 +70,11 @@ impl ScanMorsel {
                 "path={} file_len={} offset={} length={} scan_range_id={} external_datacache={:?}",
                 path, file_len, offset, length, scan_range_id, external_datacache,
             ),
-            ScanMorsel::ConnectorScanUnit {
-                index,
-                row_position,
-            } => format!(
-                "connector_scan_unit_index={index} row_position_range={}",
-                row_position
-                    .as_ref()
-                    .map(|position| position.scan_range_id.to_string())
-                    .unwrap_or_else(|| "none".to_string())
-            ),
+            ScanMorsel::ConnectorScanUnit { index } => format!("connector_scan_unit_index={index}"),
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
             ScanMorsel::OperatorDriven => "operator_driven".to_string(),
             ScanMorsel::Empty => "empty".to_string(),
         }
-    }
-
-    pub fn connector_row_position(&self) -> Option<&ConnectorRowPosition> {
-        match self {
-            Self::ConnectorScanUnit { row_position, .. } => row_position.as_ref(),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConnectorRowPosition {
-    pub scan_range_id: i32,
-}
-
-/// Query-local core binding for an engine late-materialization lookup. It is
-/// deliberately provider-neutral: the split remains opaque and the bound
-/// instance owns every table-format read semantic.
-#[derive(Clone)]
-pub struct ConnectorRowPositionLookup {
-    pub binding: Arc<ConnectorExecutionBinding>,
-    pub splits: HashMap<i32, ConnectorSplit>,
-}
-
-impl ConnectorRowPositionLookup {
-    pub fn new_execution(
-        binding: Arc<ConnectorExecutionBinding>,
-        splits: HashMap<i32, ConnectorSplit>,
-    ) -> Self {
-        Self { binding, splits }
-    }
-
-    pub fn splits(&self) -> impl Iterator<Item = (&i32, &ConnectorSplit)> {
-        self.splits.iter()
     }
 }
 
@@ -399,8 +351,6 @@ pub struct ScanNode {
     /// When set, scan operators will stop reading new morsels after outputting this many rows.
     limit: Option<usize>,
     accept_empty_scan_ranges: bool,
-    row_position: Option<RowPositionSpec>,
-    connector_row_position_lookup: Option<ConnectorRowPositionLookup>,
 }
 
 /// Test-only static source that binds to a fixed, pre-built op regardless of
@@ -425,8 +375,6 @@ impl ScanNode {
             connector_io_tasks_per_scan_operator: None,
             limit: None,
             accept_empty_scan_ranges: false,
-            row_position: None,
-            connector_row_position_lookup: None,
         }
     }
 
@@ -492,19 +440,6 @@ impl ScanNode {
         self
     }
 
-    pub fn with_row_position(mut self, spec: Option<RowPositionSpec>) -> Self {
-        self.row_position = spec;
-        self
-    }
-
-    pub fn with_connector_row_position_lookup(
-        mut self,
-        lookup: Option<ConnectorRowPositionLookup>,
-    ) -> Self {
-        self.connector_row_position_lookup = lookup;
-        self
-    }
-
     pub fn node_id(&self) -> Option<i32> {
         self.node_id
     }
@@ -550,14 +485,6 @@ impl ScanNode {
     pub fn accept_empty_scan_ranges(&self) -> bool {
         self.accept_empty_scan_ranges
     }
-
-    pub fn row_position(&self) -> Option<&RowPositionSpec> {
-        self.row_position.as_ref()
-    }
-
-    pub fn connector_row_position_lookup(&self) -> Option<&ConnectorRowPositionLookup> {
-        self.connector_row_position_lookup.as_ref()
-    }
 }
 
 impl std::fmt::Debug for ScanNode {
@@ -572,7 +499,7 @@ impl std::fmt::Debug for ScanNode {
 mod tests {
     use std::sync::Arc;
 
-    use super::{ConnectorRowPosition, RuntimeFilterContext, ScanMorsel};
+    use super::RuntimeFilterContext;
     use crate::exec::runtime_filter::{RuntimeFilterType, RuntimeMinMaxFilter};
 
     #[test]
@@ -590,17 +517,5 @@ mod tests {
         );
 
         assert_eq!(ctx.min_max_filters().len(), 1);
-    }
-
-    #[test]
-    fn connector_scan_unit_keeps_only_generic_row_position_metadata() {
-        let morsel = ScanMorsel::ConnectorScanUnit {
-            index: 3,
-            row_position: Some(ConnectorRowPosition { scan_range_id: 5 }),
-        };
-        assert_eq!(
-            morsel.connector_row_position(),
-            Some(&ConnectorRowPosition { scan_range_id: 5 })
-        );
     }
 }

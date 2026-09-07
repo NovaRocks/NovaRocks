@@ -128,7 +128,6 @@ fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32,
             }
         }
         ExecNodeKind::Limit(value) => collect_incremental_scan_contracts(&value.input, output),
-        ExecNodeKind::Fetch(value) => collect_incremental_scan_contracts(&value.input, output),
         ExecNodeKind::Aggregate(value) => collect_incremental_scan_contracts(&value.input, output),
         ExecNodeKind::Join(value) => {
             collect_incremental_scan_contracts(&value.left, output);
@@ -159,7 +158,7 @@ fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32,
                 collect_incremental_scan_contracts(input, output);
             }
         }
-        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) | ExecNodeKind::LookUp(_) => {}
+        ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) => {}
     }
 }
 
@@ -219,8 +218,6 @@ impl ProgramInventory {
                 }
                 Ok(())
             }
-            ExecNodeKind::Fetch(node) => self.visit(&node.input),
-            ExecNodeKind::LookUp(_) => Ok(()),
             ExecNodeKind::Aggregate(node) => self.visit(&node.input),
             ExecNodeKind::Join(node) => {
                 self.visit(&node.left)?;
@@ -603,7 +600,6 @@ mod tests {
     };
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::exchange_source::ExchangeSourceNode;
-    use crate::exec::node::fetch::FetchNode;
     use crate::exec::node::filter::FilterNode;
     use crate::exec::node::join::{
         JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
@@ -2013,44 +2009,6 @@ mod tests {
             BTreeMap::new(),
         );
         FragmentSubmission::try_new(program, instance).expect("set op child scan");
-    }
-
-    #[test]
-    fn compat_fetch_wrapper_is_traversed() {
-        let id = FragmentNodeId::new(10);
-        let output_schema = Arc::new(ChunkSchema::empty());
-        let plan = ExecPlan {
-            arena: ExprArena::default(),
-            root: ExecNode {
-                kind: ExecNodeKind::Fetch(FetchNode {
-                    input: Box::new(scan_node(Some(10))),
-                    node_id: 30,
-                    target_node_id: 10,
-                    row_pos_descs: HashMap::new(),
-                    output_slots_by_tuple: HashMap::new(),
-                    nodes_info: None,
-                    output_chunk_schema: output_schema,
-                }),
-            },
-        };
-        let program = program_with(
-            plan,
-            result_sink(),
-            BTreeMap::from([(id, ScanAssignmentKind::File)]),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        );
-        let instance = instance_with(
-            FragmentContractVersion::CURRENT,
-            query_id(1, 2),
-            uid(1, 62),
-            BTreeMap::from([(id, ScanAssignmentKind::File)]),
-            BTreeMap::new(),
-            FragmentSinkAssignment::None,
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
-        FragmentSubmission::try_new(program, instance).expect("fetch child scan");
     }
 
     use std::sync::atomic::{AtomicI64, Ordering};

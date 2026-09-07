@@ -62,13 +62,9 @@ use crate::exec::operators::hashjoin::partitioned_join_shared::PartitionedJoinSh
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
-use crate::runtime::fragment::io::FragmentLookupClient;
-#[cfg(test)]
-use crate::runtime::fragment::io::UnavailableFragmentLookupClient;
 
 use super::operator_factory::OperatorFactory;
 use crate::exec::operators::AssertNumRowsProcessorFactory;
-use crate::exec::operators::FetchProcessorFactory;
 use crate::exec::operators::analytic_shared::AnalyticSharedState;
 use crate::exec::operators::local_exchanger::{LocalExchangePartitionSpec, LocalExchanger};
 use crate::exec::operators::runtime_filter::NativeRuntimeFilterProcessorFactory;
@@ -78,11 +74,10 @@ use crate::exec::operators::{
     BroadcastJoinProbeProcessorFactory, ChangeEventExpandProcessorFactory, ExceptSinkFactory,
     ExceptSourceFactory, ExchangeSourceFactory, FilterProcessorFactory, HashJoinBuildSinkFactory,
     IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory, LocalExchangeSinkFactory,
-    LocalExchangeSourceFactory, LookUpSourceFactory, PartitionedJoinProbeProcessorFactory,
-    ProjectProcessorFactory, RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory,
-    TableFinishOperatorFactory, TableFunctionProcessorFactory, TableWriterOperatorFactory,
-    UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory, UnpivotProcessorFactory,
-    ValuesSourceFactory,
+    LocalExchangeSourceFactory, PartitionedJoinProbeProcessorFactory, ProjectProcessorFactory,
+    RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory, TableFinishOperatorFactory,
+    TableFunctionProcessorFactory, TableWriterOperatorFactory, UnionAllSharedState,
+    UnionAllSinkFactory, UnionAllSourceFactory, UnpivotProcessorFactory, ValuesSourceFactory,
 };
 use crate::exec::operators::{ExceptSharedState, IntersectSharedState, SetOpStageController};
 use crate::exec::operators::{
@@ -116,7 +111,6 @@ struct PipelineBuildContext {
     runtime_filter_execution: PipelineRuntimeFilterExecution,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
-    lookup_client: Arc<dyn FragmentLookupClient>,
     next_pipeline_id: i32,
     pipeline_dop: i32,
     operator_buffer_chunks: usize,
@@ -180,7 +174,6 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_dop(
         pipeline_dop,
         None,
         PipelineRuntimeFilterExecution { session: None },
-        Arc::new(UnavailableFragmentLookupClient),
         crate::exec::expr::agg::test_builtin_execution_function_set(),
         1,
         1,
@@ -240,37 +233,6 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
     root_sink_dop: Option<i32>,
     session: Option<execution::RuntimeFilterSessionRef>,
 ) -> Result<PipelineGraph, String> {
-    build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session_and_lookup_client(
-        plan,
-        debug,
-        dep_manager,
-        exchange_finst_id,
-        exchange_bindings,
-        scan_bindings,
-        pipeline_dop,
-        root_sink_dop,
-        session,
-        Arc::new(UnavailableFragmentLookupClient),
-    )
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The pipeline assembly boundary receives every independently-owned runtime service."
-)]
-#[cfg(test)]
-pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_runtime_filter_session_and_lookup_client(
-    plan: &ExecPlan,
-    debug: bool,
-    dep_manager: DependencyManager,
-    exchange_finst_id: Option<(i64, i64)>,
-    exchange_bindings: ExchangeBindings,
-    scan_bindings: ScanBindings,
-    pipeline_dop: i32,
-    root_sink_dop: Option<i32>,
-    session: Option<execution::RuntimeFilterSessionRef>,
-    lookup_client: Arc<dyn FragmentLookupClient>,
-) -> Result<PipelineGraph, String> {
     build_pipeline_graph_in_mode(
         plan,
         debug,
@@ -281,7 +243,6 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_root_sink_dop_and_r
         pipeline_dop,
         root_sink_dop,
         PipelineRuntimeFilterExecution { session },
-        lookup_client,
         crate::exec::expr::agg::test_builtin_execution_function_set(),
         1,
         1,
@@ -304,7 +265,6 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
     session: Option<execution::RuntimeFilterSessionRef>,
-    lookup_client: Arc<dyn FragmentLookupClient>,
     function_set: Arc<SealedExecutionFunctionSet>,
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
@@ -320,7 +280,6 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_settings(
         pipeline_dop,
         root_sink_dop,
         PipelineRuntimeFilterExecution { session },
-        lookup_client,
         function_set,
         operator_buffer_chunks.max(1),
         local_exchange_buffer_mem_limit_per_driver.max(1),
@@ -357,7 +316,6 @@ pub(crate) fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_sess
         pipeline_dop,
         None,
         PipelineRuntimeFilterExecution { session },
-        Arc::new(UnavailableFragmentLookupClient),
         crate::exec::expr::agg::test_builtin_execution_function_set(),
         1,
         1,
@@ -379,7 +337,6 @@ fn build_pipeline_graph_in_mode(
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
     runtime_filter_execution: PipelineRuntimeFilterExecution,
-    lookup_client: Arc<dyn FragmentLookupClient>,
     function_set: Arc<SealedExecutionFunctionSet>,
     operator_buffer_chunks: usize,
     local_exchange_buffer_mem_limit_per_driver: usize,
@@ -393,7 +350,6 @@ fn build_pipeline_graph_in_mode(
         runtime_filter_execution,
         exchange_bindings,
         scan_bindings,
-        lookup_client,
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: operator_buffer_chunks.max(1),
@@ -660,8 +616,6 @@ pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chun
         ExecNodeKind::RuntimeFilterConsumer(consumer) => {
             output_chunk_schema_for_node(&consumer.input)
         }
-        ExecNodeKind::Fetch(fetch) => Some(Arc::clone(&fetch.output_chunk_schema)),
-        ExecNodeKind::LookUp(lookup) => Some(Arc::clone(&lookup.output_chunk_schema)),
         ExecNodeKind::Aggregate(aggregate) => Some(Arc::clone(&aggregate.output_chunk_schema)),
         ExecNodeKind::Join(join) => Some(Arc::clone(&join.join_scope_chunk_schema)),
         ExecNodeKind::NestedLoopJoin(join) => Some(Arc::clone(&join.join_scope_chunk_schema)),
@@ -2001,16 +1955,6 @@ fn build_pipeline_for_node(
                 stream: StreamDesc::any(ctx.pipeline_dop),
             })
         }
-        ExecNodeKind::LookUp(lookup) => {
-            let source: Box<dyn OperatorFactory> =
-                Box::new(LookUpSourceFactory::new(lookup.node_id));
-            let pipeline = new_source_pipeline(ctx, source);
-            Ok(PipelineBuildResult {
-                pipeline,
-                extra_pipelines: Vec::new(),
-                stream: StreamDesc::any(ctx.pipeline_dop),
-            })
-        }
         ExecNodeKind::Scan(scan) => {
             validate_native_consumer_specs(scan.native_runtime_filter_specs(), ctx)?;
             // The bound op is materialized per-instance in `ScanBindings`
@@ -2119,26 +2063,6 @@ fn build_pipeline_for_node(
                 stream: StreamDesc::single(),
             })
         }
-        ExecNodeKind::Fetch(fetch) => {
-            let mut child_build = build_pipeline_for_node(&fetch.input, ctx)?;
-            child_build
-                .pipeline
-                .factories
-                .push(Box::new(FetchProcessorFactory::new(
-                    fetch.node_id,
-                    fetch.target_node_id,
-                    fetch.row_pos_descs.clone(),
-                    fetch.output_slots_by_tuple.clone(),
-                    fetch.nodes_info.clone(),
-                    fetch.output_chunk_schema.clone(),
-                    Arc::clone(&ctx.lookup_client),
-                )));
-            Ok(PipelineBuildResult {
-                pipeline: child_build.pipeline,
-                extra_pipelines: child_build.extra_pipelines,
-                stream: child_build.stream,
-            })
-        }
     }
 }
 
@@ -2192,8 +2116,8 @@ fn build_native_pipeline_graph_for_exec_plan_with_runtime_filter_context(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -2208,10 +2132,12 @@ mod tests {
         AggFunction, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
     };
     use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
-    use crate::exec::node::lookup::LookUpNode;
+    use crate::exec::node::exchange_source::ExchangeSourceNode;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
-    use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
+    use crate::exec::pipeline::binding::{ExchangeBinding, ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::dependency::DependencyManager;
+    use crate::runtime::exchange::ExchangeKey;
+    use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
     use novarocks_types::SlotId;
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
@@ -2229,25 +2155,40 @@ mod tests {
             .expect("resolved builtin aggregate")
     }
 
-    #[allow(
-        dead_code,
-        reason = "Retained as a focused pipeline builder regression fixture."
-    )]
-    fn lookup_node(node_id: i32, output_chunk_schema: ChunkSchemaRef) -> ExecNode {
+    fn exchange_source_node(node_id: i32, output_chunk_schema: ChunkSchemaRef) -> ExecNode {
         ExecNode {
-            kind: ExecNodeKind::LookUp(LookUpNode {
+            kind: ExecNodeKind::ExchangeSource(ExchangeSourceNode::new(
                 node_id,
-                row_pos_descs: HashMap::new(),
+                Duration::from_secs(1),
                 output_chunk_schema,
-            }),
+            )),
         }
+    }
+
+    fn exchange_bindings_for(node_ids: &[i32]) -> ExchangeBindings {
+        let mut bindings = ExchangeBindings::default();
+        for node_id in node_ids {
+            bindings.insert(
+                *node_id,
+                ExchangeBinding {
+                    key: ExchangeKey {
+                        finst_id_hi: 1,
+                        finst_id_lo: 2,
+                        node_id: *node_id,
+                    },
+                    expected_senders: 1,
+                    receiver_port: in_process_test_exchange_receiver_port(),
+                },
+            );
+        }
+        bindings
     }
 
     #[test]
     fn ensure_hash_dedups_redundant_shuffle_for_nested_group_by() {
         // The input must be a dop>1 source so the inner aggregate inserts a local hash shuffle;
         // the outer aggregate must then recognize the input is already partitioned by the same
-        // group keys and skip its own shuffle (dedup). A LookUp source maps to a dop>1 pipeline
+        // group keys and skip its own shuffle (dedup). An exchange source maps to a dop>1 pipeline
         // (StreamDesc::any(ctx.pipeline_dop)); a Values source is dop=1 and would suppress both
         // shuffles, making this assertion vacuous.
         let lookup_input_chunk_schema = chunk_schema_of(
@@ -2271,13 +2212,10 @@ mod tests {
 
         let inner = ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
-                input: Box::new(ExecNode {
-                    kind: ExecNodeKind::LookUp(LookUpNode {
-                        node_id: 0,
-                        row_pos_descs: HashMap::new(),
-                        output_chunk_schema: Arc::clone(&lookup_input_chunk_schema),
-                    }),
-                }),
+                input: Box::new(exchange_source_node(
+                    0,
+                    Arc::clone(&lookup_input_chunk_schema),
+                )),
                 node_id: 0,
                 group_by: vec![k],
                 functions: vec![AggFunction {
@@ -2335,7 +2273,7 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
-            ExchangeBindings::default(),
+            exchange_bindings_for(&[0]),
             ScanBindings::default(),
             2,
         )
@@ -2367,13 +2305,10 @@ mod tests {
             arena: ExprArena::default(),
             root: ExecNode {
                 kind: ExecNodeKind::AssertNumRows(AssertNumRowsNode {
-                    input: Box::new(ExecNode {
-                        kind: ExecNodeKind::LookUp(LookUpNode {
-                            node_id: 0,
-                            row_pos_descs: HashMap::new(),
-                            output_chunk_schema: Arc::clone(&lookup_output_chunk_schema),
-                        }),
-                    }),
+                    input: Box::new(exchange_source_node(
+                        0,
+                        Arc::clone(&lookup_output_chunk_schema),
+                    )),
                     node_id: 11,
                     mode: AssertNumRowsMode::PerKeyAtMostOne {
                         key_slots: vec![row_id_slot],
@@ -2389,7 +2324,7 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
-            ExchangeBindings::default(),
+            exchange_bindings_for(&[0]),
             ScanBindings::default(),
             2,
         )
@@ -2428,13 +2363,10 @@ mod tests {
             arena: ExprArena::default(),
             root: ExecNode {
                 kind: ExecNodeKind::AssertNumRows(AssertNumRowsNode {
-                    input: Box::new(ExecNode {
-                        kind: ExecNodeKind::LookUp(LookUpNode {
-                            node_id: 0,
-                            row_pos_descs: HashMap::new(),
-                            output_chunk_schema: Arc::clone(&lookup_output_chunk_schema),
-                        }),
-                    }),
+                    input: Box::new(exchange_source_node(
+                        0,
+                        Arc::clone(&lookup_output_chunk_schema),
+                    )),
                     node_id: 11,
                     mode: AssertNumRowsMode::Global {
                         desired_num_rows: Some(1),
@@ -2450,7 +2382,7 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
-            ExchangeBindings::default(),
+            exchange_bindings_for(&[0]),
             ScanBindings::default(),
             2,
         )
@@ -2474,11 +2406,7 @@ mod tests {
         let plan = ExecPlan {
             arena: ExprArena::default(),
             root: ExecNode {
-                kind: ExecNodeKind::LookUp(LookUpNode {
-                    node_id: 17,
-                    row_pos_descs: HashMap::new(),
-                    output_chunk_schema: Arc::clone(&lookup_input_chunk_schema),
-                }),
+                kind: exchange_source_node(17, Arc::clone(&lookup_input_chunk_schema)).kind,
             },
         };
 
@@ -2487,7 +2415,7 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
-            ExchangeBindings::default(),
+            exchange_bindings_for(&[17]),
             ScanBindings::default(),
             4,
             Some(1),
@@ -2524,7 +2452,7 @@ mod tests {
         // groups across drivers, otherwise downstream `count(key)` will over-count DISTINCT keys.
         //
         // The input must be a dop>1 source for the aggregate's local-shuffle insertion to fire
-        // (it is gated on `build.pipeline.dop > 1`). A LookUp source maps to a dop>1 pipeline
+        // (it is gated on `build.pipeline.dop > 1`). An exchange source maps to a dop>1 pipeline
         // (StreamDesc::any(ctx.pipeline_dop)); a Values source is dop=1 and would suppress the
         // shuffle, making this assertion vacuous.
         let lookup_input_chunk_schema = chunk_schema_of(
@@ -2548,13 +2476,10 @@ mod tests {
 
         let root = ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
-                input: Box::new(ExecNode {
-                    kind: ExecNodeKind::LookUp(LookUpNode {
-                        node_id: 0,
-                        row_pos_descs: HashMap::new(),
-                        output_chunk_schema: Arc::clone(&lookup_input_chunk_schema),
-                    }),
-                }),
+                input: Box::new(exchange_source_node(
+                    0,
+                    Arc::clone(&lookup_input_chunk_schema),
+                )),
                 node_id: 0,
                 group_by: vec![k],
                 functions: vec![AggFunction {
@@ -2586,7 +2511,7 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
-            ExchangeBindings::default(),
+            exchange_bindings_for(&[0]),
             ScanBindings::default(),
             2,
         )
@@ -2609,7 +2534,7 @@ mod tests {
         // return fewer than N distinct groups after downstream merge/finalize aggregation.
         //
         // The input must be a dop>1 source for the aggregate's local-shuffle insertion to fire
-        // (it is gated on `build.pipeline.dop > 1`). A LookUp source maps to a dop>1 pipeline
+        // (it is gated on `build.pipeline.dop > 1`). An exchange source maps to a dop>1 pipeline
         // (StreamDesc::any(ctx.pipeline_dop)); a Values source is dop=1 and would suppress the
         // shuffle, making this assertion vacuous.
         let lookup_input_chunk_schema = chunk_schema_of(
@@ -2633,13 +2558,10 @@ mod tests {
 
         let root = ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
-                input: Box::new(ExecNode {
-                    kind: ExecNodeKind::LookUp(LookUpNode {
-                        node_id: 0,
-                        row_pos_descs: HashMap::new(),
-                        output_chunk_schema: Arc::clone(&lookup_input_chunk_schema),
-                    }),
-                }),
+                input: Box::new(exchange_source_node(
+                    0,
+                    Arc::clone(&lookup_input_chunk_schema),
+                )),
                 node_id: 0,
                 group_by: vec![k],
                 functions: vec![AggFunction {
@@ -2671,7 +2593,7 @@ mod tests {
             false,
             DependencyManager::new(),
             None,
-            ExchangeBindings::default(),
+            exchange_bindings_for(&[0]),
             ScanBindings::default(),
             2,
         )

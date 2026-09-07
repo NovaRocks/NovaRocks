@@ -932,7 +932,7 @@ mod tests {
             &self,
             properties: &NormalizedCatalogProperties,
         ) -> Result<ConnectorExecutionRoleBinding, ConnectorMaterializationError> {
-            ConnectorExecutionRoleBinding::try_new(properties.clone(), None, None, None)
+            ConnectorExecutionRoleBinding::try_new(properties.clone(), None, None)
                 .map_err(Into::into)
         }
     }

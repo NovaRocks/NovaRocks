@@ -56,7 +56,6 @@ mod update_cow;
 pub mod validation;
 pub mod variant_write;
 pub mod write_control;
-pub mod write_execution;
 pub mod write_fence;
 pub mod write_io;
 mod write_preparation;

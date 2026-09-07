@@ -14,10 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::datatypes::Field;
-
-use novarocks_types::SlotId;
-
 // Iceberg virtual column names (no trailing underscore)
 pub const ROW_SOURCE_ID_COL: &str = "_row_source_id";
 pub const SCAN_RANGE_ID_COL: &str = "_scan_range_id";
@@ -72,38 +68,9 @@ pub fn is_change_op(name: &str) -> bool {
     name.eq_ignore_ascii_case(CHANGE_OP_COL)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RowPositionType {
-    Iceberg,
-}
-
-#[derive(Clone, Debug)]
-pub struct RowPositionDescriptor {
-    pub row_position_type: RowPositionType,
-    pub row_source_slot: SlotId,
-    pub fetch_ref_slots: Vec<SlotId>,
-    pub lookup_ref_slots: Vec<SlotId>,
-}
-
-/// Row position spec for Iceberg V3 tables (scan_range_id + row_id).
-#[derive(Clone, Debug)]
-pub struct RowPositionSpec {
-    pub row_source_slot: SlotId,
-    pub scan_range_slot: SlotId,
-    pub row_id_slot: SlotId,
-    pub row_source_field: Field,
-    pub scan_range_field: Field,
-    pub row_id_field: Field,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn row_position_type_is_thrift_free_domain_enum() {
-        assert_eq!(RowPositionType::Iceberg, RowPositionType::Iceberg);
-    }
 
     #[test]
     fn is_iceberg_row_id_recognizes_name_case_insensitive() {

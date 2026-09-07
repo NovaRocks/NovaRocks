@@ -149,10 +149,6 @@ fn preparation_enumerates_no_split() {
     )
     .expect("typed scan preparation");
 
-    assert!(
-        bindings.connector_reads().next().is_none(),
-        "no opaque connector read with a frozen split list may be produced"
-    );
     let (fragment_id, node_id) = only_scan_node(&bindings);
     let typed = bindings
         .typed_scan(fragment_id, node_id)

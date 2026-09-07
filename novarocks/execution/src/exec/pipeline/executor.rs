@@ -44,9 +44,7 @@ use super::global_driver_executor::{DriverTask, FragmentCompletion};
 use super::operator_factory::OperatorFactory;
 use super::pipeline::Pipeline;
 use crate::runtime::endpoint::RuntimeEndpoint;
-use crate::runtime::fragment::io::{
-    FragmentEventSink, FragmentLookupClient, UnavailableFragmentLookupClient,
-};
+use crate::runtime::fragment::io::FragmentEventSink;
 
 use crate::runtime::profile::{Profiler, ScopedTimer};
 
@@ -307,7 +305,6 @@ pub(crate) fn prepare_pipeline_execution(
         root_sink_dop,
         runtime_filter_session,
         event_sink,
-        Arc::new(UnavailableFragmentLookupClient),
         false,
     )
 }
@@ -327,7 +324,6 @@ pub fn prepare_report_neutral_pipeline_execution(
     root_sink_dop: Option<i32>,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
-    lookup_client: Arc<dyn FragmentLookupClient>,
 ) -> Result<PreparedPipelineExecution, String> {
     prepare_pipeline_execution_inner(
         plan,
@@ -346,7 +342,6 @@ pub fn prepare_report_neutral_pipeline_execution(
         root_sink_dop,
         runtime_filter_session,
         event_sink,
-        lookup_client,
         true,
     )
 }
@@ -369,7 +364,6 @@ fn prepare_pipeline_execution_inner(
     root_sink_dop: Option<i32>,
     runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
     event_sink: Arc<dyn FragmentEventSink>,
-    lookup_client: Arc<dyn FragmentLookupClient>,
     report_neutral: bool,
 ) -> Result<PreparedPipelineExecution, String> {
     let dep_manager = DependencyManager::new();
@@ -386,7 +380,6 @@ fn prepare_pipeline_execution_inner(
         pipeline_dop,
         root_sink_dop,
         runtime_filter_session,
-        lookup_client,
         runtime_state
             .execution_runtime()
             .ok_or_else(|| "native pipeline execution requires an execution runtime".to_string())?

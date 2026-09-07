@@ -29,6 +29,9 @@ use crate::runtime::fragment::error::{
 };
 use crate::runtime::fragment::exchange::materialize_exchange_bindings;
 use crate::runtime::fragment::fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
+use crate::runtime::fragment::io::FragmentEventSink;
+#[cfg(test)]
+use crate::runtime::fragment::io::NoopFragmentEventSink;
 use crate::runtime::fragment::io::{
     ExchangeFrameTransmitter, FragmentResultWriter, ResultPresentation, ResultWriteSpec,
 };
@@ -36,9 +39,6 @@ use crate::runtime::fragment::io::{
     ExchangeReceiverPort, FragmentCommitPort, ScanRegistrationPort,
     UnavailableExchangeReceiverPort, UnavailableFragmentCommitPort,
 };
-use crate::runtime::fragment::io::{FragmentEventSink, FragmentLookupClient};
-#[cfg(test)]
-use crate::runtime::fragment::io::{NoopFragmentEventSink, UnavailableFragmentLookupClient};
 use crate::runtime::fragment::resources::{FragmentResources, ResourceCleanupFaults};
 use crate::runtime::fragment::runtime_state::{
     RuntimeStateInputs, apply_query_option_overrides, build_runtime_state,
@@ -56,7 +56,6 @@ pub struct FragmentPrepareContext {
     mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter: Option<RuntimeFilterSessionRef>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-    lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     event_sink: Arc<dyn FragmentEventSink>,
     result_spec: Option<ResultWriteSpec>,
@@ -211,7 +210,6 @@ impl Default for FragmentPrepareContext {
             runtime_filter: None,
             exchange_transmitter:
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
-            lookup_client: Arc::new(UnavailableFragmentLookupClient),
             edge_gates: None,
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
             event_sink: Arc::new(NoopFragmentEventSink),
@@ -244,7 +242,6 @@ impl FragmentPrepareContext {
         mem_tracker: Option<Arc<MemTracker>>,
         runtime_filter: Option<RuntimeFilterSessionRef>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
@@ -253,7 +250,6 @@ impl FragmentPrepareContext {
             mem_tracker,
             runtime_filter,
             exchange_transmitter,
-            lookup_client,
             result_writer,
             event_sink,
             edge_gates: None,
@@ -318,7 +314,6 @@ impl FragmentPrepareContext {
         profiler: Option<Profiler>,
         mem_tracker: Option<Arc<MemTracker>>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
@@ -327,7 +322,6 @@ impl FragmentPrepareContext {
             mem_tracker,
             None,
             exchange_transmitter,
-            lookup_client,
             result_writer,
             event_sink,
         )
@@ -344,7 +338,6 @@ impl FragmentPrepareContext {
         root_sink_dop: Option<i32>,
         group_execution_scan_dop: Option<i32>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
-        lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
     ) -> Self {
@@ -353,7 +346,6 @@ impl FragmentPrepareContext {
             mem_tracker,
             runtime_filter: None,
             exchange_transmitter,
-            lookup_client,
             result_writer,
             event_sink,
             edge_gates: None,
@@ -742,7 +734,6 @@ pub fn prepare_fragment(
             context.root_sink_dop,
             context.runtime_filter.clone(),
             Arc::clone(&context.event_sink),
-            Arc::clone(&context.lookup_client),
         )
         .map_err(|error| {
             FragmentLaunchError::new(

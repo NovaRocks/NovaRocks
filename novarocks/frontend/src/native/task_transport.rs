@@ -1856,13 +1856,6 @@ mod tests {
             Err(Self::rejected("TransmitRuntimeFilterEnvelope"))
         }
 
-        async fn lookup(
-            &self,
-            _request: Request<filter::LookupRequest>,
-        ) -> Result<Response<filter::LookupResponse>, Status> {
-            Err(Self::rejected("Lookup"))
-        }
-
         async fn fetch_result(
             &self,
             _request: Request<proto::FetchResultRequest>,

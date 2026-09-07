@@ -36,11 +36,10 @@ use novarocks_connector_binding::{
 use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 use novarocks_spi::connector::write_stack::ConnectorWriteExecutionFactory;
 use novarocks_spi::connector::{
-    CatalogProperties, CatalogProviderKind, CatalogWriteExecutionBundleFactory,
-    ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
+    CatalogProperties, CatalogProviderKind, ConnectorControlFactoryRequest, ConnectorError,
+    ConnectorErrorKind,
 };
 
-use crate::IcebergCatalogWriteExecutionFactory;
 use crate::commit::write_stack::codec::{
     IcebergWriteFragmentDecoder, IcebergWriteFragmentEncoder, IcebergWriteHandleDecoder,
     IcebergWriteHandleEncoder,
@@ -49,7 +48,6 @@ use crate::commit::write_stack::control::IcebergWriteSessionControl;
 use crate::commit::write_stack::execution::IcebergWriteStackExecutionFactory;
 use crate::commit::write_stack::runtime::build_write_adapter;
 use crate::connector_factory::IcebergConnectorFactory;
-use crate::file_reader::execution_installer::IcebergExecutionBindingFactory;
 use crate::resources::{IcebergExecutionResources, IcebergMetadataResources};
 use crate::typed_provider_factory::{IcebergTypedProviderFactory, iceberg_descriptor};
 use crate::typed_read::page_source_provider::IcebergPageSourceProviderOptions;
@@ -280,13 +278,6 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         )
         .build(catalog_properties)
         .map_err(ConnectorMaterializationError::from)?;
-        let execution = IcebergExecutionBindingFactory::new(self.resources.clone())
-            .bind_for_catalog_properties(catalog_properties)
-            .map_err(ConnectorMaterializationError::from)?;
-        let typed_write =
-            IcebergCatalogWriteExecutionFactory::new(self.resources.binding().clone())
-                .build(catalog_properties)
-                .map_err(ConnectorMaterializationError::from)?;
         // The write-stack execution and both codec facets are minted from the
         // same immutable catalog generation the read facets above were bound
         // to: one descriptor derived from this exact catalog handle, and one
@@ -304,7 +295,6 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         let read =
             ConnectorExecutionReadBinding::new(typed_read.provider_factory(), typed_read.decoder());
         let write = ConnectorExecutionWriteBinding::new(
-            typed_write.execution(),
             write_execution,
             // The backend's half of each pair, the mirror image of the
             // frontend's: it decodes the handles it is given and encodes the
@@ -312,13 +302,8 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
             Arc::new(IcebergWriteHandleDecoder::new(adapter.clone())),
             Arc::new(IcebergWriteFragmentEncoder::new(adapter)),
         );
-        ConnectorExecutionRoleBinding::try_new(
-            properties.clone(),
-            Some(execution),
-            Some(read),
-            Some(write),
-        )
-        .map_err(ConnectorMaterializationError::from)
+        ConnectorExecutionRoleBinding::try_new(properties.clone(), Some(read), Some(write))
+            .map_err(ConnectorMaterializationError::from)
     }
 }
 
@@ -430,45 +415,14 @@ mod tests {
             .expect("local role binding without catalog I/O");
 
         assert_eq!(binding.properties(), &normalized);
-        assert_eq!(
-            binding
-                .execution()
-                .expect("legacy execution facets")
-                .provider_id()
-                .as_str(),
-            CatalogProviderKind::Iceberg.provider_id()
-        );
-        assert_eq!(
-            binding
-                .execution()
-                .expect("legacy execution facets")
-                .key()
-                .instance_id,
-            *normalized.handle().catalog_name()
-        );
-        assert!(
-            binding
-                .execution()
-                .expect("legacy execution facets")
-                .read()
-                .is_some()
-        );
-        assert!(
-            binding
-                .execution()
-                .expect("legacy execution facets")
-                .write()
-                .is_some()
-        );
         assert!(binding.read().is_some());
 
-        // The four-member write group is complete and every member names the
+        // The three-member write group is complete and every member names the
         // one catalog generation these properties froze.
         let write = binding.write().expect("one complete typed write group");
         let catalog_name = normalized.handle().catalog_name().as_str();
         assert_eq!(write.handle_decoder().owner(), catalog_name);
         assert_eq!(write.fragment_encoder().owner(), catalog_name);
-        assert_eq!(write.write().catalog_handle(), normalized.handle());
         assert_eq!(write.execution().catalog_handle(), normalized.handle());
 
         // The backend's decoder rebuilds a handle bound to that same

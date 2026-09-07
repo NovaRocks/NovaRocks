@@ -2562,14 +2562,6 @@ impl Drop for ConnectorWriteLeaseRelease {
     }
 }
 
-/// The generic "this provider writes" capability marker.
-///
-/// It carries no method: writers are opened, driven and finished through the
-/// write stack's own execution binding. This slot exists only so the execution
-/// role binding can require the generic and typed write groups to agree about
-/// whether a provider writes at all (ADR-0130).
-pub trait ConnectorWriteExecution: Send + Sync {}
-
 fn validate_handle_payload(payload: &Bytes) -> Result<(), ConnectorError> {
     if payload.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES {
         return Err(ConnectorError::new(

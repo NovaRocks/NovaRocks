@@ -22,11 +22,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::runtime::descriptor_snapshot::DescriptorSnapshot;
-use novarocks_execution::exec::node::scan::ConnectorRowPositionLookup;
 use novarocks_execution::exec::node::scan::IncrementalScanRange;
 use novarocks_execution::exec::node::scan::ScanOp;
 use novarocks_execution::exec::operators::scan::dispatch::ScanDispatchState;
-use novarocks_execution::exec::row_position::RowPositionDescriptor;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
 use novarocks_types::SlotId;
@@ -167,25 +165,12 @@ pub(crate) struct QueryContext {
     pub(crate) query_expire: Duration,
     #[allow(dead_code)]
     pub(crate) query_deadline: Instant,
-    pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
-    pub(crate) lookup_fetchers: HashMap<i32, LookupFetcherLifecycle>,
-    pub(crate) connector_glm_contexts: HashMap<SlotId, ConnectorRowPositionLookup>,
     pub(crate) mem_tracker: Arc<MemTracker>,
     cleanup_leases: Vec<QueryCleanupLease>,
 }
 
 #[derive(Default)]
 struct RuntimeFilterQueryCancellationAction;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "Lookup-fetcher lifecycle states are retained for connector lookup integrations outside the backend lib test configuration."
-)]
-pub enum LookupFetcherLifecycle {
-    Exact(usize),
-    Unknown,
-}
 
 #[allow(
     dead_code,
@@ -227,9 +212,6 @@ impl QueryContext {
             delivery_deadline: now + delivery_expire,
             query_expire,
             query_deadline: now + query_expire,
-            row_pos_descs: HashMap::new(),
-            lookup_fetchers: HashMap::new(),
-            connector_glm_contexts: HashMap::new(),
             mem_tracker,
             cleanup_leases: Vec::new(),
         }
@@ -273,10 +255,6 @@ impl QueryContext {
 
     pub(crate) fn is_dead(&self) -> bool {
         self.num_active_fragments == 0
-            && self
-                .lookup_fetchers
-                .values()
-                .all(|lifecycle| matches!(lifecycle, LookupFetcherLifecycle::Exact(0)))
             && (self.cancelled_by_fe
                 || self
                     .total_fragments
@@ -294,118 +272,6 @@ impl QueryContext {
 
     pub(crate) fn extend_delivery_lifetime(&mut self) {
         self.delivery_deadline = Instant::now() + self.delivery_expire;
-    }
-
-    pub(crate) fn merge_row_pos_descs(
-        &mut self,
-        descs: HashMap<i32, RowPositionDescriptor>,
-    ) -> Result<(), String> {
-        self.validate_row_pos_descs(&descs)?;
-        for (tuple_id, incoming) in descs {
-            self.row_pos_descs.entry(tuple_id).or_insert(incoming);
-        }
-        Ok(())
-    }
-
-    fn validate_row_pos_descs(
-        &self,
-        descs: &HashMap<i32, RowPositionDescriptor>,
-    ) -> Result<(), String> {
-        for (tuple_id, incoming) in descs {
-            if let Some(existing) = self.row_pos_descs.get(tuple_id)
-                && (existing.row_position_type != incoming.row_position_type
-                    || existing.row_source_slot != incoming.row_source_slot
-                    || existing.fetch_ref_slots != incoming.fetch_ref_slots
-                    || existing.lookup_ref_slots != incoming.lookup_ref_slots)
-            {
-                return Err(format!(
-                    "conflicting row position descriptor for tuple_id={tuple_id}"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn row_pos_desc(&self, tuple_id: i32) -> Option<RowPositionDescriptor> {
-        self.row_pos_descs.get(&tuple_id).cloned()
-    }
-
-    pub(crate) fn register_lookup_fetchers(
-        &mut self,
-        lifecycles: &HashMap<i32, LookupFetcherLifecycle>,
-    ) {
-        for (node_id, incoming) in lifecycles {
-            self.lookup_fetchers
-                .entry(*node_id)
-                .and_modify(|existing| {
-                    *existing = match (*existing, *incoming) {
-                        (
-                            LookupFetcherLifecycle::Exact(current),
-                            LookupFetcherLifecycle::Exact(new),
-                        ) => LookupFetcherLifecycle::Exact(current.max(new)),
-                        (LookupFetcherLifecycle::Unknown, LookupFetcherLifecycle::Exact(new)) => {
-                            LookupFetcherLifecycle::Exact(new)
-                        }
-                        (
-                            LookupFetcherLifecycle::Exact(current),
-                            LookupFetcherLifecycle::Unknown,
-                        ) => LookupFetcherLifecycle::Exact(current),
-                        (LookupFetcherLifecycle::Unknown, LookupFetcherLifecycle::Unknown) => {
-                            LookupFetcherLifecycle::Unknown
-                        }
-                    };
-                })
-                .or_insert(*incoming);
-        }
-    }
-
-    pub(crate) fn complete_lookup_fetcher(&mut self, node_id: i32) -> Result<(), String> {
-        let lifecycle = self
-            .lookup_fetchers
-            .get_mut(&node_id)
-            .ok_or_else(|| format!("lookup node {node_id} is not registered"))?;
-        let LookupFetcherLifecycle::Exact(count) = lifecycle else {
-            // Without the FE-provided peer-fragment count, a close cannot prove that
-            // it is the last fetch fragment. Keep the dispatcher until bounded expiry.
-            return Ok(());
-        };
-        if *count == 0 {
-            return Ok(());
-        }
-        *count -= 1;
-        Ok(())
-    }
-
-    pub(crate) fn register_connector_glm(
-        &mut self,
-        row_source_slot: SlotId,
-        lookup: ConnectorRowPositionLookup,
-    ) -> Result<(), String> {
-        if let Some(existing) = self.connector_glm_contexts.get(&row_source_slot) {
-            if existing.binding.key() != lookup.binding.key() || existing.splits != lookup.splits {
-                return Err(format!(
-                    "conflicting connector late-materialization binding for row source slot {row_source_slot}"
-                ));
-            }
-            return Ok(());
-        }
-        self.connector_glm_contexts.insert(row_source_slot, lookup);
-        Ok(())
-    }
-
-    pub(crate) fn connector_glm_split(
-        &self,
-        row_source_slot: SlotId,
-        scan_range_id: i32,
-    ) -> Option<(
-        Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
-        novarocks_spi::connector::ConnectorSplit,
-    )> {
-        let lookup = self.connector_glm_contexts.get(&row_source_slot)?;
-        Some((
-            Arc::clone(&lookup.binding),
-            lookup.splits.get(&scan_range_id)?.clone(),
-        ))
     }
 
     pub(crate) fn mem_tracker(&self) -> Arc<MemTracker> {
@@ -820,91 +686,6 @@ impl QueryContextManager {
         query_ids.sort_by_key(|query_id| (query_id.high(), query_id.low()));
         query_ids.dedup();
         query_ids
-    }
-
-    pub(crate) fn register_row_pos_descs(
-        &self,
-        query_id: QueryId,
-        descs: HashMap<i32, RowPositionDescriptor>,
-    ) -> Result<(), String> {
-        self.with_context_mut(query_id, |ctx| ctx.merge_row_pos_descs(descs))
-    }
-
-    pub(crate) fn register_lookup_fetchers(
-        &self,
-        query_id: QueryId,
-        lifecycles: HashMap<i32, LookupFetcherLifecycle>,
-    ) -> Result<(), String> {
-        self.with_context_mut(query_id, |ctx| {
-            ctx.register_lookup_fetchers(&lifecycles);
-            Ok(())
-        })
-    }
-
-    pub(crate) fn complete_lookup_fetcher(
-        &self,
-        query_id: QueryId,
-        node_id: i32,
-    ) -> Result<(), String> {
-        let removed = {
-            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            if let Some(ctx) = guard.active.get_mut(&query_id) {
-                ctx.complete_lookup_fetcher(node_id)?;
-                None
-            } else if let Some(ctx) = guard.second_chance.get_mut(&query_id) {
-                ctx.complete_lookup_fetcher(node_id)?;
-                if ctx.is_dead() {
-                    guard.second_chance.remove(&query_id)
-                } else {
-                    None
-                }
-            } else {
-                return Err(format!("QueryContext not found: query_id={query_id}"));
-            }
-        };
-        drop(removed);
-        Ok(())
-    }
-
-    pub(crate) fn register_connector_glm(
-        &self,
-        query_id: QueryId,
-        row_source_slot: SlotId,
-        lookup: ConnectorRowPositionLookup,
-    ) -> Result<(), String> {
-        self.with_context_mut(query_id, |ctx| {
-            ctx.register_connector_glm(row_source_slot, lookup)
-        })
-    }
-
-    pub(crate) fn connector_glm_split(
-        &self,
-        query_id: QueryId,
-        row_source_slot: SlotId,
-        scan_range_id: i32,
-    ) -> Option<(
-        Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
-        novarocks_spi::connector::ConnectorSplit,
-    )> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.connector_glm_split(row_source_slot, scan_range_id))
-    }
-
-    pub(crate) fn row_pos_desc(
-        &self,
-        query_id: QueryId,
-        tuple_id: i32,
-    ) -> Option<RowPositionDescriptor> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .active
-            .get(&query_id)
-            .or_else(|| guard.second_chance.get(&query_id))
-            .and_then(|ctx| ctx.row_pos_desc(tuple_id))
     }
 
     /// Returns the query tracker for lifecycle verification and neutral runtime observers.
@@ -1575,131 +1356,6 @@ mod fragment_cancellation_boundary_tests {
         );
         assert!(completion.driver_finished());
         assert_eq!(completion.wait(), Ok(()));
-    }
-}
-
-#[cfg(test)]
-mod lookup_lifecycle_tests {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
-    use std::time::Duration;
-
-    use super::{LookupFetcherLifecycle, QueryContextManager, QueryContextManagerInner, QueryId};
-
-    fn test_manager() -> QueryContextManager {
-        QueryContextManager {
-            inner: Mutex::new(QueryContextManagerInner::default()),
-            stopped: AtomicBool::new(false),
-        }
-    }
-
-    #[test]
-    fn lookup_context_survives_all_fragments_until_last_fetcher_closes() {
-        let manager = test_manager();
-        let query_id = QueryId::new(901, 902);
-        for _ in 0..2 {
-            manager
-                .get_or_register(
-                    query_id,
-                    false,
-                    Duration::from_secs(1),
-                    Duration::from_secs(5),
-                )
-                .expect("fragment context");
-        }
-        {
-            let mut guard = manager.inner.lock().expect("query ctx manager lock");
-            guard
-                .active
-                .get_mut(&query_id)
-                .expect("active query")
-                .total_fragments = Some(2);
-        }
-        manager
-            .register_lookup_fetchers(
-                query_id,
-                HashMap::from([(3, LookupFetcherLifecycle::Exact(1))]),
-            )
-            .expect("lookup lifecycle");
-
-        manager.finish_fragment(query_id);
-        manager.finish_fragment(query_id);
-
-        {
-            let guard = manager.inner.lock().expect("query ctx manager lock");
-            assert!(!guard.active.contains_key(&query_id));
-            assert!(guard.second_chance.contains_key(&query_id));
-        }
-
-        manager
-            .complete_lookup_fetcher(query_id, 3)
-            .expect("last fetcher close");
-
-        let guard = manager.inner.lock().expect("query ctx manager lock");
-        assert!(!guard.active.contains_key(&query_id));
-        assert!(!guard.second_chance.contains_key(&query_id));
-    }
-
-    #[test]
-    fn duplicate_fragment_registration_does_not_double_lookup_fetchers() {
-        let manager = test_manager();
-        let query_id = QueryId::new(911, 912);
-        manager
-            .get_or_register(
-                query_id,
-                false,
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-            )
-            .expect("query context");
-
-        for _ in 0..2 {
-            manager
-                .register_lookup_fetchers(
-                    query_id,
-                    HashMap::from([(7, LookupFetcherLifecycle::Exact(2))]),
-                )
-                .expect("idempotent registration");
-        }
-
-        manager
-            .complete_lookup_fetcher(query_id, 7)
-            .expect("first close");
-        manager
-            .complete_lookup_fetcher(query_id, 7)
-            .expect("second close");
-        manager
-            .complete_lookup_fetcher(query_id, 7)
-            .expect("duplicate close is idempotent");
-    }
-
-    #[test]
-    fn unknown_lookup_fetcher_count_keeps_context_until_bounded_expiry() {
-        let manager = test_manager();
-        let query_id = QueryId::new(921, 922);
-        manager
-            .get_or_register(query_id, false, Duration::ZERO, Duration::from_secs(5))
-            .expect("query context");
-        manager
-            .register_lookup_fetchers(
-                query_id,
-                HashMap::from([(8, LookupFetcherLifecycle::Unknown)]),
-            )
-            .expect("unknown lookup lifecycle");
-
-        manager.finish_fragment(query_id);
-        manager
-            .complete_lookup_fetcher(query_id, 8)
-            .expect("unknown close is acknowledged conservatively");
-
-        {
-            let guard = manager.inner.lock().expect("query ctx manager lock");
-            assert!(guard.second_chance.contains_key(&query_id));
-        }
-        manager.clean_expired();
-        let guard = manager.inner.lock().expect("query ctx manager lock");
-        assert!(!guard.second_chance.contains_key(&query_id));
     }
 }
 

@@ -18,33 +18,8 @@
 syntax = "proto3";
 package novarocks.filter;
 
-import "common.proto";  // novarocks.common.{Status, UniqueId, TypeDesc}
+import "common.proto";
 import "plan.proto";
-
-// Point lookup (row-position fetch; used by Iceberg v3 pure mode). Producer:
-// src/exec/operators/fetch_processor.rs. Consumer: src/service/internal_rpc.rs
-// -> src/runtime/lookup.rs. Replaces starrocks.PLookUpRequest/Response.
-message LookupRequest {
-  novarocks.common.UniqueId query_id = 1;       // query that owns the lookup request
-  int32 lookup_node_id = 2;                     // lookup plan node that serves the fetch
-  int32 request_tuple_id = 3;                   // tuple id for requested row positions
-  repeated Column request_columns = 4;          // row-position references
-}
-
-// Point lookup response payload. Producer: src/runtime/lookup.rs through
-// src/service/internal_rpc.rs. Consumer: src/exec/operators/fetch_processor.rs.
-message LookupResponse {
-  novarocks.common.Status status = 1;           // lookup result status
-  repeated Column columns = 2;                  // fetched columns encoded as Arrow IPC
-}
-
-// One lookup column payload. Producer and consumer follow the owning lookup
-// request/response paths; data remains opaque to the IDL layer.
-message Column {
-  int32 slot_id = 1;                            // destination/request slot id
-  int64 data_size = 2;                          // decoded byte size for accounting
-  bytes data = 3;                               // Arrow IPC streaming (opaque)
-}
 
 enum RuntimeFilterEnvelopeKind {
   RUNTIME_FILTER_ENVELOPE_KIND_UNSPECIFIED = 0;
