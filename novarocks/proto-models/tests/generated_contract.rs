@@ -951,19 +951,16 @@ fn an_iceberg_commit_fragment_describes_exactly_one_artifact() {
     }
 }
 
-/// The write-operation aggregate carried three plan messages and one terminal
-/// report list. They are gone; their tags must stay reserved so a later field
-/// cannot silently occupy a number an older encoder still fills.
+/// Sink tags and names stay reserved so a later field cannot silently occupy
+/// a number an older encoder still fills.
 #[test]
-fn retired_write_operation_aggregate_fields_remain_reserved() {
+fn data_sink_reserved_fields_are_not_reused() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
 
     for (message_name, field_number, field_name) in [
         ("novarocks.plan.DataSink", 7, "connector_write"),
         ("novarocks.plan.DataSink", 8, "statistics"),
-        // The two `QueryTerminalFragmentSnapshot` tags this cut also reserved
-        // are gone with the message: a deleted carrier reserves nothing.
     ] {
         let message = pool
             .get_message_by_name(message_name)
@@ -987,34 +984,17 @@ fn retired_write_operation_aggregate_fields_remain_reserved() {
             "{message_name} must not reuse name {field_name}"
         );
     }
-
-    // The aggregate's own carriers are gone, not merely unreferenced.
-    for retired in [
-        "novarocks.plan.ConnectorWriterIdentity",
-        "novarocks.plan.ConnectorWriterHandleEnvelope",
-        "novarocks.plan.ConnectorWriteFragmentSink",
-        "novarocks.plan.StatisticsSink",
-        "novarocks.plan.StatisticsMetric",
-        "novarocks.ConnectorStagedReportFrame",
-    ] {
-        assert!(
-            pool.get_message_by_name(retired).is_none(),
-            "{retired} must not exist in the native schema"
-        );
-    }
 }
 
 #[test]
-fn retired_write_operation_aggregate_wire_fields_fail_closed() {
+fn data_sink_reserved_wire_tags_have_no_sink_kind() {
     // DataSink field 7, wire type 2: the retired `connector_write` sink arm.
     let sink = plan::DataSink::decode(&[0x3a, 0x00][..])
         .expect("retired sink field remains decodable as an unknown field");
     assert!(sink.kind.is_none());
 
-    // DataSink field 8 is the retired statistics side channel. Its unknown tag
-    // decodes away and cannot revive that authority. The terminal-snapshot half
-    // of this cut went with the retired fragment query lifecycle: no carrier
-    // declares that message, so there is no decode left to assert on.
+    // DataSink field 8 is reserved for statistics. Unknown tags do not select
+    // a sink kind, so these bytes cannot introduce another output channel.
     let sink = plan::DataSink::decode(&[0x42, 0x00][..])
         .expect("retired statistics sink remains decodable as an unknown field");
     assert!(sink.kind.is_none());

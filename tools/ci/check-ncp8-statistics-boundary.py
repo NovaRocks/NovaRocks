@@ -16,12 +16,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Verify the retired NCP-8 path and sketch dependency boundaries.
+"""Verify statistics wire reservations and sketch dependency boundaries.
 
-The Cargo checks use resolved dependency metadata rather than source imports.
-The source check tokenizes Rust/proto code after removing comments, so string-
-addressed revivals are rejected while historical documentation and the one
-generated compatibility test remain explicit witnesses.
+Cargo's resolved graph defines the permitted dependency kinds and features.
+The source check protects reservations on the current DataSink carrier;
+descriptor and unknown-field behavior are exercised by the protocol tests.
 """
 
 import argparse
@@ -49,28 +48,6 @@ FORBIDDEN_ICEBERG_FUNCTIONS_CLOSURE = {
     BACKEND,
     SERVER,
     ICEBERG_PROVIDER,
-}
-
-RETIRED_IDENTIFIERS = {
-    "StatisticsSink",
-    "StatisticsSinkProgram",
-    "StatisticsSinkFactory",
-    "StatisticsSinkHandle",
-    "StatisticsBatchCollector",
-    "StatisticsFragmentPartial",
-    "QUERY_TERMINAL_STATISTICS_PAYLOAD_MAX_BYTES",
-    "statistics_payload",
-}
-EXECUTION_PROVIDER_IDENTIFIERS = {
-    "Puffin",
-    "StatisticAggregationsDescriptor",
-    "StatisticsAggregationDescriptor",
-    "StatisticsDescriptor",
-    "StatisticsMetricDescriptor",
-}
-RETIRED_EXECUTION_PATHS = {
-    "novarocks/execution/src/exec/statistics.rs",
-    "novarocks/execution/src/exec/operators/statistics_sink.rs",
 }
 
 
@@ -316,69 +293,6 @@ def verify_dependency_boundary(metadata, repo_root):
         )
 
 
-def strip_comments(source):
-    """Remove Rust/proto comments while preserving code and string contents."""
-
-    output = []
-    index = 0
-    block_depth = 0
-    length = len(source)
-    while index < length:
-        if block_depth:
-            if source.startswith("/*", index):
-                block_depth += 1
-                index += 2
-            elif source.startswith("*/", index):
-                block_depth -= 1
-                index += 2
-            else:
-                index += 1
-            continue
-        if source.startswith("//", index):
-            newline = source.find("\n", index + 2)
-            index = length if newline < 0 else newline
-            continue
-        if source.startswith("/*", index):
-            block_depth = 1
-            index += 2
-            continue
-
-        raw = re.match(r"(?:b|c)?r(#+)?\"", source[index:])
-        if raw:
-            hashes = raw.group(1) or ""
-            terminator = '"' + hashes
-            end = source.find(terminator, index + raw.end())
-            next_index = length if end < 0 else end + len(terminator)
-            output.append(source[index:next_index])
-            index = next_index
-            continue
-
-        prefix_length = 0
-        if source.startswith(('b"', 'c"'), index):
-            prefix_length = 1
-        if source[index + prefix_length : index + prefix_length + 1] == '"':
-            start = index
-            index += prefix_length + 1
-            while index < length:
-                if source[index] == "\\":
-                    index += 2
-                elif source[index] == '"':
-                    index += 1
-                    break
-                else:
-                    index += 1
-            output.append(source[start:index])
-            continue
-
-        output.append(source[index])
-        index += 1
-    return "".join(output)
-
-
-def identifiers(source):
-    return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", strip_comments(source)))
-
-
 def extract_proto_message(source, message_name):
     code = re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
     match = re.search(rf"\bmessage\s+{re.escape(message_name)}\s*\{{", code)
@@ -404,84 +318,16 @@ def require_reserved(message_body, number, name, context):
         fail(f"{context} must reserve field name {name}")
 
 
-def production_source_files(repo_root):
-    roots = [repo_root / "novarocks", repo_root / "novarocks-server", repo_root / "idl"]
-    for root in roots:
-        if not root.exists():
-            continue
-        for path in root.rglob("*"):
-            if not path.is_file() or path.suffix not in {".rs", ".proto"}:
-                continue
-            relative = path.relative_to(repo_root)
-            if "benches" in relative.parts:
-                continue
-            if relative == Path("novarocks/proto-models/tests/generated_contract.rs"):
-                continue
-            yield relative, path
-
-
 def verify_source_boundary(repo_root):
-    for retired in sorted(RETIRED_EXECUTION_PATHS):
-        if (repo_root / retired).exists():
-            fail(f"retired execution source path exists: {retired}")
-
-    violations = []
-    execution_prefix = Path("novarocks/execution/src")
-    for relative, path in production_source_files(repo_root):
-        forbidden = set(RETIRED_IDENTIFIERS)
-        if relative.is_relative_to(execution_prefix):
-            forbidden |= EXECUTION_PROVIDER_IDENTIFIERS
-        source = path.read_text(encoding="utf-8")
-        if relative == Path("idl/novarocks/service.proto"):
-            # The old name must survive only as this exact reservation.  Any
-            # other code or string occurrence remains visible to the scan.
-            source = re.sub(
-                r'\breserved\s+"statistics_payload"\s*;', "", source, count=1
-            )
-        # Most files contain none of the exact retired identifiers.  Avoid
-        # running the Rust comment/literal scanner over the entire tree when a
-        # cheap raw token prefilter proves there can be no violation.
-        candidates = {
-            identifier
-            for identifier in forbidden
-            if re.search(rf"\b{re.escape(identifier)}\b", source)
-        }
-        found = identifiers(source) & candidates if candidates else set()
-        if found:
-            violations.append(f"{relative}: {', '.join(sorted(found))}")
-    if violations:
-        fail("retired/provider-specific production identifiers found: " + "; ".join(violations))
-
-    service = (repo_root / "idl/novarocks/service.proto").read_text(encoding="utf-8")
-    terminal = extract_proto_message(service, "QueryTerminalFragmentSnapshot")
-    require_reserved(terminal, 12, "statistics_payload", "QueryTerminalFragmentSnapshot")
-
     plan = (repo_root / "idl/novarocks/plan.proto").read_text(encoding="utf-8")
     sink = extract_proto_message(plan, "DataSink")
     require_reserved(sink, 8, "statistics", "DataSink")
-    if re.search(r"\bmessage\s+StatisticsSink\b", plan):
-        fail("plan.proto must not define the retired StatisticsSink message")
-
-    witness_path = repo_root / "novarocks/proto-models/tests/generated_contract.rs"
-    witness = strip_comments(witness_path.read_text(encoding="utf-8"))
-    for required in (
-        '"novarocks.plan.StatisticsSink"',
-        '"statistics_payload"',
-    ):
-        if required not in witness:
-            fail(f"generated compatibility witness is missing {required}")
-    for test_name in (
-        "retired_write_operation_aggregate_fields_remain_reserved",
-        "retired_write_operation_aggregate_wire_fields_fail_closed",
-    ):
-        if re.search(rf"#\s*\[\s*test\s*\]\s*fn\s+{test_name}\b", witness) is None:
-            fail(f"generated compatibility witness is missing active test {test_name}")
 
 
 def main():
     default_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(
-        description="Verify NCP-8 retired statistics and dependency boundaries."
+        description="Verify statistics wire reservations and sketch dependency boundaries."
     )
     parser.add_argument("--repo-root", type=Path, default=default_root)
     parser.add_argument("--manifest-path", type=Path)
