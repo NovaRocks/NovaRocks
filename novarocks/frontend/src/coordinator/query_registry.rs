@@ -164,7 +164,38 @@ pub(crate) struct FrontendQueryRegistry {
     active: Mutex<BTreeMap<QueryKey, ActiveQuery>>,
     retained_terminal_ingress: Mutex<BTreeMap<QueryExecutionId, RetainedTerminalIngress>>,
     latest_retained_execution: Mutex<Option<QueryExecutionId>>,
+    /// The convergence evidence of the most recent attempt to finish, whatever
+    /// protocol ran it.
+    ///
+    /// One slot, last publication wins. The two protocols each publish their
+    /// own attempt's immutable evidence into it, which is not two authorities
+    /// over one decision: an execution id is owned by exactly one attempt, and
+    /// an attempt runs on exactly one protocol. What the slot must not become
+    /// is a place where a reader chooses between two candidates for the same
+    /// attempt.
+    latest_convergence: Mutex<Option<RetainedConvergenceEvidence>>,
     backend_topology: Mutex<BackendTopologyState>,
+}
+
+/// Where the latest attempt's convergence evidence is read from.
+///
+/// The lifecycle variant is deliberately lazy. That attempt keeps folding late
+/// unary terminal outcomes in after its registry binding drops, so freezing a
+/// snapshot at retention time would publish evidence that is complete only by
+/// accident of timing. The task protocol has no late ingress: its evidence is
+/// complete when the last release settles, so it is published frozen.
+enum RetainedConvergenceEvidence {
+    LifecycleAttempt(Arc<dyn ActiveQueryAttemptControl>),
+    TaskRound(Box<QueryLifecycleConvergenceSnapshot>),
+}
+
+impl RetainedConvergenceEvidence {
+    fn snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+        match self {
+            Self::LifecycleAttempt(control) => control.convergence_snapshot(),
+            Self::TaskRound(snapshot) => Some((**snapshot).clone()),
+        }
+    }
 }
 
 pub(crate) struct AttemptBackendOwnershipError {
@@ -196,6 +227,7 @@ impl FrontendQueryRegistry {
             active: Mutex::new(BTreeMap::new()),
             retained_terminal_ingress: Mutex::new(BTreeMap::new()),
             latest_retained_execution: Mutex::new(None),
+            latest_convergence: Mutex::new(None),
             backend_topology: Mutex::new(BackendTopologyState::default()),
         }
     }
@@ -506,11 +538,29 @@ impl FrontendQueryRegistry {
     }
 
     fn latest_retained_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
-        let execution_id = *self
-            .latest_retained_execution
+        self.latest_convergence
             .lock()
-            .expect("frontend latest retained terminal ingress lock");
-        execution_id.and_then(|execution_id| self.retained_convergence_snapshot(execution_id))
+            .expect("frontend latest convergence evidence lock")
+            .as_ref()
+            .and_then(RetainedConvergenceEvidence::snapshot)
+    }
+
+    /// Publishes the immutable convergence evidence of one task-protocol
+    /// attempt.
+    ///
+    /// Called once per attempt, after its last query context released: that is
+    /// the point at which every participant's contribution is either in hand
+    /// or will never arrive. Nothing reads a partial attempt here, so the
+    /// evidence is frozen rather than recomputed on read.
+    pub(crate) fn publish_task_round_convergence(
+        &self,
+        snapshot: QueryLifecycleConvergenceSnapshot,
+    ) {
+        *self
+            .latest_convergence
+            .lock()
+            .expect("frontend latest convergence evidence lock") =
+            Some(RetainedConvergenceEvidence::TaskRound(Box::new(snapshot)));
     }
 
     pub(crate) fn preserve_failure_context(
@@ -605,6 +655,7 @@ impl FrontendQueryRegistry {
 
     fn retain_terminal_control(&self, control: Arc<dyn ActiveQueryAttemptControl>) {
         let execution_id = control.execution_id();
+        let convergence = Arc::clone(&control);
         let now = Instant::now();
         let mut retained = self
             .retained_terminal_ingress
@@ -630,6 +681,11 @@ impl FrontendQueryRegistry {
             .latest_retained_execution
             .lock()
             .expect("frontend latest retained terminal ingress lock") = Some(execution_id);
+        *self
+            .latest_convergence
+            .lock()
+            .expect("frontend latest convergence evidence lock") =
+            Some(RetainedConvergenceEvidence::LifecycleAttempt(convergence));
     }
 
     fn retained_terminal_control(
@@ -889,6 +945,67 @@ mod tests {
                 .execution_id,
             execution_id,
             "the read-only diagnostic seam returns retained attempt evidence"
+        );
+    }
+
+    /// The one convergence slot answers for whichever protocol ran the latest
+    /// attempt.
+    ///
+    /// The defect this catches: a reader wired only to the retired lifecycle's
+    /// retention. Every task-protocol query then leaves the endpoint reporting
+    /// the last lifecycle attempt -- a real snapshot of the wrong query --
+    /// which reads as stale data rather than as a missing producer.
+    #[test]
+    fn the_convergence_reader_answers_for_the_protocol_that_ran_the_latest_attempt() {
+        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(41));
+        let lifecycle_execution =
+            QueryExecutionId::new(QueryId::new(41, 42), AttemptId::new(1).expect("attempt"))
+                .expect("execution id");
+        let task_execution =
+            QueryExecutionId::new(QueryId::new(41, 43), AttemptId::new(1).expect("attempt"))
+                .expect("execution id");
+
+        registry.retain_terminal_control(Arc::new(RetainedControl {
+            execution_id: lifecycle_execution,
+            reports: AtomicUsize::new(0),
+        }));
+        assert_eq!(
+            QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
+                .expect("a retained lifecycle attempt is readable")
+                .execution_id,
+            lifecycle_execution
+        );
+
+        registry.publish_task_round_convergence(QueryLifecycleConvergenceSnapshot {
+            execution_id: task_execution,
+            error_source: None,
+            primary_error: None,
+            participant_outcomes: Vec::new(),
+            runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+            ),
+            metrics: FrontendQueryLifecycleMetricsSnapshot::default(),
+        });
+        let latest = QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
+            .expect("a published task attempt is readable");
+        assert_eq!(latest.execution_id, task_execution);
+        assert!(
+            latest.participant_outcomes.is_empty(),
+            "the task protocol mints no participant terminal outcome, and none \
+             may be invented for it"
+        );
+
+        // And back the other way: the slot is last-publication-wins, not
+        // first-protocol-wins.
+        registry.retain_terminal_control(Arc::new(RetainedControl {
+            execution_id: lifecycle_execution,
+            reports: AtomicUsize::new(0),
+        }));
+        assert_eq!(
+            QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
+                .expect("the retained lifecycle attempt is readable again")
+                .execution_id,
+            lifecycle_execution
         );
     }
 

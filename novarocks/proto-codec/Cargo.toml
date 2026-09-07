@@ -12,6 +12,7 @@ prost = "0.13"
 prost-reflect = "0.14"
 sha2 = "0.10"
 novarocks-types = { path = "../types" }
+novarocks-execution = { path = "../execution" }
 novarocks-proto-models = { path = "../proto-models" }
 novarocks-spi = { path = "../spi" }
 

@@ -32,8 +32,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use super::operator::{
-    BlockedReason, DictionaryCarrierStats, Operator, dictionary_carrier_stats,
-    hydrate_for_downstream,
+    BlockedReason, DictionaryCarrierStats, FinishingWait, Operator, ProcessorOperator,
+    dictionary_carrier_stats, hydrate_for_downstream,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
@@ -731,9 +731,24 @@ impl PipelineDriver {
             if in_edge >= self.edge_closed.len() {
                 continue;
             }
-            if self.edge_closed[in_edge] && self.edge_chunks[in_edge].is_none() {
-                return true;
+            if !self.edge_closed[in_edge] || self.edge_chunks[in_edge].is_some() {
+                continue;
             }
+            // An operator waiting for an event it cannot produce has no
+            // finishing work that is ready; claiming otherwise would spin this
+            // driver instead of parking it. One that still owes output does:
+            // it is holding a payload or an end-of-stream marker that only its
+            // own next turn can push, and skipping it here is what parks a
+            // driver forever with that output in hand.
+            let wait = self
+                .operators
+                .get(idx)
+                .and_then(|op| op.as_processor_ref())
+                .map_or(FinishingWait::Complete, ProcessorOperator::finishing_wait);
+            if wait.is_pending() && !wait.can_progress() {
+                continue;
+            }
+            return true;
         }
         false
     }
@@ -1310,8 +1325,15 @@ impl PipelineDriver {
                 "Driver set_finishing: driver_id={} op_idx={} op_name={} success. edge_closed[{}]={}",
                 self.driver_id, idx, op_name, in_edge, self.edge_closed[in_edge]
             );
-            self.operator_finishing_set[idx] = true;
-            *made_progress = true;
+            // Latch only once the operator says finishing is done. An operator
+            // that is still waiting stays unlatched so a later turn retries it;
+            // without this, `set_finishing` runs exactly once and an operator
+            // that could not finish yet would never get another chance.
+            let wait = proc.finishing_wait();
+            self.operator_finishing_set[idx] = !wait.is_pending();
+            if !wait.is_pending() {
+                *made_progress = true;
+            }
         }
         Ok(())
     }
@@ -1321,5 +1343,205 @@ impl Drop for PipelineDriver {
     fn drop(&mut self) {
         self.finish_blocked_interval();
         self.close_operators();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::{BlockedReason, DriverState, PipelineDriver};
+    use crate::exec::chunk::Chunk;
+    use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
+    use crate::runtime::runtime_state::RuntimeState;
+
+    /// A source that is finished before the driver's first turn, so the edge
+    /// into the sink closes immediately and the driver goes straight to
+    /// finishing it.
+    struct FinishedSource;
+
+    impl Operator for FinishedSource {
+        fn name(&self) -> &str {
+            "FinishedSource"
+        }
+
+        fn is_finished(&self) -> bool {
+            true
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for FinishedSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("the finished source accepts no input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A sink whose finishing wait is scripted, standing in for an exchange
+    /// sink holding a payload behind a gated outbound edge.
+    ///
+    /// It mirrors the real sink where it matters: it refuses input while it
+    /// owes output, so the driver parks on `OutputFull` rather than spinning,
+    /// and it is not finished until its wait is `Complete`.
+    struct ScriptedSink {
+        wait: Arc<Mutex<FinishingWait>>,
+        set_finishing_calls: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedSink {
+        fn new(wait: Arc<Mutex<FinishingWait>>) -> Self {
+            Self {
+                wait,
+                set_finishing_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn wait(&self) -> FinishingWait {
+            *self.wait.lock().expect("scripted wait lock")
+        }
+    }
+
+    impl Operator for ScriptedSink {
+        fn name(&self) -> &str {
+            "ScriptedSink"
+        }
+
+        fn is_finished(&self) -> bool {
+            !self.wait().is_pending()
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for ScriptedSink {
+        fn need_input(&self) -> bool {
+            !self.wait().is_pending()
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.set_finishing_calls.fetch_add(1, Ordering::SeqCst);
+            // The turn is what pushes owed output, exactly as the exchange
+            // sink flushes its parked payload and sends its end-of-stream
+            // inside this call. A wait for an external event is unchanged by
+            // it.
+            let mut wait = self.wait.lock().expect("scripted wait lock");
+            if *wait == FinishingWait::OwedOutput {
+                *wait = FinishingWait::Complete;
+            }
+            Ok(())
+        }
+
+        fn finishing_wait(&self) -> FinishingWait {
+            self.wait()
+        }
+    }
+
+    /// The defect this catches: the driver asked one boolean -- "is finishing
+    /// pending?" -- for two different decisions, and used it to conclude that
+    /// a parked driver had no ready finishing work. An operator that still
+    /// owes output it can push on its own next turn was therefore skipped, and
+    /// since an exchange edge opening notifies nothing, the blocked-driver
+    /// poller's `check_is_ready` stayed false forever.
+    ///
+    /// The consequence is a query that hangs with no failure anywhere. The one
+    /// producer holding rows parks with the payload in hand, never sends its
+    /// end of stream, the receiving exchange counts senders until the
+    /// statement deadline, and the frontend's read completion -- which waits
+    /// on the root task's FINISHED and its own end of stream, neither of which
+    /// fails on absence -- waits with it. Measured on a real 1FE+3BE cluster
+    /// as a distributed `SELECT ... ORDER BY` timing out after 120 s: two of
+    /// three producers, both with no rows to send, sealed their stream; the
+    /// third, with the two matching rows, parked and stayed parked.
+    #[test]
+    fn a_parked_driver_is_re_readied_once_its_sink_can_push_the_output_it_owes() {
+        let runtime_state = Arc::new(RuntimeState::default());
+        // The edge is closed: the sink is waiting for a decision only the
+        // frontend can make.
+        let wait = Arc::new(Mutex::new(FinishingWait::ExternalEvent));
+        let sink = ScriptedSink::new(Arc::clone(&wait));
+        let calls = Arc::clone(&sink.set_finishing_calls);
+        let mut driver = PipelineDriver::new(
+            1,
+            vec![Box::new(FinishedSource), Box::new(sink)],
+            None,
+            Vec::new(),
+            runtime_state,
+            None,
+        );
+
+        let state = driver.process(Duration::from_millis(10));
+        assert!(
+            matches!(state, DriverState::Blocked(BlockedReason::OutputFull)),
+            "actual: {state:?}"
+        );
+        let turns_before_parking = calls.load(Ordering::SeqCst);
+        assert!(
+            turns_before_parking >= 1,
+            "the driver gives finishing at least one turn before it parks"
+        );
+        assert!(
+            !driver.check_is_ready(),
+            "nothing can move while the sink waits on an event it cannot produce"
+        );
+
+        // The edge opens. The payload the sink parked is now output only its
+        // own next turn can push, so the driver must be re-readied -- and this
+        // is the assertion the defect fails.
+        *wait.lock().expect("scripted wait lock") = FinishingWait::OwedOutput;
+        assert!(
+            driver.check_is_ready(),
+            "a sink that can push the output it owes must re-ready its driver"
+        );
+
+        // And the turn it is re-readied for is the one that pushes it.
+        let state = driver.process(Duration::from_millis(10));
+        assert!(matches!(state, DriverState::Finished), "actual: {state:?}");
+        assert!(
+            calls.load(Ordering::SeqCst) > turns_before_parking,
+            "the re-readied turn is the one that finishes the sink"
+        );
     }
 }

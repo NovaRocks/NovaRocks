@@ -23,12 +23,14 @@
 
 use std::sync::Arc;
 
+use crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates;
+
 use arrow::array::{Array, BooleanArray};
 use arrow::compute::filter_record_batch;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::ExchangeFrameTransmitter;
@@ -108,9 +110,37 @@ impl SplitDataStreamSinkFactory {
             sinks: sinks_out,
         }
     }
+
+    /// Grants the inner sinks the edge gates their destinations are bound by.
+    ///
+    /// A composite sink's branches all belong to the same task, so one gate
+    /// set governs all of them; forwarding here keeps the send path's
+    /// permission check in exactly one place.
+    /// Whether every branch is bound by a gate set.
+    #[cfg(test)]
+    pub(crate) fn is_edge_gated(&self) -> bool {
+        !self.sinks.is_empty() && self.sinks.iter().all(|spec| spec.factory.is_edge_gated())
+    }
+
+    pub fn with_edge_gates(mut self, gates: Arc<ExchangeEdgeGates>) -> Self {
+        self.sinks = self
+            .sinks
+            .into_iter()
+            .map(|mut spec| {
+                spec.factory = spec.factory.with_edge_gates(Arc::clone(&gates));
+                spec
+            })
+            .collect();
+        self
+    }
 }
 
 impl OperatorFactory for SplitDataStreamSinkFactory {
+    #[cfg(test)]
+    fn is_edge_gated(&self) -> bool {
+        Self::is_edge_gated(self)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -211,6 +241,31 @@ impl Operator for SplitDataStreamSinkOperator {
 }
 
 impl ProcessorOperator for SplitDataStreamSinkOperator {
+    /// The aggregate of what this sink's branches are still waiting for.
+    ///
+    /// The same contract [`MultiCastDataStreamSinkOperator::finishing_wait`]
+    /// carries, for the same reason: without it the default `Complete`
+    /// applies, the driver latches finishing after one call, and a branch that
+    /// was not ready at that call never sends its end-of-stream. `OwedOutput`
+    /// outranks `ExternalEvent` because branches finish independently.
+    fn finishing_wait(&self) -> FinishingWait {
+        if !self.finishing {
+            return FinishingWait::Complete;
+        }
+        let mut wait = FinishingWait::Complete;
+        for sink in &self.sinks {
+            let Some(inner) = sink.op.as_processor_ref() else {
+                continue;
+            };
+            match inner.finishing_wait() {
+                FinishingWait::OwedOutput => return FinishingWait::OwedOutput,
+                FinishingWait::ExternalEvent => wait = FinishingWait::ExternalEvent,
+                FinishingWait::Complete => {}
+            }
+        }
+        wait
+    }
+
     fn need_input(&self) -> bool {
         if self.is_finished() || self.finishing {
             return false;
@@ -267,21 +322,27 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
         Ok(None)
     }
 
+    /// Drives every branch's finishing, on this call and on every retry.
+    ///
+    /// See [`MultiCastDataStreamSinkOperator::set_finishing`]: a branch whose
+    /// edge is still closed or which still holds a parked payload needs the
+    /// later turns, and returning early once `finishing` was set swallowed
+    /// them.
     fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
         if let Some(err) = self.init_error.as_ref() {
             return Err(err.clone());
         }
-        if self.finishing {
-            return Ok(());
-        }
+        let first_call = !self.finishing;
+        self.finishing = true;
         for sink in &mut self.sinks {
             let inner = sink
                 .op
                 .as_processor_mut()
                 .ok_or_else(|| "inner data stream op missing processor operator".to_string())?;
-            inner.set_finishing(state)?;
+            if first_call || inner.finishing_wait().is_pending() {
+                inner.set_finishing(state)?;
+            }
         }
-        self.finishing = true;
         Ok(())
     }
 
@@ -414,7 +475,7 @@ mod tests {
     use super::split_chunk_by_exprs;
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+    use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
     use crate::exec::pipeline::schedule::observer::Observable;
     use crate::runtime::runtime_state::RuntimeState;
     use novarocks_types::SlotId;
@@ -554,5 +615,143 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("value column");
         assert_eq!(values.values(), &[10]);
+    }
+
+    /// Inner sink that seals only once its permission arrives, the way an
+    /// exchange sink whose outbound edge is still closed behaves.
+    struct GatedFinishSink {
+        name: String,
+        permitted: Arc<AtomicBool>,
+        finishing: bool,
+        sealed: Arc<AtomicBool>,
+        observable: Arc<Observable>,
+    }
+
+    impl GatedFinishSink {
+        fn new(name: &str, permitted: Arc<AtomicBool>, sealed: Arc<AtomicBool>) -> Self {
+            Self {
+                name: name.to_string(),
+                permitted,
+                finishing: false,
+                sealed,
+                observable: Arc::new(Observable::new()),
+            }
+        }
+    }
+
+    impl Operator for GatedFinishSink {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn is_finished(&self) -> bool {
+            self.sealed.load(Ordering::SeqCst)
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for GatedFinishSink {
+        fn finishing_wait(&self) -> FinishingWait {
+            if !self.finishing {
+                return FinishingWait::Complete;
+            }
+            if !self.permitted.load(Ordering::SeqCst) {
+                return FinishingWait::ExternalEvent;
+            }
+            if self.sealed.load(Ordering::SeqCst) {
+                FinishingWait::Complete
+            } else {
+                FinishingWait::OwedOutput
+            }
+        }
+
+        fn need_input(&self) -> bool {
+            !self.finishing && !self.is_finished()
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.finishing = true;
+            if self.permitted.load(Ordering::SeqCst) {
+                self.sealed.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        fn sink_observable(&self) -> Option<Arc<Observable>> {
+            (!self.is_finished()).then(|| Arc::clone(&self.observable))
+        }
+    }
+
+    #[test]
+    fn a_branch_that_could_not_seal_yet_is_driven_again() {
+        // The same defect the multi-cast wrapper had: no finishing wait was
+        // reported and the branches were never re-entered, so a branch that
+        // could not seal on the first call never sent its end-of-stream and
+        // its receiver waited for a sender that never sealed.
+        let open = Arc::new(AtomicBool::new(true));
+        let closed = Arc::new(AtomicBool::new(false));
+        let open_sealed = Arc::new(AtomicBool::new(false));
+        let closed_sealed = Arc::new(AtomicBool::new(false));
+        let mut op = SplitDataStreamSinkOperator {
+            name: "SPLIT_DATA_STREAM_SINK(test)".to_string(),
+            init_error: None,
+            split_arena: Arc::new(ExprArena::default()),
+            split_exprs: Vec::new(),
+            fanout: false,
+            sinks: vec![
+                InnerSinkRuntime {
+                    op: Box::new(GatedFinishSink::new(
+                        "open",
+                        Arc::clone(&open),
+                        Arc::clone(&open_sealed),
+                    )),
+                },
+                InnerSinkRuntime {
+                    op: Box::new(GatedFinishSink::new(
+                        "closed",
+                        Arc::clone(&closed),
+                        Arc::clone(&closed_sealed),
+                    )),
+                },
+            ],
+            finishing: false,
+        };
+
+        let state = RuntimeState::default();
+        op.set_finishing(&state).expect("set finishing");
+        assert!(open_sealed.load(Ordering::SeqCst));
+        assert!(!closed_sealed.load(Ordering::SeqCst));
+        assert!(
+            op.finishing_wait().is_pending(),
+            "the wrapper must ask the driver for another turn while a branch waits"
+        );
+
+        closed.store(true, Ordering::SeqCst);
+        op.set_finishing(&state).expect("set finishing again");
+        assert!(
+            closed_sealed.load(Ordering::SeqCst),
+            "the retry must reach the branch that was not ready before"
+        );
+        assert!(!op.finishing_wait().is_pending());
+        assert!(op.is_finished());
     }
 }

@@ -78,8 +78,8 @@ fn compilation_error(message: impl Into<String>) -> DistributedQueryError {
 /// Compile a deployment from one sealed SQL/schedule/topology handoff.
 ///
 /// An empty graph deliberately produces no contribution. A nonempty graph
-/// produces one typed install for every frozen live backend, including an
-/// explicitly empty service-only install when it has no RF-local role.
+/// produces one typed install per backend that hosts a task, which is an
+/// explicitly empty install when that backend carries no filter role.
 pub(crate) fn compile_scheduled_runtime_filter_deployment(
     view: RuntimeFilterScheduledView<'_>,
     config: FrontendRuntimeFilterDeploymentCompilerConfig,
@@ -93,7 +93,7 @@ pub(crate) fn compile_scheduled_runtime_filter_deployment(
         view.clone().query_id_wire(),
         view.clone().deployment_epoch(),
         config.lifecycle,
-        view.frozen_live_backend_ids(),
+        view.scheduled_backend_ids(),
         std::iter::empty(),
         &RuntimeFilterWaitGraph::default(),
     )
@@ -341,9 +341,13 @@ fn compile_nonempty_deployment(
             deployment_policy,
             &feedback.publications,
         )?;
+        // A backend can host a task whose fragment has no filter binding. That
+        // is a participant with no local role, not a participant without work:
+        // it still establishes a query context, and its install is explicitly
+        // empty rather than absent.
         let participant =
             if install.core_channels.is_empty() && install.routing_channels.is_empty() {
-                FrontendRuntimeFilterParticipant::service_only(backend_idx)
+                FrontendRuntimeFilterParticipant::without_local_role(backend_idx)
             } else {
                 FrontendRuntimeFilterParticipant::active(backend_idx, install)
             }
@@ -360,14 +364,47 @@ fn compile_nonempty_deployment(
         &feedback.wait_graph,
     )
     .map_err(|error| compilation_error(error.to_string()))?;
-    encode_install_contributions(&deployment, feedback.declaration)
+    let mut encoded = encode_install_contributions(&deployment, feedback.declaration)?;
+    encoded.pad_to_frozen_live_backends(
+        view.frozen_live_backend_ids(),
+        deployment_policy.lifecycle.to_wire(),
+    )?;
+    Ok(encoded)
 }
 
+/// The backends a deployment may address: exactly those hosting a task.
+///
+/// A filter role has to belong to real work. A backend the schedule placed
+/// nothing on can neither produce a contribution nor consume an artifact, so
+/// giving it a participant identity created a control-plane member with no
+/// execution behind it — which is what the task protocol replaces with "one
+/// query context per backend carrying at least one task".
+///
+/// The endpoint and process identity still come from the frozen live snapshot,
+/// because that is the only place they are frozen; this narrows *which*
+/// entries become participants, never where their addresses come from.
 fn sealed_topology(
     view: RuntimeFilterScheduledView<'_>,
 ) -> Result<BTreeMap<usize, ParticipantTopology>, DistributedQueryError> {
+    let scheduled = view
+        .clone()
+        .scheduled_backend_ids()
+        .collect::<BTreeSet<_>>();
+    let live = view
+        .clone()
+        .frozen_live_backend_ids()
+        .collect::<BTreeSet<_>>();
+    if let Some(unknown) = scheduled.difference(&live).next() {
+        return Err(compilation_error(format!(
+            "runtime filter schedule places work on backend {unknown} which is absent from the \
+             frozen live-backend snapshot"
+        )));
+    }
     let mut topology = BTreeMap::new();
-    for entry in view.clone().frozen_live_backends() {
+    for entry in view.frozen_live_backends() {
+        if !scheduled.contains(&entry.backend_idx()) {
+            continue;
+        }
         let process_id = entry.process_id();
         if topology
             .insert(
@@ -387,11 +424,10 @@ fn sealed_topology(
     }
     if topology.is_empty() {
         return Err(compilation_error(
-            "runtime filter deployment requires a nonempty frozen live-backend snapshot",
+            "runtime filter deployment requires at least one backend hosting a task",
         ));
     }
-    let ids = view.frozen_live_backend_ids().collect::<BTreeSet<_>>();
-    if ids != topology.keys().copied().collect() {
+    if scheduled != topology.keys().copied().collect() {
         return Err(compilation_error(
             "runtime filter frozen topology id set does not match topology entries",
         ));

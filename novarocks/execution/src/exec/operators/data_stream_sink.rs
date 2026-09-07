@@ -33,8 +33,12 @@ use crate::exec::fragment::sink::{DataStreamPartitionType, DataStreamSinkFactory
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::exchange;
 use crate::runtime::fragment::io::exchange_queue::{ExchangeSendTask, ExchangeSendTracker};
-use crate::runtime::fragment::io::{ExchangeFrame, ExchangeFrameTransmitter};
+use crate::runtime::fragment::io::{
+    EdgeSendGate, EdgeSendState, ExchangeDestinationKey, ExchangeEdgeGates, ExchangeFrame,
+    ExchangeFrameTransmitter,
+};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
+use crate::task_execution::domain::ExchangeEdgeId;
 use arrow::datatypes::DataType;
 use novarocks_types::SlotId;
 use novarocks_types::{UniqueId, format_uuid};
@@ -44,7 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::profile::{ProfileUnit, clamp_u128_to_i64};
@@ -1029,6 +1033,7 @@ pub struct DataStreamSinkFactory {
     plan_node_id: i32,
     finish_state: Arc<DataStreamSinkFinishState>,
     shared_sequence: Arc<AtomicI64>,
+    edge_gates: Option<Arc<ExchangeEdgeGates>>,
 }
 
 impl DataStreamSinkFactory {
@@ -1061,11 +1066,55 @@ impl DataStreamSinkFactory {
             plan_node_id,
             finish_state: Arc::new(DataStreamSinkFinishState::default()),
             shared_sequence: Arc::new(AtomicI64::new(0)),
+            edge_gates: None,
         }
+    }
+
+    /// Installs the send permission of this producer's outbound edges.
+    ///
+    /// Every gated edge starts closed, so nothing is sent on it until the
+    /// frontend opens it. A sink left ungated keeps its ungated behavior,
+    /// which is what the fragment paths that have no frozen edge topology
+    /// still rely on.
+    pub fn with_edge_gates(mut self, gates: Arc<ExchangeEdgeGates>) -> Self {
+        self.edge_gates = Some(gates);
+        self
+    }
+
+    /// Whether this sink is bound by a gate set.
+    ///
+    /// The barrier's behavior is covered at the operator level; this exists so
+    /// materialization can be shown to have supplied the gates at all, which
+    /// is the failure it actually had.
+    #[cfg(test)]
+    pub(crate) const fn is_edge_gated(&self) -> bool {
+        self.edge_gates.is_some()
+    }
+
+    /// The outbound edges a normal downstream cancellation closed, lowest id
+    /// first, so a status producer can report normal downstream cancellation
+    /// rather than a failure. Empty for an ungated sink.
+    pub fn normally_canceled_edges(&self) -> Vec<ExchangeEdgeId> {
+        self.edge_gates
+            .as_ref()
+            .map(|gates| gates.normally_canceled_edges())
+            .unwrap_or_default()
+    }
+
+    /// How many outbound edges a normal downstream cancellation closed.
+    pub fn normally_canceled_edge_count(&self) -> usize {
+        self.edge_gates
+            .as_ref()
+            .map_or(0, |gates| gates.normally_canceled_edge_count())
     }
 }
 
 impl OperatorFactory for DataStreamSinkFactory {
+    #[cfg(test)]
+    fn is_edge_gated(&self) -> bool {
+        Self::is_edge_gated(self)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1146,6 +1195,9 @@ impl OperatorFactory for DataStreamSinkFactory {
             max_transmit_batched_bytes: 1,
             finished: AtomicBool::new(false),
             finishing: AtomicBool::new(false),
+            finish_counted: AtomicBool::new(false),
+            finish_completed_set: AtomicBool::new(false),
+            end_of_stream_sent: AtomicBool::new(false),
             send_tracker: ExchangeSendTracker::new(),
             send_observable,
             error_state: None,
@@ -1156,6 +1208,7 @@ impl OperatorFactory for DataStreamSinkFactory {
             pending_payload_mem_tracker: None,
             send_queue_mem_tracker: None,
             exchange_queue: None,
+            edge_gates: self.edge_gates.clone(),
         })
     }
 
@@ -1177,6 +1230,9 @@ struct PendingPayload {
 enum PayloadEnqueue {
     Enqueued,
     NoCapacity(PendingPayload),
+    /// The destination's edge was closed by a normal downstream cancellation,
+    /// so the payload is dropped rather than parked or sent.
+    Discarded,
 }
 
 struct DataStreamSinkOperator {
@@ -1198,6 +1254,31 @@ struct DataStreamSinkOperator {
     max_transmit_batched_bytes: usize,
     finished: AtomicBool,
     finishing: AtomicBool,
+    /// Whether this driver's own finish has already been counted against the
+    /// sink's driver set.
+    ///
+    /// `set_finishing` is retried by the driver for as long as
+    /// `finishing_wait` says this operator is still waiting -- which is
+    /// exactly what happens while the outbound edge has not been opened yet.
+    /// Counting on every retry would let one driver consume the whole set and
+    /// latch the sink's one-shot end-of-stream guard, after which no driver
+    /// could ever emit end-of-stream and the receiver would wait forever.
+    finish_counted: AtomicBool,
+    /// Whether this driver was the one that completed the set, remembered so
+    /// the retries after the edge opens still know who owes end-of-stream.
+    finish_completed_set: AtomicBool,
+    /// Whether this driver has handed its destinations the end-of-stream
+    /// marker.
+    ///
+    /// It has to be a latch, because nothing else this operator can read tells
+    /// the two sides of that moment apart: "every edge is open and nothing is
+    /// parked" is equally true just before the marker is enqueued and just
+    /// after. A sink that judged itself finished from those two facts alone
+    /// latched `finished` in the window between its edge opening and the
+    /// driver's next `set_finishing`, and `set_finishing` then returns early on
+    /// `finished` -- so the marker was never sent and the receiver counted
+    /// senders until the statement deadline.
+    end_of_stream_sent: AtomicBool,
     send_tracker: Arc<ExchangeSendTracker>,
     send_observable: Arc<Observable>,
     error_state: Option<Arc<RuntimeErrorState>>,
@@ -1208,6 +1289,7 @@ struct DataStreamSinkOperator {
     pending_payload_mem_tracker: Option<Arc<MemTracker>>,
     send_queue_mem_tracker: Option<Arc<MemTracker>>,
     exchange_queue: Option<Arc<crate::runtime::fragment::io::exchange_queue::ExchangeSendQueue>>,
+    edge_gates: Option<Arc<ExchangeEdgeGates>>,
 }
 
 impl Operator for DataStreamSinkOperator {
@@ -1271,6 +1353,16 @@ impl Operator for DataStreamSinkOperator {
     fn prepare(&mut self) -> Result<(), String> {
         // Align with StarRocks: count actual sink drivers prepared, not planned DOP.
         self.finish_state.register_driver();
+        // The edge opening is the only event that can unpark this driver once
+        // its payload is parked behind a closed edge, and the executor
+        // re-checks an output-blocked driver only when an observable that
+        // driver registered fires. Registering here, rather than at runtime
+        // binding, is deliberate: `bind_runtime_state` returns early without
+        // an `ExecutionRuntime`, and the gate wake-up must not depend on
+        // whether a send queue was bound.
+        if let Some(gates) = self.edge_gates.as_ref() {
+            gates.register_open_waiter(&self.send_observable);
+        }
         tracing::debug!(
             "DataStreamSink registered driver: finst={} driver_id={} dest_node_id={} sender_id={} remaining_drivers={}",
             format_uuid(
@@ -1321,10 +1413,71 @@ impl DataStreamSinkOperator {
         self.pending_per_dest.iter().map(VecDeque::len).sum()
     }
 
+    /// The gate of one destination's edge.
+    ///
+    /// `Ok(None)` means this sink is ungated. An installed gate set that does
+    /// not know a destination is a topology error, never an implicit
+    /// permission: each destination belongs to exactly one edge, and that is
+    /// what keeps a decision about one edge away from another's destinations.
+    fn destination_gate(
+        &self,
+        dest: &FragmentDestination,
+    ) -> Result<Option<Arc<EdgeSendGate>>, String> {
+        let Some(gates) = self.edge_gates.as_ref() else {
+            return Ok(None);
+        };
+        let key = ExchangeDestinationKey::new(*dest.finst_id(), self.input.dest_node_id);
+        gates
+            .gate_for_destination(key)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "exchange destination {key} is not attributed to any outbound edge of this producer"
+                )
+            })
+    }
+
+    /// The send state of the destination at `idx` for the read-only
+    /// predicates. A destination the gates do not know reports `None`; the
+    /// enqueue path is where that becomes an explicit error.
+    fn destination_state_at(&self, idx: usize) -> Option<EdgeSendState> {
+        let dest = self.destinations().get(idx)?;
+        self.destination_gate(dest).ok()?.map(|gate| gate.state())
+    }
+
+    /// Whether the destination at `idx` abandoned its frames through a normal
+    /// downstream cancellation. Such data is discarded, so it must never hold
+    /// this sink open.
+    fn destination_withdrawn(&self, idx: usize) -> bool {
+        self.destination_state_at(idx) == Some(EdgeSendState::NormallyCanceled)
+    }
+
+    /// Whether any destination this sink still owes output to is waiting for
+    /// its edge to be opened.
+    ///
+    /// A producer whose input drains before the frontend opens its edge is a
+    /// normal race, not a failure: the open follows one round trip after every
+    /// destination acknowledges creation, and a small fragment can finish
+    /// reading in less than that. So finishing waits here rather than failing,
+    /// and the driver retries once the edge opens. A blocked driver is polled,
+    /// so the wait is bounded even without a wake-up.
+    fn awaits_edge_permission(&self) -> bool {
+        self.input
+            .destinations
+            .iter()
+            .enumerate()
+            .any(|(idx, dest)| {
+                !Self::is_pseudo_destination(dest)
+                    && self.destination_state_at(idx) == Some(EdgeSendState::AwaitingPermission)
+            })
+    }
+
     fn has_pending_chunks(&self) -> bool {
         self.pending_per_dest
             .iter()
-            .any(|chunks| !chunks.is_empty())
+            .enumerate()
+            .any(|(idx, chunks)| !chunks.is_empty() && !self.destination_withdrawn(idx))
     }
 
     fn pending_payload_bytes_total(&self) -> usize {
@@ -1342,20 +1495,49 @@ impl DataStreamSinkOperator {
     }
 
     fn has_pending_payloads(&self) -> bool {
-        self.pending_payloads_per_dest.iter().any(|p| p.is_some())
+        self.pending_payloads_per_dest
+            .iter()
+            .enumerate()
+            .any(|(idx, payload)| payload.is_some() && !self.destination_withdrawn(idx))
     }
 
     fn has_pending_data(&self) -> bool {
         self.has_pending_chunks() || self.has_pending_payloads()
     }
 
+    /// Whether this driver still owes its destinations the end-of-stream
+    /// marker.
+    ///
+    /// Only the driver that completed the sink's driver set sends it, so only
+    /// that driver can owe it; every other driver's `finish_completed_set` is
+    /// false and this is false with it.
+    ///
+    /// This is output the sink owes exactly like a parked payload, and it is
+    /// the one piece of owed output that cannot be derived from edge state or
+    /// from what is buffered: an open edge with nothing parked describes both
+    /// "the marker has not been sent yet" and "the marker is sent and this sink
+    /// is done".
+    fn owes_end_of_stream(&self) -> bool {
+        self.finish_completed_set.load(Ordering::SeqCst)
+            && !self.end_of_stream_sent.load(Ordering::SeqCst)
+    }
+
     fn pending_payloads_can_send(&self) -> bool {
         let max_inflight = self.exchange_queue().max_inflight_bytes();
-        for payload in self
-            .pending_payloads_per_dest
-            .iter()
-            .filter_map(|p| p.as_ref())
-        {
+        for (idx, payload) in self.pending_payloads_per_dest.iter().enumerate() {
+            let Some(payload) = payload.as_ref() else {
+                continue;
+            };
+            match self.destination_state_at(idx) {
+                // A payload parked on an edge that has no send permission yet
+                // is the whole of a closed edge's backpressure: it keeps its
+                // single per-destination slot and the sink stops taking input.
+                Some(EdgeSendState::AwaitingPermission) => return false,
+                // A withdrawn edge's payload is dropped on the next flush, so
+                // it must not hold this sink back.
+                Some(EdgeSendState::NormallyCanceled) => continue,
+                None | Some(EdgeSendState::Open) => {}
+            }
             if payload.payload_bytes > max_inflight {
                 continue;
             }
@@ -1435,11 +1617,40 @@ impl DataStreamSinkOperator {
         if self.finished.load(Ordering::Acquire) {
             return true;
         }
+        // A destination still awaiting permission is owed its end-of-stream
+        // even when no data is parked for it. Finishing without that marker
+        // would leave the destination counting senders forever.
+        //
+        // `owes_end_of_stream` is the same rule for the moment after the edge
+        // opens. This predicate is read by `is_finished` and `need_input`,
+        // which the scheduler calls between driver turns, so without it the
+        // sink declares itself finished as soon as its edge opens -- before the
+        // driver has had a turn in which to send the marker, and `set_finishing`
+        // returns early once `finished` is latched.
         if self.finishing.load(Ordering::Acquire)
             && !self.has_pending_data()
+            && !self.awaits_edge_permission()
+            && !self.owes_end_of_stream()
             && self.send_tracker.is_idle()
         {
-            self.finished.store(true, Ordering::Release);
+            if !self.finished.swap(true, Ordering::AcqRel) {
+                // The one line that says this sink stopped owing output, and
+                // on whose strength the driver terminates. Absent it, a sink
+                // that finished with its seal unsent is indistinguishable
+                // from one that never got that far.
+                tracing::debug!(
+                    "DataStreamSink finished: finst={} driver_id={} dest_node_id={} sender_id={} end_of_stream_sent={} last_driver={}",
+                    format_uuid(
+                        self.fragment_instance_id.high(),
+                        self.fragment_instance_id.low()
+                    ),
+                    self.driver_id,
+                    self.input.dest_node_id,
+                    self.sender_id,
+                    self.end_of_stream_sent.load(Ordering::SeqCst),
+                    self.finish_completed_set.load(Ordering::SeqCst),
+                );
+            }
             return true;
         }
         false
@@ -1588,6 +1799,21 @@ impl DataStreamSinkOperator {
                 self.fragment_instance_id.low(),
             ));
         }
+        let edge_gate = self.destination_gate(dest)?;
+        match edge_gate.as_ref().map(|gate| gate.state()) {
+            None | Some(EdgeSendState::Open) => {}
+            // A closed edge sends nothing and reserves nothing. The payload
+            // keeps the sink's existing single per-destination slot, which is
+            // what makes waiting for permission bounded backpressure rather
+            // than a second buffer.
+            Some(EdgeSendState::AwaitingPermission) => {
+                return Ok(PayloadEnqueue::NoCapacity(pending));
+            }
+            // The destination left normally, so its frames are dropped here
+            // rather than parked or sent.
+            Some(EdgeSendState::NormallyCanceled) => return Ok(PayloadEnqueue::Discarded),
+        }
+
         let allow_overflow =
             allow_overflow || pending.payload_bytes > self.exchange_queue().max_inflight_bytes();
         let reserve_bytes = pending.payload_bytes.max(1);
@@ -1617,7 +1843,12 @@ impl DataStreamSinkOperator {
         ) {
             accounting.transfer_to(Arc::clone(tracker));
         }
-        let task = self.build_exchange_send_task(dest.clone(), pending, Arc::clone(error_state));
+        let task = self.build_exchange_send_task(
+            dest.clone(),
+            pending,
+            Arc::clone(error_state),
+            edge_gate,
+        );
         if allow_overflow {
             self.exchange_queue().try_submit(task, true)?;
             return Ok(PayloadEnqueue::Enqueued);
@@ -1631,6 +1862,7 @@ impl DataStreamSinkOperator {
         destination: FragmentDestination,
         pending: PendingPayload,
         error_state: Arc<RuntimeErrorState>,
+        edge_gate: Option<Arc<EdgeSendGate>>,
     ) -> ExchangeSendTask {
         #[cfg(test)]
         record_payload_identity_for_test(self.fragment_instance_id, pending.be_number, pending.eos);
@@ -1656,6 +1888,7 @@ impl DataStreamSinkOperator {
             notify: Arc::clone(&self.send_observable),
             error_state,
             tracker: Arc::clone(&self.send_tracker),
+            edge_gate,
         }
     }
 
@@ -1747,7 +1980,28 @@ impl DataStreamSinkOperator {
                 );
                 Ok(PayloadEnqueue::Enqueued)
             }
+            PayloadEnqueue::Discarded => {
+                debug!(
+                    "DataStreamSink::transmit_partition discarded: dest_finst={} node_id={} eos={} seq={} bytes={} reason=destination_cancelled_normally",
+                    dest_finst_id, self.input.dest_node_id, eos, sequence, payload_bytes
+                );
+                Ok(PayloadEnqueue::Discarded)
+            }
             PayloadEnqueue::NoCapacity(payload) => Ok(PayloadEnqueue::NoCapacity(payload)),
+        }
+    }
+
+    /// Drops everything still owed to one abandoned destination: its buffered
+    /// chunks, their byte accounting, and its single parked payload.
+    fn discard_pending_for_dest(&mut self, dest_idx: usize) {
+        if let Some(chunks) = self.pending_per_dest.get_mut(dest_idx) {
+            chunks.clear();
+        }
+        if let Some(bytes) = self.pending_bytes_per_dest.get_mut(dest_idx) {
+            *bytes = 0;
+        }
+        if let Some(payload) = self.pending_payloads_per_dest.get_mut(dest_idx) {
+            *payload = None;
         }
     }
 
@@ -1849,6 +2103,22 @@ impl DataStreamSinkOperator {
             if Self::is_pseudo_destination(dest) {
                 continue;
             }
+            let send_state = self.destination_state_at(i);
+            // A destination that left normally abandons its own edge's frames
+            // and nothing else.
+            if send_state == Some(EdgeSendState::NormallyCanceled) {
+                self.discard_pending_for_dest(i);
+                continue;
+            }
+            // A closed edge must not stall the destinations that can send, so
+            // it parks its own payload and the loop moves on to the next
+            // destination instead of abandoning the whole flush.
+            // A closed edge parks its own payload and lets the loop move on:
+            // `try_enqueue_payload` reserves nothing for it, on the finishing
+            // drain exactly as on a normal one. The operator then reports
+            // finishing as still pending, so the driver comes back instead of
+            // treating a legitimate race as a failure.
+            let closed_edge = send_state == Some(EdgeSendState::AwaitingPermission);
             let pending_payload = self
                 .pending_payloads_per_dest
                 .get_mut(i)
@@ -1856,9 +2126,12 @@ impl DataStreamSinkOperator {
                 .take();
             if let Some(payload) = pending_payload {
                 match self.try_enqueue_payload(dest, payload, allow_overflow)? {
-                    PayloadEnqueue::Enqueued => {}
+                    PayloadEnqueue::Enqueued | PayloadEnqueue::Discarded => {}
                     PayloadEnqueue::NoCapacity(payload) => {
                         self.pending_payloads_per_dest[i] = Some(payload);
+                        if closed_edge {
+                            continue;
+                        }
                         return Ok(());
                     }
                 }
@@ -1874,8 +2147,15 @@ impl DataStreamSinkOperator {
                 }
                 match self.transmit_partition(i, dest, &chunks, false, allow_overflow)? {
                     PayloadEnqueue::Enqueued => {}
+                    PayloadEnqueue::Discarded => {
+                        self.discard_pending_for_dest(i);
+                        break;
+                    }
                     PayloadEnqueue::NoCapacity(payload) => {
                         self.pending_payloads_per_dest[i] = Some(payload);
+                        if closed_edge {
+                            break;
+                        }
                         return Ok(());
                     }
                 }
@@ -1887,26 +2167,99 @@ impl DataStreamSinkOperator {
         Ok(())
     }
 
+    /// Hands every destination this sink still owes one the end-of-stream
+    /// marker.
+    ///
+    /// Only the driver that completed the sink's driver set calls it, and only
+    /// once every edge is open and nothing is parked -- so a destination
+    /// skipped here is skipped for a reason that is permanent (it is a pruned
+    /// pseudo destination, or it withdrew), never because it is not ready yet.
+    /// That is what makes it sound to latch "the seal is sent" on return.
     fn send_eos(&mut self) -> Result<(), String> {
         self.ensure_pending_buffers_initialized();
         let dests: Vec<FragmentDestination> = self.destinations().to_vec();
+        let mut sealed = 0_usize;
+        let mut skipped = 0_usize;
         for (i, dest) in dests.iter().enumerate() {
             // No fragment instance is running for pseudo destinations — do not send EOS.
             if Self::is_pseudo_destination(dest) {
+                skipped += 1;
                 continue;
             }
+            match self.destination_state_at(i) {
+                // A destination that left normally is not owed an
+                // end-of-stream marker either.
+                Some(EdgeSendState::NormallyCanceled) => {
+                    self.discard_pending_for_dest(i);
+                    skipped += 1;
+                    continue;
+                }
+                // End-of-stream is output like any other frame, so it needs
+                // permission. The caller checks that no edge awaits permission
+                // before it calls this, and an edge never returns to awaiting
+                // permission once it leaves that state -- so this is
+                // unreachable, and it is refused rather than skipped: sealing
+                // some destinations and silently not others would latch "the
+                // seal is sent" over a sender the receiver keeps counting.
+                Some(EdgeSendState::AwaitingPermission) => {
+                    return Err(format!(
+                        "exchange send EOS reached destination {} whose edge is still awaiting \
+                         permission",
+                        dest.finst_id()
+                    ));
+                }
+                None | Some(EdgeSendState::Open) => {}
+            }
             match self.transmit_partition(i, dest, &[], true, true)? {
-                PayloadEnqueue::Enqueued => {}
+                PayloadEnqueue::Enqueued | PayloadEnqueue::Discarded => sealed += 1,
                 PayloadEnqueue::NoCapacity(_) => {
                     return Err("exchange send EOS unexpectedly blocked".to_string());
                 }
             }
         }
+        // Latched only now that every destination this sink owes has its
+        // marker: the receiver's sender count closes on this and on nothing
+        // else, so the latch has to describe the send that happened rather
+        // than the intent to send.
+        self.end_of_stream_sent.store(true, Ordering::SeqCst);
+        tracing::debug!(
+            "DataStreamSink end-of-stream sent: finst={} driver_id={} dest_node_id={} sender_id={} sealed={} skipped={}",
+            format_uuid(
+                self.fragment_instance_id.high(),
+                self.fragment_instance_id.low()
+            ),
+            self.driver_id,
+            self.input.dest_node_id,
+            self.sender_id,
+            sealed,
+            skipped,
+        );
         Ok(())
     }
 }
 
 impl ProcessorOperator for DataStreamSinkOperator {
+    fn finishing_wait(&self) -> FinishingWait {
+        if !self.finishing.load(Ordering::Acquire) {
+            return FinishingWait::Complete;
+        }
+        // Permission outranks owed output, and the order is load-bearing in
+        // both directions. While an edge is closed a flush can only park the
+        // payload again, so reporting owed output would spin the driver over
+        // an obstacle only the frontend's edge-open decision can clear. Once
+        // the edge is open, a parked payload and an unsent end-of-stream are
+        // output only this operator's own next turn can push -- and reporting
+        // *that* as a wait for an external event is what parked the driver
+        // forever with the rows in hand.
+        if self.awaits_edge_permission() {
+            return FinishingWait::ExternalEvent;
+        }
+        if self.has_pending_data() || self.owes_end_of_stream() {
+            return FinishingWait::OwedOutput;
+        }
+        FinishingWait::Complete
+    }
+
     fn accepts_encoded_column(&self, _slot_id: SlotId, data_type: &DataType) -> bool {
         is_low_cardinality_exchange_dictionary(data_type)
             && matches!(
@@ -2005,7 +2358,65 @@ impl ProcessorOperator for DataStreamSinkOperator {
         );
 
         self.flush_pending(true, true)?;
-        let is_last_driver = self.finish_state.driver_finished();
+        // The gate state per outbound edge, and the state of the gate each
+        // destination of THIS sink resolves to. A sink that waits forever is
+        // waiting on one of these, and without both halves it cannot be told
+        // apart from a sink whose edge opened but whose data never drained.
+        debug!(
+            "DataStreamSink finishing gates: finst={} driver_id={} dest_node_id={} edges={:?} destination_gates={:?} awaits_permission={} has_pending_data={}",
+            format_uuid(
+                self.fragment_instance_id.high(),
+                self.fragment_instance_id.low()
+            ),
+            self.driver_id,
+            self.input.dest_node_id,
+            self.edge_gates
+                .as_ref()
+                .map(|gates| gates.edges().collect::<Vec<_>>()),
+            self.destinations()
+                .iter()
+                .enumerate()
+                .map(|(idx, dest)| (
+                    dest.finst_id().low(),
+                    Self::is_pseudo_destination(dest),
+                    self.destination_state_at(idx)
+                ))
+                .collect::<Vec<_>>(),
+            self.awaits_edge_permission(),
+            self.has_pending_data(),
+        );
+        // A driver holding rows is not finished, whatever the driver set's
+        // arithmetic says.
+        //
+        // The pending buffers are per driver, but the end-of-stream is per
+        // sender: whichever driver completes the set sends one marker for all
+        // of them, and the receiver's sender count closes on that one marker.
+        // A driver that counted itself while still holding rows would let a
+        // sibling seal the sender over frames nobody has sent, and the
+        // receiver would report the exchange complete and silently short --
+        // no error anywhere, just fewer rows.
+        //
+        // So the count means "this driver has handed over everything it
+        // holds", which is what earns the last-driver verdict the right to
+        // speak for the others. `finishing_wait` already reports owed output
+        // for a driver with pending data and parks one whose edge is still
+        // closed, so returning here costs a turn, not the rows. Permission
+        // deliberately does not withhold the count: an edge that is closed
+        // with nothing behind it owes nothing, and withholding on that would
+        // stall the seal on a driver that has no rows to lose.
+        if self.has_pending_data() {
+            return Ok(());
+        }
+        // One driver reports its own finish exactly once, however many times
+        // the driver retries this call while waiting for its edge to open.
+        let is_last_driver = if self.finish_counted.swap(true, Ordering::SeqCst) {
+            self.finish_completed_set.load(Ordering::SeqCst)
+        } else {
+            let completed_set = self.finish_state.driver_finished();
+            self.finish_completed_set
+                .store(completed_set, Ordering::SeqCst);
+            completed_set
+        };
         debug!(
             "DataStreamSink finishing progressed: finst={} driver_id={} dest_node_id={} sender_id={} last_driver={} (only last driver sends EOS)",
             format_uuid(
@@ -2018,6 +2429,14 @@ impl ProcessorOperator for DataStreamSinkOperator {
             is_last_driver
         );
         if !is_last_driver {
+            return Ok(());
+        }
+        // The marker is output like any other frame, so it needs this
+        // driver's edges open. The last-driver verdict is latched, so
+        // returning here keeps it for the retry that `finishing_wait` asks
+        // for. Pending data needs no second check: no driver reaches the
+        // count while it still holds any.
+        if self.awaits_edge_permission() {
             return Ok(());
         }
         self.send_eos()?;
@@ -2201,6 +2620,9 @@ mod tests {
             max_transmit_batched_bytes: 1,
             finished: AtomicBool::new(false),
             finishing: AtomicBool::new(false),
+            finish_counted: AtomicBool::new(false),
+            finish_completed_set: AtomicBool::new(false),
+            end_of_stream_sent: AtomicBool::new(false),
             send_tracker: ExchangeSendTracker::new(),
             send_observable: Arc::new(Observable::new()),
             error_state: None,
@@ -2216,6 +2638,7 @@ mod tests {
                     Arc::new(crate::runtime::io::IoExecutor::new(1)),
                 ),
             )),
+            edge_gates: None,
         }
     }
 
@@ -2228,6 +2651,71 @@ mod tests {
             1,
         )
         .expect("destination")
+    }
+
+    fn destination_with_finst(low: i64) -> FragmentDestination {
+        FragmentDestination::new(
+            UniqueId::new(9, low),
+            RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+            UniqueId::new(1, 2),
+            0,
+            1,
+        )
+        .expect("destination")
+    }
+
+    fn edge_id(value: u32) -> ExchangeEdgeId {
+        ExchangeEdgeId::new(value).expect("nonzero edge")
+    }
+
+    /// Gates the sink's destinations one edge per destination, all closed, so
+    /// each edge's decision is observable in isolation.
+    fn gate_destinations(op: &mut DataStreamSinkOperator, dests: Vec<FragmentDestination>) {
+        let gates = ExchangeEdgeGates::try_new(dests.iter().enumerate().map(|(idx, dest)| {
+            (
+                edge_id(idx as u32 + 1),
+                vec![ExchangeDestinationKey::new(
+                    *dest.finst_id(),
+                    op.input.dest_node_id,
+                )],
+            )
+        }))
+        .expect("legal gate set");
+        op.input.destinations = dests;
+        op.edge_gates = Some(gates);
+    }
+
+    /// One version opens one exact edge set, so every edge a test needs open
+    /// is named in a single request.
+    fn open_edges(op: &DataStreamSinkOperator, edges: &[ExchangeEdgeId]) {
+        op.edge_gates
+            .as_ref()
+            .expect("gated sink")
+            .open(crate::task_execution::domain::EdgeOpenVersion::FIRST, edges)
+            .expect("open edges");
+    }
+
+    fn cancel_edge(op: &DataStreamSinkOperator, edge: ExchangeEdgeId) {
+        assert!(
+            op.edge_gates
+                .as_ref()
+                .expect("gated sink")
+                .gate(edge)
+                .expect("gated edge")
+                .close_for_normal_cancellation()
+        );
+    }
+
+    fn test_payload(bytes: usize) -> PendingPayload {
+        PendingPayload {
+            be_number: 0,
+            payload: vec![7; bytes],
+            payload_bytes: bytes,
+            encode_ns: 0,
+            sequence: 0,
+            eos: false,
+            accounting: None,
+        }
     }
 
     fn make_test_exchange_send_task() -> ExchangeSendTask {
@@ -2252,6 +2740,7 @@ mod tests {
                 accounting: None,
             },
             Arc::new(RuntimeErrorState::default()),
+            None,
         )
     }
 
@@ -2383,6 +2872,494 @@ mod tests {
             "non-empty payloads must carry wire meta because enqueue is not delivery confirmation"
         );
         assert!(!DataStreamSinkOperator::should_include_wire_meta(true));
+    }
+
+    #[test]
+    fn a_closed_edge_enqueues_no_frame_and_reserves_no_bytes() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest.clone()]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+
+        assert!(matches!(
+            op.try_enqueue_payload(&dest, test_payload(4), false),
+            Ok(PayloadEnqueue::NoCapacity(_))
+        ));
+        assert!(
+            op.send_tracker.is_idle(),
+            "a closed edge must hand nothing to the send queue"
+        );
+        assert_eq!(
+            op.exchange_queue().inflight_bytes(),
+            0,
+            "a closed edge must not hold any of the shared byte budget"
+        );
+    }
+
+    #[test]
+    fn opening_an_edge_lets_the_sinks_frames_through() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest.clone()]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+
+        open_edges(&op, &[edge_id(1)]);
+        assert!(matches!(
+            op.try_enqueue_payload(&dest, test_payload(4), false),
+            Ok(PayloadEnqueue::Enqueued)
+        ));
+
+        // Opening is monotonic and idempotent, so a replay changes nothing.
+        open_edges(&op, &[edge_id(1)]);
+        assert!(matches!(
+            op.try_enqueue_payload(&dest, test_payload(4), false),
+            Ok(PayloadEnqueue::Enqueued)
+        ));
+    }
+
+    #[test]
+    fn a_normally_cancelled_edge_discards_its_payload_and_its_pending_chunks() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest.clone()]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        open_edges(&op, &[edge_id(1)]);
+
+        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        assert!(op.has_pending_chunks());
+
+        cancel_edge(&op, edge_id(1));
+        assert!(matches!(
+            op.try_enqueue_payload(&dest, test_payload(4), false),
+            Ok(PayloadEnqueue::Discarded)
+        ));
+
+        op.flush_pending(true, false).expect("flush pending");
+        assert_eq!(op.pending_chunk_count_total(), 0);
+        assert_eq!(op.pending_payload_count(), 0);
+        assert!(
+            !op.has_pending_data(),
+            "abandoned data must not hold the sink open"
+        );
+        assert!(op.send_tracker.is_idle(), "no frame reaches the send queue");
+        assert_eq!(op.exchange_queue().inflight_bytes(), 0);
+        assert_eq!(
+            op.current_error(),
+            None,
+            "a destination's normal departure is not this producer's failure"
+        );
+    }
+
+    #[test]
+    fn a_normally_cancelled_edge_leaves_the_other_destinations_sending() {
+        let mut op = make_test_operator();
+        let abandoned = destination_with_finst(1);
+        let healthy = destination_with_finst(2);
+        gate_destinations(&mut op, vec![abandoned.clone(), healthy.clone()]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        open_edges(&op, &[edge_id(1), edge_id(2)]);
+
+        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        assert_eq!(op.pending_per_dest.len(), 2);
+        assert!(!op.pending_per_dest[0].is_empty() && !op.pending_per_dest[1].is_empty());
+
+        cancel_edge(&op, edge_id(1));
+        op.flush_pending(true, false).expect("flush pending");
+
+        assert!(
+            op.pending_per_dest[0].is_empty(),
+            "the abandoned edge's chunks are dropped"
+        );
+        assert!(
+            op.pending_per_dest[1].is_empty() && op.pending_payloads_per_dest[1].is_none(),
+            "the healthy edge's chunks are handed to the send queue, not dropped or parked"
+        );
+        assert!(matches!(
+            op.try_enqueue_payload(&abandoned, test_payload(4), false),
+            Ok(PayloadEnqueue::Discarded)
+        ));
+        assert!(
+            op.edge_gates
+                .as_ref()
+                .expect("gated sink")
+                .gate(edge_id(2))
+                .expect("edge two")
+                .may_send(),
+            "the healthy edge keeps its send permission"
+        );
+        assert_eq!(op.current_error(), None);
+    }
+
+    #[test]
+    fn a_closed_edge_does_not_stall_a_destination_that_can_send() {
+        let mut op = make_test_operator();
+        let closed = destination_with_finst(1);
+        let open = destination_with_finst(2);
+        gate_destinations(&mut op, vec![closed, open]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        open_edges(&op, &[edge_id(2)]);
+
+        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        op.flush_pending(true, false).expect("flush pending");
+
+        assert!(
+            op.pending_payloads_per_dest[0].is_some(),
+            "the closed edge parks its own payload"
+        );
+        assert!(
+            op.pending_payloads_per_dest[1].is_none() && op.pending_per_dest[1].is_empty(),
+            "one edge waiting for permission must not block another edge's flush"
+        );
+    }
+
+    #[test]
+    fn a_destination_no_edge_claims_fails_closed() {
+        let mut op = make_test_operator();
+        gate_destinations(&mut op, vec![destination_with_finst(1)]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+
+        let Err(error) = op.try_enqueue_payload(&destination_with_finst(7), test_payload(4), false)
+        else {
+            panic!("an unattributed destination must not send");
+        };
+        assert!(
+            error.contains("not attributed to any outbound edge"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_closed_edge_holds_at_most_one_payload_and_stops_taking_input() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest]);
+        // One byte batches every buffered chunk, so each push offers the
+        // closed edge a payload.
+        op.max_transmit_batched_bytes = 1;
+        let state = RuntimeState::default();
+
+        let mut pushed = 0;
+        while ProcessorOperator::need_input(&op) && pushed < 8 {
+            ProcessorOperator::push_chunk(&mut op, &state, int64_chunk(8)).expect("push chunk");
+            pushed += 1;
+        }
+
+        assert!(
+            pushed < 8,
+            "a closed edge must stop the sink from taking more input"
+        );
+        assert!(
+            op.pending_payload_count() <= op.destinations().len(),
+            "the single per-destination payload slot is the whole bound"
+        );
+        assert_eq!(
+            op.exchange_queue().inflight_bytes(),
+            0,
+            "a closed edge takes nothing from the global or the per-destination ceiling"
+        );
+        assert!(op.send_tracker.is_idle(), "nothing was handed to the queue");
+        let buffered = op.pending_chunk_bytes_total() + op.pending_payload_bytes_total();
+        let bound = op.exchange_queue().max_inflight_bytes();
+        assert!(
+            buffered <= bound,
+            "a closed edge held {buffered} bytes, above the send queue's own ceiling {bound}"
+        );
+        // A healthy destination can still claim the whole budget while the
+        // closed edge waits, because the closed edge reserved nothing.
+        assert!(op.exchange_queue().can_reserve(bound));
+
+        open_edges(&op, &[edge_id(1)]);
+        assert!(
+            ProcessorOperator::need_input(&op),
+            "opening the edge releases the backpressure"
+        );
+    }
+
+    /// A producer whose input drains before its edge opens is a normal race,
+    /// not a failure: the open follows a round trip after every destination
+    /// acknowledges creation, and a small fragment can finish reading sooner.
+    /// So the finishing drain waits, and the driver is told to come back.
+    #[test]
+    fn finishing_before_an_edge_opens_waits_instead_of_failing() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        op.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+
+        op.flush_pending(true, true)
+            .expect("the finishing drain parks a closed edge rather than failing");
+        assert!(
+            op.current_error().is_none(),
+            "waiting for permission is not the producer's error"
+        );
+        assert!(
+            op.awaits_edge_permission(),
+            "the sink must still be waiting on its edge"
+        );
+        assert_eq!(
+            op.exchange_queue().inflight_bytes(),
+            0,
+            "a closed edge reserved nothing while it waited"
+        );
+
+        op.finishing.store(true, Ordering::Release);
+        assert_eq!(
+            ProcessorOperator::finishing_wait(&op),
+            FinishingWait::ExternalEvent,
+            "a closed edge is an obstacle this operator cannot clear, so the driver parks"
+        );
+        assert!(
+            !op.maybe_mark_finished(),
+            "the sink cannot be finished while it still owes output"
+        );
+
+        open_edges(&op, &[edge_id(1)]);
+        assert!(!op.awaits_edge_permission());
+        assert_eq!(
+            ProcessorOperator::finishing_wait(&op),
+            FinishingWait::OwedOutput,
+            "with the edge open the parked payload is output only this operator can push, \
+             so the driver must give it a turn rather than park again"
+        );
+        op.flush_pending(true, true)
+            .expect("the drain now completes");
+        assert!(!ProcessorOperator::finishing_wait(&op).is_pending());
+    }
+
+    /// The same race with nothing buffered. Only an end-of-stream is owed, and
+    /// forgetting it would leave the destination counting senders forever.
+    #[test]
+    fn a_closed_edge_owed_only_an_end_of_stream_still_blocks_finishing() {
+        let mut op = make_test_operator();
+        let dest = make_test_destination();
+        gate_destinations(&mut op, vec![dest]);
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+
+        assert!(
+            !op.has_pending_data(),
+            "nothing is buffered, so only the end-of-stream is outstanding"
+        );
+        op.finishing.store(true, Ordering::Release);
+        assert!(
+            !op.maybe_mark_finished(),
+            "an unsent end-of-stream is still output this sink owes"
+        );
+        assert_eq!(
+            ProcessorOperator::finishing_wait(&op),
+            FinishingWait::ExternalEvent
+        );
+
+        open_edges(&op, &[edge_id(1)]);
+        op.send_eos().expect("the end-of-stream now goes out");
+        assert!(!ProcessorOperator::finishing_wait(&op).is_pending());
+    }
+
+    /// The defect this catches: a sink that deferred its end-of-stream while
+    /// its edge was closed declared itself *finished* the moment that edge
+    /// opened, because "nothing parked and no closed edge" was the whole of
+    /// "I owe no more output". The scheduler reads that verdict through
+    /// `is_finished` and `need_input` between driver turns, and `set_finishing`
+    /// returns early once `finished` is latched -- so the marker was never
+    /// sent, by no race: the driver's own turn re-checks `is_finished` before
+    /// it re-checks the operator's pending finish.
+    ///
+    /// The consequence is a hang with no failure anywhere. The receiving
+    /// exchange keeps counting senders, so its scan never reaches end of
+    /// stream, the root fragment never fills its result buffer, and the
+    /// frontend's read completion -- which needs the root FINISHED and its own
+    /// end of stream, neither of which fails on absence -- waits out the whole
+    /// statement budget. Measured on a real 1FE+3BE cluster as a distributed
+    /// `SELECT ... ORDER BY` timing out after 120 s with two minutes of total
+    /// silence in every process's log.
+    #[test]
+    fn an_edge_opening_must_not_finish_a_sink_before_its_end_of_stream_is_sent() {
+        let runtime = RuntimeState::default();
+        let mut op = make_test_operator();
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        // One driver, so this operator is the one that completes the set and
+        // therefore the one that owes the marker.
+        op.finish_state.register_driver();
+        gate_destinations(&mut op, vec![make_test_destination()]);
+
+        // Nothing buffered: this producer's input drained before the frontend
+        // decided the edge, which is the ordinary shape for a fragment
+        // instance that read no matching rows at all.
+        ProcessorOperator::set_finishing(&mut op, &runtime)
+            .expect("a closed edge parks the seal rather than failing");
+        assert!(!op.has_pending_data());
+        assert_eq!(
+            op.shared_sequence.load(Ordering::SeqCst),
+            0,
+            "no frame may leave a sink whose edge has not been opened"
+        );
+
+        open_edges(&op, &[edge_id(1)]);
+
+        // Exactly what the scheduler asks between driver turns, and what the
+        // driver itself asks at the top of its next turn.
+        assert!(
+            !Operator::is_finished(&op),
+            "a sink that still owes its end-of-stream has not finished"
+        );
+        assert_eq!(
+            ProcessorOperator::finishing_wait(&op),
+            FinishingWait::OwedOutput,
+            "the driver must be told to come back and send it"
+        );
+        assert!(
+            ProcessorOperator::need_input(&op),
+            "the sink is not blocked; it is owed one more turn"
+        );
+
+        // The turn the driver is now still allowed to take.
+        ProcessorOperator::set_finishing(&mut op, &runtime).expect("the seal now goes out");
+        assert_eq!(
+            op.shared_sequence.load(Ordering::SeqCst),
+            1,
+            "exactly one frame left this sink, and with nothing buffered it is the end-of-stream"
+        );
+        assert!(
+            !op.owes_end_of_stream(),
+            "the sink no longer owes the marker once it has been enqueued"
+        );
+        assert!(!ProcessorOperator::finishing_wait(&op).is_pending());
+        // Whether the operator is *finished* additionally waits for the send
+        // queue to hand the frame off, which is asynchronous and not this
+        // test's subject.
+    }
+
+    /// The defect this catches: `set_finishing` counted this driver against
+    /// the sink's driver set on every call, while `finishing_wait` had
+    /// the driver retry that same call for as long as the edge stayed closed.
+    /// One driver's retries therefore consumed the whole set and latched the
+    /// one-shot end-of-stream guard, so once the edge finally opened no driver
+    /// was the last one any more and end-of-stream was never sent. The
+    /// destination then counted senders forever: observed in a real 1FE+3BE
+    /// run as a distributed SELECT hanging until its statement deadline.
+    #[test]
+    fn retrying_set_finishing_while_an_edge_is_closed_does_not_consume_the_driver_set() {
+        let state = Arc::new(DataStreamSinkFinishState::default());
+        // Two drivers on one sink, both sharing the frozen finish state.
+        state.register_driver();
+        state.register_driver();
+        let runtime = RuntimeState::default();
+
+        let mut first = make_test_operator();
+        first.finish_state = Arc::clone(&state);
+        first.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        gate_destinations(&mut first, vec![make_test_destination()]);
+
+        let mut second = make_test_operator();
+        second.driver_id = 1;
+        second.finish_state = Arc::clone(&state);
+        second.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        gate_destinations(&mut second, vec![make_test_destination()]);
+
+        // The first driver drains while the edge is still closed and is
+        // retried, exactly as the pipeline driver retries a pending finish.
+        for _ in 0..8 {
+            ProcessorOperator::set_finishing(&mut first, &runtime)
+                .expect("a closed edge parks the drain rather than failing");
+            assert!(
+                ProcessorOperator::finishing_wait(&first).is_pending(),
+                "the driver is told to come back while the edge is closed"
+            );
+        }
+        assert_eq!(
+            state.remaining_drivers.load(Ordering::SeqCst),
+            1,
+            "eight retries by one driver must count once"
+        );
+
+        // The second driver finishes, which completes the set.
+        ProcessorOperator::set_finishing(&mut second, &runtime).expect("the second driver drains");
+        assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 0);
+
+        // The edge opens. The driver that completed the set still owes the
+        // end-of-stream, and its next retry sends it.
+        open_edges(&second, &[edge_id(1)]);
+        ProcessorOperator::set_finishing(&mut second, &runtime)
+            .expect("the end-of-stream now goes out");
+        assert!(
+            !ProcessorOperator::finishing_wait(&second).is_pending(),
+            "the sink no longer owes output once the end-of-stream is enqueued"
+        );
+        assert!(
+            !state.force_eos_sent.load(Ordering::SeqCst),
+            "the one-shot guard is for a genuine accounting error, not for retries"
+        );
+    }
+
+    /// The defect this catches: the driver that completes a sink's driver set
+    /// sends one end-of-stream for the whole set, but the pending buffers are
+    /// per driver. That driver checked only its own, so a sibling that had
+    /// finished while still holding rows had them dropped -- the receiver's
+    /// sender count closed on the marker and reported the exchange complete,
+    /// silently short, with no error anywhere. Observed on a real 1FE+3BE run
+    /// as `SELECT ... UNION SELECT ...` returning one row of two and as
+    /// `COUNT(*)` over a union returning 0; it reproduced in 3 of 8 suite
+    /// runs and in none on the commit before the cutover.
+    #[test]
+    fn a_driver_still_holding_rows_is_not_counted_against_the_driver_set() {
+        let state = Arc::new(DataStreamSinkFinishState::default());
+        // Two drivers on one sink, both sharing the frozen finish state.
+        state.register_driver();
+        state.register_driver();
+        let runtime = RuntimeState::default();
+
+        let mut holder = make_test_operator();
+        holder.finish_state = Arc::clone(&state);
+        holder.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        gate_destinations(&mut holder, vec![make_test_destination()]);
+
+        let mut sibling = make_test_operator();
+        sibling.driver_id = 1;
+        sibling.finish_state = Arc::clone(&state);
+        sibling.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        gate_destinations(&mut sibling, vec![make_test_destination()]);
+
+        // One driver finishes holding rows it has not been able to hand over.
+        holder.buffer_chunk(int64_chunk(8)).expect("buffer chunk");
+        assert!(holder.has_pending_chunks());
+        ProcessorOperator::set_finishing(&mut holder, &runtime)
+            .expect("a closed edge parks the drain rather than failing");
+        assert!(
+            holder.has_pending_data(),
+            "the closed edge leaves the rows on this driver"
+        );
+        assert_eq!(
+            state.remaining_drivers.load(Ordering::SeqCst),
+            2,
+            "a driver holding rows has not finished, so it must not count"
+        );
+
+        // Its sibling finishing must therefore not complete the set, and must
+        // not seal the sender over rows the first driver still holds.
+        ProcessorOperator::set_finishing(&mut sibling, &runtime)
+            .expect("the sibling drains with nothing to hand over");
+        assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 1);
+        assert!(
+            !sibling.end_of_stream_sent.load(Ordering::SeqCst),
+            "no end-of-stream may go out while a sibling still holds rows"
+        );
+
+        // The edge opens: the holder hands its rows over on its next turn,
+        // counts, completes the set, and only then does the marker follow the
+        // frames it seals.
+        open_edges(&holder, &[edge_id(1)]);
+        ProcessorOperator::set_finishing(&mut holder, &runtime)
+            .expect("the parked rows and then the seal go out");
+        assert!(!holder.has_pending_data());
+        assert_eq!(state.remaining_drivers.load(Ordering::SeqCst), 0);
+        assert!(
+            holder.end_of_stream_sent.load(Ordering::SeqCst),
+            "the driver that counted last seals, and it seals after its rows"
+        );
+        assert!(
+            !state.force_eos_sent.load(Ordering::SeqCst),
+            "the one-shot guard is for a genuine accounting error, not for this"
+        );
     }
 
     #[test]

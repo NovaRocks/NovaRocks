@@ -20,9 +20,9 @@
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
+use crate::query_execution::profile::FragmentProfileTree;
 use crate::query_execution::statistics::StatisticsCollectionProgram;
 use crate::runtime::query_result::QueryResult;
-use novarocks_execution::runtime::profile::RuntimeProfileTree;
 
 /// Role-neutral execution data assembled by core engine flows before intent
 /// validation seals the public distributed-query outcome.
@@ -32,7 +32,7 @@ pub(crate) struct QueryExecutionResult {
     /// plane. It carries the commit authority and the rows every writer
     /// accepted; neither may be surfaced before the external commit succeeds.
     pub(crate) write_session: Option<ConnectorWriteSessionCompletion>,
-    pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
+    pub(crate) fragment_profiles: Vec<FragmentProfileTree>,
 }
 
 impl std::fmt::Debug for QueryExecutionResult {
@@ -148,15 +148,15 @@ impl WriteExecutionOutcome {
 }
 
 pub struct FragmentProfileSet {
-    profiles: Vec<RuntimeProfileTree>,
+    profiles: Vec<FragmentProfileTree>,
 }
 
 impl FragmentProfileSet {
-    pub(crate) fn new(profiles: Vec<RuntimeProfileTree>) -> Self {
+    pub(crate) fn new(profiles: Vec<FragmentProfileTree>) -> Self {
         Self { profiles }
     }
 
-    pub(crate) fn into_profiles(self) -> Vec<RuntimeProfileTree> {
+    pub(crate) fn into_profiles(self) -> Vec<FragmentProfileTree> {
         self.profiles
     }
 }

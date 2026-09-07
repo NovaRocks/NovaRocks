@@ -16,6 +16,29 @@
 -- under the License.
 
 -- @sequential=true
+--
+-- A backend process that disappears mid-query must not leave the query
+-- hanging, and the backends that survive must release the attempt.
+--
+-- Migrated onto the task protocol. Both retired parts are replaced:
+--
+--   * the trigger. The retired directive waited for SHOW BACKENDS to report a
+--     fresh ScheduledFragments count, and that column is only fed by the
+--     retired stage loop, so on the task path it never moves and the kill was
+--     never delivered. The kill is now released by the backend's own
+--     admission marker.
+--   * the fragment backend limit. It existed so the killed backend was
+--     certainly a fragment executor. Every backend the task protocol gives a
+--     query context to hosts a task, so the limit has nothing left to select
+--     -- and its evidence branch reads retired ControlReady fields.
+--
+-- The expected error is DERIVED, not verified: the task protocol has no
+-- attributed backend-process-loss detector. A lost operation is retried
+-- inside the frontend queue-residence bound and then dropped with no
+-- consumer, and a dropped status subscription exhausts a budget nothing
+-- reads, so the loss surfaces only when an exchange peer of the dead process
+-- fails -- which depends on where the aggregation task was placed. The
+-- survivor assertions below hold whichever way that lands.
 
 -- query 1
 -- @skip_result_check=true
@@ -31,9 +54,22 @@ INSERT INTO ${case_db}.resilience_series
 SELECT generate_series FROM TABLE(generate_series(666667, 1000000));
 
 -- query 2
--- @query_control_fragment_backend_limit=2
--- @kill_be_after_fragment_start=1
--- @expect_error=backend 1 lost after heartbeat timeout
+-- @kill_be_after_be_log_contains=1,NOVAROCKS_TASK_CREATE_APPLIED
+-- The attempt is decided by the killed backend's status subscription settling
+-- where resubscribing cannot repair it, and the error names that backend. It
+-- deliberately does not assert the root result fetch failing instead: that
+-- happens only when the killed process was the one holding the root task, so
+-- asserting it would make this case pass or fail on where the scheduler put
+-- the root.
+-- @expect_error=is no longer observable
+-- Neither count is the cluster size. A context exists only where a task is
+-- placed, and which backends get the table's splits is the scheduler's
+-- business -- a backend restart earlier in the suite is enough to co-locate
+-- two of three. Aborts are then participants minus the one whose process is
+-- gone. What the case is about survives that: more than one backend ran a
+-- task, and the loss of one was fanned out to a peer.
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,2
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,1
 SELECT COUNT(*) FROM ${case_db}.resilience_series;
 
 -- query 3

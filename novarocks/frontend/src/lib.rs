@@ -48,6 +48,7 @@ pub mod statistics;
 pub mod statistics_jobs;
 pub mod system_catalog;
 pub mod table_maintenance;
+pub mod task_execution;
 mod topology;
 mod user_variable;
 pub mod view;

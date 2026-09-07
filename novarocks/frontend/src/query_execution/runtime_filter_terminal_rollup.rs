@@ -160,25 +160,39 @@ pub(crate) struct RuntimeFilterTerminalScanNotEvaluatedTotals {
     pub(crate) snapshot_not_published: u64,
 }
 
-pub(crate) fn rollup(set: &QueryTerminalSet) -> RuntimeFilterTerminalRollup {
-    let mut participants = Vec::with_capacity(set.snapshots().len());
-    let mut totals = RuntimeFilterTerminalTotals::default();
-    let mut totals_unavailable = None;
+/// Folds one participant's telemetry at a time into the query rollup.
+///
+/// Both carriers of these facts fold through this: the retired lifecycle's
+/// terminal set and the task protocol's release acknowledgements. Two folds
+/// would be two chances for the same counters to be summed differently, and
+/// the rollup is what every structured assertion reads.
+struct RuntimeFilterTerminalRollupBuilder {
+    participants: Vec<RuntimeFilterParticipantTerminalTelemetry>,
+    totals: RuntimeFilterTerminalTotals,
+    totals_unavailable: Option<RuntimeFilterTerminalTotalsUnavailable>,
+}
 
-    for snapshot in set.snapshots() {
-        let participant = RuntimeFilterTerminalParticipant {
-            process_id: snapshot
-                .participant()
-                .backend_process_id()
-                .expect("validated terminal snapshot always has a backend process id"),
-        };
-        let telemetry = snapshot.profile_contribution_telemetry();
+impl RuntimeFilterTerminalRollupBuilder {
+    fn with_capacity(participants: usize) -> Self {
+        Self {
+            participants: Vec::with_capacity(participants),
+            totals: RuntimeFilterTerminalTotals::default(),
+            totals_unavailable: None,
+        }
+    }
 
+    fn absorb(
+        &mut self,
+        process_id: BackendProcessId,
+        telemetry: &novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionTelemetry,
+    ) {
+        let participant = RuntimeFilterTerminalParticipant { process_id };
         let telemetry = if let Some(contribution) = telemetry.available() {
-            if totals_unavailable.is_none()
-                && add_contribution_totals(&mut totals, &contribution).is_err()
+            if self.totals_unavailable.is_none()
+                && add_contribution_totals(&mut self.totals, &contribution).is_err()
             {
-                totals_unavailable = Some(RuntimeFilterTerminalTotalsUnavailable::CounterOverflow);
+                self.totals_unavailable =
+                    Some(RuntimeFilterTerminalTotalsUnavailable::CounterOverflow);
             }
             RuntimeFilterParticipantTerminalTelemetryValue::Available(
                 RuntimeFilterParticipantTerminalDetails {
@@ -192,7 +206,7 @@ pub(crate) fn rollup(set: &QueryTerminalSet) -> RuntimeFilterTerminalRollup {
             let unavailable = telemetry
                 .unavailable()
                 .expect("validated telemetry is available or unavailable");
-            totals_unavailable =
+            self.totals_unavailable =
                 Some(RuntimeFilterTerminalTotalsUnavailable::ParticipantTelemetryUnavailable);
             RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(
                 RuntimeFilterTerminalUnavailable {
@@ -201,20 +215,53 @@ pub(crate) fn rollup(set: &QueryTerminalSet) -> RuntimeFilterTerminalRollup {
                 },
             )
         };
-
-        participants.push(RuntimeFilterParticipantTerminalTelemetry {
-            participant,
-            telemetry,
-        });
+        self.participants
+            .push(RuntimeFilterParticipantTerminalTelemetry {
+                participant,
+                telemetry,
+            });
     }
 
-    RuntimeFilterTerminalRollup {
-        participants,
-        totals: match totals_unavailable {
-            Some(reason) => RuntimeFilterTerminalTotalsTelemetry::Unavailable(reason),
-            None => RuntimeFilterTerminalTotalsTelemetry::Available(totals),
-        },
+    fn finish(self) -> RuntimeFilterTerminalRollup {
+        RuntimeFilterTerminalRollup {
+            participants: self.participants,
+            totals: match self.totals_unavailable {
+                Some(reason) => RuntimeFilterTerminalTotalsTelemetry::Unavailable(reason),
+                None => RuntimeFilterTerminalTotalsTelemetry::Available(self.totals),
+            },
+        }
     }
+}
+
+pub(crate) fn rollup(set: &QueryTerminalSet) -> RuntimeFilterTerminalRollup {
+    let mut builder = RuntimeFilterTerminalRollupBuilder::with_capacity(set.snapshots().len());
+    for snapshot in set.snapshots() {
+        let process_id = snapshot
+            .participant()
+            .backend_process_id()
+            .expect("validated terminal snapshot always has a backend process id");
+        builder.absorb(process_id, &snapshot.profile_contribution_telemetry());
+    }
+    builder.finish()
+}
+
+/// Folds the contributions the task protocol's release acknowledgements
+/// carried, one per backend that released.
+///
+/// The caller owns completeness: this reports exactly the participants it was
+/// given, in the order it was given them, and never substitutes an empty
+/// contribution for a backend whose release did not answer.
+pub(crate) fn rollup_from_release_contributions(
+    contributions: &[(
+        BackendProcessId,
+        novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionTelemetry,
+    )],
+) -> RuntimeFilterTerminalRollup {
+    let mut builder = RuntimeFilterTerminalRollupBuilder::with_capacity(contributions.len());
+    for (process_id, telemetry) in contributions {
+        builder.absorb(*process_id, telemetry);
+    }
+    builder.finish()
 }
 
 fn add_contribution_totals(
@@ -502,6 +549,50 @@ mod tests {
             ..Default::default()
         })
         .expect("terminal snapshot")
+    }
+
+    /// The task protocol's release-carried contributions fold to the same
+    /// rollup the lifecycle's terminal set folds to.
+    ///
+    /// The two carriers must not sum the same counters differently: this
+    /// rollup is what every structured runtime-filter assertion reads, so a
+    /// second fold would make the same query answer differently depending on
+    /// which protocol ran it.
+    #[test]
+    fn release_carried_contributions_fold_to_the_same_rollup_as_a_terminal_set() {
+        let set = QueryTerminalSet::new(vec![
+            available_snapshot(2, 101, 1),
+            available_snapshot(1, 101, 1),
+        ])
+        .expect("terminal set");
+        let from_set = set.runtime_filter_terminal_rollup();
+
+        let contributions = [1_u64, 2]
+            .into_iter()
+            .map(|seed| {
+                let snapshot = available_snapshot(seed, 101, 1);
+                let telemetry = novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
+                    snapshot
+                        .as_proto()
+                        .profile_contribution
+                        .clone()
+                        .expect("the fixture carries a contribution"),
+                )
+                .expect("the fixture contribution is valid");
+                let bytes: [u8; 16] = test_backend_process_id(seed)
+                    .value
+                    .try_into()
+                    .expect("sixteen bytes");
+                (
+                    novarocks_types::BackendProcessId::try_from_bytes(bytes)
+                        .expect("a legal UUIDv7"),
+                    telemetry,
+                )
+            })
+            .collect::<Vec<_>>();
+        let from_releases = super::rollup_from_release_contributions(&contributions);
+
+        assert_eq!(from_releases, from_set);
     }
 
     #[test]

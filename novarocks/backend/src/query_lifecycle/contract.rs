@@ -32,7 +32,9 @@ use novarocks_proto_codec::lifecycle::{
     QueryTerminationAck, QueryTerminationReason, StageDigest,
 };
 use novarocks_spi::connector::{CatalogHandle, CredentialLeaseId};
-use novarocks_types::{BackendProcessId, UniqueId};
+use novarocks_types::BackendProcessId;
+
+use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 
 /// Backend-local lifecycle failure categories.
 ///
@@ -190,17 +192,14 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
         }
     }
 
-    /// Authorizes one native exchange frame against an active participant
+    /// Claims one native exchange frame against an active participant
     /// manifest. The data-plane never obtains authority from a receiver key.
-    fn authorize_exchange(
-        &self,
-        _destination_fragment_instance_id: UniqueId,
-        _destination_node_id: i32,
-        _source_fragment_instance_id: UniqueId,
-        _sender_ordinal: u32,
-        _sender_count: u32,
-    ) -> Result<(), String> {
-        Err("exchange route is not authorized by the query lifecycle ingress".to_string())
+    ///
+    /// An ingress with no lifecycle state holds no destination at all, so it
+    /// disclaims rather than refusing: a refusal here would be this owner
+    /// speaking about another owner's destinations.
+    fn claim_exchange_route(&self, _query: ExchangeRouteQuery) -> ExchangeRouteClaim {
+        ExchangeRouteClaim::NotHeld
     }
 
     /// Atomically records the participant-local stage contract. Fragment

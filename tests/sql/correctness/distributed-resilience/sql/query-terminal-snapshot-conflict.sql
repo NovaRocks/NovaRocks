@@ -16,6 +16,16 @@
 -- under the License.
 
 -- @sequential=true
+--
+-- The statement is ANALYZE, not a SELECT. The terminal snapshot this case
+-- perturbs belongs to the retired lifecycle, which after the task-protocol
+-- cutover serves exactly one intent: statistics collection. A SELECT no
+-- longer reports a lifecycle terminal at all, so the fault had nothing to
+-- perturb and the query simply succeeded -- the case failed for expecting an
+-- error rather than for the contract being broken.
+--
+-- The frontend fragment-backend limit is dropped with it: that directive
+-- rests on the participant/service-only shape, which ADR-0135 removed.
 
 -- query 1
 -- @skip_result_check=true
@@ -36,12 +46,8 @@ INSERT INTO ${case_db}.terminal_conflict VALUES (3, 30);
 -- identity but a different digest before FE ACK. The query must fail closed,
 -- never publish a successful terminal set, and clean up normally.
 -- @terminal_snapshot_conflict_be_index=0
--- @query_control_fragment_backend_limit=2
 -- @expect_error=query terminal outcome conflicts with an already stored participant outcome
-SELECT SUM(left_side.payload) AS total
-FROM ${case_db}.terminal_conflict left_side
-JOIN ${case_db}.terminal_conflict right_side
-  ON left_side.id = right_side.id;
+ANALYZE TABLE ${case_db}.terminal_conflict (payload);
 
 -- query 4
 -- Health query after the rejected terminal identity conflict.

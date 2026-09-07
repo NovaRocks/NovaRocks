@@ -161,8 +161,8 @@ impl Scenario for OtherIslandHardCut {
         run_distributed_queries(context, &[0, 1])?;
         context
             .handle()
-            .assert_be_log(2, "NOVAROCKS_QUERY_INIT_APPLIED")
-            .expect_err("OtherIsland BE must never receive InitQuery from FE");
+            .assert_be_log(2, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)
+            .expect_err("OtherIsland BE must never be given a query context by the FE");
         assert_raw_ingress_hard_cuts(context)?;
         context.action(
             "excluded epoch-2 BE remained OtherIsland while SQL admitted only compatible BEs",
@@ -562,7 +562,7 @@ fn run_distributed_queries(
     for &backend in expected_backends {
         context
             .handle()
-            .assert_be_log(backend, "NOVAROCKS_QUERY_INIT_APPLIED")?;
+            .assert_be_log(backend, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)?;
     }
     Ok(())
 }

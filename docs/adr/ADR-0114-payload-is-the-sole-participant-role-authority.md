@@ -2,9 +2,9 @@
 id: ADR-0114
 title: "Payload is the sole authority for participant roles"
 domain: [distributed-query-lifecycle, runtime-filter]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0135
 date: 2026-08-26
 provenance:
   - "mechanism: participant-role field removal with payload-derived participant classification on the native lifecycle wire"

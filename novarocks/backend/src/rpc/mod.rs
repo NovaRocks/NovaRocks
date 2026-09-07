@@ -10,6 +10,7 @@ pub(crate) mod data_plane;
 pub(crate) mod data_plane_handlers;
 pub(crate) mod runtime;
 pub(crate) mod server;
+pub(crate) mod task_execution;
 
 pub(crate) mod transport {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));

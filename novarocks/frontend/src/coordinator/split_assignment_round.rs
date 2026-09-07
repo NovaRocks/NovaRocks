@@ -92,33 +92,50 @@ pub(crate) fn assignment_endpoints(
 /// there, and a source dropped without closing leaves the connector holding
 /// whatever the enumeration opened.
 pub(crate) struct RoundSplitAssignmentPlan {
-    transport: Arc<dyn TaskUpdateTransport>,
     targets: BTreeMap<i32, Vec<AssignmentTarget>>,
     sources: Vec<RoundSplitSource>,
     retry_policy: TaskUpdateRetryPolicy,
     initial_dynamic_filter_wait_cap: std::time::Duration,
+    /// Every backend this round may address, frozen with the schedule.
+    ///
+    /// Carried on the plan because the schedule is consumed before either path
+    /// builds its transport, and a transport built from a later snapshot could
+    /// address a process this attempt never scheduled.
+    endpoints: Vec<(usize, RuntimeEndpoint)>,
 }
 
 impl RoundSplitAssignmentPlan {
+    /// Everything but the delivery transport.
+    ///
+    /// The transport arrives at [`SplitAssignmentRoundGuard::start`] because
+    /// the two are frozen at different moments: sources must be open before
+    /// the attempt's credential leases are sealed, while the task substrate's
+    /// delivery bridge cannot exist until the task graph does -- and the graph
+    /// is built from the encoder output, which comes later.
     pub(crate) fn new(
-        transport: Arc<dyn TaskUpdateTransport>,
         targets: BTreeMap<i32, Vec<AssignmentTarget>>,
         sources: Vec<RoundSplitSource>,
         retry_policy: TaskUpdateRetryPolicy,
         initial_dynamic_filter_wait_cap: std::time::Duration,
+        endpoints: Vec<(usize, RuntimeEndpoint)>,
     ) -> Self {
         Self {
-            transport,
             targets,
             sources,
             retry_policy,
             initial_dynamic_filter_wait_cap,
+            endpoints,
         }
     }
 
     /// The scan nodes this plan opened a source for.
     pub(crate) fn plan_node_ids(&self) -> impl Iterator<Item = i32> + '_ {
         self.sources.iter().map(|source| source.plan_node_id)
+    }
+
+    /// Every backend this round may address.
+    pub(crate) fn endpoints(&self) -> &[(usize, RuntimeEndpoint)] {
+        &self.endpoints
     }
 }
 
@@ -146,6 +163,14 @@ impl Drop for RoundSplitAssignmentPlan {
 pub(crate) struct SplitAssignmentRoundGuard {
     stop: RoundSplitAssignmentStop,
     worker: Option<std::thread::JoinHandle<Result<SplitSourceProfile, SplitAssignmentDriverError>>>,
+    /// The worker's own verdict, once it has been joined.
+    ///
+    /// Reaped by [`Self::failure`] as soon as the thread stops, so the round
+    /// runner can read a delivery failure while it is still turning. Without
+    /// it the verdict is only visible to [`Self::finish`], which runs after
+    /// the loop -- and a round whose deliverer died never reaches the loop's
+    /// own exit, because the scans it stopped feeding never finish.
+    joined: Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>,
 }
 
 impl SplitAssignmentRoundGuard {
@@ -154,11 +179,11 @@ impl SplitAssignmentRoundGuard {
     pub(crate) fn start(
         execution_id: QueryExecutionId,
         mut plan: RoundSplitAssignmentPlan,
+        transport: Arc<dyn TaskUpdateTransport>,
     ) -> Option<Self> {
         // Taken, not borrowed: the sources move into the round, so the plan's
         // own drop must not close what the round now owns.
         let sources = std::mem::take(&mut plan.sources);
-        let transport = Arc::clone(&plan.transport);
         let tasks = std::mem::take(&mut plan.targets);
         if sources.is_empty() {
             return None;
@@ -192,7 +217,52 @@ impl SplitAssignmentRoundGuard {
         Some(Self {
             stop,
             worker: Some(worker),
+            joined: None,
         })
+    }
+
+    /// Whether the worker has stopped.
+    ///
+    /// The task substrate's delivery bridge is settled by the round runner on
+    /// the statement thread, so a worker still waiting for an acknowledgement
+    /// can only be released by another turn. Joining it before it has stopped
+    /// would stop the very loop that releases it, so the caller asks first and
+    /// keeps turning until this is true.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.joined.is_some()
+            || self
+                .worker
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    /// Why delivery stopped, if it stopped by failing.
+    ///
+    /// Only ever joins a thread that has already stopped, so a caller may ask
+    /// on every turn. A worker that finished normally answers `None`: a round
+    /// whose sources are all terminal legitimately stops delivering long
+    /// before its scans finish, and that is not a failure.
+    ///
+    /// This exists because a failed deliverer is otherwise silent. Every
+    /// remaining scan then waits for splits nobody will send, the round keeps
+    /// turning with nothing to fold, and the query dies on the statement
+    /// deadline reporting the wait instead of the cause -- including the case
+    /// ADR-0123 froze a bounded budget for, whose exhaustion is longer than a
+    /// typical statement timeout and so could never be seen.
+    pub(crate) fn failure(&mut self) -> Option<&SplitAssignmentDriverError> {
+        if self.joined.is_none()
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            let worker = self.worker.take().expect("the worker was just observed");
+            self.joined = Some(worker.join().unwrap_or(Ok(SplitSourceProfile::default())));
+        }
+        match self.joined.as_ref() {
+            Some(Err(error)) => Some(error),
+            _ => None,
+        }
     }
 
     /// Wait for delivery to finish, returning the worker result.
@@ -203,6 +273,9 @@ impl SplitAssignmentRoundGuard {
     /// unconfirmed immutable assignment. Cancellation and unwinding still use
     /// `Drop`, which signals stop before joining.
     pub(crate) fn finish(mut self) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
+        if let Some(joined) = self.joined.take() {
+            return joined;
+        }
         match self.worker.take() {
             Some(worker) => worker.join().unwrap_or(Ok(SplitSourceProfile::default())),
             None => Ok(SplitSourceProfile::default()),
@@ -256,12 +329,13 @@ mod tests {
             SplitAssignmentRoundGuard::start(
                 execution_id(),
                 RoundSplitAssignmentPlan::new(
-                    Arc::new(NeverCalled),
                     BTreeMap::new(),
                     Vec::new(),
                     TaskUpdateRetryPolicy::default(),
                     std::time::Duration::ZERO,
+                    Vec::new(),
                 ),
+                Arc::new(NeverCalled),
             )
             .is_none()
         );
@@ -280,6 +354,7 @@ mod tests {
                 worker_observed_stop.store(worker_stop.is_stopped(), Ordering::SeqCst);
                 Ok(SplitSourceProfile::default())
             })),
+            joined: None,
         };
 
         guard.finish().expect("finish waits for delivery");
@@ -288,5 +363,54 @@ mod tests {
             !observed_stop.load(Ordering::SeqCst),
             "normal finish must not interrupt an in-flight task update retry"
         );
+    }
+
+    #[test]
+    fn a_failed_deliverer_is_readable_while_the_round_is_still_turning() {
+        // What this catches: a delivery failure that is only visible to
+        // `finish`, which runs after the round loop. A deliverer that stopped
+        // will never feed the tasks it had left, so that loop never reaches
+        // its own exit -- the query runs out its statement deadline and
+        // reports what it was waiting on instead of why nobody was sending.
+        // A normal stop must stay silent, because a round whose sources all
+        // went terminal legitimately stops delivering long before its scans
+        // finish.
+        let mut failed = SplitAssignmentRoundGuard {
+            stop: RoundSplitAssignmentStop::default(),
+            worker: Some(std::thread::spawn(|| {
+                Err(SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 4 })
+            })),
+            joined: None,
+        };
+        while !failed.is_finished() {
+            std::thread::yield_now();
+        }
+        let detail = failed
+            .failure()
+            .expect("a failed deliverer reports its own cause")
+            .to_string();
+        assert!(detail.contains("no admitted task"), "{detail}");
+        // Reaped, not consumed: the same verdict is still the round's own
+        // result afterwards.
+        assert!(failed.failure().is_some());
+        failed
+            .finish()
+            .expect_err("the joined verdict is still the round's result");
+
+        let mut healthy = SplitAssignmentRoundGuard {
+            stop: RoundSplitAssignmentStop::default(),
+            worker: Some(std::thread::spawn(|| Ok(SplitSourceProfile::default()))),
+            joined: None,
+        };
+        while !healthy.is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(
+            healthy.failure().is_none(),
+            "a deliverer that ran out of sources has not failed"
+        );
+        healthy
+            .finish()
+            .expect("a clean stop is still a clean stop");
     }
 }

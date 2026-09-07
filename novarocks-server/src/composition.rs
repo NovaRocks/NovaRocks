@@ -42,6 +42,9 @@ use novarocks_connector_starrocks::{
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
+use novarocks_execution::task_execution::{
+    DispatchBudget, LeaseBounds, OperationWaitCaps, TaskExecutionBudgets, TransportBudget,
+};
 use novarocks_frontend::{
     CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
     FrontendQueryControlTimeouts, FrontendServerConfig, LakePublicationRuntimePolicy,
@@ -566,7 +569,10 @@ pub fn compose_frontend_server_config(
             Duration::from_millis(runtime_config.query_control_task_update_retry_max_backoff_ms),
         )
         .map_err(|error| anyhow::anyhow!("construct task update retry policy: {error}"))?,
-    );
+    )
+    // Composed and validated here, then frozen: the coordinator never reads a
+    // process-global configuration per attempt.
+    .with_task_execution_budgets(compose_task_execution_budgets(config)?);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
         execution =
@@ -634,6 +640,66 @@ pub fn compose_frontend_server_config(
         state_store_provider_registry,
         native_trust: std::sync::Arc::clone(native_trust.trust()),
         native_transport: frontend_native_transport(native_trust.transport()),
+    })
+}
+
+/// Materializes the task protocol's budgets from one validated role config.
+///
+/// Deserialization has already rejected a zero or inverted bound, so each
+/// neutral constructor here can only fail if that validation and these types
+/// disagree, which is worth failing startup over rather than clamping.
+#[allow(
+    dead_code,
+    reason = "The native task protocol is not routed into production yet; the coordinator cutover reads these budgets."
+)]
+pub fn compose_task_execution_budgets(
+    config: &NovaRocksConfig,
+) -> anyhow::Result<TaskExecutionBudgets> {
+    let runtime = &config.runtime;
+    let dispatch = DispatchBudget::new(
+        runtime.task_dispatch_create_permits,
+        runtime.task_dispatch_update_permits,
+        runtime.task_dispatch_lifecycle_permits,
+    )
+    .ok_or_else(|| anyhow::anyhow!("construct task dispatch budget: permits must be nonzero"))?;
+    let wait_caps = OperationWaitCaps::new(
+        Duration::from_millis(runtime.task_operation_create_wait_cap_ms),
+        Duration::from_millis(runtime.task_operation_update_wait_cap_ms),
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!("construct task operation wait caps: both caps must be nonzero")
+    })?;
+    let lease_bounds = LeaseBounds::new(
+        Duration::from_millis(runtime.task_lease_min_ms),
+        Duration::from_millis(runtime.task_lease_max_ms),
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!("construct task lease bounds: the accepted range must not be inverted")
+    })?;
+    let transport = TransportBudget::new(
+        runtime.task_operation_max_batch_items,
+        runtime.task_operation_max_batch_encoded_bytes,
+        runtime.task_descriptor_max_encoded_bytes,
+        runtime.task_query_backend_max_queued_operations,
+        runtime.task_query_backend_max_queued_bytes,
+        runtime.task_backend_max_queued_operations,
+        runtime.task_backend_max_queued_bytes,
+        runtime.task_max_tasks_per_context,
+        runtime.task_max_active_tasks_per_backend,
+        Duration::from_millis(runtime.task_operation_queue_residence_ms),
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "construct task transport budget: a descriptor must fit in a batch, a batch in one \
+             query's queue, and that queue in the process's"
+        )
+    })?;
+    Ok(TaskExecutionBudgets {
+        dispatch,
+        wait_caps,
+        lease_bounds,
+        transport,
+        status_subscription_error_budget: runtime.task_status_subscription_error_budget,
     })
 }
 
@@ -824,9 +890,11 @@ mod tests {
     use super::{
         IcebergStorageLakeTargetSnapshotObservation,
         compose_backend_execution_role_binding_factories, compose_frontend_control_role_factories,
-        mv_lake_target_snapshot_observation,
+        compose_task_execution_budgets, mv_lake_target_snapshot_observation,
     };
+    use novarocks_execution::task_execution::{DispatchBudget, LeaseBounds, TransportBudget};
     use novarocks_spi::connector::CatalogProviderKind;
+    use std::time::Duration;
 
     #[test]
     fn lake_target_snapshot_adapter_preserves_provider_metadata() {
@@ -871,5 +939,106 @@ mod tests {
                 "backend must compose {provider:?} exactly once"
             );
         }
+    }
+
+    #[test]
+    fn a_configured_budget_may_tighten_the_bounds_but_not_invert_them() {
+        // The bounds are a hierarchy, not ten unrelated numbers. Composition
+        // is where a deployment's numbers become the type that enforces them,
+        // so a configuration that could never send anything must fail here
+        // rather than at the first oversized descriptor.
+        let mut config = crate::app_config::NovaRocksConfig::default();
+        config.runtime.task_operation_max_batch_items = 4;
+        config.runtime.task_operation_max_batch_encoded_bytes = 1 << 20;
+        config.runtime.task_descriptor_max_encoded_bytes = 1 << 19;
+        let budgets = compose_task_execution_budgets(&config).expect("a tightened budget composes");
+        assert_eq!(budgets.transport.max_batch_items(), 4);
+        assert_eq!(budgets.transport.max_descriptor_encoded_bytes(), 1 << 19);
+
+        // A descriptor larger than a batch could never be sent at all.
+        config.runtime.task_descriptor_max_encoded_bytes = (1 << 20) + 1;
+        let error = compose_task_execution_budgets(&config)
+            .expect_err("an inverted hierarchy is refused")
+            .to_string();
+        assert!(
+            error.contains("task transport budget"),
+            "the refusal must name the budget it rejected, got: {error}"
+        );
+
+        let mut zeroed = crate::app_config::NovaRocksConfig::default();
+        zeroed.runtime.task_operation_max_batch_items = 0;
+        assert!(
+            compose_task_execution_budgets(&zeroed).is_err(),
+            "a zero bound is not a disabled bound"
+        );
+    }
+
+    #[test]
+    fn task_execution_budgets_default_to_the_frozen_contract_values() {
+        let config = crate::app_config::NovaRocksConfig::default();
+        let budgets = compose_task_execution_budgets(&config).expect("default budgets");
+
+        assert_eq!(budgets.dispatch, DispatchBudget::DEFAULT);
+        assert_eq!(budgets.lease_bounds, LeaseBounds::DEFAULT);
+        let frozen = TransportBudget::DEFAULT;
+        assert_eq!(
+            budgets.transport.max_batch_items(),
+            frozen.max_batch_items()
+        );
+        assert_eq!(
+            budgets.transport.max_batch_encoded_bytes(),
+            frozen.max_batch_encoded_bytes()
+        );
+        assert_eq!(
+            budgets.transport.max_descriptor_encoded_bytes(),
+            frozen.max_descriptor_encoded_bytes()
+        );
+        assert_eq!(
+            budgets.transport.max_query_backend_queued_operations(),
+            frozen.max_query_backend_queued_operations()
+        );
+        assert_eq!(
+            budgets.transport.max_query_backend_queued_bytes(),
+            frozen.max_query_backend_queued_bytes()
+        );
+        assert_eq!(
+            budgets.transport.max_backend_queued_operations(),
+            frozen.max_backend_queued_operations()
+        );
+        assert_eq!(
+            budgets.transport.max_backend_queued_bytes(),
+            frozen.max_backend_queued_bytes()
+        );
+        assert_eq!(
+            budgets.transport.max_tasks_per_context(),
+            frozen.max_tasks_per_context()
+        );
+        assert_eq!(
+            budgets.transport.max_active_tasks_per_backend(),
+            frozen.max_active_tasks_per_backend()
+        );
+        assert_eq!(
+            budgets.transport.frontend_queue_residence(),
+            frozen.frontend_queue_residence()
+        );
+        // `OperationWaitCaps` has no accessors, so the caps are compared
+        // through the clamp they exist for.
+        assert_eq!(
+            budgets.wait_caps.clamp(
+                novarocks_execution::task_execution::OperationKind::CreateTask,
+                novarocks_execution::task_execution::MaxWait::new(Duration::from_secs(300))
+                    .expect("representable"),
+            ),
+            novarocks_execution::task_execution::MaxWait::DEFAULT_CREATE
+        );
+        assert_eq!(
+            budgets.wait_caps.clamp(
+                novarocks_execution::task_execution::OperationKind::UpdateTask,
+                novarocks_execution::task_execution::MaxWait::new(Duration::from_secs(300))
+                    .expect("representable"),
+            ),
+            novarocks_execution::task_execution::MaxWait::DEFAULT_UPDATE
+        );
+        assert!(budgets.status_subscription_error_budget > 0);
     }
 }

@@ -10,6 +10,7 @@ pub(crate) mod rpc;
 mod runtime;
 pub(crate) mod runtime_filter;
 mod service;
+pub mod task_execution;
 
 pub use application::{
     BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,

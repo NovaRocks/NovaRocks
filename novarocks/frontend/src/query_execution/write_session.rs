@@ -51,8 +51,8 @@ use novarocks_spi::connector::{
 };
 
 use crate::connector::control_host::ConnectorWriteStackLease;
-use crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets;
 use crate::query_execution::write_result::DecodedPreparedWriteSet;
+use novarocks_plan_codec::SealedWriteTargets;
 
 /// What a session has already decided. Recorded so a second, different
 /// decision is refused rather than silently issuing two external effects.
@@ -1398,8 +1398,8 @@ pub(crate) mod tests {
     /// is exactly the kind of defect no single unit test can see.
     #[test]
     fn the_frontend_write_path_composes_from_begin_to_commit() {
-        use crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets;
         use crate::query_execution::write_barrier::WriteCommitBarrier;
+        use novarocks_plan_codec::SealedWriteTargets;
 
         let fixture = fixture_with_outcome(
             1,

@@ -368,6 +368,15 @@ fn complete_profile(
     if fragment_profiles.is_empty() {
         return Err("EXPLAIN ANALYZE completed without fragment runtime profiles".into());
     }
+    // Per-fragment attribution is read while each tree still carries the
+    // fragment its producer named; every other summary below is a counter sum
+    // over the trees themselves and needs no attribution.
+    let per_fragment =
+        crate::query_execution::profile::collect_per_fragment_profile_summaries(&fragment_profiles);
+    let fragment_profiles = fragment_profiles
+        .into_iter()
+        .map(crate::query_execution::profile::FragmentProfileTree::into_tree)
+        .collect::<Vec<_>>();
     let actuals =
         crate::query_execution::profile::collect_actuals_by_plan_node_id_from_profile_trees(
             &fragment_profiles,
@@ -376,8 +385,6 @@ fn complete_profile(
         crate::query_execution::profile::collect_distributed_profile_summary_from_profile_trees(
             &fragment_profiles,
         );
-    let per_fragment =
-        crate::query_execution::profile::collect_per_fragment_profile_summaries(&fragment_profiles);
     let mut lines = Vec::new();
     lines.push(format!(
         "Planning: {} / Execution: {} / Rows: {}",

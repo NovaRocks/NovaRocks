@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(debug_assertions)]
-use std::collections::BTreeMap;
 use std::sync::Arc;
-#[cfg(debug_assertions)]
-use std::sync::{Mutex, OnceLock};
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -142,34 +138,6 @@ pub(crate) fn handle_stage_fragments(
     let response = ingress.stage_fragments(request);
     if response.outcome().is_staged()
         && let Some(scope) = claim_backend_fault(
-            QueryLifecycleFaultKind::HeartbeatStopAfterStage,
-            execution_id,
-            ingress.backend_process_id(),
-        )?
-    {
-        register_staged_heartbeat_stop(scope);
-    }
-    if response.outcome().is_staged()
-        && let Some(scope) = claim_backend_fault(
-            QueryLifecycleFaultKind::StageAckDrop,
-            execution_id,
-            ingress.backend_process_id(),
-        )?
-    {
-        eprintln!(
-            "NOVAROCKS_STAGE_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
-            execution_id.query_id().high(),
-            execution_id.query_id().low(),
-            execution_id.attempt_id().get(),
-            scope.backend_index,
-            scope.token
-        );
-        return Err(tonic::Status::deadline_exceeded(
-            "runner-owned StageAck response dropped after staging",
-        ));
-    }
-    if response.outcome().is_staged()
-        && let Some(scope) = claim_backend_fault(
             QueryLifecycleFaultKind::StageConflictAfterApply,
             execution_id,
             ingress.backend_process_id(),
@@ -271,25 +239,6 @@ pub(crate) fn handle_start_prepared_query(
     };
     let response = ingress.start_prepared_query(request);
     if response.outcome().is_running()
-        && let Some(scope) = claim_backend_fault(
-            QueryLifecycleFaultKind::StartAckDrop,
-            execution_id,
-            ingress.backend_process_id(),
-        )?
-    {
-        eprintln!(
-            "NOVAROCKS_START_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
-            execution_id.query_id().high(),
-            execution_id.query_id().low(),
-            execution_id.attempt_id().get(),
-            scope.backend_index,
-            scope.token
-        );
-        return Err(tonic::Status::deadline_exceeded(
-            "runner-owned StartAck response dropped after release",
-        ));
-    }
-    if response.outcome().is_running()
         && let Some(scope) = observe_backend_fault(
             QueryLifecycleFaultKind::StartAckSuppress,
             execution_id,
@@ -366,16 +315,6 @@ pub(crate) async fn handle_query_control_stream(
             )));
         }
     }
-    let heartbeat_stop = claim_backend_fault(
-        QueryLifecycleFaultKind::HeartbeatStop,
-        execution_id,
-        ingress.backend_process_id(),
-    )?;
-    let terminal_snapshot_stream_drop = claim_backend_fault(
-        QueryLifecycleFaultKind::TerminalSnapshotStreamDrop,
-        execution_id,
-        ingress.backend_process_id(),
-    )?;
     let terminal_proof_stream_drop = claim_backend_fault(
         QueryLifecycleFaultKind::TerminalProofStreamDrop,
         execution_id,
@@ -398,11 +337,8 @@ pub(crate) async fn handle_query_control_stream(
         attachment.runtime_filter_feedback,
         outbound_tx,
         shutdown,
-        heartbeat_stop,
-        terminal_snapshot_stream_drop,
         terminal_proof_stream_drop,
         terminal_attestation_stream_drop,
-        execution_id,
         tls_verified,
     ));
     Ok(ReceiverStream::new(outbound_rx))
@@ -419,11 +355,8 @@ async fn run_attached_control_stream(
     mut runtime_filter_feedback: tokio::sync::mpsc::Receiver<QueryControlEvent>,
     outbound: tokio::sync::mpsc::Sender<Result<proto::QueryControlResponse, tonic::Status>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
-    heartbeat_stop: Option<QueryLifecycleFaultScope>,
-    terminal_snapshot_stream_drop: Option<QueryLifecycleFaultScope>,
     terminal_proof_stream_drop: Option<QueryLifecycleFaultScope>,
     terminal_attestation_stream_drop: Option<QueryLifecycleFaultScope>,
-    execution_id: QueryExecutionId,
     tls_verified: bool,
 ) {
     let first_event = tokio::select! {
@@ -461,7 +394,6 @@ async fn run_attached_control_stream(
     }
 
     let mut awaiting_graceful_termination = false;
-    let mut heartbeat_stop_logged = false;
     let mut runtime_filter_feedback_open = true;
     loop {
         tokio::select! {
@@ -523,27 +455,7 @@ async fn run_attached_control_stream(
                 );
                 let result = match command.as_proto().command.as_ref() {
                     Some(proto::query_control_request::Command::Heartbeat(heartbeat)) => {
-                        if let Some(scope) = heartbeat_stop
-                            .as_ref()
-                            .cloned()
-                            .or_else(|| staged_heartbeat_stop(execution_id))
-                        {
-                            if !heartbeat_stop_logged {
-                                eprintln!(
-                                    "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED execution_id={}:{}:{} backend_index={} process_id={} token={}",
-                                    scope.execution_id.query_id().high(),
-                                    scope.execution_id.query_id().low(),
-                                    scope.execution_id.attempt_id().get(),
-                                    scope.backend_index,
-                                    scope.process_id,
-                                    scope.token
-                                );
-                                heartbeat_stop_logged = true;
-                            }
-                            Ok(())
-                        } else {
-                            lease.control().heartbeat(heartbeat.sequence)
-                        }
+                        lease.control().heartbeat(heartbeat.sequence)
                     }
                     Some(proto::query_control_request::Command::Abort(abort)) => {
                         awaiting_graceful_termination = true;
@@ -610,14 +522,10 @@ async fn run_attached_control_stream(
                     Some(proto::query_control_response::Event::TerminalOutcome(outcome)) => {
                         match outcome.outcome.as_ref() {
                             Some(proto::participant_terminal_outcome::Outcome::Proof(_)) => {
-                                terminal_proof_stream_drop
-                                    .as_ref()
-                                    .or(terminal_snapshot_stream_drop.as_ref())
+                                terminal_proof_stream_drop.as_ref()
                             }
                             Some(proto::participant_terminal_outcome::Outcome::NegativeAttestation(_)) => {
-                                terminal_attestation_stream_drop
-                                    .as_ref()
-                                    .or(terminal_snapshot_stream_drop.as_ref())
+                                terminal_attestation_stream_drop.as_ref()
                             }
                             None => None,
                         }
@@ -690,43 +598,6 @@ use novarocks_failpoint::observe_matching_fault;
 use novarocks_failpoint::{QueryLifecycleFaultKind, QueryLifecycleFaultScope};
 #[cfg(debug_assertions)]
 use novarocks_failpoint::{claim_matching_fault, trigger_path};
-
-#[cfg(debug_assertions)]
-fn staged_heartbeat_stops() -> &'static Mutex<
-    BTreeMap<novarocks_proto_codec::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
-> {
-    static STOPS: OnceLock<
-        Mutex<
-            BTreeMap<novarocks_proto_codec::lifecycle::QueryExecutionId, QueryLifecycleFaultScope>,
-        >,
-    > = OnceLock::new();
-    STOPS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-#[cfg(debug_assertions)]
-fn register_staged_heartbeat_stop(scope: QueryLifecycleFaultScope) {
-    let mut stops = staged_heartbeat_stops()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    stops.insert(scope.execution_id, scope);
-}
-
-#[cfg(not(debug_assertions))]
-fn register_staged_heartbeat_stop(_scope: QueryLifecycleFaultScope) {}
-
-#[cfg(debug_assertions)]
-fn staged_heartbeat_stop(execution_id: QueryExecutionId) -> Option<QueryLifecycleFaultScope> {
-    staged_heartbeat_stops()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&execution_id)
-        .cloned()
-}
-
-#[cfg(not(debug_assertions))]
-fn staged_heartbeat_stop(_execution_id: QueryExecutionId) -> Option<QueryLifecycleFaultScope> {
-    None
-}
 
 #[cfg(debug_assertions)]
 #[expect(

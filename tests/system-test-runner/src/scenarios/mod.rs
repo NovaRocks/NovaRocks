@@ -12,6 +12,8 @@ mod query_lifecycle;
 mod runtime_filter;
 mod state_family;
 mod table_maintenance;
+mod task_evidence;
+mod task_execution;
 
 pub fn all() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
@@ -28,5 +30,6 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(native_compatibility::scenarios());
     scenarios.extend(state_family::scenarios());
     scenarios.extend(table_maintenance::scenarios());
+    scenarios.extend(task_execution::scenarios());
     scenarios
 }

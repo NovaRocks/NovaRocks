@@ -30,6 +30,9 @@ pub(crate) mod starrocks_binding_registry;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_connector_starrocks::{StarRocksLocalBindingRef, StarRocksRoleBindingResources};
+use novarocks_execution::task_execution::{
+    DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait, TransportBudget,
+};
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
@@ -598,6 +601,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_state_store_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
     validate_query_control_config(&cfg.runtime)?;
+    validate_task_execution_config(&cfg.runtime)?;
     validate_lake_publication_runtime_policy(&cfg.runtime)?;
     #[cfg(not(debug_assertions))]
     reject_fault_injection_environment()?;
@@ -1217,6 +1221,42 @@ pub struct RuntimeConfig {
     pub query_control_task_update_retry_initial_backoff_ms: u64,
     #[serde(default = "default_query_control_task_update_retry_max_backoff_ms")]
     pub query_control_task_update_retry_max_backoff_ms: u64,
+    #[serde(default = "default_task_dispatch_create_permits")]
+    pub task_dispatch_create_permits: usize,
+    #[serde(default = "default_task_dispatch_update_permits")]
+    pub task_dispatch_update_permits: usize,
+    #[serde(default = "default_task_dispatch_lifecycle_permits")]
+    pub task_dispatch_lifecycle_permits: usize,
+    #[serde(default = "default_task_operation_max_batch_items")]
+    pub task_operation_max_batch_items: usize,
+    #[serde(default = "default_task_operation_max_batch_encoded_bytes")]
+    pub task_operation_max_batch_encoded_bytes: usize,
+    #[serde(default = "default_task_descriptor_max_encoded_bytes")]
+    pub task_descriptor_max_encoded_bytes: usize,
+    #[serde(default = "default_task_query_backend_max_queued_operations")]
+    pub task_query_backend_max_queued_operations: usize,
+    #[serde(default = "default_task_query_backend_max_queued_bytes")]
+    pub task_query_backend_max_queued_bytes: usize,
+    #[serde(default = "default_task_backend_max_queued_operations")]
+    pub task_backend_max_queued_operations: usize,
+    #[serde(default = "default_task_backend_max_queued_bytes")]
+    pub task_backend_max_queued_bytes: usize,
+    #[serde(default = "default_task_max_tasks_per_context")]
+    pub task_max_tasks_per_context: usize,
+    #[serde(default = "default_task_max_active_tasks_per_backend")]
+    pub task_max_active_tasks_per_backend: usize,
+    #[serde(default = "default_task_operation_queue_residence_ms")]
+    pub task_operation_queue_residence_ms: u64,
+    #[serde(default = "default_task_operation_create_wait_cap_ms")]
+    pub task_operation_create_wait_cap_ms: u64,
+    #[serde(default = "default_task_operation_update_wait_cap_ms")]
+    pub task_operation_update_wait_cap_ms: u64,
+    #[serde(default = "default_task_lease_min_ms")]
+    pub task_lease_min_ms: u64,
+    #[serde(default = "default_task_lease_max_ms")]
+    pub task_lease_max_ms: u64,
+    #[serde(default = "default_task_status_subscription_error_budget")]
+    pub task_status_subscription_error_budget: u32,
     #[serde(default = "default_query_control_tombstone_retention_ms")]
     pub query_control_tombstone_retention_ms: u64,
     #[serde(default = "default_query_control_tombstone_capacity")]
@@ -1572,6 +1612,215 @@ fn default_query_control_stage_max_inflight_encoded_bytes() -> usize {
 
 fn default_query_control_stage_max_dormant_workers() -> usize {
     512
+}
+
+/// Every default below is read from the neutral type that owns the frozen
+/// value, so a contract change moves the configuration default with it and the
+/// number is never written down twice.
+fn default_task_dispatch_create_permits() -> usize {
+    DispatchBudget::DEFAULT.create_permits()
+}
+
+fn default_task_dispatch_update_permits() -> usize {
+    DispatchBudget::DEFAULT.update_permits()
+}
+
+fn default_task_dispatch_lifecycle_permits() -> usize {
+    DispatchBudget::DEFAULT.lifecycle_permits()
+}
+
+fn default_task_operation_max_batch_items() -> usize {
+    TransportBudget::DEFAULT.max_batch_items()
+}
+
+fn default_task_operation_max_batch_encoded_bytes() -> usize {
+    TransportBudget::DEFAULT.max_batch_encoded_bytes()
+}
+
+fn default_task_descriptor_max_encoded_bytes() -> usize {
+    TransportBudget::DEFAULT.max_descriptor_encoded_bytes()
+}
+
+fn default_task_query_backend_max_queued_operations() -> usize {
+    TransportBudget::DEFAULT.max_query_backend_queued_operations()
+}
+
+fn default_task_query_backend_max_queued_bytes() -> usize {
+    TransportBudget::DEFAULT.max_query_backend_queued_bytes()
+}
+
+fn default_task_backend_max_queued_operations() -> usize {
+    TransportBudget::DEFAULT.max_backend_queued_operations()
+}
+
+fn default_task_backend_max_queued_bytes() -> usize {
+    TransportBudget::DEFAULT.max_backend_queued_bytes()
+}
+
+fn default_task_max_tasks_per_context() -> usize {
+    TransportBudget::DEFAULT.max_tasks_per_context()
+}
+
+fn default_task_max_active_tasks_per_backend() -> usize {
+    TransportBudget::DEFAULT.max_active_tasks_per_backend()
+}
+
+fn default_task_operation_queue_residence_ms() -> u64 {
+    duration_millis(TransportBudget::DEFAULT.frontend_queue_residence())
+}
+
+/// `OperationWaitCaps` exposes no accessor for either cap, so both defaults
+/// come from the `MaxWait` constants its own `DEFAULT` is built from.
+fn default_task_operation_create_wait_cap_ms() -> u64 {
+    duration_millis(MaxWait::DEFAULT_CREATE)
+}
+
+fn default_task_operation_update_wait_cap_ms() -> u64 {
+    duration_millis(MaxWait::DEFAULT_UPDATE)
+}
+
+fn default_task_lease_min_ms() -> u64 {
+    duration_millis(LeaseBounds::DEFAULT.min())
+}
+
+fn default_task_lease_max_ms() -> u64 {
+    duration_millis(LeaseBounds::DEFAULT.max())
+}
+
+/// How many times a lost status stream may be reopened from its cursors.
+///
+/// No neutral type owns this number: the protocol requires the budget to be
+/// bounded without fixing its size, so the deployment owns it.
+fn default_task_status_subscription_error_budget() -> u32 {
+    novarocks_execution::task_execution::DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET
+}
+
+fn duration_millis(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Validates the task protocol's configured budgets.
+///
+/// Every count and every duration must be positive, and every paired bound
+/// must be ordered: a per-query bound cannot exceed its per-process total, a
+/// descriptor cannot be larger than the batch that would carry it, and a lease
+/// range cannot be inverted.
+fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
+    let nonzero_counts = [
+        (
+            "runtime.task_dispatch_create_permits",
+            runtime.task_dispatch_create_permits,
+        ),
+        (
+            "runtime.task_dispatch_update_permits",
+            runtime.task_dispatch_update_permits,
+        ),
+        (
+            "runtime.task_dispatch_lifecycle_permits",
+            runtime.task_dispatch_lifecycle_permits,
+        ),
+        (
+            "runtime.task_operation_max_batch_items",
+            runtime.task_operation_max_batch_items,
+        ),
+        (
+            "runtime.task_operation_max_batch_encoded_bytes",
+            runtime.task_operation_max_batch_encoded_bytes,
+        ),
+        (
+            "runtime.task_descriptor_max_encoded_bytes",
+            runtime.task_descriptor_max_encoded_bytes,
+        ),
+        (
+            "runtime.task_query_backend_max_queued_operations",
+            runtime.task_query_backend_max_queued_operations,
+        ),
+        (
+            "runtime.task_query_backend_max_queued_bytes",
+            runtime.task_query_backend_max_queued_bytes,
+        ),
+        (
+            "runtime.task_backend_max_queued_operations",
+            runtime.task_backend_max_queued_operations,
+        ),
+        (
+            "runtime.task_backend_max_queued_bytes",
+            runtime.task_backend_max_queued_bytes,
+        ),
+        (
+            "runtime.task_max_tasks_per_context",
+            runtime.task_max_tasks_per_context,
+        ),
+        (
+            "runtime.task_max_active_tasks_per_backend",
+            runtime.task_max_active_tasks_per_backend,
+        ),
+    ];
+    for (field, value) in nonzero_counts {
+        if value == 0 {
+            bail!("{field} must be greater than 0");
+        }
+    }
+    if runtime.task_status_subscription_error_budget == 0 {
+        bail!("runtime.task_status_subscription_error_budget must be greater than 0");
+    }
+    let nonzero_durations = [
+        (
+            "runtime.task_operation_queue_residence_ms",
+            runtime.task_operation_queue_residence_ms,
+        ),
+        (
+            "runtime.task_operation_create_wait_cap_ms",
+            runtime.task_operation_create_wait_cap_ms,
+        ),
+        (
+            "runtime.task_operation_update_wait_cap_ms",
+            runtime.task_operation_update_wait_cap_ms,
+        ),
+        ("runtime.task_lease_min_ms", runtime.task_lease_min_ms),
+        ("runtime.task_lease_max_ms", runtime.task_lease_max_ms),
+    ];
+    for (field, value) in nonzero_durations {
+        if value == 0 {
+            bail!("{field} must be greater than 0");
+        }
+    }
+    if runtime.task_lease_max_ms < runtime.task_lease_min_ms {
+        bail!("runtime.task_lease_max_ms must be at least runtime.task_lease_min_ms");
+    }
+    if runtime.task_descriptor_max_encoded_bytes > runtime.task_operation_max_batch_encoded_bytes {
+        bail!(
+            "runtime.task_descriptor_max_encoded_bytes must not exceed runtime.task_operation_max_batch_encoded_bytes"
+        );
+    }
+    if runtime.task_operation_max_batch_encoded_bytes > runtime.task_query_backend_max_queued_bytes
+    {
+        bail!(
+            "runtime.task_operation_max_batch_encoded_bytes must not exceed runtime.task_query_backend_max_queued_bytes"
+        );
+    }
+    if runtime.task_query_backend_max_queued_operations > runtime.task_backend_max_queued_operations
+    {
+        bail!(
+            "runtime.task_query_backend_max_queued_operations must not exceed runtime.task_backend_max_queued_operations"
+        );
+    }
+    if runtime.task_query_backend_max_queued_bytes > runtime.task_backend_max_queued_bytes {
+        bail!(
+            "runtime.task_query_backend_max_queued_bytes must not exceed runtime.task_backend_max_queued_bytes"
+        );
+    }
+    let wait_ceiling = duration_millis(MaxWait::MAX_REPRESENTABLE);
+    if runtime.task_operation_create_wait_cap_ms > wait_ceiling
+        || runtime.task_operation_update_wait_cap_ms > wait_ceiling
+    {
+        bail!("task operation wait caps must not exceed {wait_ceiling} ms");
+    }
+    let lease_ceiling = duration_millis(LeaseValidFor::MAX_REPRESENTABLE);
+    if runtime.task_lease_max_ms > lease_ceiling {
+        bail!("runtime.task_lease_max_ms must not exceed {lease_ceiling} ms");
+    }
+    Ok(())
 }
 
 fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
@@ -2034,6 +2283,26 @@ impl Default for RuntimeConfig {
                 default_query_control_task_update_retry_initial_backoff_ms(),
             query_control_task_update_retry_max_backoff_ms:
                 default_query_control_task_update_retry_max_backoff_ms(),
+            task_dispatch_create_permits: default_task_dispatch_create_permits(),
+            task_dispatch_update_permits: default_task_dispatch_update_permits(),
+            task_dispatch_lifecycle_permits: default_task_dispatch_lifecycle_permits(),
+            task_operation_max_batch_items: default_task_operation_max_batch_items(),
+            task_operation_max_batch_encoded_bytes: default_task_operation_max_batch_encoded_bytes(
+            ),
+            task_descriptor_max_encoded_bytes: default_task_descriptor_max_encoded_bytes(),
+            task_query_backend_max_queued_operations:
+                default_task_query_backend_max_queued_operations(),
+            task_query_backend_max_queued_bytes: default_task_query_backend_max_queued_bytes(),
+            task_backend_max_queued_operations: default_task_backend_max_queued_operations(),
+            task_backend_max_queued_bytes: default_task_backend_max_queued_bytes(),
+            task_max_tasks_per_context: default_task_max_tasks_per_context(),
+            task_max_active_tasks_per_backend: default_task_max_active_tasks_per_backend(),
+            task_operation_queue_residence_ms: default_task_operation_queue_residence_ms(),
+            task_operation_create_wait_cap_ms: default_task_operation_create_wait_cap_ms(),
+            task_operation_update_wait_cap_ms: default_task_operation_update_wait_cap_ms(),
+            task_lease_min_ms: default_task_lease_min_ms(),
+            task_lease_max_ms: default_task_lease_max_ms(),
+            task_status_subscription_error_budget: default_task_status_subscription_error_budget(),
             query_control_tombstone_retention_ms: default_query_control_tombstone_retention_ms(),
             query_control_tombstone_capacity: default_query_control_tombstone_capacity(),
             query_control_terminal_drain_timeout_ms:
@@ -2386,8 +2655,10 @@ impl Default for CacheConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MEM_LIMIT_SPEC, MAX_STARROCKS_LOCAL_BINDING_RETRY_COUNT, NovaRocksConfig,
-        RuntimeConfig, StandaloneServerConfig, validate_query_control_config,
+        DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor,
+        MAX_STARROCKS_LOCAL_BINDING_RETRY_COUNT, MaxWait, NovaRocksConfig, RuntimeConfig,
+        StandaloneServerConfig, TransportBudget, validate_query_control_config,
+        validate_task_execution_config,
     };
     use crate::env_reference::{EnvLookupError, resolve_env_references_with};
     use novarocks_connector_starrocks::StarRocksLocalBindingRef;
@@ -2925,6 +3196,199 @@ access_key_secret = ""
             mutate(&mut runtime);
             let error = validate_query_control_config(&runtime)
                 .expect_err("zero query-control values must be rejected");
+            assert!(
+                error.to_string().contains(field),
+                "error must identify {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_execution_config_defaults_to_the_frozen_contract_values() {
+        let runtime = RuntimeConfig::default();
+        let frozen = TransportBudget::DEFAULT;
+
+        assert_eq!(
+            runtime.task_dispatch_create_permits,
+            DispatchBudget::DEFAULT.create_permits()
+        );
+        assert_eq!(
+            runtime.task_dispatch_update_permits,
+            DispatchBudget::DEFAULT.update_permits()
+        );
+        assert_eq!(
+            runtime.task_dispatch_lifecycle_permits,
+            DispatchBudget::DEFAULT.lifecycle_permits()
+        );
+        assert_eq!(
+            runtime.task_operation_max_batch_items,
+            frozen.max_batch_items()
+        );
+        assert_eq!(
+            runtime.task_operation_max_batch_encoded_bytes,
+            frozen.max_batch_encoded_bytes()
+        );
+        assert_eq!(
+            runtime.task_descriptor_max_encoded_bytes,
+            frozen.max_descriptor_encoded_bytes()
+        );
+        assert_eq!(
+            runtime.task_query_backend_max_queued_operations,
+            frozen.max_query_backend_queued_operations()
+        );
+        assert_eq!(
+            runtime.task_query_backend_max_queued_bytes,
+            frozen.max_query_backend_queued_bytes()
+        );
+        assert_eq!(
+            runtime.task_backend_max_queued_operations,
+            frozen.max_backend_queued_operations()
+        );
+        assert_eq!(
+            runtime.task_backend_max_queued_bytes,
+            frozen.max_backend_queued_bytes()
+        );
+        assert_eq!(
+            runtime.task_max_tasks_per_context,
+            frozen.max_tasks_per_context()
+        );
+        assert_eq!(
+            runtime.task_max_active_tasks_per_backend,
+            frozen.max_active_tasks_per_backend()
+        );
+        assert_eq!(
+            runtime.task_operation_queue_residence_ms,
+            frozen.frontend_queue_residence().as_millis() as u64
+        );
+        assert_eq!(
+            runtime.task_operation_create_wait_cap_ms,
+            MaxWait::DEFAULT_CREATE.as_millis() as u64
+        );
+        assert_eq!(
+            runtime.task_operation_update_wait_cap_ms,
+            MaxWait::DEFAULT_UPDATE.as_millis() as u64
+        );
+        assert_eq!(
+            runtime.task_lease_min_ms,
+            LeaseBounds::DEFAULT.min().as_millis() as u64
+        );
+        assert_eq!(
+            runtime.task_lease_max_ms,
+            LeaseBounds::DEFAULT.max().as_millis() as u64
+        );
+        assert!(runtime.task_status_subscription_error_budget > 0);
+        validate_task_execution_config(&runtime).expect("the frozen defaults are valid");
+    }
+
+    #[test]
+    #[expect(
+        clippy::type_complexity,
+        reason = "The table-driven validation fixture keeps each field mutator explicit."
+    )]
+    fn task_execution_config_rejects_zero_values() {
+        let cases: [(&str, fn(&mut RuntimeConfig)); 18] = [
+            ("task_dispatch_create_permits", |runtime| {
+                runtime.task_dispatch_create_permits = 0;
+            }),
+            ("task_dispatch_update_permits", |runtime| {
+                runtime.task_dispatch_update_permits = 0;
+            }),
+            ("task_dispatch_lifecycle_permits", |runtime| {
+                runtime.task_dispatch_lifecycle_permits = 0;
+            }),
+            ("task_operation_max_batch_items", |runtime| {
+                runtime.task_operation_max_batch_items = 0;
+            }),
+            ("task_operation_max_batch_encoded_bytes", |runtime| {
+                runtime.task_operation_max_batch_encoded_bytes = 0;
+            }),
+            ("task_descriptor_max_encoded_bytes", |runtime| {
+                runtime.task_descriptor_max_encoded_bytes = 0;
+            }),
+            ("task_query_backend_max_queued_operations", |runtime| {
+                runtime.task_query_backend_max_queued_operations = 0;
+            }),
+            ("task_query_backend_max_queued_bytes", |runtime| {
+                runtime.task_query_backend_max_queued_bytes = 0;
+            }),
+            ("task_backend_max_queued_operations", |runtime| {
+                runtime.task_backend_max_queued_operations = 0;
+            }),
+            ("task_backend_max_queued_bytes", |runtime| {
+                runtime.task_backend_max_queued_bytes = 0;
+            }),
+            ("task_max_tasks_per_context", |runtime| {
+                runtime.task_max_tasks_per_context = 0;
+            }),
+            ("task_max_active_tasks_per_backend", |runtime| {
+                runtime.task_max_active_tasks_per_backend = 0;
+            }),
+            ("task_status_subscription_error_budget", |runtime| {
+                runtime.task_status_subscription_error_budget = 0;
+            }),
+            ("task_operation_queue_residence_ms", |runtime| {
+                runtime.task_operation_queue_residence_ms = 0;
+            }),
+            ("task_operation_create_wait_cap_ms", |runtime| {
+                runtime.task_operation_create_wait_cap_ms = 0;
+            }),
+            ("task_operation_update_wait_cap_ms", |runtime| {
+                runtime.task_operation_update_wait_cap_ms = 0;
+            }),
+            ("task_lease_min_ms", |runtime| {
+                runtime.task_lease_min_ms = 0;
+            }),
+            ("task_lease_max_ms", |runtime| {
+                runtime.task_lease_max_ms = 0;
+            }),
+        ];
+
+        for (field, mutate) in cases {
+            let mut runtime = RuntimeConfig::default();
+            mutate(&mut runtime);
+            let error = validate_task_execution_config(&runtime)
+                .expect_err("zero task-protocol values must be rejected");
+            assert!(
+                error.to_string().contains(field),
+                "error must identify {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::type_complexity,
+        reason = "The table-driven validation fixture keeps each inverted pair explicit."
+    )]
+    fn task_execution_config_rejects_inverted_bounds() {
+        let cases: [(&str, fn(&mut RuntimeConfig)); 5] = [
+            ("task_lease_max_ms", |runtime| {
+                runtime.task_lease_min_ms = 30_000;
+                runtime.task_lease_max_ms = 29_999;
+            }),
+            ("task_descriptor_max_encoded_bytes", |runtime| {
+                runtime.task_descriptor_max_encoded_bytes =
+                    runtime.task_operation_max_batch_encoded_bytes + 1;
+            }),
+            ("task_operation_max_batch_encoded_bytes", |runtime| {
+                runtime.task_query_backend_max_queued_bytes =
+                    runtime.task_operation_max_batch_encoded_bytes - 1;
+            }),
+            ("task_query_backend_max_queued_operations", |runtime| {
+                runtime.task_backend_max_queued_operations =
+                    runtime.task_query_backend_max_queued_operations - 1;
+            }),
+            ("task_lease_max_ms", |runtime| {
+                runtime.task_lease_max_ms =
+                    (LeaseValidFor::MAX_REPRESENTABLE.as_millis() as u64) + 1;
+            }),
+        ];
+
+        for (field, mutate) in cases {
+            let mut runtime = RuntimeConfig::default();
+            mutate(&mut runtime);
+            let error = validate_task_execution_config(&runtime)
+                .expect_err("an inverted task-protocol bound must be rejected");
             assert!(
                 error.to_string().contains(field),
                 "error must identify {field}: {error}"

@@ -198,6 +198,26 @@ fn parse_kill_be_at_lifecycle_phase(raw: &str) -> anyhow::Result<KillBeAtLifecyc
     Ok(KillBeAtLifecyclePhaseDirective { be_index, phase })
 }
 
+fn parse_kill_be_after_be_log_directive(raw: &str) -> anyhow::Result<KillBeAfterBeLogDirective> {
+    let (be_index, pattern) = raw.split_once(',').ok_or_else(|| {
+        anyhow::anyhow!(
+            "@kill_be_after_be_log_contains requires <be_index>,<pattern>; received {raw:?}"
+        )
+    })?;
+    let be_index = be_index
+        .trim()
+        .parse::<usize>()
+        .with_context(|| format!("invalid kill_be_after_be_log_contains BE index {be_index:?}"))?;
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        bail!("@kill_be_after_be_log_contains pattern must not be empty");
+    }
+    Ok(KillBeAfterBeLogDirective {
+        be_index,
+        pattern: pattern.to_string(),
+    })
+}
+
 fn parse_participant_outcome_expectation(
     raw: &str,
 ) -> anyhow::Result<ParticipantOutcomeExpectation> {
@@ -442,24 +462,6 @@ fn parse_meta_with_sql_error_descriptors(
                     .with_context(|| format!("invalid kill_be_index: {}", raw_value))?;
                 meta.kill_be_index = Some(value);
             }
-            "kill_be_after_fragment_start" => {
-                let value: usize = raw_value.parse().with_context(|| {
-                    format!("invalid kill_be_after_fragment_start: {}", raw_value)
-                })?;
-                meta.kill_be_after_fragment_start = Some(value);
-            }
-            "fail_fragment_after_start_be_index" => {
-                let value: usize = raw_value.parse().with_context(|| {
-                    format!("invalid fail_fragment_after_start_be_index: {}", raw_value)
-                })?;
-                meta.fail_fragment_after_start_be_index = Some(value);
-            }
-            "network_partition_be" => {
-                let value: usize = raw_value
-                    .parse()
-                    .with_context(|| format!("invalid network_partition_be: {}", raw_value))?;
-                meta.network_partition_be = Some(value);
-            }
             "heartbeat_delay_ms" => {
                 let value: u64 = raw_value
                     .parse()
@@ -489,81 +491,31 @@ fn parse_meta_with_sql_error_descriptors(
             "publication_catalog_fault" => {
                 meta.publication_catalog_fault = Some(parse_publication_catalog_fault(&raw_value)?);
             }
-            "drop_next_init_ack_be_index" => {
-                let value = raw_value
-                    .parse::<usize>()
-                    .with_context(|| format!("invalid drop_next_init_ack_be_index: {raw_value}"))?;
-                meta.drop_next_init_ack_be_index = Some(value);
-            }
-            "stop_query_control_heartbeat_be_index" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid stop_query_control_heartbeat_be_index: {raw_value}")
-                })?;
-                meta.stop_query_control_heartbeat_be_index = Some(value);
-            }
-            "kill_fe_after_control_ready_count" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid kill_fe_after_control_ready_count: {raw_value}")
-                })?;
-                meta.kill_fe_after_control_ready_count = Some(value);
-            }
             "kill_fe_after_mv_known_committed_before_projector_cas" => {
                 meta.kill_fe_after_mv_known_committed_before_projector_cas =
                     parse_bool(&raw_value)?;
             }
-            "restart_be_after_init_ack_index" => {
+            "restart_be_after_establish_context_index" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid restart_be_after_init_ack_index: {raw_value}")
+                    format!("invalid restart_be_after_establish_context_index: {raw_value}")
                 })?;
-                meta.restart_be_after_init_ack_index = Some(value);
+                meta.restart_be_after_establish_context_index = Some(value);
             }
-            "kill_query_after_control_ready_count" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid kill_query_after_control_ready_count: {raw_value}")
-                })?;
-                meta.kill_query_after_control_ready_count = Some(value);
+            "kill_be_after_be_log_contains" => {
+                meta.kill_be_after_be_log_contains =
+                    Some(parse_kill_be_after_be_log_directive(&raw_value)?);
+            }
+            "kill_fe_after_be_log_contains" => {
+                if raw_value.is_empty() {
+                    bail!("kill_fe_after_be_log_contains must not be empty");
+                }
+                meta.kill_fe_after_be_log_contains = Some(raw_value);
             }
             "kill_query_after_be_log_contains" => {
                 if raw_value.is_empty() {
                     bail!("kill_query_after_be_log_contains must not be empty");
                 }
                 meta.kill_query_after_be_log_contains = Some(raw_value);
-            }
-            "fail_stage_prepare_ordinal" => {
-                let value = raw_value
-                    .parse::<usize>()
-                    .with_context(|| format!("invalid fail_stage_prepare_ordinal: {raw_value}"))?;
-                meta.fail_stage_prepare_ordinal = Some(value);
-            }
-            "drop_next_stage_ack_be_index" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid drop_next_stage_ack_be_index: {raw_value}")
-                })?;
-                meta.drop_next_stage_ack_be_index = Some(value);
-            }
-            "drop_next_start_ack_be_index" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid drop_next_start_ack_be_index: {raw_value}")
-                })?;
-                meta.drop_next_start_ack_be_index = Some(value);
-            }
-            "suppress_start_ack_be_index" => {
-                let value = raw_value
-                    .parse::<usize>()
-                    .with_context(|| format!("invalid suppress_start_ack_be_index: {raw_value}"))?;
-                meta.suppress_start_ack_be_index = Some(value);
-            }
-            "drop_next_terminal_ack_be_index" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid drop_next_terminal_ack_be_index: {raw_value}")
-                })?;
-                meta.drop_next_terminal_ack_be_index = Some(value);
-            }
-            "drop_terminal_snapshot_stream_be_index" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid drop_terminal_snapshot_stream_be_index: {raw_value}")
-                })?;
-                meta.drop_terminal_snapshot_stream_be_index = Some(value);
             }
             "terminal_snapshot_conflict_be_index" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
@@ -636,36 +588,9 @@ fn parse_meta_with_sql_error_descriptors(
                     })
                     .map(Some)?;
             }
-            "kill_fe_at_lifecycle_phase" => {
-                let phase = QueryLifecyclePhase::parse(&raw_value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged or terminal-retained"
-                    )
-                })?;
-                if !matches!(
-                    phase,
-                    QueryLifecyclePhase::Staged | QueryLifecyclePhase::TerminalRetained
-                ) {
-                    bail!(
-                        "invalid kill_fe_at_lifecycle_phase: {raw_value}; expected staged or terminal-retained"
-                    );
-                }
-                meta.kill_fe_at_lifecycle_phase = Some(phase);
-            }
             "kill_be_at_lifecycle_phase" => {
                 meta.kill_be_at_lifecycle_phase =
                     Some(parse_kill_be_at_lifecycle_phase(&raw_value)?);
-            }
-            "stop_query_control_heartbeat_after_stage_be_index" => {
-                let value = raw_value.parse::<usize>().with_context(|| {
-                    format!(
-                        "invalid stop_query_control_heartbeat_after_stage_be_index: {raw_value}"
-                    )
-                })?;
-                meta.stop_query_control_heartbeat_after_stage_be_index = Some(value);
-            }
-            "hold_start_until_early_ingress" => {
-                meta.hold_start_until_early_ingress = parse_bool(&raw_value)?;
             }
             "query_control_fragment_backend_limit" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
@@ -747,19 +672,24 @@ fn parse_meta_with_sql_error_descriptors(
                 meta.be_log_be_count_at_least
                     .push((pattern.to_string(), count));
             }
-            "be_log_exact_fragment_cancellation" => {
-                let count = raw_value.parse::<usize>().with_context(|| {
-                    format!("invalid @be_log_exact_fragment_cancellation BE count: {raw_value}")
-                })?;
-                if count == 0 {
-                    bail!("@be_log_exact_fragment_cancellation BE count must be positive");
-                }
-                meta.be_log_exact_fragment_cancellation = Some(count);
-            }
             "sequential" => {
                 // Parsed here but ignored in merge_meta; handled at case level.
             }
-            _ => {}
+            // A directive this parser does not know is refused rather than
+            // ignored.
+            //
+            // Silently dropping one is how a case comes to assert nothing: it
+            // still reads as though it arms a fault or checks evidence, the
+            // runner does neither, and the case passes on whatever the engine
+            // happened to do. That is the exact shape of the failures this
+            // suite exists to catch, so it must not be reachable through a
+            // typo or a directive whose implementation was retired out from
+            // under a case.
+            other => bail!(
+                "unknown directive @{other}: a directive the runner does not \
+                 implement would assert nothing, so it is refused rather than \
+                 ignored"
+            ),
         }
     }
     Ok(meta)
@@ -892,34 +822,16 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         retry_count: override_meta.retry_count.or(base.retry_count),
         retry_interval_ms: override_meta.retry_interval_ms.or(base.retry_interval_ms),
         kill_be_index: override_meta.kill_be_index.or(base.kill_be_index),
-        kill_be_after_fragment_start: override_meta
-            .kill_be_after_fragment_start
-            .or(base.kill_be_after_fragment_start),
-        fail_fragment_after_start_be_index: override_meta
-            .fail_fragment_after_start_be_index
-            .or(base.fail_fragment_after_start_be_index),
-        network_partition_be: override_meta
-            .network_partition_be
-            .or(base.network_partition_be),
         heartbeat_delay_ms: override_meta.heartbeat_delay_ms.or(base.heartbeat_delay_ms),
         restart_be_delay_ms: override_meta
             .restart_be_delay_ms
             .or(base.restart_be_delay_ms),
-        drop_next_init_ack_be_index: override_meta
-            .drop_next_init_ack_be_index
-            .or(base.drop_next_init_ack_be_index),
-        stop_query_control_heartbeat_be_index: override_meta
-            .stop_query_control_heartbeat_be_index
-            .or(base.stop_query_control_heartbeat_be_index),
-        kill_fe_after_control_ready_count: override_meta
-            .kill_fe_after_control_ready_count
-            .or(base.kill_fe_after_control_ready_count),
         kill_fe_after_mv_known_committed_before_projector_cas: override_meta
             .kill_fe_after_mv_known_committed_before_projector_cas
             || base.kill_fe_after_mv_known_committed_before_projector_cas,
-        restart_be_after_init_ack_index: override_meta
-            .restart_be_after_init_ack_index
-            .or(base.restart_be_after_init_ack_index),
+        restart_be_after_establish_context_index: override_meta
+            .restart_be_after_establish_context_index
+            .or(base.restart_be_after_establish_context_index),
         restart_fe_after_step: override_meta.restart_fe_after_step || base.restart_fe_after_step,
         cleanup_fault: override_meta
             .cleanup_fault
@@ -928,31 +840,18 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         publication_catalog_fault: override_meta
             .publication_catalog_fault
             .or(base.publication_catalog_fault),
-        kill_query_after_control_ready_count: override_meta
-            .kill_query_after_control_ready_count
-            .or(base.kill_query_after_control_ready_count),
         kill_query_after_be_log_contains: override_meta
             .kill_query_after_be_log_contains
             .clone()
             .or_else(|| base.kill_query_after_be_log_contains.clone()),
-        fail_stage_prepare_ordinal: override_meta
-            .fail_stage_prepare_ordinal
-            .or(base.fail_stage_prepare_ordinal),
-        drop_next_stage_ack_be_index: override_meta
-            .drop_next_stage_ack_be_index
-            .or(base.drop_next_stage_ack_be_index),
-        drop_next_start_ack_be_index: override_meta
-            .drop_next_start_ack_be_index
-            .or(base.drop_next_start_ack_be_index),
-        suppress_start_ack_be_index: override_meta
-            .suppress_start_ack_be_index
-            .or(base.suppress_start_ack_be_index),
-        drop_next_terminal_ack_be_index: override_meta
-            .drop_next_terminal_ack_be_index
-            .or(base.drop_next_terminal_ack_be_index),
-        drop_terminal_snapshot_stream_be_index: override_meta
-            .drop_terminal_snapshot_stream_be_index
-            .or(base.drop_terminal_snapshot_stream_be_index),
+        kill_be_after_be_log_contains: override_meta
+            .kill_be_after_be_log_contains
+            .clone()
+            .or_else(|| base.kill_be_after_be_log_contains.clone()),
+        kill_fe_after_be_log_contains: override_meta
+            .kill_fe_after_be_log_contains
+            .clone()
+            .or_else(|| base.kill_fe_after_be_log_contains.clone()),
         terminal_snapshot_conflict_be_index: override_meta
             .terminal_snapshot_conflict_be_index
             .or(base.terminal_snapshot_conflict_be_index),
@@ -977,17 +876,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         kill_query_at_lifecycle_phase: override_meta
             .kill_query_at_lifecycle_phase
             .or(base.kill_query_at_lifecycle_phase),
-        kill_fe_at_lifecycle_phase: override_meta
-            .kill_fe_at_lifecycle_phase
-            .or(base.kill_fe_at_lifecycle_phase),
         kill_be_at_lifecycle_phase: override_meta
             .kill_be_at_lifecycle_phase
             .or(base.kill_be_at_lifecycle_phase),
-        stop_query_control_heartbeat_after_stage_be_index: override_meta
-            .stop_query_control_heartbeat_after_stage_be_index
-            .or(base.stop_query_control_heartbeat_after_stage_be_index),
-        hold_start_until_early_ingress: override_meta.hold_start_until_early_ingress
-            || base.hold_start_until_early_ingress,
         query_control_fragment_backend_limit: override_meta
             .query_control_fragment_backend_limit
             .or(base.query_control_fragment_backend_limit),
@@ -1041,9 +932,6 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         } else {
             override_meta.be_log_be_count_at_least.clone()
         },
-        be_log_exact_fragment_cancellation: override_meta
-            .be_log_exact_fragment_cancellation
-            .or(base.be_log_exact_fragment_cancellation),
     }
 }
 
@@ -1430,8 +1318,8 @@ mod opt5_directive_tests {
                 },
             ),
         ] {
-            let meta = parse_meta(&[directive.to_string()], &re)
-                .expect("parse catalog observation fault");
+            let meta =
+                parse_meta(&[directive.to_string()], &re).expect("parse catalog observation fault");
             assert_eq!(meta.publication_catalog_fault, Some(expected));
         }
         let error = parse_meta(
@@ -1526,9 +1414,6 @@ mod opt5_directive_tests {
         let re = meta_re();
         let lines = vec![
             "-- @kill_be_index=1".to_string(),
-            "-- @kill_be_after_fragment_start=2".to_string(),
-            "-- @fail_fragment_after_start_be_index=0".to_string(),
-            "-- @network_partition_be=2".to_string(),
             "-- @heartbeat_delay_ms=250".to_string(),
             "-- @restart_be_delay_ms=500".to_string(),
         ];
@@ -1536,9 +1421,6 @@ mod opt5_directive_tests {
         let meta = parse_meta(&lines, &re).expect("parse ok");
 
         assert_eq!(meta.kill_be_index, Some(1));
-        assert_eq!(meta.kill_be_after_fragment_start, Some(2));
-        assert_eq!(meta.fail_fragment_after_start_be_index, Some(0));
-        assert_eq!(meta.network_partition_be, Some(2));
         assert_eq!(meta.heartbeat_delay_ms, Some(250));
         assert_eq!(meta.restart_be_delay_ms, Some(500));
     }
@@ -1564,43 +1446,24 @@ mod opt5_directive_tests {
     fn parse_meta_parses_query_lifecycle_fault_directives() {
         let re = meta_re();
         let lines = vec![
-            "-- @drop_next_init_ack_be_index=1".to_string(),
-            "-- @stop_query_control_heartbeat_be_index=2".to_string(),
-            "-- @kill_fe_after_control_ready_count=3".to_string(),
             "-- @kill_fe_after_mv_known_committed_before_projector_cas=true".to_string(),
-            "-- @restart_be_after_init_ack_index=0".to_string(),
-            "-- @kill_query_after_control_ready_count=2".to_string(),
+            "-- @restart_be_after_establish_context_index=1".to_string(),
             "-- @kill_query_after_be_log_contains=split_id=iceberg-metadata-0".to_string(),
-            "-- @fail_stage_prepare_ordinal=2".to_string(),
-            "-- @drop_next_stage_ack_be_index=1".to_string(),
-            "-- @drop_next_start_ack_be_index=2".to_string(),
-            "-- @suppress_start_ack_be_index=0".to_string(),
-            "-- @drop_next_terminal_ack_be_index=1".to_string(),
+            "-- @terminal_snapshot_conflict_be_index=2".to_string(),
             "-- @kill_query_at_lifecycle_phase=starting".to_string(),
-            "-- @kill_fe_at_lifecycle_phase=staged".to_string(),
             "-- @kill_be_at_lifecycle_phase=2,terminal-retained".to_string(),
-            "-- @stop_query_control_heartbeat_after_stage_be_index=1".to_string(),
-            "-- @hold_start_until_early_ingress=true".to_string(),
             "-- @query_control_fragment_backend_limit=2".to_string(),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse query lifecycle fault directives");
 
-        assert_eq!(meta.drop_next_init_ack_be_index, Some(1));
-        assert_eq!(meta.stop_query_control_heartbeat_be_index, Some(2));
-        assert_eq!(meta.kill_fe_after_control_ready_count, Some(3));
         assert!(meta.kill_fe_after_mv_known_committed_before_projector_cas);
-        assert_eq!(meta.restart_be_after_init_ack_index, Some(0));
-        assert_eq!(meta.kill_query_after_control_ready_count, Some(2));
+        assert_eq!(meta.restart_be_after_establish_context_index, Some(1));
         assert_eq!(
             meta.kill_query_after_be_log_contains.as_deref(),
             Some("split_id=iceberg-metadata-0")
         );
-        assert_eq!(meta.fail_stage_prepare_ordinal, Some(2));
-        assert_eq!(meta.drop_next_stage_ack_be_index, Some(1));
-        assert_eq!(meta.drop_next_start_ack_be_index, Some(2));
-        assert_eq!(meta.suppress_start_ack_be_index, Some(0));
-        assert_eq!(meta.drop_next_terminal_ack_be_index, Some(1));
+        assert_eq!(meta.terminal_snapshot_conflict_be_index, Some(2));
         assert_eq!(
             meta.kill_be_at_lifecycle_phase,
             Some(KillBeAtLifecyclePhaseDirective {
@@ -1612,15 +1475,6 @@ mod opt5_directive_tests {
             meta.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Starting)
         );
-        assert_eq!(
-            meta.kill_fe_at_lifecycle_phase,
-            Some(QueryLifecyclePhase::Staged)
-        );
-        assert_eq!(
-            meta.stop_query_control_heartbeat_after_stage_be_index,
-            Some(1)
-        );
-        assert!(meta.hold_start_until_early_ingress);
         assert_eq!(meta.query_control_fragment_backend_limit, Some(2));
     }
 
@@ -1629,44 +1483,16 @@ mod opt5_directive_tests {
         let re = meta_re();
         for (directive, expected) in [
             (
-                "drop_next_init_ack_be_index=first",
-                "invalid drop_next_init_ack_be_index: first",
-            ),
-            (
-                "stop_query_control_heartbeat_be_index=last",
-                "invalid stop_query_control_heartbeat_be_index: last",
-            ),
-            (
-                "kill_fe_after_control_ready_count=all",
-                "invalid kill_fe_after_control_ready_count: all",
-            ),
-            (
-                "restart_be_after_init_ack_index=middle",
-                "invalid restart_be_after_init_ack_index: middle",
-            ),
-            (
-                "kill_query_after_control_ready_count=some",
-                "invalid kill_query_after_control_ready_count: some",
-            ),
-            (
                 "query_control_fragment_backend_limit=two",
                 "invalid query_control_fragment_backend_limit: two",
             ),
             (
-                "fail_stage_prepare_ordinal=second",
-                "invalid fail_stage_prepare_ordinal: second",
+                "restart_be_after_establish_context_index=first",
+                "invalid restart_be_after_establish_context_index: first",
             ),
             (
-                "drop_next_stage_ack_be_index=first",
-                "invalid drop_next_stage_ack_be_index: first",
-            ),
-            (
-                "drop_next_start_ack_be_index=first",
-                "invalid drop_next_start_ack_be_index: first",
-            ),
-            (
-                "suppress_start_ack_be_index=first",
-                "invalid suppress_start_ack_be_index: first",
+                "terminal_snapshot_conflict_be_index=first",
+                "invalid terminal_snapshot_conflict_be_index: first",
             ),
         ] {
             let error = parse_meta(&[format!("-- @{directive}")], &re)
@@ -1679,8 +1505,7 @@ mod opt5_directive_tests {
 
         for directive in [
             "kill_query_at_lifecycle_phase=after-start",
-            "kill_fe_at_lifecycle_phase=running",
-            "hold_start_until_early_ingress=maybe",
+            "kill_be_at_lifecycle_phase=1,after-start",
         ] {
             assert!(
                 parse_meta(&[format!("-- @{directive}")], &re).is_err(),
@@ -1972,7 +1797,6 @@ mod opt5_directive_tests {
     fn merge_meta_inherits_fault_directives_from_base() {
         let base = QueryMeta {
             kill_be_index: Some(1),
-            network_partition_be: Some(2),
             heartbeat_delay_ms: Some(250),
             restart_be_delay_ms: Some(500),
             ..QueryMeta::default()
@@ -1980,7 +1804,6 @@ mod opt5_directive_tests {
         let merged = merge_meta(&base, &QueryMeta::default());
 
         assert_eq!(merged.kill_be_index, Some(1));
-        assert_eq!(merged.network_partition_be, Some(2));
         assert_eq!(merged.heartbeat_delay_ms, Some(250));
         assert_eq!(merged.restart_be_delay_ms, Some(500));
     }
@@ -1989,14 +1812,12 @@ mod opt5_directive_tests {
     fn merge_meta_overrides_fault_directives_when_present() {
         let base = QueryMeta {
             kill_be_index: Some(1),
-            network_partition_be: Some(2),
             heartbeat_delay_ms: Some(250),
             restart_be_delay_ms: Some(500),
             ..QueryMeta::default()
         };
         let override_meta = QueryMeta {
             kill_be_index: Some(3),
-            network_partition_be: Some(4),
             heartbeat_delay_ms: Some(750),
             restart_be_delay_ms: Some(1000),
             ..QueryMeta::default()
@@ -2004,7 +1825,6 @@ mod opt5_directive_tests {
         let merged = merge_meta(&base, &override_meta);
 
         assert_eq!(merged.kill_be_index, Some(3));
-        assert_eq!(merged.network_partition_be, Some(4));
         assert_eq!(merged.heartbeat_delay_ms, Some(750));
         assert_eq!(merged.restart_be_delay_ms, Some(1000));
     }
@@ -2012,102 +1832,48 @@ mod opt5_directive_tests {
     #[test]
     fn merge_meta_inherits_and_overrides_query_lifecycle_fault_directives() {
         let base = QueryMeta {
-            drop_next_init_ack_be_index: Some(0),
-            stop_query_control_heartbeat_be_index: Some(1),
-            kill_fe_after_control_ready_count: Some(2),
             kill_fe_after_mv_known_committed_before_projector_cas: true,
-            restart_be_after_init_ack_index: Some(0),
-            kill_query_after_control_ready_count: Some(1),
+            restart_be_after_establish_context_index: Some(0),
             kill_query_after_be_log_contains: Some("reader-open".to_string()),
-            fail_stage_prepare_ordinal: Some(2),
-            drop_next_stage_ack_be_index: Some(0),
-            drop_next_start_ack_be_index: Some(1),
-            suppress_start_ack_be_index: Some(2),
-            drop_next_terminal_ack_be_index: Some(1),
+            terminal_snapshot_conflict_be_index: Some(1),
             kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Staging),
-            kill_fe_at_lifecycle_phase: Some(QueryLifecyclePhase::Staged),
-            stop_query_control_heartbeat_after_stage_be_index: Some(1),
-            hold_start_until_early_ingress: true,
             query_control_fragment_backend_limit: Some(2),
             ..QueryMeta::default()
         };
         let inherited = merge_meta(&base, &QueryMeta::default());
-        assert_eq!(inherited.drop_next_init_ack_be_index, Some(0));
-        assert_eq!(inherited.stop_query_control_heartbeat_be_index, Some(1));
-        assert_eq!(inherited.kill_fe_after_control_ready_count, Some(2));
         assert!(inherited.kill_fe_after_mv_known_committed_before_projector_cas);
-        assert_eq!(inherited.restart_be_after_init_ack_index, Some(0));
-        assert_eq!(inherited.kill_query_after_control_ready_count, Some(1));
+        assert_eq!(inherited.restart_be_after_establish_context_index, Some(0));
         assert_eq!(
             inherited.kill_query_after_be_log_contains.as_deref(),
             Some("reader-open")
         );
-        assert_eq!(inherited.fail_stage_prepare_ordinal, Some(2));
-        assert_eq!(inherited.drop_next_stage_ack_be_index, Some(0));
-        assert_eq!(inherited.drop_next_start_ack_be_index, Some(1));
-        assert_eq!(inherited.suppress_start_ack_be_index, Some(2));
-        assert_eq!(inherited.drop_next_terminal_ack_be_index, Some(1));
+        assert_eq!(inherited.terminal_snapshot_conflict_be_index, Some(1));
         assert_eq!(
             inherited.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Staging)
         );
-        assert_eq!(
-            inherited.kill_fe_at_lifecycle_phase,
-            Some(QueryLifecyclePhase::Staged)
-        );
-        assert_eq!(
-            inherited.stop_query_control_heartbeat_after_stage_be_index,
-            Some(1)
-        );
-        assert!(inherited.hold_start_until_early_ingress);
         assert_eq!(inherited.query_control_fragment_backend_limit, Some(2));
 
         let override_meta = QueryMeta {
-            drop_next_init_ack_be_index: Some(2),
-            stop_query_control_heartbeat_be_index: Some(0),
-            kill_fe_after_control_ready_count: Some(3),
-            restart_be_after_init_ack_index: Some(2),
-            kill_query_after_control_ready_count: Some(3),
+            restart_be_after_establish_context_index: Some(2),
             kill_query_after_be_log_contains: Some("metadata-open".to_string()),
-            fail_stage_prepare_ordinal: Some(4),
-            drop_next_stage_ack_be_index: Some(2),
-            drop_next_start_ack_be_index: Some(0),
-            suppress_start_ack_be_index: Some(1),
-            drop_next_terminal_ack_be_index: Some(0),
+            terminal_snapshot_conflict_be_index: Some(0),
             kill_query_at_lifecycle_phase: Some(QueryLifecyclePhase::Running),
-            stop_query_control_heartbeat_after_stage_be_index: Some(2),
             query_control_fragment_backend_limit: Some(1),
             ..QueryMeta::default()
         };
         let overridden = merge_meta(&base, &override_meta);
-        assert_eq!(overridden.drop_next_init_ack_be_index, Some(2));
-        assert_eq!(overridden.stop_query_control_heartbeat_be_index, Some(0));
-        assert_eq!(overridden.kill_fe_after_control_ready_count, Some(3));
         assert!(overridden.kill_fe_after_mv_known_committed_before_projector_cas);
-        assert_eq!(overridden.restart_be_after_init_ack_index, Some(2));
-        assert_eq!(overridden.kill_query_after_control_ready_count, Some(3));
+        assert_eq!(overridden.restart_be_after_establish_context_index, Some(2));
         assert_eq!(
             overridden.kill_query_after_be_log_contains.as_deref(),
             Some("metadata-open")
         );
-        assert_eq!(overridden.fail_stage_prepare_ordinal, Some(4));
-        assert_eq!(overridden.drop_next_stage_ack_be_index, Some(2));
-        assert_eq!(overridden.drop_next_start_ack_be_index, Some(0));
-        assert_eq!(overridden.suppress_start_ack_be_index, Some(1));
-        assert_eq!(overridden.drop_next_terminal_ack_be_index, Some(0));
+        assert_eq!(overridden.terminal_snapshot_conflict_be_index, Some(0));
         assert_eq!(
             overridden.kill_query_at_lifecycle_phase,
             Some(QueryLifecyclePhase::Running)
         );
-        assert_eq!(
-            overridden.kill_fe_at_lifecycle_phase,
-            Some(QueryLifecyclePhase::Staged)
-        );
-        assert_eq!(
-            overridden.stop_query_control_heartbeat_after_stage_be_index,
-            Some(2)
-        );
-        assert!(overridden.hold_start_until_early_ingress);
         assert_eq!(overridden.query_control_fragment_backend_limit, Some(1));
     }
 
@@ -2119,7 +1885,6 @@ mod opt5_directive_tests {
             "-- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED".to_string(),
             "-- @be_log_count_at_least=runtime_filter_receive,2".to_string(),
             "-- @be_log_be_count_at_least=exchange_receive eos=true,2".to_string(),
-            "-- @be_log_exact_fragment_cancellation=3".to_string(),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse BE log directives");
@@ -2140,7 +1905,6 @@ mod opt5_directive_tests {
             meta.be_log_be_count_at_least,
             vec![("exchange_receive eos=true".to_string(), 2)]
         );
-        assert_eq!(meta.be_log_exact_fragment_cancellation, Some(3));
     }
 
     #[test]
@@ -2152,19 +1916,6 @@ mod opt5_directive_tests {
 
         assert!(
             format!("{error:#}").contains("invalid @be_log_count_at_least count: zero"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn exact_fragment_cancellation_requires_positive_be_count() {
-        let re = meta_re();
-        let lines = vec!["-- @be_log_exact_fragment_cancellation=0".to_string()];
-
-        let error = parse_meta(&lines, &re).expect_err("zero BE coverage must fail");
-
-        assert!(
-            format!("{error:#}").contains("BE count must be positive"),
             "unexpected error: {error:#}"
         );
     }
@@ -2361,6 +2112,28 @@ mod opt5_directive_tests {
             format!("{error:#}").contains("expected terminal-retained"),
             "unexpected error: {error:#}"
         );
+    }
+
+    /// The defect this catches: an unrecognised directive used to be ignored,
+    /// so a case could read as though it armed a fault or checked evidence
+    /// while the runner did neither -- and then pass on whatever the engine
+    /// happened to do. Every failure this suite exists to catch has that
+    /// shape, and a typo or a directive retired out from under a case was
+    /// enough to reach it.
+    #[test]
+    fn an_unknown_directive_is_refused_rather_than_ignored() {
+        let re = meta_re();
+        let error = parse_meta(&["-- @not_a_directive=1".to_string()], &re)
+            .expect_err("an unimplemented directive asserts nothing");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unknown directive @not_a_directive"),
+            "the refusal has to name the directive, got: {message}"
+        );
+
+        // A directive parsed here and consumed elsewhere is still known.
+        parse_meta(&["-- @sequential=true".to_string()], &re)
+            .expect("a directive handled at case level is not unknown");
     }
 
     #[test]

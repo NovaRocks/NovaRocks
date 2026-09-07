@@ -2094,13 +2094,9 @@ pub trait ServerHandle: Send {
             self.query_lifecycle_structured_snapshot()
         })
     }
-    fn release_query_lifecycle_phase_fault(
-        &mut self,
-        phase: QueryLifecyclePhase,
-        fe_crash: bool,
-    ) -> Result<()> {
+    fn release_query_lifecycle_phase_fault(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
-            "lifecycle phase fault release is unsupported by this server mode (phase={}, fe_crash={fe_crash})",
+            "lifecycle phase fault release is unsupported by this server mode (phase={})",
             phase.as_str()
         )
     }
@@ -2116,32 +2112,14 @@ pub trait ServerHandle: Send {
     fn arm_init_ack_drop(&mut self, index: usize) -> Result<()> {
         bail!("InitAck drop is unsupported by this server mode (index={index})")
     }
-    fn arm_query_control_heartbeat_stop(&mut self, index: usize) -> Result<()> {
-        bail!("query-control heartbeat stop is unsupported by this server mode (index={index})")
-    }
-    fn arm_fe_crash_after_control_ready(&mut self, count: usize) -> Result<()> {
-        bail!("FE crash is unsupported by this server mode (ready_count={count})")
-    }
     fn arm_be_restart_after_init_ack(&mut self, index: usize) -> Result<()> {
         bail!("BE restart-after-InitAck is unsupported by this server mode (index={index})")
-    }
-    fn arm_stage_prepare_failure(&mut self, ordinal: usize) -> Result<()> {
-        bail!("Stage prepare failure is unsupported by this server mode (ordinal={ordinal})")
-    }
-    fn arm_stage_ack_drop(&mut self, index: usize) -> Result<()> {
-        bail!("StageAck drop is unsupported by this server mode (index={index})")
-    }
-    fn arm_start_ack_drop(&mut self, index: usize) -> Result<()> {
-        bail!("StartAck drop is unsupported by this server mode (index={index})")
     }
     fn arm_start_ack_suppress(&mut self, index: usize) -> Result<()> {
         bail!("StartAck suppression is unsupported by this server mode (index={index})")
     }
     fn arm_terminal_ack_drop(&mut self, index: usize) -> Result<()> {
         bail!("TerminalAck drop is unsupported by this server mode (index={index})")
-    }
-    fn arm_terminal_snapshot_stream_drop(&mut self, index: usize) -> Result<()> {
-        bail!("TerminalSnapshot stream drop is unsupported by this server mode (index={index})")
     }
     fn arm_terminal_snapshot_conflict(&mut self, index: usize) -> Result<()> {
         bail!("TerminalSnapshot conflict is unsupported by this server mode (index={index})")
@@ -2156,12 +2134,6 @@ pub trait ServerHandle: Send {
     fn arm_kill_query_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
         bail!(
             "KILL QUERY lifecycle phase fault is unsupported by this server mode (phase={})",
-            phase.as_str()
-        )
-    }
-    fn arm_fe_crash_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
-        bail!(
-            "FE lifecycle phase fault is unsupported by this server mode (phase={})",
             phase.as_str()
         )
     }
@@ -2183,14 +2155,6 @@ pub trait ServerHandle: Send {
             phase.as_str()
         )
     }
-    fn arm_query_control_heartbeat_stop_after_stage(&mut self, index: usize) -> Result<()> {
-        bail!(
-            "query-control heartbeat stop-after-stage is unsupported by this server mode (index={index})"
-        )
-    }
-    fn arm_hold_start_until_early_ingress(&mut self) -> Result<()> {
-        bail!("Start hold until early ingress is unsupported by this server mode")
-    }
     fn arm_query_control_fragment_backend_limit(&mut self, limit: usize) -> Result<()> {
         bail!(
             "query-control fragment backend limit is unsupported by this server mode (limit={limit})"
@@ -2199,10 +2163,6 @@ pub trait ServerHandle: Send {
     fn be_count(&self) -> usize {
         0
     }
-    fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
-        bail!("scheduled fragment telemetry is unsupported by this server mode (index={index})")
-    }
-
     fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
         bail!(
             "fragment executor failure injection is unsupported by this server mode (index={index})"
@@ -2217,9 +2177,6 @@ pub trait ServerHandle: Send {
         bail!(
             "fragment executor failure cleanup is unsupported by this server mode (index={index})"
         )
-    }
-    fn armed_fragment_failure_token(&self, index: usize) -> Result<Option<String>> {
-        bail!("fragment failure token is unsupported by this server mode (index={index})")
     }
     #[allow(dead_code)]
     fn assert_be_log(&self, index: usize, _needle: &str) -> Result<()> {
@@ -2527,20 +2484,8 @@ impl QueryLifecycleFaultFiles {
         self.be_path(index, QueryLifecycleFaultKind::InitAckDrop)
     }
 
-    fn heartbeat_stop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, QueryLifecycleFaultKind::HeartbeatStop)
-    }
-
     fn restart_after_init_ack_path(&self, index: usize) -> Result<PathBuf> {
         self.be_path(index, QueryLifecycleFaultKind::RestartAfterInitAck)
-    }
-
-    fn stage_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, QueryLifecycleFaultKind::StageAckDrop)
-    }
-
-    fn start_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, QueryLifecycleFaultKind::StartAckDrop)
     }
 
     fn start_ack_suppress_path(&self, index: usize) -> Result<PathBuf> {
@@ -2551,16 +2496,8 @@ impl QueryLifecycleFaultFiles {
         self.be_path(index, QueryLifecycleFaultKind::TerminalAckDrop)
     }
 
-    fn terminal_snapshot_stream_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, QueryLifecycleFaultKind::TerminalSnapshotStreamDrop)
-    }
-
     fn terminal_snapshot_conflict_path(&self, index: usize) -> Result<PathBuf> {
         self.be_path(index, QueryLifecycleFaultKind::TerminalSnapshotConflict)
-    }
-
-    fn heartbeat_stop_after_stage_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, QueryLifecycleFaultKind::HeartbeatStopAfterStage)
     }
 
     fn rfo_8r2_fault_path(&self, index: usize, kind: &'static str) -> Result<PathBuf> {
@@ -2570,26 +2507,13 @@ impl QueryLifecycleFaultFiles {
         self.be_path(index, kind)
     }
 
-    fn fe_crash_path(&self) -> PathBuf {
-        self.root.join("fe-crash-after-control-ready.trigger")
-    }
-
     fn fragment_backend_limit_path(&self) -> PathBuf {
         self.root.join("fragment-backend-limit.trigger")
-    }
-
-    fn stage_prepare_failure_path(&self) -> PathBuf {
-        self.root.join("stage-prepare-fail.trigger")
     }
 
     fn kill_query_at_phase_path(&self, phase: QueryLifecyclePhase) -> PathBuf {
         self.root
             .join(format!("kill-query-at-{}.trigger", phase.as_str()))
-    }
-
-    fn fe_crash_at_phase_path(&self, phase: QueryLifecyclePhase) -> PathBuf {
-        self.root
-            .join(format!("fe-crash-at-{}.trigger", phase.as_str()))
     }
 
     fn mv_known_committed_before_projector_cas_trigger_path(&self) -> PathBuf {
@@ -2600,28 +2524,12 @@ impl QueryLifecycleFaultFiles {
         mv_known_committed_before_projector_cas_marker_path(&self.root)
     }
 
-    fn hold_start_until_early_ingress_path(&self) -> PathBuf {
-        self.root.join("hold-start-until-early-ingress.trigger")
-    }
-
     fn publish_init_ack_drop(&self, index: usize) -> Result<String> {
         self.publish(self.init_ack_drop_path(index)?, index, None)
     }
 
-    fn publish_heartbeat_stop(&self, index: usize) -> Result<String> {
-        self.publish(self.heartbeat_stop_path(index)?, index, None)
-    }
-
     fn publish_restart_after_init_ack(&self, index: usize) -> Result<String> {
         self.publish(self.restart_after_init_ack_path(index)?, index, None)
-    }
-
-    fn publish_stage_ack_drop(&self, index: usize) -> Result<String> {
-        self.publish(self.stage_ack_drop_path(index)?, index, None)
-    }
-
-    fn publish_start_ack_drop(&self, index: usize) -> Result<String> {
-        self.publish(self.start_ack_drop_path(index)?, index, None)
     }
 
     fn publish_start_ack_suppress(&self, index: usize) -> Result<String> {
@@ -2632,24 +2540,12 @@ impl QueryLifecycleFaultFiles {
         self.publish(self.terminal_ack_drop_path(index)?, index, None)
     }
 
-    fn publish_terminal_snapshot_stream_drop(&self, index: usize) -> Result<String> {
-        self.publish(self.terminal_snapshot_stream_drop_path(index)?, index, None)
-    }
-
     fn publish_terminal_snapshot_conflict(&self, index: usize) -> Result<String> {
         self.publish(self.terminal_snapshot_conflict_path(index)?, index, None)
     }
 
-    fn publish_heartbeat_stop_after_stage(&self, index: usize) -> Result<String> {
-        self.publish(self.heartbeat_stop_after_stage_path(index)?, index, None)
-    }
-
     fn publish_rfo_8r2_fault(&self, index: usize, kind: &'static str) -> Result<String> {
         self.publish(self.rfo_8r2_fault_path(index, kind)?, index, None)
-    }
-
-    fn publish_fe_crash(&self, count: usize) -> Result<String> {
-        self.publish(self.fe_crash_path(), self.be_count, Some(count))
     }
 
     fn publish_fragment_backend_limit(&self, limit: usize) -> Result<String> {
@@ -2660,27 +2556,9 @@ impl QueryLifecycleFaultFiles {
         )
     }
 
-    fn publish_stage_prepare_failure(&self, ordinal: usize) -> Result<String> {
-        self.publish_fields(
-            self.stage_prepare_failure_path(),
-            self.be_count,
-            "ordinal",
-            ordinal,
-        )
-    }
-
     fn publish_kill_query_at_phase(&self, phase: QueryLifecyclePhase) -> Result<String> {
         self.publish_fields(
             self.kill_query_at_phase_path(phase),
-            self.be_count,
-            "phase",
-            phase.as_str(),
-        )
-    }
-
-    fn publish_fe_crash_at_phase(&self, phase: QueryLifecyclePhase) -> Result<String> {
-        self.publish_fields(
-            self.fe_crash_at_phase_path(phase),
             self.be_count,
             "phase",
             phase.as_str(),
@@ -2702,15 +2580,6 @@ impl QueryLifecycleFaultFiles {
             self.be_count,
             "phase",
             "known-committed-before-projector-cas",
-        )
-    }
-
-    fn publish_hold_start_until_early_ingress(&self) -> Result<String> {
-        self.publish_fields(
-            self.hold_start_until_early_ingress_path(),
-            self.be_count,
-            "enabled",
-            "true",
         )
     }
 
@@ -3667,37 +3536,6 @@ impl ServerHandle for CrossProcessServerHandle {
         Ok(())
     }
 
-    fn arm_query_control_heartbeat_stop(&mut self, index: usize) -> Result<()> {
-        self.ensure_be_index(index)?;
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_heartbeat_stop(index)?;
-        self.query_lifecycle_fault_tokens
-            .insert((index, "heartbeat-stop"), token.clone());
-        println!(
-            "armed query-control heartbeat stop for cross-process BE[{index}] token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .heartbeat_stop_path(index)?
-                .display()
-        );
-        Ok(())
-    }
-
-    fn arm_fe_crash_after_control_ready(&mut self, count: usize) -> Result<()> {
-        if !(1..=self.be_processes.len()).contains(&count) {
-            bail!(
-                "FE crash ControlReady count {count} is outside 1..={}",
-                self.be_processes.len()
-            );
-        }
-        let token = self.query_lifecycle_fault_files.publish_fe_crash(count)?;
-        println!(
-            "armed FE crash after {count} ControlReady marker(s) token={token} trigger={}",
-            self.query_lifecycle_fault_files.fe_crash_path().display()
-        );
-        Ok(())
-    }
-
     fn arm_be_restart_after_init_ack(&mut self, index: usize) -> Result<()> {
         self.ensure_be_index(index)?;
         let token = self
@@ -3709,54 +3547,6 @@ impl ServerHandle for CrossProcessServerHandle {
             "armed BE[{index}] restart after InitAck token={token} trigger={}",
             self.query_lifecycle_fault_files
                 .restart_after_init_ack_path(index)?
-                .display()
-        );
-        Ok(())
-    }
-
-    fn arm_stage_prepare_failure(&mut self, ordinal: usize) -> Result<()> {
-        if ordinal == 0 {
-            bail!("Stage prepare ordinal must be at least 1");
-        }
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_stage_prepare_failure(ordinal)?;
-        println!(
-            "armed Stage prepare failure at ordinal={ordinal} token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .stage_prepare_failure_path()
-                .display()
-        );
-        Ok(())
-    }
-
-    fn arm_stage_ack_drop(&mut self, index: usize) -> Result<()> {
-        self.ensure_be_index(index)?;
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_stage_ack_drop(index)?;
-        self.query_lifecycle_fault_tokens
-            .insert((index, "stage-ack-drop"), token.clone());
-        println!(
-            "armed StageAck drop for cross-process BE[{index}] token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .stage_ack_drop_path(index)?
-                .display()
-        );
-        Ok(())
-    }
-
-    fn arm_start_ack_drop(&mut self, index: usize) -> Result<()> {
-        self.ensure_be_index(index)?;
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_start_ack_drop(index)?;
-        self.query_lifecycle_fault_tokens
-            .insert((index, "start-ack-drop"), token.clone());
-        println!(
-            "armed StartAck drop for cross-process BE[{index}] token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .start_ack_drop_path(index)?
                 .display()
         );
         Ok(())
@@ -3789,22 +3579,6 @@ impl ServerHandle for CrossProcessServerHandle {
             "armed TerminalAck drop for cross-process BE[{index}] token={token} trigger={}",
             self.query_lifecycle_fault_files
                 .terminal_ack_drop_path(index)?
-                .display()
-        );
-        Ok(())
-    }
-
-    fn arm_terminal_snapshot_stream_drop(&mut self, index: usize) -> Result<()> {
-        self.ensure_be_index(index)?;
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_terminal_snapshot_stream_drop(index)?;
-        self.query_lifecycle_fault_tokens
-            .insert((index, "terminal-snapshot-stream-drop"), token.clone());
-        println!(
-            "armed TerminalSnapshot stream drop for cross-process BE[{index}] token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .terminal_snapshot_stream_drop_path(index)?
                 .display()
         );
         Ok(())
@@ -3856,20 +3630,6 @@ impl ServerHandle for CrossProcessServerHandle {
         Ok(())
     }
 
-    fn arm_fe_crash_at_lifecycle_phase(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_fe_crash_at_phase(phase)?;
-        println!(
-            "armed FE crash at lifecycle phase={} token={token} trigger={}",
-            phase.as_str(),
-            self.query_lifecycle_fault_files
-                .fe_crash_at_phase_path(phase)
-                .display()
-        );
-        Ok(())
-    }
-
     fn arm_mv_known_committed_before_projector_cas(&mut self) -> Result<()> {
         let token = self
             .query_lifecycle_fault_files
@@ -3901,51 +3661,13 @@ impl ServerHandle for CrossProcessServerHandle {
         Ok(())
     }
 
-    fn arm_query_control_heartbeat_stop_after_stage(&mut self, index: usize) -> Result<()> {
-        self.ensure_be_index(index)?;
-        let token = self
+    fn release_query_lifecycle_phase_fault(&mut self, phase: QueryLifecyclePhase) -> Result<()> {
+        let path = self
             .query_lifecycle_fault_files
-            .publish_heartbeat_stop_after_stage(index)?;
-        self.query_lifecycle_fault_tokens
-            .insert((index, "heartbeat-stop-after-stage"), token.clone());
-        println!(
-            "armed query-control heartbeat stop after Stage for cross-process BE[{index}] token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .heartbeat_stop_after_stage_path(index)?
-                .display()
-        );
-        Ok(())
-    }
-
-    fn arm_hold_start_until_early_ingress(&mut self) -> Result<()> {
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_hold_start_until_early_ingress()?;
-        println!(
-            "armed Start hold until early ingress token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .hold_start_until_early_ingress_path()
-                .display()
-        );
-        Ok(())
-    }
-
-    fn release_query_lifecycle_phase_fault(
-        &mut self,
-        phase: QueryLifecyclePhase,
-        fe_crash: bool,
-    ) -> Result<()> {
-        let path = if fe_crash {
-            self.query_lifecycle_fault_files
-                .fe_crash_at_phase_path(phase)
-        } else {
-            self.query_lifecycle_fault_files
-                .kill_query_at_phase_path(phase)
-        };
+            .kill_query_at_phase_path(phase);
         remove_fragment_failure_file(&path).with_context(|| {
             format!(
-                "release {} lifecycle phase fault {}",
-                if fe_crash { "FE crash" } else { "KILL QUERY" },
+                "release KILL QUERY lifecycle phase fault {}",
                 phase.as_str()
             )
         })
@@ -3976,25 +3698,6 @@ impl ServerHandle for CrossProcessServerHandle {
                 .display()
         );
         Ok(())
-    }
-
-    fn scheduled_fragment_count(&self, index: usize) -> Result<u64> {
-        self.ensure_be_index(index)?;
-        let grpc_port = self.be_grpc_ports[index];
-        let rows = query_frontend_backend_topology(
-            &self.mysql_user,
-            &self.target_host,
-            self.target_port,
-            TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
-        )?;
-        rows.into_iter()
-            .find(|row| row.grpc_port == grpc_port && row.is_eligible_live())
-            .map(|row| row.scheduled_fragments)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
-                )
-            })
     }
 
     fn backend_process_id(&self, index: usize) -> Result<novarocks_types::BackendProcessId> {
@@ -4096,11 +3799,6 @@ impl ServerHandle for CrossProcessServerHandle {
         })?;
         self.fragment_failure_tokens[index] = None;
         Ok(())
-    }
-
-    fn armed_fragment_failure_token(&self, index: usize) -> Result<Option<String>> {
-        self.ensure_be_index(index)?;
-        Ok(self.fragment_failure_tokens[index].clone())
     }
 
     fn assert_be_log(&self, index: usize, needle: &str) -> Result<()> {
@@ -5603,47 +5301,28 @@ mod tests {
         let init_token = paths
             .publish_init_ack_drop(1)
             .expect("publish init ack token");
-        let heartbeat_token = paths
-            .publish_heartbeat_stop(2)
-            .expect("publish heartbeat stop token");
-        let stage_ack_token = paths
-            .publish_stage_ack_drop(0)
-            .expect("publish stage ack token");
         let start_ack_token = paths
             .publish_start_ack_suppress(1)
             .expect("publish start ack token");
-        let stage_prepare_token = paths
-            .publish_stage_prepare_failure(2)
-            .expect("publish stage prepare failure");
+        let terminal_ack_token = paths
+            .publish_terminal_ack_drop(2)
+            .expect("publish terminal ack token");
         let phase_token = paths
             .publish_kill_query_at_phase(QueryLifecyclePhase::Starting)
             .expect("publish phase fault");
-        let hold_token = paths
-            .publish_hold_start_until_early_ingress()
-            .expect("publish early ingress hold");
 
-        assert_ne!(init_token, heartbeat_token);
+        assert_ne!(init_token, start_ack_token);
         assert_eq!(
             fs::read_to_string(paths.init_ack_drop_path(1).expect("init path"))
                 .expect("read init token"),
             format!("token={init_token}\nbackend_index=1\n")
         );
-        assert_eq!(
-            fs::read_to_string(paths.heartbeat_stop_path(2).expect("heartbeat path"))
-                .expect("read heartbeat token"),
-            format!("token={heartbeat_token}\nbackend_index=2\n")
-        );
         assert!(!paths.init_ack_drop_path(0).expect("init path 0").exists());
         assert!(
             !paths
-                .heartbeat_stop_path(1)
-                .expect("heartbeat path 1")
+                .terminal_ack_drop_path(1)
+                .expect("terminal ack path 1")
                 .exists()
-        );
-        assert_eq!(
-            fs::read_to_string(paths.stage_ack_drop_path(0).expect("stage ack path"))
-                .expect("read stage ack token"),
-            format!("token={stage_ack_token}\nbackend_index=0\n")
         );
         assert_eq!(
             fs::read_to_string(paths.start_ack_suppress_path(1).expect("start ack path"))
@@ -5651,19 +5330,14 @@ mod tests {
             format!("token={start_ack_token}\nbackend_index=1\n")
         );
         assert_eq!(
-            fs::read_to_string(paths.stage_prepare_failure_path())
-                .expect("read stage prepare token"),
-            format!("token={stage_prepare_token}\nordinal=2\n")
+            fs::read_to_string(paths.terminal_ack_drop_path(2).expect("terminal ack path"))
+                .expect("read terminal ack token"),
+            format!("token={terminal_ack_token}\nbackend_index=2\n")
         );
         assert_eq!(
             fs::read_to_string(paths.kill_query_at_phase_path(QueryLifecyclePhase::Starting))
                 .expect("read phase token"),
             format!("token={phase_token}\nphase=starting\n")
-        );
-        assert_eq!(
-            fs::read_to_string(paths.hold_start_until_early_ingress_path())
-                .expect("read hold token"),
-            format!("token={hold_token}\nenabled=true\n")
         );
 
         let duplicate = paths

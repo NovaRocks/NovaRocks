@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common::backend_topology::BackendTopologyService;
@@ -708,51 +708,53 @@ pub(super) fn record_lifecycle_phase_marker_for_execution(
     let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(());
     };
-    for (kind, action) in [("kill-query", "kill_query"), ("fe-crash", "kill_fe")] {
-        let path = root.join(format!("{kind}-at-{phase}.trigger"));
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(contract_error(format!(
-                    "read runner-owned lifecycle phase trigger {}: {error}",
-                    path.display()
-                )));
-            }
-        };
-        let fields = contents
-            .lines()
-            .filter_map(|line| line.split_once('='))
-            .collect::<BTreeMap<_, _>>();
-        let token = fields
-            .get("token")
-            .copied()
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| contract_error("runner-owned lifecycle phase trigger has no token"))?;
-        if fields.get("phase").copied() != Some(phase) || fields.len() != 2 {
+    // The barrier publishes exactly one action: the runner kills the target
+    // query at the named phase. A coordinator-crash variant of the same
+    // trigger no longer exists, so this reads one file rather than a family.
+    const ACTION: &str = "kill_query";
+    let path = root.join(format!("kill-query-at-{phase}.trigger"));
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
             return Err(contract_error(format!(
-                "runner-owned lifecycle phase trigger {} has invalid contents",
+                "read runner-owned lifecycle phase trigger {}: {error}",
                 path.display()
             )));
         }
-        eprintln!(
-            "NOVAROCKS_QUERY_LIFECYCLE_PHASE execution_id={}:{}:{} phase={} action={} token={}",
-            execution_id.query_id().high(),
-            execution_id.query_id().low(),
-            execution_id.attempt_id().get(),
-            phase,
-            action,
-            token
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while path.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if path.exists() {
-            return Err(failed(format!(
-                "timed out waiting for runner to execute {action} at lifecycle phase {phase}"
-            )));
-        }
+    };
+    let fields = contents
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    let token = fields
+        .get("token")
+        .copied()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| contract_error("runner-owned lifecycle phase trigger has no token"))?;
+    if fields.get("phase").copied() != Some(phase) || fields.len() != 2 {
+        return Err(contract_error(format!(
+            "runner-owned lifecycle phase trigger {} has invalid contents",
+            path.display()
+        )));
+    }
+    eprintln!(
+        "NOVAROCKS_QUERY_LIFECYCLE_PHASE execution_id={}:{}:{} phase={} action={} token={}",
+        execution_id.query_id().high(),
+        execution_id.query_id().low(),
+        execution_id.attempt_id().get(),
+        phase,
+        ACTION,
+        token
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if path.exists() {
+        return Err(failed(format!(
+            "timed out waiting for runner to execute {ACTION} at lifecycle phase {phase}"
+        )));
     }
     Ok(())
 }
@@ -1260,77 +1262,25 @@ fn wait_for_catalog_ready(
     }
 }
 
+/// Publishes this participant's ControlReady marker.
+///
+/// It is the retained chain's own observability, not a fault seam: the
+/// runner-owned FE-crash-after-ControlReady barrier that used to read a
+/// trigger here is gone, so nothing can hold the coordinator at this point
+/// any more.
 #[cfg(debug_assertions)]
 fn record_control_ready_marker(participant: &MaterializedParticipant) -> Result<(), String> {
-    let Some(root) = novarocks_failpoint::configured_root() else {
+    if novarocks_failpoint::configured_root().is_none() {
         return Ok(());
-    };
+    }
     let execution_id = participant_execution_id(participant);
     let backend_index = participant.target.backend_idx();
-    let trigger_path = root.join("fe-crash-after-control-ready.trigger");
-    let contents = match std::fs::read_to_string(&trigger_path) {
-        Ok(contents) => Some(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(format!(
-                "read runner-owned FE crash trigger {}: {error}",
-                trigger_path.display()
-            ));
-        }
-    };
-    let Some(contents) = contents else {
-        eprintln!(
-            "NOVAROCKS_QUERY_CONTROL_READY execution_id={}:{}:{} backend_index={backend_index} token=none ready_count=0",
-            execution_id.query_id().high(),
-            execution_id.query_id().low(),
-            execution_id.attempt_id().get()
-        );
-        return Ok(());
-    };
-    let mut lines = contents.lines();
-    let token = lines.next().unwrap_or_default().trim();
-    let target = lines
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .parse::<usize>()
-        .map_err(|error| format!("invalid runner-owned FE crash ready count: {error}"))?;
-    if target == 0
-        || token.is_empty()
-        || !token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        || lines.any(|line| !line.trim().is_empty())
-    {
-        return Err("runner-owned FE crash trigger has invalid tokenized contents".to_string());
-    }
-    static COUNTS: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
-    let observed = {
-        let mut counts = COUNTS
-            .get_or_init(|| Mutex::new(BTreeMap::new()))
-            .lock()
-            .map_err(|_| "lock FE crash ControlReady counter".to_string())?;
-        let count = counts.entry(token.to_string()).or_default();
-        *count = count.saturating_add(1);
-        *count
-    };
     eprintln!(
-        "NOVAROCKS_QUERY_CONTROL_READY execution_id={}:{}:{} backend_index={backend_index} token={token} ready_count={observed}",
+        "NOVAROCKS_QUERY_CONTROL_READY execution_id={}:{}:{} backend_index={backend_index} token=none ready_count=0",
         execution_id.query_id().high(),
         execution_id.query_id().low(),
         execution_id.attempt_id().get()
     );
-    if observed == target {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while trigger_path.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        return Err(if trigger_path.exists() {
-            format!("timed out waiting for runner to kill FE after ControlReady count {target}")
-        } else {
-            "runner released FE crash trigger without killing FE".to_string()
-        });
-    }
     Ok(())
 }
 

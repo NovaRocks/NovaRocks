@@ -64,8 +64,8 @@ INSERT INTO ${case_db}.task_update_ack_loss VALUES (9);
 -- query 11
 -- Baseline: each backend receives a real remote split assignment before the
 -- acknowledgement-loss scenario asks one backend to replay it.
--- @query_control_fragment_backend_limit=3
 -- @result_contains=45
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED,3
 SELECT SUM(id) AS total FROM ${case_db}.task_update_ack_loss;
 
@@ -74,8 +74,8 @@ SELECT SUM(id) AS total FROM ${case_db}.task_update_ack_loss;
 -- reply, then observes the exact immutable retransmission as duplicates. The
 -- result must remain complete and the retry must not re-enqueue a split.
 -- @query_lifecycle_fault=task-update-terminal-ack-drop,0
--- @query_control_fragment_backend_limit=3
 -- @result_contains=45
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CREATE_APPLIED,3
 -- @be_log_contains=NOVAROCKS_TASK_UPDATE_TERMINAL_ACK_DROPPED
 -- @be_log_contains=NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED
 -- @be_log_contains=NOVAROCKS_TASK_SPLIT_ASSIGNMENT_DUPLICATE

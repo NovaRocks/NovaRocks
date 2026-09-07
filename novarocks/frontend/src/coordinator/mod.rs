@@ -28,6 +28,7 @@ mod query_lifecycle;
 mod query_registry;
 mod report;
 mod scheduler;
+pub(crate) mod task_round;
 
 pub use execution::FrontendDistributedQueryCoordinator;
 pub(crate) use query_registry::{

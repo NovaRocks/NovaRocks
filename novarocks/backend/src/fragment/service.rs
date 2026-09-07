@@ -118,24 +118,6 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
     )
 }
 
-#[cfg(debug_assertions)]
-fn runner_stage_prepare_failure(
-    available_fragments: usize,
-) -> Result<Option<novarocks_failpoint::StagePrepareFailure>, NativeFragmentIngressError> {
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return Ok(None);
-    };
-    novarocks_failpoint::claim_stage_prepare_failure(&root, available_fragments)
-        .map_err(NativeFragmentIngressError::new)
-}
-
-#[cfg(not(debug_assertions))]
-fn runner_stage_prepare_failure(
-    _available_fragments: usize,
-) -> Result<Option<novarocks_failpoint::StagePrepareFailure>, NativeFragmentIngressError> {
-    Ok(None)
-}
-
 pub struct NativeFragmentService {
     pub(super) controls: Arc<FragmentControlRegistry>,
     lifecycle: Arc<QueryLifecycleRegistry>,
@@ -544,26 +526,7 @@ impl NativeFragmentService {
         fragments: &[StageFragment],
         gate: Arc<StartGate>,
     ) -> Result<(), NativeFragmentIngressError> {
-        let injected_failure = runner_stage_prepare_failure(fragments.len())?;
-        for (index, fragment) in fragments.iter().enumerate() {
-            if injected_failure
-                .as_ref()
-                .is_some_and(|failure| failure.ordinal == index.saturating_add(1))
-            {
-                let failure = injected_failure.expect("checked injected Stage failure");
-                eprintln!(
-                    "NOVAROCKS_STAGE_PREPARE_FAILED execution_id={}:{}:{} ordinal={} token={}",
-                    execution_id.query_id().high(),
-                    execution_id.query_id().low(),
-                    execution_id.attempt_id().get(),
-                    failure.ordinal,
-                    failure.token
-                );
-                return Err(NativeFragmentIngressError::new(format!(
-                    "runner-owned Stage prepare failure at ordinal {}",
-                    failure.ordinal
-                )));
-            }
+        for fragment in fragments {
             let fragment_instance_id = fragment
                 .instance_params()
                 .fragment_instance_id
@@ -1185,11 +1148,7 @@ fn consume_terminal_fact(
 }
 
 fn profiler_for_native_fragment(root_plan_node_id: i32) -> Profiler {
-    let profiler = Profiler::new(format!(
-        "execute_fragment_native (plan_node_id={root_plan_node_id})"
-    ));
-    profiler.set_metadata(i64::from(root_plan_node_id));
-    profiler
+    novarocks_execution::runtime::profile::fragment_root_profiler(root_plan_node_id)
 }
 
 #[cfg(test)]

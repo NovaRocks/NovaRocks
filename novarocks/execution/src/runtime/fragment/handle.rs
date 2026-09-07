@@ -67,6 +67,14 @@ pub struct FragmentPrepareContext {
     scan_registration: Option<Arc<dyn ScanRegistrationPort>>,
     commit_port: Arc<dyn FragmentCommitPort>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+    /// The per-edge send permission this task's push sinks are bound by.
+    ///
+    /// Absent means the caller runs no closed-edge barrier, which is how
+    /// every non-task caller and every test that does not exercise it builds
+    /// a context. A task-protocol submission always supplies one, because the
+    /// barrier is the only thing that stops a producer from sending to a
+    /// destination that has not acknowledged its creation.
+    edge_gates: Option<Arc<crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates>>,
     #[cfg(test)]
     prepare_failure: Option<PrepareFailurePoint>,
     #[cfg(test)]
@@ -204,6 +212,7 @@ impl Default for FragmentPrepareContext {
             exchange_transmitter:
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
             lookup_client: Arc::new(UnavailableFragmentLookupClient),
+            edge_gates: None,
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
             event_sink: Arc::new(NoopFragmentEventSink),
             result_spec: None,
@@ -247,6 +256,7 @@ impl FragmentPrepareContext {
             lookup_client,
             result_writer,
             event_sink,
+            edge_gates: None,
             result_spec: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
@@ -271,6 +281,19 @@ impl FragmentPrepareContext {
 
     pub fn with_debug_exec_node_output(mut self, enabled: bool) -> Self {
         self.debug_exec_node_output = enabled;
+        self
+    }
+
+    /// Binds this fragment's push sinks to the per-edge send permission its
+    /// task holds.
+    ///
+    /// Every frozen edge starts closed, so a sink built without this sends the
+    /// moment it has rows and the barrier exists only on paper.
+    pub fn with_edge_gates(
+        mut self,
+        gates: Arc<crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates>,
+    ) -> Self {
+        self.edge_gates = Some(gates);
         self
     }
 
@@ -333,6 +356,7 @@ impl FragmentPrepareContext {
             lookup_client,
             result_writer,
             event_sink,
+            edge_gates: None,
             result_spec,
             root_sink_dop,
             group_execution_scan_dop,
@@ -723,6 +747,7 @@ pub fn prepare_fragment(
             instance,
             Arc::clone(&context.exchange_transmitter),
             resources.result_session(),
+            context.edge_gates.clone(),
         )?;
         let statistics_sink = materialized_sink.statistics_handle;
         let sink = materialized_sink.factory;

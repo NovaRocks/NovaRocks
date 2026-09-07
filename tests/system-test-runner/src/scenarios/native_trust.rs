@@ -24,6 +24,7 @@
 
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
+use crate::scenarios::task_evidence;
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use h2::client;
@@ -34,8 +35,7 @@ use novarocks_cluster_harness::vended_rest_catalog::{
     VendedRefreshBehavior, VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
 };
 use novarocks_cluster_harness::{
-    NativeTrustFixture, NativeTrustFixtureMode, ParticipantTerminalOutcomeKind,
-    QueryLifecycleStructuredSnapshot, ServerHandle,
+    NativeTrustFixture, NativeTrustFixtureMode, QueryLifecycleStructuredSnapshot, ServerHandle,
 };
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
 use novarocks_proto_models::{catalog, common, novarocks as proto};
@@ -46,6 +46,7 @@ use novarocks_version::{
     NativeCarrierDeclaration, derive_repository_native_compatibility_material,
 };
 use prost::Message;
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -120,6 +121,7 @@ impl Scenario for NativeTrustPositive {
             .query_lifecycle_structured_snapshot()?
             .and_then(|snapshot| snapshot.execution_id);
         let mut snapshots = Vec::new();
+        let mut participating = BTreeSet::new();
         let deadline = context.deadline();
         for ordinal in 1..=3 {
             let rows: Vec<i64> = connection
@@ -141,16 +143,34 @@ impl Scenario for NativeTrustPositive {
                     format!("read FE lifecycle snapshot for Native trust query {ordinal}")
                 })?;
             previous_execution = snapshot.execution_id.clone();
-            assert_successful_lifecycle(&snapshot)?;
+            let backends =
+                assert_query_crossed_trust_boundary(context, &snapshot, "Native trust query")?;
+            participating.extend(backends);
             snapshots.push(snapshot);
         }
-        for backend in 0..REQUIRED_BACKENDS {
-            context
-                .handle()
-                .assert_be_log(backend, "NOVAROCKS_QUERY_INIT_APPLIED")?;
-        }
+        // Replaces a per-backend `NOVAROCKS_QUERY_INIT_APPLIED` loop, whose
+        // subject -- the retired InitQuery -- no production query sends any
+        // more. Its stated property was FE-to-BE admission across every BE,
+        // and the task protocol cannot restate that through queries: a query
+        // context is established only where the scheduler placed a task, and
+        // the constant query above places tasks on one backend. Reading the
+        // frontend's own registry proves the same reach without depending on
+        // placement: a backend is eligible-live only once its authenticated
+        // announce and the FE-pull exact heartbeat agree, and both are Native
+        // RPCs over the transport profile under test, so a BE this fixture
+        // could not authenticate to could not appear here.
+        let topology = context
+            .handle()
+            .frontend_backend_topology()
+            .context("read the frontend backend registry over the Native trust profile")?;
+        ensure!(
+            topology.len() == REQUIRED_BACKENDS
+                && topology.iter().all(|row| row.is_eligible_live()),
+            "frontend registry does not hold {REQUIRED_BACKENDS} eligible-live backends over transport={:?}: {topology:?}",
+            self.fixture.mode()
+        );
         context.action(format!(
-            "proved real 1FE+3BE topology, FE-to-BE lifecycle admission across every BE, and BE-to-FE terminal delivery with transport={:?}; terminal snapshots={}",
+            "proved real 1FE+3BE topology, authenticated FE-to-BE reach on every BE, and a completed FE/BE query round trip with transport={:?}; terminal snapshots={}, participating backends={participating:?}",
             self.fixture.mode()
             , snapshots.len()
         ));
@@ -735,25 +755,38 @@ fn assert_authentication_order(
     Ok(())
 }
 
-fn assert_successful_lifecycle(snapshot: &QueryLifecycleStructuredSnapshot) -> Result<()> {
-    ensure!(
-        !snapshot.participant_outcomes.is_empty(),
-        "Native trust query produced no BE lifecycle participant outcome"
-    );
-    ensure!(
-        snapshot.error_source.is_none(),
-        "Native trust query lifecycle reported an error source: {:?}",
-        snapshot.error_source
-    );
-    ensure!(
-        snapshot
-            .participant_outcomes
-            .iter()
-            .all(|outcome| matches!(outcome, ParticipantTerminalOutcomeKind::Proof)),
-        "Native trust query contained a non-proof terminal outcome: {:?}",
-        snapshot.participant_outcomes
-    );
-    Ok(())
+/// Confirms one acceptance query really crossed the trust boundary and
+/// finished there.
+///
+/// Named for the boundary rather than for a lifecycle, because the retired
+/// protocol that owned that word is not what carries these queries any more.
+///
+/// This scenario is about JWT and TLS, not about lifecycle bookkeeping: the
+/// retired assertions here -- a non-empty participant outcome list, no error
+/// source, and every outcome a positive proof -- were only how it confirmed
+/// that a query had run end to end over the transport under test. None of the
+/// three has a subject on the task protocol:
+///
+/// * Participant outcomes are gone as a concept. The task protocol mints no
+///   `ParticipantTerminalOutcome`, and the frontend publishes an empty list
+///   rather than fabricating proofs (ADR-0135), so both the "not empty" and
+///   the "all proofs" assertions are unsatisfiable rather than merely false.
+/// * `error_source` is structurally `None` here. A task round publishes its
+///   convergence evidence only after the client-visible answer is already
+///   linearized as a success -- a failed attempt aborts its contexts and
+///   publishes nothing -- so the assertion could not fail, and an assertion
+///   that cannot fail is worse than no assertion.
+///
+/// What replaces them is the same confirmation built from the task protocol's
+/// own evidence, and it is deliberately stronger in one respect: it is scoped
+/// to this query's execution identity, where the retired backend-log
+/// assertions matched any query in the run.
+fn assert_query_crossed_trust_boundary(
+    context: &mut ScenarioContext,
+    snapshot: &QueryLifecycleStructuredSnapshot,
+    subject: &str,
+) -> Result<BTreeSet<usize>> {
+    task_evidence::assert_query_completed_across_boundary(context, snapshot, subject)
 }
 
 #[derive(Debug)]

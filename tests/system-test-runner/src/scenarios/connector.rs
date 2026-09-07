@@ -23,6 +23,42 @@ use std::thread;
 use std::time::Duration;
 
 const CONNECTOR_READER_OPEN: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN";
+/// The task protocol's abort marker, emitted where the abort actually
+/// applied. It replaces `NOVAROCKS_QUERY_LIFECYCLE_ABORT`, which only the
+/// retired chain emits and which a production query no longer reaches.
+const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
+/// A Backend is about to build at least one catalog runtime for one attempt.
+///
+/// The task protocol's successor of `NOVAROCKS_CATALOG_LOADING`, and the only
+/// point at which a cold install is observably in flight: the install runs
+/// inside the establish that carries the catalog bindings, not in a background
+/// pass with its own Loading/Ready progression.
+const CATALOG_INSTALL_STARTED: &str = "NOVAROCKS_CATALOG_INSTALL_STARTED";
+/// One selected Backend's cold install was failed by the runner's trigger.
+const CATALOG_INSTALL_FAILED: &str = "NOVAROCKS_CATALOG_INSTALL_FAILED";
+/// A provider bind produced one catalog runtime. Protocol-neutral and live:
+/// it is emitted by the catalog manager's factory set, which both the retired
+/// chain and the task protocol drive, and it is the fact "this catalog is
+/// usable here" actually consists of.
+const CATALOG_RUNTIME_MATERIALIZED: &str = "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED";
+/// One task was admitted on a Backend. The successor of
+/// `NOVAROCKS_CATALOG_STAGE_ADMITTED` for ordering claims: a task is the
+/// smallest thing a Backend admits, and it cannot exist before the establish
+/// that installed its context's catalogs returned.
+const TASK_CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+/// The task protocol's establish acknowledgement drop, and the marker its
+/// claim prints. It replaces the retired `InitAck` drop: `EstablishQueryContext`
+/// is where a query's catalog bindings cross the boundary, so it is the
+/// operation whose lost answer could make one Backend install twice.
+const ESTABLISH_CONTEXT_ACK_DROP: &str = "establish-context-ack-drop";
+const ESTABLISH_CONTEXT_ACK_DROPPED_MARKER: &str = "NOVAROCKS_TASK_ESTABLISH_CONTEXT_ACK_DROPPED";
+/// The one Backend the injected catalog-install failure and the dropped
+/// establish acknowledgement are armed on.
+///
+/// A Backend index, never a count: it is fixed so the scenario can name the
+/// process its evidence must come from, and nothing here assumes how many
+/// Backends a plan reaches.
+const CATALOG_FAILURE_BACKEND: usize = 1;
 const TYPED_SPLIT_ACCEPTED: &str = "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED";
 const TYPED_SPLIT_NO_MORE: &str = "NOVAROCKS_TASK_SPLIT_NO_MORE";
 const TYPED_PAGE_SOURCE_OPEN: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN";
@@ -416,6 +452,28 @@ impl Scenario for CatalogReadyLifecycle {
     fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
         let mut config = connector_launch_config();
         let hold_file = scenario_root.join("catalog-install-hold");
+        let failure_file = scenario_root.join("catalog-install-failure");
+        // Both triggers are cleared here, before the cluster is launched, and
+        // not only where each is written.
+        //
+        // Neither is armed by the scenario until well after the fixture has
+        // written 300,000 rows through this catalog, and those writes are
+        // themselves cold installs. So a trigger left behind by a run that
+        // died while armed takes effect on the *fixture*, long before the
+        // clear at either write site can run: the fixture's first cold
+        // install is held from startup, its lease renewal outruns the
+        // establish, and the write fails closed with "a renewal cannot create
+        // a query context" -- observed exactly that way. The scenario root
+        // outlives a single run and nothing else removes these files, so the
+        // only clear that can prevent it is one that happens before the
+        // backends exist.
+        for trigger in [&hold_file, &failure_file] {
+            if trigger.exists() {
+                std::fs::remove_file(trigger).with_context(|| {
+                    format!("clear stale catalog trigger {}", trigger.display())
+                })?;
+            }
+        }
         config.child_environment.be.insert(
             "NOVAROCKS_SQL_TEST_CATALOG_INSTALL_HOLD_FILE".to_string(),
             hold_file.to_string_lossy().into_owned(),
@@ -427,14 +485,11 @@ impl Scenario for CatalogReadyLifecycle {
         config
             .child_environment
             .be_by_index
-            .entry(1)
+            .entry(CATALOG_FAILURE_BACKEND)
             .or_default()
             .insert(
                 "NOVAROCKS_SQL_TEST_CATALOG_INSTALL_FAILURE_FILE".to_string(),
-                scenario_root
-                    .join("catalog-install-failure")
-                    .to_string_lossy()
-                    .into_owned(),
+                failure_file.to_string_lossy().into_owned(),
             );
         Ok(config)
     }
@@ -455,33 +510,109 @@ impl Scenario for CatalogReadyLifecycle {
         let warehouse = create_warehouse(context, "catalog-ready-lifecycle")?;
         create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
 
+        // A cold install that is cancelled while it is still held.
+        //
+        // The task protocol installs a query context's catalogs inside the
+        // establish that carries them, so "the install is in flight" lasts a
+        // few milliseconds and cancellation would otherwise always land
+        // before or after it. The hold is what makes that instant long enough
+        // to act on, and the marker is what proves this backend is inside it.
         control
             .query_drop(format!("DROP CATALOG {CATALOG}"))
             .context("replace warm catalog before held cancellation")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
         let hold_file = context.scenario_root().join("catalog-install-hold");
+        // The scenario root outlives a single run, and a run that dies while
+        // the install is held leaves this file behind -- after which every
+        // later run's first cold install is held from the start, its lease
+        // renewal outruns the establish, and the fixture write fails closed
+        // with "a renewal cannot create a query context". Observed exactly
+        // that way. Clearing it here makes the setup idempotent rather than
+        // dependent on the previous run having exited cleanly.
+        if hold_file.exists() {
+            std::fs::remove_file(&hold_file).with_context(|| {
+                format!(
+                    "clear stale catalog-install hold file {}",
+                    hold_file.display()
+                )
+            })?;
+        }
         let before_cancel = backend_log_snapshots(context)?;
         std::fs::write(&hold_file, "hold\n")
             .with_context(|| format!("create catalog-install hold file {}", hold_file.display()))?;
-        context.action("hold cold catalog install, then cancel before CatalogReady");
-        let cancelled = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        context.action("hold a cold catalog install, then cancel it before any runtime is built");
+        // The scenario-bounded connection form, because this statement is
+        // parked before it produces a single row: its first response byte is
+        // the cancellation itself, so a socket read timeout would turn any
+        // server latency into EAGAIN and destroy the measurement below.
+        let cancelled = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
         let connection_id = cancelled
             .ready
             .recv_timeout(context.remaining("receive held catalog query connection id")?)
             .context("held catalog query terminated before publishing connection id")?;
-        wait_for_catalog_lifecycle_marker(
+        let installing = wait_for_cold_catalog_install(
             context,
             &before_cancel,
-            "NOVAROCKS_CATALOG_LOADING",
-            "observe Loading on every Backend before cancellation",
+            "observe a held cold catalog install",
         )?;
-        assert_no_appended_catalog_stage_admitted(context, &before_cancel)?;
+        // The hold is before the provider bind, so nothing may be usable yet.
+        // This is the assertion that gives the whole phase its meaning: it is
+        // checked against a marker this same scenario later observes
+        // appearing, so it cannot pass because the marker has no emitter.
+        assert_no_appended_catalog_runtime(
+            context,
+            &before_cancel,
+            CATALOG,
+            "while the cold catalog install is held",
+        )?;
+        // And nothing may execute against a catalog that is not usable. On
+        // the retired chain this was `no Stage was admitted`; a task cannot be
+        // created before its context's establish returns, so the observable
+        // form of the same claim is that no reader for this catalog opened.
+        assert_no_appended_reader_open(
+            context,
+            &before_cancel,
+            CATALOG,
+            "while the cold catalog install is held",
+        )?;
         control
             .query_drop(format!("KILL QUERY {connection_id}"))
             .context("cancel query while catalog install is held")?;
-        assert_cancelled_query(
+        let killed_at = std::time::Instant::now();
+        // Delivery of the abort is asserted before the client's error code,
+        // and the order is load-bearing twice over.
+        //
+        // It is the more primitive fact: the backend standing its held
+        // install down is what has to happen for the client to be owed
+        // anything at all. Asserting it first splits a single opaque failure
+        // into two different diagnoses -- an abort that never reached a
+        // backend parked in its establish, versus one that did while the
+        // frontend still failed to report the interrupt.
+        //
+        // And it must precede lifting the hold: the held install ends on
+        // either the abort or the hold file, so lifting the file first would
+        // let a cancellation that had not arrived yet race a provider bind
+        // that then really would make the catalog usable.
+        wait_for_context_abort_on(
+            context,
+            &before_cancel,
+            &installing,
+            "observe the abort reach every Backend holding a cold catalog install",
+        )?;
+        // `KILL QUERY` owes this client 1317, and owes it only once the
+        // coordinator's worker has unwound: the frontend deliberately
+        // withholds the interrupt until the statement generation is released,
+        // so that the probe below can reuse this connection
+        // (`cancellation_requires_statement_fence` in
+        // `novarocks/frontend/src/query.rs`). By this line the abort has
+        // already reached every installing Backend, so anything other than a
+        // prompt 1317 is the frontend failing to report an interrupt it owes,
+        // never the expectation being wrong.
+        assert_held_query_interrupted(
             &cancelled.done,
-            context.remaining("await held catalog query cancellation")?,
+            killed_at,
+            HELD_QUERY_INTERRUPT_BUDGET
+                .min(context.remaining("await held catalog query cancellation")?),
         )?;
         assert_target_connection_remains_usable(
             &cancelled,
@@ -494,8 +625,24 @@ impl Scenario for CatalogReadyLifecycle {
             .join()
             .map_err(|_| anyhow::anyhow!("held catalog reader thread panicked"))??;
         await_resource_convergence(context, &baseline, "cancelled catalog install")?;
-        assert_no_appended_catalog_ready(context, &before_cancel)?;
+        // Re-checked over the whole cancelled window, after convergence: the
+        // attempt is fully unwound by now, so a runtime that appeared here
+        // would be one the cancelled install left behind.
+        assert_no_appended_catalog_runtime(
+            context,
+            &before_cancel,
+            CATALOG,
+            "as a result of the cancelled catalog install",
+        )?;
+        assert_no_appended_reader_open(
+            context,
+            &before_cancel,
+            CATALOG,
+            "as a result of the cancelled catalog install",
+        )?;
 
+        // One backend's cold install fails, and the retry after the trigger is
+        // cleared has to succeed on that same backend.
         control
             .query_drop(format!("DROP CATALOG {CATALOG}"))
             .context("replace cancelled catalog before injected install failure")?;
@@ -508,8 +655,7 @@ impl Scenario for CatalogReadyLifecycle {
                 failure_file.display()
             )
         })?;
-        context
-            .action("fail catalog installation on one Backend and reject the query before Stage");
+        context.action("fail the cold catalog install on one Backend and reject the query");
         let failed_query: Result<Vec<i64>, mysql::Error> =
             control.query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"));
         if let Ok(rows) = failed_query {
@@ -518,11 +664,23 @@ impl Scenario for CatalogReadyLifecycle {
         wait_for_catalog_lifecycle_marker_on_backend(
             context,
             &before_failure,
-            1,
-            "NOVAROCKS_CATALOG_FAILED",
-            "observe the injected CatalogLoadFailed from BE[1]",
+            CATALOG_FAILURE_BACKEND,
+            CATALOG_INSTALL_FAILED,
+            "observe the injected catalog install failure from the selected Backend",
         )?;
-        assert_no_appended_catalog_stage_admitted(context, &before_failure)?;
+        // Only on the Backend the failure was injected into, and deliberately
+        // not cluster-wide: the task protocol has no cross-Backend establish
+        // barrier, so a Backend whose own install succeeded may create its
+        // task and open its reader while this one is still failing. What the
+        // refusal has to mean is that *this* Backend never held usable
+        // catalog facts, and therefore never read through them.
+        assert_no_appended_reader_open_on_backend(
+            context,
+            &before_failure,
+            CATALOG_FAILURE_BACKEND,
+            CATALOG,
+            "after the injected catalog install failure",
+        )?;
         std::fs::remove_file(&failure_file).with_context(|| {
             format!(
                 "remove catalog-install failure trigger {}",
@@ -537,20 +695,21 @@ impl Scenario for CatalogReadyLifecycle {
         if rows != [300_000] {
             bail!("catalog install retry returned {rows:?}, expected [300000]");
         }
-        wait_for_catalog_lifecycle_marker_on_backend(
+        // Asserted on the one backend the failure was injected into, because
+        // it is the only one whose cell was never built: the others took the
+        // whole-set ready fast path on the retry and correctly rebuild
+        // nothing. A cluster-wide count here would be asserting that.
+        wait_for_catalog_runtime_on_backend(
             context,
             &before_retry,
-            1,
-            "NOVAROCKS_CATALOG_READY",
-            "observe retry CatalogReady from the formerly failing Backend",
-        )?;
-        wait_for_catalog_lifecycle_marker(
-            context,
-            &before_retry,
-            "NOVAROCKS_CATALOG_STAGE_ADMITTED",
-            "observe retry Stage after the failed catalog version becomes Ready",
+            CATALOG_FAILURE_BACKEND,
+            CATALOG,
+            "observe the formerly failing Backend build this catalog's runtime on retry",
         )?;
 
+        // A cold install that is released rather than cancelled: the runtime
+        // has to exist on a backend before that backend admits any task of the
+        // query that asked for it.
         control
             .query_drop(format!("DROP CATALOG {CATALOG}"))
             .context("replace retried catalog before cold ready path")?;
@@ -559,41 +718,41 @@ impl Scenario for CatalogReadyLifecycle {
         std::fs::write(&hold_file, "hold\n").with_context(|| {
             format!("recreate catalog-install hold file {}", hold_file.display())
         })?;
-        context.action("hold cold catalog install until all Backends report Loading");
+        context.action("hold a cold catalog install until every installing Backend reports it");
         let cold = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
         let cold_connection_id = cold
             .ready
             .recv_timeout(context.remaining("receive cold catalog query connection id")?)
             .context("cold catalog query terminated before publishing connection id")?;
-        wait_for_catalog_lifecycle_marker(
+        let installing = wait_for_cold_catalog_install(
             context,
             &before_cold,
-            "NOVAROCKS_CATALOG_LOADING",
-            "observe Loading on every Backend before releasing cold install",
+            "observe the cold catalog install before releasing it",
         )?;
-        assert_no_appended_catalog_stage_admitted(context, &before_cold)?;
-        context.action("release cold catalog install and require Ready before Stage");
-        release_catalog_install_hold(&hold_file)?;
-        wait_for_catalog_lifecycle_marker(
+        assert_no_appended_catalog_runtime(
             context,
             &before_cold,
-            "NOVAROCKS_CATALOG_READY",
-            "observe CatalogReady on every Backend",
-        )?;
-        wait_for_catalog_lifecycle_marker(
-            context,
-            &before_cold,
-            "NOVAROCKS_CATALOG_STAGE_ADMITTED",
-            "observe Stage only after CatalogReady",
-        )?;
-        wait_for_open_reader_on_every_backend(
-            context,
             CATALOG,
-            "observe readers after cold CatalogReady",
+            "before the cold catalog install is released",
+        )?;
+        context.action("release the cold catalog install and require the runtime before any task");
+        release_catalog_install_hold(&hold_file)?;
+        let after_cold = wait_for_open_reader_on(
+            context,
+            &before_cold,
+            CATALOG,
+            &installing,
+            "observe a reader on every Backend that installed the cold catalog",
+        )?;
+        assert_catalog_runtime_precedes_task_create(
+            &before_cold,
+            &after_cold,
+            &installing,
+            CATALOG,
         )?;
         control
             .query_drop(format!("KILL QUERY {cold_connection_id}"))
-            .context("cancel cold catalog reader after Ready")?;
+            .context("cancel cold catalog reader after its runtime exists")?;
         assert_cancelled_query(
             &cold.done,
             context.remaining("await cold catalog reader cancellation")?,
@@ -607,8 +766,9 @@ impl Scenario for CatalogReadyLifecycle {
             .join()
             .map_err(|_| anyhow::anyhow!("cold catalog reader thread panicked"))??;
 
+        // A warm query reuses the runtime the cold one built.
         let before_warm = backend_log_snapshots(context)?;
-        context.action("execute a warm query without another catalog load event");
+        context.action("execute a warm query without another catalog install");
         let rows: Vec<i64> = control
             .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
             .context("run warm catalog query")?;
@@ -616,34 +776,56 @@ impl Scenario for CatalogReadyLifecycle {
             bail!("warm catalog query returned {rows:?}, expected [300000]");
         }
         let after_warm = backend_log_snapshots(context)?;
-        assert_no_new_catalog_lifecycle_markers(&before_warm, &after_warm)?;
+        assert_no_appended_marker(
+            &before_warm,
+            &after_warm,
+            CATALOG_INSTALL_STARTED,
+            "during a warm catalog query",
+        )?;
+        assert_no_appended_catalog_runtime(
+            context,
+            &before_warm,
+            CATALOG,
+            "during a warm catalog query",
+        )?;
 
+        // A dropped establish acknowledgement is recovered by replaying the
+        // exact establish, and the replay must not build a second runtime.
+        //
+        // This replaced the retired InitAck drop: `EstablishQueryContext` is
+        // where the task protocol carries a query's catalog bindings, so it is
+        // the operation whose lost answer can make a backend install twice.
         control
             .query_drop(format!("DROP CATALOG {CATALOG}"))
-            .context("replace warm catalog before InitAck retry coverage")?;
+            .context("replace warm catalog before establish-replay coverage")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
-        let before_init_retry = backend_log_snapshots(context)?;
+        let before_replay = backend_log_snapshots(context)?;
         context
             .handle()
-            .arm_init_ack_drop(1)
-            .context("arm InitAck drop on BE[1] for cold catalog retry")?;
-        context.action("retry the exact cold Init after an Applied InitAck is dropped");
+            .arm_query_lifecycle_fault(CATALOG_FAILURE_BACKEND, ESTABLISH_CONTEXT_ACK_DROP)
+            .context("arm the establish acknowledgement drop for the cold catalog replay")?;
+        context.action("retry the exact cold establish after its acknowledgement is dropped");
         let rows: Vec<i64> = control
             .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
-            .context("execute cold catalog query with dropped InitAck")?;
+            .context("execute cold catalog query with a dropped establish acknowledgement")?;
         context
             .handle()
             .clear_query_lifecycle_faults()
-            .context("clear catalog InitAck drop fault")?;
+            .context("clear the establish acknowledgement drop")?;
         if rows != [300_000] {
-            bail!("InitAck retry catalog query returned {rows:?}, expected [300000]");
+            bail!("establish replay catalog query returned {rows:?}, expected [300000]");
         }
-        let after_init_retry = backend_log_snapshots(context)?;
-        assert_exactly_one_new_catalog_marker_per_backend(
-            &before_init_retry,
-            &after_init_retry,
-            "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED",
+        let after_replay = backend_log_snapshots(context)?;
+        // The fault has to have fired. Without this the phase passes on a
+        // query whose acknowledgement was never dropped, which is the shape a
+        // retired fault leaves behind.
+        assert_appended_marker_on_backend(
+            &before_replay,
+            &after_replay,
+            CATALOG_FAILURE_BACKEND,
+            ESTABLISH_CONTEXT_ACK_DROPPED_MARKER,
         )?;
+        assert_catalog_runtime_built_at_most_once(&before_replay, &after_replay, CATALOG)?;
         await_resource_convergence(context, &baseline, "catalog ready lifecycle")?;
         Ok(())
     }
@@ -2665,12 +2847,71 @@ fn assert_positive_profile_counter(profile: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Which connection form a connector reader runs on.
+///
+/// The distinction is not cosmetic, and it is about what the *first* byte of
+/// the response is. `SocketBounded` carries a ten-second socket read timeout,
+/// which is harmless — and useful — for a reader that is already streaming
+/// rows when it is cancelled: every packet resets the window, so the timeout
+/// can only fire on a genuine stall.
+///
+/// A statement that is parked before it produces anything has no such
+/// packets. Its first byte *is* the cancellation response, so the whole wait
+/// sits inside one read and the socket timeout converts any server latency
+/// past ten seconds into `EAGAIN` — on macOS, `Resource temporarily
+/// unavailable (os error 35)`, which says nothing about whether the server
+/// answered wrongly, late, or not at all. `ScenarioBounded` drops the read
+/// timeout so the wait is bounded by an explicit assertion instead, and the
+/// answer that arrives can be judged on its merits.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ReaderConnection {
+    SocketBounded,
+    ScenarioBounded,
+}
+
 fn start_connector_read(
     user: &str,
     port: u16,
     catalog: &str,
     database: &str,
     table: &str,
+) -> Result<ConnectorRead> {
+    start_connector_read_on(
+        user,
+        port,
+        catalog,
+        database,
+        table,
+        ReaderConnection::SocketBounded,
+    )
+}
+
+/// A connector reader whose statement is expected to be parked, producing
+/// nothing, until another session cancels it.
+fn start_held_connector_read(
+    user: &str,
+    port: u16,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<ConnectorRead> {
+    start_connector_read_on(
+        user,
+        port,
+        catalog,
+        database,
+        table,
+        ReaderConnection::ScenarioBounded,
+    )
+}
+
+fn start_connector_read_on(
+    user: &str,
+    port: u16,
+    catalog: &str,
+    database: &str,
+    table: &str,
+    connection_form: ReaderConnection,
 ) -> Result<ConnectorRead> {
     let (ready_tx, ready) = mpsc::sync_channel(1);
     let (done_tx, done) = mpsc::sync_channel(1);
@@ -2686,8 +2927,15 @@ fn start_connector_read(
         "SELECT t.s FROM (SELECT sleep(1) AS s FROM {catalog}.{database}.{table} WHERE v % 4096 = 0) AS t CROSS JOIN TABLE(generate_series(1, 1000000000)) AS gs(x)"
     );
     let thread = thread::spawn(move || -> Result<()> {
-        let mut connection = mysql_actor::connect(&user, port, Duration::from_secs(10))
-            .context("connect connector reader MySQL client")?;
+        let mut connection = match connection_form {
+            ReaderConnection::SocketBounded => {
+                mysql_actor::connect(&user, port, Duration::from_secs(10))
+            }
+            ReaderConnection::ScenarioBounded => {
+                mysql_actor::connect_for_cancellation(&user, port, Duration::from_secs(10))
+            }
+        }
+        .context("connect connector reader MySQL client")?;
         ready_tx
             .send(connection.connection_id())
             .context("publish connector reader MySQL connection id")?;
@@ -2806,6 +3054,69 @@ fn release_connector_read(target: &ConnectorRead) -> Result<()> {
         .release
         .send(())
         .context("release connector reader session after cancellation")
+}
+
+/// How long a `KILL QUERY` may take to reach the client that issued the
+/// statement, once every Backend has already applied the abort.
+///
+/// The frontend withholds the interrupt until the coordinator's worker has
+/// unwound, which is a bounded amount of local work: the drain loop notices
+/// cancellation within its five-millisecond idle wait, releases the aborts to
+/// the transport without waiting for their acknowledgements, and returns. Five
+/// seconds is therefore three orders of magnitude of slack on the expected
+/// path, while still landing below the frontend's own fifteen-second transport
+/// queue-residence bound and the thirty-second initial query execution lease.
+/// That gap is the point: an interrupt that only arrives after one of those
+/// elapses is a cancellation that waited out a timeout rather than one that
+/// was delivered, and this budget is what tells the two apart.
+const HELD_QUERY_INTERRUPT_BUDGET: Duration = Duration::from_secs(5);
+
+/// The interrupt owed to a client whose parked statement was killed.
+///
+/// Separate from [`assert_cancelled_query`] because it measures rather than
+/// only classifies. A statement that produced nothing before the kill has its
+/// whole wait inside one socket read, so "which error arrived" and "how long
+/// it took" are the same question here, and a run that cannot report the
+/// second cannot diagnose the first.
+///
+/// `killed_at` is the instant the `KILL QUERY` statement returned, so the
+/// elapsed time this reports is the latency the client actually experienced.
+fn assert_held_query_interrupted(
+    done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    killed_at: std::time::Instant,
+    budget: Duration,
+) -> Result<()> {
+    let result = match done.recv_timeout(budget) {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "the killed statement produced no answer within {} ms of its KILL QUERY, although \
+             every installing Backend had already applied the abort; the frontend withholds a \
+             KILL QUERY interrupt until its coordinator worker unwinds, so this is that worker \
+             failing to unwind rather than a client-side wait",
+            budget.as_millis()
+        ),
+    };
+    let elapsed = killed_at.elapsed();
+    let error = match result {
+        Ok(rows) => bail!(
+            "the killed statement succeeded after {} ms with {rows:?}",
+            elapsed.as_millis()
+        ),
+        Err(error) => error,
+    };
+    match error {
+        mysql::Error::MySqlError(error) if error.code == 1317 => {
+            println!(
+                "held-install KILL QUERY interrupt delivered after {} ms",
+                elapsed.as_millis()
+            );
+            Ok(())
+        }
+        other => bail!(
+            "expected MySQL cancellation error 1317 after {} ms, received {other}",
+            elapsed.as_millis()
+        ),
+    }
 }
 
 fn assert_cancelled_query(
@@ -2934,16 +3245,124 @@ fn backend_log_snapshots(context: &mut ScenarioContext) -> Result<Vec<String>> {
         .context("read Backend log snapshots")
 }
 
-fn wait_for_catalog_lifecycle_marker(
+/// The per-backend text appended to every Backend log since `before`.
+///
+/// A truncated log is an error rather than an empty appendix: a rotation that
+/// silently reset the window would make every absence assertion below pass.
+fn appended_since<'a>(logs: &'a [String], before: &[String], moment: &str) -> Result<Vec<&'a str>> {
+    logs.iter()
+        .zip(before)
+        .enumerate()
+        .map(|(index, (log, previous))| {
+            log.get(previous.len()..)
+                .with_context(|| format!("BE[{index}] log was truncated while checking {moment}"))
+        })
+        .collect()
+}
+
+/// The byte offset of the first appended line satisfying `matches`.
+fn first_line_offset(text: &str, matches: impl Fn(&str) -> bool) -> Option<usize> {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if matches(line) {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// The exact shape one catalog's name takes inside a materialization marker.
+///
+/// `CatalogHandle` is printed with its derived `Debug`, so the name arrives
+/// quoted inside its newtype. Matching that shape rather than the bare name
+/// keeps a marker for `catalog_ready_lifecycle_v2` from satisfying an
+/// assertion about `catalog_ready_lifecycle`.
+fn catalog_instance_needle(catalog: &str) -> String {
+    format!("ConnectorInstanceId(\"{catalog}\")")
+}
+
+/// Waits until at least one Backend has begun a cold catalog install, and
+/// returns every Backend that has.
+///
+/// Not every Backend in the cluster, and not a count: a query context exists
+/// only where the scheduler placed a task, and a catalog is installed on a
+/// Backend because it has one, so the number of installing Backends is a
+/// property of the plan rather than of the cluster. Requiring the marker
+/// cluster-wide waits forever on a plan that touched two of three Backends.
+///
+/// The returned set is what every later assertion of the phase is keyed on,
+/// and it is required to be non-empty: a phase whose subject never began an
+/// install must fail here rather than pass every assertion vacuously.
+fn wait_for_cold_catalog_install(
     context: &mut ScenarioContext,
     before: &[String],
-    marker: &str,
+    operation: &str,
+) -> Result<BTreeSet<usize>> {
+    let logs = wait_for_backend_logs(context, operation, |logs| {
+        logs.iter().zip(before).any(|(log, previous)| {
+            log.get(previous.len()..)
+                .is_some_and(|added| added.contains(CATALOG_INSTALL_STARTED))
+        })
+    })?;
+    let installing = appended_since(&logs, before, operation)?
+        .into_iter()
+        .enumerate()
+        .filter(|(_, added)| added.contains(CATALOG_INSTALL_STARTED))
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        !installing.is_empty(),
+        "no Backend began a cold catalog install while waiting to {operation}"
+    );
+    Ok(installing)
+}
+
+/// Waits until every Backend in `backends` has applied this query's abort.
+fn wait_for_context_abort_on(
+    context: &mut ScenarioContext,
+    before: &[String],
+    backends: &BTreeSet<usize>,
+    operation: &str,
+) -> Result<()> {
+    ensure!(
+        !backends.is_empty(),
+        "no Backend was named while waiting to {operation}"
+    );
+    wait_for_backend_logs(context, operation, |logs| {
+        backends.iter().all(|&index| {
+            logs.get(index)
+                .zip(before.get(index))
+                .and_then(|(log, previous)| log.get(previous.len()..))
+                .is_some_and(|added| added.contains(TASK_CONTEXT_ABORT_APPLIED))
+        })
+    })
+    .map(|_| ())
+}
+
+/// Waits until every Backend in `backends` has opened a reader for `catalog`.
+///
+/// Keyed on the named Backends rather than on the whole cluster, for the same
+/// reason `wait_for_cold_catalog_install` is: a Backend the scheduler gave no
+/// task will never open a reader, so requiring one cluster-wide waits forever
+/// on a plan that touched fewer Backends than the cluster has.
+fn wait_for_open_reader_on(
+    context: &mut ScenarioContext,
+    before: &[String],
+    catalog: &str,
+    backends: &BTreeSet<usize>,
     operation: &str,
 ) -> Result<Vec<String>> {
+    ensure!(
+        !backends.is_empty(),
+        "no Backend was named while waiting to {operation}"
+    );
     wait_for_backend_logs(context, operation, |logs| {
-        logs.iter().zip(before).all(|(log, previous)| {
-            log.get(previous.len()..)
-                .is_some_and(|appended| appended.contains(marker))
+        backends.iter().all(|&index| {
+            logs.get(index)
+                .zip(before.get(index))
+                .and_then(|(log, previous)| log.get(previous.len()..))
+                .is_some_and(|added| reader_open_lines(added, catalog).next().is_some())
         })
     })
 }
@@ -2966,55 +3385,230 @@ fn wait_for_catalog_lifecycle_marker_on_backend(
     .map(|_| ())
 }
 
-fn assert_no_appended_catalog_stage_admitted(
+/// Waits until one named Backend has built a runtime for exactly `catalog`.
+fn wait_for_catalog_runtime_on_backend(
     context: &mut ScenarioContext,
     before: &[String],
+    backend: usize,
+    catalog: &str,
+    operation: &str,
 ) -> Result<()> {
-    let logs = backend_log_snapshots(context)?;
-    assert_no_new_catalog_marker(before, &logs, "NOVAROCKS_CATALOG_STAGE_ADMITTED")
+    let previous = before
+        .get(backend)
+        .with_context(|| format!("missing BE[{backend}] log snapshot"))?;
+    let needle = catalog_instance_needle(catalog);
+    wait_for_backend_logs(context, operation, |logs| {
+        logs.get(backend)
+            .and_then(|log| log.get(previous.len()..))
+            .and_then(|added| {
+                first_line_offset(added, |line| {
+                    line.contains(CATALOG_RUNTIME_MATERIALIZED) && line.contains(&needle)
+                })
+            })
+            .is_some()
+    })
+    .map(|_| ())
 }
 
-fn assert_no_appended_catalog_ready(
-    context: &mut ScenarioContext,
+fn assert_appended_marker_on_backend(
     before: &[String],
+    after: &[String],
+    backend: usize,
+    marker: &str,
 ) -> Result<()> {
-    let logs = backend_log_snapshots(context)?;
-    assert_no_new_catalog_marker(before, &logs, "NOVAROCKS_CATALOG_READY")
-}
-
-fn assert_no_new_catalog_lifecycle_markers(before: &[String], after: &[String]) -> Result<()> {
-    for marker in ["NOVAROCKS_CATALOG_LOADING", "NOVAROCKS_CATALOG_READY"] {
-        assert_no_new_catalog_marker(before, after, marker)?;
-    }
+    let moment = format!("{marker} on BE[{backend}]");
+    let appended = appended_since(after, before, &moment)?;
+    let added = appended
+        .get(backend)
+        .with_context(|| format!("missing BE[{backend}] log snapshot"))?;
+    ensure!(
+        added.contains(marker),
+        "BE[{backend}] did not emit {marker}, so the fault it belongs to never fired"
+    );
     Ok(())
 }
 
-fn assert_no_new_catalog_marker(before: &[String], after: &[String], marker: &str) -> Result<()> {
-    for (index, (previous, current)) in before.iter().zip(after).enumerate() {
-        let appended = current.get(previous.len()..).with_context(|| {
-            format!("BE[{index}] log was truncated while checking marker {marker}")
-        })?;
-        if appended.contains(marker) {
-            bail!("BE[{index}] emitted unexpected catalog lifecycle marker {marker}");
-        }
-    }
-    Ok(())
-}
-
-fn assert_exactly_one_new_catalog_marker_per_backend(
+fn assert_no_appended_marker(
     before: &[String],
     after: &[String],
     marker: &str,
+    moment: &str,
 ) -> Result<()> {
-    for (index, (previous, current)) in before.iter().zip(after).enumerate() {
-        let appended = current.get(previous.len()..).with_context(|| {
-            format!("BE[{index}] log was truncated while counting marker {marker}")
-        })?;
-        let count = appended.matches(marker).count();
-        if count != 1 {
-            bail!("BE[{index}] emitted {count} new {marker} markers, expected exactly one");
+    for (index, added) in appended_since(after, before, moment)?
+        .into_iter()
+        .enumerate()
+    {
+        if added.contains(marker) {
+            bail!("BE[{index}] emitted {marker} {moment}");
         }
     }
+    Ok(())
+}
+
+/// No Backend built a runtime for `catalog` in this window.
+///
+/// Scoped to the one catalog rather than to the marker alone, because the
+/// marker is process-wide: another catalog's runtime being built says nothing
+/// about this one. The marker itself is the live, protocol-neutral emitter in
+/// `ConnectorExecutionRoleBindingFactorySet::bind`, and this scenario observes
+/// it appearing in its own later phases -- so an absence here is a fact about
+/// this window and not about a marker nothing emits.
+fn assert_no_appended_catalog_runtime(
+    context: &mut ScenarioContext,
+    before: &[String],
+    catalog: &str,
+    moment: &str,
+) -> Result<()> {
+    let logs = backend_log_snapshots(context)?;
+    let needle = catalog_instance_needle(catalog);
+    for (index, added) in appended_since(&logs, before, moment)?
+        .into_iter()
+        .enumerate()
+    {
+        if first_line_offset(added, |line| {
+            line.contains(CATALOG_RUNTIME_MATERIALIZED) && line.contains(&needle)
+        })
+        .is_some()
+        {
+            bail!("BE[{index}] built a runtime for catalog {catalog} {moment}");
+        }
+    }
+    Ok(())
+}
+
+/// No Backend read `catalog` in this window.
+///
+/// The observable successor of the retired "no Stage was admitted while the
+/// catalog was not ready": a task cannot exist before its context's establish
+/// returns, and the establish is where the install runs, so what a case can
+/// see is that no execution reached this catalog's data.
+///
+/// Only usable where every Backend is prevented from finishing its install,
+/// because the task protocol has no cross-Backend establish barrier: one
+/// Backend whose own install completed will create its task and open its
+/// reader while another is still installing. Use the per-Backend form for
+/// anything narrower.
+fn assert_no_appended_reader_open(
+    context: &mut ScenarioContext,
+    before: &[String],
+    catalog: &str,
+    moment: &str,
+) -> Result<()> {
+    let logs = backend_log_snapshots(context)?;
+    for (index, added) in appended_since(&logs, before, moment)?
+        .into_iter()
+        .enumerate()
+    {
+        if reader_open_lines(added, catalog).next().is_some() {
+            bail!("BE[{index}] opened a connector reader for catalog {catalog} {moment}");
+        }
+    }
+    Ok(())
+}
+
+/// One named Backend read nothing from `catalog` in this window.
+fn assert_no_appended_reader_open_on_backend(
+    context: &mut ScenarioContext,
+    before: &[String],
+    backend: usize,
+    catalog: &str,
+    moment: &str,
+) -> Result<()> {
+    let logs = backend_log_snapshots(context)?;
+    let appended = appended_since(&logs, before, moment)?;
+    let added = appended
+        .get(backend)
+        .with_context(|| format!("missing BE[{backend}] log snapshot"))?;
+    if reader_open_lines(added, catalog).next().is_some() {
+        bail!("BE[{backend}] opened a connector reader for catalog {catalog} {moment}");
+    }
+    Ok(())
+}
+
+/// Every installing Backend built the runtime before it admitted any task.
+///
+/// This is what the retired "Stage only after CatalogReady" proved, expressed
+/// in the two live markers that bracket it. Both offsets are required: a
+/// Backend that began a cold install and never built the runtime, and one that
+/// built it and then admitted nothing, are each a broken phase rather than a
+/// satisfied ordering.
+fn assert_catalog_runtime_precedes_task_create(
+    before: &[String],
+    after: &[String],
+    installing: &BTreeSet<usize>,
+    catalog: &str,
+) -> Result<()> {
+    let moment = "the cold catalog install ordering";
+    ensure!(
+        !installing.is_empty(),
+        "no Backend began a cold install, so {moment} has no subject"
+    );
+    let appended = appended_since(after, before, moment)?;
+    let needle = catalog_instance_needle(catalog);
+    for &index in installing {
+        let added = appended
+            .get(index)
+            .with_context(|| format!("missing BE[{index}] log snapshot"))?;
+        let runtime = first_line_offset(added, |line| {
+            line.contains(CATALOG_RUNTIME_MATERIALIZED) && line.contains(&needle)
+        })
+        .with_context(|| {
+            format!(
+                "BE[{index}] began a cold install of catalog {catalog} but never built its runtime"
+            )
+        })?;
+        let created = first_line_offset(added, |line| line.contains(TASK_CREATE_APPLIED))
+            .with_context(|| {
+                format!(
+                    "BE[{index}] built a runtime for catalog {catalog} but admitted no task, so \
+                     nothing ever used it"
+                )
+            })?;
+        if created < runtime {
+            bail!(
+                "BE[{index}] admitted a task before catalog {catalog} had a runtime on it \
+                 (task at {created}, runtime at {runtime})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A replayed establish reused the cell the first one installed.
+///
+/// Per Backend, because building a runtime twice is the defect; and at least
+/// once across the cluster, because a window in which nothing was built at all
+/// would satisfy the per-Backend bound without the replay having had a cold
+/// install to be idempotent about.
+fn assert_catalog_runtime_built_at_most_once(
+    before: &[String],
+    after: &[String],
+    catalog: &str,
+) -> Result<()> {
+    let moment = "the establish replay";
+    let needle = catalog_instance_needle(catalog);
+    let mut built = 0;
+    for (index, added) in appended_since(after, before, moment)?
+        .into_iter()
+        .enumerate()
+    {
+        let count = added
+            .lines()
+            .filter(|line| line.contains(CATALOG_RUNTIME_MATERIALIZED) && line.contains(&needle))
+            .count();
+        if count > 1 {
+            bail!(
+                "BE[{index}] built catalog {catalog}'s runtime {count} times across {moment}; a \
+                 replayed establish must reuse the cell the first one installed"
+            );
+        }
+        built += count;
+    }
+    ensure!(
+        built > 0,
+        "no Backend built catalog {catalog}'s runtime across {moment}, so the replay had no cold \
+         install to be idempotent about"
+    );
     Ok(())
 }
 
@@ -3023,14 +3617,30 @@ fn release_catalog_install_hold(hold_file: &std::path::Path) -> Result<()> {
         .with_context(|| format!("release catalog-install hold file {}", hold_file.display()))
 }
 
+/// No connector reader may open after this query's abort reached a backend.
+///
+/// Asserted per backend that had a context to abort, not per backend in the
+/// cluster: a query context exists only where a task was placed, so one the
+/// scheduler gave no task has nothing to abort and nothing to prove. At least
+/// one must have recorded the abort, or this would pass on a query that was
+/// never aborted anywhere -- which is the vacuous form the marker rename
+/// could easily have left behind.
 fn assert_no_reader_open_after_abort(logs: &[String]) -> Result<()> {
+    let mut aborted_backends = 0_usize;
     for (index, log) in logs.iter().enumerate() {
-        let Some(abort_offset) = log.find("NOVAROCKS_QUERY_LIFECYCLE_ABORT") else {
-            bail!("BE[{index}] did not record lifecycle Abort after KILL QUERY");
+        let Some(abort_offset) = log.find(TASK_CONTEXT_ABORT_APPLIED) else {
+            continue;
         };
+        aborted_backends += 1;
         if log[abort_offset..].contains(CONNECTOR_READER_OPEN) {
-            bail!("BE[{index}] opened a connector reader after lifecycle Abort");
+            bail!("BE[{index}] opened a connector reader after its query context was aborted");
         }
+    }
+    if aborted_backends == 0 {
+        bail!(
+            "no backend recorded {TASK_CONTEXT_ABORT_APPLIED} after KILL QUERY, so the abort \
+             never reached one"
+        );
     }
     Ok(())
 }

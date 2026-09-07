@@ -16,6 +16,12 @@
 -- under the License.
 
 -- @sequential=true
+--
+-- The retired protocol's terminal markers are gone. What must still be true
+-- is the resource fact they stood for: a query that gave up releases its
+-- backends rather than leaving them to a lease expiry. On the task protocol
+-- that is the context abort, which the statement-deadline path sends to every
+-- context before it returns.
 
 -- query 1
 -- @skip_result_check=true
@@ -37,7 +43,7 @@ INSERT INTO ${case_db}.sqlx2_profile_timeout_cleanup VALUES (3, 3);
 -- the compiler. The timeout must abort every participant and leave no state
 -- that contaminates the next EXPLAIN ANALYZE request.
 -- @expect_error=query timed out after 1000 ms
--- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_ABORT,3
+-- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED,3
 SET query_timeout = 1;
 EXPLAIN ANALYZE
 SELECT COUNT(*)

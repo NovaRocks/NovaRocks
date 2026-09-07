@@ -82,8 +82,7 @@ fn encode_binding(
         node_id: binding.node_id(),
         apply_point: encode_apply_point(binding.apply_point()),
         expression: Some(
-            crate::native::fragment_encoder::expr::encode_expr(binding.expression())
-                .map_err(encoding_error)?,
+            novarocks_plan_codec::encode_expr(binding.expression()).map_err(encoding_error)?,
         ),
         contract: Some(logical_domain.contract()),
         reduction: Some(logical_domain.encode_reduction(binding.reduction())?),

@@ -247,9 +247,16 @@ impl FrontendRuntimeFilterParticipant {
         Ok(participant)
     }
 
-    /// A live backend without scheduled fragments still participates in the
-    /// query lifecycle and receives a typed, explicitly empty install.
-    pub(crate) fn service_only(backend_idx: usize) -> Result<Self, RuntimeFilterDeploymentError> {
+    /// A backend that hosts tasks but carries no filter role for this query.
+    ///
+    /// Its install is explicitly empty rather than absent: the backend is a
+    /// real participant with real work, and the empty install says "no local
+    /// producer, consumer, or aggregator" as a typed fact. This is not a
+    /// participant for a backend with no tasks — those get no participant at
+    /// all, because a filter role with no execution behind it is not a role.
+    pub(crate) fn without_local_role(
+        backend_idx: usize,
+    ) -> Result<Self, RuntimeFilterDeploymentError> {
         Self::new(
             backend_idx,
             filter::RuntimeFilterParticipantInstall {
@@ -395,7 +402,7 @@ impl FrontendRuntimeFilterDeployment {
         query_id: common::UniqueId,
         deployment_epoch: u64,
         lifecycle: FrontendRuntimeFilterLifecycle,
-        expected_live_backend_ids: impl IntoIterator<Item = usize>,
+        expected_task_hosting_backend_ids: impl IntoIterator<Item = usize>,
         participants: impl IntoIterator<Item = FrontendRuntimeFilterParticipant>,
         wait_graph: &RuntimeFilterWaitGraph,
     ) -> Result<Self, RuntimeFilterDeploymentError> {
@@ -413,7 +420,7 @@ impl FrontendRuntimeFilterDeployment {
             .validate()
             .map_err(|error| RuntimeFilterDeploymentError::Invalid(error.to_string()))?;
 
-        let expected_live_backend_ids = expected_live_backend_ids
+        let expected_task_hosting_backend_ids = expected_task_hosting_backend_ids
             .into_iter()
             .collect::<BTreeSet<_>>();
         let mut by_backend = BTreeMap::new();
@@ -427,13 +434,13 @@ impl FrontendRuntimeFilterDeployment {
         }
         if !by_backend.is_empty() {
             let actual = by_backend.keys().copied().collect::<BTreeSet<_>>();
-            if actual != expected_live_backend_ids {
-                let missing = expected_live_backend_ids
+            if actual != expected_task_hosting_backend_ids {
+                let missing = expected_task_hosting_backend_ids
                     .difference(&actual)
                     .copied()
                     .collect::<Vec<_>>();
                 let unknown = actual
-                    .difference(&expected_live_backend_ids)
+                    .difference(&expected_task_hosting_backend_ids)
                     .copied()
                     .collect::<Vec<_>>();
                 return Err(RuntimeFilterDeploymentError::Invalid(format!(

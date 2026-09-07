@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc};
+use tracing::warn;
 
 use prost::Message;
 
@@ -240,7 +241,28 @@ impl BackendRuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryC
             )
             .await
             .map_err(BackendRuntimeFilterUnaryError::transport)?;
-        decode_runtime_filter_unary_ack(response)
+        // The peer's refusal reason exists only here. It never reaches the
+        // completion channel, which carries a status and no text, and refusing
+        // a runtime filter fails nothing downstream -- so without this line a
+        // filter refused by every peer is indistinguishable from one that was
+        // never produced, and the only symptom is a consumer waiting out its
+        // whole wait cap.
+        let rejection =
+            (!response.rejection_reason.is_empty()).then(|| response.rejection_reason.clone());
+        let ack = decode_runtime_filter_unary_ack(response)?;
+        if ack.status() == BackendAcceptStatus::Rejected {
+            warn!(
+                target: "novarocks::runtime_filter",
+                query_id = ?envelope.query_id(),
+                deployment_epoch = envelope.deployment_epoch(),
+                channel_id = envelope.channel_id().get(),
+                kind = ?envelope.kind(),
+                peer = %route.endpoint(),
+                reason = rejection.as_deref().unwrap_or("<none>"),
+                "runtime filter envelope refused by its peer backend"
+            );
+        }
+        Ok(ack)
     }
 }
 
@@ -548,6 +570,16 @@ fn fail_open_completion(
     reason: ReliableTransportFailOpenReason,
 ) -> BackendRuntimeFilterSinkCompletion {
     let _ = state.transport_failed(identity, Instant::now());
+    // Failing open is correct -- the join is the authority and the result stays
+    // correct -- which is exactly why it must be said out loud: the query
+    // succeeds either way, and the only other trace is a consumer that waited
+    // out its cap.
+    warn!(
+        target: "novarocks::runtime_filter",
+        route = ?identity,
+        reason = ?reason,
+        "runtime filter envelope failed open after exhausting its transport budget"
+    );
     BackendRuntimeFilterSinkCompletion::TransportFailure(
         identity,
         BackendRuntimeFilterUnaryError::transport("runtime filter retry budget exhausted"),

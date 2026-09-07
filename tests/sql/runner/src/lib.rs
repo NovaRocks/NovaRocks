@@ -1613,9 +1613,8 @@ fn execute_target_query_with_fault(
             format!("FAIL (runner fault injection): {error:#}"),
         )
     });
-    if meta.kill_fe_after_control_ready_count.is_some()
-        || meta.kill_fe_after_mv_known_committed_before_projector_cas
-        || meta.kill_fe_at_lifecycle_phase.is_some()
+    if meta.kill_fe_after_mv_known_committed_before_projector_cas
+        || meta.kill_fe_after_be_log_contains.is_some()
     {
         if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return (
@@ -2308,10 +2307,6 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 break;
             }
         }
-        let _fragment_failure_guard = fault_injection::fragment_failure_step_guard(
-            &step.meta,
-            Arc::clone(&ctx.server_handle),
-        );
         let _query_lifecycle_fault_guard = fault_injection::query_lifecycle_fault_step_guard(
             &step.meta,
             Arc::clone(&ctx.server_handle),
@@ -3759,19 +3754,11 @@ fn restart_frontend_after_step(
 
 fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
     const DIRECTIVES: &[&str] = &[
-        "drop_next_init_ack_be_index",
-        "stop_query_control_heartbeat_be_index",
-        "kill_fe_after_control_ready_count",
         "kill_fe_after_mv_known_committed_before_projector_cas",
-        "restart_be_after_init_ack_index",
-        "kill_query_after_control_ready_count",
+        "restart_be_after_establish_context_index",
         "kill_query_after_be_log_contains",
-        "fail_stage_prepare_ordinal",
-        "drop_next_stage_ack_be_index",
-        "drop_next_start_ack_be_index",
-        "suppress_start_ack_be_index",
-        "drop_next_terminal_ack_be_index",
-        "drop_terminal_snapshot_stream_be_index",
+        "kill_fe_after_be_log_contains",
+        "kill_be_after_be_log_contains",
         "terminal_snapshot_conflict_be_index",
         "query_lifecycle_fault",
         "expect_lifecycle_error_source",
@@ -3785,12 +3772,8 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "expect_runtime_filter_detail",
         "expect_runtime_filter_total_at_least",
         "kill_query_at_lifecycle_phase",
-        "kill_fe_at_lifecycle_phase",
         "kill_be_at_lifecycle_phase",
-        "stop_query_control_heartbeat_after_stage_be_index",
-        "hold_start_until_early_ingress",
         "query_control_fragment_backend_limit",
-        "fail_fragment_after_start_be_index",
     ];
     const LIFECYCLE_EVIDENCE_MARKERS: &[&str] = &[
         "NOVAROCKS_QUERY_INIT_",
@@ -5081,19 +5064,16 @@ mod tests {
     #[test]
     fn lifecycle_fault_preflight_matches_faults_and_lifecycle_evidence() {
         assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @drop_next_init_ack_be_index=1\nSELECT 1;"
+            "-- @query_lifecycle_fault=terminal-outcome-suppress,1\nSELECT 1;"
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @kill_query_after_control_ready_count=3\nSELECT 1;"
+            "-- @kill_query_after_be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED\nSELECT 1;"
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @drop_next_stage_ack_be_index=1\nSELECT 1;"
+            "-- @query_control_fragment_backend_limit=2\nSELECT 1;"
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @hold_start_until_early_ingress=true\nSELECT 1;"
-        ));
-        assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @fail_fragment_after_start_be_index=1\nSELECT 1;"
+            "-- @restart_be_after_establish_context_index=1\nSELECT 1;"
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @be_log_be_count_at_least=NOVAROCKS_QUERY_LIFECYCLE_TERMINATED,3\nSELECT 1;"

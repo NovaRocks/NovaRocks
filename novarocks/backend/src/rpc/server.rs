@@ -29,6 +29,8 @@ use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use crate::rpc::data_plane::BackendDataPlane;
+use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
+use crate::task_execution::TaskInboundCapabilities;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -75,6 +77,7 @@ struct NativeTlsVerified;
 #[derive(Clone)]
 pub(crate) struct BackendRpcService {
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
+    task_execution_ingress: Arc<dyn TaskExecutionIngress>,
     query_control_shutdown: Option<watch::Receiver<bool>>,
     data_plane: BackendDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
@@ -84,16 +87,20 @@ pub(crate) struct BackendRpcService {
 impl BackendRpcService {
     pub(crate) fn new(
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
+        task_execution_ingress: Arc<dyn TaskExecutionIngress>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+        task_inbound_capabilities: Arc<TaskInboundCapabilities>,
         process_descriptor: BackendProcessDescriptor,
     ) -> Self {
         Self {
             query_lifecycle_ingress: Arc::clone(&query_lifecycle_ingress),
+            task_execution_ingress,
             query_control_shutdown: None,
             data_plane: BackendDataPlane::with_exchange_receiver_port(
                 exchange_receiver_port,
                 Arc::clone(&query_lifecycle_ingress),
+                task_inbound_capabilities,
             ),
             runtime_filter_ingress,
             process_descriptor,
@@ -115,6 +122,7 @@ impl NovaRocksGrpc for BackendRpcService {
                 + 'static,
         >,
     >;
+    type SubscribeTaskStatusStream = TaskStatusEventStream;
     type QueryControlStreamStream = std::pin::Pin<
         Box<
             dyn tokio_stream::Stream<Item = Result<proto::QueryControlResponse, tonic::Status>>
@@ -301,6 +309,80 @@ impl NovaRocksGrpc for BackendRpcService {
                 proto::BackendReportedState::Running as i32
             },
         }))
+    }
+
+    async fn apply_task_operations(
+        &self,
+        request: tonic::Request<proto::ApplyTaskOperationsRequest>,
+    ) -> Result<tonic::Response<proto::ApplyTaskOperationsResponse>, tonic::Status> {
+        let ingress = Arc::clone(&self.task_execution_ingress);
+        let response = tokio::task::spawn_blocking(move || {
+            ingress.apply_task_operations(request.into_inner())
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("apply_task_operations handler panicked: {error}"))
+        })??;
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn subscribe_task_status(
+        &self,
+        request: tonic::Request<proto::SubscribeTaskStatusRequest>,
+    ) -> Result<tonic::Response<Self::SubscribeTaskStatusStream>, tonic::Status> {
+        // Opening a subscription only registers a cursor, so it does not need
+        // the blocking pool the mutation path uses.
+        let stream = self
+            .task_execution_ingress
+            .subscribe_task_status(request.into_inner())?;
+        Ok(tonic::Response::new(stream))
+    }
+
+    async fn fetch_task_dynamic_filters(
+        &self,
+        request: tonic::Request<proto::FetchTaskDynamicFiltersRequest>,
+    ) -> Result<tonic::Response<proto::FetchTaskDynamicFiltersResponse>, tonic::Status> {
+        let ingress = Arc::clone(&self.task_execution_ingress);
+        let response = tokio::task::spawn_blocking(move || {
+            ingress.fetch_task_dynamic_filters(request.into_inner())
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!(
+                "fetch_task_dynamic_filters handler panicked: {error}"
+            ))
+        })??;
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn get_final_task_info(
+        &self,
+        request: tonic::Request<proto::GetFinalTaskInfoRequest>,
+    ) -> Result<tonic::Response<proto::GetFinalTaskInfoResponse>, tonic::Status> {
+        let ingress = Arc::clone(&self.task_execution_ingress);
+        let response =
+            tokio::task::spawn_blocking(move || ingress.get_final_task_info(request.into_inner()))
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!(
+                        "get_final_task_info handler panicked: {error}"
+                    ))
+                })??;
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn fetch_task_result(
+        &self,
+        request: tonic::Request<proto::FetchTaskResultRequest>,
+    ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
+        let ingress = Arc::clone(&self.task_execution_ingress);
+        let response =
+            tokio::task::spawn_blocking(move || ingress.fetch_task_result(request.into_inner()))
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!("fetch_task_result handler panicked: {error}"))
+                })??;
+        Ok(tonic::Response::new(response))
     }
 
     async fn init_query(

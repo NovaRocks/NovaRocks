@@ -17,6 +17,7 @@
 
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -28,9 +29,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::common::backend_topology::{
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
 };
-use crate::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
+use crate::native::fragment_transport::{
+    ExpectedOutputSchemaView, FetchOutcome, FinalTaskInfoRead, FragmentDispatcher,
+    NativeTaskResultTransport, RootResultOutcome, TaskReadGrace, TaskResultTransport,
+};
 use crate::query_execution::artifact::{
-    PreparedDistributedQuery, RunningNativeExecutionParts, ValidatedFragmentSchedule,
+    PreparedDistributedQuery, RunningNativeExecutionParts,
+    RuntimeFilterDeploymentReadyDistributedQuery, ValidatedFragmentSchedule,
+    ValidatedNativeSubmission,
 };
 use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptReservation};
 use crate::query_execution::contract::{
@@ -45,14 +51,17 @@ use crate::query_execution::lifecycle_plan::{
 };
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
-use crate::query_execution::split_assignment::RoundSplitSource;
+use crate::query_execution::split_assignment::{RoundSplitSource, TaskUpdateTransport};
 use crate::runtime::statement_result::StatementResult;
+use crate::task_execution::sources::AttemptEstablishFacts;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
+use novarocks_types::identity::{BackendProcessId, FrontendProcessId, TaskId};
 use novarocks_types::{
     AttemptId, LocalQuerySequence, NativeCompatibilityId, QueryExecutionId, QueryId,
     QueryIdAttribution, QueryProcessNamespace,
 };
 
+use super::query_lifecycle::FrontendLifecycleMetrics;
 use super::query_lifecycle::{
     FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, QueryLifecycleTransport,
 };
@@ -60,11 +69,17 @@ use super::query_lifecycle::{
 use super::query_lifecycle::{
     QueryControlSession, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
 };
-use super::query_registry::{FrontendQueryRegistry, QueryLifecycleConvergenceReader};
+use super::query_registry::{
+    FrontendQueryRegistry, QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot,
+    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
+};
 use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentRoundGuard, assignment_endpoints, assignment_targets,
+};
+use super::task_round::{
+    AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
 };
 use crate::metrics::{
     observe_pre_ready_replan, observe_waiting_for_backend, record_pre_ready_effect_gate,
@@ -73,14 +88,28 @@ use crate::metrics::{
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
+use crate::native::task_transport::AttemptWireFacts;
 use crate::native::transport::{
     GrpcTaskUpdateTransport, new_fragment_dispatcher, new_query_lifecycle_transport,
 };
+use crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions;
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
+use crate::task_execution::completion::{WriteCompletionTracker, accept_final_info};
+use crate::task_execution::error::TaskExecutionError;
+use crate::task_execution::execution::ReleasedRuntimeFilterContributions;
+use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
+use crate::task_execution::graph::TaskNode;
+use crate::task_execution::remote_task::RemoteTaskState;
+use crate::task_execution::round::{TaskRound, TurnReport};
+use crate::task_execution::split_transport::SplitDeliveryBridge;
+use crate::task_execution::status_intake::{CondvarWake, StatusIntakeWake};
+use novarocks_execution::task_execution::{
+    AbortCause, FinalTaskInfo, MaxWait, OperationKind, TaskIdentity,
+};
 #[cfg(test)]
 use novarocks_proto_codec::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
@@ -590,6 +619,17 @@ pub struct FrontendDistributedQueryCoordinator {
     /// Validated once at startup from the timeouts the composition root froze;
     /// query admission consumes it rather than re-reading configuration.
     lifecycle_config: FrontendQueryLifecycleConfig,
+    /// Every bound the task protocol runs one attempt with, frozen at startup.
+    ///
+    /// Held rather than read per attempt so a deployment's bounds cannot change
+    /// while the process runs.
+    task_execution_budgets: novarocks_execution::task_execution::TaskExecutionBudgets,
+    /// This frontend process's own identity, minted once per process.
+    ///
+    /// It is half of every query context reference, so a backend can tell one
+    /// frontend's contexts from a restarted frontend's. Minting it per process
+    /// rather than per query is what makes that distinction meaningful.
+    frontend_process_id: FrontendProcessId,
     pre_start_timeout: Duration,
     task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
     connector_split_initial_dynamic_filter_wait_cap: Duration,
@@ -648,6 +688,23 @@ fn build_lifecycle_config(
     .with_participant_fanout_max_inflight(timeouts.participant_fanout_max_inflight)
 }
 
+/// Whether this intent is the one still routed to the old lifecycle.
+///
+/// A named predicate rather than an inline comparison because the two
+/// directions of getting it wrong are not symmetric. Sending Statistics to the
+/// task path fails loudly -- that path refuses the intent outright. Sending
+/// anything else to the lifecycle path is silent: the query would simply run
+/// on the retired stack and succeed, and nothing downstream would say so.
+/// This is the half that needs to be assertable.
+const fn runs_on_query_lifecycle(intent: DistributedQueryIntent) -> bool {
+    match intent {
+        DistributedQueryIntent::Statistics => true,
+        DistributedQueryIntent::Result
+        | DistributedQueryIntent::Write
+        | DistributedQueryIntent::Profile => false,
+    }
+}
+
 impl FrontendDistributedQueryCoordinator {
     #[expect(
         private_interfaces,
@@ -661,6 +718,7 @@ impl FrontendDistributedQueryCoordinator {
         query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
         task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
         connector_split_initial_dynamic_filter_wait_cap: Duration,
+        task_execution_budgets: novarocks_execution::task_execution::TaskExecutionBudgets,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, DistributedQueryError> {
@@ -693,6 +751,8 @@ impl FrontendDistributedQueryCoordinator {
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
             data_runtime,
             lifecycle_config,
+            task_execution_budgets,
+            frontend_process_id: FrontendProcessId::new_v7(),
             pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
             task_update_retry_policy,
             connector_split_initial_dynamic_filter_wait_cap,
@@ -750,6 +810,9 @@ impl FrontendDistributedQueryCoordinator {
     ) -> Self {
         let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
+            task_execution_budgets:
+                novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
+            frontend_process_id: FrontendProcessId::new_v7(),
             report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
                 report_endpoint,
             )),
@@ -825,6 +888,9 @@ impl FrontendDistributedQueryCoordinator {
     ) -> Self {
         let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
+            task_execution_budgets:
+                novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
+            frontend_process_id: FrontendProcessId::new_v7(),
             report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
                 report_endpoint,
             )),
@@ -977,7 +1043,6 @@ impl FrontendDistributedQueryCoordinator {
         let split_assignment_plan = prepare_round_split_assignment(
             &parts.artifacts,
             &schedule,
-            self.data_runtime.clone(),
             self.task_update_retry_policy,
             Arc::clone(&feedback_state),
             self.connector_split_initial_dynamic_filter_wait_cap,
@@ -1034,22 +1099,10 @@ impl FrontendDistributedQueryCoordinator {
             .saturating_add(remaining_budget.as_millis())
             .try_into()
             .map_err(|_| failed("query deadline exceeds u64 milliseconds"))?;
-        let lifecycle_barrier = FrontendQueryLifecycleBarrier::new(
-            Arc::clone(&backend_services.lifecycle_transport),
-            Arc::clone(&self.registry),
-            self.lifecycle_config,
-        )
-        .with_cancellation(parts.cancellation.clone())
-        .with_backend_topology(
-            Arc::clone(&self.backend_topology),
-            parts.topology.revision(),
-        )
-        .with_runtime_filter_feedback(feedback_declaration)
-        .with_runtime_filter_feedback_state(feedback_state);
         let init_options = QueryInitOptions::new(
             execution_id,
             self.native_compatibility_id,
-            backend_services.live_backends,
+            backend_services.live_backends.clone(),
             &parts.options,
             ProtocolQueryOptions::parse(encode_query_options(parts.options.runtime_options()))
                 .map_err(|error| {
@@ -1080,12 +1133,96 @@ impl FrontendDistributedQueryCoordinator {
             }
             None => init_options,
         };
+        // `DistributedQueryIntent::Statistics` is the ONE intent that does not
+        // move onto the task protocol. This branch exists for that single
+        // reason; it is not ordinary intent dispatch, and nothing else may
+        // take the path it selects.
+        //
+        // ANALYZE's payload is produced by the fragment terminal fact and
+        // carried by the old lifecycle's terminal report. The task protocol
+        // has no field for it, deliberately: NCP-8 turns statistics into
+        // ordinary aggregates read over the root result plane, and its own
+        // tasks own both halves of the removal -- NCP-8 T06 moves the payload
+        // onto that plane, NCP-8 T08 deletes `statistics_payload` and this
+        // branch with it. Building a carrier here would be torn out by that
+        // work; deleting the old path before it lands would leave ANALYZE
+        // unavailable in between.
+        let handoff = RoundHandoff {
+            query_id,
+            execution_id,
+            statement_deadline,
+            timeout_ms,
+            intent,
+            cancellation: parts.cancellation,
+            completion: parts.completion,
+            topology: parts.topology,
+            statistics_program: parts.statistics_program,
+            write_stack_session,
+            backend_services,
+            dispatcher,
+            retry_boundary,
+            runtime_filter_ready,
+            init_options,
+            feedback_declaration,
+            feedback_state,
+            split_assignment_plan,
+            scheduled_backend_ownership,
+        };
+        if runs_on_query_lifecycle(intent) {
+            return self.execute_statistics_round_on_query_lifecycle(handoff);
+        }
+        self.execute_round_on_task_protocol(handoff)
+    }
+
+    /// The pre-task-protocol execution path, retained only for ANALYZE.
+    ///
+    /// See the branch that selects it: the statistics payload has no carrier
+    /// on the task protocol, and NCP-8 owns both moving it and deleting this.
+    /// Everything here is the code that used to run for every intent.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the retained lifecycle path is moved verbatim so its removal stays a deletion"
+    )]
+    fn execute_statistics_round_on_query_lifecycle(
+        &self,
+        handoff: RoundHandoff<'_>,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let RoundHandoff {
+            query_id,
+            execution_id,
+            statement_deadline,
+            timeout_ms,
+            intent,
+            cancellation,
+            completion,
+            topology,
+            statistics_program,
+            write_stack_session,
+            backend_services,
+            dispatcher,
+            retry_boundary,
+            runtime_filter_ready,
+            init_options,
+            feedback_declaration,
+            feedback_state,
+            split_assignment_plan,
+            scheduled_backend_ownership: _,
+        } = handoff;
+        let lifecycle_barrier = FrontendQueryLifecycleBarrier::new(
+            Arc::clone(&backend_services.lifecycle_transport),
+            Arc::clone(&self.registry),
+            self.lifecycle_config,
+        )
+        .with_cancellation(cancellation.clone())
+        .with_backend_topology(Arc::clone(&self.backend_topology), topology.revision())
+        .with_runtime_filter_feedback(feedback_declaration)
+        .with_runtime_filter_feedback_state(feedback_state);
         let connector_binding_ready = runtime_filter_ready
             .initialize_query(init_options, &lifecycle_barrier)
             .map_err(|error| {
                 reclassify_pre_ready_lifecycle_failure(
                     self.backend_topology.as_ref(),
-                    &parts.topology,
+                    &topology,
                     error,
                     statement_deadline.min(
                         Instant::now()
@@ -1116,7 +1253,19 @@ impl FrontendDistributedQueryCoordinator {
         // its attempt is staged or running. The guard owns the pump thread, so
         // every exit path below closes the sources by dropping it.
         let mut split_assignment = split_assignment_plan
-            .and_then(|plan| SplitAssignmentRoundGuard::start(execution_id, plan));
+            .map(|plan| {
+                GrpcTaskUpdateTransport::new(plan.endpoints(), self.data_runtime.clone())
+                    .map(|transport| (plan, Arc::new(transport)))
+                    .map_err(|error| failed(format!("task update transport: {error}")))
+            })
+            .transpose()?
+            .and_then(|(plan, transport)| {
+                SplitAssignmentRoundGuard::start(
+                    execution_id,
+                    plan,
+                    transport as Arc<dyn TaskUpdateTransport>,
+                )
+            });
         let RunningNativeExecutionParts {
             root_fetch,
             expected_output,
@@ -1139,7 +1288,7 @@ impl FrontendDistributedQueryCoordinator {
         let mut observed_result_eof = false;
         if root_fetch.uses_result_buffer() {
             loop {
-                if parts.cancellation.is_cancelled() {
+                if cancellation.is_cancelled() {
                     return Err(self.fail_cancel_then_abort_query_lifecycle(
                         query_id,
                         &mut query_lifecycle_lease,
@@ -1195,7 +1344,7 @@ impl FrontendDistributedQueryCoordinator {
             }
         }
 
-        if parts.cancellation.is_cancelled() {
+        if cancellation.is_cancelled() {
             return Err(self.fail_cancel_then_abort_query_lifecycle(
                 query_id,
                 &mut query_lifecycle_lease,
@@ -1274,9 +1423,9 @@ impl FrontendDistributedQueryCoordinator {
             );
         }
         let outcome = (|| match intent {
-            DistributedQueryIntent::Result => parts
-                .completion
-                .result(expected_output.into_query_result(batches)?),
+            DistributedQueryIntent::Result => {
+                completion.result(expected_output.into_query_result(batches)?)
+            }
             DistributedQueryIntent::Write => {
                 let session = write_stack_session.ok_or_else(|| {
                     DistributedQueryError::new(
@@ -1320,7 +1469,7 @@ impl FrontendDistributedQueryCoordinator {
                     )?);
                 }
                 barrier.observe_execution_terminals(terminal_set.is_success());
-                if parts.cancellation.is_cancelled() {
+                if cancellation.is_cancelled() {
                     barrier.observe_cancelled();
                 }
 
@@ -1330,7 +1479,7 @@ impl FrontendDistributedQueryCoordinator {
                         blocked.as_str(),
                     )
                 })?;
-                parts.completion.write_session_outcome(session, prepared)
+                completion.write_session_outcome(session, prepared)
             }
             DistributedQueryIntent::Profile => {
                 let result = expected_output.into_query_result(batches)?;
@@ -1342,10 +1491,10 @@ impl FrontendDistributedQueryCoordinator {
                     }
                 }
                 builder.apply_split_assignment_profile(split_assignment_profile);
-                parts.completion.profile(result, builder.finish())
+                completion.profile(result, builder.finish())
             }
             DistributedQueryIntent::Statistics => {
-                let program = parts.statistics_program.as_ref().ok_or_else(|| {
+                let program = statistics_program.as_ref().ok_or_else(|| {
                     DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
                         "statistics execution lost its typed collection program",
@@ -1356,7 +1505,7 @@ impl FrontendDistributedQueryCoordinator {
                         .fragments()
                         .map(|fragment| fragment.statistics_payload.as_slice()),
                 )?;
-                parts.completion.statistics(program, result)
+                completion.statistics(program, result)
             }
         })();
         if let Err(error) = &outcome {
@@ -1378,6 +1527,835 @@ impl FrontendDistributedQueryCoordinator {
             return Err(message);
         }
         outcome
+    }
+
+    /// The production execution path: one attempt's tasks on the task protocol.
+    ///
+    /// It replaces `Init -> ControlReady -> Stage -> Start` with the substrate's
+    /// own sequence -- establish one query context per scheduled backend,
+    /// create every task, open each exchange edge when its destinations exist
+    /// -- and then reads the client's rows from the root task's own result
+    /// plane. Nothing here decides completion: the state machine computes the
+    /// verdicts and this loop reads them.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one attempt's assembly, drive loop and drain are one linear story; splitting them would hide the order they must happen in"
+    )]
+    fn execute_round_on_task_protocol(
+        &self,
+        handoff: RoundHandoff<'_>,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let RoundHandoff {
+            query_id,
+            execution_id,
+            statement_deadline,
+            timeout_ms,
+            intent,
+            cancellation,
+            completion,
+            // The captured snapshot is kept: it is what a pre-establish
+            // failure is judged against. A statistics program never reaches
+            // this path at all.
+            topology: captured_topology,
+            statistics_program: _,
+            write_stack_session,
+            backend_services,
+            dispatcher: _,
+            retry_boundary,
+            runtime_filter_ready,
+            init_options,
+            feedback_declaration,
+            feedback_state,
+            split_assignment_plan,
+            scheduled_backend_ownership,
+        } = handoff;
+
+        // The catalog lease this produces is held for the whole attempt: the FE
+        // control leases that resolved this query's typed reads must outlive
+        // the backends that are still reading through them.
+        let mut prepared = runtime_filter_ready.prepare_task_execution(init_options)?;
+        let submission_attachment = {
+            let view = prepared.native_submission_view()?;
+            encode_native_submission(&view).map_err(failed)?
+        };
+        let (submissions, root_fetch, expected_output) = prepared
+            .seal_task_submission(submission_attachment)?
+            .into_parts();
+        if !root_fetch.uses_result_buffer() {
+            // The root result plane serves only the task whose sink is the
+            // query's result sink, and a read completes only once this
+            // frontend has consumed the end of that stream. A root that owns
+            // no result buffer could satisfy neither, so it is refused here
+            // rather than waited on forever.
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "task execution requires a root fragment that owns the query result sink",
+            ));
+        }
+
+        let backend_process_ids = scheduled_backend_ownership
+            .iter()
+            .copied()
+            .collect::<BTreeMap<usize, BackendProcessId>>();
+        let mut backends = Vec::with_capacity(backend_process_ids.len());
+        for target in &backend_services.live_backends {
+            let Some(&process_id) = backend_process_ids.get(&target.backend_idx()) else {
+                // Live but not scheduled. Freezing it would let an operation
+                // reach a process this attempt never placed a task on.
+                continue;
+            };
+            let endpoint = target
+                .endpoint()
+                .map_err(|error| failed(error.to_string()))?;
+            backends.push((process_id, endpoint));
+        }
+        if backends.len() != backend_process_ids.len() {
+            return Err(failed(
+                "a scheduled backend is absent from this attempt's live snapshot",
+            ));
+        }
+
+        // Each backend establishes the role bindings its own tasks play, so the
+        // map is built over the scheduled backends rather than over whatever
+        // the deployment happens to name: the deployment covers every live
+        // backend, and a live one this attempt did not schedule has no context
+        // to establish anything on.
+        //
+        // A deployment with no contributions at all is a query with no runtime
+        // filters, and every context establishes the empty contribution. That
+        // is the neutral form of the absent contribution the old participant
+        // manifest carried, not a guessed default: the sealing step admits
+        // only "one per live backend" or "none", so a missing entry while
+        // others exist is a real disagreement between the filter compiler and
+        // the scheduler and is refused.
+        let compiled_filters = prepared.runtime_filter_contributions();
+        let mut runtime_filters = Vec::with_capacity(backend_process_ids.len());
+        for (&backend_idx, &process_id) in &backend_process_ids {
+            let contribution = match compiled_filters.get(&backend_idx) {
+                Some(contribution) => contribution.clone(),
+                None if compiled_filters.is_empty() => {
+                    novarocks_proto_models::novarocks::RuntimeFilterContribution::default()
+                }
+                None => {
+                    return Err(failed(format!(
+                        "runtime filter deployment has no contribution for scheduled backend \
+                         {backend_idx}"
+                    )));
+                }
+            };
+            runtime_filters.push((process_id, contribution));
+        }
+        let establish = AttemptEstablishFacts::freeze(
+            prepared.catalog_set().as_proto().clone(),
+            runtime_filters,
+            prepared.init_options().credential_leases(),
+        )
+        .map_err(|error| failed(error.to_string()))?;
+        // Taken before the facts are handed to the runner: the rotation owner
+        // has to start from the exact domain every establish installs, or its
+        // first rotation would be a gap every context refuses.
+        let initial_credential = establish.credential().clone();
+        // Taken now that the establish holds its own wire copy: the attempt
+        // keeps one owner of the vended material, and the connectors' planning
+        // route is re-pointed at it. Held to the end of this call so neither
+        // that route nor a write session's commit finds it already dropped.
+        let attempt_storage = prepared.take_terminal_storage_resolver();
+
+        // Declared from the encoded plans, before they are consumed. A write's
+        // completion turns on every writer having finished, and "this query is
+        // a write" does not say which of its fragments write.
+        let writer_fragments = if intent == DistributedQueryIntent::Write {
+            submissions
+                .iter()
+                .filter(|submission| submission.declares_table_writer())
+                .map(ValidatedNativeSubmission::fragment_id)
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+
+        // Also read off the encoded plans before they are consumed, and only
+        // when a profile will actually be rendered. A task's own report names
+        // per-operator plan nodes and its stage; the fragment it ran is a fact
+        // of the sealed plan, and this is the last point where that plan is in
+        // hand. Without it, EXPLAIN ANALYZE has no fragment key at all -- and
+        // deriving one from a task's profile tree would name a plan node the
+        // task's facts do not belong to.
+        let fragment_root_plan_node_ids = if intent == DistributedQueryIntent::Profile {
+            submissions
+                .iter()
+                .map(|submission| {
+                    submission
+                        .fragment_root_plan_node_id()
+                        .map(|root_node_id| (submission.fragment_id(), root_node_id))
+                        .map_err(failed)
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?
+        } else {
+            BTreeMap::new()
+        };
+
+        let wake = Arc::new(CondvarWake::default());
+        let attempt = AttemptWireFacts {
+            query_options: *prepared.init_options().query_options().as_proto(),
+            native_compatibility_id: Some(
+                novarocks_proto_models::novarocks::NativeCompatibilityId {
+                    value: self.native_compatibility_id.as_bytes().to_vec(),
+                },
+            ),
+        };
+        let AssembledRound {
+            mut round,
+            split_delivery,
+        } = assemble_round(
+            execution_id,
+            self.frontend_process_id,
+            prepared.scheduling_plan(),
+            prepared.fragment_edges(),
+            &backend_process_ids,
+            &backends,
+            submissions,
+            establish,
+            Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+            AttemptTransport {
+                budget: self.task_execution_budgets.dispatch,
+                transport: self.task_execution_budgets.transport,
+                status_subscription_error_budget: self
+                    .task_execution_budgets
+                    .status_subscription_error_budget,
+                attempt,
+                data_runtime: self.data_runtime.clone(),
+            },
+        )
+        .map_err(|error| failed(error.to_string()))?;
+        let result_transport = Arc::new(
+            NativeTaskResultTransport::new(
+                &backends,
+                self.data_runtime.clone(),
+                TaskReadGrace::new(
+                    self.task_execution_budgets
+                        .transport
+                        .frontend_queue_residence(),
+                ),
+            )
+            .map_err(failed)?,
+        );
+        let root_task = round.root_task();
+
+        // The two per-attempt feedback loops. Both hang on the runner's one
+        // pump seam rather than on call sites in the drive loop below: see
+        // `TaskRound::turn` for why they land between the status fold and
+        // submission. The runner refuses to turn until this has run, so
+        // omitting it is a query failure rather than a silently missing loop.
+        let credential_rotation = install_attempt_pumps(
+            &mut round,
+            AttemptPumps {
+                execution_id,
+                feedback_state: Arc::clone(&feedback_state),
+                declared_feedback_channels: feedback_declaration.channels().len(),
+                reads: Arc::clone(&result_transport) as Arc<dyn TaskDynamicFilterReads>,
+                initial_credential: &initial_credential,
+                credential_storage: attempt_storage.clone(),
+            },
+        );
+
+        let mut write_completion = if intent == DistributedQueryIntent::Write {
+            let writers = round
+                .execution()
+                .graph()
+                .tasks()
+                .filter(|task| writer_fragments.contains(&task.fragment_id()))
+                .map(TaskNode::identity)
+                .collect::<Vec<_>>();
+            Some(
+                WriteCompletionTracker::try_new(root_task, writers)
+                    .map_err(|error| failed(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        // Started as soon as the substrate exists rather than after a staging
+        // barrier this path does not have: a delivery for a task that is still
+        // creating is queued on that task and drains when its create is
+        // acknowledged.
+        let mut split_assignment = split_assignment_plan.and_then(|plan| {
+            SplitAssignmentRoundGuard::start(
+                execution_id,
+                plan,
+                Arc::clone(&split_delivery) as Arc<dyn TaskUpdateTransport>,
+            )
+        });
+
+        let mut final_task_info = FinalTaskInfoCollector::new(
+            result_transport.as_ref(),
+            intent == DistributedQueryIntent::Profile,
+        );
+        // The task protocol's analogue of the two lifecycle gates: every query
+        // context established is ControlReady, every task created is Stage and
+        // Start. Both close exactly once, and until the first one closes a
+        // failure may still be a replaced backend rather than this query's.
+        let mut contexts_established = false;
+        let mut tasks_created = false;
+        // The membership owner gets the same window the old Init RPC had to
+        // prove a replacement, taken from the task protocol's own establish
+        // cap rather than a second number invented here.
+        let establish_wait = self.task_execution_budgets.wait_caps.clamp(
+            OperationKind::UpdateQueryContext,
+            MaxWait::default_for(OperationKind::UpdateQueryContext),
+        );
+        let mut batches = Vec::new();
+        // Recorded rather than inferred, exactly as the old path recorded it: a
+        // write commits on the strength of this fact.
+        let mut observed_result_eof = false;
+        let mut last_root_poll = RootResultPoll::default();
+        // Taken before the loop because the polls run beside it: the schema
+        // is shared, immutable and only read, while `expected_output` itself
+        // is consumed by this attempt's answer.
+        let root_output_schema = Arc::clone(expected_output.fetch_view().chunk_schema());
+        let mut root_result_polls: Option<RootResultPolls> = None;
+        let mut wait_witness = TaskRoundWaitWitness::new(
+            task_round_wait_facts(&round, root_task, 0, last_root_poll),
+            Instant::now(),
+        );
+        let outcome = loop {
+            // Recomputed each turn so the two gates and the classification
+            // window are read from this turn's state rather than last turn's.
+            let classification = TaskRoundFailureClassification {
+                before_contexts_established: !contexts_established,
+                captured: &captured_topology,
+                observation_deadline: statement_deadline.min(
+                    Instant::now()
+                        .checked_add(establish_wait)
+                        .unwrap_or(statement_deadline),
+                ),
+                cancellation: &cancellation,
+            };
+            if cancellation.is_cancelled() {
+                break Err(self.fail_task_round(
+                    query_id,
+                    &mut round,
+                    &split_delivery,
+                    classification,
+                    "query cancelled while fetching result",
+                ));
+            }
+            if let Some(message) = self.registry.first_failure(query_id) {
+                break Err(self.fail_task_round(
+                    query_id,
+                    &mut round,
+                    &split_delivery,
+                    classification,
+                    message,
+                ));
+            }
+            let now = Instant::now();
+            if now >= statement_deadline {
+                // The message names the facts rather than only the elapsed
+                // time. A completion rule that waits on absent facts has to
+                // say which one was absent, or its timeout is indistinguishable
+                // from every other timeout.
+                let waiting_on =
+                    task_round_wait_facts(&round, root_task, batches.len(), last_root_poll);
+                break Err(self.fail_task_round(
+                    query_id,
+                    &mut round,
+                    &split_delivery,
+                    classification,
+                    format!("query timed out after {timeout_ms} ms waiting on {waiting_on}"),
+                ));
+            }
+
+            let mut moved = match advance_task_round(&mut round, &split_delivery) {
+                Ok(report) => !report.is_idle(),
+                Err(error) => {
+                    break Err(self.fail_task_round(
+                        query_id,
+                        &mut round,
+                        &split_delivery,
+                        classification,
+                        format!("task execution did not advance: {error}"),
+                    ));
+                }
+            };
+            final_task_info.observe(&round);
+            if !contexts_established && round.contexts_established() {
+                contexts_established = true;
+                if let Some(retry_boundary) = retry_boundary {
+                    retry_boundary.close_after_control_ready();
+                }
+            }
+            if contexts_established && !tasks_created && round.tasks_created() {
+                tasks_created = true;
+                if let Some(retry_boundary) = retry_boundary {
+                    retry_boundary.close_after_stage_or_start();
+                }
+            }
+            // Re-read after the gates moved: a failure seen from here on is
+            // judged against the window this turn actually reached.
+            let classification = TaskRoundFailureClassification {
+                before_contexts_established: !contexts_established,
+                captured: &captured_topology,
+                observation_deadline: statement_deadline.min(
+                    Instant::now()
+                        .checked_add(establish_wait)
+                        .unwrap_or(statement_deadline),
+                ),
+                cancellation: &cancellation,
+            };
+            if let Some(detail) = round.failure_cause() {
+                let detail = format!("task execution terminated: {detail:?}");
+                break Err(self.fail_task_round(
+                    query_id,
+                    &mut round,
+                    &split_delivery,
+                    classification,
+                    detail,
+                ));
+            }
+            // A deliverer that failed will never feed the scans it had left,
+            // so the round cannot reach its own exit and would otherwise run
+            // out the statement deadline reporting the wait instead of the
+            // cause. Read every turn, and only a failure ends the attempt:
+            // a worker that stopped because every source went terminal is the
+            // normal case and says nothing about the query.
+            let delivery_failure = split_assignment
+                .as_mut()
+                .and_then(SplitAssignmentRoundGuard::failure)
+                .map(|error| format!("split assignment stopped delivering: {error}"));
+            if let Some(detail) = delivery_failure {
+                break Err(self.fail_task_round(
+                    query_id,
+                    &mut round,
+                    &split_delivery,
+                    classification,
+                    detail,
+                ));
+            }
+
+            // The polls run until this loop has observed the end of the
+            // result stream, and that fact alone stops them. Not the root
+            // task leaving its created state: delivering the end of stream is
+            // what retires that task, so stopping on its terminal status
+            // races the last answer -- and losing that answer leaves the read
+            // waiting for an end of stream nothing will send again.
+            //
+            // Its creation being acknowledged is still what starts the first
+            // poll, because the result plane refuses a poll for a task it
+            // does not hold yet.
+            if observed_result_eof {
+                root_result_polls = None;
+            } else if root_result_polls.is_none() && task_is_created(&round, root_task) {
+                match RootResultPolls::start(
+                    Arc::clone(&result_transport) as Arc<dyn TaskResultTransport>,
+                    root_task,
+                    Arc::clone(&root_output_schema),
+                    statement_deadline,
+                    Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                ) {
+                    Ok(polls) => root_result_polls = Some(polls),
+                    Err(error) => {
+                        break Err(self.fail_task_round(
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            error,
+                        ));
+                    }
+                }
+            }
+            // One answer per turn. Consuming it makes the turn non-idle, so
+            // the loop comes straight back for the next one instead of
+            // parking on the wake the poller raised.
+            if let Some(answer) = root_result_polls.as_mut().and_then(RootResultPolls::take) {
+                match answer {
+                    Ok(RootResultOutcome::Ready {
+                        packet_sequence,
+                        batch,
+                    }) => {
+                        if let Err(error) = round.consume_root_result_packet(packet_sequence, false)
+                        {
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                format!("root result packet was refused: {error}"),
+                            ));
+                        }
+                        batches.push(batch);
+                        last_root_poll = RootResultPoll::Packet(packet_sequence);
+                        moved = true;
+                    }
+                    Ok(RootResultOutcome::EndOfStream { packet_sequence }) => {
+                        if let Err(error) = round.consume_root_result_packet(packet_sequence, true)
+                        {
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                format!("root result end of stream was refused: {error}"),
+                            ));
+                        }
+                        observed_result_eof = true;
+                        last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
+                        moved = true;
+                    }
+                    Ok(RootResultOutcome::NotReady) => {
+                        // Deliberately not progress. The poller is already
+                        // asking again, so a turn that claimed this moved
+                        // something would keep the loop spinning through
+                        // that whole wait instead of parking until the
+                        // poller, an acknowledgement or a status event wakes
+                        // it.
+                        last_root_poll = RootResultPoll::NotReady;
+                    }
+                    Ok(RootResultOutcome::Failed(detail)) | Err(detail) => {
+                        // A refused or failed poll is also how a read ends
+                        // when the task it names has already gone. If this
+                        // attempt has a failure of its own, that failure is
+                        // the cause and this answer is the reaction to it, so
+                        // it is the one reported.
+                        let detail = round.failure_cause().map_or(detail, |cause| {
+                            format!("task execution terminated: {cause:?}")
+                        });
+                        break Err(self.fail_task_round(
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            detail,
+                        ));
+                    }
+                }
+            }
+
+            wait_witness.observe(
+                execution_id,
+                task_round_wait_facts(&round, root_task, batches.len(), last_root_poll),
+                Instant::now(),
+            );
+
+            if round.client_visible_completion() {
+                match write_completion.as_mut() {
+                    // A write's completion is not the read's. Every declared
+                    // writer and the root finish task must have published
+                    // FINISHED, so this keeps turning while one has not.
+                    Some(tracker) => {
+                        observe_write_statuses(&round, tracker);
+                        if tracker
+                            .execution_verdict(round.failure_cause().is_some())
+                            .is_complete()
+                        {
+                            break Ok(());
+                        }
+                    }
+                    None => break Ok(()),
+                }
+            }
+            if !moved {
+                wake.wait(TASK_ROUND_IDLE_WAIT);
+            }
+        };
+        // Nothing rotates or prunes for a query whose answer is already
+        // decided, success or failure. Both loops are stopped before the
+        // outcome is propagated: the drain below keeps turning, and a rotation
+        // started there would be judged against a hard deadline for material
+        // no task still reads -- which would turn a linearized completion into
+        // a failure. Closing the feedback state also wakes any split source
+        // still inside its initial wait.
+        if let Some(rotation) = &credential_rotation {
+            rotation.wipe();
+        }
+        feedback_state.close();
+        outcome?;
+
+        // The client-visible completion is linearized. Draining closes this
+        // attempt's internal resources and releases every query context; it
+        // must never be able to take that completion back, so a drain that
+        // does not finish inside the statement's own budget is reported rather
+        // than turned into a query failure.
+        drain_task_round(
+            &mut round,
+            &split_delivery,
+            &wake,
+            split_assignment.as_ref(),
+            statement_deadline,
+            self.task_execution_budgets
+                .transport
+                .frontend_queue_residence(),
+            execution_id,
+            &mut final_task_info,
+        );
+
+        // Read once the drain has ended: a release acknowledgement is the only
+        // message that carries a backend's sealed runtime-filter observation,
+        // and the drain is what waits for every one of them. Read before the
+        // intent match so the same set feeds the convergence evidence and the
+        // profile -- two reads could disagree, and they are the same fact.
+        let runtime_filter_contributions =
+            round.execution().released_runtime_filter_contributions();
+        self.publish_task_round_convergence(execution_id, &runtime_filter_contributions);
+
+        // The split worker blocks on acknowledgements the drain above settles,
+        // so joining it is safe only now that it has stopped. A worker still
+        // waiting is woken with an unknown outcome, and the guard's own stop
+        // then keeps it from resending.
+        let split_assignment_profile = match split_assignment.take() {
+            Some(assignment) => {
+                if !assignment.is_finished() {
+                    split_delivery.abandon("split assignment round ended with the attempt");
+                }
+                match assignment.finish() {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        return Err(self.fail_and_cancel(
+                            query_id,
+                            format!("split assignment did not finish: {error}"),
+                        ));
+                    }
+                }
+            }
+            None => novarocks_spi::connector::read_stack::SplitSourceProfile::default(),
+        };
+
+        if let Some(session) = write_stack_session.as_ref()
+            && let Some(resolver) = attempt_storage.as_ref()
+        {
+            // A connector write reaches its external commit after this attempt
+            // finalizes, and on a vended-credential deployment that commit
+            // reads object storage through the attempt's own leases.
+            session
+                .retain_terminal_storage_resolver(Arc::clone(resolver)
+                    as Arc<dyn novarocks_spi::connector::ConnectorStorageResolver>);
+        }
+
+        let outcome = (|| match intent {
+            DistributedQueryIntent::Result => {
+                completion.result(expected_output.into_query_result(batches)?)
+            }
+            DistributedQueryIntent::Write => {
+                let session = write_stack_session.ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "distributed write execution has no connector write session",
+                    )
+                })?;
+                let tracker = write_completion.as_mut().ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "distributed write execution has no write completion tracker",
+                    )
+                })?;
+                // The write relation is engine machinery: the client's result
+                // is empty, and the rows are decoded by position against the
+                // frozen relation instead.
+                let mut decoder =
+                    crate::query_execution::write_result::RootWriteResultDecoder::new(
+                        &session.expected_targets(),
+                    )
+                    .map_err(|error| {
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            error,
+                        )
+                    })?;
+                for batch in batches {
+                    decoder.apply_chunk(&batch.into_chunk()).map_err(|error| {
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            error,
+                        )
+                    })?;
+                }
+
+                let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
+                // Only an observed end of stream can produce a complete set. A
+                // prefix is not most of a write; it is no write at all.
+                if observed_result_eof {
+                    barrier.observe_prepared_write_set(decoder.finish_at_eof().map_err(
+                        |error| {
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                error,
+                            )
+                        },
+                    )?);
+                }
+                observe_write_statuses(&round, tracker);
+                // The execution half only. The barrier keeps "the prepared
+                // write set is complete" as its own independent fact, and
+                // handing it a verdict that already folded that in would let
+                // one signal stand for both again.
+                barrier.observe_task_execution(
+                    tracker.execution_verdict(round.failure_cause().is_some()),
+                );
+                if cancellation.is_cancelled() {
+                    barrier.observe_cancelled();
+                }
+
+                let prepared_set = barrier.into_committable().map_err(|blocked| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        blocked.as_str(),
+                    )
+                })?;
+                completion.write_session_outcome(session, prepared_set)
+            }
+            DistributedQueryIntent::Profile => {
+                let result = expected_output.into_query_result(batches)?;
+                let mut builder = ProfileTerminalBuilder::new();
+                let graph = round.execution().graph();
+                for info in &final_task_info.collected {
+                    // Stage to fragment to sealed fragment root: each hop is a
+                    // fact this attempt froze, so a task whose stage or
+                    // fragment cannot be resolved is a disagreement between the
+                    // graph and the plan, not a profile to publish partially.
+                    let stage_id = info.final_status().identity().stage_id();
+                    let fragment_id = graph
+                        .stage(stage_id)
+                        .ok_or_else(|| {
+                            failed(format!(
+                                "final task info names stage {stage_id} which this attempt's task \
+                                 graph does not contain"
+                            ))
+                        })?
+                        .fragment_id();
+                    let root_node_id = fragment_root_plan_node_ids
+                        .get(&fragment_id)
+                        .copied()
+                        .ok_or_else(|| {
+                            failed(format!(
+                                "stage {stage_id} names fragment {fragment_id} which this \
+                                 attempt's sealed submissions do not contain"
+                            ))
+                        })?;
+                    builder.apply_task_operator_statistics(info, root_node_id)?;
+                }
+                // The runtime-filter half of the profile comes from the
+                // participants' own terminal observations, not from any task's
+                // operator statistics: the row effects a filter applies are
+                // folded by the query context's participant, and a task's
+                // projection never carried them.
+                for (process_id, telemetry) in runtime_filter_contributions.contributions() {
+                    builder.apply_runtime_filter_contribution(
+                        execution_id,
+                        *process_id,
+                        telemetry,
+                    )?;
+                }
+                builder.apply_split_assignment_profile(split_assignment_profile);
+                completion.profile(result, builder.finish())
+            }
+            // Statistics never reaches this path; the branch in `execute_round`
+            // that keeps it on the old lifecycle is the only route it has.
+            DistributedQueryIntent::Statistics => Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "statistics execution does not run on the task protocol",
+            )),
+        })();
+        if let Err(error) = &outcome {
+            let _ = self
+                .registry
+                .latch_failure_and_cancel(query_id, error.message().to_string());
+            return Err(DistributedQueryError::new(error.kind(), error.message()));
+        }
+        outcome
+    }
+
+    /// Stands every query context of this attempt down, then classifies why it
+    /// failed.
+    ///
+    /// A dropped round would leave the backends holding tasks until their
+    /// lease expired; an explicit abort is what makes a failed attempt release
+    /// its resources at the moment the frontend gave up on it.
+    ///
+    /// A failure that arrived before every query context was established gets
+    /// the same treatment the old barrier gave a pre-ControlReady one: it is
+    /// marked as needing a topology observation, and the membership owner --
+    /// not this failure's text -- decides whether an exact captured process
+    /// was replaced. Nothing is latched in that case, because a replanned
+    /// Publishes this task-protocol attempt's immutable convergence evidence.
+    ///
+    /// Called once, after the drain, because that is the point at which every
+    /// participant's contribution is either in hand or will never arrive.
+    ///
+    /// What this attempt genuinely does not have is not invented here. The
+    /// task protocol produces no `ParticipantTerminalOutcome`: a task's
+    /// terminal is its own status, and there is no per-participant proof or
+    /// attestation to report -- so the outcome list is empty rather than
+    /// populated with proofs this protocol never minted. `error_source` and
+    /// `primary_error` are likewise absent: this path is reached only after
+    /// the attempt's answer is already linearized as a success, and a failed
+    /// attempt aborts its contexts instead of releasing them, so it has no
+    /// sealed contribution to publish at all.
+    ///
+    /// `metrics` carries the process-wide lifecycle counters, which is the
+    /// same set the lifecycle attempt publishes -- neither protocol keeps an
+    /// attempt-scoped copy of them.
+    fn publish_task_round_convergence(
+        &self,
+        execution_id: QueryExecutionId,
+        contributions: &ReleasedRuntimeFilterContributions,
+    ) {
+        // A context whose release never answered may still have observed
+        // runtime-filter activity this frontend has not seen, so the rollup is
+        // refused rather than summed over the backends that did answer.
+        let runtime_filter = if contributions.is_complete() {
+            RuntimeFilterTerminalRollupSnapshot::Available(rollup_from_release_contributions(
+                contributions.contributions(),
+            ))
+        } else {
+            RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+            )
+        };
+        tracing::debug!(
+            execution_id = ?execution_id,
+            contributions = contributions.contributions().len(),
+            contexts = contributions.contexts(),
+            complete = contributions.is_complete(),
+            "task protocol attempt published its runtime filter convergence evidence"
+        );
+        self.registry
+            .publish_task_round_convergence(QueryLifecycleConvergenceSnapshot {
+                execution_id,
+                error_source: None,
+                primary_error: None,
+                participant_outcomes: Vec::new(),
+                runtime_filter,
+                metrics: FrontendLifecycleMetrics::process_shared().snapshot(),
+            });
+    }
+
+    /// round registers its own attempt and the failure belongs to the one
+    /// being abandoned.
+    fn fail_task_round(
+        &self,
+        query_id: QueryId,
+        round: &mut TaskRound,
+        split_delivery: &SplitDeliveryBridge,
+        classification: TaskRoundFailureClassification<'_>,
+        message: impl Into<String>,
+    ) -> DistributedQueryError {
+        let message = message.into();
+        split_delivery.abandon(message.clone());
+        // Released to the transport before any judgement below, and released
+        // unconditionally: a backend that applies its establish after this
+        // frontend has given up must not be left holding the context. What
+        // the judgement decides is only whether this worker waits, never
+        // whether the backends are told.
+        abort_task_round(round, &message);
+        match judge_pre_ready_task_round_failure(
+            self.backend_topology.as_ref(),
+            classification,
+            &message,
+        ) {
+            Some(classified) => classified,
+            None => self.fail_and_cancel(query_id, message),
+        }
     }
 
     fn fail_and_cancel(
@@ -1847,10 +2825,7 @@ mod tests {
 
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
-        FrontendReportEndpointBinding, QueryAbortRequest, QueryControlAttach, QueryControlSession,
-        QueryIdSource, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleTarget,
-        QueryLifecycleTransport, QueryLifecycleTransportError, QueryStageAck, QueryStageRequest,
-        QueryStartAck, QueryStartRequest, QueryTerminationAck, ReadyLifecycleTransportForTest,
+        FrontendReportEndpointBinding, QueryIdSource, ReadyLifecycleTransportForTest,
         UniqueQueryIdSource, fail_closed_one_shot_topology_retry,
         pre_ready_topology_validation_error,
     };
@@ -1858,12 +2833,13 @@ mod tests {
     use crate::common::backend_topology::{
         BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
     };
-    use crate::common::query_cancellation::QueryCancellationSource;
+    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::connector::{
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
     };
     use crate::native::fragment_transport::{
-        ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
+        DynamicFilterRead, DynamicFilterReadError, ExpectedOutputSchemaView, FetchOutcome,
+        FinalTaskInfoRead, FragmentDispatcher, RootResultOutcome,
     };
     use crate::query_execution::completion::{
         PreReadyRetryBoundary, PreparedDistributedQuery, PreparedDistributedRequestFactory,
@@ -1877,10 +2853,13 @@ mod tests {
     };
     use crate::query_execution::preparation::{ScanPreparationOptions, prepare_fragments};
     use crate::topology::ClusterBackendService;
-    use novarocks_proto_codec::lifecycle::{QueryControlEndpoint, QueryExecutionId};
+    use novarocks_execution::task_execution::domain::DomainVersion;
+    use novarocks_execution::task_execution::{MaxWait, TaskIdentity};
+    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
-    use novarocks_proto_models::novarocks as protocol;
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
+    use novarocks_types::identity::{StageId, TaskId};
+    use novarocks_types::{AttemptId, QueryExecutionId};
     use novarocks_types::{
         BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace, UniqueId,
     };
@@ -2039,146 +3018,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct RetryTransportState {
-        first_init: bool,
-        init_attempts: Vec<u64>,
-        abort_attempts: Vec<u64>,
-        stage_attempts: Vec<u64>,
-        start_attempts: Vec<u64>,
-    }
-
-    struct DrainingThenReadyTransport {
-        state: Arc<Mutex<RetryTransportState>>,
-        topology: Arc<ClusterBackendService>,
-        replacement: BackendProcessDescriptor,
-    }
-
-    impl DrainingThenReadyTransport {
-        fn execution_id(
-            request: &QueryInitRequest,
-        ) -> Result<QueryExecutionId, QueryLifecycleTransportError> {
-            request
-                .manifest()
-                .and_then(|manifest| manifest.execution_id())
-                .map_err(super::protocol_contract_error)
-        }
-
-        fn init_ack(
-            request: &QueryInitRequest,
-            outcome: QueryInitOutcome,
-        ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
-            let execution_id = Self::execution_id(request)?;
-            let digest = request
-                .manifest()
-                .and_then(|manifest| manifest.digest())
-                .map_err(super::protocol_contract_error)?;
-            QueryInitAck::parse(protocol::InitQueryResponse {
-                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                    execution_id,
-                )),
-                init_digest: digest.as_bytes().to_vec(),
-                outcome: outcome as i32,
-            })
-            .map_err(super::protocol_contract_error)
-        }
-    }
-
-    impl QueryLifecycleTransport for DrainingThenReadyTransport {
-        fn init_query(
-            &self,
-            _target: QueryLifecycleTarget,
-            request: QueryInitRequest,
-            _timeout: Duration,
-        ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
-            let execution_id = Self::execution_id(&request)?;
-            let first = {
-                let mut state = self.state.lock().expect("retry transport state");
-                state.init_attempts.push(execution_id.attempt_id().get());
-                if state.first_init {
-                    false
-                } else {
-                    state.first_init = true;
-                    true
-                }
-            };
-            if first {
-                self.topology
-                    .record_announce(self.replacement.clone(), BackendReportedState::Running)
-                    .expect("replacement announce");
-                self.topology.record_heartbeat_success(
-                    self.replacement
-                        .process_id()
-                        .expect("replacement process id"),
-                    self.replacement.clone(),
-                    BackendReportedState::Running,
-                    2,
-                    2,
-                );
-                Self::init_ack(&request, QueryInitOutcome::QueryInitRejectedBackendDraining)
-            } else {
-                Self::init_ack(&request, QueryInitOutcome::QueryInitApplied)
-            }
-        }
-
-        fn attach_control(
-            &self,
-            target: QueryLifecycleTarget,
-            attach: QueryControlAttach,
-            timeout: Duration,
-        ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
-            ReadyLifecycleTransportForTest.attach_control(target, attach, timeout)
-        }
-
-        fn stage_fragments(
-            &self,
-            target: QueryLifecycleTarget,
-            request: &QueryStageRequest,
-            timeout: Duration,
-        ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
-            self.state
-                .lock()
-                .expect("retry transport state")
-                .stage_attempts
-                .push(request.execution_id().attempt_id().get());
-            ReadyLifecycleTransportForTest.stage_fragments(target, request, timeout)
-        }
-
-        fn start_prepared_query(
-            &self,
-            target: QueryLifecycleTarget,
-            request: &QueryStartRequest,
-            timeout: Duration,
-        ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
-            self.state
-                .lock()
-                .expect("retry transport state")
-                .start_attempts
-                .push(request.execution_id().attempt_id().get());
-            ReadyLifecycleTransportForTest.start_prepared_query(target, request, timeout)
-        }
-
-        fn abort_query(
-            &self,
-            target: QueryLifecycleTarget,
-            request: QueryAbortRequest,
-            timeout: Duration,
-        ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
-            self.state
-                .lock()
-                .expect("retry transport state")
-                .abort_attempts
-                .push(
-                    request
-                        .execution_id()
-                        .map_err(super::protocol_contract_error)?
-                        .attempt_id()
-                        .get(),
-                );
-            ReadyLifecycleTransportForTest.abort_query(target, request, timeout)
-        }
-    }
-
     struct RecordingRetryFactory {
         permits: Arc<AtomicUsize>,
         control_ready_closures: Arc<AtomicUsize>,
@@ -2232,7 +3071,6 @@ mod tests {
             self.stage_or_start_closures.fetch_add(1, Ordering::SeqCst);
         }
     }
-
     fn descriptor(process_id: BackendProcessId, endpoint: SocketAddr) -> BackendProcessDescriptor {
         BackendProcessDescriptor::new(
             process_id,
@@ -2278,6 +3116,12 @@ mod tests {
         let native = crate::query_execution::native_fragment::native_fragment_attachment_for_test(
             [novarocks_proto_models::plan::PlanFragment {
                 fragment_id: 7,
+                // The task protocol refuses a fragment plan with no sink, so a
+                // fixture without one would fail at graph assembly and never
+                // reach the behaviour these tests are about.
+                sink: Some(novarocks_proto_models::plan::DataSink {
+                    kind: Some(novarocks_proto_models::plan::data_sink::Kind::Result(true)),
+                }),
                 ..Default::default()
             }],
             &BTreeSet::from([7]),
@@ -2288,7 +3132,10 @@ mod tests {
         let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
             ClusterRole::Fe,
             topology,
-            Some(Instant::now() + Duration::from_secs(5)),
+            // Short on purpose. These fixtures point at endpoints nothing
+            // listens on, so an attempt that reaches the task substrate ends
+            // at its own deadline; the budget only has to outlast preparation.
+            Some(Instant::now() + Duration::from_secs(1)),
             cancellation.view(),
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
         );
@@ -2301,8 +3148,174 @@ mod tests {
         )
     }
 
+    /// The pre-establish replan survived the cutover, with a different trigger.
+    ///
+    /// The old lifecycle refused Init on a draining backend and that refusal
+    /// was what a replan rested on. The task protocol has no such refusal, so
+    /// what remains -- and what this asserts -- is the evidence
+    /// `reclassify_pre_ready_lifecycle_failure` always required: the
+    /// membership owner independently proving that an exact captured process
+    /// was replaced. Only the failure that evidence is applied to moved.
     #[test]
-    fn pre_ready_draining_aborts_first_round_and_replans_on_verified_replacement() {
+    fn exactly_one_intent_still_runs_on_the_retired_lifecycle() {
+        // The task protocol is the production path. Statistics is the single
+        // exception, because its payload is produced by the fragment terminal
+        // fact and NCP-8 owns moving it onto the root result plane.
+        //
+        // This asserts over every intent rather than over the exception, so
+        // adding an intent forces a decision here instead of inheriting one.
+        // The dangerous direction is silent: an intent that drifted onto the
+        // lifecycle path would run on the retired stack and succeed, with
+        // nothing downstream reporting it. The other direction is loud -- the
+        // task path refuses Statistics in its own intent match.
+        for intent in [
+            DistributedQueryIntent::Result,
+            DistributedQueryIntent::Write,
+            DistributedQueryIntent::Profile,
+        ] {
+            assert!(
+                !super::runs_on_query_lifecycle(intent),
+                "{intent:?} must run on the task protocol"
+            );
+        }
+        assert!(
+            super::runs_on_query_lifecycle(DistributedQueryIntent::Statistics),
+            "ANALYZE has no carrier on the task protocol until NCP-8 moves it"
+        );
+    }
+
+    #[test]
+    fn a_drain_never_inherits_the_remainder_of_a_long_statement_timeout() {
+        // The client-visible answer is linearized before the drain starts, so
+        // every moment the drain spends is a moment the caller waits for a
+        // result already in hand. A query that finished in a second against
+        // one stuck backend must return in about the drain budget, not in five
+        // minutes.
+        let now = Instant::now();
+        let statement_deadline = now + Duration::from_secs(300);
+        let budget = Duration::from_secs(15);
+
+        let deadline = super::drain_deadline(statement_deadline, budget, now);
+        assert_eq!(
+            deadline - now,
+            budget,
+            "the drain's own budget bounds it, not the statement's remaining time"
+        );
+
+        // A statement already near its end has no time left to lend: the drain
+        // cannot extend a query past the deadline its caller was promised.
+        let nearly_over = now + Duration::from_millis(50);
+        assert_eq!(
+            super::drain_deadline(nearly_over, budget, now),
+            nearly_over,
+            "the statement deadline still caps the drain"
+        );
+
+        // And an already-expired statement yields no drain time at all rather
+        // than wrapping into a long wait.
+        let expired = now - Duration::from_secs(1);
+        assert!(
+            super::drain_deadline(expired, budget, now) <= now,
+            "an expired statement leaves the drain no budget"
+        );
+    }
+
+    /// A killed statement's worker must not wait out the pre-establish
+    /// membership observation.
+    ///
+    /// `KILL QUERY` is withheld from the client until this worker unwinds, so
+    /// a pre-ControlReady failure that stops to ask the membership owner
+    /// whether a backend was replaced spends that entire window inside the
+    /// client's wait for its own interrupt. On a healthy cluster no
+    /// replacement ever arrives, so the window is spent in full -- and the
+    /// window is the fifteen-second establish wait, which is exactly the
+    /// interrupt latency a real 1FE+3BE cluster reported for a statement
+    /// killed while its `EstablishQueryContext` was still in flight.
+    ///
+    /// Both directions are asserted, and the uncancelled one comes first
+    /// because it is the direction that can pass for the wrong reason. A
+    /// change that simply stopped observing would satisfy the cancelled half
+    /// and break the other, and that observation is the only evidence a
+    /// pre-establish replan is ever allowed to rest on.
+    #[test]
+    fn a_cancelled_attempt_does_not_wait_out_the_pre_establish_membership_observation() {
+        let endpoint: SocketAddr = "127.0.0.1:19061".parse().expect("test endpoint");
+        let backend = descriptor(BackendProcessId::new_v7(), endpoint);
+        let topology = Arc::new(ClusterBackendService::new_transient_for_test(1));
+        topology
+            .record_announce(backend.clone(), BackendReportedState::Running)
+            .expect("announce the only backend");
+        verify(topology.as_ref(), &backend, 1);
+        let captured = topology.snapshot().expect("captured topology");
+
+        // Short enough to keep this test quick, long enough that spending it
+        // is unmistakable. Production's window is the establish wait.
+        const OBSERVATION: Duration = Duration::from_secs(1);
+        const MESSAGE: &str = "query cancelled while fetching result";
+
+        let cancellation = QueryCancellationSource::new();
+        let view = cancellation.view();
+
+        // Nothing has cancelled this attempt, so the membership owner is
+        // asked. This topology's revision never advances, so being asked
+        // means the whole window is spent before the failure is judged to be
+        // this attempt's own.
+        let started = Instant::now();
+        let observed = super::judge_pre_ready_task_round_failure(
+            topology.as_ref(),
+            super::TaskRoundFailureClassification {
+                before_contexts_established: true,
+                captured: &captured,
+                observation_deadline: started + OBSERVATION,
+                cancellation: &view,
+            },
+            MESSAGE,
+        );
+        let uncancelled = started.elapsed();
+        assert!(
+            observed.is_none(),
+            "an unchanged topology proves no replacement, so the failure is this attempt's own"
+        );
+        assert!(
+            uncancelled >= OBSERVATION.mul_f32(0.75),
+            "an uncancelled pre-establish failure must still consult the membership owner, \
+             yet it was judged after only {uncancelled:?}"
+        );
+
+        // Latch the cancellation the statement source latches for a
+        // `KILL QUERY`, and ask again. Nothing about the topology changed;
+        // only the answer's already being decided has.
+        cancellation.request(QueryCancellationReason::ExplicitKill {
+            requester_connection_id: 7,
+        });
+        assert!(view.is_cancelled(), "the statement source latches the kill");
+
+        let started = Instant::now();
+        let cancelled = super::judge_pre_ready_task_round_failure(
+            topology.as_ref(),
+            super::TaskRoundFailureClassification {
+                before_contexts_established: true,
+                captured: &captured,
+                observation_deadline: started + OBSERVATION,
+                cancellation: &view,
+            },
+            MESSAGE,
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            cancelled.is_none(),
+            "a cancelled attempt is never reclassified into topology-retry evidence, \
+             because a replan must never re-run a statement the client killed"
+        );
+        assert!(
+            elapsed < OBSERVATION / 4,
+            "a killed statement's worker must unwind without waiting out the membership \
+             observation, yet it was judged after {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_replaced_captured_process_replans_the_round_once_before_establish() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2330,12 +3343,6 @@ mod tests {
             )])
             .expect("replacement scheduler"),
         );
-        let state = Arc::new(Mutex::new(RetryTransportState::default()));
-        let transport = Arc::new(DrainingThenReadyTransport {
-            state: Arc::clone(&state),
-            topology: Arc::clone(&topology),
-            replacement: replacement.clone(),
-        });
         let coordinator =
             FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
                 QueryId::new(7, 11),
@@ -2344,9 +3351,17 @@ mod tests {
                 Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
                 Arc::new(()),
-                transport,
+                Arc::new(ReadyLifecycleTransportForTest),
                 Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
             );
+        // The membership owner replaces the captured process. Published before
+        // the round starts because that is the only ordering a test can pin;
+        // what matters is that the replan rests on this fact rather than on a
+        // transport's own report of it.
+        topology
+            .record_announce(replacement.clone(), BackendReportedState::Running)
+            .expect("replacement announce");
+        verify(topology.as_ref(), &replacement, 2);
         let permits = Arc::new(AtomicUsize::new(0));
         let control_ready_closures = Arc::new(AtomicUsize::new(0));
         let stage_or_start_closures = Arc::new(AtomicUsize::new(0));
@@ -2364,13 +3379,19 @@ mod tests {
 
         let error = coordinator
             .execute_prepared(operation)
-            .expect_err("second round reaches the scripted post-start fetch failure");
+            .expect_err("the replanned round has no backend to reach");
+        // The second round runs on the task substrate against an endpoint
+        // nothing listens on, so it ends at its own deadline. What this test
+        // is about happened before that: one permit, one replan, onto the
+        // process the membership owner named.
         assert!(
-            error
-                .message()
-                .contains("test fetch failure after retry stage/start")
+            error.message().contains("query timed out after"),
+            "actual: {}",
+            error.message()
         );
         assert_eq!(permits.load(Ordering::SeqCst), 1);
+        // Neither gate may close: no query context was ever established, so
+        // the window in which a replan is still legal never ended.
         assert_eq!(control_ready_closures.load(Ordering::SeqCst), 0);
         assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 0);
         let replanned = replanned_topologies.lock().expect("replanned topologies");
@@ -2382,18 +3403,16 @@ mod tests {
                 .expect("replacement process id"),
             replacement.process_id().expect("replacement process id"),
         );
-        let state = state.lock().expect("retry transport state");
-        assert_eq!(state.init_attempts, vec![1, 2]);
-        // The first pre-ready attempt has no attached control stream, so its
-        // cleanup must use the unary Abort RPC. The second attempt reaches
-        // Start and is cancelled through its attached control stream instead.
-        assert_eq!(state.abort_attempts, vec![1]);
-        assert_eq!(state.stage_attempts, vec![2]);
-        assert_eq!(state.start_attempts, vec![2]);
     }
 
+    /// The same replan through the raw entrypoint, which owns the write
+    /// outcome boundary.
+    ///
+    /// Its subject is that a replan does not lose that boundary, not how the
+    /// replan was triggered, so it follows the surviving trigger for the same
+    /// reason the test above does.
     #[test]
-    fn raw_pre_ready_draining_replans_without_losing_the_write_outcome_boundary() {
+    fn raw_replan_on_a_replaced_process_keeps_the_write_outcome_boundary() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2419,12 +3438,6 @@ mod tests {
             )])
             .expect("replacement scheduler"),
         );
-        let state = Arc::new(Mutex::new(RetryTransportState::default()));
-        let transport = Arc::new(DrainingThenReadyTransport {
-            state: Arc::clone(&state),
-            topology: Arc::clone(&topology),
-            replacement: replacement.clone(),
-        });
         let coordinator =
             FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
                 QueryId::new(7, 13),
@@ -2433,9 +3446,13 @@ mod tests {
                 Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
                 Arc::new(()),
-                transport,
+                Arc::new(ReadyLifecycleTransportForTest),
                 Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
             );
+        topology
+            .record_announce(replacement.clone(), BackendReportedState::Running)
+            .expect("replacement announce");
+        verify(topology.as_ref(), &replacement, 2);
         let permits = Arc::new(AtomicUsize::new(0));
         let control_ready_closures = Arc::new(AtomicUsize::new(0));
         let stage_or_start_closures = Arc::new(AtomicUsize::new(0));
@@ -2444,20 +3461,20 @@ mod tests {
             fresh_result_request(first_snapshot.clone()).expect("first request"),
             Box::new(RecordingRetryFactory {
                 permits: Arc::clone(&permits),
-                control_ready_closures,
-                stage_or_start_closures,
+                control_ready_closures: Arc::clone(&control_ready_closures),
+                stage_or_start_closures: Arc::clone(&stage_or_start_closures),
                 replanned_topologies: Arc::clone(&replanned_topologies),
             }),
         );
 
         let error = match coordinator.execute_prepared_raw(operation) {
-            Ok(_) => panic!("second raw round reaches the scripted post-start fetch failure"),
+            Ok(_) => panic!("the replanned raw round has no backend to reach"),
             Err(error) => error,
         };
         assert!(
-            error
-                .message()
-                .contains("test fetch failure after retry stage/start")
+            error.message().contains("query timed out after"),
+            "actual: {}",
+            error.message()
         );
         assert_eq!(permits.load(Ordering::SeqCst), 1);
         let replanned = replanned_topologies.lock().expect("replanned topologies");
@@ -2469,15 +3486,23 @@ mod tests {
                 .expect("replacement process id"),
             replacement.process_id().expect("replacement process id"),
         );
-        let state = state.lock().expect("retry transport state");
-        assert_eq!(state.init_attempts, vec![1, 2]);
-        assert_eq!(state.abort_attempts, vec![1]);
-        assert_eq!(state.stage_attempts, vec![2]);
-        assert_eq!(state.start_attempts, vec![2]);
     }
 
+    /// Both gates are evidence, not milestones a code path passes.
+    ///
+    /// This round reaches the task substrate and never gets an answer from it,
+    /// so no query context is established and no task is created. Neither gate
+    /// may close: closing one here would end the window in which a replaced
+    /// backend can still be replanned onto, on the strength of having asked
+    /// rather than having been answered.
+    ///
+    /// The other half -- that both gates do close once the answers arrive --
+    /// is asserted against the state machine itself in
+    /// `task_execution::tests::the_two_start_gates_are_observations_of_acknowledgements_not_of_sending`,
+    /// because a fixture-injected transport cannot answer the task protocol:
+    /// it speaks over a real connection.
     #[test]
-    fn control_ready_and_stage_close_the_round_retry_boundary() {
+    fn the_round_retry_boundary_stays_open_while_no_backend_has_answered() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2520,17 +3545,820 @@ mod tests {
 
         let error = coordinator
             .execute_prepared(operation)
-            .expect_err("scripted fetch failure occurs after Start");
+            .expect_err("the round has no backend to reach");
         assert!(
-            error
-                .message()
-                .contains("test fetch failure after retry stage/start")
+            error.message().contains("query timed out after"),
+            "actual: {}",
+            error.message()
         );
-        assert_eq!(control_ready_closures.load(Ordering::SeqCst), 1);
-        assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 1);
+        assert_eq!(control_ready_closures.load(Ordering::SeqCst), 0);
+        assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 0);
+    }
+
+    /// A root result transport whose every poll answers only when this test
+    /// says so, so that "a poll is in flight" is a state the test holds
+    /// rather than one it races.
+    struct ScriptedRootResult {
+        /// One answer per poll, in the order they are given.
+        answers: Mutex<std::collections::VecDeque<RootResultOutcome>>,
+        /// Received once per poll before it answers.
+        releases: Mutex<std::sync::mpsc::Receiver<()>>,
+        polls: AtomicUsize,
+    }
+
+    impl super::TaskResultTransport for ScriptedRootResult {
+        fn fetch_root_result(
+            &self,
+            _root_task: TaskIdentity,
+            _max_wait: MaxWait,
+            _expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
+        ) -> Result<RootResultOutcome, String> {
+            self.releases
+                .lock()
+                .expect("scripted release lock")
+                .recv()
+                .map_err(|_| "the test stopped releasing polls".to_owned())?;
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.answers
+                .lock()
+                .expect("scripted answer lock")
+                .pop_front()
+                .ok_or_else(|| "the script ran out of answers".to_owned())
+        }
+
+        fn final_task_info(&self, _identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
+            Err("this transport answers only root result polls".to_owned())
+        }
+
+        fn dynamic_filters(
+            &self,
+            _identity: TaskIdentity,
+            _acknowledged: Option<DomainVersion>,
+        ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
+            Err(DynamicFilterReadError::Refused(
+                "this transport answers only root result polls".to_owned(),
+            ))
+        }
+    }
+
+    fn root_task_for_test() -> TaskIdentity {
+        TaskIdentity::new(
+            QueryExecutionId::new(
+                QueryId::new(0x1234, 0x5678),
+                AttemptId::new(1).expect("attempt one is nonzero"),
+            )
+            .expect("a nonzero query id"),
+            StageId::new(1).expect("a nonzero stage id"),
+            TaskId::new(1).expect("a nonzero task id"),
+            BackendProcessId::new_v7(),
+        )
+    }
+
+    /// Waits for the poller to answer, bounded, so a failure is a failure
+    /// rather than a hang.
+    fn answer_within(
+        polls: &mut super::RootResultPolls,
+        budget: Duration,
+    ) -> Option<Result<RootResultOutcome, String>> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(answer) = polls.take() {
+                return Some(answer);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The defect this pins: one root result poll asks a backend to hold its
+    /// answer for up to `MAX_ROOT_RESULT_WAIT`, and an attempt has exactly
+    /// one thread -- the one that turns its task state machine. While that
+    /// thread waited out a poll it dispatched nothing, so every decision made
+    /// by another thread meanwhile waited for the poll instead of for its own
+    /// facts. A distributed `SELECT` opens its producers' exchange edges
+    /// exactly there: each edge-open decision cost one whole poll wait, and
+    /// the cost was invisible as anything but latency. Measured on a 1FE+3BE
+    /// cluster, every statement of the `filter` suite took ~0.85 s of which
+    /// ~0.05 s was work, and the suite took 92 s against its baseline's 4 s.
+    ///
+    /// So the answers must reach the loop without the loop ever waiting for
+    /// one, and the polls must stop themselves once the read is over: a poll
+    /// after the end of the stream is refused by a backend that has already
+    /// handed its result over.
+    #[test]
+    fn root_result_polls_answer_a_loop_that_never_waits_for_one() {
+        let (release, releases) = std::sync::mpsc::channel();
+        let transport = Arc::new(ScriptedRootResult {
+            answers: Mutex::new(
+                [
+                    RootResultOutcome::NotReady,
+                    RootResultOutcome::EndOfStream { packet_sequence: 7 },
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            releases: Mutex::new(releases),
+            polls: AtomicUsize::new(0),
+        });
+        let wake = Arc::new(crate::task_execution::status_intake::CountingWake::default());
+        let mut polls = super::RootResultPolls::start(
+            Arc::clone(&transport) as Arc<dyn super::TaskResultTransport>,
+            root_task_for_test(),
+            Arc::new(novarocks_execution::exec::chunk::ChunkSchema::empty()),
+            Instant::now() + Duration::from_secs(60),
+            Arc::clone(&wake) as Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
+        )
+        .expect("the poller starts");
+
+        // A poll is in flight and this test is holding its answer. Taking
+        // from the poller answers immediately anyway, and that is the whole
+        // property: the loop is free to turn its state machine.
+        assert!(
+            polls.take().is_none(),
+            "a poll in flight must not hand the loop an answer"
+        );
+        assert_eq!(wake.count(), 0, "nothing has been answered yet");
+
+        // The first answer says nothing is ready. It still wakes the loop,
+        // and the poller asks again on its own.
+        release
+            .send(())
+            .expect("the poller is waiting for a release");
+        let first = answer_within(&mut polls, Duration::from_secs(10))
+            .expect("the first answer reaches the loop");
+        assert!(
+            matches!(first, Ok(RootResultOutcome::NotReady)),
+            "actual: {first:?}"
+        );
+        assert!(wake.count() >= 1, "an answer wakes the loop");
+
+        release.send(()).expect("the poller polls again by itself");
+        let second = answer_within(&mut polls, Duration::from_secs(10))
+            .expect("the second answer reaches the loop");
+        assert!(
+            matches!(
+                second,
+                Ok(RootResultOutcome::EndOfStream { packet_sequence: 7 })
+            ),
+            "actual: {second:?}"
+        );
+
+        // Nothing is polled after the end of the stream. The poller has let
+        // go of the transport, which is what says it stopped rather than
+        // merely paused.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&transport) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            Arc::strong_count(&transport),
+            1,
+            "the poller must stop itself once the read is over"
+        );
+        assert_eq!(
+            transport.polls.load(Ordering::SeqCst),
+            2,
+            "exactly the two polls this test released"
+        );
     }
 }
 
+/// How long the coordinator parks when one turn moved nothing at all.
+///
+/// Only a pacing bound: every wait ends early when the transport wakes the
+/// runner, and every deadline is checked before the next turn.
+const TASK_ROUND_IDLE_WAIT: Duration = Duration::from_millis(5);
+
+/// The longest one root result poll may block a backend.
+///
+/// It bounds how long a backend holds one request, and nothing else: the polls
+/// run on [`RootResultPolls`], so the attempt's own loop keeps settling
+/// acknowledgements and opening edges throughout one. What the number still
+/// buys is diagnostics and shutdown -- the interval at which a poll that
+/// answers nothing refreshes the wait facts, and the longest a poller lingers
+/// after the loop stops reading it.
+///
+/// It must not be read as a bound on the loop's responsiveness. It was one
+/// once, and being one is what made every statement of a distributed suite
+/// wait a poll per edge-open decision.
+const MAX_ROOT_RESULT_WAIT: Duration = Duration::from_millis(200);
+
+/// How long an attempt may make no observable progress before it says, in the
+/// log, which facts its completion is still waiting on.
+const TASK_ROUND_WAIT_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What the last root result poll answered.
+///
+/// `NotPolledYet` is a distinct answer on purpose: the result plane refuses a
+/// poll for a task whose creation has not been acknowledged, so the loop does
+/// not make one. "Never polled" and "polled and told nothing" are different
+/// faults and must not read alike in a log.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+enum RootResultPoll {
+    #[default]
+    NotPolledYet,
+    NotReady,
+    Packet(u64),
+    EndOfStream(u64),
+}
+
+impl std::fmt::Display for RootResultPoll {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPolledYet => formatter.write_str("not polled yet"),
+            Self::NotReady => formatter.write_str("not ready"),
+            Self::Packet(sequence) => write!(formatter, "packet {sequence}"),
+            Self::EndOfStream(sequence) => write!(formatter, "end of stream at {sequence}"),
+        }
+    }
+}
+
+/// Every fact one attempt's client-visible completion is still waiting on.
+///
+/// A read completes only when the root task published `FINISHED` and this
+/// frontend consumed the end of the root result stream. Both halves tolerate
+/// absence by design -- a fact that has not arrived keeps the loop turning
+/// rather than failing it -- which is exactly why the loop has to be able to
+/// name the one that is missing. Without it, an attempt that waited out its
+/// whole statement budget reported only "query timed out", a message that
+/// names no fact and leaves the difference between "the root never finished",
+/// "the stream never ended" and "the root's create was never acknowledged, so
+/// nothing was ever polled" to be recovered from a cluster run per candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaskRoundWaitFacts {
+    contexts_established: bool,
+    tasks_created: bool,
+    read: crate::task_execution::completion::ReadVerdict,
+    /// `None` means no task of the root's id is in this attempt's state at
+    /// all, which is a different fault from a root that is still creating.
+    root_create: Option<RemoteTaskState>,
+    last_root_poll: RootResultPoll,
+    packets: usize,
+    tasks: Vec<(
+        TaskIdentity,
+        RemoteTaskState,
+        novarocks_execution::task_execution::TaskState,
+    )>,
+}
+
+impl std::fmt::Display for TaskRoundWaitFacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "read={:?} contexts_established={} tasks_created={} root_create={} \
+             last_root_poll={} packets={} tasks=[",
+            self.read,
+            self.contexts_established,
+            self.tasks_created,
+            match self.root_create {
+                Some(state) => format!("{state:?}"),
+                None => "absent".to_owned(),
+            },
+            self.last_root_poll,
+            self.packets,
+        )?;
+        for (index, (identity, create, state)) in self.tasks.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{identity} {create:?}/{state}")?;
+        }
+        formatter.write_str("]")
+    }
+}
+
+/// Reads, without changing anything, every fact this attempt's completion
+/// still depends on.
+fn task_round_wait_facts(
+    round: &TaskRound,
+    root_task: TaskIdentity,
+    packets: usize,
+    last_root_poll: RootResultPoll,
+) -> TaskRoundWaitFacts {
+    let mut tasks = Vec::new();
+    for stage in round.execution().graph().stages() {
+        let Some(execution_stage) = round.execution().stage(stage.stage_id()) else {
+            continue;
+        };
+        for (_, task) in execution_stage.tasks() {
+            tasks.push((task.identity(), task.state(), task.task_state()));
+        }
+    }
+    TaskRoundWaitFacts {
+        contexts_established: round.contexts_established(),
+        tasks_created: round.tasks_created(),
+        read: round.execution().read_completion(),
+        root_create: round
+            .execution()
+            .task(root_task.task_id())
+            .map(crate::task_execution::remote_task::RemoteTask::state),
+        last_root_poll,
+        packets,
+        tasks,
+    }
+}
+
+/// Reports what an attempt is waiting on once it stops changing.
+///
+/// Driven by the facts rather than by a timer alone: an attempt that is still
+/// moving says nothing, and one that has stopped says what it stopped on, once
+/// per interval, for as long as it is stopped. One line at the end would not
+/// be enough -- the attempt's own timeout is one of the outcomes this has to
+/// explain, and a hang that is killed from outside never reaches an end.
+struct TaskRoundWaitWitness {
+    facts: TaskRoundWaitFacts,
+    unchanged_since: Instant,
+}
+
+impl TaskRoundWaitWitness {
+    const fn new(facts: TaskRoundWaitFacts, now: Instant) -> Self {
+        Self {
+            facts,
+            unchanged_since: now,
+        }
+    }
+
+    /// Records this turn's facts, reporting them when a whole interval passed
+    /// with none of them changing.
+    fn observe(&mut self, execution_id: QueryExecutionId, facts: TaskRoundWaitFacts, now: Instant) {
+        if self.facts != facts {
+            self.facts = facts;
+            self.unchanged_since = now;
+            return;
+        }
+        if now.duration_since(self.unchanged_since) < TASK_ROUND_WAIT_REPORT_INTERVAL {
+            return;
+        }
+        self.unchanged_since = now;
+        tracing::warn!(
+            execution_id = ?execution_id,
+            waiting_on = %self.facts,
+            "attempt made no observable progress for {:?}; these are the facts its \
+             client-visible completion is waiting on",
+            TASK_ROUND_WAIT_REPORT_INTERVAL,
+        );
+    }
+}
+
+/// Everything both execution paths receive from the shared preamble.
+///
+/// It exists so the two paths take the same frozen inputs rather than
+/// re-deriving any of them: one attempt is scheduled, sealed and budgeted
+/// exactly once, whichever path runs it.
+struct RoundHandoff<'a> {
+    query_id: QueryId,
+    execution_id: QueryExecutionId,
+    statement_deadline: Instant,
+    timeout_ms: i64,
+    intent: DistributedQueryIntent,
+    /// Only the request fields both paths still need: `artifacts` is consumed
+    /// by the preamble that produced `runtime_filter_ready`, so the request
+    /// cannot travel whole.
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
+    completion: crate::query_execution::contract::QueryOutcomeFactory,
+    topology: BackendTopologySnapshot,
+    statistics_program: Option<crate::query_execution::statistics::StatisticsCollectionProgram>,
+    write_stack_session: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
+    backend_services: QueryBackendServices,
+    dispatcher: Arc<dyn FragmentDispatcher>,
+    retry_boundary: Option<&'a dyn PreReadyRetryBoundary>,
+    runtime_filter_ready: RuntimeFilterDeploymentReadyDistributedQuery,
+    init_options: QueryInitOptions,
+    feedback_declaration:
+        crate::runtime_filter::install_encoder::FrontendRuntimeFilterFeedbackDeclaration,
+    feedback_state: Arc<RuntimeFilterFeedbackState>,
+    split_assignment_plan: Option<RoundSplitAssignmentPlan>,
+    scheduled_backend_ownership: Vec<(usize, BackendProcessId)>,
+}
+
+/// Hands the substrate whatever split delivery produced, then steps the runner.
+///
+/// The order is the reason this is one function: a submission recorded before
+/// the turn is released by that same turn, while one recorded after it waits a
+/// whole turn for no reason. Every submission taken is reported back, because
+/// a submission the substrate refused would otherwise keep its sender blocked
+/// until the driver's own timeout and then be resent -- a retry of a decision.
+fn advance_task_round(
+    round: &mut TaskRound,
+    split_delivery: &SplitDeliveryBridge,
+) -> Result<TurnReport, TaskExecutionError> {
+    for pending in split_delivery.take_pending() {
+        let delivery = pending.delivery();
+        let task = pending.task();
+        let admitted = round
+            .execution_mut()
+            .enqueue_task_update(task, pending.into_update());
+        let reported = match &admitted {
+            Ok(admission) => Ok(*admission),
+            Err(error) => Err(error),
+        };
+        split_delivery
+            .admit(delivery, reported)
+            .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
+        // A refused fact is the frontend's own disagreement about what this
+        // task may still be told, so it fails the attempt rather than being
+        // dropped after the sender has been told about it.
+        admitted?;
+    }
+    round.turn()
+}
+
+/// How one failure of an attempt that has not finished starting is judged.
+///
+/// Before every query context is established, a failure may be the shadow of a
+/// backend that was replaced or went unavailable between the schedule and the
+/// establish. The failure's own text never decides that; this only records
+/// that the membership owner should be asked, and for how long.
+///
+/// A cancelled attempt asks nobody. The cancellation is held as the live view
+/// rather than a snapshot so that question is answered when the failure is
+/// judged rather than when this turn's classification was built: the two
+/// differ, because one classification judges several break sites.
+#[derive(Clone, Copy)]
+struct TaskRoundFailureClassification<'a> {
+    before_contexts_established: bool,
+    captured: &'a BackendTopologySnapshot,
+    observation_deadline: Instant,
+    cancellation: &'a crate::common::query_cancellation::QueryCancellationView,
+}
+
+impl TaskRoundFailureClassification<'_> {
+    /// Whether a membership observation could still change this attempt's
+    /// answer.
+    ///
+    /// It cannot once cancellation is latched, and there are only two
+    /// consumers of what such an observation would prove. The client is one:
+    /// a cancelled statement finishes `Cancelled`, so it is owed
+    /// `ER_QUERY_INTERRUPTED` whatever the membership owner goes on to say.
+    /// The pre-ready replan is the other, and it must never re-run a
+    /// statement the client killed.
+    ///
+    /// So the observation is pure cost, and on the `KILL QUERY` form it is
+    /// cost the killing client pays directly: that interrupt is deliberately
+    /// withheld until this worker unwinds, so the client may reuse its
+    /// connection (`cancellation_requires_statement_fence` in
+    /// `crate::query`). Entering a blocking wait on the membership owner here
+    /// is therefore the drain's own rule broken one stage earlier -- the
+    /// answer is decided, and every moment spent proving something about it
+    /// is a moment the client waits for an answer it could already have had.
+    fn observation_can_change_the_answer(self) -> bool {
+        !self.cancellation.is_cancelled()
+    }
+}
+
+/// Whether a pre-ControlReady failure is really this attempt's own, or the
+/// shadow of a backend the membership owner can prove was replaced.
+///
+/// `Some` is typed pre-ready evidence the caller returns as it stands; `None`
+/// means the failure belongs to this attempt and the caller fails it closed.
+///
+/// Split out of `fail_task_round` so the rule is assertable on its own. What
+/// it protects is a latency, not a value, and a judgement reachable only
+/// through a method that needs a whole live attempt cannot be timed.
+fn judge_pre_ready_task_round_failure(
+    topology: &dyn BackendTopologyPort,
+    classification: TaskRoundFailureClassification<'_>,
+    message: &str,
+) -> Option<DistributedQueryError> {
+    if !classification.before_contexts_established {
+        return None;
+    }
+    // Checked before the observation rather than inside it, because the
+    // observation is a blocking wait on the membership owner and the whole
+    // point is not to enter one. See
+    // `TaskRoundFailureClassification::observation_can_change_the_answer`.
+    if !classification.observation_can_change_the_answer() {
+        return None;
+    }
+    let classified = reclassify_pre_ready_lifecycle_failure(
+        topology,
+        classification.captured,
+        DistributedQueryError::pre_ready_topology_observation(message.to_owned()),
+        classification.observation_deadline,
+    );
+    classified
+        .pre_ready_topology_outcome()
+        .is_some()
+        .then_some(classified)
+}
+
+/// Whether this task's creation has been acknowledged.
+///
+/// The root result plane refuses a poll for a task whose creation transaction
+/// has not committed, so polling before this is true would turn a normal
+/// startup race into a query failure.
+fn task_is_created(round: &TaskRound, identity: TaskIdentity) -> bool {
+    round
+        .execution()
+        .task(identity.task_id())
+        .is_some_and(|task| matches!(task.state(), RemoteTaskState::Created))
+}
+
+/// The wait one root result poll asks for, bounded by the statement deadline.
+fn max_root_result_wait(now: Instant, deadline: Instant) -> MaxWait {
+    let remaining = deadline.saturating_duration_since(now);
+    let wait = remaining
+        .min(MAX_ROOT_RESULT_WAIT)
+        .max(Duration::from_millis(1));
+    // `wait` is already clamped into (0, MAX_ROOT_RESULT_WAIT], which is far
+    // inside what `MaxWait` represents, so the fallback is unreachable rather
+    // than a silent widening of a wait the deadline had bounded.
+    MaxWait::new(wait).unwrap_or_else(|_| MaxWait::default_for(OperationKind::GetFinalTaskInfo))
+}
+
+/// One attempt's root result polls, run beside the loop that owns the attempt.
+///
+/// A poll asks the root task's backend to hold the request until it has
+/// something to say, for up to [`MAX_ROOT_RESULT_WAIT`]. An attempt has
+/// exactly one thread, and it is the thread that turns the task state
+/// machine: waiting out the poll on it stops that machine for the whole wait,
+/// and turning it is what dispatches an edge open, settles an
+/// acknowledgement and folds status.
+///
+/// Every one of those decisions is made by another thread -- a create
+/// acknowledgement arriving, a status event published -- so each one that
+/// lands while the poll is in flight waits for the poll instead of for its
+/// own facts. A distributed `SELECT` opens its producers' edges exactly
+/// there, which cost one whole poll wait per edge decision and showed up
+/// nowhere except as latency: measured on a 1FE+3BE cluster, every statement
+/// of the `filter` suite took ~0.85 s, of which ~0.05 s was work.
+///
+/// So the polls run here instead. One is in flight at a time, in order, and
+/// each answer wakes the loop -- the read is exactly as sequential and as
+/// prompt as it was, while the loop stays free to move a decision the moment
+/// it is made.
+struct RootResultPolls {
+    answers: std::sync::mpsc::Receiver<Result<RootResultOutcome, String>>,
+}
+
+impl RootResultPolls {
+    /// Starts polling `root_task`.
+    ///
+    /// The caller has already observed that this task's creation was
+    /// acknowledged: the result plane refuses a poll for a task it does not
+    /// hold yet, and that refusal fails the attempt.
+    fn start(
+        transport: Arc<dyn TaskResultTransport>,
+        root_task: TaskIdentity,
+        expected_output_schema: novarocks_execution::exec::chunk::ChunkSchemaRef,
+        statement_deadline: Instant,
+        wake: Arc<dyn StatusIntakeWake>,
+    ) -> Result<Self, String> {
+        // One answer of slack, so the next poll may already be in flight
+        // while the loop folds the last one. More would buy nothing: the
+        // answers are one ordered stream with one consumer.
+        let (sender, answers) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("root-result-polls".to_owned())
+            .spawn(move || {
+                loop {
+                    let now = Instant::now();
+                    if now >= statement_deadline {
+                        break;
+                    }
+                    let answer = transport.fetch_root_result(
+                        root_task,
+                        max_root_result_wait(now, statement_deadline),
+                        Some(ExpectedOutputSchemaView::new(&expected_output_schema)),
+                    );
+                    // Nothing is polled after an answer the loop cannot ask
+                    // to be repeated. The stream has ended or the read
+                    // failed, and a poll past that point is refused by a
+                    // backend that has already handed its result over -- an
+                    // error the loop would read as this query's failure.
+                    let last = !matches!(
+                        answer,
+                        Ok(RootResultOutcome::Ready { .. } | RootResultOutcome::NotReady)
+                    );
+                    if sender.send(answer).is_err() {
+                        // The loop stopped reading, so this attempt is over.
+                        break;
+                    }
+                    wake.wake();
+                    if last {
+                        break;
+                    }
+                }
+            })
+            .map(|_| Self { answers })
+            .map_err(|error| format!("root result poller thread could not start: {error}"))
+    }
+
+    /// The next answer, if one has arrived.
+    ///
+    /// A disconnected poller answers `None` for the rest of the attempt: it
+    /// stops only after a terminal answer this loop already folded, or at the
+    /// statement deadline the loop checks itself.
+    fn take(&mut self) -> Option<Result<RootResultOutcome, String>> {
+        self.answers.try_recv().ok()
+    }
+}
+
+/// Feeds every task's latest status to the write completion tracker.
+///
+/// Every task, not only the declared writers: a task that reported writer
+/// facts without being declared a writer means the declared set is not the
+/// real one, and that is a fact only the whole set can show.
+fn observe_write_statuses(round: &TaskRound, tracker: &mut WriteCompletionTracker) {
+    for stage in round.execution().graph().stages() {
+        let Some(execution_stage) = round.execution().stage(stage.stage_id()) else {
+            continue;
+        };
+        for (_, task) in execution_stage.tasks() {
+            if let Some(status) = task.status() {
+                tracker.observe_status(status);
+            }
+        }
+    }
+}
+
+/// Reads the bounded final info of every terminal task of this attempt.
+///
+/// Final info is observation only: success and failure are decided by
+/// `TaskStatus` alone, so a task that cannot answer costs diagnostics and
+/// nothing else. That is why a failed read is logged and skipped rather than
+/// failing a query that already completed.
+struct FinalTaskInfoCollector<'a> {
+    transport: &'a dyn TaskResultTransport,
+    collected: Vec<FinalTaskInfo>,
+    read: BTreeSet<TaskId>,
+    enabled: bool,
+}
+
+impl<'a> FinalTaskInfoCollector<'a> {
+    /// Collects nothing unless this attempt's intent asked for a profile.
+    ///
+    /// Final info is one extra round trip per task, and only `EXPLAIN ANALYZE`
+    /// has anything to do with it.
+    const fn new(transport: &'a dyn TaskResultTransport, enabled: bool) -> Self {
+        Self {
+            transport,
+            collected: Vec::new(),
+            read: BTreeSet::new(),
+            enabled,
+        }
+    }
+
+    /// Reads the final info of every task that has just become terminal.
+    ///
+    /// Called on each turn rather than once at the end because releasing a
+    /// query context is what lets a backend reclaim its retained terminal
+    /// records: a sweep after the drain would find exactly the tasks whose
+    /// info it wanted already gone.
+    ///
+    /// Losing one costs diagnostics and nothing else -- success and failure
+    /// are decided by `TaskStatus` alone -- so a failed read is reported and
+    /// skipped rather than failing a query that already ran.
+    fn observe(&mut self, round: &TaskRound) {
+        if !self.enabled {
+            return;
+        }
+        for stage in round.execution().graph().stages() {
+            let Some(execution_stage) = round.execution().stage(stage.stage_id()) else {
+                continue;
+            };
+            for (task_id, task) in execution_stage.tasks() {
+                if !task.is_terminal() || self.read.contains(task_id) {
+                    continue;
+                }
+                let Some(observed) = task.status() else {
+                    continue;
+                };
+                self.read.insert(*task_id);
+                match self.transport.final_task_info(task.identity()) {
+                    Ok(FinalTaskInfoRead::Available(info)) => {
+                        // A final info that contradicts the terminal already
+                        // observed is a protocol conflict, not a profile: two
+                        // answers would exist to a question with one answer.
+                        match accept_final_info(observed, &info) {
+                            Ok(()) => self.collected.push(info),
+                            Err(error) => tracing::warn!(
+                                task = %task.identity(),
+                                error = %error,
+                                "final task info disagrees with the observed terminal; \
+                                 it is dropped from the profile"
+                            ),
+                        }
+                    }
+                    Ok(FinalTaskInfoRead::Unavailable(outcome)) => tracing::debug!(
+                        task = %task.identity(),
+                        outcome = ?outcome,
+                        "final task info is unavailable"
+                    ),
+                    Err(error) => tracing::warn!(
+                        task = %task.identity(),
+                        error = %error,
+                        "final task info could not be read"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Keeps turning until every task terminated and every context was released.
+///
+/// Bounded by the statement's own deadline. A drain that does not finish
+/// inside it is reported and left to the query execution lease, which is the
+/// mechanism that exists for exactly this: it never fails a completion that
+/// has already been linearized.
+/// When a drain gives up, whichever of its own budget and the statement's
+/// deadline runs out first.
+///
+/// Split out from the drain so the rule is assertable: the client-visible
+/// answer is already linearized when this is computed, so a drain that
+/// silently inherited the statement deadline would hold the caller for the
+/// remainder of a long statement timeout with a finished result in hand.
+fn drain_deadline(statement_deadline: Instant, drain_budget: Duration, now: Instant) -> Instant {
+    statement_deadline.min(now + drain_budget)
+}
+
+fn drain_task_round(
+    round: &mut TaskRound,
+    split_delivery: &SplitDeliveryBridge,
+    wake: &CondvarWake,
+    split_assignment: Option<&SplitAssignmentRoundGuard>,
+    statement_deadline: Instant,
+    drain_budget: Duration,
+    execution_id: QueryExecutionId,
+    final_task_info: &mut FinalTaskInfoCollector<'_>,
+) {
+    // The drain gets a budget of its own rather than the statement's. The
+    // client-visible answer is already linearized, so every moment spent here
+    // is a moment the client waits for a result it could already have had: a
+    // query that finished in a second against one stuck backend must not hold
+    // its caller for the rest of a five-minute statement timeout.
+    //
+    // The bound is the transport's own queue-residence budget, not a number
+    // invented here. That is how long a released operation may sit before the
+    // transport itself calls it lost, so a release still unanswered after it
+    // is not going to be answered. The statement deadline still caps it: a
+    // statement already past its deadline has no time left to lend.
+    let deadline = drain_deadline(statement_deadline, drain_budget, Instant::now());
+    loop {
+        let split_worker_stopped =
+            split_assignment.is_none_or(SplitAssignmentRoundGuard::is_finished);
+        if round.attempt_drained() && split_worker_stopped {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let facts = round.execution().attempt_drain_facts();
+            tracing::warn!(
+                execution_id = ?execution_id,
+                tasks_terminal = facts.all_tasks_terminal(),
+                output_released = facts.all_output_released(),
+                contexts_released = facts.all_contexts_released(),
+                split_worker_stopped,
+                "attempt did not finish draining inside its drain budget; \
+                 the query execution lease closes what is left"
+            );
+            return;
+        }
+        if let Err(error) = advance_task_round(round, split_delivery) {
+            tracing::warn!(
+                execution_id = ?execution_id,
+                error = %error,
+                "attempt could not be drained after its client-visible completion"
+            );
+            return;
+        }
+        // Each task's final info is read here, while its context still exists:
+        // releasing the context is what lets its backend reclaim the retained
+        // terminal record this reads.
+        final_task_info.observe(round);
+        wake.wait(TASK_ROUND_IDLE_WAIT);
+    }
+}
+
+/// Stands every query context of a failed attempt down.
+///
+/// Best effort by construction: the attempt has already failed, so an abort
+/// that cannot be sent changes nothing about the query's answer -- it only
+/// leaves the backends to their lease. What it must not do is return before
+/// the aborts have been released to the transport.
+fn abort_task_round(round: &mut TaskRound, reason: &str) {
+    let contexts = round
+        .execution()
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    for context in contexts {
+        if let Err(error) = round
+            .execution_mut()
+            .abort_context(context, AbortCause::QueryFailed)
+        {
+            tracing::warn!(
+                context = %context,
+                error = %error,
+                reason,
+                "query context could not be aborted after the attempt failed"
+            );
+        }
+    }
+}
 /// Open one lazy split source per typed connector scan of this round.
 ///
 /// Enumeration itself does not happen here: `get_splits` hands back a source
@@ -2544,7 +4372,6 @@ mod tests {
 fn prepare_round_split_assignment(
     artifacts: &PreparedDistributedQuery,
     schedule: &ValidatedFragmentSchedule,
-    data_runtime: FrontendDataRuntime,
     retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
     feedback: Arc<RuntimeFilterFeedbackState>,
     initial_dynamic_filter_wait_cap: Duration,
@@ -2597,14 +4424,12 @@ fn prepare_round_split_assignment(
             )));
         }
     }
-    let transport = GrpcTaskUpdateTransport::new(&assignment_endpoints(schedule), data_runtime)
-        .map_err(|error| failed(format!("task update transport: {error}")))?;
     Ok(Some(RoundSplitAssignmentPlan::new(
-        Arc::new(transport),
         targets,
         sources,
         retry_policy,
         initial_dynamic_filter_wait_cap,
+        assignment_endpoints(schedule),
     )))
 }
 

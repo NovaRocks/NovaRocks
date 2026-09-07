@@ -39,14 +39,9 @@ pub const MV_KNOWN_COMMITTED_BEFORE_PROJECTOR_CAS_MARKER: &str =
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum QueryLifecycleFaultKind {
     InitAckDrop,
-    StageAckDrop,
-    StartAckDrop,
     StartAckSuppress,
-    HeartbeatStop,
-    HeartbeatStopAfterStage,
     RestartAfterInitAck,
     TerminalAckDrop,
-    TerminalSnapshotStreamDrop,
     TerminalSnapshotConflict,
     ObservationP2AssemblyFailure,
     ObservationP2BudgetPressure,
@@ -62,10 +57,96 @@ pub enum QueryLifecycleFaultKind {
     RuntimeFilterFeedbackContractDigestCorrupt,
     RuntimeFilterFeedbackUnavailable,
     TaskUpdateTerminalAckDrop,
+    /// Drops the acknowledgement of one `EstablishQueryContext` after the
+    /// backend has installed the context. The context exists and the frontend
+    /// does not know it, which is the unknown-outcome case the protocol's
+    /// idempotent replay exists to survive.
+    EstablishContextAckDrop,
+    /// Drops the acknowledgement of one `CreateTask` after the task is
+    /// admitted and running. It is the successor of the retired protocol's
+    /// separate Stage and Start acknowledgements, because `CreateTask` is the
+    /// task protocol's single admission point rather than two phases.
+    CreateTaskAckDrop,
+    /// Drops one `SubscribeTaskStatus` stream after the subscription is
+    /// established. Cursors are unconsumed, so the observation is recovered by
+    /// resubscribing rather than by re-running anything.
+    TaskStatusSubscriptionDrop,
+    /// Drops the acknowledgement of one applied lease renewal. It has no
+    /// counterpart in the retired lifecycle: the query execution lease is a
+    /// domain the task protocol introduced.
+    LeaseRenewalAckDrop,
+    /// Stops answering lease renewals for the rest of the attempt, rather
+    /// than dropping one acknowledgement. The lease then genuinely expires and
+    /// the backend must stand its tasks down -- the failure path the retired
+    /// protocol's heartbeat-loss case asserted, which a single dropped
+    /// acknowledgement cannot reach because the frontend simply resends it.
+    LeaseRenewalStop,
+    /// Fails one task's local execution after the task started.
+    ///
+    /// It is deliberately not an acknowledgement drop: the subject is a task
+    /// that was admitted, published RUNNING, and then failed on its own, which
+    /// is the only way to observe the attempt-wide stand-down a single
+    /// participant's failure must cause. It never fabricates a success and
+    /// never skips the create it follows.
+    TaskExecutionFailure,
+    /// Holds one applied `EstablishQueryContext` open so the harness can
+    /// replace that exact backend process.
+    ///
+    /// The successor of `RestartAfterInitAck`: the establish is the task
+    /// protocol's first per-backend admission point, so it is where a process
+    /// replacement can still be observed against a context the backend really
+    /// installed. It fabricates nothing -- it publishes a token-scoped marker
+    /// and waits to be killed.
+    ///
+    /// Its arming is matched rather than consumed. The frontend's own operation
+    /// wait is shorter than the hold, so it replays the establish while the
+    /// rendezvous is still waiting, and answering that replay would tell the
+    /// frontend this backend is ready moments before the harness replaces it.
+    RestartAfterEstablishContext,
     StageConflictAfterApply,
     StartDigestCorrupt,
     ObservationForeignParticipant,
-    RuntimeFilterFeedbackForeignParticipant,
+    /// Answers one admitted `CreateTask` with the task protocol's own
+    /// `CreateConflict` verdict.
+    ///
+    /// The successor of `StageConflictAfterApply`, and the same shape: the
+    /// operation really applied -- the task is admitted and running on this
+    /// backend -- and only the answer says otherwise. That is what makes the
+    /// resulting failure a statement about the frontend's fence rather than
+    /// about the backend's state, because a frontend that retried or ignored a
+    /// conflict verdict would find a working task and the query would succeed.
+    CreateTaskConflictAfterApply,
+    /// Makes one admitted `CreateTask` acknowledgement name a different task
+    /// than the request it answers.
+    ///
+    /// The successor of `StartDigestCorrupt`. The digest that fault corrupted
+    /// has no counterpart: the task protocol has no second operation that
+    /// commits a previously staged plan, and a descriptor's fingerprint is
+    /// derived by the receiver from the bytes it just read, so no request field
+    /// can disagree with a plan the receiver already holds. What survives is
+    /// the identity half of the same fence -- `TaskIdentity` is indivisible and
+    /// an answer that names another task is refused rather than adopted -- so
+    /// that is the value this fault misstates.
+    CreateTaskReceiptForeignTask,
+    /// Makes one delivered task status event name a foreign backend process.
+    ///
+    /// The successor of `ObservationForeignParticipant`, which swapped the
+    /// `ParticipantAttemptRef` of a fragment observation on the retired control
+    /// stream. The surviving observation channel is `SubscribeTaskStatus`, and
+    /// the identity it carries is the event's own `TaskIdentity`, so the
+    /// forgeable fact is that identity's backend process.
+    TaskStatusForeignProcess,
+    /// Makes one terminal logical feedback publication claim it belongs to
+    /// another attempt of the same query.
+    ///
+    /// It replaces the retired `RuntimeFilterFeedbackForeignParticipant`,
+    /// which swapped the publisher's `ParticipantAttemptRef` on the control
+    /// stream. The task carrier names no publisher on the wire -- the
+    /// frontend derives it from the `TaskIdentity` it fetched from -- so that
+    /// forgery has no expression on the surviving carrier. The attempt the
+    /// publication claims is the part a backend can still misstate, and the
+    /// frontend fences it ahead of the pruning winner.
+    RuntimeFilterFeedbackForeignAttempt,
     /// Fails one connector writer at commit-fragment egress. It only fails a
     /// writer that already staged its artifacts; it never substitutes a
     /// fabricated carrier, so it cannot become a production fallback.
@@ -76,16 +157,11 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 35] = [
         Self::InitAckDrop,
-        Self::StageAckDrop,
-        Self::StartAckDrop,
         Self::StartAckSuppress,
-        Self::HeartbeatStop,
-        Self::HeartbeatStopAfterStage,
         Self::RestartAfterInitAck,
         Self::TerminalAckDrop,
-        Self::TerminalSnapshotStreamDrop,
         Self::TerminalSnapshotConflict,
         Self::ObservationP2AssemblyFailure,
         Self::ObservationP2BudgetPressure,
@@ -101,10 +177,20 @@ impl QueryLifecycleFaultKind {
         Self::RuntimeFilterFeedbackContractDigestCorrupt,
         Self::RuntimeFilterFeedbackUnavailable,
         Self::TaskUpdateTerminalAckDrop,
+        Self::EstablishContextAckDrop,
+        Self::CreateTaskAckDrop,
+        Self::TaskStatusSubscriptionDrop,
+        Self::LeaseRenewalAckDrop,
+        Self::LeaseRenewalStop,
+        Self::TaskExecutionFailure,
+        Self::RestartAfterEstablishContext,
         Self::StageConflictAfterApply,
         Self::StartDigestCorrupt,
         Self::ObservationForeignParticipant,
-        Self::RuntimeFilterFeedbackForeignParticipant,
+        Self::CreateTaskConflictAfterApply,
+        Self::CreateTaskReceiptForeignTask,
+        Self::TaskStatusForeignProcess,
+        Self::RuntimeFilterFeedbackForeignAttempt,
         Self::ConnectorWriteWriterFailure,
         Self::ConnectorWriteRootFailure,
     ];
@@ -112,14 +198,9 @@ impl QueryLifecycleFaultKind {
     pub const fn file_stem(self) -> &'static str {
         match self {
             Self::InitAckDrop => "init-ack-drop",
-            Self::StageAckDrop => "stage-ack-drop",
-            Self::StartAckDrop => "start-ack-drop",
             Self::StartAckSuppress => "start-ack-suppress",
-            Self::HeartbeatStop => "heartbeat-stop",
-            Self::HeartbeatStopAfterStage => "heartbeat-stop-after-stage",
             Self::RestartAfterInitAck => "restart-after-init-ack",
             Self::TerminalAckDrop => "terminal-ack-drop",
-            Self::TerminalSnapshotStreamDrop => "terminal-snapshot-stream-drop",
             Self::TerminalSnapshotConflict => "terminal-snapshot-conflict",
             Self::ObservationP2AssemblyFailure => "observation-p2-assembly-failure",
             Self::ObservationP2BudgetPressure => "observation-p2-budget-pressure",
@@ -137,12 +218,20 @@ impl QueryLifecycleFaultKind {
             }
             Self::RuntimeFilterFeedbackUnavailable => "runtime-filter-feedback-unavailable",
             Self::TaskUpdateTerminalAckDrop => "task-update-terminal-ack-drop",
+            Self::EstablishContextAckDrop => "establish-context-ack-drop",
+            Self::CreateTaskAckDrop => "create-task-ack-drop",
+            Self::TaskStatusSubscriptionDrop => "task-status-subscription-drop",
+            Self::LeaseRenewalAckDrop => "lease-renewal-ack-drop",
+            Self::LeaseRenewalStop => "lease-renewal-stop",
+            Self::TaskExecutionFailure => "task-execution-failure",
+            Self::RestartAfterEstablishContext => "restart-after-establish-context",
             Self::StageConflictAfterApply => "stage-conflict-after-apply",
             Self::StartDigestCorrupt => "start-digest-corrupt",
             Self::ObservationForeignParticipant => "observation-foreign-participant",
-            Self::RuntimeFilterFeedbackForeignParticipant => {
-                "runtime-filter-feedback-foreign-participant"
-            }
+            Self::CreateTaskConflictAfterApply => "create-task-conflict-after-apply",
+            Self::CreateTaskReceiptForeignTask => "create-task-receipt-foreign-task",
+            Self::TaskStatusForeignProcess => "task-status-foreign-process",
+            Self::RuntimeFilterFeedbackForeignAttempt => "runtime-filter-feedback-foreign-attempt",
             Self::ConnectorWriteWriterFailure => "connector-write-writer-failure",
             Self::ConnectorWriteRootFailure => "connector-write-root-failure",
         }
@@ -164,7 +253,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 20] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 30] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -179,10 +268,34 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 20] = [
     QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
     QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
+    // The task protocol's four core-operation faults. Each drops an
+    // acknowledgement the backend already earned; none of them skips the
+    // operation, because a fault that never applied anything would exercise
+    // no replay path at all.
+    QueryLifecycleFaultKind::EstablishContextAckDrop,
+    QueryLifecycleFaultKind::CreateTaskAckDrop,
+    QueryLifecycleFaultKind::TaskStatusSubscriptionDrop,
+    QueryLifecycleFaultKind::LeaseRenewalAckDrop,
+    QueryLifecycleFaultKind::LeaseRenewalStop,
+    // The task protocol's two non-acknowledgement faults. One fails a task
+    // that really started; the other holds an applied establish open so the
+    // harness can replace that exact backend process. Neither can be written
+    // as an acknowledgement drop, because in both cases the answer arriving
+    // is not what the case is about.
+    QueryLifecycleFaultKind::TaskExecutionFailure,
+    QueryLifecycleFaultKind::RestartAfterEstablishContext,
     QueryLifecycleFaultKind::StageConflictAfterApply,
     QueryLifecycleFaultKind::StartDigestCorrupt,
     QueryLifecycleFaultKind::ObservationForeignParticipant,
-    QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignParticipant,
+    // The task protocol's three identity-fencing faults, successors of the
+    // three entries above. Each misstates one fact on the wire after the
+    // operation it follows has genuinely applied: the create's verdict, the
+    // create acknowledgement's task, and a status event's backend process.
+    // None of them skips an operation, and none fabricates a success.
+    QueryLifecycleFaultKind::CreateTaskConflictAfterApply,
+    QueryLifecycleFaultKind::CreateTaskReceiptForeignTask,
+    QueryLifecycleFaultKind::TaskStatusForeignProcess,
+    QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignAttempt,
     // The write data plane's two faults. Both only ever fail: a writer fault
     // fires at commit-fragment egress, after the writer already staged, and a
     // root fault fires at carrier validation. Neither substitutes a value.
@@ -326,40 +439,6 @@ mod typed {
         pub process_id: BackendProcessId,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct StagePrepareFailure {
-        pub token: String,
-        pub ordinal: usize,
-    }
-
-    pub fn claim_stage_prepare_failure(
-        root: &Path,
-        available_fragments: usize,
-    ) -> Result<Option<StagePrepareFailure>, String> {
-        let path = root.join("stage-prepare-fail.trigger");
-        let contents = match fs::read_to_string(&path) {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("read {}: {error}", path.display())),
-        };
-        let fields = parse_fields(&contents)?;
-        let failure = StagePrepareFailure {
-            token: required_token(&fields)?,
-            ordinal: required_usize(&fields, "ordinal")?,
-        };
-        if failure.ordinal == 0 {
-            return Err("stage prepare fault ordinal must be at least one".to_string());
-        }
-        if failure.ordinal > available_fragments {
-            return Ok(None);
-        }
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(Some(failure)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("consume {}: {error}", path.display())),
-        }
-    }
-
     pub fn bind_armed_fault(
         root: &Path,
         kind: QueryLifecycleFaultKind,
@@ -390,6 +469,36 @@ mod typed {
         let trigger = trigger_path(root, backend_index, kind);
         publish_new(&trigger, serialize_scope(&scope).as_bytes())?;
         fs::remove_file(&arm).map_err(|error| format!("consume {}: {error}", arm.display()))?;
+        Ok(Some(scope))
+    }
+
+    /// Matches an armed fault without consuming it.
+    ///
+    /// A one-shot claim answers "perturb this one operation". Some faults have
+    /// to answer "keep perturbing every one of these until the attempt ends" --
+    /// a lease that genuinely expires needs every renewal refused, not one.
+    /// Consuming the trigger would make the second renewal succeed and the
+    /// lease survive, which is the opposite of what such a case asserts.
+    pub fn match_persistent_fault(
+        root: &Path,
+        kind: QueryLifecycleFaultKind,
+        execution_id: QueryExecutionId,
+        backend_index: usize,
+        process_id: BackendProcessId,
+    ) -> Result<Option<QueryLifecycleFaultScope>, String> {
+        let trigger = trigger_path(root, backend_index, kind);
+        let contents = match fs::read_to_string(&trigger) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("read {}: {error}", trigger.display())),
+        };
+        let scope = parse_scope(&contents)?;
+        if scope.execution_id != execution_id
+            || scope.backend_index != backend_index
+            || scope.process_id != process_id
+        {
+            return Ok(None);
+        }
         Ok(Some(scope))
     }
 
@@ -630,14 +739,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 30);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 35);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 20);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 30);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)
@@ -649,6 +758,42 @@ mod tests {
         assert_eq!(
             parse_runner_rfo_kind("task-update-terminal-ack-drop"),
             Some(QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("establish-context-ack-drop"),
+            Some(QueryLifecycleFaultKind::EstablishContextAckDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("create-task-ack-drop"),
+            Some(QueryLifecycleFaultKind::CreateTaskAckDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("task-status-subscription-drop"),
+            Some(QueryLifecycleFaultKind::TaskStatusSubscriptionDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("lease-renewal-ack-drop"),
+            Some(QueryLifecycleFaultKind::LeaseRenewalAckDrop)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("task-execution-failure"),
+            Some(QueryLifecycleFaultKind::TaskExecutionFailure)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("restart-after-establish-context"),
+            Some(QueryLifecycleFaultKind::RestartAfterEstablishContext)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("create-task-conflict-after-apply"),
+            Some(QueryLifecycleFaultKind::CreateTaskConflictAfterApply)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("create-task-receipt-foreign-task"),
+            Some(QueryLifecycleFaultKind::CreateTaskReceiptForeignTask)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("task-status-foreign-process"),
+            Some(QueryLifecycleFaultKind::TaskStatusForeignProcess)
         );
         assert_eq!(
             parse_runner_rfo_kind("connector-write-writer-failure"),

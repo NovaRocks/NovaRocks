@@ -33,6 +33,7 @@ use crate::runtime::fragment::error::{
 use crate::runtime::fragment::instance::{FragmentInstanceSpec, FragmentSinkAssignment};
 use crate::runtime::fragment::io::ExchangeFrameTransmitter;
 use crate::runtime::fragment::io::FragmentResultSession;
+use crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates;
 
 #[allow(
     dead_code,
@@ -44,7 +45,7 @@ pub(crate) fn materialize_fragment_sink(
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
-    materialize_fragment_sink_with_result(program, instance, transmitter, result_session)
+    materialize_fragment_sink_with_result(program, instance, transmitter, result_session, None)
         .map(|materialized| materialized.factory)
 }
 
@@ -62,6 +63,7 @@ pub(crate) fn materialize_fragment_sink_with_result(
     instance: &FragmentInstanceSpec,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
+    edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
 ) -> Result<MaterializedFragmentSink, FragmentLaunchError> {
     materialize_fragment_sink_components_with_result_and_statistics(
         program.sink(),
@@ -72,6 +74,7 @@ pub(crate) fn materialize_fragment_sink_with_result(
         program.root_plan_node_id().get(),
         transmitter,
         result_session,
+        edge_gates,
     )
 }
 
@@ -121,6 +124,7 @@ pub(crate) fn materialize_fragment_sink_components_with_result(
         plan_node_id,
         transmitter,
         result_session,
+        None,
     )
     .map(|materialized| materialized.factory)
 }
@@ -138,6 +142,7 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
     result_session: Option<std::sync::Arc<dyn FragmentResultSession>>,
+    edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
 ) -> Result<MaterializedFragmentSink, FragmentLaunchError> {
     match (program.program(), assignment) {
         (FragmentSinkProgram::Result, FragmentSinkAssignment::None) => {
@@ -181,15 +186,22 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             },
         ) => {
             let input = stream_input(stream, destinations.clone())?;
+            let factory = DataStreamSinkFactory::new(
+                input,
+                fragment_instance_id,
+                *sender_id,
+                plan_node_id,
+                stream.partition_arena().clone(),
+                std::sync::Arc::clone(&transmitter),
+            );
+            // Without the gates a push sink sends the moment it has rows, and
+            // the frozen edge's closed state means nothing.
+            let factory = match edge_gates {
+                Some(gates) => factory.with_edge_gates(gates),
+                None => factory,
+            };
             Ok(MaterializedFragmentSink {
-                factory: Box::new(DataStreamSinkFactory::new(
-                    input,
-                    fragment_instance_id,
-                    *sender_id,
-                    plan_node_id,
-                    stream.partition_arena().clone(),
-                    std::sync::Arc::clone(&transmitter),
-                )),
+                factory: Box::new(factory),
                 statistics_handle: None,
             })
         }
@@ -203,6 +215,7 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             *sender_id,
             plan_node_id,
             std::sync::Arc::clone(&transmitter),
+            edge_gates.clone(),
         )
         .map(|factory| MaterializedFragmentSink {
             factory,
@@ -218,6 +231,7 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             *sender_id,
             plan_node_id,
             std::sync::Arc::clone(&transmitter),
+            edge_gates.clone(),
         )
         .map(|factory| MaterializedFragmentSink {
             factory,
@@ -238,6 +252,7 @@ fn materialize_multicast(
     sender_id: Option<i32>,
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
+    edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     ensure_group_count(program.sinks().len(), groups.len())?;
     let sinks = program
@@ -248,14 +263,21 @@ fn materialize_multicast(
             Ok((branch_input(stream, destinations.clone())?, stream.limit()))
         })
         .collect::<Result<Vec<_>, FragmentLaunchError>>()?;
-    Ok(Box::new(MultiCastDataStreamSinkFactory::new(
+    let factory = MultiCastDataStreamSinkFactory::new(
         sinks,
         fragment_instance_id,
         sender_id,
         program.partition_arena().clone(),
         plan_node_id,
         transmitter,
-    )))
+    );
+    // Without the gates a push sink sends the moment it has rows, and the
+    // frozen edge's closed state means nothing.
+    let factory = match edge_gates {
+        Some(gates) => factory.with_edge_gates(gates),
+        None => factory,
+    };
+    Ok(Box::new(factory))
 }
 
 fn materialize_split(
@@ -265,6 +287,7 @@ fn materialize_split(
     sender_id: Option<i32>,
     plan_node_id: i32,
     transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
+    edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
 ) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
     let sinks = program
         .sinks()
@@ -272,7 +295,7 @@ fn materialize_split(
         .zip(groups)
         .map(|(stream, destinations)| branch_input(stream, destinations.clone()))
         .collect::<Result<Vec<_>, FragmentLaunchError>>()?;
-    Ok(Box::new(SplitDataStreamSinkFactory::new(
+    let factory = SplitDataStreamSinkFactory::new(
         sinks,
         fragment_instance_id,
         sender_id,
@@ -282,7 +305,12 @@ fn materialize_split(
         program.split_exprs().to_vec(),
         program.fanout(),
         transmitter,
-    )))
+    );
+    let factory = match edge_gates {
+        Some(gates) => factory.with_edge_gates(gates),
+        None => factory,
+    };
+    Ok(Box::new(factory))
 }
 
 fn stream_input(
@@ -380,7 +408,10 @@ mod tests {
     use novarocks_types::SlotId;
     use novarocks_types::UniqueId;
 
-    use super::{materialize_fragment_sink, materialize_fragment_sink_components};
+    use super::{
+        materialize_fragment_sink, materialize_fragment_sink_components,
+        materialize_fragment_sink_with_result,
+    };
 
     fn test_transmitter() -> std::sync::Arc<dyn ExchangeFrameTransmitter> {
         crate::runtime::fragment::io::exchange::discard_exchange_transmitter()
@@ -450,6 +481,73 @@ mod tests {
     ) {
         assert_eq!(factory.name(), expected);
         assert_eq!(factory.create(1, 0).name(), expected);
+    }
+
+    #[test]
+    fn every_push_sink_shape_receives_the_edge_gates_it_is_given() {
+        // The barrier's behaviour is covered where the operator consults it.
+        // What was missing is the step before that: nothing supplied the gates,
+        // so every frozen edge was effectively open and the closed state meant
+        // nothing. This pins the supply for all three push sink shapes.
+        use crate::exec::operators::{
+            DataStreamSinkFactory, MultiCastDataStreamSinkFactory, SplitDataStreamSinkFactory,
+        };
+        use crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates;
+
+        let gates = ExchangeEdgeGates::try_new(std::iter::empty()).expect("an empty gate set");
+
+        let cases: Vec<(FragmentSinkProgram, FragmentSinkAssignment)> = vec![
+            (
+                FragmentSinkProgram::DataStream(stream_program()),
+                FragmentSinkAssignment::StreamDestinations {
+                    destinations: Vec::new(),
+                    sender_id: None,
+                },
+            ),
+            (
+                FragmentSinkProgram::MultiCastDataStream(
+                    MultiCastDataStreamSinkProgram::try_new(
+                        vec![stream_branch(17)],
+                        ExprArena::default(),
+                    )
+                    .expect("multicast program"),
+                ),
+                FragmentSinkAssignment::DestinationGroups {
+                    groups: vec![Vec::new()],
+                    sender_id: None,
+                },
+            ),
+        ];
+
+        for (sink, assignment) in cases {
+            let program = fragment_program(sink);
+            let instance = instance(assignment);
+            let gated = materialize_fragment_sink_with_result(
+                &program,
+                &instance,
+                test_transmitter(),
+                None,
+                Some(std::sync::Arc::clone(&gates)),
+            )
+            .expect("a gated sink materializes");
+            let ungated = materialize_fragment_sink_with_result(
+                &program,
+                &instance,
+                test_transmitter(),
+                None,
+                None,
+            )
+            .expect("an ungated sink materializes");
+
+            assert!(
+                gated.factory.is_edge_gated(),
+                "materialization dropped the gates"
+            );
+            assert!(
+                !ungated.factory.is_edge_gated(),
+                "a caller with no barrier must not gain one"
+            );
+        }
     }
 
     #[test]

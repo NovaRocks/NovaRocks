@@ -30,9 +30,9 @@ use novarocks_proto_codec::lifecycle::{
     ParticipantManifestDigest, ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach,
     QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome,
     QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
-    QueryStartOutcome, QueryStartRequest, QueryTerminalAck, QueryTerminalProfileContributionV1,
-    QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck,
-    QueryTerminationReason, StageDigest,
+    QueryStartOutcome, QueryStartRequest, QueryTerminalAck, QueryTerminalReportAck,
+    QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck, QueryTerminationReason,
+    StageDigest,
 };
 use novarocks_spi::connector::{
     CatalogProperties, ConnectorError, ConnectorErrorKind, ConnectorStorageResolver,
@@ -61,15 +61,14 @@ use crate::metrics::{
     publish_backend_query_lifecycle_terminal_limits,
 };
 use crate::rpc::client::BackendRpcClient;
+use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::runtime::profile_codec::encode_runtime_profile_tree;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
 use crate::runtime_filter::domain::{
     BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication, BackendFrontendFeedbackSink,
 };
 use crate::runtime_filter::install_decode::decode_runtime_filter_contribution;
-use crate::runtime_filter::observation::{
-    RuntimeFilterChannelTerminal, RuntimeFilterConsumerOutcome, RuntimeFilterObservationSnapshot,
-};
+use crate::runtime_filter::observation::RuntimeFilterObservationSnapshot;
 use crate::runtime_filter::participant::{
     BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
     RuntimeFilterParticipantFactory,
@@ -77,6 +76,7 @@ use crate::runtime_filter::participant::{
 use crate::runtime_filter::rpc::{
     BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
 };
+use crate::runtime_filter::terminal_contribution::capture_terminal_profile_contribution;
 
 const CONTROL_EVENT_BUFFER_CAPACITY: usize = 16;
 const RESERVED_CONTROL_EVENT_CAPACITY: usize = 3;
@@ -101,10 +101,11 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
     ) {
         use novarocks_proto_models::novarocks as wire;
 
-        #[cfg(debug_assertions)]
-        let outcome = force_feedback_unavailable(validated(self.participant.execution_id()))
-            .unwrap_or(outcome);
-
+        // No runner-owned perturbation is claimed here any more. The three
+        // feedback faults moved to `TaskRuntimeFilterFeedbackEgress`, which is
+        // the carrier every production query publishes through; claiming them
+        // on both carriers would let an ANALYZE consume an arming a task-path
+        // case is waiting on.
         let terminal_outcome = match outcome {
             BackendFrontendFeedbackOutcome::CanonicalDomain(domain) => {
                 wire::runtime_filter_feedback_event::TerminalOutcome::CanonicalDomain(
@@ -132,19 +133,11 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
                 )
             }
         };
-        let mut contract_digest = publication.contract_digest().to_vec();
-        #[cfg(debug_assertions)]
-        if corrupt_feedback_contract_digest(validated(self.participant.execution_id())) {
-            contract_digest[0] ^= 1;
-        }
+        let contract_digest = publication.contract_digest().to_vec();
         let event =
             protocol_control_event(wire::query_control_response::Event::RuntimeFilterFeedback(
                 wire::RuntimeFilterFeedbackEvent {
-                    participant_attempt: Some(
-                        feedback_participant_ref(&self.participant)
-                            .as_proto()
-                            .clone(),
-                    ),
+                    participant_attempt: Some(self.participant.as_proto().clone()),
                     participant_id: self.participant_id,
                     deployment_epoch,
                     channel_id: channel_id.get(),
@@ -154,70 +147,6 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
             ));
         let _ = self.events.try_send(event);
     }
-}
-
-#[cfg(debug_assertions)]
-fn corrupt_feedback_contract_digest(execution_id: QueryExecutionId) -> bool {
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return false;
-    };
-    matches!(
-        novarocks_failpoint::claim_matching_receiver_agnostic_fault(
-            &root,
-            QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
-            execution_id,
-        ),
-        Ok(Some(_))
-    )
-}
-
-#[cfg(debug_assertions)]
-fn force_feedback_unavailable(
-    execution_id: QueryExecutionId,
-) -> Option<BackendFrontendFeedbackOutcome> {
-    let root = novarocks_failpoint::configured_root()?;
-    matches!(
-        novarocks_failpoint::claim_matching_receiver_agnostic_fault(
-            &root,
-            QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
-            execution_id,
-        ),
-        Ok(Some(_))
-    )
-    .then_some(BackendFrontendFeedbackOutcome::ProducerUnavailable)
-}
-
-#[cfg(debug_assertions)]
-fn feedback_participant_ref(participant: &ParticipantAttemptRef) -> ParticipantAttemptRef {
-    let execution_id = validated(participant.execution_id());
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return participant.clone();
-    };
-    match novarocks_failpoint::claim_matching_fault_for_process(
-        &root,
-        QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignParticipant,
-        execution_id,
-        validated(participant.backend_process_id()),
-    ) {
-        Ok(Some(scope)) => {
-            eprintln!(
-                "NOVAROCKS_RUNTIME_FILTER_FEEDBACK_FOREIGN_PARTICIPANT execution_id={}:{}:{} backend_index={} token={}",
-                execution_id.query_id().high(),
-                execution_id.query_id().low(),
-                execution_id.attempt_id().get(),
-                scope.backend_index,
-                scope.token
-            );
-            ParticipantAttemptRef::new(execution_id, BackendProcessId::new_v7())
-                .expect("valid generated process creates a foreign participant ref")
-        }
-        Ok(None) | Err(_) => participant.clone(),
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn feedback_participant_ref(participant: &ParticipantAttemptRef) -> ParticipantAttemptRef {
-    participant.clone()
 }
 
 #[cfg(debug_assertions)]
@@ -251,6 +180,24 @@ fn observation_participant_ref(participant: &ParticipantAttemptRef) -> Participa
 #[cfg(not(debug_assertions))]
 fn observation_participant_ref(participant: &ParticipantAttemptRef) -> ParticipantAttemptRef {
     participant.clone()
+}
+
+/// One catalog manager for a registry built without an injected one.
+///
+/// Only the test constructors reach this. Production composes the manager
+/// once and shares it, because it is a process resource that outlives any one
+/// lifecycle stack.
+fn default_catalog_manager() -> Arc<
+    crate::connector::catalog_manager::CatalogManager<
+        crate::connector::ConnectorExecutionRoleBinding,
+    >,
+> {
+    Arc::new(
+        crate::connector::catalog_manager::CatalogManager::try_new(
+            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+        )
+        .expect("the default catalog manager configuration is valid"),
+    )
 }
 
 fn empty_execution_role_binding_factories()
@@ -613,226 +560,6 @@ fn negative_terminal_outcome(
         snapshot: None,
     })
     .expect("Backend-generated negative outcome satisfies the Protocol contract")
-}
-
-fn terminal_profile_contribution(
-    snapshot: RuntimeFilterObservationSnapshot,
-) -> Result<QueryTerminalProfileContributionV1, QueryLifecycleError> {
-    use novarocks_proto_models::{common, novarocks as wire};
-    let channels = snapshot
-        .channels()
-        .iter()
-        .map(|channel| {
-            let terminal_state = match channel.terminal() {
-                None => wire::QueryTerminalRuntimeFilterChannelTerminalStateV1::Open,
-                Some(RuntimeFilterChannelTerminal::Completed(_)) => {
-                    wire::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed
-                }
-                Some(RuntimeFilterChannelTerminal::Unavailable(_)) => {
-                    wire::QueryTerminalRuntimeFilterChannelTerminalStateV1::Unavailable
-                }
-                Some(RuntimeFilterChannelTerminal::Cancelled) => {
-                    wire::QueryTerminalRuntimeFilterChannelTerminalStateV1::Cancelled
-                }
-            };
-            let identity = channel.identity();
-            wire::QueryTerminalRuntimeFilterChannelV1 {
-                channel_binding_id: identity.binding_id().get(),
-                channel_id: identity.channel_id().get(),
-                install_state: wire::QueryTerminalRuntimeFilterChannelInstallStateV1::Installed
-                    as i32,
-                terminal_state: terminal_state as i32,
-                latest_published_logical_version: channel
-                    .latest_published_version()
-                    .map(|value| value.get()),
-                published_count: channel.published(),
-                completed_count: channel.completed(),
-                unavailable_count: channel.unavailable(),
-                cancelled_count: channel.cancelled(),
-            }
-        })
-        .collect();
-    let producer_streams = snapshot
-        .producer_streams()
-        .iter()
-        .map(|stream| {
-            let identity = stream.identity();
-            let channel = identity.channel();
-            let fragment = identity.fragment_instance_id();
-            wire::QueryTerminalRuntimeFilterProducerStreamV1 {
-                channel_binding_id: channel.binding_id().get(),
-                channel_id: channel.channel_id().get(),
-                producer_fragment_instance_id: Some(common::UniqueId {
-                    hi: fragment.high(),
-                    lo: fragment.low(),
-                }),
-                partition_id: identity.partition_id().get(),
-                latest_accepted_sequence: stream.latest_accepted_sequence(),
-                accepted_count: stream.accepted(),
-                duplicate_count: stream.duplicate(),
-                stale_count: stream.stale(),
-                conflict_count: stream.conflict(),
-                resource_limit_count: stream.resource_limit(),
-            }
-        })
-        .collect();
-    let transport_routes = snapshot
-        .transport_routes()
-        .iter()
-        .map(|route| {
-            let identity = route.identity();
-            let channel = identity.channel();
-            wire::QueryTerminalRuntimeFilterTransportRouteV1 {
-                channel_binding_id: channel.binding_id().get(),
-                channel_id: channel.channel_id().get(),
-                route_edge_id: identity.route_edge_id().get(),
-                sent_count: route.sent(),
-                sent_bytes: route.sent_bytes(),
-                retried_count: route.retried(),
-                retried_bytes: route.retried_bytes(),
-                acked_count: route.acked(),
-                acked_bytes: route.acked_bytes(),
-                fail_open_count: route.failed_open(),
-                fail_open_bytes: route.failed_open_bytes(),
-            }
-        })
-        .collect();
-    let consumers = snapshot
-        .consumers()
-        .iter()
-        .map(|consumer| {
-            let identity = consumer.identity();
-            let subscription_terminal = match consumer.terminal() {
-                Some(novarocks_execution::runtime_filter::LiveTerminal::Completed) => {
-                    wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed
-                }
-                Some(
-                    novarocks_execution::runtime_filter::LiveTerminal::CompletedWithoutArtifact,
-                ) => {
-                    wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::CompletedWithoutArtifact
-                }
-                Some(novarocks_execution::runtime_filter::LiveTerminal::Unavailable(_)) => {
-                    wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unavailable
-                }
-                Some(novarocks_execution::runtime_filter::LiveTerminal::Cancelled) => {
-                    wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Cancelled
-                }
-                None => match consumer.outcome() {
-                    None => wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Pending,
-                    Some(RuntimeFilterConsumerOutcome::Acquired) => {
-                        wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Acquired
-                    }
-                    Some(RuntimeFilterConsumerOutcome::TimedOut) => {
-                        wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::TimedOut
-                    }
-                    Some(RuntimeFilterConsumerOutcome::Unavailable(_)) => {
-                        wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unavailable
-                    }
-                    Some(RuntimeFilterConsumerOutcome::Unsupported(_)) => {
-                        wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Unsupported
-                    }
-                    Some(RuntimeFilterConsumerOutcome::Cancelled) => {
-                        wire::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Cancelled
-                    }
-                },
-            };
-            let reasons = consumer.scan_not_evaluated_reasons();
-            let channel = identity.channel();
-            let fragment = identity.fragment_instance_id();
-            wire::QueryTerminalRuntimeFilterConsumerV1 {
-                channel_binding_id: channel.binding_id().get(),
-                channel_id: channel.channel_id().get(),
-                consumer_binding_id: identity.consumer_binding_id().get(),
-                fragment_instance_id: Some(common::UniqueId {
-                    hi: fragment.high(),
-                    lo: fragment.low(),
-                }),
-                latest_delivered_logical_version: consumer
-                    .latest_delivered_version()
-                    .map(|value| value.get()),
-                latest_applied_logical_version: consumer
-                    .latest_applied_version()
-                    .map(|value| value.get()),
-                subscription_terminal: subscription_terminal as i32,
-                row_evaluations: consumer.row_evaluations(),
-                input_rows: consumer.row_input(),
-                output_rows: consumer.row_output(),
-                scan_evaluated: consumer.scan_evaluated(),
-                scan_kept: consumer.scan_kept(),
-                scan_pruned: consumer.scan_pruned(),
-                scan_not_evaluated: consumer.scan_not_evaluated(),
-                scan_not_evaluated_reasons: Some(
-                    wire::QueryTerminalRuntimeFilterScanNotEvaluatedV1 {
-                        unit_facts_missing: reasons.unit_facts_missing,
-                        column_facts_missing: reasons.column_facts_missing,
-                        data_type_unsupported: reasons.data_type_unsupported,
-                        predicate_capability_unsupported: reasons.predicate_capability_unsupported,
-                        resource_unavailable: reasons.resource_unavailable,
-                        snapshot_unavailable: reasons.snapshot_unavailable,
-                        snapshot_timed_out: reasons.snapshot_timed_out,
-                        snapshot_not_published: reasons.snapshot_not_published,
-                    },
-                ),
-            }
-        })
-        .collect();
-    QueryTerminalProfileContributionV1::seal(wire::QueryTerminalProfileContributionV1 {
-        version:
-            novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
-        channels,
-        producer_streams,
-        transport_routes,
-        consumers,
-    })
-    .map_err(protocol_contract_error)
-}
-
-// Design: ADR-0106 (docs/adr/ADR-0106-native-wire-layering-and-terminal-content-identity.md)
-pub(super) fn capture_terminal_profile_contribution(
-    snapshot: Option<RuntimeFilterObservationSnapshot>,
-    runtime_filter_installed: bool,
-) -> Result<
-    novarocks_proto_models::novarocks::QueryTerminalProfileContributionTelemetry,
-    QueryLifecycleError,
-> {
-    use novarocks_proto_models::novarocks as wire;
-    use wire::query_terminal_profile_contribution_telemetry::Telemetry;
-    let unavailable = |code: &str| wire::QueryTerminalProfileContributionTelemetry {
-        telemetry: Some(Telemetry::Unavailable(wire::TerminalTelemetryUnavailable {
-            stage: "runtime_filter_terminal_capture".to_owned(),
-            code: code.to_owned(),
-        })),
-    };
-    let Some(snapshot) = snapshot else {
-        if runtime_filter_installed {
-            return Ok(unavailable("PARTICIPANT_RELEASED"));
-        }
-        return Ok(wire::QueryTerminalProfileContributionTelemetry {
-            telemetry: Some(Telemetry::Available(wire::QueryTerminalProfileContributionV1 {
-                version: novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
-                ..Default::default()
-            })),
-        });
-    };
-    if let Some(error) = snapshot.correctness_error() {
-        return Err(QueryLifecycleError::new(
-            QueryLifecycleErrorCode::InvalidManifest,
-            format!("runtime-filter observation correctness failure: {error}"),
-        ));
-    }
-    match terminal_profile_contribution(snapshot) {
-        Ok(contribution) => Ok(wire::QueryTerminalProfileContributionTelemetry {
-            telemetry: Some(Telemetry::Available(contribution.as_proto().clone())),
-        }),
-        Err(error) => {
-            warn!(
-                target: "novarocks::query_lifecycle",
-                error = %error,
-                "runtime-filter terminal profile contribution is unavailable"
-            );
-            Ok(unavailable("CONTRIBUTION_INVALID"))
-        }
-    }
 }
 
 fn send_reserved_control_event(
@@ -1428,7 +1155,7 @@ impl QueryLifecycleRegistry {
             terminal_fallback,
             NativeCompatibilityId::new([0x71; 32]),
             empty_execution_role_binding_factories(),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            default_catalog_manager(),
         )
     }
 
@@ -1457,7 +1184,7 @@ impl QueryLifecycleRegistry {
             runtime_filter_factory,
             NativeCompatibilityId::new([0x71; 32]),
             empty_execution_role_binding_factories(),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            default_catalog_manager(),
         )
     }
 
@@ -1478,23 +1205,7 @@ impl QueryLifecycleRegistry {
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
             NativeCompatibilityId::new([0x71; 32]),
             empty_execution_role_binding_factories(),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
-        )
-    }
-
-    pub(crate) fn new_with_runtime(
-        runtime: BackendDataRuntime,
-        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
-        config: QueryLifecycleRegistryConfig,
-        native_compatibility_id: NativeCompatibilityId,
-    ) -> Arc<Self> {
-        Self::new_with_runtime_and_execution_role_binding_factories(
-            runtime,
-            local_runtime,
-            config,
-            native_compatibility_id,
-            empty_execution_role_binding_factories(),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            default_catalog_manager(),
         )
     }
 
@@ -1506,7 +1217,11 @@ impl QueryLifecycleRegistry {
         execution_role_binding_factories: Arc<
             crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet,
         >,
-        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+        catalog_manager: Arc<
+            crate::connector::catalog_manager::CatalogManager<
+                crate::connector::ConnectorExecutionRoleBinding,
+            >,
+        >,
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
             runtime.clone(),
@@ -1518,7 +1233,7 @@ impl QueryLifecycleRegistry {
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
             native_compatibility_id,
             execution_role_binding_factories,
-            catalog_manager_config,
+            catalog_manager,
         )
     }
 
@@ -1538,7 +1253,11 @@ impl QueryLifecycleRegistry {
         execution_role_binding_factories: Arc<
             crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet,
         >,
-        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+        catalog_manager: Arc<
+            crate::connector::catalog_manager::CatalogManager<
+                crate::connector::ConnectorExecutionRoleBinding,
+            >,
+        >,
     ) -> Arc<Self> {
         Self::new_with_backend_identity_and_runtime_filter_factory(
             runtime.clone(),
@@ -1551,7 +1270,7 @@ impl QueryLifecycleRegistry {
             Arc::new(BackendRuntimeFilterParticipantFactory::new(runtime)),
             native_compatibility_id,
             execution_role_binding_factories,
-            catalog_manager_config,
+            catalog_manager,
         )
     }
 
@@ -1572,7 +1291,11 @@ impl QueryLifecycleRegistry {
         execution_role_binding_factories: Arc<
             crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet,
         >,
-        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+        catalog_manager: Arc<
+            crate::connector::catalog_manager::CatalogManager<
+                crate::connector::ConnectorExecutionRoleBinding,
+            >,
+        >,
     ) -> Arc<Self> {
         assert!(config.max_active_entries > 0);
         assert!(config.tombstone_capacity > 0);
@@ -1599,10 +1322,7 @@ impl QueryLifecycleRegistry {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
             catalog_install_runtime,
-            catalog_manager: Arc::new(
-                crate::connector::catalog_manager::CatalogManager::try_new(catalog_manager_config)
-                    .expect("backend catalog manager configuration was validated at startup"),
-            ),
+            catalog_manager,
             execution_role_binding_factories,
             runtime_filter_factory,
             config,
@@ -1766,48 +1486,76 @@ impl QueryLifecycleRegistry {
     /// Admission-derived authorization for the native exchange data plane.
     /// Routes exist only while the owning lifecycle entry can still execute;
     /// tombstone/terminal retention therefore automatically revokes frames.
-    pub(crate) fn authorize_exchange(
-        &self,
-        destination_fragment_instance_id: UniqueId,
-        destination_node_id: i32,
-        source_fragment_instance_id: UniqueId,
-        sender_ordinal: u32,
-        sender_count: u32,
-    ) -> Result<(), String> {
-        if sender_count == 0 || sender_ordinal >= sender_count {
-            return Err("exchange sender ordinal/count is invalid".to_string());
-        }
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| "query lifecycle registry lock is poisoned".to_string())?;
+    ///
+    /// This owner holds a destination exactly while one of its active entries
+    /// lists that fragment instance among the instances it admitted. That is
+    /// what separates "this destination is not mine" from "this route is
+    /// illegal": the task substrate owns the destinations of every query that
+    /// runs on the task protocol, and a lifecycle refusal for one of those
+    /// would be this owner deciding another owner's frame.
+    pub(crate) fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            // A poisoned owner lock cannot prove ownership either way, and
+            // claiming the destination in order to refuse it would hide a
+            // legal frame the other owner holds.
+            Err(_) => {
+                return ExchangeRouteClaim::NotHeld;
+            }
+        };
+        let mut held_by_active_entry = false;
+        let mut authorized = false;
         for entry in state.entries.values() {
-            let phase = entry
-                .state
-                .lock()
-                .map_err(|_| "query lifecycle entry lock is poisoned".to_string())?
-                .phase;
+            let Ok(entry_state) = entry.state.lock() else {
+                continue;
+            };
+            let phase = entry_state.phase;
+            drop(entry_state);
             if !matches!(
                 phase,
                 QueryLifecyclePhase::Staged | QueryLifecyclePhase::Running
             ) {
                 continue;
             }
+            if !entry
+                .manifest
+                .expected_fragment_instance_ids()
+                .into_iter()
+                .any(|instance| {
+                    UniqueId::new(instance.hi, instance.lo)
+                        == query.destination_fragment_instance_id
+                })
+            {
+                continue;
+            }
+            held_by_active_entry = true;
             for route in validated(entry.manifest.exchange_routes()) {
                 let source = validated(route.source_fragment_instance_id());
                 let destination = validated(route.destination_fragment_instance_id());
-                if UniqueId::new(source.hi, source.lo) == source_fragment_instance_id
+                if UniqueId::new(source.hi, source.lo) == query.source_fragment_instance_id
                     && UniqueId::new(destination.hi, destination.lo)
-                        == destination_fragment_instance_id
-                    && route.destination_node_id() == destination_node_id
-                    && route.sender_ordinal() == sender_ordinal
-                    && route.sender_count() == sender_count
+                        == query.destination_fragment_instance_id
+                    && route.destination_node_id() == query.destination_node_id
+                    && route.sender_ordinal() == query.sender_ordinal
+                    && route.sender_count() == query.sender_count
                 {
-                    return Ok(());
+                    authorized = true;
+                    break;
                 }
             }
+            if authorized {
+                break;
+            }
         }
-        Err("exchange route is absent from every active participant manifest".to_string())
+        match (held_by_active_entry, authorized) {
+            (_, true) => ExchangeRouteClaim::Authorized,
+            (true, false) => ExchangeRouteClaim::Refused(
+                "the route is absent from the active participant manifest that admitted this \
+                 destination"
+                    .to_string(),
+            ),
+            (false, false) => ExchangeRouteClaim::NotHeld,
+        }
     }
 
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
@@ -3147,22 +2895,25 @@ impl QueryLifecycleRegistry {
         state.runtime_filter.clone()
     }
 
-    /// Dispatches an already decoded envelope through an existing exact
-    /// attempt. A miss is deliberately lookup-only and cannot release a gate.
-    pub(crate) fn dispatch_runtime_filter_envelope(
+    /// The participant this registry installed for the exact attempt.
+    ///
+    /// Ownership only: whether the envelope is legal is the participant's own
+    /// verdict, and `None` says nothing about attempts installed by another
+    /// owner. The task protocol creates no `InitQuery` manifest, so its
+    /// attempts are never found here — that is correct, not a miss.
+    pub(crate) fn claim_runtime_filter_participant(
         &self,
-        envelope: BackendNativeRuntimeFilterEnvelope,
-    ) -> crate::runtime_filter::domain::BackendIngressResult {
-        let participant = self
-            .state
+        participant: crate::runtime_filter::domain::BackendParticipantIdentity,
+    ) -> Option<Arc<RuntimeFilterParticipant>> {
+        self.state
             .lock()
             .expect("query lifecycle registry lock")
             .entries
             .iter()
             .find(|(execution_id, _)| {
-                execution_id.query_id().high() == envelope.participant().query_id().high()
-                    && execution_id.query_id().low() == envelope.participant().query_id().low()
-                    && execution_id.attempt_id().get() == envelope.participant().deployment_epoch()
+                execution_id.query_id().high() == participant.query_id().high()
+                    && execution_id.query_id().low() == participant.query_id().low()
+                    && execution_id.attempt_id().get() == participant.deployment_epoch()
             })
             .map(|(_, entry)| entry)
             .and_then(|entry| {
@@ -3172,8 +2923,16 @@ impl QueryLifecycleRegistry {
                     .expect("query lifecycle entry lock")
                     .runtime_filter
                     .clone()
-            });
-        match participant {
+            })
+    }
+
+    /// Dispatches an already decoded envelope through an existing exact
+    /// attempt. A miss is deliberately lookup-only and cannot release a gate.
+    pub(crate) fn dispatch_runtime_filter_envelope(
+        &self,
+        envelope: BackendNativeRuntimeFilterEnvelope,
+    ) -> crate::runtime_filter::domain::BackendIngressResult {
+        match self.claim_runtime_filter_participant(envelope.participant()) {
             Some(participant) => participant.dispatch_envelope(envelope),
             None => crate::runtime_filter::domain::BackendIngressResult::rejected(
                 "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace",
@@ -5581,22 +5340,8 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
         outcome
     }
 
-    fn authorize_exchange(
-        &self,
-        destination_fragment_instance_id: UniqueId,
-        destination_node_id: i32,
-        source_fragment_instance_id: UniqueId,
-        sender_ordinal: u32,
-        sender_count: u32,
-    ) -> Result<(), String> {
-        QueryLifecycleRegistry::authorize_exchange(
-            self,
-            destination_fragment_instance_id,
-            destination_node_id,
-            source_fragment_instance_id,
-            sender_ordinal,
-            sender_count,
-        )
+    fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
+        QueryLifecycleRegistry::claim_exchange_route(self, query)
     }
 
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {

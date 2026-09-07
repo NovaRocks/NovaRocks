@@ -38,6 +38,18 @@ pub struct KillBeAtLifecyclePhaseDirective {
     pub phase: QueryLifecyclePhase,
 }
 
+/// A runner-owned BE process kill released once a runner-owned BE log shows a
+/// new matching line.
+///
+/// Protocol-neutral by construction: the case names the execution point it
+/// wants the process to disappear at, rather than a coordinator phase whose
+/// marker belongs to one protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillBeAfterBeLogDirective {
+    pub be_index: usize,
+    pub pattern: String,
+}
+
 /// Structured fault assertions deliberately name a result category rather
 /// than matching a human-readable diagnostic. T7/T9 provide the actual
 /// snapshot producer; T4 owns this stable runner contract.
@@ -292,9 +304,6 @@ pub struct QueryMeta {
     pub retry_count: Option<usize>,
     pub retry_interval_ms: Option<u64>,
     pub kill_be_index: Option<usize>,
-    pub kill_be_after_fragment_start: Option<usize>,
-    pub fail_fragment_after_start_be_index: Option<usize>,
-    pub network_partition_be: Option<usize>,
     pub heartbeat_delay_ms: Option<u64>,
     pub restart_be_delay_ms: Option<u64>,
     /// Restart the runner-owned frontend after this statement has succeeded.
@@ -306,28 +315,25 @@ pub struct QueryMeta {
     /// One bounded runner-owned fault for the next matching standard Iceberg
     /// REST publication request. The SQL case never names an operation id.
     pub publication_catalog_fault: Option<PublicationCatalogFaultDirective>,
-    pub drop_next_init_ack_be_index: Option<usize>,
-    pub stop_query_control_heartbeat_be_index: Option<usize>,
-    pub kill_fe_after_control_ready_count: Option<usize>,
     /// Kill and restart FE after an MV lake publication is known committed but
     /// before the Accelerator projector can CAS its local projection.
     pub kill_fe_after_mv_known_committed_before_projector_cas: bool,
-    pub restart_be_after_init_ack_index: Option<usize>,
-    /// Execute KILL QUERY from a separate client after this query's Nth ControlReady.
-    pub kill_query_after_control_ready_count: Option<usize>,
+    /// Replace one BE process after its task-protocol `EstablishQueryContext`
+    /// has been applied.
+    pub restart_be_after_establish_context_index: Option<usize>,
     /// Execute KILL QUERY after a new matching line is observed in a runner-owned BE log.
     pub kill_query_after_be_log_contains: Option<String>,
-    /// Fail the local StageFragments build at this one-based fragment ordinal.
-    pub fail_stage_prepare_ordinal: Option<usize>,
-    pub drop_next_stage_ack_be_index: Option<usize>,
-    pub drop_next_start_ack_be_index: Option<usize>,
-    pub suppress_start_ack_be_index: Option<usize>,
-    /// Store the immutable terminal snapshot but deliberately omit the stream
-    /// ACK for this participant, requiring BE unary fallback delivery.
-    pub drop_next_terminal_ack_be_index: Option<usize>,
-    /// Close one BE's control stream immediately before TerminalSnapshot so
-    /// the immutable payload can only reach FE through unary fallback.
-    pub drop_terminal_snapshot_stream_be_index: Option<usize>,
+    /// Kill one BE after a new matching line is observed in a runner-owned BE
+    /// log.
+    pub kill_be_after_be_log_contains: Option<KillBeAfterBeLogDirective>,
+    /// Kill and restart FE after a new matching line is observed in a
+    /// runner-owned BE log.
+    ///
+    /// Protocol-neutral for the same reason as
+    /// `kill_query_after_be_log_contains`: the case names the point it wants
+    /// the coordinator to die at, instead of a phase whose marker belongs to
+    /// one protocol.
+    pub kill_fe_after_be_log_contains: Option<String>,
     /// Inject a second valid-but-different participant snapshot at FE ingress
     /// before ACK, proving same-identity conflicts fail closed.
     pub terminal_snapshot_conflict_be_index: Option<usize>,
@@ -342,12 +348,9 @@ pub struct QueryMeta {
     /// intentionally separate from `expect_error` and log assertions.
     pub query_lifecycle_structured_assertion: Option<QueryLifecycleStructuredAssertion>,
     pub kill_query_at_lifecycle_phase: Option<QueryLifecyclePhase>,
-    pub kill_fe_at_lifecycle_phase: Option<QueryLifecyclePhase>,
     /// Kill one BE only after FE has retained an immutable participant outcome
     /// for the requested lifecycle phase.
     pub kill_be_at_lifecycle_phase: Option<KillBeAtLifecyclePhaseDirective>,
-    pub stop_query_control_heartbeat_after_stage_be_index: Option<usize>,
-    pub hold_start_until_early_ingress: bool,
     pub query_control_fragment_backend_limit: Option<usize>,
     /// Before this step, resolve a REST-catalog table and write one real,
     /// deliberately unreferenced MinIO object below its data directory.
@@ -387,11 +390,6 @@ pub struct QueryMeta {
     pub be_log_count_at_least: Vec<(String, usize)>,
     /// Require a substring to appear in at least this many distinct BE logs.
     pub be_log_be_count_at_least: Vec<(String, usize)>,
-    /// Prove exact accepted/cancelled fragment identity equality for the injected query.
-    ///
-    /// The value is the exact number of runner-owned BE logs that must contribute
-    /// at least one accepted fragment for that query.
-    pub be_log_exact_fragment_cancellation: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,7 +501,6 @@ impl QueryMeta {
             || !self.be_log_not_contains.is_empty()
             || !self.be_log_count_at_least.is_empty()
             || !self.be_log_be_count_at_least.is_empty()
-            || self.be_log_exact_fragment_cancellation.is_some()
     }
 }
 

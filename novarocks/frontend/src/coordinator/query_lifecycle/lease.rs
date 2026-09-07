@@ -285,12 +285,19 @@ impl ActiveSession {
 }
 
 #[derive(Default)]
-pub(super) struct FrontendLifecycleMetrics {
+pub(crate) struct FrontendLifecycleMetrics {
     snapshot: Mutex<FrontendQueryLifecycleMetricsSnapshot>,
 }
 
 impl FrontendLifecycleMetrics {
-    pub(super) fn process_shared() -> Arc<Self> {
+    /// The one process-wide lifecycle counter set.
+    ///
+    /// Reachable from the coordinator so a task-protocol attempt publishes the
+    /// same process counters the lifecycle attempt publishes. These are
+    /// process facts either way -- neither protocol keeps an attempt-scoped
+    /// copy -- so both carriers reporting the same set is what keeps the
+    /// endpoint's `metrics` field meaning one thing.
+    pub(crate) fn process_shared() -> Arc<Self> {
         static METRICS: OnceLock<Arc<FrontendLifecycleMetrics>> = OnceLock::new();
         Arc::clone(METRICS.get_or_init(|| Arc::new(Self::default())))
     }
@@ -378,7 +385,7 @@ impl FrontendLifecycleMetrics {
         self.update(|snapshot| snapshot.terminal_finalize_failures += 1);
     }
 
-    pub(super) fn snapshot(&self) -> FrontendQueryLifecycleMetricsSnapshot {
+    pub(crate) fn snapshot(&self) -> FrontendQueryLifecycleMetricsSnapshot {
         *self.snapshot.lock().expect("frontend lifecycle metrics")
     }
 

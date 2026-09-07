@@ -18,15 +18,12 @@
 //! Native coordinator-to-runtime wire encoders.
 
 mod bundle;
-pub(crate) mod expr;
 pub(crate) mod instance;
-pub(crate) mod plan;
+mod prepared_scan_facts;
 pub(crate) mod submission;
 
 pub use bundle::encode_native_fragment_bundle;
 pub(crate) use bundle::encode_native_fragment_bundle_for_input;
-pub(crate) use instance::encode_instance_params;
-pub(crate) use plan::encode_data_partition;
 
 #[cfg(test)]
 mod tests;

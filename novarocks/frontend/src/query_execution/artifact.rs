@@ -572,6 +572,174 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             stage_bindings,
         })
     }
+
+    /// Freeze this attempt's shared facts for the task protocol.
+    ///
+    /// It performs the same admission the lifecycle path performs before it
+    /// may encode a submission -- the execution-id check and the query-wide
+    /// catalog freeze -- and deliberately stops there: on the task path a
+    /// query context is established by the substrate itself, so there is no
+    /// barrier to enter and no participant manifest to compile.
+    pub fn prepare_task_execution(
+        self,
+        options: QueryInitOptions,
+    ) -> Result<TaskExecutionPreparedQuery, DistributedQueryError> {
+        if options.execution_id().query_id() != self.schedule.execution_id.query_id()
+            || options.execution_id().attempt_id().get()
+                != self.schedule.execution_id.attempt_id().get()
+        {
+            return Err(contract_error(
+                "task execution preparation execution id does not match validated schedule",
+            ));
+        }
+        let catalog_lease = freeze_query_catalog_lease(&self.prepared, options.catalog_set())?;
+        let options = options.with_catalog_set(catalog_lease.catalog_set().clone());
+        Ok(TaskExecutionPreparedQuery {
+            handoff_id: self.handoff_id,
+            prepared: self.prepared,
+            native_bundle: self.native_bundle,
+            schedule: self.schedule,
+            options,
+            catalog_lease,
+            runtime_filter_contributions: self.runtime_filter_contributions,
+        })
+    }
+}
+
+/// One attempt's frozen inputs for the task protocol.
+///
+/// It is the task path's counterpart of [`ControlReadyDistributedQuery`], and
+/// it exists because the two paths differ in exactly one thing: the old had to
+/// reach a lifecycle barrier before it was allowed to encode a submission,
+/// while the task path establishes its query contexts from the same frozen
+/// facts and creates tasks directly. Everything else -- the execution-id
+/// check, the query-wide catalog freeze, the retained planning leases -- is
+/// identical and is done here rather than duplicated at the call site.
+pub struct TaskExecutionPreparedQuery {
+    handoff_id: u64,
+    prepared: PreparedFragmentSet,
+    native_bundle: NativeFragmentAttachment,
+    schedule: ValidatedFragmentSchedule,
+    options: QueryInitOptions,
+    /// Held, never read: the FE control leases inside it are released when it
+    /// drops, and this value is what keeps them alive for the whole attempt.
+    /// A backend still resolving a catalog through one of them must not find
+    /// its planning ownership already gone.
+    #[expect(
+        dead_code,
+        reason = "the catalog planning leases are retained for the attempt's lifetime, not read"
+    )]
+    catalog_lease: QueryCatalogLease,
+    runtime_filter_contributions: BTreeMap<usize, novarocks::RuntimeFilterContribution>,
+}
+
+impl TaskExecutionPreparedQuery {
+    /// Stable placement identity facts for the owner-local native submission
+    /// mapper, exactly as the lifecycle path's own typestate exposes them.
+    pub fn native_submission_view(
+        &self,
+    ) -> Result<NativeSubmissionEncodingView<'_>, DistributedQueryError> {
+        native_submission_encoding_view(
+            self.handoff_id,
+            self.schedule.execution_id,
+            &self.prepared,
+            &self.native_bundle,
+            &self.schedule.inner,
+            self.options.native_submission_options(),
+        )
+    }
+
+    /// The frozen placement result the task graph is built from.
+    pub(crate) const fn scheduling_plan(&self) -> &SchedulingPlan {
+        &self.schedule.inner
+    }
+
+    /// The exchange edges of this plan, in the planner's own order.
+    pub(crate) fn fragment_edges(&self) -> &[novarocks_sql::plan_read::FragmentEdge] {
+        self.prepared.scheduling_view().edges()
+    }
+
+    /// The query-wide catalog contribution every query context establishes.
+    pub(crate) fn catalog_set(&self) -> &CatalogSet {
+        self.options.catalog_set()
+    }
+
+    /// The runtime-filter contribution each scheduled backend establishes.
+    ///
+    /// Keyed by backend index because that is what the compiler produced; the
+    /// caller translates to process identity through the same ownership map
+    /// the graph is built with, so a contribution can never be established on
+    /// a process the schedule did not name.
+    pub(crate) const fn runtime_filter_contributions(
+        &self,
+    ) -> &BTreeMap<usize, novarocks::RuntimeFilterContribution> {
+        &self.runtime_filter_contributions
+    }
+
+    pub(crate) const fn init_options(&self) -> &QueryInitOptions {
+        &self.options
+    }
+
+    /// Takes this attempt's vended-storage capability, once.
+    ///
+    /// Called after the establish froze its own copy of the material: the
+    /// table moves into the capability so the attempt keeps one owner of the
+    /// secrets. A deployment that vends nothing has no capability to hand out
+    /// and gets `None`, which is a different statement from a denied one.
+    pub(crate) fn take_terminal_storage_resolver(
+        &mut self,
+    ) -> Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>> {
+        self.options
+            .take_credential_leases()
+            .into_attempt_storage_resolver()
+    }
+
+    /// Consume a matching native submission attachment.
+    ///
+    /// The attachment is validated against this exact handoff for the same
+    /// reason the lifecycle path validates it: a submission set produced for
+    /// another artifact would place tasks this schedule never admitted.
+    pub fn seal_task_submission(
+        &self,
+        attachment: NativeSubmissionAttachment,
+    ) -> Result<TaskExecutionSubmission, DistributedQueryError> {
+        if !attachment.matches(self.handoff_id, self.schedule.execution_id) {
+            return Err(contract_error(
+                "native submission attachment does not belong to this task execution handoff",
+            ));
+        }
+        let (submissions, root_fetch, expected_output) = attachment.into_parts();
+        Ok(TaskExecutionSubmission {
+            submissions,
+            root_fetch,
+            expected_output,
+        })
+    }
+}
+
+/// Everything the coordinator needs after the encoder has run.
+///
+/// The catalog lease deliberately does not travel with it: it stays on
+/// [`TaskExecutionPreparedQuery`], which the coordinator keeps alive for the
+/// whole attempt. Dropping the FE control leases while tasks are running would
+/// release planning ownership of a catalog the backends are still reading
+/// through.
+pub struct TaskExecutionSubmission {
+    submissions: Vec<ValidatedNativeSubmission>,
+    root_fetch: RootFetchMetadata,
+    expected_output: ExpectedOutputSchema,
+}
+
+impl TaskExecutionSubmission {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<ValidatedNativeSubmission>,
+        RootFetchMetadata,
+        ExpectedOutputSchema,
+    ) {
+        (self.submissions, self.root_fetch, self.expected_output)
+    }
 }
 
 /// Freeze every catalog required by typed reads into the exact query-wide Init
@@ -1278,35 +1446,85 @@ fn build_fragment_lifecycle_projection(
         .with_frozen_live_backends(frozen_live_backends.into_values().collect())
 }
 
+/// Numbers every sender of one exchange node across the union of the
+/// fragments that feed it.
+///
+/// The sender set belongs to the exchange NODE, not to one producing
+/// fragment. A node fed by two fragments has one contiguous ordinal space
+/// spanning both, and its size is the total. Numbering per edge instead --
+/// each fragment restarting at zero and announcing only its own placement
+/// count -- disagrees with the two other places that derive the same fact:
+/// `populate_sender_counts` accumulates across edges into the receiver's
+/// `per_exch_num_senders`, and the task graph numbers the union in ascending
+/// fragment-then-instance order. Under the task protocol that disagreement is
+/// caught: the descriptor's frozen `expected_sender_count` is the union size,
+/// so a per-fragment count is refused as a sender-count mismatch and every
+/// multi-fed exchange -- a UNION ALL across fragments, for one -- fails.
+///
+/// The ordering here is the graph's ordering, so the two derivations are the
+/// same function of the same frozen schedule rather than two functions that
+/// happen to agree for the single-producer case.
 fn populate_destinations(
     schedule: &mut SchedulingPlan,
     edges: &[novarocks_sql::plan_read::FragmentEdge],
 ) {
+    // Group the feeding fragments per exchange node first: an ordinal cannot
+    // be assigned until every fragment reaching that node is known.
+    let mut feeders: BTreeMap<(u32, i32), Vec<u32>> = BTreeMap::new();
     for edge in edges {
+        let key = (edge.target_fragment_id, edge.target_exchange_node_id);
+        let sources = feeders.entry(key).or_default();
+        if !sources.contains(&edge.source_fragment_id) {
+            sources.push(edge.source_fragment_id);
+        }
+    }
+
+    for ((target_fragment_id, _), mut source_fragment_ids) in feeders {
+        // Ascending fragment id, then instance order, exactly as the task
+        // graph walks it.
+        source_fragment_ids.sort_unstable();
+        let mut ordinal_of = BTreeMap::new();
+        let mut next_ordinal = 0_u32;
+        for source_fragment_id in &source_fragment_ids {
+            let placements = schedule
+                .by_fragment
+                .get(source_fragment_id)
+                .map(Vec::len)
+                .unwrap_or_default();
+            for instance_index in 0..placements {
+                ordinal_of.insert((*source_fragment_id, instance_index), next_ordinal);
+                next_ordinal += 1;
+            }
+        }
+        let sender_count = next_ordinal;
+
         let destinations = schedule
             .by_fragment
-            .get(&edge.target_fragment_id)
+            .get(&target_fragment_id)
             .into_iter()
             .flatten()
             .map(|placement| (placement.finst_id, placement.endpoint.clone()))
             .collect::<Vec<_>>();
-        if let Some(sources) = schedule.by_fragment.get_mut(&edge.source_fragment_id) {
-            let sender_count =
-                u32::try_from(sources.len()).expect("native fragment source count fits in u32");
-            for (sender_ordinal, source) in sources.iter_mut().enumerate() {
-                let sender_ordinal = u32::try_from(sender_ordinal)
-                    .expect("native fragment sender ordinal fits in u32");
-                for (destination_finst_id, destination_endpoint) in &destinations {
-                    source.destinations.push(
-                        FragmentDestination::new(
-                            *destination_finst_id,
-                            destination_endpoint.clone(),
-                            source.finst_id,
-                            sender_ordinal,
-                            sender_count,
-                        )
-                        .expect("scheduled exchange destination has a valid sender set"),
-                    );
+        for source_fragment_id in &source_fragment_ids {
+            if let Some(sources) = schedule.by_fragment.get_mut(source_fragment_id) {
+                for (instance_index, source) in sources.iter_mut().enumerate() {
+                    let Some(&sender_ordinal) =
+                        ordinal_of.get(&(*source_fragment_id, instance_index))
+                    else {
+                        continue;
+                    };
+                    for (destination_finst_id, destination_endpoint) in &destinations {
+                        source.destinations.push(
+                            FragmentDestination::new(
+                                *destination_finst_id,
+                                destination_endpoint.clone(),
+                                source.finst_id,
+                                sender_ordinal,
+                                sender_count,
+                            )
+                            .expect("scheduled exchange destination has a valid sender set"),
+                        );
+                    }
                 }
             }
         }
@@ -1373,6 +1591,64 @@ impl ValidatedNativeSubmission {
 
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
+    }
+
+    /// Whether this instance's plan contains a connector table writer.
+    ///
+    /// Read off the encoded plan rather than inferred from the intent: a
+    /// distributed write's writer set is what decides whether the write
+    /// completed, and "the query is a write" says nothing about which of its
+    /// fragments actually write. Absence of a writer node is a positive fact
+    /// here -- an exchange or scan fragment of a write plan is not a writer,
+    /// and counting it as one would make a normal stand-down look like a
+    /// partial write.
+    pub(crate) fn declares_table_writer(&self) -> bool {
+        fn contains_writer(node: &novarocks_proto_models::plan::DistributedNode) -> bool {
+            if matches!(
+                node.payload.as_ref(),
+                Some(novarocks_proto_models::plan::distributed_node::Payload::TableWriter(_))
+            ) {
+                return true;
+            }
+            node.children.iter().any(contains_writer)
+        }
+        self.plan.root.as_ref().is_some_and(contains_writer)
+    }
+
+    /// The plan-node id of this fragment's root (output) node.
+    ///
+    /// It is the identity EXPLAIN ANALYZE keys a fragment by: the renderer
+    /// looks each `PLAN FRAGMENT` up by its sealed root node id, and the
+    /// encoder copies that id onto the wire plan unchanged, so the id read
+    /// here and the id the renderer holds are the same one.
+    ///
+    /// A plan with no root names no fragment root, and that is refused rather
+    /// than answered with a substitute id.
+    pub(crate) fn fragment_root_plan_node_id(&self) -> Result<i32, String> {
+        self.plan
+            .root
+            .as_ref()
+            .map(|root| root.node_id)
+            .ok_or_else(|| {
+                format!(
+                    "native fragment {} carries no root node",
+                    self.plan.fragment_id
+                )
+            })
+    }
+
+    /// Packages this instance's plan and its own parameters for the task
+    /// protocol.
+    ///
+    /// The two travel together because the backend proves them against each
+    /// other: a descriptor whose plan names a different instance than the
+    /// descriptor does is refused at decode. Handing them over separately
+    /// would let a caller pair a plan with the wrong instance's parameters.
+    pub fn into_task_fragment_plan(self) -> novarocks_proto_models::novarocks::TaskFragmentPlan {
+        novarocks_proto_models::novarocks::TaskFragmentPlan {
+            plan: Some(self.plan),
+            instance_params: Some(self.instance_params),
+        }
     }
 
     fn into_stage_fragment(self) -> Result<(usize, StageFragment), DistributedQueryError> {
@@ -1923,6 +2199,59 @@ mod tests {
         assert_ne!(
             derive_fragment_instance_id(second_attempt, 9, 3).expect("second fragment instance id"),
             first
+        );
+    }
+
+    #[test]
+    fn one_exchange_node_fed_by_two_fragments_numbers_its_senders_once() {
+        // The sender set belongs to the exchange node, not to one producing
+        // fragment. Numbering per edge -- each fragment restarting at zero and
+        // announcing only its own placement count -- disagrees with the two
+        // other derivations of the same fact: the receiver's
+        // per_exch_num_senders accumulates across edges, and the task
+        // descriptor freezes the union size as expected_sender_count. Under
+        // the task protocol that disagreement is caught rather than tolerated,
+        // so every multi-fed exchange -- a UNION ALL across fragments, for one
+        // -- would be refused as a sender-count mismatch.
+        let mut schedule = SchedulingPlan {
+            root_fragment_id: 30,
+            by_fragment: BTreeMap::from([
+                (
+                    10,
+                    vec![
+                        placement(10, 0, UniqueId::new(1, 1), 0),
+                        placement(10, 1, UniqueId::new(1, 2), 1),
+                    ],
+                ),
+                (20, vec![placement(20, 0, UniqueId::new(2, 1), 0)]),
+                (30, vec![placement(30, 0, UniqueId::new(3, 1), 0)]),
+            ]),
+            root_finst_id: UniqueId::new(3, 1),
+            root_backend_idx: 0,
+        };
+        // Both fragments reach the SAME exchange node of fragment 30.
+        let edges = vec![stream_edge(20, 30, 300), stream_edge(10, 30, 300)];
+        super::populate_destinations(&mut schedule, &edges);
+        super::populate_sender_counts(&mut schedule, &edges);
+
+        let mut seen = Vec::new();
+        for fragment_id in [10, 20] {
+            for source in &schedule.by_fragment[&fragment_id] {
+                for destination in &source.destinations {
+                    seen.push((destination.sender_ordinal(), destination.sender_count()));
+                }
+            }
+        }
+        seen.sort_unstable();
+
+        // Three senders over one contiguous ordinal space, every one of them
+        // announcing the same total.
+        assert_eq!(seen, vec![(0, 3), (1, 3), (2, 3)]);
+
+        // And that total is exactly what the receiver waits for.
+        assert_eq!(
+            schedule.by_fragment[&30][0].per_exch_num_senders[&300], 3,
+            "the announced sender count must equal the receiver's expectation"
         );
     }
 
