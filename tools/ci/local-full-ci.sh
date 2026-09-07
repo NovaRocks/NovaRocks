@@ -453,6 +453,15 @@ run_cargo_gates() {
     cargo clippy --workspace --all-targets
   run_fail_fast_stage "cargo build" "cargo-build.log" \
     cargo build --workspace --profile "$NOVA_CI_CARGO_PROFILE"
+  # The SQL error manifest is a generated whitelist that other tools consume as
+  # fact: the sql-test runner include_str!s it and rejects any @expect_sql_code
+  # missing from it. A stale manifest therefore does not surface as "this file
+  # is out of date" -- it surfaces as an unrelated suite failing to load its
+  # cases. Regenerating is the fix (`cargo run -p novarocks-error-manifest`).
+  # This tool is its own workspace and defines no dev-opt profile, so it builds
+  # under the default one.
+  run_fail_fast_stage "SQL error manifest freshness" "error-manifest-check.log" \
+    cargo run --quiet --manifest-path tools/error-manifest/Cargo.toml -- --check
 
   if [ "$SKIP_CARGO_TEST" = "true" ]; then
     ci_record_stage "workspace component tests" "SKIP" "0" ""

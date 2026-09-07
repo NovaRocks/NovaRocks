@@ -82,11 +82,13 @@ ROLLBACK;
 SAVEPOINT before_publish;
 
 -- Rejecting autocommit-off is an admission decision and the preceding SET
--- assignment in the same command must not be applied first.
+-- assignment in the same command must not be applied first. The location is
+-- the offending assignment, not the statement head, so it stays on
+-- `autocommit` even when an accepted assignment precedes it.
 -- @expect_error_tier=target
 -- @expect_sql_code=sql.admit.session_transaction_unsupported
 -- @expect_sql_phase=Admit
--- @expect_error_at=1:5
+-- @expect_error_at=1:24
 SET query_timeout = 1, autocommit = OFF;
 
 -- @expect_error_tier=target

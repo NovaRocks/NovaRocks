@@ -9,6 +9,7 @@ sql.admit.kill_connection_unsupported	Admit
 sql.admit.kill_denied	Admit
 sql.admit.merge_unsupported_form	Admit
 sql.admit.session_global_scope_unsupported	Admit
+sql.admit.session_transaction_unsupported	Admit
 sql.admit.update_unsupported_form	Admit
 sql.analyze.internal	Analyze
 sql.analyze.invalid_argument	Analyze

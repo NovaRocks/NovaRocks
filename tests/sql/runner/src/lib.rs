@@ -682,6 +682,15 @@ struct SuiteOutcome {
     wall_time: Duration,
 }
 
+/// A case file the runner could not turn into executable steps.  It is carried
+/// alongside the loadable cases so one unparseable file fails as itself instead
+/// of aborting the whole suite and hiding every other case.
+struct CaseLoadFailure {
+    case_id: String,
+    source_file: PathBuf,
+    error: String,
+}
+
 #[derive(Clone)]
 struct CaseTiming {
     suite_name: String,
@@ -694,6 +703,7 @@ struct CaseTiming {
 struct PreparedSuite {
     ctx: SuiteRunContext,
     cases: Vec<SqlCase>,
+    load_failures: Vec<CaseLoadFailure>,
     init_hook: Option<SuiteHook>,
     cleanup_hook: Option<SuiteHook>,
 }
@@ -3369,10 +3379,30 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
 // Per-suite execution (init -> parallel cases -> cleanup)
 // ---------------------------------------------------------------------------
 
+/// Render every unparseable case file as a failing case of the suite, so a
+/// metadata error is attributed to its own case instead of hiding the rest.
+fn load_failure_outcomes(suite_name: &str, failures: &[CaseLoadFailure]) -> Vec<CaseOutcome> {
+    failures
+        .iter()
+        .map(|failure| CaseOutcome {
+            case_id: failure.case_id.clone(),
+            status: CaseStatus::Fail,
+            elapsed: Duration::ZERO,
+            log: format!(
+                "\n[{}] {} (unloadable)\n    ❌ failed to load {}: {}\n",
+                suite_name,
+                failure.case_id,
+                failure.source_file.display(),
+                failure.error,
+            ),
+        })
+        .collect()
+}
+
 fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) -> SuiteOutcome {
     let wall_start = Instant::now();
     let ctx = &ps.ctx;
-    let total = ps.cases.len();
+    let total = ps.cases.len() + ps.load_failures.len();
     let pass_count = AtomicUsize::new(0);
     let fail_count = AtomicUsize::new(0);
 
@@ -3415,6 +3445,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                         case.steps.len(),
                     ),
                 })
+                .chain(load_failure_outcomes(&ctx.suite_name, &ps.load_failures))
                 .collect();
             return SuiteOutcome {
                 suite_name: ctx.suite_name.clone(),
@@ -3472,6 +3503,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                             case.steps.len(),
                         ),
                     })
+                    .chain(load_failure_outcomes(&ctx.suite_name, &ps.load_failures))
                     .collect();
                 return SuiteOutcome {
                     suite_name: ctx.suite_name.clone(),
@@ -3515,15 +3547,24 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
     let outcomes: Vec<CaseOutcome> = if ctx.benchmark_cleanup_only {
         Vec::new()
     } else {
+        // Unloadable case files count as failures of themselves.
+        let mut outcomes: Vec<CaseOutcome> =
+            load_failure_outcomes(&ctx.suite_name, &ps.load_failures);
+        for outcome in &outcomes {
+            report_outcome(outcome);
+        }
+
         // Run parallel cases first.
-        let mut outcomes: Vec<CaseOutcome> = parallel_cases
-            .par_iter()
-            .map(|case| {
-                let outcome = run_case(ctx, case, abort);
-                report_outcome(&outcome);
-                outcome
-            })
-            .collect();
+        outcomes.extend(
+            parallel_cases
+                .par_iter()
+                .map(|case| {
+                    let outcome = run_case(ctx, case, abort);
+                    report_outcome(&outcome);
+                    outcome
+                })
+                .collect::<Vec<CaseOutcome>>(),
+        );
 
         // Then run sequential cases one by one.
         for case in &sequential_cases {
@@ -4434,6 +4475,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
             }
 
             let mut cases: Vec<SqlCase> = Vec::new();
+            let mut load_failures: Vec<CaseLoadFailure> = Vec::new();
             for sql_file in sql_files {
                 match parser::load_sql_case_from_file(
                     &sql_file,
@@ -4448,15 +4490,30 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                             sql_file.display()
                         );
                     }
+                    // An unparseable case file is that case failing, not a
+                    // suite-level abort: keep loading so the remaining cases
+                    // still run and still report.
                     Err(exc) => {
+                        let case_id = sql_file
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or("<unnamed>")
+                            .to_string();
                         println!("❌ ERROR: {}", exc);
-                        return Ok(1);
+                        load_failures.push(CaseLoadFailure {
+                            case_id,
+                            source_file: sql_file.clone(),
+                            error: format!("{exc:#}"),
+                        });
                     }
                 }
             }
 
-            let available_case_ids: HashSet<String> =
-                cases.iter().map(|c| c.case_id.clone()).collect();
+            let available_case_ids: HashSet<String> = cases
+                .iter()
+                .map(|c| c.case_id.clone())
+                .chain(load_failures.iter().map(|f| f.case_id.clone()))
+                .collect();
             let only_set = parse_selector_list(cli.only.as_deref(), &available_case_ids, "--only")?;
             let skip_set = parse_selector_list(cli.skip.as_deref(), &available_case_ids, "--skip")?;
 
@@ -4466,6 +4523,12 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 }
                 !skip_set.contains(&case.case_id)
             });
+            load_failures.retain(|failure| {
+                if !only_set.is_empty() && !only_set.contains(&failure.case_id) {
+                    return false;
+                }
+                !skip_set.contains(&failure.case_id)
+            });
 
             if let Some(limit) = cli.limit
                 && cases.len() > limit
@@ -4473,7 +4536,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 cases.truncate(limit);
             }
 
-            if cases.is_empty() {
+            if cases.is_empty() && load_failures.is_empty() {
                 println!("⚠️ WARNING: no queries selected for suite {}", suite.name);
                 continue;
             }
@@ -4693,12 +4756,23 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
             prepared_suites.push(PreparedSuite {
                 ctx,
                 cases,
+                load_failures,
                 init_hook: suite_init_hook,
                 cleanup_hook: suite_cleanup_hook,
             });
         }
 
         if cli.dry_run {
+            // --dry-run is the case-validation path: unloadable case files must
+            // fail it rather than being reported and then exiting zero.
+            let unloadable: usize = prepared_suites
+                .iter()
+                .map(|ps| ps.load_failures.len())
+                .sum();
+            if unloadable > 0 {
+                println!("❌ ERROR: {unloadable} case file(s) failed to load");
+                return Ok(1);
+            }
             return Ok(0);
         }
 
@@ -6363,5 +6437,46 @@ access_key_secret = "admin123"
             Err(error) => error,
         };
         assert!(error.to_string().contains("requires iceberg_rest_uri"));
+    }
+
+    #[test]
+    fn unloadable_case_files_become_failing_cases_of_their_own() {
+        let failures = vec![
+            super::CaseLoadFailure {
+                case_id: "bad_meta".to_string(),
+                source_file: std::path::PathBuf::from("/suite/sql/bad_meta.sql"),
+                error: "unknown expect_sql_code: sql.does.not.exist".to_string(),
+            },
+            super::CaseLoadFailure {
+                case_id: "also_bad".to_string(),
+                source_file: std::path::PathBuf::from("/suite/sql/also_bad.sql"),
+                error: "invalid expect_error_at: 0:0".to_string(),
+            },
+        ];
+
+        let outcomes = super::load_failure_outcomes("demo", &failures);
+
+        // Every unloadable file is one failing case, so a suite reports the
+        // rest of its cases instead of aborting on the first bad one.
+        assert_eq!(outcomes.len(), failures.len());
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.status == crate::CaseStatus::Fail)
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.case_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bad_meta", "also_bad"],
+        );
+        // The log must name the file and carry the parser's own reason.
+        assert!(outcomes[0].log.contains("/suite/sql/bad_meta.sql"));
+        assert!(
+            outcomes[0]
+                .log
+                .contains("unknown expect_sql_code: sql.does.not.exist")
+        );
     }
 }
