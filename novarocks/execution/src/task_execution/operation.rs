@@ -1109,6 +1109,7 @@ pub struct EstablishQueryContext {
     context: QueryContextRef,
     catalog_binding: Arc<dyn CodecOwnedContent>,
     initial_runtime_filter: Arc<dyn CodecOwnedContent>,
+    query_options: Arc<dyn CodecOwnedContent>,
     initial_credential: CredentialUpdate,
     initial_lease_valid_for: LeaseValidFor,
 }
@@ -1119,6 +1120,7 @@ impl EstablishQueryContext {
         context: QueryContextRef,
         catalog_binding: Arc<dyn CodecOwnedContent>,
         initial_runtime_filter: Arc<dyn CodecOwnedContent>,
+        query_options: Arc<dyn CodecOwnedContent>,
         initial_credential: CredentialUpdate,
         initial_lease_valid_for: LeaseValidFor,
     ) -> Self {
@@ -1130,6 +1132,7 @@ impl EstablishQueryContext {
             context,
             catalog_binding,
             initial_runtime_filter,
+            query_options,
             initial_credential,
             initial_lease_valid_for,
         }
@@ -1149,6 +1152,11 @@ impl EstablishQueryContext {
 
     pub fn initial_runtime_filter(&self) -> &Arc<dyn CodecOwnedContent> {
         &self.initial_runtime_filter
+    }
+
+    /// The immutable execution options shared by every task in this context.
+    pub fn query_options(&self) -> &Arc<dyn CodecOwnedContent> {
+        &self.query_options
     }
 
     pub const fn initial_credential(&self) -> &CredentialUpdate {
@@ -2092,6 +2100,7 @@ mod request_tests {
             context,
             content(),
             content(),
+            content(),
             credential(),
             valid_for(),
         ));
@@ -2129,6 +2138,7 @@ mod request_tests {
         let establish = EstablishQueryContext::new(
             TaskOperationId::new_v7(),
             context,
+            content(),
             content(),
             content(),
             credential(),

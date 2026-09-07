@@ -4338,6 +4338,15 @@ fn finish_run_with_server_cleanup(
     failure_artifacts: &FailureArtifactRecorder,
 ) -> Result<i32> {
     let primary_failed = !matches!(&primary_result, Ok(0));
+    // A real cross-process shutdown removes its runtime directory even when
+    // process cleanup reports an error. Stage one bounded terminal candidate
+    // while the logs still exist, but persist it only if shutdown is the
+    // failure; successful runs retain the existing no-artifact cleanup.
+    let shutdown_failure_candidate = if primary_failed {
+        Ok(None)
+    } else {
+        failure_artifacts.stage_run_failure(server_handle.as_ref())
+    };
     let mut preserve_result = if primary_failed {
         failure_artifacts.persist_run_failure(server_handle.as_ref())
     } else {
@@ -4346,7 +4355,8 @@ fn finish_run_with_server_cleanup(
     report_preserved_failure_artifacts(&preserve_result);
     let cleanup_result = shutdown_server_handle(&server_handle);
     if !primary_failed && cleanup_result.is_err() {
-        preserve_result = failure_artifacts.persist_run_failure(server_handle.as_ref());
+        preserve_result = shutdown_failure_candidate
+            .and_then(|candidate| failure_artifacts.persist_staged_run_failure(candidate));
         report_preserved_failure_artifacts(&preserve_result);
     }
     let run_result = match (primary_result, cleanup_result) {
@@ -6137,7 +6147,9 @@ mod tests {
         );
     }
 
-    struct CleanupFailureServer;
+    struct CleanupFailureServer {
+        shutdown_started: bool,
+    }
 
     impl crate::cluster::ServerHandle for CleanupFailureServer {
         fn target_host(&self) -> Option<&str> {
@@ -6156,16 +6168,27 @@ mod tests {
             1
         }
 
-        fn fe_log_contents(&self) -> anyhow::Result<String> {
-            Ok("FE shutdown failure".to_string())
-        }
-
-        fn be_log_contents(&self, index: usize) -> anyhow::Result<String> {
-            assert_eq!(index, 0);
-            Ok("BE shutdown failure".to_string())
+        fn failure_log_sources(
+            &self,
+            max_backend_logs: usize,
+            max_history_tail_bytes: usize,
+        ) -> anyhow::Result<Option<crate::cluster::ServerFailureLogSources>> {
+            if self.shutdown_started {
+                anyhow::bail!("runtime logs were removed during shutdown");
+            }
+            Ok(Some(crate::cluster::ServerFailureLogSources::from_inline(
+                1,
+                "FE shutdown failure".to_string(),
+                (max_backend_logs > 0)
+                    .then(|| "BE shutdown failure".to_string())
+                    .into_iter()
+                    .collect(),
+                max_history_tail_bytes,
+            )))
         }
 
         fn shutdown(&mut self) -> anyhow::Result<()> {
+            self.shutdown_started = true;
             anyhow::bail!("injected shutdown failure")
         }
     }
@@ -6173,7 +6196,9 @@ mod tests {
     #[test]
     fn post_launch_cleanup_reports_primary_shutdown_and_residual_failures() {
         let server: std::sync::Arc<std::sync::Mutex<Box<dyn crate::cluster::ServerHandle>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Box::new(CleanupFailureServer)));
+            std::sync::Arc::new(std::sync::Mutex::new(Box::new(CleanupFailureServer {
+                shutdown_started: false,
+            })));
         let temp = tempfile::TempDir::new().expect("temp dir");
         let failure_artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
             crate::failure_artifacts::FailureArtifactContext {
@@ -6203,7 +6228,9 @@ mod tests {
     #[test]
     fn server_cleanup_failure_captures_a_terminal_snapshot() {
         let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
-            Arc::new(Mutex::new(Box::new(CleanupFailureServer)));
+            Arc::new(Mutex::new(Box::new(CleanupFailureServer {
+                shutdown_started: false,
+            })));
         let temp = tempfile::TempDir::new().expect("temp dir");
         let artifact_root = temp.path().join("artifacts");
         let failure_artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
@@ -6249,13 +6276,20 @@ mod tests {
             1
         }
 
-        fn fe_log_contents(&self) -> anyhow::Result<String> {
-            Ok("FE log".to_string())
-        }
-
-        fn be_log_contents(&self, index: usize) -> anyhow::Result<String> {
-            assert_eq!(index, 0);
-            Ok("BE log".to_string())
+        fn failure_log_sources(
+            &self,
+            max_backend_logs: usize,
+            max_history_tail_bytes: usize,
+        ) -> anyhow::Result<Option<crate::cluster::ServerFailureLogSources>> {
+            Ok(Some(crate::cluster::ServerFailureLogSources::from_inline(
+                1,
+                "FE log".to_string(),
+                (max_backend_logs > 0)
+                    .then(|| "BE log".to_string())
+                    .into_iter()
+                    .collect(),
+                max_history_tail_bytes,
+            )))
         }
     }
 

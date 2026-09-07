@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cluster::ServerHandle;
+use crate::cluster::{ServerFailureLogSources, ServerHandle};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,6 +31,11 @@ static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_FAILURE_SNAPSHOTS: usize = 2;
 const MAX_CAPTURED_BACKEND_LOGS: usize = 31;
 const MAX_PROCESS_LOG_TAIL_BYTES: usize = 128 * 1024;
+const MAX_FAILURE_SNAPSHOT_BYTES: usize =
+    (MAX_CAPTURED_BACKEND_LOGS + 1) * MAX_PROCESS_LOG_TAIL_BYTES;
+
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 pub(crate) struct FailureArtifactContext {
     pub(crate) root: PathBuf,
@@ -68,6 +73,10 @@ impl SnapshotSlot {
 pub(crate) struct FailureArtifactRecorder {
     context: FailureArtifactContext,
     state: Mutex<CaptureState>,
+}
+
+pub(crate) struct StagedRunFailure {
+    captured: CapturedFailureLogs,
 }
 
 impl FailureArtifactRecorder {
@@ -110,53 +119,101 @@ impl FailureArtifactRecorder {
         self.persist_claimed(server_handle, SnapshotSlot::Terminal, prefix)
     }
 
+    /// Captures the terminal candidate while process logs still exist, without
+    /// claiming a slot or creating an artifact. A successful shutdown drops
+    /// this bounded value; a shutdown failure can persist it afterwards.
+    pub(crate) fn stage_run_failure(
+        &self,
+        server_handle: &Mutex<Box<dyn ServerHandle>>,
+    ) -> Result<Option<StagedRunFailure>> {
+        detach_failure_log_sources(server_handle)?
+            .map(|sources| {
+                capture_failure_log_sources(sources, SnapshotSlot::Terminal)
+                    .map(|captured| StagedRunFailure { captured })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn persist_staged_run_failure(
+        &self,
+        staged: Option<StagedRunFailure>,
+    ) -> Result<Option<PathBuf>> {
+        let Some(staged) = staged else {
+            return Ok(None);
+        };
+        if !self.claim(SnapshotSlot::Terminal) {
+            return Ok(None);
+        }
+        let prefix = format!(
+            "{}-terminal",
+            artifact_name_prefix(&self.context.lane, &self.context.suites)
+        );
+        let result =
+            persist_captured_failure_logs(&self.context.root, &prefix, staged.captured).map(Some);
+        if result.is_err() {
+            self.release(SnapshotSlot::Terminal);
+        }
+        result
+    }
+
     fn persist_claimed(
         &self,
         server_handle: &Mutex<Box<dyn ServerHandle>>,
         slot: SnapshotSlot,
         prefix: String,
     ) -> Result<Option<PathBuf>> {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let claimed = match slot {
-                SnapshotSlot::FirstCausal => &mut state.first_causal_claimed,
-                SnapshotSlot::Terminal => &mut state.terminal_claimed,
-            };
-            if *claimed {
-                return Ok(None);
-            }
-            *claimed = true;
+        if !self.claim(slot) {
+            return Ok(None);
         }
 
-        // The server lock protects only bounded in-memory capture. Filesystem
-        // creation, writes, and syncs happen after the global handle is free.
-        let captured = match server_handle.lock() {
-            Ok(server) => capture_cross_process_failure_logs(server.as_ref(), slot),
-            Err(_) => Err(anyhow::anyhow!(
-                "server handle lock poisoned while capturing failure artifacts"
-            )),
-        };
-        let result = captured.and_then(|captured| {
-            captured
-                .map(|captured| {
-                    persist_captured_failure_logs(&self.context.root, &prefix, captured)
-                })
-                .transpose()
-        });
+        // The server lock protects only path/Arc cloning and bounded history
+        // tails. Durable-log reads, redaction, file creation, writes, and syncs
+        // all happen after the global handle is free.
+        let result = detach_failure_log_sources(server_handle)
+            .and_then(|sources| {
+                sources
+                    .map(|sources| capture_failure_log_sources(sources, slot))
+                    .transpose()
+            })
+            .and_then(|captured| {
+                captured
+                    .map(|captured| {
+                        persist_captured_failure_logs(&self.context.root, &prefix, captured)
+                    })
+                    .transpose()
+            });
         if !matches!(result, Ok(Some(_))) {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match slot {
-                SnapshotSlot::FirstCausal => state.first_causal_claimed = false,
-                SnapshotSlot::Terminal => state.terminal_claimed = false,
-            }
+            self.release(slot);
         }
         result
+    }
+
+    fn claim(&self, slot: SnapshotSlot) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let claimed = match slot {
+            SnapshotSlot::FirstCausal => &mut state.first_causal_claimed,
+            SnapshotSlot::Terminal => &mut state.terminal_claimed,
+        };
+        if *claimed {
+            false
+        } else {
+            *claimed = true;
+            true
+        }
+    }
+
+    fn release(&self, slot: SnapshotSlot) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot {
+            SnapshotSlot::FirstCausal => state.first_causal_claimed = false,
+            SnapshotSlot::Terminal => state.terminal_claimed = false,
+        }
     }
 }
 
@@ -177,10 +234,59 @@ struct PendingArtifactDir {
     committed: bool,
 }
 
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+fn prepare_artifact_root(root: &Path) -> Result<()> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "SQL failure artifact root must not be a symbolic link: {}",
+                    root.display()
+                );
+            }
+            if !metadata.is_dir() {
+                bail!(
+                    "SQL failure artifact root is not a directory: {}",
+                    root.display()
+                );
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = root.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "create parent of SQL failure artifact root {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            match create_private_directory(root) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    prepare_artifact_root(root)
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!("create SQL failure artifact root {}", root.display())
+                }),
+            }
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect SQL failure artifact root {}", root.display())),
+    }
+}
+
 impl PendingArtifactDir {
     fn create(root: &Path, name_prefix: &str) -> Result<Self> {
-        fs::create_dir_all(root)
-            .with_context(|| format!("create SQL failure artifact root {}", root.display()))?;
+        prepare_artifact_root(root)?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("system clock is before the Unix epoch")?
@@ -190,7 +296,7 @@ impl PendingArtifactDir {
         for _ in 0..64 {
             let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = root.join(format!("{name_prefix}-{timestamp:020}-{pid}-{sequence:04}"));
-            match fs::create_dir(&path) {
+            match create_private_directory(&path) {
                 Ok(()) => {
                     return Ok(Self {
                         path,
@@ -213,10 +319,16 @@ impl PendingArtifactDir {
     }
 
     fn write_file(&self, name: &str, contents: &str) -> Result<()> {
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            bail!("SQL failure artifact file name must not contain a directory: {name:?}");
+        }
         let path = self.path.join(name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
             .open(&path)
             .with_context(|| format!("create SQL failure artifact {}", path.display()))?;
         file.write_all(contents.as_bytes())
@@ -269,50 +381,50 @@ fn persist_cross_process_failure_logs(
         .transpose()
 }
 
+#[cfg(test)]
 fn capture_cross_process_failure_logs(
     server: &dyn ServerHandle,
     slot: SnapshotSlot,
 ) -> Result<Option<CapturedFailureLogs>> {
-    let be_count = server.be_count();
-    if be_count == 0 {
-        return Ok(None);
-    }
-
-    let fe_log = server
-        .fe_log_contents()
-        .context("capture cross-process FE log for failed SQL run")?;
-    let mut logs = Vec::with_capacity(be_count.min(MAX_CAPTURED_BACKEND_LOGS) + 1);
-    logs.push(bounded_process_log("fe.log".to_string(), fe_log));
-    for index in 0..be_count.min(MAX_CAPTURED_BACKEND_LOGS) {
-        let log = server
-            .be_log_contents(index)
-            .with_context(|| format!("capture cross-process BE[{index}] log for failed SQL run"))?;
-        logs.push(bounded_process_log(format!("be-{index:03}.log"), log));
-    }
-
-    Ok(Some(CapturedFailureLogs {
-        slot,
-        backend_count: be_count,
-        logs,
-    }))
+    server
+        .failure_log_sources(MAX_CAPTURED_BACKEND_LOGS, MAX_PROCESS_LOG_TAIL_BYTES)?
+        .map(|sources| capture_failure_log_sources(sources, slot))
+        .transpose()
 }
 
-fn bounded_process_log(name: String, contents: String) -> CapturedProcessLog {
-    let original_bytes = contents.len();
-    let contents = if original_bytes <= MAX_PROCESS_LOG_TAIL_BYTES {
-        contents
-    } else {
-        let mut start = original_bytes - MAX_PROCESS_LOG_TAIL_BYTES;
-        while !contents.is_char_boundary(start) {
-            start += 1;
-        }
-        contents[start..].to_string()
-    };
-    CapturedProcessLog {
-        name,
-        original_bytes,
-        contents,
+fn detach_failure_log_sources(
+    server_handle: &Mutex<Box<dyn ServerHandle>>,
+) -> Result<Option<ServerFailureLogSources>> {
+    match server_handle.lock() {
+        Ok(server) => server
+            .failure_log_sources(MAX_CAPTURED_BACKEND_LOGS, MAX_PROCESS_LOG_TAIL_BYTES)
+            .context("detach cross-process failure log sources"),
+        Err(_) => Err(anyhow::anyhow!(
+            "server handle lock poisoned while detaching failure log sources"
+        )),
     }
+}
+
+fn capture_failure_log_sources(
+    sources: ServerFailureLogSources,
+    slot: SnapshotSlot,
+) -> Result<CapturedFailureLogs> {
+    let captured = sources
+        .capture(MAX_PROCESS_LOG_TAIL_BYTES)
+        .context("capture bounded cross-process failure log tails")?;
+    Ok(CapturedFailureLogs {
+        slot,
+        backend_count: captured.backend_count,
+        logs: captured
+            .logs
+            .into_iter()
+            .map(|log| CapturedProcessLog {
+                name: log.name,
+                original_bytes: log.original_bytes,
+                contents: log.contents,
+            })
+            .collect(),
+    })
 }
 
 fn persist_captured_failure_logs(
@@ -320,13 +432,32 @@ fn persist_captured_failure_logs(
     name_prefix: &str,
     captured: CapturedFailureLogs,
 ) -> Result<PathBuf> {
+    if captured.logs.len() > MAX_CAPTURED_BACKEND_LOGS + 1 {
+        bail!(
+            "failure snapshot contains {} process logs, exceeding the limit {}",
+            captured.logs.len(),
+            MAX_CAPTURED_BACKEND_LOGS + 1
+        );
+    }
+    let retained_snapshot_bytes = captured.logs.iter().try_fold(0_usize, |total, log| {
+        total
+            .checked_add(log.contents.len())
+            .ok_or_else(|| anyhow::anyhow!("failure snapshot retained byte accounting overflowed"))
+    })?;
+    if retained_snapshot_bytes > MAX_FAILURE_SNAPSHOT_BYTES {
+        bail!(
+            "failure snapshot retained {retained_snapshot_bytes} bytes, exceeding the limit {MAX_FAILURE_SNAPSHOT_BYTES}"
+        );
+    }
     let pending = PendingArtifactDir::create(root, name_prefix)?;
     let mut manifest = format!(
-        "schema_version=1\nslot={}\nmax_snapshots={}\nmax_backend_logs={}\nmax_process_log_tail_bytes={}\nbackend_count={}\ncaptured_backend_logs={}\nomitted_backend_logs={}\n",
+        "schema_version=2\nslot={}\nmax_snapshots={}\nmax_backend_logs={}\nmax_process_log_tail_bytes={}\nmax_snapshot_bytes={}\nretained_snapshot_bytes={}\nredaction_scope=source-structured-redaction,known-sensitive-child-environment-values\nbackend_count={}\ncaptured_backend_logs={}\nomitted_backend_logs={}\n",
         captured.slot.label(),
         MAX_FAILURE_SNAPSHOTS,
         MAX_CAPTURED_BACKEND_LOGS,
         MAX_PROCESS_LOG_TAIL_BYTES,
+        MAX_FAILURE_SNAPSHOT_BYTES,
+        retained_snapshot_bytes,
         captured.backend_count,
         captured.logs.len().saturating_sub(1),
         captured
@@ -459,15 +590,24 @@ mod tests {
             self.be_logs.len()
         }
 
-        fn fe_log_contents(&self) -> Result<String> {
-            Ok(self.fe_log.clone())
-        }
-
-        fn be_log_contents(&self, index: usize) -> Result<String> {
-            self.be_logs
-                .get(index)
-                .cloned()
-                .with_context(|| format!("missing test BE log {index}"))
+        fn failure_log_sources(
+            &self,
+            max_backend_logs: usize,
+            max_history_tail_bytes: usize,
+        ) -> Result<Option<ServerFailureLogSources>> {
+            if self.be_logs.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(ServerFailureLogSources::from_inline(
+                self.be_logs.len(),
+                self.fe_log.clone(),
+                self.be_logs
+                    .iter()
+                    .take(max_backend_logs)
+                    .cloned()
+                    .collect(),
+                max_history_tail_bytes,
+            )))
         }
     }
 
@@ -519,6 +659,61 @@ mod tests {
         let manifest = fs::read_to_string(path.join("manifest.txt")).unwrap();
         assert!(manifest.contains("slot=first-causal"), "{manifest}");
         assert!(manifest.contains("backend_count=2"), "{manifest}");
+        assert!(
+            manifest.contains("redaction_scope=source-structured-redaction"),
+            "{manifest}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_artifact_leaf_is_owner_only_without_rewriting_an_existing_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().join("private-artifacts");
+        let server = LogServer {
+            fe_log: "FE diagnostic\n".to_string(),
+            be_logs: vec!["BE diagnostic\n".to_string()],
+        };
+
+        let artifact = persist_cross_process_failure_logs(&server, &context(&root))
+            .expect("persist logs")
+            .expect("cross-process artifacts");
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&artifact).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for name in ["fe.log", "be-000.log", "manifest.txt"] {
+            assert_eq!(
+                fs::metadata(artifact.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{name}"
+            );
+        }
+
+        let existing_root = temp.path().join("shared-artifacts");
+        fs::create_dir(&existing_root).unwrap();
+        fs::set_permissions(&existing_root, fs::Permissions::from_mode(0o750)).unwrap();
+        let artifact = persist_cross_process_failure_logs(&server, &context(&existing_root))
+            .expect("persist under existing root")
+            .expect("cross-process artifacts");
+        assert_eq!(
+            fs::metadata(&existing_root).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(artifact).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]
@@ -720,6 +915,10 @@ mod tests {
             "{manifest}"
         );
         assert!(manifest.contains("omitted_backend_logs=3"), "{manifest}");
+        assert!(
+            manifest.contains(&format!("max_snapshot_bytes={MAX_FAILURE_SNAPSHOT_BYTES}")),
+            "{manifest}"
+        );
     }
 
     // Keep these imports exercised as trait objects too: production owns the

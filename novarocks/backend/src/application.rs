@@ -1700,6 +1700,10 @@ mod tests {
                 install: Some(filter::RuntimeFilterParticipantInstall::default()),
             },
         ));
+        let options: Arc<dyn CodecOwnedContent> = Arc::new(WireContent::new(
+            b"query-options",
+            protocol::QueryOptions::default(),
+        ));
         let credential = CredentialUpdate::new(
             CredentialLeaseId::new(1),
             CredentialEpoch::FIRST,
@@ -1714,6 +1718,7 @@ mod tests {
                 context,
                 &catalogs,
                 &filter,
+                &options,
                 &credential,
             ))
             .expect("establishing a query context with a participant is legal");

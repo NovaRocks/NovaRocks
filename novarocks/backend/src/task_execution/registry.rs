@@ -1011,6 +1011,7 @@ impl TaskExecutionRegistry {
             context,
             request.catalog_binding(),
             request.initial_runtime_filter(),
+            request.query_options(),
             request.initial_credential(),
         ));
 

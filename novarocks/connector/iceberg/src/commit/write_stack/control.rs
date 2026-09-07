@@ -172,7 +172,7 @@ struct IcebergWriteSessionEvidenceV1 {
 }
 
 /// The frontend-only Iceberg write authority of one exact catalog generation.
-// Design: ADR-0135 (docs/adr/ADR-0135-ordinary-aggregate-statistics-dataflow.md)
+// Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 pub struct IcebergWriteSessionControl {
     key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,

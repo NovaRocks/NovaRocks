@@ -19,7 +19,7 @@
 //! values their owners consume.
 //!
 //! The task protocol hands a backend its shared facts as neutral content: a
-//! catalog binding, a runtime filter, and a credential rotation are all
+//! catalog binding, a runtime filter, query options, and a credential rotation are all
 //! opaque handles by the time they reach an owner, because the neutral layer
 //! cannot name a generated message. That is the right boundary for the
 //! protocol and the wrong one for the catalog manager and the filter
@@ -30,11 +30,13 @@
 //! domain's payload fails closed here instead of being misread one layer down.
 //! Nothing else in the backend may name a wire type to get at a payload.
 
+use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution::task_execution::descriptor::PhysicalFragmentPlan;
 use novarocks_execution::task_execution::domain::CodecOwnedContent;
 use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_execution::task_execution::operation::CredentialUpdate;
 use novarocks_execution::task_execution::status::TaskFailureCategory;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
 use novarocks_proto_codec::task_execution::domain::{
@@ -72,6 +74,17 @@ pub fn runtime_filter_install(
 ) -> Result<&proto::RuntimeFilterContribution, HostRejection> {
     stored_message::<proto::RuntimeFilterContribution>(payload)
         .ok_or_else(|| internal("runtime filter payload is not a participant contribution"))
+}
+
+/// The execution options one establish freezes for every task in the context.
+pub fn query_options(payload: &dyn CodecOwnedContent) -> Result<QueryOptions, HostRejection> {
+    let raw = stored_message::<proto::QueryOptions>(payload)
+        .ok_or_else(|| internal("query options payload is not a native query options message"))?;
+    crate::fragment::decode::query_options::decode_query_options_at(
+        raw,
+        FieldPath::root("establish").field("query_options"),
+    )
+    .map_err(|error| protocol(&format!("query options are invalid: {error}")))
 }
 
 /// The material one credential rotation carries.

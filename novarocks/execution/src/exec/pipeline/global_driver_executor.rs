@@ -188,6 +188,10 @@ impl DriverTask {
         self.driver.driver_id()
     }
 
+    pub(crate) fn source_name(&self) -> &str {
+        self.driver.source_name()
+    }
+
     pub(crate) fn fragment_instance_id(&self) -> Option<(i64, i64)> {
         self.driver.fragment_instance_id()
     }

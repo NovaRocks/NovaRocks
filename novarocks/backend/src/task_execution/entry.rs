@@ -55,6 +55,7 @@ pub(super) struct EstablishRecord {
     pub(super) operation: TaskOperationId,
     pub(super) catalog: ContentFingerprint,
     pub(super) runtime_filter: ContentFingerprint,
+    pub(super) query_options: ContentFingerprint,
     pub(super) credential_lease: novarocks_execution::task_execution::domain::CredentialLeaseId,
     pub(super) credential_epoch: novarocks_execution::task_execution::domain::CredentialEpoch,
     pub(super) lease_valid_for: LeaseValidFor,
@@ -66,6 +67,7 @@ impl EstablishRecord {
             operation: request.envelope().operation_id(),
             catalog: request.catalog_binding().fingerprint(),
             runtime_filter: request.initial_runtime_filter().fingerprint(),
+            query_options: request.query_options().fingerprint(),
             credential_lease: request.initial_credential().lease_id(),
             credential_epoch: request.initial_credential().epoch(),
             lease_valid_for: request.initial_lease_valid_for(),
@@ -80,6 +82,7 @@ impl EstablishRecord {
     pub(super) fn same_content(&self, other: &Self) -> bool {
         self.catalog == other.catalog
             && self.runtime_filter == other.runtime_filter
+            && self.query_options == other.query_options
             && self.credential_lease == other.credential_lease
             && self.credential_epoch == other.credential_epoch
             && self.lease_valid_for == other.lease_valid_for

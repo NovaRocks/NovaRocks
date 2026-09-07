@@ -676,7 +676,10 @@ oss_endpoint = "http://127.0.0.1:9000"
             Some("sqlb_ssb_stable"),
         );
 
-        assert_eq!(variables.get("run_id"), Some(&"sqlb_ssb_stable".to_string()));
+        assert_eq!(
+            variables.get("run_id"),
+            Some(&"sqlb_ssb_stable".to_string())
+        );
         assert_eq!(
             variables.get("suite_uuid0"),
             Some(&"sqlb_ssb_stable_0".to_string())

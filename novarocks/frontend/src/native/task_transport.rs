@@ -112,10 +112,9 @@ pub(crate) struct EstablishWireContent {
 ///
 /// Nothing is handed in from outside: an intent carries its payloads behind a
 /// fingerprint, and the codec that produced them is the only thing that can
-/// recover them. The two attempt-level facts an establish needs -- the query
-/// options and the compatibility identity -- come from the sink, because they
-/// belong to the attempt rather than to any one operation and the neutral
-/// request deliberately does not name a generated type.
+/// recover them. Query options come from the immutable establish intent. The
+/// compatibility identity still comes from the sink because it belongs to the
+/// attempt-wide wire island rather than to the query-context owner.
 fn encode_operation(
     intent: &OperationIntent,
     attempt: &AttemptWireFacts,
@@ -148,10 +147,10 @@ fn encode_operation(
     }
 }
 
-/// The two attempt-level facts an establish carries that no intent names.
+/// The attempt-level compatibility fact an establish carries outside its
+/// neutral intent.
 #[derive(Clone, Debug)]
 pub(crate) struct AttemptWireFacts {
-    pub(crate) query_options: proto::QueryOptions,
     pub(crate) native_compatibility_id: Option<proto::NativeCompatibilityId>,
 }
 
@@ -187,6 +186,9 @@ fn encode_query_context_operation(
                 establish.initial_runtime_filter().as_ref(),
             )
             .ok_or("establish runtime filter is not a codec-produced contribution")?;
+            let query_options =
+                stored_message::<proto::QueryOptions>(establish.query_options().as_ref())
+                    .ok_or("establish query options are not codec-produced")?;
             let credential = stored_credential(establish.initial_credential().material().as_ref())
                 .ok_or("establish credential is not codec-produced material")?;
             Ok(encode_establish_query_context(
@@ -199,7 +201,7 @@ fn encode_query_context_operation(
                     descriptors: credential.descriptors().to_vec(),
                     envelopes: credential.envelopes().to_vec(),
                 },
-                attempt.query_options.clone(),
+                *query_options,
                 attempt.native_compatibility_id.clone(),
             ))
         }
@@ -1484,8 +1486,15 @@ mod tests {
     use std::pin::Pin;
 
     use novarocks_execution::task_execution::{
-        CancelReason, CancelTask, CreateTaskReceipt, FetchTaskDynamicFilters, LeaseSequence,
+        CancelReason, CancelTask, CreateTaskReceipt, CredentialEpoch, CredentialLeaseId,
+        CredentialUpdate, EstablishQueryContext, FetchTaskDynamicFilters, LeaseSequence,
         LeaseValidFor, MonotonicInstant, RenewQueryExecutionLease, TaskStatus, TaskStatusVersion,
+    };
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::task_execution::domain::{WireContent, WireCredential};
+    use novarocks_proto_codec::task_execution::operation::{
+        ESTABLISH_CATALOG_DOMAIN_TAG, ESTABLISH_FILTER_DOMAIN_TAG,
+        ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
     };
     use novarocks_proto_codec::task_execution::operation::{
         decode_subscribe_task_status, encode_operation_outcome, encode_status_event,
@@ -1569,9 +1578,56 @@ mod tests {
     /// The attempt-level wire facts every test sink carries.
     fn test_attempt_facts() -> AttemptWireFacts {
         AttemptWireFacts {
-            query_options: proto::QueryOptions::default(),
             native_compatibility_id: None,
         }
+    }
+
+    #[test]
+    fn an_establish_encodes_the_query_options_owned_by_its_intent() {
+        let backend = BackendProcessId::new_v7();
+        let expected = proto::QueryOptions {
+            query_mem_limit: 4096,
+            pipeline_dop: 3,
+            ..proto::QueryOptions::default()
+        };
+        let request = UpdateQueryContext::Establish(EstablishQueryContext::new(
+            TaskOperationId::new_v7(),
+            context(backend),
+            Arc::new(WireContent::new(
+                ESTABLISH_CATALOG_DOMAIN_TAG,
+                catalog::CatalogSet::default(),
+            )),
+            Arc::new(WireContent::new(
+                ESTABLISH_FILTER_DOMAIN_TAG,
+                proto::RuntimeFilterContribution::default(),
+            )),
+            Arc::new(WireContent::new(
+                ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
+                expected,
+            )),
+            CredentialUpdate::new(
+                CredentialLeaseId::new(1),
+                CredentialEpoch::FIRST,
+                Arc::new(
+                    WireCredential::decode(&[], &[], FieldPath::root("credential"))
+                        .expect("an empty credential table is legal"),
+                ),
+            ),
+            LeaseValidFor::new(Duration::from_secs(30)).expect("a legal lease"),
+        ));
+
+        let encoded = encode_query_context_operation(&request, &test_attempt_facts())
+            .expect("the establish is codec-owned");
+        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) = encoded.operation
+        else {
+            panic!("an establish encodes as UpdateQueryContext");
+        };
+        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+            update.command
+        else {
+            panic!("the update carries an establish");
+        };
+        assert_eq!(establish.query_options, Some(expected));
     }
 
     // -----------------------------------------------------------------------

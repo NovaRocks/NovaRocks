@@ -102,12 +102,13 @@ impl std::error::Error for HostRejection {}
 /// The shared facts one establish installs, handed over as a single unit.
 ///
 /// They are passed together because they become observable together: the
-/// context reaches `Active` only once all three are materialized, so a host
+/// context reaches `Active` only once all four are materialized, so a host
 /// never publishes a catalog binding a query's credential cannot yet read.
 pub struct SharedFactsRequest<'a> {
     context: QueryContextRef,
     catalog_binding: &'a Arc<dyn CodecOwnedContent>,
     initial_runtime_filter: &'a Arc<dyn CodecOwnedContent>,
+    query_options: &'a Arc<dyn CodecOwnedContent>,
     initial_credential: &'a CredentialUpdate,
 }
 
@@ -116,12 +117,14 @@ impl<'a> SharedFactsRequest<'a> {
         context: QueryContextRef,
         catalog_binding: &'a Arc<dyn CodecOwnedContent>,
         initial_runtime_filter: &'a Arc<dyn CodecOwnedContent>,
+        query_options: &'a Arc<dyn CodecOwnedContent>,
         initial_credential: &'a CredentialUpdate,
     ) -> Self {
         Self {
             context,
             catalog_binding,
             initial_runtime_filter,
+            query_options,
             initial_credential,
         }
     }
@@ -136,6 +139,10 @@ impl<'a> SharedFactsRequest<'a> {
 
     pub const fn initial_runtime_filter(&self) -> &'a Arc<dyn CodecOwnedContent> {
         self.initial_runtime_filter
+    }
+
+    pub const fn query_options(&self) -> &'a Arc<dyn CodecOwnedContent> {
+        self.query_options
     }
 
     pub const fn initial_credential(&self) -> &'a CredentialUpdate {

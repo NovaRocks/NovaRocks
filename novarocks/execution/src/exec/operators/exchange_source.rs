@@ -259,6 +259,7 @@ impl OperatorFactory for ExchangeSourceFactory {
             finished: false,
             logged_first_pull: false,
             logged_first_none: false,
+            last_partial_eos_marker_count: 0,
             arena: Arc::clone(&self.arena),
             native_runtime_filter_consumers: Some(self.runtime_filter_execution.consumers.clone()),
             event_sink: Arc::new(NoopFragmentEventSink),
@@ -287,6 +288,7 @@ struct ExchangeSourceOperator {
     finished: bool,
     logged_first_pull: bool,
     logged_first_none: bool,
+    last_partial_eos_marker_count: usize,
     arena: Arc<ExprArena>,
     native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
     event_sink: Arc<dyn FragmentEventSink>,
@@ -461,6 +463,23 @@ impl ProcessorOperator for ExchangeSourceOperator {
                 }
                 Some(exchange::ExchangePopResult::Finished(stats)) => {
                     self.idle_deadline.cancel();
+                    if exchange::exchange_snapshot_markers_enabled() {
+                        let snapshot = self
+                            .binding
+                            .receiver_port
+                            .snapshot(receiver_key(self.binding.key));
+                        exchange::emit_exchange_snapshot_marker(|| {
+                            format!(
+                                "event=source_finished finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                                self.binding.key.finst_uuid(),
+                                self.node.node_id,
+                                self.driver_id,
+                                self.binding.expected_senders,
+                                snapshot,
+                                self.source_observable.generation(),
+                            )
+                        });
+                    }
                     debug!(
                         "ExchangeSource finished: finst={} node_id={} driver_id={} request_received={} bytes_received={} deserialize_ns={} chunks_received={} rows_received={}",
                         self.binding.key.finst_uuid(),
@@ -489,8 +508,48 @@ impl ProcessorOperator for ExchangeSourceOperator {
                             self.node.node_id
                         ));
                     }
-                    if !self.logged_first_none {
+                    let first_none = !self.logged_first_none;
+                    if first_none {
                         self.logged_first_none = true;
+                    }
+                    if exchange::exchange_snapshot_markers_enabled() {
+                        let snapshot = self
+                            .binding
+                            .receiver_port
+                            .snapshot(receiver_key(self.binding.key));
+                        if first_none {
+                            let first_snapshot = snapshot.clone();
+                            exchange::emit_exchange_snapshot_marker(|| {
+                                format!(
+                                    "event=source_first_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                                    self.binding.key.finst_uuid(),
+                                    self.node.node_id,
+                                    self.driver_id,
+                                    self.binding.expected_senders,
+                                    first_snapshot,
+                                    self.source_observable.generation(),
+                                )
+                            });
+                        }
+                        if let Some(snapshot) = snapshot
+                            && snapshot.finished_senders > self.last_partial_eos_marker_count
+                            && snapshot.finished_senders < self.binding.expected_senders
+                        {
+                            self.last_partial_eos_marker_count = snapshot.finished_senders;
+                            exchange::emit_exchange_snapshot_marker(|| {
+                                format!(
+                                    "event=source_partial_eos_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                                    self.binding.key.finst_uuid(),
+                                    self.node.node_id,
+                                    self.driver_id,
+                                    self.binding.expected_senders,
+                                    snapshot,
+                                    self.source_observable.generation(),
+                                )
+                            });
+                        }
+                    }
+                    if first_none {
                         debug!(
                             "ExchangeSource no output yet: node_id={} driver_id={}",
                             self.node.node_id, self.driver_id
@@ -1036,6 +1095,117 @@ mod tests {
             "receiver progress must rotate an idle deadline even when a sibling consumes the chunk"
         );
         assert!(second_after.at() >= second_before.at());
+        binding
+            .receiver_port
+            .cancel_fragment(UniqueId::new(key.finst_id_hi, key.finst_id_lo));
+    }
+
+    #[test]
+    fn every_parked_driver_observes_the_shared_three_sender_eos() {
+        let key = exchange::ExchangeKey {
+            finst_id_hi: 92_031,
+            finst_id_lo: 92_032,
+            node_id: 92_033,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let node = ExchangeSourceNode::new(
+            key.node_id,
+            Duration::from_secs(1),
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .expect("chunk schema"),
+        );
+        let binding = ExchangeBinding {
+            key,
+            expected_senders: 3,
+            receiver_port: in_process_test_exchange_receiver_port(),
+        };
+        let factory = ExchangeSourceFactory::new_native(
+            node,
+            binding.clone(),
+            Arc::new(ExprArena::default()),
+        )
+        .expect("exchange source factory");
+        let state = Arc::new(runtime_state());
+        let fragment = Arc::new(FragmentContext::new(
+            None,
+            Arc::clone(&state),
+            Some((key.finst_id_hi, key.finst_id_lo)),
+            None,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(5);
+        let rows = Arc::new(AtomicUsize::new(0));
+        let mut observables = Vec::new();
+        let mut tasks = Vec::new();
+        for driver_id in 0..5 {
+            let mut source = factory.create(5, driver_id);
+            source.prepare().expect("prepare exchange source");
+            source
+                .bind_runtime_state(&state)
+                .expect("bind exchange source runtime");
+            observables.push(
+                source
+                    .as_processor_ref()
+                    .and_then(ProcessorOperator::source_observable)
+                    .expect("source observable"),
+            );
+            let driver = PipelineDriver::new(
+                driver_id,
+                vec![
+                    source,
+                    Box::new(CountingSink {
+                        rows: Arc::clone(&rows),
+                        finishing: false,
+                    }),
+                ],
+                None,
+                Vec::new(),
+                Arc::clone(&state),
+                fragment.fragment_instance_id(),
+            );
+            tasks.push(DriverTask::new(
+                driver,
+                Arc::clone(&completion),
+                Arc::clone(&fragment),
+                Duration::from_millis(5),
+            ));
+        }
+
+        let executor = GlobalDriverExecutor::new(2);
+        executor.submit(tasks);
+        let park_deadline = Instant::now() + Duration::from_secs(1);
+        while observables
+            .iter()
+            .any(|observable| observable.num_observers() == 0)
+            && Instant::now() < park_deadline
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            observables
+                .iter()
+                .all(|observable| observable.num_observers() > 0),
+            "every high-DOP exchange driver must be parked before EOS"
+        );
+
+        for sender in 0..3 {
+            binding.receiver_port.push_local(
+                receiver_key(key),
+                100 + sender,
+                sender,
+                Vec::new(),
+                true,
+            );
+        }
+
+        completion
+            .wait_timeout(
+                Duration::from_secs(1),
+                "shared exchange EOS did not finish every parked driver".to_string(),
+            )
+            .expect("all exchange drivers finish after the third sender EOS");
+        assert_eq!(rows.load(Ordering::Acquire), 0);
         binding
             .receiver_port
             .cancel_fragment(UniqueId::new(key.finst_id_hi, key.finst_id_lo));

@@ -77,6 +77,28 @@ pub(crate) fn decode_instance_params(
     src: &proto::InstanceParams,
 ) -> Result<NativeFragmentInstanceInput, NativeFragmentIngressError> {
     let path = FieldPath::root("instance_params");
+    let wire_query_options = src.query_options.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("query_options"),
+            "native InstanceParams requires query_options with explicit pipeline_dop",
+        )
+    })?;
+    let query_options = decode_query_options(wire_query_options)
+        .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
+    decode_instance_params_with_query_options(src, query_options)
+}
+
+/// Decodes task-local instance facts while taking query-wide execution options
+/// from the already established query context.
+///
+/// The wire copy remains required because its pipeline DOP is also projected
+/// into the task descriptor and must be checked there. It is not reconstructed
+/// into another query-options authority on this path.
+pub(crate) fn decode_instance_params_with_query_options(
+    src: &proto::InstanceParams,
+    query_options: QueryOptions,
+) -> Result<NativeFragmentInstanceInput, NativeFragmentIngressError> {
+    let path = FieldPath::root("instance_params");
     let query_id = src.query_id.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("query_id"),
@@ -103,8 +125,6 @@ pub(crate) fn decode_instance_params(
             "native InstanceParams requires query_options with explicit pipeline_dop",
         )
     })?;
-    let query_options = decode_query_options(wire_query_options)
-        .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
     let pipeline_dop = usize::try_from(wire_query_options.pipeline_dop)
         .ok()
         .and_then(NonZeroUsize::new)

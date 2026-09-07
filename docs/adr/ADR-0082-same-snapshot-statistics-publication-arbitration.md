@@ -4,7 +4,7 @@ title: "Full-coverage statistics outrank incremental ones on the same snapshot"
 domain: [connector-spi]
 status: superseded
 supersedes: []
-superseded-by: ADR-0135
+superseded-by: ADR-0136
 date: 2026-08-17
 provenance:
   - "PR: pending (ancestor statistics reads and measured-snapshot publication)"

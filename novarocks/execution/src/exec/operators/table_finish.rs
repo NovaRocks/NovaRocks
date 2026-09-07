@@ -28,7 +28,7 @@
 //! complete or it does not exist. On abort the buffered fragments are released
 //! immediately rather than held until the driver is dropped.
 //!
-//! Design: ADR-0135 (docs/adr/ADR-0135-ordinary-aggregate-statistics-dataflow.md)
+//! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;

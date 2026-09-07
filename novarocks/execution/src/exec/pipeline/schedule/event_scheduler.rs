@@ -327,6 +327,10 @@ impl EventScheduler {
         generation: u64,
         deadline: Option<DriverBlockDeadline>,
     ) {
+        let emit_exchange_marker = crate::runtime::exchange::exchange_snapshot_markers_enabled()
+            && matches!(reason, BlockedReason::InputEmpty)
+            && task.source_name().contains("EXCHANGE")
+            && generation == 0;
         let key = DriverKey::new(task.fragment_instance_id(), task.driver_id());
         let block_epoch = self
             .next_block_epoch
@@ -363,6 +367,20 @@ impl EventScheduler {
             }
             aborted
         };
+
+        if emit_exchange_marker {
+            crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
+                format!(
+                    "event=driver_park finst={:?} driver_id={} reason={:?} frozen_generation={} current_generation={} block_epoch={}",
+                    key.finst,
+                    key.driver_id,
+                    reason,
+                    generation,
+                    observable.generation(),
+                    block_epoch,
+                )
+            });
+        }
 
         // Registration can race with a transition that already made the task
         // runnable. The generation comparison closes that window without
@@ -561,17 +579,47 @@ impl EventScheduler {
     }
 
     fn try_schedule_key(self: &Arc<Self>, key: DriverKey) {
-        let task = {
+        let (task, exchange_marker) = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             let entry = blocked.remove(&key);
+            let exchange_marker = crate::runtime::exchange::exchange_snapshot_markers_enabled()
+                .then_some(entry.as_ref())
+                .flatten()
+                .and_then(|entry| {
+                    entry
+                        .task
+                        .source_name()
+                        .contains("EXCHANGE")
+                        .then(|| {
+                            let (blocked_generation, current_generation) = entry
+                                .observable
+                                .as_ref()
+                                .and_then(|(observable, blocked_generation)| {
+                                    observable.upgrade().map(|observable| {
+                                        (*blocked_generation, observable.generation())
+                                    })
+                                })
+                                .map_or((0, 0), |generations| generations);
+                            (blocked_generation, current_generation, entry.block_epoch)
+                        })
+                        .filter(|(blocked_generation, _, _)| *blocked_generation == 0)
+                });
             let mut state = self
                 .reschedule_queue
                 .lock()
                 .expect("event scheduler queue lock");
             state.pending.remove(&key);
             state.remove_deadline(key);
-            entry.map(|entry| entry.task)
+            (entry.map(|entry| entry.task), exchange_marker)
         };
+        if let Some((blocked_generation, current_generation, block_epoch)) = exchange_marker {
+            crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
+                format!(
+                    "event=driver_wake finst={:?} driver_id={} blocked_generation={} current_generation={} block_epoch={}",
+                    key.finst, key.driver_id, blocked_generation, current_generation, block_epoch,
+                )
+            });
+        }
         let Some(mut task) = task else {
             return;
         };

@@ -25,5 +25,7 @@
 mod managed_process;
 mod reserved_tcp_port;
 
-pub use managed_process::{ManagedProcess, ReadyMarker};
+pub use managed_process::{
+    ManagedProcess, ManagedProcessLogSource, ManagedProcessLogTail, ReadyMarker,
+};
 pub use reserved_tcp_port::ReservedTcpPort;

@@ -1,5 +1,5 @@
 ---
-id: ADR-0135
+id: ADR-0136
 title: "Statistics use ordinary aggregates, dataflow artifacts, and provider-owned publication sessions"
 domain: [provider-spi]
 status: active

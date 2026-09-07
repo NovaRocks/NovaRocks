@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 ))]
 use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -575,6 +575,65 @@ pub struct ManagedProcess {
     stopped: bool,
 }
 
+/// A detachable handle to one managed process's durable output.
+///
+/// Cloning this value performs no filesystem I/O and does not retain the child
+/// process. Callers can therefore copy it while holding their own lifecycle
+/// mutex, release that mutex, and read a bounded tail afterwards.
+#[derive(Clone)]
+pub struct ManagedProcessLogSource {
+    label: String,
+    log_path: PathBuf,
+    output_io_error: SharedOutputIoError,
+}
+
+/// One point-in-time, bounded durable-log byte observation.
+///
+/// Keeping the tail as bytes avoids expanding malformed UTF-8 before the
+/// caller has applied its own redaction and final presentation budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedProcessLogTail {
+    pub original_bytes: usize,
+    pub bytes: Vec<u8>,
+}
+
+impl ManagedProcessLogSource {
+    pub fn read_tail(&self, max_bytes: usize) -> Result<ManagedProcessLogTail> {
+        let output_error = self
+            .output_io_error
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process output I/O error state lock poisoned"))?
+            .clone();
+        if let Some(error) = output_error {
+            bail!(
+                "{} cannot snapshot durable log: {error}; log={}",
+                self.label,
+                self.log_path.display()
+            );
+        }
+
+        let mut file = File::open(&self.log_path)
+            .with_context(|| format!("open durable process log {}", self.log_path.display()))?;
+        let original_bytes_u64 = file
+            .metadata()
+            .with_context(|| format!("inspect durable process log {}", self.log_path.display()))?
+            .len();
+        let retained_bytes = original_bytes_u64.min(max_bytes as u64);
+        file.seek(SeekFrom::Start(original_bytes_u64 - retained_bytes))
+            .with_context(|| format!("seek durable process log {}", self.log_path.display()))?;
+        let mut bytes = Vec::with_capacity(retained_bytes as usize);
+        file.take(retained_bytes)
+            .read_to_end(&mut bytes)
+            .with_context(|| {
+                format!("read durable process log tail {}", self.log_path.display())
+            })?;
+        Ok(ManagedProcessLogTail {
+            original_bytes: usize::try_from(original_bytes_u64).unwrap_or(usize::MAX),
+            bytes,
+        })
+    }
+}
+
 struct SpawnRequest {
     label: String,
     command: Command,
@@ -598,6 +657,16 @@ impl std::fmt::Debug for ManagedProcess {
 }
 
 impl ManagedProcess {
+    /// Detaches the immutable durable-log location and shared writer error
+    /// state from the process lifecycle owner without reading the log.
+    pub fn log_source(&self) -> ManagedProcessLogSource {
+        ManagedProcessLogSource {
+            label: self.label.clone(),
+            log_path: self.log_path.clone(),
+            output_io_error: Arc::clone(&self.output_io_error),
+        }
+    }
+
     pub fn run_to_completion(
         label: String,
         command: Command,
@@ -1890,9 +1959,9 @@ fn read_tail(buffer: &Arc<Mutex<String>>, poisoned: &str) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        FileReadinessSnapshot, ManagedProcess, ProcessGroupOwnership, ReadinessBaseline,
-        ReadyMarker, SpawnRequest, WaitSiginfo, run_reader_with_panic_boundary, spawn_reader,
-        unsupported_runtime_exit_status, wait_siginfo_abi_supported,
+        FileReadinessSnapshot, ManagedProcess, ManagedProcessLogSource, ProcessGroupOwnership,
+        ReadinessBaseline, ReadyMarker, SpawnRequest, WaitSiginfo, run_reader_with_panic_boundary,
+        spawn_reader, unsupported_runtime_exit_status, wait_siginfo_abi_supported,
     };
     use std::fs;
     use std::io::{self, Cursor, Write};
@@ -1927,6 +1996,41 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn detached_log_source_reads_only_the_requested_tail() {
+        let temp = TempDir::new("detached-log-tail");
+        let log_path = temp.path().join("fixture.log");
+        fs::write(&log_path, b"discarded-prefix-terminal").expect("write fixture log");
+        let source = ManagedProcessLogSource {
+            label: "fixture".to_string(),
+            log_path,
+            output_io_error: Arc::new(Mutex::new(None)),
+        };
+
+        let tail = source.read_tail(8).expect("read bounded tail");
+        assert_eq!(tail.original_bytes, 25);
+        assert_eq!(tail.bytes, b"terminal");
+    }
+
+    #[test]
+    fn detached_log_source_does_not_expand_invalid_utf8_past_the_requested_tail() {
+        let temp = TempDir::new("detached-invalid-utf8-tail");
+        let log_path = temp.path().join("fixture.log");
+        let mut contents = vec![0xff; 512];
+        contents.extend_from_slice(b"terminal");
+        fs::write(&log_path, &contents).expect("write invalid UTF-8 fixture log");
+        let source = ManagedProcessLogSource {
+            label: "fixture".to_string(),
+            log_path,
+            output_io_error: Arc::new(Mutex::new(None)),
+        };
+
+        let tail = source.read_tail(128).expect("read bounded byte tail");
+        assert_eq!(tail.original_bytes, contents.len());
+        assert!(tail.bytes.len() <= 128);
+        assert!(tail.bytes.ends_with(b"terminal"));
     }
 
     fn shell(script: &str) -> Command {

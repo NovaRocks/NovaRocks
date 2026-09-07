@@ -76,11 +76,7 @@ fn execute_command(command: &mut Command) -> (bool, Option<QueryExecution>, Stri
                 )
             }
         }
-        Err(err) => (
-            false,
-            None,
-            format!("failed to start shell command: {err}"),
-        ),
+        Err(err) => (false, None, format!("failed to start shell command: {err}")),
     }
 }
 
@@ -94,16 +90,23 @@ mod tests {
 
         assert!(ok, "{error}");
         assert!(error.is_empty());
-        assert_eq!(execution.expect("successful execution").text_output, "0\nSHELL_OK");
+        assert_eq!(
+            execution.expect("successful execution").text_output,
+            "0\nSHELL_OK"
+        );
     }
 
     #[test]
     fn failed_shell_step_reports_status_stdout_and_stderr() {
-        let (ok, execution, error) =
-            execute_shell_step("shell: printf 'stdout evidence\\n'; printf 'stderr evidence\\n' >&2; exit 7");
+        let (ok, execution, error) = execute_shell_step(
+            "shell: printf 'stdout evidence\\n'; printf 'stderr evidence\\n' >&2; exit 7",
+        );
 
         assert!(!ok);
-        assert_eq!(execution.expect("failed execution is retained").text_output, "7\nstdout evidence");
+        assert_eq!(
+            execution.expect("failed execution is retained").text_output,
+            "7\nstdout evidence"
+        );
         assert!(error.contains("status 7"), "{error}");
         assert!(error.contains("stdout evidence"), "{error}");
         assert!(error.contains("stderr evidence"), "{error}");
@@ -111,7 +114,8 @@ mod tests {
 
     #[test]
     fn shell_start_failure_is_reported() {
-        let mut command = std::process::Command::new("/definitely-not-an-executable-novarocks-sql-runner");
+        let mut command =
+            std::process::Command::new("/definitely-not-an-executable-novarocks-sql-runner");
         let (ok, execution, error) = super::execute_command(&mut command);
 
         assert!(!ok);

@@ -40,10 +40,10 @@ use novarocks_proto_codec::lifecycle::{
 use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
 use novarocks_proto_codec::task_execution::domain::{WireContent, WireCredential};
 use novarocks_proto_codec::task_execution::operation::{
-    ESTABLISH_CATALOG_DOMAIN_TAG, ESTABLISH_FILTER_DOMAIN_TAG,
+    ESTABLISH_CATALOG_DOMAIN_TAG, ESTABLISH_FILTER_DOMAIN_TAG, ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
 };
 use novarocks_proto_models::catalog::CatalogSet;
-use novarocks_proto_models::novarocks::RuntimeFilterContribution;
+use novarocks_proto_models::novarocks::{QueryOptions, RuntimeFilterContribution};
 use novarocks_types::identity::BackendProcessId;
 
 use novarocks_sql::plan_read::FragmentId;
@@ -346,6 +346,11 @@ mod tests {
         // would notice until a filter reached the wrong place.
         let first = BackendProcessId::new_v7();
         let second = BackendProcessId::new_v7();
+        let query_options = QueryOptions {
+            query_mem_limit: 4096,
+            pipeline_dop: 3,
+            ..QueryOptions::default()
+        };
         let facts = AttemptEstablishFacts::freeze(
             CatalogSet::default(),
             vec![
@@ -364,6 +369,7 @@ mod tests {
                     },
                 ),
             ],
+            query_options,
             &QueryCredentialLeases::empty(),
         )
         .expect("a legal attempt");
@@ -377,6 +383,11 @@ mod tests {
             )
             .expect("this codec produced it");
             assert_eq!(contribution.participant_id, expected);
+            assert_eq!(
+                stored_message::<QueryOptions>(established.query_options.as_ref())
+                    .expect("the establish owns its exact query options"),
+                &query_options
+            );
         }
 
         // A backend that hosts tasks but compiled no contribution is a
@@ -402,6 +413,7 @@ mod tests {
         let facts = AttemptEstablishFacts::freeze(
             CatalogSet::default(),
             vec![(backend, RuntimeFilterContribution::default())],
+            QueryOptions::default(),
             &QueryCredentialLeases::empty(),
         )
         .expect("a legal attempt");
@@ -438,6 +450,7 @@ const ATTEMPT_CREDENTIAL_DOMAIN: CredentialLeaseId = CredentialLeaseId::new(1);
 pub struct AttemptEstablishFacts {
     catalog_binding: Arc<dyn CodecOwnedContent>,
     filters: BTreeMap<BackendProcessId, Arc<dyn CodecOwnedContent>>,
+    query_options: Arc<dyn CodecOwnedContent>,
     credential: CredentialUpdate,
 }
 
@@ -447,6 +460,7 @@ impl fmt::Debug for AttemptEstablishFacts {
         formatter
             .debug_struct("AttemptEstablishFacts")
             .field("backends", &self.filters.len())
+            .field("query_options", &self.query_options.fingerprint())
             .finish()
     }
 }
@@ -463,6 +477,7 @@ impl AttemptEstablishFacts {
     pub fn freeze(
         catalog_set: CatalogSet,
         filters: impl IntoIterator<Item = (BackendProcessId, RuntimeFilterContribution)>,
+        query_options: QueryOptions,
         leases: &QueryCredentialLeases,
     ) -> Result<Self, TaskExecutionError> {
         let mut descriptors = Vec::new();
@@ -496,6 +511,10 @@ impl AttemptEstablishFacts {
                     )
                 })
                 .collect(),
+            query_options: Arc::new(WireContent::new(
+                ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
+                query_options,
+            )),
             // The protocol's lease id names the attempt's credential domain,
             // not a storage lease: a query context has exactly one such
             // domain, and each vended lease keeps its own sixteen-byte
@@ -536,6 +555,7 @@ impl ContextEstablishSource for AttemptEstablishFacts {
         Ok(ContextEstablishFacts {
             catalog_binding: Arc::clone(&self.catalog_binding),
             initial_runtime_filter,
+            query_options: Arc::clone(&self.query_options),
             initial_credential: self.credential.clone(),
         })
     }

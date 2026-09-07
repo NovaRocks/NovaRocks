@@ -13,6 +13,13 @@ pub(crate) fn decode_query_options(
     src: &novarocks::QueryOptions,
 ) -> Result<QueryOptions, ProtocolError> {
     let path = FieldPath::root("instance_params").field("query_options");
+    decode_query_options_at(src, path)
+}
+
+pub(crate) fn decode_query_options_at(
+    src: &novarocks::QueryOptions,
+    path: FieldPath,
+) -> Result<QueryOptions, ProtocolError> {
     validate_protocol_options(src, path.clone())?;
     let validated = ProtocolQueryOptions::parse(*src).map_err(|error| {
         ProtocolError::new(

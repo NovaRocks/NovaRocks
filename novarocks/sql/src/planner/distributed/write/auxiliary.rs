@@ -22,7 +22,7 @@
 //! bindings, target grouping, and generic literal mappings. Neither the wire
 //! contract nor Execution receives a Connector session or artifact descriptor.
 //!
-//! Design: ADR-0135 (docs/adr/ADR-0135-ordinary-aggregate-statistics-dataflow.md)
+//! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

@@ -120,7 +120,7 @@ code-anchors:
 - ADR-0085 — durable caller 为何通过既有 exact metadata lease capture/rebind 物理表对象，而不依赖统计能力或新增平行 authority（active）
 - ADR-0080 — 统计证据为何拆成 collection 级覆盖度与 per-metric 基准版本/来源/数值性质/集合关系四个独立维度（active）
 - ADR-0081 — 统计为何是带版本、允许陈旧、由读侧逐 metric 决定可用性的估计事实（active）
-- ADR-0135 — 统计为何复用普通聚合与写入数据流，并由provider single-use session发布（active）
+- ADR-0136 — 统计为何复用普通聚合与写入数据流，并由provider single-use session发布（active）
 - ADR-0111 — Frontend maintenance/statistics job 为何是 ProcessRuntime，而 GC first-observation 是 Accelerator（active）
 - ADR-0097 — durable MV 与维护基表 identity 为何保持 opaque、只在 provider-local 边界解释（active）
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
@@ -131,8 +131,8 @@ code-anchors:
 
 #### 历史
 
-- ADR-0022 — Connector statistics capability 为何保持 FE-only、generation-fenced 且不进入 BE binding（superseded → ADR-0135）
-- ADR-0082 — 同一快照上的统计发布为何以覆盖度排序、且冲突重试必须重新判定（superseded → ADR-0135）
+- ADR-0022 — Connector statistics capability 为何保持 FE-only、generation-fenced 且不进入 BE binding（superseded → ADR-0136）
+- ADR-0082 — 同一快照上的统计发布为何以覆盖度排序、且冲突重试必须重新判定（superseded → ADR-0136）
 
 - ADR-0048 — distributed write为何以 Provider-signed preparation、exact lease 与中立 durable terminal fact 收敛 caller authority（superseded → ADR-0051）
 - ADR-0023 — distributed writer 为何以 operation/cohort/execution/writer 分层，并由 FE 聚合外部提交（superseded → ADR-0133）

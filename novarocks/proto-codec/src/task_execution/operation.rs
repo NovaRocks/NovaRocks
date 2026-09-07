@@ -53,13 +53,15 @@ use crate::task_execution::domain::{
     decode_task_domain,
 };
 
-/// Domain separation tags for the two shared facts an establish installs.
+/// Domain separation tags for the shared facts an establish installs.
 /// They are distinct from the tags an advance uses, because the same content
 /// arriving as an install and as a rotation is not the same operation.
 pub const ESTABLISH_CATALOG_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.catalog_binding.v1";
 pub const ESTABLISH_FILTER_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.initial_runtime_filter.v1";
+pub const ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG: &[u8] =
+    b"novarocks.task_execution.establish.query_options.v1";
 use crate::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use crate::task_execution::identity::{
     decode_query_context_ref, decode_task_operation_id, encode_query_context_ref,
@@ -150,6 +152,7 @@ pub struct DecodedEstablishQueryContext {
     envelope: OperationEnvelope,
     catalog_set: Arc<WireContent<novarocks_proto_models::catalog::CatalogSet>>,
     initial_runtime_filter: Arc<WireContent<novarocks::RuntimeFilterContribution>>,
+    query_options: Arc<WireContent<novarocks::QueryOptions>>,
     initial_credential: DecodedQueryContextDomain,
     initial_lease_valid_for: LeaseValidFor,
 }
@@ -171,6 +174,11 @@ impl DecodedEstablishQueryContext {
     /// The initial runtime filter, for the backend's shared-fact owner.
     pub fn initial_runtime_filter(&self) -> &novarocks::RuntimeFilterContribution {
         self.initial_runtime_filter.wire()
+    }
+
+    /// The exact query options frozen for this query context.
+    pub fn query_options(&self) -> &novarocks::QueryOptions {
+        self.query_options.wire()
     }
 
     /// The credential rotation, whose material stays behind its confidential
@@ -226,6 +234,7 @@ impl DecodedUpdateQueryContext {
                     request.context(),
                     Arc::clone(&request.catalog_set) as Arc<dyn CodecOwnedContent>,
                     Arc::clone(&request.initial_runtime_filter) as Arc<dyn CodecOwnedContent>,
+                    Arc::clone(&request.query_options) as Arc<dyn CodecOwnedContent>,
                     update.clone(),
                     request.initial_lease_valid_for(),
                 )))
@@ -541,6 +550,22 @@ fn decode_update_query_context(
                 ESTABLISH_FILTER_DOMAIN_TAG,
                 initial_runtime_filter,
             ));
+            let query_options = establish.query_options.ok_or_else(|| {
+                missing(
+                    establish_path.clone().field("query_options"),
+                    "establish requires query options",
+                )
+            })?;
+            crate::lifecycle::QueryOptions::parse(query_options).map_err(|error| {
+                invalid(
+                    establish_path.clone().field("query_options"),
+                    error.detail(),
+                )
+            })?;
+            let query_options = Arc::new(WireContent::new(
+                ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
+                query_options,
+            ));
             let credential = establish.initial_credential.as_ref().ok_or_else(|| {
                 missing(
                     establish_path.clone().field("initial_credential"),
@@ -590,6 +615,7 @@ fn decode_update_query_context(
                     envelope,
                     catalog_set,
                     initial_runtime_filter,
+                    query_options,
                     initial_credential,
                     initial_lease_valid_for,
                 },

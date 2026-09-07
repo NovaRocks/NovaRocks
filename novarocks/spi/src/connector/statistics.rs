@@ -16,7 +16,7 @@
 // under the License.
 
 //! FE-only provider-neutral statistics contract.
-//! Design: ADR-0135 (docs/adr/ADR-0135-ordinary-aggregate-statistics-dataflow.md)
+//! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 //! Design: ADR-0080 (docs/adr/ADR-0080-statistics-evidence-four-dimension-model.md)
 
 use std::collections::BTreeMap;

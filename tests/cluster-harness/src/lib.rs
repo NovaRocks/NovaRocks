@@ -34,7 +34,9 @@ use novarocks_native_trust::{
     ValidatedSharedSecret,
 };
 use novarocks_secret::SecretValue;
-use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
+use novarocks_test_support::{
+    ManagedProcess, ManagedProcessLogSource, ReadyMarker, ReservedTcpPort,
+};
 use novarocks_types::NativeEndpoint;
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
@@ -46,6 +48,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -54,6 +57,7 @@ use toml::Value;
 const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 const SYSTEM_NATIVE_TRUST_DEPLOYMENT_ID: &str = "novarocks-system-tests";
 const SYSTEM_NATIVE_TRUST_SECRET_ENV: &str = "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET";
+const MAX_FAILURE_LOG_REDACTION_VALUE_BYTES: usize = 64 * 1024;
 
 #[derive(serde::Deserialize)]
 struct LifecycleConvergenceWireSnapshot {
@@ -1959,6 +1963,229 @@ where
     }
 }
 
+/// Detachable, immutable sources for a bounded failed-run diagnostic snapshot.
+///
+/// A server owner constructs this value while its lifecycle lock is held. The
+/// expensive filesystem reads happen later through [`Self::capture`], after
+/// that lock has been released.
+pub struct ServerFailureLogSources {
+    backend_count: usize,
+    logs: Vec<ServerFailureLogSource>,
+}
+
+pub struct CapturedServerFailureLogs {
+    pub backend_count: usize,
+    pub logs: Vec<CapturedServerProcessLog>,
+}
+
+pub struct CapturedServerProcessLog {
+    pub name: String,
+    pub original_bytes: usize,
+    pub contents: String,
+}
+
+enum FailureLogCurrentSource {
+    Managed(ManagedProcessLogSource),
+    Inline {
+        original_bytes: usize,
+        bytes: Vec<u8>,
+    },
+}
+
+struct ServerFailureLogSource {
+    name: String,
+    history_bytes: usize,
+    history_tail: Vec<u8>,
+    current: FailureLogCurrentSource,
+    redactions: Arc<[String]>,
+}
+
+impl ServerFailureLogSources {
+    /// Constructs bounded in-memory sources for non-process test handles.
+    pub fn from_inline(
+        backend_count: usize,
+        fe_log: String,
+        be_logs: Vec<String>,
+        max_tail_bytes: usize,
+    ) -> Self {
+        let redactions = Arc::<[String]>::from([]);
+        let mut logs = Vec::with_capacity(backend_count + 1);
+        logs.push(ServerFailureLogSource::inline(
+            "fe.log".to_string(),
+            fe_log,
+            max_tail_bytes,
+            Arc::clone(&redactions),
+        ));
+        logs.extend(be_logs.into_iter().enumerate().map(|(index, contents)| {
+            ServerFailureLogSource::inline(
+                format!("be-{index:03}.log"),
+                contents,
+                max_tail_bytes,
+                Arc::clone(&redactions),
+            )
+        }));
+        Self {
+            backend_count,
+            logs,
+        }
+    }
+
+    pub fn capture(self, max_tail_bytes: usize) -> Result<CapturedServerFailureLogs> {
+        let logs = self
+            .logs
+            .into_iter()
+            .map(|source| source.capture(max_tail_bytes))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CapturedServerFailureLogs {
+            backend_count: self.backend_count,
+            logs,
+        })
+    }
+}
+
+impl ServerFailureLogSource {
+    fn managed(
+        name: String,
+        history: &str,
+        current: ManagedProcessLogSource,
+        max_tail_bytes: usize,
+        redactions: Arc<[String]>,
+    ) -> Self {
+        let capture_window_bytes = redaction_capture_window_bytes(max_tail_bytes, &redactions);
+        Self {
+            name,
+            history_bytes: history.len(),
+            history_tail: bounded_bytes_tail(history.as_bytes(), capture_window_bytes),
+            current: FailureLogCurrentSource::Managed(current),
+            redactions,
+        }
+    }
+
+    fn inline(
+        name: String,
+        contents: String,
+        max_tail_bytes: usize,
+        redactions: Arc<[String]>,
+    ) -> Self {
+        let original_bytes = contents.len();
+        let capture_window_bytes = redaction_capture_window_bytes(max_tail_bytes, &redactions);
+        Self {
+            name,
+            history_bytes: 0,
+            history_tail: Vec::new(),
+            current: FailureLogCurrentSource::Inline {
+                original_bytes,
+                bytes: bounded_bytes_tail(contents.as_bytes(), capture_window_bytes),
+            },
+            redactions,
+        }
+    }
+
+    #[cfg(test)]
+    fn inline_bytes(
+        name: String,
+        bytes: Vec<u8>,
+        max_tail_bytes: usize,
+        redactions: Arc<[String]>,
+    ) -> Self {
+        let original_bytes = bytes.len();
+        let capture_window_bytes = redaction_capture_window_bytes(max_tail_bytes, &redactions);
+        Self {
+            name,
+            history_bytes: 0,
+            history_tail: Vec::new(),
+            current: FailureLogCurrentSource::Inline {
+                original_bytes,
+                bytes: bounded_bytes_tail(&bytes, capture_window_bytes),
+            },
+            redactions,
+        }
+    }
+
+    fn capture(self, max_tail_bytes: usize) -> Result<CapturedServerProcessLog> {
+        let capture_window_bytes = redaction_capture_window_bytes(max_tail_bytes, &self.redactions);
+        let (current_bytes, current_tail) = match self.current {
+            FailureLogCurrentSource::Managed(source) => {
+                let tail = source.read_tail(capture_window_bytes)?;
+                (tail.original_bytes, tail.bytes)
+            }
+            FailureLogCurrentSource::Inline {
+                original_bytes,
+                bytes,
+            } => (original_bytes, bytes),
+        };
+        let mut combined = self.history_tail;
+        combined.extend_from_slice(&current_tail);
+        let mut redactions = self
+            .redactions
+            .iter()
+            .filter(|secret| !secret.is_empty())
+            .collect::<Vec<_>>();
+        redactions.sort_by(|left, right| {
+            right
+                .len()
+                .cmp(&left.len())
+                .then_with(|| left.as_bytes().cmp(right.as_bytes()))
+        });
+        for secret in redactions {
+            combined = replace_bytes(&combined, secret.as_bytes(), b"<redacted>");
+        }
+        Ok(CapturedServerProcessLog {
+            name: self.name,
+            original_bytes: self.history_bytes.saturating_add(current_bytes),
+            contents: bounded_lossy_utf8_tail(&combined, max_tail_bytes),
+        })
+    }
+}
+
+fn redaction_capture_window_bytes(max_tail_bytes: usize, redactions: &[String]) -> usize {
+    let longest_redaction_bytes = redactions.iter().map(String::len).max().unwrap_or(0);
+    assert!(
+        longest_redaction_bytes <= MAX_FAILURE_LOG_REDACTION_VALUE_BYTES,
+        "failure-log redaction values must be validated before capture"
+    );
+    max_tail_bytes.saturating_add(longest_redaction_bytes.saturating_sub(1))
+}
+
+fn bounded_bytes_tail(contents: &[u8], max_bytes: usize) -> Vec<u8> {
+    contents[contents.len().saturating_sub(max_bytes)..].to_vec()
+}
+
+fn replace_bytes(contents: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return contents.to_vec();
+    }
+    let mut replaced = Vec::with_capacity(contents.len());
+    let mut cursor = 0;
+    while let Some(relative) = contents[cursor..]
+        .windows(needle.len())
+        .position(|candidate| candidate == needle)
+    {
+        let start = cursor + relative;
+        replaced.extend_from_slice(&contents[cursor..start]);
+        replaced.extend_from_slice(replacement);
+        cursor = start + needle.len();
+    }
+    replaced.extend_from_slice(&contents[cursor..]);
+    replaced
+}
+
+fn bounded_lossy_utf8_tail(contents: &[u8], max_bytes: usize) -> String {
+    let contents = String::from_utf8_lossy(contents);
+    bounded_utf8_tail(&contents, max_bytes)
+}
+
+fn bounded_utf8_tail(contents: &str, max_bytes: usize) -> String {
+    if contents.len() <= max_bytes {
+        return contents.to_string();
+    }
+    let mut start = contents.len() - max_bytes;
+    while !contents.is_char_boundary(start) {
+        start += 1;
+    }
+    contents[start..].to_string()
+}
+
 pub trait ServerHandle: Send {
     fn target_host(&self) -> Option<&str>;
     fn target_port(&self) -> Option<u16>;
@@ -2162,6 +2389,14 @@ pub trait ServerHandle: Send {
     }
     fn be_count(&self) -> usize {
         0
+    }
+    /// Detaches bounded failure-log sources without reading their files.
+    fn failure_log_sources(
+        &self,
+        _max_backend_logs: usize,
+        _max_history_tail_bytes: usize,
+    ) -> Result<Option<ServerFailureLogSources>> {
+        Ok(None)
     }
     fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
         bail!(
@@ -2718,6 +2953,7 @@ pub struct CrossProcessServerHandle {
     startup_timeout: Duration,
     fe_environment: BTreeMap<String, String>,
     be_environments: Vec<BTreeMap<String, String>>,
+    failure_log_redactions: Arc<[String]>,
     retain_runtime_artifacts: bool,
 }
 
@@ -2805,6 +3041,8 @@ impl CrossProcessServerHandle {
                 native_trust_fixture.shared_secret.clone(),
             );
         }
+        let failure_log_redactions =
+            collect_failure_log_redactions(&fe_environment, &be_environments)?;
         let reserved = ReservedRuntimePorts::new(cluster_size)?;
         let query_lifecycle_fault_files = QueryLifecycleFaultFiles::new(
             &runtime_dir.path().join("query-lifecycle-faults"),
@@ -3000,6 +3238,7 @@ impl CrossProcessServerHandle {
             startup_timeout,
             fe_environment,
             be_environments,
+            failure_log_redactions,
             retain_runtime_artifacts: false,
         })
     }
@@ -3838,6 +4077,38 @@ impl ServerHandle for CrossProcessServerHandle {
         Ok(format!("{}{}", self.fe_log_history, current))
     }
 
+    fn failure_log_sources(
+        &self,
+        max_backend_logs: usize,
+        max_history_tail_bytes: usize,
+    ) -> Result<Option<ServerFailureLogSources>> {
+        let backend_count = self.be_processes.len();
+        if backend_count == 0 {
+            return Ok(None);
+        }
+        let mut logs = Vec::with_capacity(backend_count.min(max_backend_logs) + 1);
+        logs.push(ServerFailureLogSource::managed(
+            "fe.log".to_string(),
+            &self.fe_log_history,
+            self.fe_process.log_source(),
+            max_history_tail_bytes,
+            Arc::clone(&self.failure_log_redactions),
+        ));
+        for index in 0..backend_count.min(max_backend_logs) {
+            logs.push(ServerFailureLogSource::managed(
+                format!("be-{index:03}.log"),
+                &self.be_log_history[index],
+                self.be_processes[index].log_source(),
+                max_history_tail_bytes,
+                Arc::clone(&self.failure_log_redactions),
+            ));
+        }
+        Ok(Some(ServerFailureLogSources {
+            backend_count,
+            logs,
+        }))
+    }
+
     fn clear_query_lifecycle_faults(&mut self) -> Result<()> {
         self.query_lifecycle_fault_tokens.clear();
         self.query_lifecycle_fault_files.clear()
@@ -4306,6 +4577,42 @@ fn apply_child_environment(command: &mut Command, environment: &BTreeMap<String,
     command.envs(environment);
 }
 
+fn collect_failure_log_redactions(
+    fe_environment: &BTreeMap<String, String>,
+    be_environments: &[BTreeMap<String, String>],
+) -> Result<Arc<[String]>> {
+    let mut values = BTreeSet::new();
+    for environment in std::iter::once(fe_environment).chain(be_environments.iter()) {
+        for (name, value) in environment {
+            if value.is_empty() || !sensitive_environment_name(name) {
+                continue;
+            }
+            if value.len() > MAX_FAILURE_LOG_REDACTION_VALUE_BYTES {
+                bail!(
+                    "sensitive child environment value exceeds failure-log redaction limit: name={name} value_bytes={} max_bytes={MAX_FAILURE_LOG_REDACTION_VALUE_BYTES}",
+                    value.len()
+                );
+            }
+            values.insert(value.clone());
+        }
+    }
+    Ok(Arc::from(values.into_iter().collect::<Vec<_>>()))
+}
+
+fn sensitive_environment_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    [
+        "SECRET",
+        "PASSWORD",
+        "TOKEN",
+        "CREDENTIAL",
+        "PRIVATE_KEY",
+        "ACCESS_KEY",
+    ]
+    .iter()
+    .any(|marker| name.contains(marker))
+}
+
 fn merge_safe_config_overlay(
     root: &mut toml::map::Map<String, Value>,
     overlay: &str,
@@ -4643,6 +4950,129 @@ mod tests {
     use std::collections::VecDeque;
     use std::ffi::OsStr;
     use std::fs;
+
+    #[test]
+    fn failure_log_redactions_include_only_sensitive_child_environment_values() {
+        let fe = BTreeMap::from([
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "fe-secret".to_string()),
+            ("VISIBLE_SETTING".to_string(), "visible".to_string()),
+        ]);
+        let bes = vec![BTreeMap::from([(
+            "SERVICE_TOKEN".to_string(),
+            "be-token".to_string(),
+        )])];
+
+        let redactions = collect_failure_log_redactions(&fe, &bes).expect("collect redactions");
+        assert!(redactions.iter().any(|value| value == "fe-secret"));
+        assert!(redactions.iter().any(|value| value == "be-token"));
+        assert!(!redactions.iter().any(|value| value == "visible"));
+    }
+
+    #[test]
+    fn failure_log_redactions_reject_an_oversized_sensitive_value() {
+        let oversized = "s".repeat(MAX_FAILURE_LOG_REDACTION_VALUE_BYTES + 1);
+        let fe = BTreeMap::from([("SERVICE_TOKEN".to_string(), oversized.clone())]);
+
+        let error = collect_failure_log_redactions(&fe, &[])
+            .expect_err("oversized sensitive values must fail cluster construction");
+        let message = format!("{error:#}");
+        assert!(message.contains("name=SERVICE_TOKEN"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "value_bytes={}",
+                MAX_FAILURE_LOG_REDACTION_VALUE_BYTES + 1
+            )),
+            "{message}"
+        );
+        assert!(!message.contains(&oversized), "error must not reveal value");
+    }
+
+    #[test]
+    fn failure_log_capture_executes_known_value_redaction_before_handoff() {
+        let redactions = Arc::<[String]>::from(["raw-secret".to_string()]);
+        let sources = ServerFailureLogSources {
+            backend_count: 1,
+            logs: vec![ServerFailureLogSource::inline(
+                "fe.log".to_string(),
+                "prefix raw-secret suffix".to_string(),
+                128,
+                redactions,
+            )],
+        };
+
+        let captured = sources.capture(128).expect("capture redacted log");
+        assert_eq!(captured.logs[0].contents, "prefix <redacted> suffix");
+        assert!(!captured.logs[0].contents.contains("raw-secret"));
+    }
+
+    #[test]
+    fn failure_log_capture_redacts_a_secret_crossing_the_nominal_tail_boundary() {
+        const MAX_TAIL_BYTES: usize = 128;
+        let secret = "boundary-sensitive-token";
+        let suffix = "x".repeat(MAX_TAIL_BYTES - 12);
+        let redactions = Arc::<[String]>::from([secret.to_string()]);
+        let sources = ServerFailureLogSources {
+            backend_count: 1,
+            logs: vec![ServerFailureLogSource::inline(
+                "fe.log".to_string(),
+                format!("prefix-{secret}{suffix}"),
+                MAX_TAIL_BYTES,
+                redactions,
+            )],
+        };
+
+        let captured = sources
+            .capture(MAX_TAIL_BYTES)
+            .expect("capture boundary-redacted log");
+        let contents = &captured.logs[0].contents;
+        assert!(contents.len() <= MAX_TAIL_BYTES);
+        assert!(contents.contains("<redacted>"), "{contents}");
+        assert!(!contents.contains(secret), "{contents}");
+        assert!(!contents.contains("token"), "{contents}");
+    }
+
+    #[test]
+    fn failure_log_capture_redacts_longest_prefix_related_value_first() {
+        let redactions = Arc::<[String]>::from(["abc".to_string(), "abcdef".to_string()]);
+        let sources = ServerFailureLogSources {
+            backend_count: 1,
+            logs: vec![ServerFailureLogSource::inline(
+                "fe.log".to_string(),
+                "prefix abcdef suffix".to_string(),
+                128,
+                redactions,
+            )],
+        };
+
+        let captured = sources
+            .capture(128)
+            .expect("capture prefix-related secrets");
+        assert_eq!(captured.logs[0].contents, "prefix <redacted> suffix");
+        assert!(!captured.logs[0].contents.contains("def"));
+    }
+
+    #[test]
+    fn failure_log_capture_bounds_lossy_invalid_utf8_to_the_final_budget() {
+        const MAX_TAIL_BYTES: usize = 128;
+        let mut bytes = vec![0xff; MAX_TAIL_BYTES * 4];
+        bytes.extend_from_slice(b"terminal");
+        let sources = ServerFailureLogSources {
+            backend_count: 1,
+            logs: vec![ServerFailureLogSource::inline_bytes(
+                "fe.log".to_string(),
+                bytes,
+                MAX_TAIL_BYTES,
+                Arc::from([]),
+            )],
+        };
+
+        let captured = sources
+            .capture(MAX_TAIL_BYTES)
+            .expect("capture invalid UTF-8 log");
+        let contents = &captured.logs[0].contents;
+        assert!(contents.len() <= MAX_TAIL_BYTES);
+        assert!(contents.ends_with("terminal"), "{contents}");
+    }
 
     #[test]
     fn novarocks_command_only_enables_connector_markers_in_debug_harnesses() {

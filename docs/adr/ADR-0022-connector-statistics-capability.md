@@ -4,7 +4,7 @@ title: "Connector statistics capability"
 domain: [provider-spi]
 status: superseded
 supersedes: []
-superseded-by: ADR-0135
+superseded-by: ADR-0136
 date: 2026-07-31
 provenance:
   - "discussion: unified statistics architecture"

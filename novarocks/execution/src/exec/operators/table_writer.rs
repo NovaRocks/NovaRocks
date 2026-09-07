@@ -31,7 +31,7 @@
 //! by the encoder port, never by this layer, and each fragment is charged
 //! against the frozen single-fragment budget at egress.
 //!
-//! Design: ADR-0135 (docs/adr/ADR-0135-ordinary-aggregate-statistics-dataflow.md)
+//! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
 use std::collections::VecDeque;
 use std::mem::size_of;

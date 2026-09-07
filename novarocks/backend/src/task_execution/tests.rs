@@ -620,6 +620,7 @@ impl Fixture {
             self.context(query),
             FakeContent::arc(1),
             FakeContent::arc(2),
+            FakeContent::arc(3),
             CredentialUpdate::new(
                 CredentialLeaseId::new(9),
                 CredentialEpoch::FIRST,
@@ -1273,6 +1274,7 @@ fn an_establish_conflict_is_reported_rather_than_applied() {
         context,
         FakeContent::arc(1),
         FakeContent::arc(2),
+        FakeContent::arc(3),
         CredentialUpdate::new(
             CredentialLeaseId::new(9),
             CredentialEpoch::FIRST,
@@ -1280,6 +1282,31 @@ fn an_establish_conflict_is_reported_rather_than_applied() {
         ),
         LeaseValidFor::new(Duration::from_secs(7)).expect("a legal duration"),
     );
+    let receipt = fixture
+        .registry
+        .update_query_context(&UpdateQueryContext::Establish(conflicting));
+    assert_eq!(receipt.outcome(), OperationOutcome::ContextConflict);
+    assert_eq!(HostLedger::get(&fixture.ledger.facts_materialized), 1);
+}
+
+#[test]
+fn different_query_options_conflict_with_an_established_context() {
+    let fixture = Fixture::new();
+    let context = fixture.establish(1);
+    let conflicting = EstablishQueryContext::new(
+        TaskOperationId::new_v7(),
+        context,
+        FakeContent::arc(1),
+        FakeContent::arc(2),
+        FakeContent::arc(4),
+        CredentialUpdate::new(
+            CredentialLeaseId::new(9),
+            CredentialEpoch::FIRST,
+            FakeSecret::arc(7),
+        ),
+        LeaseValidFor::new(LeaseBounds::INITIAL_REQUEST).expect("a legal lease duration"),
+    );
+
     let receipt = fixture
         .registry
         .update_query_context(&UpdateQueryContext::Establish(conflicting));

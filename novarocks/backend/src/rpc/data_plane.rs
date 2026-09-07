@@ -18,6 +18,7 @@ use crate::task_execution::{
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
+use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::task_execution::operation::decode_fetch_task_result;
 use novarocks_proto_models as proto;
@@ -153,8 +154,8 @@ impl BackendDataPlane {
         match wait_fetch_typed(finst_id, request.max_wait_ms) {
             TryFetchTypedResult::Ready(result) => {
                 emit_typed_fetch_marker(
-                    Some(finst_id),
-                    FetchStatus::Ready as i32,
+                    FetchMarkerIdentity::Fragment(finst_id),
+                    FetchStatus::Ready,
                     result.packet_seq,
                     result.eos,
                     result.payload.len(),
@@ -168,11 +169,16 @@ impl BackendDataPlane {
                 )
             }
             TryFetchTypedResult::NotReady => {
-                emit_typed_fetch_marker(Some(finst_id), FetchStatus::NotReady as i32, 0, false, 0);
                 fetch_response(FetchStatus::NotReady, String::new(), 0, false, Vec::new())
             }
             TryFetchTypedResult::Error(error) => {
-                emit_typed_fetch_marker(Some(finst_id), FetchStatus::Error as i32, 0, false, 0);
+                emit_typed_fetch_marker(
+                    FetchMarkerIdentity::Fragment(finst_id),
+                    FetchStatus::Error,
+                    0,
+                    false,
+                    0,
+                );
                 fetch_response(FetchStatus::Error, error.message, 0, false, Vec::new())
             }
         }
@@ -215,7 +221,13 @@ pub fn fetch_task_result(
             route = ?route,
             "root result poll refused"
         );
-        emit_typed_fetch_marker(None, FetchStatus::Error as i32, 0, false, 0);
+        emit_typed_fetch_marker(
+            FetchMarkerIdentity::Task(identity),
+            FetchStatus::Error,
+            0,
+            false,
+            0,
+        );
         return Ok(fetch_response(
             FetchStatus::Error,
             detail,
@@ -241,14 +253,21 @@ pub fn fetch_task_result(
                         | StatusAdvance::Rejected(_)
                         | StatusAdvance::VersionExhausted
                 ) {
+                    emit_typed_fetch_marker(
+                        FetchMarkerIdentity::Task(identity),
+                        FetchStatus::Error,
+                        result.packet_seq,
+                        true,
+                        0,
+                    );
                     return Err(tonic::Status::internal(format!(
                         "root task {identity} could not record its result drain: {advance:?}"
                     )));
                 }
             }
             emit_typed_fetch_marker(
-                Some(binding.kernel_key()),
-                FetchStatus::Ready as i32,
+                FetchMarkerIdentity::Task(identity),
+                FetchStatus::Ready,
                 result.packet_seq,
                 result.eos,
                 result.payload.len(),
@@ -262,19 +281,12 @@ pub fn fetch_task_result(
             )
         }
         TryFetchTypedResult::NotReady => {
-            emit_typed_fetch_marker(
-                Some(binding.kernel_key()),
-                FetchStatus::NotReady as i32,
-                0,
-                false,
-                0,
-            );
             fetch_response(FetchStatus::NotReady, String::new(), 0, false, Vec::new())
         }
         TryFetchTypedResult::Error(error) => {
             emit_typed_fetch_marker(
-                Some(binding.kernel_key()),
-                FetchStatus::Error as i32,
+                FetchMarkerIdentity::Task(identity),
+                FetchStatus::Error,
                 0,
                 false,
                 0,
@@ -300,48 +312,131 @@ fn fetch_response(
     }
 }
 
+#[derive(Clone, Copy)]
+enum FetchMarkerIdentity {
+    Fragment(UniqueId),
+    Task(TaskIdentity),
+}
+
 fn emit_typed_fetch_marker(
-    finst_id: Option<UniqueId>,
-    status: i32,
+    identity: FetchMarkerIdentity,
+    status: proto::novarocks::fetch_result_response::Status,
     packet_seq: i64,
     eos: bool,
     payload_bytes: usize,
 ) {
-    if crate::config::debug_emit_grpc_fragment_marker() {
+    if crate::config::debug_emit_grpc_fragment_marker()
+        && should_emit_typed_fetch_marker(status, packet_seq, eos)
+    {
         println!(
             "{}",
-            typed_fetch_marker(finst_id, status, packet_seq, eos, payload_bytes)
+            typed_fetch_marker(identity, status, packet_seq, eos, payload_bytes)
         );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
+fn should_emit_typed_fetch_marker(
+    status: proto::novarocks::fetch_result_response::Status,
+    packet_seq: i64,
+    eos: bool,
+) -> bool {
+    use proto::novarocks::fetch_result_response::Status as FetchStatus;
+
+    match status {
+        FetchStatus::Ready => packet_seq == 0 || eos,
+        FetchStatus::Eof | FetchStatus::Error => true,
+        FetchStatus::ResultStatusUnspecified | FetchStatus::NotReady => false,
     }
 }
 
 fn typed_fetch_marker(
-    finst_id: Option<UniqueId>,
-    status: i32,
+    identity: FetchMarkerIdentity,
+    status: proto::novarocks::fetch_result_response::Status,
     packet_seq: i64,
     eos: bool,
     payload_bytes: usize,
 ) -> String {
-    let identity = finst_id.map_or_else(
-        || "finst_hi=unknown finst_lo=unknown".to_string(),
-        |finst_id| format!("finst_hi={} finst_lo={}", finst_id.high(), finst_id.low()),
-    );
+    let identity = match identity {
+        FetchMarkerIdentity::Fragment(finst_id) => {
+            format!("finst_hi={} finst_lo={}", finst_id.high(), finst_id.low())
+        }
+        FetchMarkerIdentity::Task(identity) => {
+            let execution = identity.query_execution_id();
+            format!(
+                "query_hi={} query_lo={} attempt={} stage={} task={} backend={}",
+                execution.query_id().high(),
+                execution.query_id().low(),
+                execution.attempt_id().get(),
+                identity.stage_id().get(),
+                identity.task_id().get(),
+                identity.backend_process_id(),
+            )
+        }
+    };
     format!(
-        "NOVAROCKS_GRPC_FETCH_TYPED {identity} status={status} packet_seq={packet_seq} eos={eos} payload_bytes={payload_bytes}"
+        "NOVAROCKS_GRPC_FETCH_TYPED {identity} status={} packet_seq={packet_seq} eos={eos} payload_bytes={payload_bytes}",
+        status as i32,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::typed_fetch_marker;
-    use novarocks_types::UniqueId;
+    use super::{FetchMarkerIdentity, proto, should_emit_typed_fetch_marker, typed_fetch_marker};
+    use novarocks_execution::task_execution::identity::TaskIdentity;
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId, UniqueId,
+    };
+    use proto::novarocks::fetch_result_response::Status as FetchStatus;
 
     #[test]
     fn typed_fetch_marker_identifies_payload_and_eof_without_contents() {
         assert_eq!(
-            typed_fetch_marker(Some(UniqueId::new(7, 9)), 1, 3, true, 41),
+            typed_fetch_marker(
+                FetchMarkerIdentity::Fragment(UniqueId::new(7, 9)),
+                FetchStatus::Ready,
+                3,
+                true,
+                41,
+            ),
             "NOVAROCKS_GRPC_FETCH_TYPED finst_hi=7 finst_lo=9 status=1 packet_seq=3 eos=true payload_bytes=41"
         );
+    }
+
+    #[test]
+    fn typed_fetch_marker_keeps_the_complete_task_route_identity() {
+        let identity = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(2).expect("attempt id"))
+                .expect("execution id"),
+            StageId::new(3).expect("stage id"),
+            TaskId::new(4).expect("task id"),
+            BackendProcessId::new_v7(),
+        );
+        let marker = typed_fetch_marker(
+            FetchMarkerIdentity::Task(identity),
+            FetchStatus::Error,
+            0,
+            false,
+            0,
+        );
+        assert!(marker.contains("query_hi=7 query_lo=9 attempt=2 stage=3 task=4"));
+        assert!(marker.contains(&format!("backend={}", identity.backend_process_id())));
+        assert!(!marker.contains("unknown"));
+    }
+
+    #[test]
+    fn typed_fetch_markers_are_limited_to_first_packet_eof_and_failure() {
+        assert!(should_emit_typed_fetch_marker(FetchStatus::Ready, 0, false));
+        assert!(should_emit_typed_fetch_marker(FetchStatus::Ready, 9, true));
+        assert!(should_emit_typed_fetch_marker(FetchStatus::Error, 0, false));
+        assert!(!should_emit_typed_fetch_marker(
+            FetchStatus::Ready,
+            9,
+            false
+        ));
+        assert!(!should_emit_typed_fetch_marker(
+            FetchStatus::NotReady,
+            0,
+            false
+        ));
     }
 }

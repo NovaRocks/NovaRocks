@@ -471,13 +471,13 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     {
         match armed.fault {
             PublicationFault::AfterCommitBeforeResponse => {
-                return temporary_failure("publication REST response was lost after downstream success");
+                return temporary_failure(
+                    "publication REST response was lost after downstream success",
+                );
             }
             PublicationFault::AfterCommitHoldForFrontendKill => {
                 armed.release.notified().await;
-                return temporary_failure(
-                    "publication REST response released after frontend kill",
-                );
+                return temporary_failure("publication REST response released after frontend kill");
             }
             PublicationFault::IncompleteDiscovery => {
                 // A valid empty list means discovery completed with no
@@ -499,11 +499,7 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     response
 }
 
-fn standard_catalog_action(
-    method: &Method,
-    path: &str,
-    body: &[u8],
-) -> Option<PublicationAction> {
+fn standard_catalog_action(method: &Method, path: &str, body: &[u8]) -> Option<PublicationAction> {
     if !path.contains("/v1/") {
         return None;
     }
@@ -530,10 +526,7 @@ fn standard_catalog_action(
     None
 }
 
-fn take_matching_fault(
-    state: &AppState,
-    action: PublicationAction,
-) -> Option<ArmedNextFault> {
+fn take_matching_fault(state: &AppState, action: PublicationAction) -> Option<ArmedNextFault> {
     let mut next = state.next_fault.lock().expect("publication fault mutex");
     let armed = next.armed.as_ref()?;
     if armed.action != action {

@@ -1261,6 +1261,7 @@ impl FrontendDistributedQueryCoordinator {
         let establish = AttemptEstablishFacts::freeze(
             prepared.catalog_set().as_proto().clone(),
             runtime_filters,
+            *prepared.init_options().query_options().as_proto(),
             prepared.init_options().credential_leases(),
         )
         .map_err(|error| failed(error.to_string()))?;
@@ -1310,7 +1311,6 @@ impl FrontendDistributedQueryCoordinator {
 
         let wake = Arc::new(CondvarWake::default());
         let attempt = AttemptWireFacts {
-            query_options: *prepared.init_options().query_options().as_proto(),
             native_compatibility_id: Some(
                 novarocks_proto_models::novarocks::NativeCompatibilityId {
                     value: self.native_compatibility_id.as_bytes().to_vec(),
@@ -1422,7 +1422,8 @@ impl FrontendDistributedQueryCoordinator {
         // write commits on the strength of this fact.
         let mut observed_result_eof = false;
         let mut last_root_poll = RootResultPoll::default();
-        let mut root_batch_index = 0_u64;
+        let mut root_batch_count = 0_u64;
+        let mut root_row_count = 0_u64;
         // Taken before the loop because the polls run beside it: the schema
         // is shared, immutable and only read, while `expected_output` itself
         // is consumed by this attempt's answer.
@@ -1604,6 +1605,13 @@ impl FrontendDistributedQueryCoordinator {
                     }) => {
                         if let Err(error) = round.consume_root_result_packet(packet_sequence, false)
                         {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_failure",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
                             break Err(self.fail_task_round(
                                 query_id,
                                 &mut round,
@@ -1613,12 +1621,19 @@ impl FrontendDistributedQueryCoordinator {
                                 format!("root result packet was refused: {error}"),
                             ));
                         }
-                        root_batch_index = root_batch_index.saturating_add(1);
+                        root_batch_count = root_batch_count.saturating_add(1);
                         let mut batch_rows = 0;
                         if let Some(decoder) = statistics_decoder.as_mut() {
                             let chunk = batch.into_chunk();
                             batch_rows = chunk.len();
                             if let Err(error) = decoder.apply_chunk(&chunk) {
+                                emit_distributed_write_phase_marker(
+                                    intent,
+                                    execution_id,
+                                    "root_failure",
+                                    execution_started,
+                                    Some((root_batch_count, root_row_count)),
+                                );
                                 break Err(self.fail_task_round(
                                     query_id,
                                     &mut round,
@@ -1632,6 +1647,13 @@ impl FrontendDistributedQueryCoordinator {
                             let chunk = batch.into_chunk();
                             batch_rows = chunk.len();
                             if let Err(error) = decoder.apply_chunk(&chunk) {
+                                emit_distributed_write_phase_marker(
+                                    intent,
+                                    execution_id,
+                                    "root_failure",
+                                    execution_started,
+                                    Some((root_batch_count, root_row_count)),
+                                );
                                 break Err(self.fail_task_round(
                                     query_id,
                                     &mut round,
@@ -1644,19 +1666,30 @@ impl FrontendDistributedQueryCoordinator {
                         } else {
                             batches.push(batch);
                         }
-                        emit_distributed_write_phase_marker(
-                            intent,
-                            execution_id,
-                            "root_batch",
-                            execution_started,
-                            Some((root_batch_index, batch_rows)),
-                        );
+                        root_row_count = root_row_count
+                            .saturating_add(u64::try_from(batch_rows).unwrap_or(u64::MAX));
+                        if root_batch_count == 1 {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_first_packet",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
+                        }
                         last_root_poll = RootResultPoll::Packet(packet_sequence);
                         moved = true;
                     }
                     Ok(RootResultOutcome::EndOfStream { packet_sequence }) => {
                         if let Err(error) = round.consume_root_result_packet(packet_sequence, true)
                         {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_failure",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
                             break Err(self.fail_task_round(
                                 query_id,
                                 &mut round,
@@ -1669,6 +1702,13 @@ impl FrontendDistributedQueryCoordinator {
                         if let Some(decoder) = statistics_decoder.as_mut()
                             && let Err(error) = decoder.observe_root_eof()
                         {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_failure",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
                             break Err(self.fail_task_round(
                                 query_id,
                                 &mut round,
@@ -1681,6 +1721,13 @@ impl FrontendDistributedQueryCoordinator {
                         if let Some(decoder) = write_decoder.as_mut()
                             && let Err(error) = decoder.observe_root_eof()
                         {
+                            emit_distributed_write_phase_marker(
+                                intent,
+                                execution_id,
+                                "root_failure",
+                                execution_started,
+                                Some((root_batch_count, root_row_count)),
+                            );
                             break Err(self.fail_task_round(
                                 query_id,
                                 &mut round,
@@ -1695,7 +1742,7 @@ impl FrontendDistributedQueryCoordinator {
                             execution_id,
                             "root_eof",
                             execution_started,
-                            None,
+                            Some((root_batch_count, root_row_count)),
                         );
                         observed_result_eof = true;
                         last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
@@ -1711,6 +1758,13 @@ impl FrontendDistributedQueryCoordinator {
                         last_root_poll = RootResultPoll::NotReady;
                     }
                     Ok(RootResultOutcome::Failed(detail)) => {
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_failure",
+                            execution_started,
+                            Some((root_batch_count, root_row_count)),
+                        );
                         // A refused or failed poll is also how a read ends
                         // when the task it names has already gone. If this
                         // attempt has a failure of its own, that failure is
@@ -1909,6 +1963,13 @@ impl FrontendDistributedQueryCoordinator {
                 let execution_verdict = tracker.execution_verdict(round.failure_cause().is_some());
                 if execution_verdict.is_complete() {
                     decoder.observe_execution_success().map_err(|error| {
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_failure",
+                            execution_started,
+                            Some((root_batch_count, root_row_count)),
+                        );
                         DistributedQueryError::new(
                             DistributedQueryErrorKind::ContractViolation,
                             error,
@@ -1923,6 +1984,13 @@ impl FrontendDistributedQueryCoordinator {
                     None,
                 );
                 let prepared_write_set = decoder.finish().map_err(|error| {
+                    emit_distributed_write_phase_marker(
+                        intent,
+                        execution_id,
+                        "root_failure",
+                        execution_started,
+                        Some((root_batch_count, root_row_count)),
+                    );
                     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
                 })?;
                 emit_distributed_write_phase_marker(
@@ -1930,7 +1998,7 @@ impl FrontendDistributedQueryCoordinator {
                     execution_id,
                     "write_decoder_finish_exit",
                     execution_started,
-                    None,
+                    Some((root_batch_count, root_row_count)),
                 );
                 barrier.observe_prepared_write_set(prepared_write_set);
                 barrier.observe_task_execution(execution_verdict);
@@ -2457,7 +2525,7 @@ fn emit_distributed_write_phase_marker(
     execution_id: QueryExecutionId,
     phase: &str,
     started: Instant,
-    batch: Option<(u64, usize)>,
+    root_counts: Option<(u64, u64)>,
 ) {
     if intent != DistributedQueryIntent::Write
         || !cfg!(debug_assertions)
@@ -2467,16 +2535,20 @@ fn emit_distributed_write_phase_marker(
     }
     println!(
         "{}",
-        distributed_write_phase_marker(execution_id, phase, started.elapsed().as_millis(), batch,)
+        distributed_write_phase_marker(
+            execution_id,
+            phase,
+            started.elapsed().as_millis(),
+            root_counts,
+        )
     );
-    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 fn distributed_write_phase_marker(
     execution_id: QueryExecutionId,
     phase: &str,
     elapsed_ms: u128,
-    batch: Option<(u64, usize)>,
+    root_counts: Option<(u64, u64)>,
 ) -> String {
     let query_id = execution_id.query_id();
     let marker = format!(
@@ -2487,8 +2559,8 @@ fn distributed_write_phase_marker(
         phase,
         elapsed_ms,
     );
-    batch.map_or(marker.clone(), |(batch_index, rows)| {
-        format!("{marker} batch_index={batch_index} rows={rows}")
+    root_counts.map_or(marker.clone(), |(batches, rows)| {
+        format!("{marker} root_batches={batches} root_rows={rows}")
     })
 }
 
@@ -2684,15 +2756,15 @@ mod tests {
     use novarocks_version::native_build_identity;
 
     #[test]
-    fn write_phase_marker_identifies_attempt_phase_and_batch_without_query_text() {
+    fn write_phase_marker_identifies_attempt_phase_and_bounded_root_counts() {
         let execution_id = QueryExecutionId::new(
             QueryId::new(7, 11),
             AttemptId::new(2).expect("nonzero attempt"),
         )
         .expect("nonzero execution identity");
         assert_eq!(
-            distributed_write_phase_marker(execution_id, "root_batch", 37, Some((3, 19))),
-            "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi=7 query_lo=11 attempt=2 phase=root_batch elapsed_ms=37 batch_index=3 rows=19"
+            distributed_write_phase_marker(execution_id, "root_eof", 37, Some((3, 19))),
+            "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi=7 query_lo=11 attempt=2 phase=root_eof elapsed_ms=37 root_batches=3 root_rows=19"
         );
     }
 

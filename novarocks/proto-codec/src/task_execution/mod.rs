@@ -1090,6 +1090,29 @@ mod tests {
             .is_ok(),
             "sequence zero with matched descriptors is the legal shape"
         );
+        let mut missing_options = establish(0, 1, 1);
+        let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+            missing_options.operations[0].operation.as_mut()
+        else {
+            panic!("fixture carries an update query context");
+        };
+        let Some(novarocks::update_query_context_request::Command::Establish(establish_request)) =
+            update.command.as_mut()
+        else {
+            panic!("fixture carries an establish");
+        };
+        establish_request.query_options = None;
+        assert_eq!(
+            decode_operation_batch(
+                &missing_options,
+                TransportBudget::DEFAULT,
+                FieldPath::root("batch")
+            )
+            .expect_err("query options are an immutable establish fact")
+            .path()
+            .to_string(),
+            "batch.operations[0].update_query_context.establish.query_options"
+        );
         assert_eq!(
             decode_operation_batch(
                 &establish(1, 1, 1),
