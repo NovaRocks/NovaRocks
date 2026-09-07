@@ -31,14 +31,14 @@ use tracing::warn;
 use super::observation::{
     RuntimeFilterChannelTerminal, RuntimeFilterConsumerOutcome, RuntimeFilterObservationSnapshot,
 };
-use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+use crate::runtime_filter::error::RuntimeFilterContractError;
 
 /// The stage every unavailable runtime-filter contribution names.
 pub(crate) const RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE: &str = "runtime_filter_terminal_capture";
 
 fn terminal_profile_contribution(
     snapshot: RuntimeFilterObservationSnapshot,
-) -> Result<QueryTerminalProfileContributionV1, QueryLifecycleError> {
+) -> Result<QueryTerminalProfileContributionV1, RuntimeFilterContractError> {
     use novarocks_proto_models::{common, novarocks as wire};
     let channels = snapshot
         .channels()
@@ -214,7 +214,7 @@ pub(crate) fn capture_terminal_profile_contribution(
     runtime_filter_installed: bool,
 ) -> Result<
     novarocks_proto_models::novarocks::QueryTerminalProfileContributionTelemetry,
-    QueryLifecycleError,
+    RuntimeFilterContractError,
 > {
     use novarocks_proto_models::novarocks as wire;
     use wire::query_terminal_profile_contribution_telemetry::Telemetry;
@@ -236,10 +236,9 @@ pub(crate) fn capture_terminal_profile_contribution(
         });
     };
     if let Some(error) = snapshot.correctness_error() {
-        return Err(QueryLifecycleError::new(
-            QueryLifecycleErrorCode::InvalidManifest,
-            format!("runtime-filter observation correctness failure: {error}"),
-        ));
+        return Err(RuntimeFilterContractError::invalid_contract(format!(
+            "runtime-filter observation correctness failure: {error}"
+        )));
     }
     match terminal_profile_contribution(snapshot) {
         Ok(contribution) => Ok(wire::QueryTerminalProfileContributionTelemetry {
@@ -257,6 +256,8 @@ pub(crate) fn capture_terminal_profile_contribution(
 }
 
 /// A protocol contract failure produced while sealing this projection.
-fn protocol_contract_error(error: novarocks_proto_codec::ProtocolError) -> QueryLifecycleError {
-    QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
+fn protocol_contract_error(
+    error: novarocks_proto_codec::ProtocolError,
+) -> RuntimeFilterContractError {
+    RuntimeFilterContractError::invalid_contract(error.to_string())
 }

@@ -400,18 +400,6 @@ impl RuntimeFilterObservationSnapshot {
     pub(crate) fn correctness_error(&self) -> Option<&str> {
         self.correctness_error.as_deref()
     }
-
-    #[cfg(test)]
-    pub(crate) fn correctness_failure_for_test(detail: impl Into<String>) -> Self {
-        Self {
-            channels: Vec::new(),
-            producer_streams: Vec::new(),
-            transport_routes: Vec::new(),
-            consumers: Vec::new(),
-            anomalies: RuntimeFilterObservationAnomalies::default(),
-            correctness_error: Some(detail.into()),
-        }
-    }
 }
 
 /// Diagnostics retained alongside the sealed observation manifest. Domain

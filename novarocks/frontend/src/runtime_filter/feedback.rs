@@ -5,9 +5,7 @@ use std::sync::{Condvar, Mutex};
 
 use novarocks_execution::runtime_filter::contribution::MembershipValues;
 use novarocks_execution::runtime_filter::feedback_domain::RuntimeFilterFeedbackDomain;
-use novarocks_proto_codec::lifecycle::{
-    ParticipantAttemptRef, QueryControlEvent, QueryExecutionId,
-};
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::{
     Bound, ConnectorReadColumnHandle, ConnectorReadDynamicFilterSnapshot, ConnectorValue, Domain,
     Range, TupleDomain, ValueSet,
@@ -60,7 +58,6 @@ pub(crate) struct RuntimeFilterFeedbackState {
 pub(crate) enum RuntimeFilterFeedbackAdmission {
     Applied,
     IgnoredRetiredAttempt,
-    RejectedForeignParticipant,
 }
 
 impl RuntimeFilterFeedbackState {
@@ -231,70 +228,6 @@ impl RuntimeFilterFeedbackState {
         pending
     }
 
-    /// Validates and admits one active-stream event. A retired attempt is
-    /// ignored and a foreign participant is rejected before it can mutate
-    /// query-local state. The control-stream owner decides how to observe
-    /// that nonterminal rejection without treating it as a terminal outcome.
-    pub(crate) fn admit(
-        &self,
-        event: &QueryControlEvent,
-        participant: &ParticipantAttemptRef,
-    ) -> Result<RuntimeFilterFeedbackAdmission, String> {
-        use novarocks_proto_models::novarocks::query_control_response::Event;
-        use novarocks_proto_models::novarocks::runtime_filter_feedback_event::TerminalOutcome;
-
-        let Some(Event::RuntimeFilterFeedback(feedback)) = event.as_proto().event.as_ref() else {
-            return Err("runtime filter feedback admission received a non-feedback event".into());
-        };
-        let feedback =
-            novarocks_proto_codec::lifecycle::RuntimeFilterFeedbackEvent::parse(feedback.clone())
-                .map_err(|error| error.to_string())?;
-        let feedback_participant = feedback.participant().map_err(|error| error.to_string())?;
-        if feedback_participant
-            .execution_id()
-            .map_err(|error| error.to_string())?
-            != self.execution_id
-        {
-            return Ok(RuntimeFilterFeedbackAdmission::IgnoredRetiredAttempt);
-        }
-        if feedback_participant != *participant {
-            return Ok(RuntimeFilterFeedbackAdmission::RejectedForeignParticipant);
-        }
-        let participant_process = participant
-            .backend_process_id()
-            .map_err(|error| error.to_string())?;
-        let outcome = match feedback.as_proto().terminal_outcome.as_ref() {
-            Some(TerminalOutcome::CanonicalDomain(encoded)) => {
-                TerminalFeedback::CanonicalDomain(encoded.as_slice())
-            }
-            // The reason is dropped here rather than stored: nothing reads it,
-            // and the task carrier cannot produce one. It is logged so the fact
-            // is not lost from an operator's view.
-            Some(TerminalOutcome::UnavailableReason(reason)) => {
-                tracing::debug!(
-                    channel_id = feedback.as_proto().channel_id,
-                    participant_id = feedback.as_proto().participant_id,
-                    reason,
-                    "runtime filter feedback reports an unavailable channel"
-                );
-                TerminalFeedback::Unavailable
-            }
-            None => return Err("runtime filter feedback terminal outcome is absent".into()),
-        };
-        self.admit_terminal(
-            &TerminalFeedbackFacts {
-                channel_id: feedback.as_proto().channel_id,
-                deployment_epoch: feedback.as_proto().deployment_epoch,
-                contract_digest: feedback.as_proto().contract_digest.as_slice(),
-                publisher: PublisherIdentity::Declared {
-                    participant_id: feedback.as_proto().participant_id,
-                },
-                publisher_process: participant_process,
-            },
-            outcome,
-        )
-    }
-
     /// Admits one publisher's terminal feedback as the task carrier delivers it.
     ///
     /// It presents the same authorization facts as the control-stream carrier,
@@ -317,7 +250,6 @@ impl RuntimeFilterFeedbackState {
                 channel_id: feedback.channel_id,
                 deployment_epoch: feedback.deployment_epoch,
                 contract_digest: &feedback.contract_digest,
-                publisher: PublisherIdentity::ByProcess,
                 publisher_process,
             },
             match &feedback.outcome {
@@ -351,28 +283,12 @@ impl RuntimeFilterFeedbackState {
         if facts.contract_digest != channel.contract_digest {
             return Err("runtime filter feedback contract digest differs from declaration".into());
         }
-        let participant_id = match facts.publisher {
-            PublisherIdentity::Declared { participant_id } => {
-                let slot = channel
-                    .publishers
-                    .get(&participant_id)
-                    .ok_or("runtime filter feedback publisher is not authorized")?;
-                if slot.backend_process_id != facts.publisher_process {
-                    return Err(
-                        "runtime filter feedback publisher process differs from declaration".into(),
-                    );
-                }
-                participant_id
-            }
-            PublisherIdentity::ByProcess => {
-                channel
-                    .publishers
-                    .values()
-                    .find(|slot| slot.backend_process_id == facts.publisher_process)
-                    .ok_or("runtime filter feedback publisher is not authorized")?
-                    .participant_id
-            }
-        };
+        let participant_id = channel
+            .publishers
+            .values()
+            .find(|slot| slot.backend_process_id == facts.publisher_process)
+            .ok_or("runtime filter feedback publisher is not authorized")?
+            .participant_id;
         match outcome {
             TerminalFeedback::CanonicalDomain(encoded) => {
                 RuntimeFilterFeedbackDomain::decode(
@@ -409,22 +325,16 @@ impl RuntimeFilterFeedbackState {
     }
 }
 
-/// How one carrier names the publisher of a terminal feedback.
-#[derive(Copy, Clone, Debug)]
-enum PublisherIdentity {
-    /// The carrier names a participant slot, which is then checked against the
-    /// process the carrier authenticated.
-    Declared { participant_id: u32 },
-    /// The carrier names no slot; the authenticated process selects its own.
-    ByProcess,
-}
-
-/// The fences one terminal feedback must clear, independent of its carrier.
+/// The fences one terminal feedback must clear.
+///
+/// There is no publisher name here. The retired control stream let a carrier
+/// declare a participant slot, which then had to be checked against the
+/// process it had authenticated; the task carrier names no slot at all, so the
+/// authenticated process is the only way a slot is ever selected.
 struct TerminalFeedbackFacts<'a> {
     channel_id: u32,
     deployment_epoch: u64,
     contract_digest: &'a [u8],
-    publisher: PublisherIdentity,
     publisher_process: BackendProcessId,
 }
 
@@ -726,7 +636,6 @@ mod tests {
     use arrow::datatypes::DataType;
     use novarocks_execution::runtime_filter::contribution::ValueDomainDelta;
     use novarocks_proto_codec::lifecycle::AttemptId;
-    use novarocks_proto_models::novarocks;
     use novarocks_types::{BackendProcessId, QueryId};
 
     use super::super::install_encoder::{
@@ -765,66 +674,6 @@ mod tests {
         .expect("valid declaration")
     }
 
-    fn participant(
-        execution_id: QueryExecutionId,
-        process: BackendProcessId,
-    ) -> ParticipantAttemptRef {
-        ParticipantAttemptRef::new(execution_id, process).expect("valid participant attempt")
-    }
-
-    fn event(
-        execution_id: QueryExecutionId,
-        process: BackendProcessId,
-        encoded: Vec<u8>,
-    ) -> QueryControlEvent {
-        QueryControlEvent::parse(novarocks::QueryControlResponse {
-            event: Some(
-                novarocks::query_control_response::Event::RuntimeFilterFeedback(
-                    novarocks::RuntimeFilterFeedbackEvent {
-                        participant_attempt: Some(participant(execution_id, process).as_proto().clone()),
-                        participant_id: 5,
-                        deployment_epoch: execution_id.attempt_id().get(),
-                        channel_id: 7,
-                        contract_digest: vec![9; 32],
-                        terminal_outcome: Some(
-                            novarocks::runtime_filter_feedback_event::TerminalOutcome::CanonicalDomain(
-                                encoded,
-                            ),
-                        ),
-                    },
-                ),
-            ),
-        })
-        .expect("valid event")
-    }
-
-    fn unavailable_event(
-        execution_id: QueryExecutionId,
-        process: BackendProcessId,
-        participant_id: u32,
-    ) -> QueryControlEvent {
-        QueryControlEvent::parse(novarocks::QueryControlResponse {
-            event: Some(
-                novarocks::query_control_response::Event::RuntimeFilterFeedback(
-                    novarocks::RuntimeFilterFeedbackEvent {
-                        participant_attempt: Some(participant(execution_id, process).as_proto().clone()),
-                        participant_id,
-                        deployment_epoch: execution_id.attempt_id().get(),
-                        channel_id: 7,
-                        contract_digest: vec![9; 32],
-                        terminal_outcome: Some(
-                            novarocks::runtime_filter_feedback_event::TerminalOutcome::UnavailableReason(
-                                novarocks::RuntimeFilterFeedbackUnavailableReason::DomainBudget
-                                    as i32,
-                            ),
-                        ),
-                    },
-                ),
-            ),
-        })
-        .expect("valid unavailable event")
-    }
-
     fn exact(value: i64) -> Vec<u8> {
         RuntimeFilterFeedbackDomain::Exact(ValueDomainDelta::new(
             MembershipValues::int64([value]),
@@ -841,24 +690,25 @@ mod tests {
         let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
             .expect("feedback state");
         let first = exact(41);
+        let feedback = TaskRuntimeFilterFeedback::parse(&task_envelope(
+            execution_id,
+            7,
+            [9; 32],
+            first.clone(),
+        ))
+        .expect("a legal envelope");
 
         state
-            .admit(
-                &event(execution_id, process, first.clone()),
-                &participant(execution_id, process),
-            )
+            .admit_task_feedback(&feedback, process)
             .expect("first terminal domain is admitted");
         state
-            .admit(
-                &event(execution_id, process, first.clone()),
-                &participant(execution_id, process),
-            )
+            .admit_task_feedback(&feedback, process)
             .expect("identical duplicate is idempotent");
+        let conflicting =
+            TaskRuntimeFilterFeedback::parse(&task_envelope(execution_id, 7, [9; 32], exact(42)))
+                .expect("a legal envelope");
         let conflict = state
-            .admit(
-                &event(execution_id, process, exact(42)),
-                &participant(execution_id, process),
-            )
+            .admit_task_feedback(&conflicting, process)
             .expect_err("a distinct terminal domain cannot replace the winner");
         assert!(conflict.contains("conflicts with first winner"));
 
@@ -868,53 +718,9 @@ mod tests {
     }
 
     #[test]
-    fn ignores_a_retired_attempt_before_authorizing_any_slot() {
-        let execution_id = execution_id();
-        let process = BackendProcessId::new_v7();
-        let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
-            .expect("feedback state");
-        let retired = QueryExecutionId::new(
-            QueryId::new(11, 12),
-            AttemptId::new(2).expect("valid attempt"),
-        )
-        .expect("valid execution id");
-
-        state
-            .admit(
-                &event(retired, process, exact(41)),
-                &participant(execution_id, process),
-            )
-            .expect("retired event is ignored");
-        let state = state.state.0.lock().expect("feedback state");
-        assert!(state.channels[&7].winner.is_none());
-    }
-
-    #[test]
-    fn rejects_a_foreign_participant_for_the_active_attempt() {
-        let execution_id = execution_id();
-        let process = BackendProcessId::new_v7();
-        let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
-            .expect("feedback state");
-
-        let outcome = state
-            .admit(
-                &event(execution_id, BackendProcessId::new_v7(), exact(41)),
-                &participant(execution_id, process),
-            )
-            .expect("active-attempt feedback is fenced without mutating query state");
-        assert_eq!(
-            outcome,
-            RuntimeFilterFeedbackAdmission::RejectedForeignParticipant
-        );
-        assert!(
-            state.state.0.lock().expect("feedback state").channels[&7]
-                .winner
-                .is_none()
-        );
-    }
-
-    #[test]
     fn unavailable_is_fail_open_only_after_all_anyof_publishers_close() {
+        use novarocks_proto_models::filter;
+
         let execution_id = execution_id();
         let first = BackendProcessId::new_v7();
         let second = BackendProcessId::new_v7();
@@ -946,19 +752,16 @@ mod tests {
             }])
             .expect("valid declaration");
         let state = RuntimeFilterFeedbackState::new(execution_id, declaration).expect("state");
+        let mut envelope = task_envelope(execution_id, 7, [9; 32], Vec::new());
+        envelope.kind = filter::RuntimeFilterEnvelopeKind::Unavailable as i32;
+        let feedback = TaskRuntimeFilterFeedback::parse(&envelope).expect("a legal envelope");
 
         state
-            .admit(
-                &unavailable_event(execution_id, first, 5),
-                &participant(execution_id, first),
-            )
+            .admit_task_feedback(&feedback, first)
             .expect("first unavailable is admitted");
         assert!(!state.state.0.lock().expect("state").channels[&7].is_terminal());
         state
-            .admit(
-                &unavailable_event(execution_id, second, 6),
-                &participant(execution_id, second),
-            )
+            .admit_task_feedback(&feedback, second)
             .expect("second unavailable is admitted");
         let state = state.state.0.lock().expect("state");
         assert!(state.channels[&7].winner.is_none());
@@ -971,12 +774,12 @@ mod tests {
         let process = BackendProcessId::new_v7();
         let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
             .expect("feedback state");
+        let feedback =
+            TaskRuntimeFilterFeedback::parse(&task_envelope(execution_id, 7, [9; 32], exact(41)))
+                .expect("a legal envelope");
         state.close();
         state
-            .admit(
-                &event(execution_id, process, exact(41)),
-                &participant(execution_id, process),
-            )
+            .admit_task_feedback(&feedback, process)
             .expect("closed state drops late feedback");
         let state = state.state.0.lock().expect("feedback state");
         assert!(state.closed);
@@ -1176,11 +979,11 @@ mod tests {
         .expect("valid declaration");
         let state = RuntimeFilterFeedbackState::new(execution_id, declaration).expect("state");
         assert!(state.is_initial_wait_blocked(17, [7, 8]));
+        let feedback =
+            TaskRuntimeFilterFeedback::parse(&task_envelope(execution_id, 7, [9; 32], exact(41)))
+                .expect("a legal envelope");
         state
-            .admit(
-                &event(execution_id, first, exact(41)),
-                &participant(execution_id, first),
-            )
+            .admit_task_feedback(&feedback, first)
             .expect("usable domain");
         assert!(
             !state.is_initial_wait_blocked(17, [7, 8]),

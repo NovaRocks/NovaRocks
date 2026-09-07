@@ -76,39 +76,10 @@ message CatalogProperties {
   repeated CatalogCredentialBinding credential_bindings = 5;
 }
 
-// One exact, sorted query-wide contribution. It is carried by every
-// ParticipantManifest instead of a post-ControlReady Ensure RPC.
+// One exact, sorted query-wide contribution. It is carried by the request
+// that establishes a query context, never by a separate Ensure RPC.
 message CatalogSet {
   repeated CatalogProperties catalogs = 1;
-}
-
-message CatalogLoading {}
-
-message CatalogReady {}
-
-enum CatalogLoadFailureReason {
-  CATALOG_LOAD_FAILURE_REASON_UNSPECIFIED = 0;
-  CATALOG_LOAD_FAILURE_REASON_INVALID_CATALOG_SET = 1;
-  CATALOG_LOAD_FAILURE_REASON_INSTALL_FAILED = 2;
-  CATALOG_LOAD_FAILURE_REASON_RESOURCE_EXHAUSTED = 3;
-  CATALOG_LOAD_FAILURE_REASON_TERMINATED = 4;
-  CATALOG_LOAD_FAILURE_REASON_INTERNAL = 5;
-}
-
-message CatalogLoadFailed {
-  CatalogLoadFailureReason reason = 1;
-  string safe_detail = 2;
-  optional string safe_field_path = 3;
-}
-
-// The state in the first ControlReady frame. Loading must be followed on the
-// same stream by exactly one CatalogReady or CatalogLoadFailed event.
-message CatalogLoadState {
-  oneof state {
-    CatalogLoading loading = 1;
-    CatalogReady ready = 2;
-    CatalogLoadFailed failed = 3;
-  }
 }
 
 // A complete reachable snapshot; partial or delta snapshots are invalid.

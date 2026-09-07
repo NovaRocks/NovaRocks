@@ -1282,61 +1282,27 @@ pub(crate) mod tests {
         }
     }
 
-    /// A lifecycle guard that offers the same terminal-only capability a real
-    /// vended-credential attempt offers, with the same hold accounting.
-    struct TerminalCredentialGuard {
-        accounting: Arc<TerminalCredentialAccounting>,
-    }
-
-    impl crate::query_execution::lifecycle_plan::QueryLifecycleLeaseGuard for TerminalCredentialGuard {
-        fn retain_terminal_storage_resolver(&self) -> Option<Arc<dyn ConnectorStorageResolver>> {
-            self.accounting.holds.fetch_add(1, Ordering::SeqCst);
-            Some(Arc::new(TerminalCredentialCapability {
-                accounting: Arc::clone(&self.accounting),
-            }))
-        }
-
-        fn finalize(
-            self: Box<Self>,
-        ) -> Result<
-            crate::query_execution::terminal_set::QueryTerminalSet,
-            crate::query_execution::contract::DistributedQueryError,
-        > {
-            self.accounting.finalize();
-            Ok(
-                crate::query_execution::terminal_set::QueryTerminalSet::new(Vec::new())
-                    .expect("empty terminal set"),
-            )
-        }
-
-        fn abort_preserving(
-            self: Box<Self>,
-            primary_error: String,
-        ) -> crate::query_execution::lifecycle_plan::QueryLifecycleAbortOutcome {
-            crate::query_execution::lifecycle_plan::QueryLifecycleAbortOutcome::new(
-                primary_error,
-                None,
-            )
+    impl TerminalCredentialAccounting {
+        /// Hands out the same terminal-only capability a real vended-credential
+        /// attempt hands the session, taking a hold for it.
+        fn retain_capability(self: &Arc<Self>) -> Arc<dyn ConnectorStorageResolver> {
+            self.holds.fetch_add(1, Ordering::SeqCst);
+            Arc::new(TerminalCredentialCapability {
+                accounting: Arc::clone(self),
+            })
         }
     }
 
     /// Drive the two coordinator steps that stand between an attempt's
     /// credential leases and a write's external commit: retain the terminal
-    /// capability while the lease is alive, then finalize the attempt.
+    /// capability while the attempt still owns its leases, then finish the
+    /// attempt.
     fn finalize_attempt_retaining_terminal_storage(
         session: &Arc<ConnectorWriteSession>,
     ) -> Arc<TerminalCredentialAccounting> {
         let accounting = Arc::new(TerminalCredentialAccounting::default());
-        let lease = crate::query_execution::lifecycle_plan::QueryLifecycleLease::new(Box::new(
-            TerminalCredentialGuard {
-                accounting: Arc::clone(&accounting),
-            },
-        ));
-        let resolver = lease
-            .retain_terminal_storage_resolver()
-            .expect("a vended attempt offers a terminal capability");
-        session.retain_terminal_storage_resolver(resolver);
-        lease.finalize().expect("lifecycle finalizes");
+        session.retain_terminal_storage_resolver(accounting.retain_capability());
+        accounting.finalize();
         accounting
     }
 
@@ -1921,24 +1887,6 @@ pub(crate) mod tests {
         assert!(!accounting.leases_cleared());
 
         drop(fixture);
-
-        assert_eq!(accounting.holds(), 0);
-        assert!(accounting.leases_cleared());
-    }
-
-    /// The hold accounting exists so credentials are cleared promptly when
-    /// nothing needs them. An attempt that no write session held -- every read
-    /// query -- must still clear at finalization.
-    #[test]
-    fn finalization_clears_credential_leases_when_no_write_holds_them() {
-        let accounting = Arc::new(TerminalCredentialAccounting::default());
-        crate::query_execution::lifecycle_plan::QueryLifecycleLease::new(Box::new(
-            TerminalCredentialGuard {
-                accounting: Arc::clone(&accounting),
-            },
-        ))
-        .finalize()
-        .expect("lifecycle finalizes");
 
         assert_eq!(accounting.holds(), 0);
         assert!(accounting.leases_cleared());

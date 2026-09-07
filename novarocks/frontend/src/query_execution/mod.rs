@@ -35,7 +35,6 @@ mod core_bindings;
 pub mod distributed_rewrite;
 pub mod dml;
 pub mod kernels;
-pub mod launch;
 pub mod lifecycle_plan;
 pub mod maintenance;
 pub mod mv_assembly;
@@ -83,8 +82,6 @@ pub mod service;
 )]
 pub(crate) mod split_assignment;
 pub mod statistics;
-pub(crate) mod terminal_codec;
-pub mod terminal_set;
 pub(crate) mod write_barrier;
 pub(crate) mod write_result;
 pub(crate) mod write_session;

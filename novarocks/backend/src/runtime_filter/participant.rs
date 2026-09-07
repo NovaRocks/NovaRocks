@@ -52,9 +52,9 @@ use super::domain::{
 };
 use super::observation::{RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot};
 use crate::BackendDataRuntime;
-use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use crate::runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery;
 use crate::runtime_filter::codec::{artifact as artifact_codec, producer as producer_codec};
+use crate::runtime_filter::error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::rpc::{
     BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
@@ -80,7 +80,7 @@ pub(crate) trait RuntimeFilterParticipantFactory: Send + Sync + 'static {
         &self,
         execution_id: QueryExecutionId,
         contribution: DecodedRuntimeFilterContribution,
-    ) -> Result<Arc<RuntimeFilterParticipant>, QueryLifecycleError>;
+    ) -> Result<Arc<RuntimeFilterParticipant>, RuntimeFilterContractError>;
 }
 
 pub(crate) struct BackendRuntimeFilterParticipantFactory {
@@ -99,7 +99,7 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
         &self,
         execution_id: QueryExecutionId,
         contribution: DecodedRuntimeFilterContribution,
-    ) -> Result<Arc<RuntimeFilterParticipant>, QueryLifecycleError> {
+    ) -> Result<Arc<RuntimeFilterParticipant>, RuntimeFilterContractError> {
         let query_id = UniqueId::new(
             execution_id.query_id().high(),
             execution_id.query_id().low(),
@@ -109,8 +109,7 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
         if install.participant().query_id() != query_id
             || install.participant().deployment_epoch() != execution_id.attempt_id().get()
         {
-            return Err(QueryLifecycleError::new(
-                QueryLifecycleErrorCode::InvalidManifest,
+            return Err(RuntimeFilterContractError::invalid_contract(
                 "runtime filter install does not match the query execution attempt",
             ));
         }
@@ -128,20 +127,14 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
                     channel.clone(),
                     Arc::clone(&events),
                 )
-                .map_err(|error| {
-                    QueryLifecycleError::new(
-                        QueryLifecycleErrorCode::InvalidManifest,
-                        error.to_string(),
-                    )
-                })?,
+                .map_err(|error| RuntimeFilterContractError::invalid_contract(error.to_string()))?,
             );
             for binding_id in channel.producers().keys() {
                 if producers
                     .insert(*binding_id, Arc::clone(&session))
                     .is_some()
                 {
-                    return Err(QueryLifecycleError::new(
-                        QueryLifecycleErrorCode::InvalidManifest,
+                    return Err(RuntimeFilterContractError::invalid_contract(
                         "runtime filter producer binding is installed by multiple channels",
                     ));
                 }
@@ -151,8 +144,7 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
                     .insert(*binding_id, Arc::clone(&session))
                     .is_some()
                 {
-                    return Err(QueryLifecycleError::new(
-                        QueryLifecycleErrorCode::InvalidManifest,
+                    return Err(RuntimeFilterContractError::invalid_contract(
                         "runtime filter consumer binding is installed by multiple channels",
                     ));
                 }
@@ -172,10 +164,9 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
             lifecycle.transport_max_pending_bytes,
         )
         .map_err(|error| {
-            QueryLifecycleError::new(
-                QueryLifecycleErrorCode::InvalidManifest,
-                format!("invalid runtime filter transport policy: {error:?}"),
-            )
+            RuntimeFilterContractError::invalid_contract(format!(
+                "invalid runtime filter transport policy: {error:?}"
+            ))
         })?;
         RuntimeFilterParticipant::from_installed(
             execution_id,
@@ -211,7 +202,10 @@ pub(crate) struct RuntimeFilterParticipant {
 }
 
 pub(crate) type RuntimeFilterParticipantCloseHook = Arc<
-    dyn Fn(&RuntimeFilterParticipant, QueryTerminationReason) -> Result<(), QueryLifecycleError>
+    dyn Fn(
+            &RuntimeFilterParticipant,
+            QueryTerminationReason,
+        ) -> Result<(), RuntimeFilterContractError>
         + Send
         + Sync,
 >;
@@ -233,7 +227,7 @@ impl RuntimeFilterParticipant {
         >,
         memory: Arc<MemTracker>,
         transport_sink: Arc<dyn BackendRuntimeFilterEnvelopeSink>,
-    ) -> Result<Arc<Self>, QueryLifecycleError> {
+    ) -> Result<Arc<Self>, RuntimeFilterContractError> {
         let outbound = Arc::new(BackendParticipantOutbound::new(
             install.clone(),
             transport_policy,
@@ -265,10 +259,10 @@ impl RuntimeFilterParticipant {
         execution_id: QueryExecutionId,
         fragment_instance_id: UniqueId,
         required: bool,
-    ) -> Result<Option<RuntimeFilterSessionRef>, QueryLifecycleError> {
+    ) -> Result<Option<RuntimeFilterSessionRef>, RuntimeFilterContractError> {
         if execution_id != self.execution_id {
-            return Err(QueryLifecycleError::new(
-                QueryLifecycleErrorCode::Terminated,
+            return Err(RuntimeFilterContractError::new(
+                RuntimeFilterContractErrorCode::ParticipantClosed,
                 "runtime filter participant does not belong to this execution attempt",
             ));
         }
@@ -312,10 +306,6 @@ impl RuntimeFilterParticipant {
             | BackendEnvelopeKind::CompletedWithoutArtifact
             | BackendEnvelopeKind::DegradedLogical => self.dispatch_delivery_envelope(envelope),
         }
-    }
-
-    pub(crate) const fn local_participant_id(&self) -> u32 {
-        self.install.local_participant_id()
     }
 
     fn dispatch_delivery_envelope(
@@ -745,7 +735,10 @@ impl RuntimeFilterParticipant {
         }
     }
 
-    pub(crate) fn close(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError> {
+    pub(crate) fn close(
+        &self,
+        reason: QueryTerminationReason,
+    ) -> Result<(), RuntimeFilterContractError> {
         self.cancelled.store(true, Ordering::Release);
         for session in self.producer_sessions.values() {
             session.clear_frontend_feedback_sink();

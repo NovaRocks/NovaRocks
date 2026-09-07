@@ -38,20 +38,14 @@ use novarocks_cluster_harness::{
     NativeTrustFixture, NativeTrustFixtureMode, QueryLifecycleStructuredSnapshot, ServerHandle,
 };
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
-use novarocks_proto_models::{catalog, common, novarocks as proto};
 use novarocks_secret::SecretValue;
-use novarocks_types::BackendProcessId;
 use novarocks_types::NativeEndpoint;
-use novarocks_version::{
-    NativeCarrierDeclaration, derive_repository_native_compatibility_material,
-};
 use prost::Message;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
 const REQUIRED_BACKENDS: usize = 3;
-const GRPC_INVALID_ARGUMENT: u16 = 3;
 const GRPC_UNAUTHENTICATED: u16 = 16;
 const GRPC_UNIMPLEMENTED: u16 = 12;
 const UNKNOWN_NATIVE_PATH: &str = "/novarocks.NovaRocksGrpc/Nwt3Unknown";
@@ -392,7 +386,19 @@ impl Scenario for VendedCredentialTlsGate {
             context.handle().native_trust_mode() == self.fixture.mode(),
             "vended TLS gate launched a different Native transport profile"
         );
-        assert_direct_vended_init_transport(context, self.fixture.mode())?;
+        // # The retired direct-ingress probe
+        //
+        // This step used to dial `InitQuery` on BE[0] with a confidential
+        // `CredentialLeaseSecretEnvelope` and require h2c to refuse it while
+        // TLS carried it into later validation. `InitQuery` is gone, and the
+        // envelope's successor carrier is the task protocol's
+        // `QueryContextCredentialDomain` on establish -- but the transport gate
+        // for it, `refuse_confidential_material_in_the_clear`
+        // (`novarocks/proto-codec/src/task_execution/domain.rs`), has no
+        // production caller, so no backend ingress refuses confidential
+        // material in the clear today and a probe would observe nothing.
+        // Restoring this step needs that gate wired into the apply ingress
+        // first; asserting it now would assert a refusal no code produces.
 
         let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
         let mut connection = mysql_actor::connect(
@@ -479,226 +485,6 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     );
     context.action("verified real independent-process 1FE+3BE Native topology");
     Ok(())
-}
-
-fn assert_direct_vended_init_transport(
-    context: &mut ScenarioContext,
-    mode: NativeTrustFixtureMode,
-) -> Result<()> {
-    let endpoint = context.handle().native_be_endpoint(0)?;
-    let connector = context.handle().native_probe_connector(endpoint, mode)?;
-    let authorization = authorization_header(&context.handle().native_probe_trust()?)?;
-    let init = confidential_vended_init()?;
-    match mode {
-        NativeTrustFixtureMode::Plaintext => {
-            let probe = raw_grpc_probe(
-                connector,
-                "/novarocks.NovaRocksGrpc/InitQuery",
-                Some(&authorization),
-                Some(&grpc_frame(&init)?),
-            )?;
-            ensure!(
-                probe.http_status == 200 && probe.grpc_status == Some(GRPC_INVALID_ARGUMENT),
-                "h2c direct Init carrying a vended lease must be rejected at BE ingress, got {probe:?}"
-            );
-            context
-                .action("proved direct h2c BE Init rejects a confidential vended lease envelope");
-        }
-        NativeTrustFixtureMode::Automatic | NativeTrustFixtureMode::Pem => {
-            let response: proto::InitQueryResponse = raw_unary(
-                connector,
-                "/novarocks.NovaRocksGrpc/InitQuery",
-                &authorization,
-                init,
-            )?;
-            ensure!(
-                matches!(
-                    proto::QueryInitOutcome::try_from(response.outcome),
-                    Ok(proto::QueryInitOutcome::QueryInitRejectedCompatibilityMismatch)
-                        | Ok(proto::QueryInitOutcome::QueryInitRejectedInvalidManifest)
-                ),
-                "TLS direct Init did not pass confidential-envelope parsing into later lifecycle validation: {response:?}"
-            );
-            context.action(format!(
-                "proved direct BE Init accepts the confidential envelope over {:?} Native TLS",
-                mode
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn confidential_vended_init() -> Result<proto::InitQueryRequest> {
-    let material = derive_repository_native_compatibility_material(
-        [
-            NativeCarrierDeclaration::try_new("iceberg", 1)?,
-            NativeCarrierDeclaration::try_new("starrocks", 1)?,
-        ],
-        [0x31; 32],
-        [0x41; 32],
-    )?;
-    let owner = catalog::CatalogHandle {
-        catalog_name: "vended_tls_gate".to_owned(),
-        version: vec![7; 32],
-    };
-    Ok(proto::InitQueryRequest {
-        manifest: Some(proto::ParticipantManifest {
-            execution_id: Some(proto::QueryExecutionId {
-                query_id: Some(common::UniqueId { hi: 5, lo: 6 }),
-                attempt_id: 1,
-            }),
-            backend: Some(proto::ParticipantBackendIdentity {
-                endpoint: Some(proto::QueryControlEndpoint {
-                    host: "127.0.0.1".to_owned(),
-                    port: 9030,
-                }),
-                // The wrong process id is deliberate. Successful TLS parsing
-                // must reach the later compatibility fence, without creating
-                // a real lifecycle entry on the target BE.
-                process_id: Some(proto::BackendProcessId {
-                    value: BackendProcessId::new_v7().to_bytes().to_vec(),
-                }),
-            }),
-            native_compatibility_id: Some(proto::NativeCompatibilityId {
-                value: material.id().as_bytes().to_vec(),
-            }),
-            expected_fragment_instance_ids: vec![common::UniqueId { hi: 11, lo: 12 }],
-            query_options: Some(proto::QueryOptions::default()),
-            query_deadline_unix_ms: 1_000,
-            pre_start_timeout_ms: 30_000,
-            report_endpoint: Some(proto::QueryControlEndpoint {
-                host: "127.0.0.1".to_owned(),
-                port: 9031,
-            }),
-            catalog_set: Some(catalog::CatalogSet {
-                catalogs: vec![catalog::CatalogProperties {
-                    handle: Some(owner.clone()),
-                    provider_kind: catalog::CatalogProviderKind::Iceberg as i32,
-                    config_format_version: 1,
-                    execution_properties: vec![],
-                    credential_bindings: vec![catalog::CatalogCredentialBinding {
-                        purpose: catalog::CatalogCredentialPurpose::ObjectStoreData as i32,
-                        consumer_role: catalog::CredentialConsumerRole::FrontendAndBackend as i32,
-                        mode: Some(catalog::catalog_credential_binding::Mode::VendedCredential(
-                            catalog::VendedCredential {},
-                        )),
-                    }],
-                }],
-            }),
-            credential_lease_descriptors: vec![proto::CredentialLeaseDescriptor {
-                lease_id: vec![1; 16],
-                epoch: 1,
-                owner: Some(owner),
-                provider: proto::CredentialLeaseProvider::S3 as i32,
-                prefixes: vec!["s3://vended-tls-gate/data".to_owned()],
-                not_after_unix_ms: 99,
-                refresh_capable: true,
-                storage_access_domain_id: vec![8; 32],
-            }],
-            ..Default::default()
-        }),
-        credential_lease_envelopes: vec![proto::CredentialLeaseSecretEnvelope {
-            lease_id: vec![1; 16],
-            epoch: 1,
-            s3: Some(proto::CredentialLeaseS3SecretMaterial {
-                access_key_id: "cca-vended-tls-access".to_owned(),
-                secret_access_key: "cca-vended-tls-secret".to_owned(),
-                session_token: "cca-vended-tls-token".to_owned(),
-                session_token_expires_at_unix_ms: 99,
-            }),
-        }],
-    })
-}
-
-fn grpc_frame<M: Message>(message: &M) -> Result<Vec<u8>> {
-    let mut payload = Vec::new();
-    message
-        .encode(&mut payload)
-        .context("encode raw Native gRPC protobuf")?;
-    let mut frame = Vec::with_capacity(payload.len() + 5);
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
-
-fn raw_unary<M: Message, R: Message + Default>(
-    connector: NativeEndpointConnector,
-    path: &str,
-    authorization: &str,
-    message: M,
-) -> Result<R> {
-    let frame = grpc_frame(&message)?;
-    tokio::runtime::Runtime::new()
-        .context("create Native raw unary runtime")?
-        .block_on(async move {
-            let stream = connector
-                .connect()
-                .await
-                .map_err(anyhow::Error::msg)
-                .context("connect Native raw unary")?;
-            let (mut sender, connection) = client::handshake(stream)
-                .await
-                .context("perform Native raw unary HTTP/2 handshake")?;
-            let driver = tokio::spawn(async move { connection.await });
-            let request = Request::builder()
-                .method("POST")
-                .uri(path)
-                .header(header::CONTENT_TYPE, "application/grpc")
-                .header("te", "trailers")
-                .header(header::AUTHORIZATION, authorization)
-                .body(())
-                .context("build Native raw unary request")?;
-            let (response, mut send_stream) = sender
-                .send_request(request, false)
-                .context("send Native raw unary request")?;
-            send_stream
-                .send_data(Bytes::from(frame), true)
-                .context("send Native raw unary frame")?;
-            let response = response
-                .await
-                .context("receive Native raw unary response")?;
-            ensure!(
-                response.status().as_u16() == 200,
-                "Native raw unary returned HTTP {}",
-                response.status()
-            );
-            let header_status = grpc_status(response.headers());
-            let mut body = response.into_body();
-            let mut bytes = Vec::new();
-            while let Some(chunk) = body
-                .data()
-                .await
-                .transpose()
-                .context("read Native raw unary body")?
-            {
-                bytes.extend_from_slice(&chunk);
-            }
-            let trailer_status = body
-                .trailers()
-                .await
-                .context("read Native raw unary trailers")?
-                .as_ref()
-                .and_then(grpc_status);
-            driver.abort();
-            let _ = driver.await;
-            ensure!(
-                header_status.or(trailer_status) == Some(0),
-                "Native raw unary returned non-OK gRPC status {:?}",
-                header_status.or(trailer_status)
-            );
-            ensure!(
-                bytes.len() >= 5 && bytes[0] == 0,
-                "Native raw unary response lacks an uncompressed gRPC frame"
-            );
-            let length =
-                u32::from_be_bytes(bytes[1..5].try_into().expect("frame header width")) as usize;
-            ensure!(
-                bytes.len() == length + 5,
-                "Native raw unary response frame length mismatch"
-            );
-            R::decode(&bytes[5..]).context("decode Native raw unary response")
-        })
 }
 
 fn assert_authentication_order(

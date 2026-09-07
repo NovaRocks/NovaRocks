@@ -80,17 +80,8 @@ impl QueryLifecycleErrorSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParticipantOutcomeExpectation {
-    Proof,
-    Attestation { reason: String },
-    NoOutcome,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryLifecycleStructuredAssertion {
     pub error_source: Option<QueryLifecycleErrorSource>,
-    pub participant_outcome: Option<ParticipantOutcomeExpectation>,
-    pub telemetry_unavailable: Vec<QueryLifecycleTelemetryUnavailableExpectation>,
     pub metric_deltas: Vec<QueryLifecycleMetricDeltaExpectation>,
     /// Runtime Filter facts are asserted from the typed query-terminal
     /// projection supplied by the cluster harness, never from profile text.
@@ -222,13 +213,6 @@ pub struct RuntimeFilterTotalAtLeastExpectation {
 pub struct QueryLifecycleMetricDeltaExpectation {
     pub metric: String,
     pub delta: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryLifecycleTelemetryUnavailableExpectation {
-    pub scope: String,
-    pub stage: String,
-    pub code: String,
 }
 
 #[derive(Debug, Clone)]

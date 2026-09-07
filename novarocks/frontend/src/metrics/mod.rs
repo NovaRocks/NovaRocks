@@ -31,9 +31,9 @@ use crate::workload_lifecycle::{
 pub(crate) mod dml_publication;
 mod http;
 mod management;
-pub mod query_lifecycle;
+pub mod process_query_counters;
 pub(crate) use http::{LateBoundQueryLifecycleConvergenceReader, MetricsHttpServer};
-pub use query_lifecycle::FrontendQueryLifecycleMetricsSnapshot;
+pub use process_query_counters::FrontendProcessQueryCountersSnapshot;
 
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::with_opts(Opts::new(
@@ -622,7 +622,7 @@ pub(crate) fn publish_backend_topology_metrics(
         }
     }
 }
-pub fn publish_frontend_query_lifecycle_metrics(snapshot: FrontendQueryLifecycleMetricsSnapshot) {
+pub fn publish_frontend_process_query_counters(snapshot: FrontendProcessQueryCountersSnapshot) {
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS).set(snapshot.active_attempts as i64);
     for (outcome, count) in [
         ("applied", snapshot.init_applied),
@@ -965,8 +965,8 @@ mod tests {
     }
 
     #[test]
-    fn frontend_query_lifecycle_metrics_publish_structured_snapshot() {
-        publish_frontend_query_lifecycle_metrics(FrontendQueryLifecycleMetricsSnapshot {
+    fn frontend_process_query_counters_publish_structured_snapshot() {
+        publish_frontend_process_query_counters(FrontendProcessQueryCountersSnapshot {
             active_attempts: 2,
             init_applied: 3,
             init_idempotent: 4,

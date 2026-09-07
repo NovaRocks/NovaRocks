@@ -76,7 +76,7 @@ impl Scenario for DistributedBaseline {
             third.local_sequence,
         ));
 
-        await_resource_convergence(context, &baseline, false)
+        await_resource_convergence(context, &baseline)
     }
 }
 
@@ -107,7 +107,7 @@ impl Scenario for MysqlDisconnect {
             .context("close raw public MySQL client connection")?;
         context.action("closed the raw public MySQL client connection");
 
-        await_resource_convergence(context, &baseline, true)
+        await_resource_convergence(context, &baseline)
     }
 }
 
@@ -152,7 +152,7 @@ impl Scenario for QueryTimeout {
         );
         context.action(format!("received expected MySQL timeout error: {error}"));
 
-        await_resource_convergence(context, &baseline, true)
+        await_resource_convergence(context, &baseline)
     }
 }
 
@@ -179,13 +179,13 @@ struct Nid2Fence {
 ///
 /// # Why the subject moved, and why it had to
 ///
-/// This case was `nid-2-stage-conflict`. Its fault claimed
-/// `handle_stage_fragments` (`novarocks/backend/src/query_lifecycle/rpc.rs`)
-/// and rewrote a staged participant's outcome to
-/// `StageFragmentsRejectedConflict`; no production query reaches that handler
-/// any more, so on the task path the fault was armed, nothing consumed it, the
-/// query succeeded, and the case waited out its whole budget for a marker with
-/// no emitter.
+/// This case was `nid-2-stage-conflict`. Its fault claimed the retired
+/// protocol's `StageFragments` handler and rewrote a staged participant's
+/// outcome to a stage conflict; no production query reached that handler on
+/// the task path, so the fault was armed, nothing consumed it, the query
+/// succeeded, and the case waited out its whole budget for a marker with no
+/// emitter. The handler, and the `stage-conflict-after-apply` fault kind with
+/// it, have since been deleted.
 ///
 /// The fence itself did not move far. `CreateTask` is the task protocol's
 /// single per-task admission point and `CreateConflict` is its refusal, so the
@@ -225,10 +225,10 @@ impl Scenario for Nid2CreateConflict {
 /// # Why the digest this replaces has no counterpart
 ///
 /// This case was `nid-2-start-digest-conflict`. Its fault flipped a bit of the
-/// `stage_digest` carried by `StartPreparedQuery`
-/// (`novarocks/backend/src/query_lifecycle/rpc.rs`), and the fence it met was
-/// `QueryLifecycleRegistry::start_prepared_query` refusing a start whose digest
-/// was not the one it had staged.
+/// stage digest carried by the retired protocol's `StartPreparedQuery`, and
+/// the fence it met was that protocol's backend registry refusing a start
+/// whose digest was not the one it had staged. Both the operation and the
+/// `start-digest-corrupt` fault kind have since been deleted.
 ///
 /// That fence does not exist on the task protocol, and no substitute was
 /// invented for it. There is no second operation that commits an already
@@ -280,12 +280,12 @@ impl Scenario for Nid2CreateReceiptForeignTask {
 /// # Why the subject moved, and why the verdict changed with it
 ///
 /// This case was `nid-2-post-init-foreign-ref`. Its fault replaced the
-/// `ParticipantAttemptRef` of a fragment observation published on the retired
-/// control stream (`observation_participant_ref` in
-/// `novarocks/backend/src/query_lifecycle/registry.rs`), and the frontend
-/// dropped that observation before it could reach mutable telemetry state ---
-/// so the old case asserted that the statement *succeeded* while the forged
-/// reference was refused.
+/// participant reference of a fragment observation published on the retired
+/// control stream, and the frontend dropped that observation before it could
+/// reach mutable telemetry state --- so the old case asserted that the
+/// statement *succeeded* while the forged reference was refused. That stream,
+/// and the `observation-foreign-participant` fault kind with it, have since
+/// been deleted.
 ///
 /// The surviving observation channel is `SubscribeTaskStatus`. It names no
 /// participant of its own, so the forgeable fact is the backend process inside
@@ -353,7 +353,7 @@ fn run_nid2_fence(context: &mut ScenarioContext, fence: &Nid2Fence) -> Result<()
         .with_context(|| format!("clear {} tokens", fence.fault));
     let (backend, error) = observed?;
     cleared?;
-    await_resource_convergence(context, &baseline, true)?;
+    await_resource_convergence(context, &baseline)?;
     context.action(format!(
         "BE[{backend}] published {} and the frontend fenced {}: {error}",
         fence.marker, fence.subject
@@ -617,12 +617,11 @@ fn await_resource_activity(
 fn await_resource_convergence(
     context: &mut ScenarioContext,
     baseline: &QueryExecutionResourceSnapshot,
-    permits_terminal_retention: bool,
 ) -> Result<()> {
     let deadline = context.deadline();
     context
         .handle()
-        .await_query_execution_resource_convergence(baseline, permits_terminal_retention, deadline)
+        .await_query_execution_resource_convergence(baseline, deadline)
         .context("await query-resource convergence after terminal lifecycle outcome")?;
     context.action("verified query resources converged after the terminal lifecycle outcome");
     Ok(())

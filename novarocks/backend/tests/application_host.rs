@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use novarocks_backend::{
     BackendApplicationHost, BackendDataRuntime, BackendNativeTransport, BackendServerConfig,
-    QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -69,29 +68,6 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         announce_interval: Duration::from_secs(60),
         announce_initial_backoff: Duration::from_millis(100),
         announce_max_backoff: Duration::from_secs(2),
-        query_lifecycle_sweep_interval: Duration::from_millis(1_000),
-        query_lifecycle_config: QueryLifecycleRegistryConfig::new(
-            4_096,
-            16_384,
-            Duration::from_millis(120_000),
-            Duration::from_millis(5_000),
-            Duration::from_millis(30_000),
-            256,
-            32,
-            48 * 1024 * 1024,
-            256 * 1024 * 1024,
-            512,
-            48 * 1024 * 1024,
-            Duration::from_millis(30_000),
-            Duration::from_millis(5_000),
-            Duration::from_millis(5_000),
-            5,
-            Duration::from_millis(100),
-            Duration::from_millis(1_000),
-            Duration::from_millis(120_000),
-            4_096,
-            256 * 1024 * 1024,
-        ),
         write_commit_evidence_limits: novarocks_spi::connector::WriteCommitEvidenceLimits::default(
         ),
         execution_runtime_config: ExecutionRuntimeConfig {

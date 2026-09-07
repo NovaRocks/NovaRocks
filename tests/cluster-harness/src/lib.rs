@@ -66,25 +66,8 @@ struct LifecycleConvergenceWireSnapshot {
     query_local_sequence: u64,
     query_attempt_id: u64,
     error_source: Option<String>,
-    participant_outcomes: Vec<LifecycleParticipantOutcomeWire>,
-    telemetry_unavailable: Vec<LifecycleTelemetryUnavailableWire>,
     runtime_filter: RuntimeFilterTerminalRollupWire,
     metrics: BTreeMap<String, i64>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-enum LifecycleParticipantOutcomeWire {
-    Proof,
-    Attestation { reason: String },
-    NoOutcome,
-}
-
-#[derive(serde::Deserialize)]
-struct LifecycleTelemetryUnavailableWire {
-    scope: String,
-    stage: String,
-    code: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -311,34 +294,12 @@ fn decode_query_lifecycle_structured_snapshot(
         Some("no-outcome") => Some(QueryLifecycleErrorSource::NoOutcome),
         Some(source) => bail!("unknown FE lifecycle snapshot error source {source:?}"),
     };
-    let participant_outcomes = wire
-        .participant_outcomes
-        .into_iter()
-        .map(|outcome| match outcome {
-            LifecycleParticipantOutcomeWire::Proof => ParticipantTerminalOutcomeKind::Proof,
-            LifecycleParticipantOutcomeWire::Attestation { reason } => {
-                ParticipantTerminalOutcomeKind::Attestation { reason }
-            }
-            LifecycleParticipantOutcomeWire::NoOutcome => ParticipantTerminalOutcomeKind::NoOutcome,
-        })
-        .collect();
-    let telemetry_unavailable = wire
-        .telemetry_unavailable
-        .into_iter()
-        .map(|telemetry| QueryLifecycleTelemetryUnavailable {
-            scope: telemetry.scope,
-            stage: telemetry.stage,
-            code: telemetry.code,
-        })
-        .collect();
     Ok(Some(QueryLifecycleStructuredSnapshot {
         execution_id: Some(wire.execution_id),
         process_namespace,
         local_sequence: wire.query_local_sequence,
         attempt_id: wire.query_attempt_id,
         error_source,
-        participant_outcomes,
-        telemetry_unavailable,
         runtime_filter: decode_runtime_filter_terminal_rollup(wire.runtime_filter)?,
         metrics: wire.metrics,
     }))
@@ -742,20 +703,6 @@ pub enum QueryLifecycleErrorSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParticipantTerminalOutcomeKind {
-    Proof,
-    Attestation { reason: String },
-    NoOutcome,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryLifecycleTelemetryUnavailable {
-    pub scope: String,
-    pub stage: String,
-    pub code: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryLifecycleStructuredSnapshot {
     /// The immutable execution identity used to correlate all values below.
     pub execution_id: Option<String>,
@@ -764,8 +711,6 @@ pub struct QueryLifecycleStructuredSnapshot {
     pub local_sequence: u64,
     pub attempt_id: u64,
     pub error_source: Option<QueryLifecycleErrorSource>,
-    pub participant_outcomes: Vec<ParticipantTerminalOutcomeKind>,
-    pub telemetry_unavailable: Vec<QueryLifecycleTelemetryUnavailable>,
     /// The FE-normalized Runtime Filter terminal read model. This is a
     /// query-scoped immutable projection, never a process counter or log
     /// rendering.
@@ -790,7 +735,6 @@ pub enum RuntimeFilterTerminalRollup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeFilterTerminalRollupUnavailable {
     TerminalOutcomesIncomplete,
-    NegativeAttestation,
 }
 
 /// One participant identity prefixes every detail in its terminal telemetry.
@@ -1017,9 +961,6 @@ fn decode_runtime_filter_terminal_rollup(
             let reason = match reason.as_str() {
                 "terminal-outcomes-incomplete" => {
                     RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete
-                }
-                "negative-attestation" => {
-                    RuntimeFilterTerminalRollupUnavailable::NegativeAttestation
                 }
                 _ => bail!("unknown runtime-filter rollup unavailable reason {reason:?}"),
             };
@@ -1421,7 +1362,6 @@ const TOPOLOGY_MYSQL_IO_TIMEOUT_MIN: Duration = Duration::from_millis(1);
 const RESOURCE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIFECYCLE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const QUERY_EXECUTION_RESOURCE_METRIC: &str = "novarocks_backend_query_execution_resources";
-const QUERY_LIFECYCLE_TERMINAL_METRIC: &str = "novarocks_backend_query_lifecycle_terminal_total";
 const TASK_EXECUTION_TASKS_CREATED_METRIC: &str =
     "novarocks_backend_task_execution_tasks_created_total";
 const FRONTEND_QUERY_LIFECYCLE_CONTROL_METRIC: &str =
@@ -1430,35 +1370,20 @@ const DML_PUBLICATION_TERMINAL_METRIC: &str = "novarocks_dml_publication_termina
 const FRONTEND_QUERY_LIFECYCLE_ATTEMPTS_METRIC: &str =
     "novarocks_frontend_query_lifecycle_active_attempts";
 
-const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 10] = [
-    "stage_active_builders",
-    "stage_encoded_bytes",
-    "stage_dormant_workers",
-    "fragment_controls_reserved",
-    "fragment_controls_running",
+const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 4] = [
     "native_query_contexts_active",
     "native_query_contexts_second_chance",
     "native_query_active_fragments",
-    "native_runtime_filter_services",
     "catalog_query_leases",
 ];
 
 const QUERY_EXECUTION_RESOURCE_CATALOG_HANDLE_LEASE: &str = "catalog_handle_leases";
-const TERMINAL_RETAINED_OUTCOME: &str = "terminal_retained";
-const TERMINAL_RETAINED_BYTES_OUTCOME: &str = "terminal_retained_bytes";
-const TERMINAL_RETAINED_CAPACITY_OUTCOME: &str = "terminal_retained_capacity";
-const TERMINAL_MAX_RETAINED_BYTES_OUTCOME: &str = "terminal_max_retained_bytes";
-const TERMINAL_FALLBACK_ACCEPTED_OUTCOME: &str = "terminal_fallback_accepted";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackendResourceSnapshot {
     pub index: usize,
     pub process_running: bool,
     pub resources: BTreeMap<String, f64>,
-    pub terminal_retained: f64,
-    pub terminal_retained_bytes: f64,
-    pub terminal_retained_capacity: f64,
-    pub terminal_max_retained_bytes: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1469,11 +1394,7 @@ pub struct QueryExecutionResourceSnapshot {
 }
 
 impl QueryExecutionResourceSnapshot {
-    fn convergence_failure(
-        &self,
-        baseline: &Self,
-        permits_terminal_retention: bool,
-    ) -> Option<String> {
+    fn convergence_failure(&self, baseline: &Self) -> Option<String> {
         if self.backends.len() != baseline.backends.len() {
             return Some(format!(
                 "backend cardinality changed: before={} current={}",
@@ -1507,33 +1428,6 @@ impl QueryExecutionResourceSnapshot {
                         current_value - before_value
                     ));
                 }
-            }
-            if self.fe_running
-                && !permits_terminal_retention
-                && (current.terminal_retained > before.terminal_retained
-                    || current.terminal_retained_bytes > before.terminal_retained_bytes)
-            {
-                deltas.push(format!(
-                    "BE[{}] terminal retention grew above baseline: before=({}, {}) current=({}, {})",
-                    current.index,
-                    before.terminal_retained,
-                    before.terminal_retained_bytes,
-                    current.terminal_retained,
-                    current.terminal_retained_bytes
-                ));
-            }
-            if (!self.fe_running || permits_terminal_retention)
-                && (current.terminal_retained > current.terminal_retained_capacity
-                    || current.terminal_retained_bytes > current.terminal_max_retained_bytes)
-            {
-                deltas.push(format!(
-                    "BE[{}] terminal retention exceeds published limit: retained=({}, {}) limits=({}, {})",
-                    current.index,
-                    current.terminal_retained,
-                    current.terminal_retained_bytes,
-                    current.terminal_retained_capacity,
-                    current.terminal_max_retained_bytes
-                ));
             }
         }
         (!deltas.is_empty()).then(|| deltas.join("; "))
@@ -1826,11 +1720,7 @@ const FRONTEND_METRIC_FAMILIES: [&str; 14] = [
     "novarocks_frontend_query_lifecycle_latency_micros",
 ];
 
-const BACKEND_METRIC_FAMILIES: [&str; 6] = [
-    "novarocks_backend_query_lifecycle_entries",
-    "novarocks_backend_query_lifecycle_rejections",
-    "novarocks_backend_query_lifecycle_terminations",
-    "novarocks_backend_query_lifecycle_terminal_total",
+const BACKEND_METRIC_FAMILIES: [&str; 2] = [
     "novarocks_backend_query_execution_resources",
     "novarocks_backend_task_execution_tasks_created_total",
 ];
@@ -2215,7 +2105,6 @@ pub trait ServerHandle: Send {
     fn await_query_execution_resource_convergence(
         &mut self,
         baseline: &QueryExecutionResourceSnapshot,
-        permits_terminal_retention: bool,
         deadline: Instant,
     ) -> Result<()> {
         loop {
@@ -2245,8 +2134,7 @@ pub trait ServerHandle: Send {
                     continue;
                 }
             };
-            if let Some(failure) = current.convergence_failure(baseline, permits_terminal_retention)
-            {
+            if let Some(failure) = current.convergence_failure(baseline) {
                 if Instant::now() < deadline {
                     thread::sleep(
                         deadline
@@ -2338,15 +2226,6 @@ pub trait ServerHandle: Send {
         bail!(
             "query lifecycle fault token is unsupported by this server mode (index={index}, kind={kind})"
         )
-    }
-    fn arm_init_ack_drop(&mut self, index: usize) -> Result<()> {
-        bail!("InitAck drop is unsupported by this server mode (index={index})")
-    }
-    fn arm_be_restart_after_init_ack(&mut self, index: usize) -> Result<()> {
-        bail!("BE restart-after-InitAck is unsupported by this server mode (index={index})")
-    }
-    fn arm_start_ack_suppress(&mut self, index: usize) -> Result<()> {
-        bail!("StartAck suppression is unsupported by this server mode (index={index})")
     }
     fn arm_terminal_ack_drop(&mut self, index: usize) -> Result<()> {
         bail!("TerminalAck drop is unsupported by this server mode (index={index})")
@@ -2718,18 +2597,6 @@ impl QueryLifecycleFaultFiles {
         &self.root
     }
 
-    fn init_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, QueryLifecycleFaultKind::InitAckDrop)
-    }
-
-    fn restart_after_init_ack_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, QueryLifecycleFaultKind::RestartAfterInitAck)
-    }
-
-    fn start_ack_suppress_path(&self, index: usize) -> Result<PathBuf> {
-        self.be_path(index, QueryLifecycleFaultKind::StartAckSuppress)
-    }
-
     fn terminal_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
         self.be_path(index, QueryLifecycleFaultKind::TerminalAckDrop)
     }
@@ -2760,18 +2627,6 @@ impl QueryLifecycleFaultFiles {
 
     fn mv_known_committed_before_projector_cas_marker_path(&self) -> PathBuf {
         mv_known_committed_before_projector_cas_marker_path(&self.root)
-    }
-
-    fn publish_init_ack_drop(&self, index: usize) -> Result<String> {
-        self.publish(self.init_ack_drop_path(index)?, index, None)
-    }
-
-    fn publish_restart_after_init_ack(&self, index: usize) -> Result<String> {
-        self.publish(self.restart_after_init_ack_path(index)?, index, None)
-    }
-
-    fn publish_start_ack_suppress(&self, index: usize) -> Result<String> {
-        self.publish(self.start_ack_suppress_path(index)?, index, None)
     }
 
     fn publish_terminal_ack_drop(&self, index: usize) -> Result<String> {
@@ -3299,23 +3154,6 @@ impl CrossProcessServerHandle {
         self.native_trust_fixture.probe_connector(endpoint, mode)
     }
 
-    /// Read the BE-owned terminal fallback acceptance counter for one live
-    /// cross-process backend. System scenarios use this only to prove that an
-    /// intentionally unacknowledged terminal report reached the FE fallback
-    /// endpoint; it does not alter lifecycle delivery.
-    pub fn backend_terminal_fallback_accepted(&self, index: usize) -> Result<f64> {
-        self.ensure_be_index(index)?;
-        let metrics = scrape_prometheus_metrics(self.runtime.be[index].http)
-            .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))?;
-        prometheus_labeled_gauge(
-            &metrics,
-            QUERY_LIFECYCLE_TERMINAL_METRIC,
-            "outcome",
-            TERMINAL_FALLBACK_ACCEPTED_OUTCOME,
-        )
-        .with_context(|| format!("read BE[{index}] terminal fallback accepted count"))
-    }
-
     /// Read the cumulative number of EES tasks first accepted by one backend.
     ///
     /// This is the task registry's replacement for legacy fragment-admission
@@ -3609,10 +3447,6 @@ impl CrossProcessServerHandle {
                     index,
                     process_running,
                     resources: BTreeMap::new(),
-                    terminal_retained: 0.0,
-                    terminal_retained_bytes: 0.0,
-                    terminal_retained_capacity: 0.0,
-                    terminal_max_retained_bytes: 0.0,
                 });
                 continue;
             }
@@ -3639,34 +3473,6 @@ impl CrossProcessServerHandle {
                 index,
                 process_running,
                 resources,
-                terminal_retained: prometheus_labeled_gauge(
-                    &metrics,
-                    QUERY_LIFECYCLE_TERMINAL_METRIC,
-                    "outcome",
-                    TERMINAL_RETAINED_OUTCOME,
-                )
-                .with_context(|| format!("read BE[{index}] terminal retained count"))?,
-                terminal_retained_bytes: prometheus_labeled_gauge(
-                    &metrics,
-                    QUERY_LIFECYCLE_TERMINAL_METRIC,
-                    "outcome",
-                    TERMINAL_RETAINED_BYTES_OUTCOME,
-                )
-                .with_context(|| format!("read BE[{index}] terminal retained bytes"))?,
-                terminal_retained_capacity: prometheus_labeled_gauge(
-                    &metrics,
-                    QUERY_LIFECYCLE_TERMINAL_METRIC,
-                    "outcome",
-                    TERMINAL_RETAINED_CAPACITY_OUTCOME,
-                )
-                .with_context(|| format!("read BE[{index}] terminal retained capacity"))?,
-                terminal_max_retained_bytes: prometheus_labeled_gauge(
-                    &metrics,
-                    QUERY_LIFECYCLE_TERMINAL_METRIC,
-                    "outcome",
-                    TERMINAL_MAX_RETAINED_BYTES_OUTCOME,
-                )
-                .with_context(|| format!("read BE[{index}] terminal retained byte limit"))?,
             });
         }
         Ok(QueryExecutionResourceSnapshot {
@@ -3773,54 +3579,6 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn be_count(&self) -> usize {
         self.be_processes.len()
-    }
-
-    fn arm_init_ack_drop(&mut self, index: usize) -> Result<()> {
-        self.ensure_be_index(index)?;
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_init_ack_drop(index)?;
-        self.query_lifecycle_fault_tokens
-            .insert((index, "init-ack-drop"), token.clone());
-        println!(
-            "armed InitAck drop for cross-process BE[{index}] token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .init_ack_drop_path(index)?
-                .display()
-        );
-        Ok(())
-    }
-
-    fn arm_be_restart_after_init_ack(&mut self, index: usize) -> Result<()> {
-        self.ensure_be_index(index)?;
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_restart_after_init_ack(index)?;
-        self.query_lifecycle_fault_tokens
-            .insert((index, "restart-after-init-ack"), token.clone());
-        println!(
-            "armed BE[{index}] restart after InitAck token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .restart_after_init_ack_path(index)?
-                .display()
-        );
-        Ok(())
-    }
-
-    fn arm_start_ack_suppress(&mut self, index: usize) -> Result<()> {
-        self.ensure_be_index(index)?;
-        let token = self
-            .query_lifecycle_fault_files
-            .publish_start_ack_suppress(index)?;
-        self.query_lifecycle_fault_tokens
-            .insert((index, "start-ack-suppress"), token.clone());
-        println!(
-            "armed StartAck suppression for cross-process BE[{index}] token={token} trigger={}",
-            self.query_lifecycle_fault_files
-                .start_ack_suppress_path(index)?
-                .display()
-        );
-        Ok(())
     }
 
     fn arm_terminal_ack_drop(&mut self, index: usize) -> Result<()> {
@@ -5113,8 +4871,6 @@ mod tests {
         let mut value = serde_json::json!({
             "execution_id": execution_id,
             "error_source": null,
-            "participant_outcomes": [],
-            "telemetry_unavailable": [],
             "runtime_filter": {
                 "kind": "available",
                 "participants": [{
@@ -5265,13 +5021,13 @@ mod tests {
         let mut value = lifecycle_debug_json("11:12:13");
         value["runtime_filter"] = serde_json::json!({
             "kind": "unavailable",
-            "reason": "negative-attestation"
+            "reason": "terminal-outcomes-incomplete"
         });
         let snapshot = decode_lifecycle_debug_json(value);
         assert_eq!(
             snapshot.runtime_filter,
             RuntimeFilterTerminalRollup::Unavailable {
-                reason: RuntimeFilterTerminalRollupUnavailable::NegativeAttestation
+                reason: RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete
             }
         );
 
@@ -5744,12 +5500,9 @@ mod tests {
         let trigger_dir = root.join("query-lifecycle-faults");
         let paths = QueryLifecycleFaultFiles::new(&trigger_dir, 3)
             .expect("create query lifecycle fault paths");
-        let init_token = paths
-            .publish_init_ack_drop(1)
-            .expect("publish init ack token");
-        let start_ack_token = paths
-            .publish_start_ack_suppress(1)
-            .expect("publish start ack token");
+        let snapshot_conflict_token = paths
+            .publish_terminal_snapshot_conflict(1)
+            .expect("publish terminal snapshot conflict token");
         let terminal_ack_token = paths
             .publish_terminal_ack_drop(2)
             .expect("publish terminal ack token");
@@ -5757,23 +5510,27 @@ mod tests {
             .publish_kill_query_at_phase(QueryLifecyclePhase::Starting)
             .expect("publish phase fault");
 
-        assert_ne!(init_token, start_ack_token);
+        assert_ne!(snapshot_conflict_token, terminal_ack_token);
         assert_eq!(
-            fs::read_to_string(paths.init_ack_drop_path(1).expect("init path"))
-                .expect("read init token"),
-            format!("token={init_token}\nbackend_index=1\n")
+            fs::read_to_string(
+                paths
+                    .terminal_snapshot_conflict_path(1)
+                    .expect("snapshot conflict path")
+            )
+            .expect("read snapshot conflict token"),
+            format!("token={snapshot_conflict_token}\nbackend_index=1\n")
         );
-        assert!(!paths.init_ack_drop_path(0).expect("init path 0").exists());
+        assert!(
+            !paths
+                .terminal_snapshot_conflict_path(0)
+                .expect("snapshot conflict path 0")
+                .exists()
+        );
         assert!(
             !paths
                 .terminal_ack_drop_path(1)
                 .expect("terminal ack path 1")
                 .exists()
-        );
-        assert_eq!(
-            fs::read_to_string(paths.start_ack_suppress_path(1).expect("start ack path"))
-                .expect("read start ack token"),
-            format!("token={start_ack_token}\nbackend_index=1\n")
         );
         assert_eq!(
             fs::read_to_string(paths.terminal_ack_drop_path(2).expect("terminal ack path"))
@@ -5787,7 +5544,7 @@ mod tests {
         );
 
         let duplicate = paths
-            .publish_init_ack_drop(1)
+            .publish_terminal_snapshot_conflict(1)
             .expect_err("an armed trigger must not be clobbered");
         assert!(
             format!("{duplicate:#}").contains("publish query lifecycle fault trigger"),
@@ -5812,12 +5569,12 @@ mod tests {
         let trigger_dir = root.join("query-lifecycle-faults");
         let paths = QueryLifecycleFaultFiles::new(&trigger_dir, 3).expect("create fault paths");
         let token = paths
-            .publish_rfo_8r2_fault(2, "terminal-outcome-suppress")
+            .publish_rfo_8r2_fault(2, "runtime-filter-contribution-ack-drop")
             .expect("publish RFO-8R2 arm");
         assert_eq!(
             fs::read_to_string(
                 paths
-                    .rfo_8r2_fault_path(2, "terminal-outcome-suppress")
+                    .rfo_8r2_fault_path(2, "runtime-filter-contribution-ack-drop")
                     .expect("fault path"),
             )
             .expect("read fault arm"),
@@ -6741,10 +6498,6 @@ static_file_path = "catalogs.toml"
                 index: 0,
                 process_running: true,
                 resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
-                terminal_retained: 0.0,
-                terminal_retained_bytes: 0.0,
-                terminal_retained_capacity: 4_096.0,
-                terminal_max_retained_bytes: 268_435_456.0,
             }],
         };
         let exited = QueryExecutionResourceSnapshot {
@@ -6754,13 +6507,9 @@ static_file_path = "catalogs.toml"
                 index: 0,
                 process_running: false,
                 resources: BTreeMap::new(),
-                terminal_retained: 0.0,
-                terminal_retained_bytes: 0.0,
-                terminal_retained_capacity: 0.0,
-                terminal_max_retained_bytes: 0.0,
             }],
         };
-        assert!(exited.convergence_failure(&baseline, false).is_none());
+        assert!(exited.convergence_failure(&baseline).is_none());
 
         let leaked = QueryExecutionResourceSnapshot {
             fe_running: true,
@@ -6769,15 +6518,11 @@ static_file_path = "catalogs.toml"
                 index: 0,
                 process_running: true,
                 resources: BTreeMap::from([("native_query_contexts_active".to_string(), 1.0)]),
-                terminal_retained: 0.0,
-                terminal_retained_bytes: 0.0,
-                terminal_retained_capacity: 4_096.0,
-                terminal_max_retained_bytes: 268_435_456.0,
             }],
         };
         assert!(
             leaked
-                .convergence_failure(&baseline, false)
+                .convergence_failure(&baseline)
                 .expect("live leak must be reported")
                 .contains("native_query_contexts_active")
         );
@@ -6792,10 +6537,6 @@ static_file_path = "catalogs.toml"
                 index: 0,
                 process_running: true,
                 resources: BTreeMap::from([("catalog_query_leases".to_string(), 1.0)]),
-                terminal_retained: 0.0,
-                terminal_retained_bytes: 0.0,
-                terminal_retained_capacity: 4_096.0,
-                terminal_max_retained_bytes: 268_435_456.0,
             }],
         };
         let released = QueryExecutionResourceSnapshot {
@@ -6805,14 +6546,10 @@ static_file_path = "catalogs.toml"
                 index: 0,
                 process_running: true,
                 resources: BTreeMap::from([("catalog_query_leases".to_string(), 0.0)]),
-                terminal_retained: 0.0,
-                terminal_retained_bytes: 0.0,
-                terminal_retained_capacity: 4_096.0,
-                terminal_max_retained_bytes: 268_435_456.0,
             }],
         };
 
-        assert!(released.convergence_failure(&baseline, false).is_none());
+        assert!(released.convergence_failure(&baseline).is_none());
     }
 
     #[test]
@@ -6824,10 +6561,6 @@ static_file_path = "catalogs.toml"
                 index: 0,
                 process_running: true,
                 resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
-                terminal_retained: 0.0,
-                terminal_retained_bytes: 0.0,
-                terminal_retained_capacity: 4_096.0,
-                terminal_max_retained_bytes: 268_435_456.0,
             }],
         };
         let retained = QueryExecutionResourceSnapshot {
@@ -6837,15 +6570,11 @@ static_file_path = "catalogs.toml"
                 index: 0,
                 process_running: true,
                 resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
-                terminal_retained: 2.0,
-                terminal_retained_bytes: 512.0,
-                terminal_retained_capacity: 4_096.0,
-                terminal_max_retained_bytes: 268_435_456.0,
             }],
         };
 
-        assert!(retained.convergence_failure(&baseline, true).is_none());
-        assert!(retained.convergence_failure(&baseline, false).is_some());
+        assert!(retained.convergence_failure(&baseline).is_none());
+        assert!(retained.convergence_failure(&baseline).is_some());
     }
 
     #[test]
@@ -6857,10 +6586,6 @@ static_file_path = "catalogs.toml"
                 index: 0,
                 process_running: true,
                 resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
-                terminal_retained: 2.0,
-                terminal_retained_bytes: 512.0,
-                terminal_retained_capacity: 4_096.0,
-                terminal_max_retained_bytes: 268_435_456.0,
             }],
         };
         let expired = QueryExecutionResourceSnapshot {
@@ -6870,13 +6595,9 @@ static_file_path = "catalogs.toml"
                 index: 0,
                 process_running: true,
                 resources: BTreeMap::from([("native_query_contexts_active".to_string(), 0.0)]),
-                terminal_retained: 1.0,
-                terminal_retained_bytes: 256.0,
-                terminal_retained_capacity: 4_096.0,
-                terminal_max_retained_bytes: 268_435_456.0,
             }],
         };
 
-        assert!(expired.convergence_failure(&baseline, false).is_none());
+        assert!(expired.convergence_failure(&baseline).is_none());
     }
 }

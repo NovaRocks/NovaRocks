@@ -224,28 +224,6 @@ fn parse_kill_be_after_be_log_directive(raw: &str) -> anyhow::Result<KillBeAfter
     })
 }
 
-fn parse_participant_outcome_expectation(
-    raw: &str,
-) -> anyhow::Result<ParticipantOutcomeExpectation> {
-    if raw == "proof" {
-        return Ok(ParticipantOutcomeExpectation::Proof);
-    }
-    if raw == "no-outcome" {
-        return Ok(ParticipantOutcomeExpectation::NoOutcome);
-    }
-    let Some(reason) = raw.strip_prefix("attestation:") else {
-        bail!(
-            "invalid expect_participant_outcome: {raw}; expected proof, no-outcome, or attestation:<reason>"
-        );
-    };
-    if reason.trim().is_empty() {
-        bail!("expect_participant_outcome attestation reason must not be empty");
-    }
-    Ok(ParticipantOutcomeExpectation::Attestation {
-        reason: reason.trim().to_string(),
-    })
-}
-
 fn parse_lifecycle_metric_delta(raw: &str) -> anyhow::Result<QueryLifecycleMetricDeltaExpectation> {
     let (metric, delta) = raw.split_once(',').ok_or_else(|| {
         anyhow::anyhow!(
@@ -267,25 +245,6 @@ fn parse_lifecycle_metric_delta(raw: &str) -> anyhow::Result<QueryLifecycleMetri
     Ok(QueryLifecycleMetricDeltaExpectation {
         metric: metric.to_string(),
         delta,
-    })
-}
-
-fn parse_lifecycle_telemetry_unavailable(
-    raw: &str,
-) -> anyhow::Result<QueryLifecycleTelemetryUnavailableExpectation> {
-    let mut fields = raw.splitn(3, ',');
-    let scope = fields.next().unwrap_or_default();
-    let stage = fields.next().unwrap_or_default();
-    let code = fields.next().unwrap_or_default();
-    if !matches!(scope, "fragment" | "query") || stage.is_empty() || code.is_empty() {
-        bail!(
-            "@expect_lifecycle_telemetry_unavailable requires <fragment|query>,<stage>,<code>; received {raw:?}"
-        );
-    }
-    Ok(QueryLifecycleTelemetryUnavailableExpectation {
-        scope: scope.to_string(),
-        stage: stage.to_string(),
-        code: code.to_string(),
     })
 }
 
@@ -320,8 +279,6 @@ fn structured_assertion_mut(meta: &mut QueryMeta) -> &mut QueryLifecycleStructur
     meta.query_lifecycle_structured_assertion
         .get_or_insert_with(|| QueryLifecycleStructuredAssertion {
             error_source: None,
-            participant_outcome: None,
-            telemetry_unavailable: Vec::new(),
             metric_deltas: Vec::new(),
             runtime_filter_availability: None,
             runtime_filter_details: Vec::new(),
@@ -550,15 +507,6 @@ fn parse_meta_with_sql_error_descriptors(
                 })?;
                 structured_assertion_mut(&mut meta).error_source = Some(source);
             }
-            "expect_participant_outcome" => {
-                structured_assertion_mut(&mut meta).participant_outcome =
-                    Some(parse_participant_outcome_expectation(&raw_value)?);
-            }
-            "expect_lifecycle_telemetry_unavailable" => {
-                structured_assertion_mut(&mut meta)
-                    .telemetry_unavailable
-                    .push(parse_lifecycle_telemetry_unavailable(&raw_value)?);
-            }
             "expect_lifecycle_metric_delta" => {
                 structured_assertion_mut(&mut meta)
                     .metric_deltas
@@ -744,15 +692,6 @@ fn merge_lifecycle_structured_assertion(
             .error_source
             .clone()
             .or_else(|| base.error_source.clone()),
-        participant_outcome: override_meta
-            .participant_outcome
-            .clone()
-            .or_else(|| base.participant_outcome.clone()),
-        telemetry_unavailable: if override_meta.telemetry_unavailable.is_empty() {
-            base.telemetry_unavailable.clone()
-        } else {
-            override_meta.telemetry_unavailable.clone()
-        },
         metric_deltas: if override_meta.metric_deltas.is_empty() {
             base.metric_deltas.clone()
         } else {
@@ -1993,10 +1932,8 @@ mod opt5_directive_tests {
     fn rfo_8r2_fault_and_structured_assertions_parse_without_log_text_contracts() {
         let re = meta_re();
         let lines = vec![
-            "-- @query_lifecycle_fault=terminal-p1-encode-failure,2".to_string(),
+            "-- @query_lifecycle_fault=runtime-filter-contribution-ack-drop,2".to_string(),
             "-- @expect_lifecycle_error_source=backend-attestation".to_string(),
-            "-- @expect_participant_outcome=attestation:P1EncodeFailed".to_string(),
-            "-- @expect_lifecycle_telemetry_unavailable=query,runtime_filter_terminal_capture,INJECTED_P2_ASSEMBLY_FAILURE".to_string(),
             "-- @expect_lifecycle_metric_delta=terminal_retained,1".to_string(),
         ];
 
@@ -2004,14 +1941,14 @@ mod opt5_directive_tests {
         assert_eq!(
             meta.query_lifecycle_fault,
             Some(QueryLifecycleFaultDirective {
-                kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                kind: QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
                 be_index: 2,
             })
         );
         assert_eq!(
             meta.query_lifecycle_faults,
             vec![QueryLifecycleFaultDirective {
-                kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                kind: QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
                 be_index: 2,
             }]
         );
@@ -2021,20 +1958,6 @@ mod opt5_directive_tests {
         assert_eq!(
             assertion.error_source,
             Some(QueryLifecycleErrorSource::BackendAttestation)
-        );
-        assert_eq!(
-            assertion.participant_outcome,
-            Some(ParticipantOutcomeExpectation::Attestation {
-                reason: "P1EncodeFailed".to_string(),
-            })
-        );
-        assert_eq!(
-            assertion.telemetry_unavailable,
-            vec![QueryLifecycleTelemetryUnavailableExpectation {
-                scope: "query".to_string(),
-                stage: "runtime_filter_terminal_capture".to_string(),
-                code: "INJECTED_P2_ASSEMBLY_FAILURE".to_string(),
-            }]
         );
         assert_eq!(
             assertion.metric_deltas,
@@ -2122,8 +2045,8 @@ mod opt5_directive_tests {
     fn parse_meta_accumulates_rfo_8r2_fault_directives() {
         let re = meta_re();
         let lines = vec![
-            "-- @query_lifecycle_fault=terminal-p1-encode-failure,2".to_string(),
-            "-- @query_lifecycle_fault=terminal-attestation-stream-drop,2".to_string(),
+            "-- @query_lifecycle_fault=runtime-filter-contribution-ack-drop,2".to_string(),
+            "-- @query_lifecycle_fault=task-update-terminal-ack-drop,2".to_string(),
         ];
 
         let meta = parse_meta(&lines, &re).expect("parse multiple RFO-8R2 directives");
@@ -2131,7 +2054,7 @@ mod opt5_directive_tests {
         assert_eq!(
             meta.query_lifecycle_fault,
             Some(QueryLifecycleFaultDirective {
-                kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                kind: QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
                 be_index: 2,
             })
         );
@@ -2139,11 +2062,11 @@ mod opt5_directive_tests {
             meta.query_lifecycle_faults,
             vec![
                 QueryLifecycleFaultDirective {
-                    kind: QueryLifecycleFaultKind::TerminalP1EncodeFailure,
+                    kind: QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
                     be_index: 2,
                 },
                 QueryLifecycleFaultDirective {
-                    kind: QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
+                    kind: QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
                     be_index: 2,
                 },
             ]

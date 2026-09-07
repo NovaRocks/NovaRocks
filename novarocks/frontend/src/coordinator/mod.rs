@@ -17,17 +17,13 @@
 
 // MIGRATION: wired into the round once the typed producer lands.
 mod execution;
+mod query_registry;
+mod scheduler;
 #[allow(
     dead_code,
     reason = "Wired into execute_round by the typed producer cut in the same PR."
 )]
 pub(crate) mod split_assignment_round;
-// Task 5 deliberately lands the lifecycle client seam before Task 6 wires the
-// production transport and Task 7 cuts over coordinator submission.
-mod query_lifecycle;
-mod query_registry;
-mod report;
-mod scheduler;
 pub(crate) mod task_round;
 
 pub use execution::FrontendDistributedQueryCoordinator;
@@ -36,5 +32,4 @@ pub(crate) use query_registry::{
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
 };
-pub use report::{FrontendCoordinatorTerminalIngress, QueryTerminalIngress};
 pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};

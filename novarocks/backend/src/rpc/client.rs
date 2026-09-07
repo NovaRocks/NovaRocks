@@ -18,7 +18,7 @@
 //! Backend-owned outbound RPC transport.
 //!
 //! This is deliberately role-private: it provides only BE-to-BE data-plane
-//! calls and the BE-to-FE terminal fallback.  It shares no transport facade
+//! calls and the BE-to-FE membership announce.  It shares no transport facade
 //! with Frontend or Core.
 
 use std::io;
@@ -132,35 +132,6 @@ impl BackendRpcClient {
         .map_err(|_| "runtime filter envelope deadline exceeded during unary RPC".to_string())?
         .map(|response| response.into_inner())
         .map_err(|error| format!("transmit_runtime_filter_envelope rpc failed: {error}"))
-    }
-
-    pub(crate) fn blocking_report_query_terminal_with_timeout(
-        &self,
-        request: proto::ReportQueryTerminalRequest,
-        timeout: Duration,
-    ) -> Result<proto::ReportQueryTerminalResponse, String> {
-        self.runtime.block_on(async {
-            let deadline_at = tokio::time::Instant::now() + timeout;
-            let mut client = self
-                .make_deadline_async_client("report_query_terminal", deadline_at)
-                .await?;
-            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(
-                    "report_query_terminal deadline exceeded before unary RPC submission"
-                        .to_string(),
-                );
-            }
-            let mut request = Request::new(request);
-            request.set_timeout(remaining);
-            tokio::time::timeout_at(deadline_at, client.report_query_terminal(request))
-                .await
-                .map_err(|_| {
-                    "report_query_terminal deadline exceeded during unary RPC".to_string()
-                })?
-                .map(|response| response.into_inner())
-                .map_err(|error| format!("report_query_terminal rpc failed: {error}"))
-        })
     }
 
     pub(crate) fn blocking_announce_backend_with_timeout(

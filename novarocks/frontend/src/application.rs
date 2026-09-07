@@ -181,30 +181,12 @@ const DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Durati
 /// a `FrontendExecutionConfig` built without a config file still validates.
 #[derive(Clone, Copy, Debug)]
 pub struct FrontendQueryControlTimeouts {
-    pub heartbeat_interval_ms: u64,
-    pub heartbeat_timeout_ms: u64,
-    pub init_rpc_timeout_ms: u64,
-    pub attach_timeout_ms: u64,
-    pub participant_fanout_max_inflight: usize,
-    pub stage_rpc_timeout_ms: u64,
-    pub start_rpc_timeout_ms: u64,
-    pub terminal_drain_timeout_ms: u64,
-    pub terminal_ack_timeout_ms: u64,
     pub pre_start_timeout_ms: u64,
 }
 
 impl Default for FrontendQueryControlTimeouts {
     fn default() -> Self {
         Self {
-            heartbeat_interval_ms: 1_000,
-            heartbeat_timeout_ms: 5_000,
-            init_rpc_timeout_ms: 5_000,
-            attach_timeout_ms: 5_000,
-            participant_fanout_max_inflight: 32,
-            stage_rpc_timeout_ms: 5_000,
-            start_rpc_timeout_ms: 2_000,
-            terminal_drain_timeout_ms: 30_000,
-            terminal_ack_timeout_ms: 5_000,
             pre_start_timeout_ms: 30_000,
         }
     }
@@ -978,15 +960,6 @@ impl FrontendApplicationHost {
         self.query_control.clone()
     }
 
-    pub fn terminal_ingress(&self) -> Arc<dyn crate::coordinator::QueryTerminalIngress> {
-        Arc::new(
-            self.coordinator
-                .as_ref()
-                .expect("frontend coordinator is installed before host open returns")
-                .terminal_ingress(),
-        )
-    }
-
     pub(crate) fn backend_membership_ingress(&self) -> Arc<ClusterBackendService> {
         Arc::clone(self.topology())
     }
@@ -1006,7 +979,6 @@ impl FrontendApplicationHost {
     {
         crate::native::report_server::FrontendReportServerHandle::start(
             bind_addr,
-            self.terminal_ingress(),
             self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
             native_trust,
@@ -1026,7 +998,6 @@ impl FrontendApplicationHost {
         crate::native::report_server::FrontendReportServerHandle::start_from_host(
             host,
             port,
-            self.terminal_ingress(),
             self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
             native_trust,
@@ -1063,21 +1034,12 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn coordinator_report_endpoint_sink(
-        &self,
-    ) -> Arc<dyn crate::common::backend_topology::CoordinatorReportEndpointSink> {
-        self.coordinator
-            .as_ref()
-            .expect("frontend coordinator is installed before host open returns")
-            .report_endpoint_sink()
-    }
-
     /// Frontend composition-time topology leaf used by FE-owned services.
     pub fn backend_topology_port(&self) -> crate::common::backend_topology::BackendTopologyService {
         Arc::clone(self.topology()) as crate::common::backend_topology::BackendTopologyService
     }
 
-    pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {
+    pub async fn shutdown(self) -> Result<(), FrontendApplicationError> {
         self.shutdown_until(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
             .await
     }
@@ -1122,11 +1084,8 @@ impl FrontendApplicationHost {
         let native_compatibility_id = execution.native_compatibility_id();
         let coordinator = Arc::new(
             FrontendDistributedQueryCoordinator::new(
-                execution.advertised_report_host,
-                execution.configured_report_port,
                 execution.runtime_filter_worker_count,
                 native_compatibility_id,
-                execution.query_control_timeouts,
                 execution.task_update_retry_policy,
                 execution.connector_split_initial_dynamic_filter_wait_cap,
                 execution.task_execution_budgets,

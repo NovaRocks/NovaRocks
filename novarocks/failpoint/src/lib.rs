@@ -38,21 +38,8 @@ pub const MV_KNOWN_COMMITTED_BEFORE_PROJECTOR_CAS_MARKER: &str =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum QueryLifecycleFaultKind {
-    InitAckDrop,
-    StartAckSuppress,
-    RestartAfterInitAck,
     TerminalAckDrop,
     TerminalSnapshotConflict,
-    ObservationP2AssemblyFailure,
-    ObservationP2BudgetPressure,
-    TerminalP0RetainedSlotExhausted,
-    TerminalP0BytesExhausted,
-    TerminalP0DeliveryPermitExhausted,
-    TerminalP1EncodeFailure,
-    TerminalP1RetentionExhausted,
-    TerminalProofStreamDrop,
-    TerminalAttestationStreamDrop,
-    TerminalOutcomeSuppress,
     RuntimeFilterContributionAckDrop,
     RuntimeFilterFeedbackContractDigestCorrupt,
     RuntimeFilterFeedbackUnavailable,
@@ -92,7 +79,7 @@ pub enum QueryLifecycleFaultKind {
     /// Holds one applied `EstablishQueryContext` open so the harness can
     /// replace that exact backend process.
     ///
-    /// The successor of `RestartAfterInitAck`: the establish is the task
+    /// The successor of the retired `RestartAfterInitAck`: the establish is the task
     /// protocol's first per-backend admission point, so it is where a process
     /// replacement can still be observed against a context the backend really
     /// installed. It fabricates nothing -- it publishes a token-scoped marker
@@ -103,13 +90,10 @@ pub enum QueryLifecycleFaultKind {
     /// rendezvous is still waiting, and answering that replay would tell the
     /// frontend this backend is ready moments before the harness replaces it.
     RestartAfterEstablishContext,
-    StageConflictAfterApply,
-    StartDigestCorrupt,
-    ObservationForeignParticipant,
     /// Answers one admitted `CreateTask` with the task protocol's own
     /// `CreateConflict` verdict.
     ///
-    /// The successor of `StageConflictAfterApply`, and the same shape: the
+    /// The successor of the retired `StageConflictAfterApply`, and the same shape: the
     /// operation really applied -- the task is admitted and running on this
     /// backend -- and only the answer says otherwise. That is what makes the
     /// resulting failure a statement about the frontend's fence rather than
@@ -119,7 +103,7 @@ pub enum QueryLifecycleFaultKind {
     /// Makes one admitted `CreateTask` acknowledgement name a different task
     /// than the request it answers.
     ///
-    /// The successor of `StartDigestCorrupt`. The digest that fault corrupted
+    /// The successor of the retired `StartDigestCorrupt`. The digest that fault corrupted
     /// has no counterpart: the task protocol has no second operation that
     /// commits a previously staged plan, and a descriptor's fingerprint is
     /// derived by the receiver from the bytes it just read, so no request field
@@ -130,7 +114,7 @@ pub enum QueryLifecycleFaultKind {
     CreateTaskReceiptForeignTask,
     /// Makes one delivered task status event name a foreign backend process.
     ///
-    /// The successor of `ObservationForeignParticipant`, which swapped the
+    /// The successor of the retired `ObservationForeignParticipant`, which swapped the
     /// `ParticipantAttemptRef` of a fragment observation on the retired control
     /// stream. The surviving observation channel is `SubscribeTaskStatus`, and
     /// the identity it carries is the event's own `TaskIdentity`, so the
@@ -169,22 +153,9 @@ pub enum QueryLifecycleFaultKind {
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 40] = [
-        Self::InitAckDrop,
-        Self::StartAckSuppress,
-        Self::RestartAfterInitAck,
+    pub const ALL: [Self; 24] = [
         Self::TerminalAckDrop,
         Self::TerminalSnapshotConflict,
-        Self::ObservationP2AssemblyFailure,
-        Self::ObservationP2BudgetPressure,
-        Self::TerminalP0RetainedSlotExhausted,
-        Self::TerminalP0BytesExhausted,
-        Self::TerminalP0DeliveryPermitExhausted,
-        Self::TerminalP1EncodeFailure,
-        Self::TerminalP1RetentionExhausted,
-        Self::TerminalProofStreamDrop,
-        Self::TerminalAttestationStreamDrop,
-        Self::TerminalOutcomeSuppress,
         Self::RuntimeFilterContributionAckDrop,
         Self::RuntimeFilterFeedbackContractDigestCorrupt,
         Self::RuntimeFilterFeedbackUnavailable,
@@ -196,9 +167,6 @@ impl QueryLifecycleFaultKind {
         Self::LeaseRenewalStop,
         Self::TaskExecutionFailure,
         Self::RestartAfterEstablishContext,
-        Self::StageConflictAfterApply,
-        Self::StartDigestCorrupt,
-        Self::ObservationForeignParticipant,
         Self::CreateTaskConflictAfterApply,
         Self::CreateTaskReceiptForeignTask,
         Self::TaskStatusForeignProcess,
@@ -214,21 +182,8 @@ impl QueryLifecycleFaultKind {
 
     pub const fn file_stem(self) -> &'static str {
         match self {
-            Self::InitAckDrop => "init-ack-drop",
-            Self::StartAckSuppress => "start-ack-suppress",
-            Self::RestartAfterInitAck => "restart-after-init-ack",
             Self::TerminalAckDrop => "terminal-ack-drop",
             Self::TerminalSnapshotConflict => "terminal-snapshot-conflict",
-            Self::ObservationP2AssemblyFailure => "observation-p2-assembly-failure",
-            Self::ObservationP2BudgetPressure => "observation-p2-budget-pressure",
-            Self::TerminalP0RetainedSlotExhausted => "terminal-p0-retained-slot-exhausted",
-            Self::TerminalP0BytesExhausted => "terminal-p0-bytes-exhausted",
-            Self::TerminalP0DeliveryPermitExhausted => "terminal-p0-delivery-permit-exhausted",
-            Self::TerminalP1EncodeFailure => "terminal-p1-encode-failure",
-            Self::TerminalP1RetentionExhausted => "terminal-p1-retention-exhausted",
-            Self::TerminalProofStreamDrop => "terminal-proof-stream-drop",
-            Self::TerminalAttestationStreamDrop => "terminal-attestation-stream-drop",
-            Self::TerminalOutcomeSuppress => "terminal-outcome-suppress",
             Self::RuntimeFilterContributionAckDrop => "runtime-filter-contribution-ack-drop",
             Self::RuntimeFilterFeedbackContractDigestCorrupt => {
                 "runtime-filter-feedback-contract-digest-corrupt"
@@ -242,9 +197,6 @@ impl QueryLifecycleFaultKind {
             Self::LeaseRenewalStop => "lease-renewal-stop",
             Self::TaskExecutionFailure => "task-execution-failure",
             Self::RestartAfterEstablishContext => "restart-after-establish-context",
-            Self::StageConflictAfterApply => "stage-conflict-after-apply",
-            Self::StartDigestCorrupt => "start-digest-corrupt",
-            Self::ObservationForeignParticipant => "observation-foreign-participant",
             Self::CreateTaskConflictAfterApply => "create-task-conflict-after-apply",
             Self::CreateTaskReceiptForeignTask => "create-task-receipt-foreign-task",
             Self::TaskStatusForeignProcess => "task-status-foreign-process",
@@ -277,17 +229,7 @@ impl QueryLifecycleFaultKind {
 /// Both the SQL runner's directive vocabulary and the cluster harness's
 /// arm-by-kind path read this list, so a fault that belongs to one belongs to
 /// both.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 35] = [
-    QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
-    QueryLifecycleFaultKind::ObservationP2BudgetPressure,
-    QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
-    QueryLifecycleFaultKind::TerminalP0BytesExhausted,
-    QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
-    QueryLifecycleFaultKind::TerminalP1EncodeFailure,
-    QueryLifecycleFaultKind::TerminalP1RetentionExhausted,
-    QueryLifecycleFaultKind::TerminalProofStreamDrop,
-    QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
-    QueryLifecycleFaultKind::TerminalOutcomeSuppress,
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 22] = [
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
@@ -308,14 +250,12 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 35] = [
     // is not what the case is about.
     QueryLifecycleFaultKind::TaskExecutionFailure,
     QueryLifecycleFaultKind::RestartAfterEstablishContext,
-    QueryLifecycleFaultKind::StageConflictAfterApply,
-    QueryLifecycleFaultKind::StartDigestCorrupt,
-    QueryLifecycleFaultKind::ObservationForeignParticipant,
     // The task protocol's three identity-fencing faults, successors of the
-    // three entries above. Each misstates one fact on the wire after the
-    // operation it follows has genuinely applied: the create's verdict, the
-    // create acknowledgement's task, and a status event's backend process.
-    // None of them skips an operation, and none fabricates a success.
+    // retired protocol's `stage-conflict-after-apply`, `start-digest-corrupt`
+    // and `observation-foreign-participant`. Each misstates one fact on the
+    // wire after the operation it follows has genuinely applied: the create's
+    // verdict, the create acknowledgement's task, and a status event's backend
+    // process. None of them skips an operation, and none fabricates a success.
     QueryLifecycleFaultKind::CreateTaskConflictAfterApply,
     QueryLifecycleFaultKind::CreateTaskReceiptForeignTask,
     QueryLifecycleFaultKind::TaskStatusForeignProcess,
@@ -767,18 +707,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 40);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 24);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 35);
-        assert_eq!(
-            parse_runner_rfo_kind("terminal-outcome-suppress"),
-            Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)
-        );
+        assert_eq!(RUNNER_RFO_KINDS.len(), 22);
         assert_eq!(
             parse_runner_rfo_kind("runtime-filter-contribution-ack-drop"),
             Some(QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop)
@@ -852,7 +788,7 @@ mod tests {
             Some(QueryLifecycleFaultKind::ConnectorWriteAppendHold)
         );
         // A generic lifecycle hook stays out of reach of a harness.
-        assert_eq!(parse_runner_rfo_kind("init-ack-drop"), None);
+        assert_eq!(parse_runner_rfo_kind("terminal-ack-drop"), None);
     }
     #[test]
     fn cleanup_directive_and_file_stem_are_explicitly_distinct() {
@@ -895,7 +831,7 @@ mod tests {
 
         let root = unique_temp_root("scope");
         std::fs::create_dir_all(&root).expect("create root");
-        let kind = QueryLifecycleFaultKind::InitAckDrop;
+        let kind = QueryLifecycleFaultKind::TerminalAckDrop;
         std::fs::write(arm_path(&root, 1, kind), "token=abc-123\nbackend_index=1\n")
             .expect("write arm");
         let execution_id = QueryExecutionId::new(

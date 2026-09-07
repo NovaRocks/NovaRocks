@@ -22,7 +22,7 @@ use crate::app_config::NovaRocksConfig;
 use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
-use novarocks_backend::{BackendServerConfig, QueryLifecycleRegistryConfig};
+use novarocks_backend::BackendServerConfig;
 use novarocks_connector_binding::{
     ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBindingFactory,
 };
@@ -435,33 +435,6 @@ pub fn compose_backend_server_config(
         announce_max_backoff: Duration::from_millis(
             config.cluster.backend_announce_max_backoff_ms(),
         ),
-        query_lifecycle_sweep_interval: Duration::from_millis(
-            runtime_config.query_control_heartbeat_interval_ms,
-        ),
-        query_lifecycle_config: QueryLifecycleRegistryConfig::new(
-            runtime_config.query_control_max_active_entries,
-            runtime_config.query_control_tombstone_capacity,
-            Duration::from_millis(runtime_config.query_control_tombstone_retention_ms),
-            Duration::from_millis(runtime_config.query_control_heartbeat_timeout_ms),
-            Duration::from_millis(runtime_config.query_control_pre_start_timeout_ms),
-            runtime_config.query_control_stage_max_fragments,
-            runtime_config.query_control_max_active_staging,
-            runtime_config.query_control_stage_max_encoded_bytes,
-            runtime_config.query_control_stage_max_inflight_encoded_bytes,
-            runtime_config.query_control_stage_max_dormant_workers,
-            runtime_config.query_control_terminal_max_encoded_bytes,
-            Duration::from_millis(runtime_config.query_control_terminal_drain_timeout_ms),
-            Duration::from_millis(runtime_config.query_control_terminal_ack_timeout_ms),
-            Duration::from_millis(runtime_config.query_control_terminal_fallback_rpc_timeout_ms),
-            runtime_config.query_control_terminal_fallback_max_attempts,
-            Duration::from_millis(
-                runtime_config.query_control_terminal_fallback_initial_backoff_ms,
-            ),
-            Duration::from_millis(runtime_config.query_control_terminal_fallback_max_backoff_ms),
-            Duration::from_millis(runtime_config.query_control_terminal_retention_ms),
-            runtime_config.query_control_terminal_retained_capacity,
-            runtime_config.query_control_terminal_max_retained_bytes,
-        ),
         write_commit_evidence_limits: WriteCommitEvidenceLimits::try_new(
             runtime_config.write_commit_evidence_max_bytes,
             runtime_config.write_commit_evidence_max_entries,
@@ -551,16 +524,6 @@ pub fn compose_frontend_server_config(
         .map_err(|error| anyhow::anyhow!("construct catalog materialization configuration: {error}"))?,
     )
     .with_query_control_timeouts(FrontendQueryControlTimeouts {
-        heartbeat_interval_ms: runtime_config.query_control_heartbeat_interval_ms,
-        heartbeat_timeout_ms: runtime_config.query_control_heartbeat_timeout_ms,
-        init_rpc_timeout_ms: runtime_config.query_control_init_rpc_timeout_ms,
-        attach_timeout_ms: runtime_config.query_control_attach_timeout_ms,
-        participant_fanout_max_inflight: runtime_config
-            .query_control_participant_fanout_max_inflight,
-        stage_rpc_timeout_ms: runtime_config.query_control_stage_rpc_timeout_ms,
-        start_rpc_timeout_ms: runtime_config.query_control_start_rpc_timeout_ms,
-        terminal_drain_timeout_ms: runtime_config.query_control_terminal_drain_timeout_ms,
-        terminal_ack_timeout_ms: runtime_config.query_control_terminal_ack_timeout_ms,
         pre_start_timeout_ms: runtime_config.query_control_pre_start_timeout_ms,
     })
     .with_task_update_retry_policy(

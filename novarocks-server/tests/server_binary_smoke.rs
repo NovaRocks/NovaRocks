@@ -325,27 +325,37 @@ fn assert_native_rejects_management(port: u16, path: &str) {
     }
 }
 
+/// The BE-side probe is a family only the BE role registry holds, and one
+/// that renders before any query runs: `..._tasks_created_total` is a counter,
+/// so a BE that has just bound its management port already publishes it at
+/// zero. That keeps "absent from the BE port" a real failure rather than an
+/// idle process, and "present on the FE port" a real leak. Its FE counterpart
+/// `novarocks_backend_registry_entries` is the FE's own view of BE membership,
+/// which the FE publishes for the same reason.
 fn assert_role_scoped_surfaces(pair: &ConfigPair, lifecycle_debug_enabled: bool) {
+    const BE_OWNED_FAMILY: &str = "novarocks_backend_task_execution_tasks_created_total";
+    const FE_OWNED_FAMILY: &str = "novarocks_backend_registry_entries";
+
     assert_native_rejects_management(pair.fe_grpc_port, "/metrics");
     assert_native_rejects_management(pair.be_grpc_port, "/metrics");
     assert_native_rejects_management(pair.fe_grpc_port, LIFECYCLE_DEBUG_PATH);
 
     let fe_metrics = scrape_metrics(pair.fe_http_port);
     assert!(
-        fe_metrics.contains("novarocks_backend_registry_entries"),
+        fe_metrics.contains(FE_OWNED_FAMILY),
         "FE metrics: {fe_metrics}"
     );
     assert!(
-        !fe_metrics.contains("novarocks_backend_query_lifecycle_entries"),
+        !fe_metrics.contains(BE_OWNED_FAMILY),
         "FE management leaked BE metrics: {fe_metrics}"
     );
     let be_metrics = scrape_metrics(pair.be_http_port);
     assert!(
-        be_metrics.contains("novarocks_backend_query_lifecycle_entries"),
+        be_metrics.contains(BE_OWNED_FAMILY),
         "BE metrics: {be_metrics}"
     );
     assert!(
-        !be_metrics.contains("novarocks_backend_registry_entries"),
+        !be_metrics.contains(FE_OWNED_FAMILY),
         "BE management leaked FE metrics: {be_metrics}"
     );
 

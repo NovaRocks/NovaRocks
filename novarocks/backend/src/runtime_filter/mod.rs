@@ -4,6 +4,7 @@ pub(crate) mod artifact;
 pub(crate) mod artifact_query;
 pub(crate) mod codec;
 pub(crate) mod domain;
+pub(crate) mod error;
 pub(crate) mod ingress;
 pub(crate) mod install_decode;
 pub(crate) mod materializer;

@@ -625,8 +625,6 @@ where
         config.native_transport.clone(),
     )?;
     let exchange_port = report_server.bound_addr().port();
-    host.coordinator_report_endpoint_sink()
-        .set_bound_port(exchange_port);
     let system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog> =
         Arc::new(crate::system_catalog::SystemCatalogService::with_defaults());
     let client_connections = Arc::new(MysqlClientConnectionRegistry::new());
@@ -1213,7 +1211,6 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
-        let report_endpoint = host.coordinator_report_endpoint_sink();
         for bind_addr in ["127.0.0.1:0".parse().unwrap(), "[::1]:0".parse().unwrap()] {
             let mut report_server = host
                 .start_report_server(
@@ -1223,7 +1220,6 @@ mod tests {
                 )
                 .expect("start frontend-owned report endpoint");
             let bound_addr = report_server.bound_addr();
-            report_endpoint.set_bound_port(bound_addr.port());
             assert_ne!(
                 bound_addr.port(),
                 0,

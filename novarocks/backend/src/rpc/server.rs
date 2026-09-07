@@ -38,14 +38,13 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
-use novarocks_native_trust::{
-    NativeIncomingAdapter, NativeServerAdmission, NativeTransportMode, NativeTrust,
-};
+use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, NativeTrust};
 use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId,
 };
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
+use novarocks_types::BackendProcessId;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -55,11 +54,8 @@ use tonic::server::NamedService;
 use tower::ServiceExt;
 
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
-use crate::query_lifecycle::rpc::{
-    QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
-    handle_stage_fragments, handle_start_prepared_query, handle_task_update,
-};
-use crate::query_lifecycle::{CatalogPruneOutcome, QueryLifecycleIngress};
+use crate::connector::catalog_manager::CatalogPruneResult;
+use crate::drain::BackendDrainState;
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
@@ -67,49 +63,75 @@ use crate::runtime_filter::rpc::{
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Connection-local proof injected only after `NativeIncomingAdapter::accept`
-/// returns. It cannot be claimed by a lifecycle protobuf frame.
-#[derive(Clone, Copy)]
-struct NativeTlsVerified;
+/// What a rejected catalog prune is allowed to say on the wire.
+///
+/// A catalog definition carries credential material. This detail is a fixed
+/// string rather than anything derived from the handles involved, so no part
+/// of a catalog's properties can reach an error, a log, or a status by being
+/// interpolated into a rejection.
+const CATALOG_PRUNE_STALE_SNAPSHOT_DETAIL: &str =
+    "catalog reachability snapshot omits one or more live catalogs";
+
+/// This process's owner of catalog reachability.
+///
+/// The frontend sends one complete reachability snapshot; the owner reconciles
+/// its retained catalog runtimes against it and answers in its own vocabulary.
+/// This port exists so the wire handler never holds a catalog registry of its
+/// own: there is exactly one `CatalogManager` per process, and a second
+/// reconciler would be a second authority over the same leases.
+pub(crate) trait CatalogReachabilityAuthority: Send + Sync + 'static {
+    fn prune_unreachable_catalogs(
+        &self,
+        reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
+    ) -> CatalogPruneResult;
+}
+
+/// Everything a heartbeat answers with.
+///
+/// A heartbeat is a question about this process, not about any query: which
+/// process is answering, what it immutably is, and whether it will still take
+/// new work. All three travel together because they are one answer, and
+/// because a reply that mixed one process's identity with another's drain
+/// state would be worse than no reply at all.
+#[derive(Clone)]
+pub(crate) struct BackendProcessFacts {
+    /// The identity minted by this process's composition root. A heartbeat
+    /// naming a different one is a stale peer talking to a replaced process.
+    pub(crate) process_id: BackendProcessId,
+    pub(crate) descriptor: BackendProcessDescriptor,
+    pub(crate) drain: Arc<BackendDrainState>,
+}
 
 /// Backend-owned production Tonic service. Domain owners contribute the narrow
 /// ingress ports while this service composes them with `BackendDataPlane`.
 #[derive(Clone)]
 pub(crate) struct BackendRpcService {
-    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
-    query_control_shutdown: Option<watch::Receiver<bool>>,
+    catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
+    process: BackendProcessFacts,
     data_plane: BackendDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
-    process_descriptor: BackendProcessDescriptor,
 }
 
 impl BackendRpcService {
     pub(crate) fn new(
-        query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
         task_execution_ingress: Arc<dyn TaskExecutionIngress>,
+        catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         task_inbound_capabilities: Arc<TaskInboundCapabilities>,
-        process_descriptor: BackendProcessDescriptor,
+        process: BackendProcessFacts,
     ) -> Self {
         Self {
-            query_lifecycle_ingress: Arc::clone(&query_lifecycle_ingress),
             task_execution_ingress,
-            query_control_shutdown: None,
+            catalog_reachability,
+            process,
             data_plane: BackendDataPlane::with_exchange_receiver_port(
                 exchange_receiver_port,
-                Arc::clone(&query_lifecycle_ingress),
                 task_inbound_capabilities,
             ),
             runtime_filter_ingress,
-            process_descriptor,
         }
-    }
-
-    fn with_query_control_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
-        self.query_control_shutdown = Some(shutdown);
-        self
     }
 }
 
@@ -123,13 +145,6 @@ impl NovaRocksGrpc for BackendRpcService {
         >,
     >;
     type SubscribeTaskStatusStream = TaskStatusEventStream;
-    type QueryControlStreamStream = std::pin::Pin<
-        Box<
-            dyn tokio_stream::Stream<Item = Result<proto::QueryControlResponse, tonic::Status>>
-                + Send
-                + 'static,
-        >,
-    >;
 
     async fn announce_backend(
         &self,
@@ -239,21 +254,6 @@ impl NovaRocksGrpc for BackendRpcService {
         Ok(tonic::Response::new(response))
     }
 
-    async fn task_update(
-        &self,
-        request: tonic::Request<proto::TaskUpdateRequest>,
-    ) -> Result<tonic::Response<proto::TaskUpdateResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_task_update(ingress.as_ref(), request.into_inner())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("task_update handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
-    }
-
     async fn prune_catalogs(
         &self,
         request: tonic::Request<catalog::PruneCatalogsRequest>,
@@ -265,19 +265,22 @@ impl NovaRocksGrpc for BackendRpcService {
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?
             .into_iter()
             .collect();
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response =
-            tokio::task::spawn_blocking(move || match ingress.prune_catalogs(reachable) {
-                CatalogPruneOutcome::Accepted => PruneCatalogsResponse::accepted(),
-                CatalogPruneOutcome::Rejected { safe_detail } => {
-                    PruneCatalogsResponse::rejected(safe_detail)
-                        .expect("lifecycle ingress produces a bounded safe catalog-prune detail")
+        let authority = Arc::clone(&self.catalog_reachability);
+        let response = tokio::task::spawn_blocking(move || {
+            match authority.prune_unreachable_catalogs(reachable) {
+                CatalogPruneResult::Pruned { .. } => PruneCatalogsResponse::accepted(),
+                // The rejected handles are deliberately not reported: naming
+                // them would put catalog properties on the wire.
+                CatalogPruneResult::Rejected { .. } => {
+                    PruneCatalogsResponse::rejected(CATALOG_PRUNE_STALE_SNAPSHOT_DETAIL)
+                        .expect("the fixed stale-snapshot detail is a bounded safe detail")
                 }
-            })
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
-            })?;
+            }
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
+        })?;
         Ok(tonic::Response::new(response.as_proto().clone()))
     }
 
@@ -292,7 +295,7 @@ impl NovaRocksGrpc for BackendRpcService {
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?
             .domain()
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        if expected_process_id != self.query_lifecycle_ingress.backend_process_id() {
+        if expected_process_id != self.process.process_id {
             return Err(tonic::Status::failed_precondition(
                 "heartbeat expected backend process id does not match this backend",
             ));
@@ -302,8 +305,8 @@ impl NovaRocksGrpc for BackendRpcService {
             .unwrap_or(1);
         Ok(tonic::Response::new(proto::HeartbeatResponse {
             num_cores,
-            descriptor: Some(self.process_descriptor.as_proto().clone()),
-            reported_state: if self.query_lifecycle_ingress.is_draining() {
+            descriptor: Some(self.process.descriptor.as_proto().clone()),
+            reported_state: if self.process.drain.is_draining() {
                 proto::BackendReportedState::Draining as i32
             } else {
                 proto::BackendReportedState::Running as i32
@@ -384,94 +387,6 @@ impl NovaRocksGrpc for BackendRpcService {
                 })??;
         Ok(tonic::Response::new(response))
     }
-
-    async fn init_query(
-        &self,
-        request: tonic::Request<proto::InitQueryRequest>,
-    ) -> Result<tonic::Response<proto::InitQueryResponse>, tonic::Status> {
-        let tls_verified = request.extensions().get::<NativeTlsVerified>().is_some();
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_init_query(ingress.as_ref(), request.into_inner(), tls_verified)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("init_query handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn stage_fragments(
-        &self,
-        request: tonic::Request<proto::StageFragmentsRequest>,
-    ) -> Result<tonic::Response<proto::StageFragmentsResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_stage_fragments(ingress.as_ref(), request.into_inner())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("stage_fragments handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn start_prepared_query(
-        &self,
-        request: tonic::Request<proto::StartPreparedQueryRequest>,
-    ) -> Result<tonic::Response<proto::StartPreparedQueryResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_start_prepared_query(ingress.as_ref(), request.into_inner())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("start_prepared_query handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn abort_query(
-        &self,
-        request: tonic::Request<proto::AbortQueryRequest>,
-    ) -> Result<tonic::Response<proto::AbortQueryResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_abort_query(ingress.as_ref(), request.into_inner())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("abort_query handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn query_control_stream(
-        &self,
-        request: tonic::Request<tonic::Streaming<proto::QueryControlRequest>>,
-    ) -> Result<tonic::Response<Self::QueryControlStreamStream>, tonic::Status> {
-        let tls_verified = request.extensions().get::<NativeTlsVerified>().is_some();
-        let stream: QueryControlResponseStream = handle_query_control_stream(
-            Arc::clone(&self.query_lifecycle_ingress),
-            request.into_inner(),
-            self.query_control_shutdown.clone(),
-            tls_verified,
-        )
-        .await?;
-        Ok(tonic::Response::new(Box::pin(stream)))
-    }
-
-    async fn report_query_terminal(
-        &self,
-        request: tonic::Request<proto::ReportQueryTerminalRequest>,
-    ) -> Result<tonic::Response<proto::ReportQueryTerminalResponse>, tonic::Status> {
-        let _ = request;
-        Ok(tonic::Response::new(proto::ReportQueryTerminalResponse {
-            outcome: proto::ReportQueryTerminalOutcome::RejectedGone as i32,
-            detail: "query terminal reports are accepted only by the frontend report endpoint"
-                .to_string(),
-        }))
-    }
 }
 
 /// A backend application owns exactly one native listener.  Unlike the legacy
@@ -525,12 +440,9 @@ impl BackendRpcServerHandle {
                         let listener = TokioTcpListener::from_std(listener).map_err(|error| {
                             format!("create Tokio native backend gRPC listener: {error}")
                         })?;
-                        let service = NovaRocksGrpcServer::new(
-                            service.with_query_control_shutdown(shutdown_rx.clone()),
-                        )
-                        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                        let shutdown_rx = shutdown_rx;
+                        let service = NovaRocksGrpcServer::new(service)
+                            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
                         let grpc_path = format!(
                             "/{}/*rest",
                             <NovaRocksGrpcServer<BackendRpcService> as NamedService>::NAME
@@ -639,7 +551,6 @@ where
                 let app = app.clone();
                 let incoming = incoming.clone();
                 tokio::spawn(async move {
-                    let tls_verified = incoming.mode() != NativeTransportMode::Disabled;
                     let stream = match incoming.accept(stream).await {
                         Ok(stream) => stream,
                         Err(_) => {
@@ -647,12 +558,9 @@ where
                             return;
                         }
                     };
-                    let service = service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
+                    let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                         let app = app.clone();
                         async move {
-                            if tls_verified {
-                                request.extensions_mut().insert(NativeTlsVerified);
-                            }
                             let response = app
                                 .oneshot(request.map(axum::body::Body::new))
                                 .await

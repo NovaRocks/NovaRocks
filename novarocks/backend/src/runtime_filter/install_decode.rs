@@ -37,7 +37,6 @@ use novarocks_proto_models::{common, filter, plan};
 use novarocks_types::UniqueId;
 
 use crate::fragment::decode::type_decode::decode_type;
-use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile, HashContractDigest};
 use crate::runtime_filter::domain::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
@@ -47,6 +46,7 @@ use crate::runtime_filter::domain::{
     BackendRouteEdgeId, BackendRouteEndpoint, BackendRoutePeer, BackendRouteRole,
     BackendRoutingChannel, BackendRoutingEdge, BackendRoutingShard,
 };
+use crate::runtime_filter::error::RuntimeFilterContractError;
 use crate::runtime_filter::membership_contract_decode::{
     MembershipContractDecodeError, decode_membership_contract,
 };
@@ -89,7 +89,7 @@ type CodecResult<T> = Result<T, ProtocolError>;
 pub(crate) fn decode_runtime_filter_contribution(
     execution_id: QueryExecutionId,
     contribution: &RuntimeFilterContribution,
-) -> Result<DecodedRuntimeFilterContribution, QueryLifecycleError> {
+) -> Result<DecodedRuntimeFilterContribution, RuntimeFilterContractError> {
     let wire = contribution.as_proto();
     let request = filter::InstallRuntimeFilterDeploymentRequest {
         query_id: Some(common::UniqueId {
@@ -110,9 +110,8 @@ pub(crate) fn decode_runtime_filter_contribution(
     // deployment derives both from the scheduled execution id, and
     // `QueryExecutionArtifact` rejects lifecycle options whose execution id
     // disagrees with the schedule.
-    let decoded = decode_participant_install(&request).map_err(|error| {
-        QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
-    })?;
+    let decoded = decode_participant_install(&request)
+        .map_err(|error| RuntimeFilterContractError::invalid_contract(error.to_string()))?;
     Ok(DecodedRuntimeFilterContribution {
         lifecycle: decoded.lifecycle,
         install: decoded.install,
@@ -1781,7 +1780,9 @@ mod tests {
     use super::{
         decode_contract, decode_runtime_filter_contribution, validate_participant_install,
     };
-    use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
+    use crate::runtime_filter::error::{
+        RuntimeFilterContractError, RuntimeFilterContractErrorCode,
+    };
     use crate::runtime_filter::{
         domain::{
             BackendChannelInstall, BackendChannelLifecycle, BackendMaterializationPolicy,
@@ -1832,8 +1833,11 @@ mod tests {
     /// Assert the boundary rejection without pinning the protocol-error
     /// rendering: the load-bearing facts are the lifecycle error code, the
     /// rejected field path, and the reason.
-    fn assert_invalid_manifest(error: &QueryLifecycleError, path: &str, reason: &str) {
-        assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
+    fn assert_invalid_contract(error: &RuntimeFilterContractError, path: &str, reason: &str) {
+        assert_eq!(
+            error.code(),
+            RuntimeFilterContractErrorCode::InvalidContract
+        );
         assert!(
             error.detail().contains(path),
             "rejection must name {path}, got {}",
@@ -1895,7 +1899,7 @@ mod tests {
 
         let error = decode_runtime_filter_contribution(execution_id(), &malformed)
             .expect_err("a lifecycle-less contribution cannot be installed");
-        assert_invalid_manifest(
+        assert_invalid_contract(
             &error,
             "install_runtime_filter_deployment_request.lifecycle",
             "lifecycle options are required",
@@ -1914,7 +1918,7 @@ mod tests {
 
         let error = decode_runtime_filter_contribution(execution_id(), &malformed)
             .expect_err("a zero lifecycle bound cannot be installed");
-        assert_invalid_manifest(
+        assert_invalid_contract(
             &error,
             "install_runtime_filter_deployment_request.lifecycle.query_expire_ms",
             "query expiry must be nonzero",
@@ -1930,7 +1934,7 @@ mod tests {
 
         let error = decode_runtime_filter_contribution(execution_id(), &malformed)
             .expect_err("an install-less contribution cannot be installed");
-        assert_invalid_manifest(
+        assert_invalid_contract(
             &error,
             "install_runtime_filter_deployment_request.install",
             "participant install is required",
@@ -1950,7 +1954,7 @@ mod tests {
 
         let error = decode_runtime_filter_contribution(execution_id(), &malformed)
             .expect_err("an unaddressed core channel cannot be installed");
-        assert_invalid_manifest(
+        assert_invalid_contract(
             &error,
             "install_runtime_filter_deployment_request.install.core_channels[0].channel_id",
             "channel id must be nonzero",
@@ -2004,7 +2008,7 @@ mod tests {
 
         let error = decode_runtime_filter_contribution(execution_id(), &malformed)
             .expect_err("a self-inconsistent routing edge cannot be installed");
-        assert_invalid_manifest(
+        assert_invalid_contract(
             &error,
             "install_runtime_filter_deployment_request.install.routing_channels[0].outbound_edges",
             "outbound edge source does not match request participant",

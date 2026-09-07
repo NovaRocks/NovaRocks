@@ -376,7 +376,7 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
     let deadline = context.deadline();
     context
         .handle()
-        .await_query_execution_resource_convergence(&baseline, true, deadline)
+        .await_query_execution_resource_convergence(&baseline, deadline)
         .context("await resource convergence after Runtime Filter cancellation")?;
     Ok(())
 }
@@ -479,7 +479,7 @@ fn run_ncp5_feedback_contract_digest_corrupt(context: &mut ScenarioContext) -> R
     let deadline = context.deadline();
     context
         .handle()
-        .await_query_execution_resource_convergence(&baseline, true, deadline)
+        .await_query_execution_resource_convergence(&baseline, deadline)
         .context("await resource convergence after fail-closed feedback rejection")?;
     context.action("typed resource oracle confirmed fail-closed feedback cleanup converged");
     Ok(())
@@ -602,7 +602,7 @@ fn run_nid2_foreign_attempt_rejection(context: &mut ScenarioContext) -> Result<(
     let deadline = context.deadline();
     context
         .handle()
-        .await_query_execution_resource_convergence(&baseline, true, deadline)
+        .await_query_execution_resource_convergence(&baseline, deadline)
         .context("await resource convergence after fail-closed foreign-attempt rejection")?;
     context.action(format!(
         "Runtime Filter feedback naming a foreign attempt was fenced ahead of the pruning winner and failed the query closed: {error}"

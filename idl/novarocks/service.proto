@@ -32,10 +32,10 @@ import "filter.proto";
 import "plan.proto";
 
 // FE<->BE control + data-plane RPC surface. One service, all cluster-internal
-// traffic. Consumers: src/service/grpc_server.rs (server), src/service/
-// grpc_client.rs + src/service/grpc_fragment_dispatcher.rs (implementing the
-// src/coordinator/dispatch.rs port) + src/runtime/heartbeat_mgr.rs + src/service/
-// Query lifecycle clients own terminal delivery through QueryControlStream.
+// traffic. Server: novarocks/backend/src/rpc/server.rs. Clients: the frontend
+// adapters under novarocks/frontend/src/native/. A query becomes work on a
+// backend only through ApplyTaskOperations, and a task's terminal is its own
+// status, read back through SubscribeTaskStatus and GetFinalTaskInfo.
 service NovaRocksGrpc {
   // Streaming exchange shuffle: sender streams chunk payloads to a receiver
   // fragment instance. Producer: src/service/exchange_sender.rs. Consumer:
@@ -52,25 +52,6 @@ service NovaRocksGrpc {
 
   // Coordinator polls a fragment instance for result batches.
   rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
-  // Coordinator establishes and owns one backend-local query attempt before
-  // any native fragment is accepted.
-  rpc InitQuery(InitQueryRequest) returns (InitQueryResponse);
-  // Coordinator atomically prepares every fragment assigned to one participant.
-  // A later StartPreparedQuery releases the participant-local start gate.
-  rpc StageFragments(StageFragmentsRequest) returns (StageFragmentsResponse);
-  rpc StartPreparedQuery(StartPreparedQueryRequest)
-      returns (StartPreparedQueryResponse);
-  // Coordinator delivers runtime split assignments to one admitted task.
-  // Producer: the FE per-round split-assignment driver. Consumer: the BE
-  // query lifecycle task-update owner.
-  rpc TaskUpdate(TaskUpdateRequest) returns (TaskUpdateResponse);
-  rpc AbortQuery(AbortQueryRequest) returns (AbortQueryResponse);
-  rpc QueryControlStream(stream QueryControlRequest)
-      returns (stream QueryControlResponse);
-  // BE -> FE fallback delivery for one immutable terminal participant snapshot.
-  // This is not control-stream recovery and never recreates an execution attempt.
-  rpc ReportQueryTerminal(ReportQueryTerminalRequest)
-      returns (ReportQueryTerminalResponse);
   // Coordinator publishes one complete catalog reachability snapshot. This is
   // best effort cache management and never carries a retire delta.
   rpc PruneCatalogs(novarocks.catalog.PruneCatalogsRequest)
@@ -102,7 +83,6 @@ service NovaRocksGrpc {
       returns (GetFinalTaskInfoResponse);
   // Root result poll, fenced against an exact task and backend process.
   rpc FetchTaskResult(FetchTaskResultRequest) returns (FetchResultResponse);
-
 }
 
 // Immutable identity for one physical execution attempt of a logical query.
@@ -165,28 +145,6 @@ message AnnounceBackendResponse {
   }
 }
 
-message ParticipantBackendIdentity {
-  reserved 1, 3;
-  reserved "backend_id", "start_epoch";
-  QueryControlEndpoint endpoint = 2;
-  BackendProcessId process_id = 4;
-}
-
-// The immutable identity of one admitted query participant. Endpoint and
-// scheduler ordinal are routing facts, not participant identity.
-message ParticipantAttemptRef {
-  QueryExecutionId execution_id = 1;
-  BackendProcessId backend_process_id = 2;
-}
-
-message ExchangeRouteManifest {
-  novarocks.common.UniqueId source_fragment_instance_id = 1;
-  novarocks.common.UniqueId destination_fragment_instance_id = 2;
-  int32 destination_node_id = 3;
-  uint32 sender_ordinal = 4;
-  uint32 sender_count = 5;
-}
-
 message RuntimeFilterContribution {
   uint32 participant_id = 1;
   novarocks.filter.RuntimeFilterQueryLifecycleOptions lifecycle = 2;
@@ -196,10 +154,9 @@ message RuntimeFilterContribution {
 }
 
 // Secret-free, immutable metadata for one query-attempt credential lease.
-// It participates in the participant-manifest digest. The credential value is
-// deliberately carried only by CredentialLeaseSecretEnvelope on a TLS native
-// lifecycle RPC; it must never be copied into a plan, fragment, or catalog
-// definition.
+// The credential value is deliberately carried only by
+// CredentialLeaseSecretEnvelope on a TLS native transport; it must never be
+// copied into a plan, fragment, or catalog definition.
 enum CredentialLeaseProvider {
   CREDENTIAL_LEASE_PROVIDER_UNSPECIFIED = 0;
   CREDENTIAL_LEASE_PROVIDER_S3 = 1;
@@ -235,37 +192,12 @@ message CredentialLeaseSecretEnvelope {
   CredentialLeaseS3SecretMaterial s3 = 3;
 }
 
-message ParticipantManifest {
-  QueryExecutionId execution_id = 1;
-  ParticipantBackendIdentity backend = 2;
-  reserved 3;
-  reserved "participant_roles";
-  repeated novarocks.common.UniqueId expected_fragment_instance_ids = 4;
-  QueryOptions query_options = 5;
-  uint64 query_deadline_unix_ms = 6;
-  repeated ExchangeRouteManifest exchange_routes = 7;
-  RuntimeFilterContribution runtime_filter = 8;
-  uint64 pre_start_timeout_ms = 9;
-  QueryControlEndpoint report_endpoint = 10;
-  NativeCompatibilityId native_compatibility_id = 11;
-  novarocks.catalog.CatalogSet catalog_set = 12;
-  repeated CredentialLeaseDescriptor credential_lease_descriptors = 13;
-}
-
-enum QueryInitOutcome {
-  QUERY_INIT_OUTCOME_UNSPECIFIED = 0;
-  QUERY_INIT_APPLIED = 1;
-  QUERY_INIT_ALREADY_APPLIED = 2;
-  QUERY_INIT_REJECTED_CONFLICT = 3;
-  QUERY_INIT_REJECTED_STALE_BACKEND = 4;
-  QUERY_INIT_REJECTED_CAPACITY = 5;
-  QUERY_INIT_REJECTED_INVALID_MANIFEST = 6;
-  QUERY_INIT_REJECTED_TERMINATED = 7;
-  QUERY_INIT_REJECTED_BACKEND_DRAINING = 8;
-  QUERY_INIT_REJECTED_BACKEND_PROCESS_MISMATCH = 9;
-  QUERY_INIT_REJECTED_COMPATIBILITY_MISMATCH = 10;
-}
-
+// Why one backend-local query participant stood down. No message carries this
+// enum any more: the RPCs that did belonged to the retired fragment lifecycle.
+// It is kept because it is still the vocabulary the backend's own
+// runtime-filter participant close path is driven by, from the task protocol's
+// query-context host -- see `close` / `prepare_terminal_capture` in
+// novarocks/backend/src/runtime_filter/participant.rs.
 enum QueryTerminationReason {
   QUERY_TERMINATION_REASON_UNSPECIFIED = 0;
   QUERY_TERMINATION_COORDINATOR_ABORT = 1;
@@ -274,279 +206,6 @@ enum QueryTerminationReason {
   QUERY_TERMINATION_COORDINATOR_HEARTBEAT_TIMEOUT = 4;
   QUERY_TERMINATION_LOCAL_FAILURE = 5;
   QUERY_TERMINATION_PRE_START_TIMEOUT = 6;
-}
-
-message InitQueryRequest {
-  ParticipantManifest manifest = 1;
-  reserved 2;
-  reserved "init_digest";
-  // Confidential lease values corresponding exactly to descriptors in manifest.
-  // They are legal only on a TLS native transport and excluded from the
-  // participant-manifest/init digest.
-  repeated CredentialLeaseSecretEnvelope credential_lease_envelopes = 3;
-}
-
-message InitQueryResponse {
-  QueryExecutionId execution_id = 1;
-  bytes init_digest = 2;
-  QueryInitOutcome outcome = 3;
-}
-
-enum StageFragmentsOutcome {
-  STAGE_FRAGMENTS_OUTCOME_UNSPECIFIED = 0;
-  STAGE_FRAGMENTS_APPLIED = 1;
-  STAGE_FRAGMENTS_ALREADY_APPLIED = 2;
-  STAGE_FRAGMENTS_REJECTED_CONFLICT = 3;
-  STAGE_FRAGMENTS_REJECTED_INVALID_STATE = 4;
-  STAGE_FRAGMENTS_REJECTED_INVALID_BATCH = 5;
-  STAGE_FRAGMENTS_REJECTED_CAPACITY = 6;
-  STAGE_FRAGMENTS_REJECTED_TERMINATED = 7;
-  STAGE_FRAGMENTS_REJECTED_LOCAL_FAILURE = 8;
-}
-
-enum StartPreparedQueryOutcome {
-  START_PREPARED_QUERY_OUTCOME_UNSPECIFIED = 0;
-  START_PREPARED_QUERY_APPLIED = 1;
-  START_PREPARED_QUERY_ALREADY_STARTED = 2;
-  START_PREPARED_QUERY_REJECTED_NOT_STAGED = 3;
-  START_PREPARED_QUERY_REJECTED_CONFLICT = 4;
-  START_PREPARED_QUERY_REJECTED_TERMINATED = 5;
-}
-
-// One static plan plus the dynamic parameters for one exact fragment instance.
-message StageFragment {
-  novarocks.plan.PlanFragment plan = 1;
-  InstanceParams instance_params = 2;
-}
-
-// The immutable complete fragment set prepared by one lifecycle participant.
-// The stage identity is derived from this content and the allocated participant
-// attempt by both roles. The Start fence and acknowledgements reference that
-// derived value. An empty fragment list is valid for service-only participants.
-message StageFragmentsRequest {
-  reserved 1, 2, 3, 4;
-  reserved "execution_id", "init_digest", "stage_digest_version", "stage_digest";
-  repeated StageFragment fragments = 5;
-  ParticipantAttemptRef participant = 6;
-}
-
-message StageFragmentsResponse {
-  QueryExecutionId execution_id = 1;
-  reserved 2;
-  reserved "stage_digest_version";
-  bytes stage_digest = 3;
-  StageFragmentsOutcome outcome = 4;
-  string detail = 5;
-}
-
-message StartPreparedQueryRequest {
-  QueryExecutionId execution_id = 1;
-  reserved 2;
-  reserved "stage_digest_version";
-  bytes stage_digest = 3;
-}
-
-message StartPreparedQueryResponse {
-  QueryExecutionId execution_id = 1;
-  reserved 2;
-  reserved "stage_digest_version";
-  bytes stage_digest = 3;
-  StartPreparedQueryOutcome outcome = 4;
-  string detail = 5;
-}
-
-message AbortQueryRequest {
-  reserved 1;
-  reserved "execution_id";
-  bytes init_digest = 2;
-  string reason = 3;
-  ParticipantAttemptRef participant = 4;
-}
-
-message AbortQueryResponse {
-  QueryExecutionId execution_id = 1;
-  QueryTerminationReason accepted_reason = 2;
-}
-
-message QueryControlAttach {
-  reserved 1, 2, 3;
-  reserved "execution_id", "init_digest", "frontend_owner_epoch";
-  ParticipantAttemptRef participant = 4;
-}
-
-message QueryControlHeartbeat {
-  uint64 sequence = 1;
-  uint64 sent_mono_ns = 2;
-}
-
-message QueryControlAbort {
-  string reason = 1;
-}
-
-message QueryControlFinalize {}
-
-// FE -> BE: stage an otherwise-invisible next credential epoch. BE must not
-// expose this value to new I/O until the matching commit arrives.
-message CredentialLeasePrepare {
-  CredentialLeaseSecretEnvelope envelope = 1;
-}
-
-// FE -> BE: atomically make a previously prepared epoch visible.
-message CredentialLeaseCommit {
-  bytes lease_id = 1;  // exactly 16 nonzero bytes
-  uint64 epoch = 2;  // nonzero
-}
-
-// BE -> FE acknowledgements for the two phase lease update. They carry no
-// material and are safe to retain in lifecycle diagnostics.
-message CredentialLeasePrepared {
-  bytes lease_id = 1;  // exactly 16 nonzero bytes
-  uint64 epoch = 2;  // nonzero
-}
-
-message CredentialLeaseCommitted {
-  bytes lease_id = 1;  // exactly 16 nonzero bytes
-  uint64 epoch = 2;  // nonzero
-}
-
-message QueryControlTerminalAck {
-  reserved 1, 2, 3, 4;
-  reserved "execution_id", "init_digest", "snapshot_version", "snapshot_digest";
-  ParticipantAttemptRef participant = 5;
-}
-
-message QueryControlRequest {
-  oneof command {
-    QueryControlAttach attach = 1;
-    QueryControlHeartbeat heartbeat = 2;
-    QueryControlAbort abort = 3;
-    QueryControlFinalize finalize = 4;
-    QueryControlTerminalAck terminal_ack = 5;
-    CredentialLeasePrepare credential_lease_prepare = 6;
-    CredentialLeaseCommit credential_lease_commit = 7;
-  }
-}
-
-// The first response after a successful attach. It always carries the closed
-// state of the catalog contribution frozen by InitQuery.
-message QueryControlReady {
-  novarocks.catalog.CatalogLoadState catalog_load_state = 1;
-}
-
-message QueryControlHeartbeatAck {
-  uint64 sequence = 1;
-}
-
-message QueryControlLocalFailure {
-  string code = 1;
-  string detail = 2;
-}
-
-message QueryControlTerminationAccepted {
-  QueryTerminationReason reason = 1;
-}
-
-message QueryControlLocalDrained {}
-
-// Best-effort, typed native fragment observation carried by the active query
-// control stream. It is deliberately independent from terminal delivery: a
-// dropped or stale observation never changes query correctness.
-message FragmentLiveObservation {
-  reserved 1, 2, 3;
-  reserved "execution_id", "init_digest", "backend";
-  novarocks.common.UniqueId fragment_instance_id = 4;
-  uint64 sequence = 5;
-  uint64 input_rows = 6;
-  uint64 output_rows = 7;
-  uint64 elapsed_ms = 8;
-  optional RuntimeProfileTree profile = 9;
-  ParticipantAttemptRef participant = 10;
-}
-
-enum RuntimeFilterFeedbackUnavailableReason {
-  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_UNSPECIFIED = 0;
-  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_DOMAIN_BUDGET = 1;
-  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_TYPE_UNSUPPORTED = 2;
-  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_REDUCTION_UNAVAILABLE = 3;
-  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_PRODUCER_UNAVAILABLE = 4;
-}
-
-// Best-effort, terminal logical runtime-filter feedback. The active control
-// stream already authenticates the participant; the Frontend additionally
-// fences this message with the frozen execution/deployment/channel contract.
-message RuntimeFilterFeedbackEvent {
-  reserved 1, 2, 3;
-  reserved "execution_id", "init_digest", "backend";
-  uint32 participant_id = 4;
-  uint64 deployment_epoch = 5;
-  uint32 channel_id = 6;
-  bytes contract_digest = 7;
-  oneof terminal_outcome {
-    bytes canonical_domain = 8;
-    RuntimeFilterFeedbackUnavailableReason unavailable_reason = 9;
-  }
-  ParticipantAttemptRef participant_attempt = 10;
-}
-
-message QueryControlResponse {
-  oneof event {
-    QueryControlReady control_ready = 1;
-    QueryControlHeartbeatAck heartbeat_ack = 2;
-    QueryControlLocalFailure local_failure = 3;
-    QueryControlTerminationAccepted termination_accepted = 4;
-    QueryControlLocalDrained local_drained = 5;
-    ParticipantTerminalOutcome terminal_outcome = 6;
-    FragmentLiveObservation fragment_observation = 7;
-    RuntimeFilterFeedbackEvent runtime_filter_feedback = 8;
-    // Cold-only completion frames. A Loading ControlReady is followed by one
-    // of these on the same active stream.
-    novarocks.catalog.CatalogReady catalog_ready = 9;
-    novarocks.catalog.CatalogLoadFailed catalog_load_failed = 10;
-    CredentialLeasePrepared credential_lease_prepared = 11;
-    CredentialLeaseCommitted credential_lease_committed = 12;
-  }
-}
-
-enum QueryTerminalFragmentOutcome {
-  QUERY_TERMINAL_FRAGMENT_OUTCOME_UNSPECIFIED = 0;
-  QUERY_TERMINAL_FRAGMENT_OUTCOME_SUCCEEDED = 1;
-  QUERY_TERMINAL_FRAGMENT_OUTCOME_FAILED = 2;
-  QUERY_TERMINAL_FRAGMENT_OUTCOME_CANCELLED = 3;
-  QUERY_TERMINAL_FRAGMENT_OUTCOME_INCOMPLETE_DRAIN = 4;
-}
-
-message QueryTerminalTabletInfo {
-  int64 tablet_id = 1;
-  int64 backend_id = 2;
-}
-
-message QueryTerminalLoadStats {
-  int64 loaded_rows = 1;
-  int64 loaded_bytes = 2;
-  int64 filtered_rows = 3;
-}
-
-message QueryTerminalFragmentSnapshot {
-  novarocks.common.UniqueId fragment_instance_id = 1;
-  int32 backend_num = 2;
-  QueryTerminalFragmentOutcome outcome = 3;
-  string error_code = 4;
-  string error_detail = 5;
-  reserved 6;
-  reserved "iceberg_commits";
-  repeated QueryTerminalTabletInfo tablet_commit_infos = 7;
-  repeated QueryTerminalTabletInfo tablet_fail_infos = 8;
-  QueryTerminalLoadStats load_stats = 9;
-  FragmentTerminalProfileTelemetry profile = 10;
-  reserved 11;
-  // Former per-writer staged-report frame list. The ConnectorStagedReportFrame
-  // message tree was removed with the write-operation aggregate; the write
-  // stack reports staged artifacts as commit fragments in the write relation.
-  reserved "connector_staged_report_frames";
-  reserved 12;
-  reserved "statistics_payload"; // former terminal statistics side channel.
-  // Diagnostic text may be bounded to retain a fixed P0 terminalization proof.
-  bool error_detail_truncated = 13;
 }
 
 enum QueryTerminalRuntimeFilterChannelInstallStateV1 {
@@ -660,91 +319,11 @@ message TerminalTelemetryUnavailable {
   string code = 2;
 }
 
-message FragmentTerminalProfileTelemetry {
-  oneof telemetry {
-    RuntimeProfileTree available = 1;
-    TerminalTelemetryUnavailable unavailable = 2;
-  }
-}
-
 message QueryTerminalProfileContributionTelemetry {
   oneof telemetry {
     QueryTerminalProfileContributionV1 available = 1;
     TerminalTelemetryUnavailable unavailable = 2;
   }
-}
-
-message QueryTerminalSnapshot {
-  uint32 version = 1;
-  reserved 2, 3, 4, 5;
-  reserved "execution_id", "backend", "init_digest", "digest";
-  repeated QueryTerminalFragmentSnapshot fragments = 6;
-  QueryTerminalProfileContributionTelemetry profile_contribution = 7;
-  ParticipantAttemptRef participant = 8;
-}
-
-message TerminalizationProofFragment {
-  novarocks.common.UniqueId fragment_instance_id = 1;
-  int32 backend_num = 2;
-  QueryTerminalFragmentOutcome outcome = 3;
-  string error_code = 4;
-  string error_detail = 5;
-  bool error_detail_truncated = 6;
-}
-
-// Bounded P0 terminalization proof. It remains independently encodable when
-// P1 evidence or P2 telemetry cannot be retained.
-message TerminalizationProof {
-  uint32 version = 1;
-  reserved 2, 3, 4, 5;
-  reserved "execution_id", "backend", "init_digest", "digest";
-  repeated TerminalizationProofFragment fragments = 6;
-  ParticipantAttemptRef participant = 7;
-}
-
-enum NegativeAttestationReason {
-  NEGATIVE_ATTESTATION_REASON_UNSPECIFIED = 0;
-  NEGATIVE_ATTESTATION_REASON_ATTEMPT_ABORTED = 1;
-  NEGATIVE_ATTESTATION_REASON_ATTEMPT_TOMBSTONED = 2;
-  NEGATIVE_ATTESTATION_REASON_TERMINAL_STATE_INVALID = 3;
-  NEGATIVE_ATTESTATION_REASON_CORRECTNESS_EVIDENCE_ENCODING_FAILED = 4;
-  NEGATIVE_ATTESTATION_REASON_CORRECTNESS_EVIDENCE_RETENTION_EXHAUSTED = 5;
-}
-
-message NegativeAttestation {
-  reserved 1, 2, 3, 7;
-  reserved "execution_id", "backend", "init_digest", "digest";
-  NegativeAttestationReason reason = 4;
-  string detail = 5;
-  bool detail_truncated = 6;
-  ParticipantAttemptRef participant = 8;
-}
-
-message ParticipantTerminalOutcome {
-  oneof outcome {
-    TerminalizationProof proof = 1;
-    NegativeAttestation negative_attestation = 2;
-  }
-  // Required exactly for proof outcomes. This P1/P2 payload is intentionally
-  // separate from the P0 proof so the latter remains independently deliverable.
-  QueryTerminalSnapshot snapshot = 3;
-}
-
-message ReportQueryTerminalRequest {
-  ParticipantTerminalOutcome outcome = 1;
-}
-
-enum ReportQueryTerminalOutcome {
-  REPORT_QUERY_TERMINAL_OUTCOME_UNSPECIFIED = 0;
-  REPORT_QUERY_TERMINAL_OUTCOME_ACCEPTED = 1;
-  REPORT_QUERY_TERMINAL_OUTCOME_ALREADY_ACCEPTED = 2;
-  REPORT_QUERY_TERMINAL_OUTCOME_REJECTED_CONFLICT = 3;
-  REPORT_QUERY_TERMINAL_OUTCOME_REJECTED_GONE = 4;
-}
-
-message ReportQueryTerminalResponse {
-  ReportQueryTerminalOutcome outcome = 1;
-  string detail = 2;
 }
 
 // One exchange shuffle chunk in flight from a sender to a receiver instance.
@@ -944,59 +523,6 @@ message FetchResultResponse {
   bool eos = 5;                  // end-of-stream marker
 }
 
-// Runtime split delivery for one admitted task attempt. It never creates a
-// lifecycle entry, never extends retention, and is admissible only after the
-// participant is staged.
-message TaskUpdateRequest {
-  QueryExecutionId execution_id = 1;
-  novarocks.common.UniqueId fragment_instance_id = 2;
-  repeated novarocks.connector_read.SplitAssignment assignments = 3;  // <= 64.
-}
-
-message TaskUpdateResponse {
-  oneof outcome {
-    TaskUpdateAccepted accepted = 1;
-    TaskUpdateRejection rejection = 2;
-  }
-}
-
-// Per plan node, the highest sequence the task has durably accepted, and
-// whether that plan node has seen its terminal no-more marker. The sender uses
-// this for backpressure and for deciding what to retransmit.
-message TaskUpdateAcceptedNode {
-  int32 plan_node_id = 1;
-  uint64 accepted_through_sequence = 2;
-  bool no_more_splits = 3;
-  uint64 queued_splits = 4;
-}
-
-message TaskUpdateAccepted {
-  repeated TaskUpdateAcceptedNode nodes = 1;
-}
-
-enum TaskUpdateRejectionReason {
-  TASK_UPDATE_REJECTION_REASON_UNSPECIFIED = 0;
-  // A backend cannot distinguish "never knew this execution" from "already
-  // reaped it": both leave no lifecycle entry, and both are reported as
-  // TERMINATED. Reserved rather than kept as a reason nothing can produce.
-  reserved 1;
-  reserved "TASK_UPDATE_REJECTION_REASON_UNKNOWN_EXECUTION";
-  TASK_UPDATE_REJECTION_REASON_UNKNOWN_TASK = 2;
-  TASK_UPDATE_REJECTION_REASON_NOT_ADMITTED = 3;
-  TASK_UPDATE_REJECTION_REASON_TERMINATED = 4;
-  TASK_UPDATE_REJECTION_REASON_SEQUENCE_CONFLICT = 5;
-  TASK_UPDATE_REJECTION_REASON_AFTER_NO_MORE_SPLITS = 6;
-  TASK_UPDATE_REJECTION_REASON_UNKNOWN_PLAN_NODE = 7;
-  TASK_UPDATE_REJECTION_REASON_INVALID_ASSIGNMENT = 8;
-  TASK_UPDATE_REJECTION_REASON_RESOURCE_EXHAUSTED = 9;
-}
-
-message TaskUpdateRejection {
-  TaskUpdateRejectionReason reason = 1;
-  string safe_detail = 2;               // <= 512 bytes, redacted by the producer.
-  optional string safe_field_path = 3;  // <= 256 bytes when present.
-}
-
 // FE-pull heartbeat request. Consumer: src/runtime/heartbeat_mgr.rs.
 message HeartbeatRequest {
   reserved 1, 2;
@@ -1011,46 +537,6 @@ message HeartbeatResponse {
   uint32 num_cores = 3;    // available cores for scheduling
   BackendProcessDescriptor descriptor = 5;
   BackendReportedState reported_state = 6;
-}
-
-// Native recursive runtime profile. Replaces the flat thrift
-// TRuntimeProfileNode list plus num_children encoding for NovaRocks-native
-// control-plane consumers. Producer: src/runtime/profile.rs. Consumer:
-// src/service/fe_report.rs for multi-fragment merge and EXPLAIN ANALYZE paths.
-message RuntimeProfileTree {
-  ProfileNode root = 1;  // root profile node for one fragment profile tree
-}
-
-// One runtime profile node with native recursive children.
-message ProfileNode {
-  string name = 1;                         // display name of the profile node
-  int32 node_id = 2;                       // plan node id; was TRuntimeProfileNode.metadata
-  repeated Counter counters = 3;           // counters owned by this profile node
-  map<string, string> info_strings = 4;    // informational key/value strings
-  repeated ProfileNode children = 5;       // child profile nodes in display order
-}
-
-// Runtime counter value and display hierarchy metadata.
-message Counter {
-  string name = 1;          // counter display name
-  string parent_name = 2;   // empty string means this is a root-level counter
-  ProfileUnit unit = 3;     // counter value unit
-  int64 value = 4;          // current counter value
-  optional int64 min_value = 5;  // merged minimum value, if available
-  optional int64 max_value = 6;  // merged maximum value, if available
-}
-
-// Runtime profile counter units. Mirrors thrift metrics.TUnit values used by
-// src/runtime/profile.rs, with an explicit unspecified zero value for proto3.
-enum ProfileUnit {
-  PROFILE_UNIT_UNSPECIFIED = 0;
-  PROFILE_UNIT_UNIT = 1;
-  PROFILE_UNIT_CPU_TICKS = 2;
-  PROFILE_UNIT_BYTES = 3;
-  PROFILE_UNIT_TIME_NS = 4;
-  PROFILE_UNIT_TIME_MS = 5;
-  PROFILE_UNIT_TIME_S = 6;
-  PROFILE_UNIT_NONE = 7;
 }
 
 // ============================================================================

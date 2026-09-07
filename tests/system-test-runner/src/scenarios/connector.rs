@@ -2418,10 +2418,6 @@ pub(super) fn connector_reader_environment() -> CrossProcessChildEnvironment {
         "NOVAROCKS_SQL_TEST_EMIT_CATALOG_MATERIALIZATION_MARKER".to_string(),
         "1".to_string(),
     );
-    environment.be.insert(
-        "NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER".to_string(),
-        "1".to_string(),
-    );
     environment
 }
 
@@ -2434,7 +2430,6 @@ pub(super) fn connector_launch_config() -> ScenarioLaunchConfig {
                 r#"
 [runtime]
 operator_buffer_chunks = 1
-query_control_terminal_drain_timeout_ms = 1000
 {READER_CACHE_OVERLAY}
 "#
             )),
@@ -2614,7 +2609,7 @@ pub(super) fn await_resource_convergence(
     ));
     context
         .handle()
-        .await_query_execution_resource_convergence(baseline, true, deadline)
+        .await_query_execution_resource_convergence(baseline, deadline)
         .with_context(|| format!("resource convergence after {operation}"))
 }
 

@@ -23,7 +23,6 @@ use novarocks_proto_models::{common, expr, filter, novarocks, plan};
 
 const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
-const REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX: &str = "0aaa010a2e0801320a0a0408031004100918013a1e0a080a0408011002100112120a10777777777777777777777777777777771a780801324e0a0408031004100918013a04086410094a060809105a180152340a320a300a105465726d696e616c467261676d656e741009221a0a06736f7572636512107465726d696e616c2d666978747572653a040a020801421e0a080a0408011002100112120a1077777777777777777777777777777777";
 const LOOKUP_REQUEST_FIXTURE_HEX: &str = "0a04080110021021182c220a083710041a0400010203";
 const LOOKUP_RESPONSE_FIXTURE_HEX: &str = "0a0412024f4b120a083710041a0403020100";
 const PLAN_FRAGMENT_FIXTURE_HEX: &str = "0801128b03080a10011a010a28ffffffffffffffffff01426c080b10011a010b28ffffffffffffffffff0152580a0c0801120269641a040a02080552480a047470636812160a086c696e656974656d120a0a02696412040a0208051a086c696e656974656d220c0801120269641a040a0208052a0c0a040a0208015a040a021001320269644256080c10011a010c28ffffffffffffffffff015a42080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791802220c0801120269641a040a0208052a0672656d6f74653202080152b0010a0c0801120269641a040a020805c2019e01080112480a220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b657912220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657920022802324c084d12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657928021a26080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792226080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792a02080132220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65793a0c0801120269641a040a020805";
@@ -327,35 +326,29 @@ fn release_plan_fragment() -> plan::PlanFragment {
     }
 }
 
-fn release_stage_fragments_request() -> novarocks::StageFragmentsRequest {
-    novarocks::StageFragmentsRequest {
-        participant: Some(novarocks::ParticipantAttemptRef {
-            execution_id: Some(novarocks::QueryExecutionId {
-                query_id: Some(id(1, 2)),
-                attempt_id: 1,
-            }),
-            backend_process_id: Some(novarocks::BackendProcessId {
-                value: vec![0x77; 16],
-            }),
+/// The task protocol's own carrier for one fragment's static plan plus its
+/// dynamic parameters. It replaces the retired `StageFragmentsRequest` this
+/// fixture was written against: the participant wrapper is gone, but every
+/// message the fixture actually exercises -- plan fragment, instance params,
+/// file scan range and destination -- travels unchanged inside `CreateTask`.
+fn release_task_fragment_plan() -> novarocks::TaskFragmentPlan {
+    novarocks::TaskFragmentPlan {
+        plan: Some(release_plan_fragment()),
+        instance_params: Some(novarocks::InstanceParams {
+            query_id: Some(id(1, 2)),
+            fragment_instance_id: Some(id(3, 4)),
+            backend_num: 9,
+            per_node_scan_ranges: HashMap::from([(
+                11,
+                novarocks::ScanRangeList {
+                    ranges: vec![release_scan_range()],
+                },
+            )]),
+            per_exch_num_senders: HashMap::from([(12, 3)]),
+            destinations: vec![release_destination()],
+            query_options: Some(release_query_options()),
+            typed_result_sink: true,
         }),
-        fragments: vec![novarocks::StageFragment {
-            plan: Some(release_plan_fragment()),
-            instance_params: Some(novarocks::InstanceParams {
-                query_id: Some(id(1, 2)),
-                fragment_instance_id: Some(id(3, 4)),
-                backend_num: 9,
-                per_node_scan_ranges: HashMap::from([(
-                    11,
-                    novarocks::ScanRangeList {
-                        ranges: vec![release_scan_range()],
-                    },
-                )]),
-                per_exch_num_senders: HashMap::from([(12, 3)]),
-                destinations: vec![release_destination()],
-                query_options: Some(release_query_options()),
-                typed_result_sink: true,
-            }),
-        }],
     }
 }
 
@@ -366,89 +359,6 @@ fn release_fetch_result_response() -> novarocks::FetchResultResponse {
         result_arrow_ipc: b"NRX1-fixture".to_vec(),
         packet_seq: 9,
         eos: true,
-    }
-}
-
-fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequest {
-    let snapshot = novarocks::QueryTerminalSnapshot {
-        version: 1,
-        participant: Some(novarocks::ParticipantAttemptRef {
-            execution_id: Some(novarocks::QueryExecutionId {
-                query_id: Some(id(1, 2)),
-                attempt_id: 1,
-            }),
-            backend_process_id: Some(novarocks::BackendProcessId {
-                value: vec![0x77; 16],
-            }),
-        }),
-        fragments: vec![novarocks::QueryTerminalFragmentSnapshot {
-            fragment_instance_id: Some(id(3, 4)),
-            backend_num: 9,
-            outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
-            error_code: String::new(),
-            error_detail: String::new(),
-            error_detail_truncated: false,
-            tablet_commit_infos: vec![novarocks::QueryTerminalTabletInfo {
-                tablet_id: 100,
-                backend_id: 9,
-            }],
-            tablet_fail_infos: vec![],
-            load_stats: Some(novarocks::QueryTerminalLoadStats {
-                loaded_rows: 9,
-                loaded_bytes: 90,
-                filtered_rows: 1,
-            }),
-            profile: Some(novarocks::FragmentTerminalProfileTelemetry {
-                telemetry: Some(
-                    novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(
-                        novarocks::RuntimeProfileTree {
-                            root: Some(novarocks::ProfileNode {
-                                name: "TerminalFragment".to_string(),
-                                node_id: 9,
-                                counters: vec![],
-                                info_strings: HashMap::from([(
-                                    "source".to_string(),
-                                    "terminal-fixture".to_string(),
-                                )]),
-                                children: vec![],
-                            }),
-                        },
-                    ),
-                ),
-            }),
-        }],
-        profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
-            telemetry: Some(
-                novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
-                    novarocks::QueryTerminalProfileContributionV1 {
-                        version: 1,
-                        channels: Vec::new(),
-                        producer_streams: Vec::new(),
-                        transport_routes: Vec::new(),
-                        consumers: Vec::new(),
-                    },
-                ),
-            ),
-        }),
-    };
-    novarocks::ReportQueryTerminalRequest {
-        outcome: Some(novarocks::ParticipantTerminalOutcome {
-            outcome: Some(novarocks::participant_terminal_outcome::Outcome::Proof(
-                novarocks::TerminalizationProof {
-                    version: 1,
-                    participant: snapshot.participant.clone(),
-                    fragments: vec![novarocks::TerminalizationProofFragment {
-                        fragment_instance_id: Some(id(3, 4)),
-                        backend_num: 9,
-                        outcome: novarocks::QueryTerminalFragmentOutcome::Succeeded as i32,
-                        error_code: String::new(),
-                        error_detail: String::new(),
-                        error_detail_truncated: false,
-                    }],
-                },
-            )),
-            snapshot: Some(snapshot),
-        }),
     }
 }
 
@@ -510,15 +420,8 @@ fn print_fixture<M: Message>(name: &str, message: &M) {
 #[test]
 #[ignore = "manual release fixture recorder; paste output into checked-in constants"]
 fn print_release_fixture_hex() {
-    print_fixture(
-        "STAGE_FRAGMENTS_REQUEST",
-        &release_stage_fragments_request(),
-    );
+    print_fixture("TASK_FRAGMENT_PLAN", &release_task_fragment_plan());
     print_fixture("FETCH_RESULT_RESPONSE", &release_fetch_result_response());
-    print_fixture(
-        "REPORT_QUERY_TERMINAL_REQUEST",
-        &release_report_query_terminal_request(),
-    );
     print_fixture("LOOKUP_REQUEST", &release_lookup_request());
     print_fixture("LOOKUP_RESPONSE", &release_lookup_response());
     print_fixture("PLAN_FRAGMENT", &release_plan_fragment());
@@ -526,89 +429,83 @@ fn print_release_fixture_hex() {
 }
 
 #[test]
-fn release_stage_fragments_request_fixture_decodes() {
-    let request = release_stage_fragments_request();
-    let bytes = request.encode_to_vec();
-    let request = novarocks::StageFragmentsRequest::decode(bytes.as_slice())
-        .expect("StageFragmentsRequest fixture decodes");
-    assert!(request.participant.is_some());
-    assert_eq!(request.fragments.len(), 1);
-    let fragment = request
-        .fragments
-        .first()
-        .expect("StageFragmentsRequest fixture fragment");
+fn release_task_fragment_plan_fixture_decodes() {
+    let fragment = release_task_fragment_plan();
+    let bytes = fragment.encode_to_vec();
+    let fragment = novarocks::TaskFragmentPlan::decode(bytes.as_slice())
+        .expect("TaskFragmentPlan fixture decodes");
     let plan = fragment
         .plan
         .as_ref()
-        .expect("StageFragmentsRequest fixture plan");
-    assert_eq!(plan.fragment_id, 1, "StageFragmentsRequest fixture plan id");
+        .expect("TaskFragmentPlan fixture plan");
+    assert_eq!(plan.fragment_id, 1, "TaskFragmentPlan fixture plan id");
 
     let params = fragment
         .instance_params
         .as_ref()
-        .expect("StageFragmentsRequest fixture instance_params");
+        .expect("TaskFragmentPlan fixture instance_params");
     assert_eq!(
         params.backend_num, 9,
-        "StageFragmentsRequest fixture backend_num"
+        "TaskFragmentPlan fixture backend_num"
     );
     let scan_ranges = params
         .per_node_scan_ranges
         .get(&11)
-        .expect("StageFragmentsRequest fixture per_node_scan_ranges[11]");
+        .expect("TaskFragmentPlan fixture per_node_scan_ranges[11]");
     assert_eq!(
         scan_ranges.ranges.len(),
         1,
-        "StageFragmentsRequest fixture per_node_scan_ranges[11].ranges.len"
+        "TaskFragmentPlan fixture per_node_scan_ranges[11].ranges.len"
     );
     let scan_range = scan_ranges
         .ranges
         .first()
         .and_then(|params| params.range.as_ref())
-        .expect("StageFragmentsRequest fixture per_node_scan_ranges[11].ranges[0].range");
+        .expect("TaskFragmentPlan fixture per_node_scan_ranges[11].ranges[0].range");
     let file_range = match scan_range.kind.as_ref() {
         Some(novarocks::scan_range::Kind::File(file)) => file,
         other => panic!(
-            "StageFragmentsRequest fixture per_node_scan_ranges[11].ranges[0].range.kind expected File, got {other:?}"
+            "TaskFragmentPlan fixture per_node_scan_ranges[11].ranges[0].range.kind expected File, got {other:?}"
         ),
     };
     assert_eq!(
         file_range.file_format, "PARQUET",
-        "StageFragmentsRequest fixture FileScanRange.file_format"
+        "TaskFragmentPlan fixture FileScanRange.file_format"
     );
     assert_eq!(
         file_range.full_path.as_deref(),
         Some("s3://bucket/data.parquet"),
-        "StageFragmentsRequest fixture FileScanRange.full_path"
+        "TaskFragmentPlan fixture FileScanRange.full_path"
     );
     assert_eq!(
         file_range.delete_files.len(),
         1,
-        "StageFragmentsRequest fixture FileScanRange.delete_files.len"
+        "TaskFragmentPlan fixture FileScanRange.delete_files.len"
     );
     let delete_file = &file_range.delete_files[0];
     assert_eq!(
         delete_file.full_path.as_deref(),
         Some("s3://bucket/delete.parquet"),
-        "StageFragmentsRequest fixture FileScanRange.delete_files[0].full_path"
+        "TaskFragmentPlan fixture FileScanRange.delete_files[0].full_path"
     );
     assert_eq!(
         delete_file.file_content, "POSITION_DELETES",
-        "StageFragmentsRequest fixture FileScanRange.delete_files[0].file_content"
+        "TaskFragmentPlan fixture FileScanRange.delete_files[0].file_content"
     );
     assert_eq!(
         delete_file.length,
         Some(64),
-        "StageFragmentsRequest fixture FileScanRange.delete_files[0].length"
+        "TaskFragmentPlan fixture FileScanRange.delete_files[0].length"
     );
     assert_eq!(
         file_range.first_row_id,
         Some(1_000),
-        "StageFragmentsRequest fixture FileScanRange.first_row_id"
+        "TaskFragmentPlan fixture FileScanRange.first_row_id"
     );
     assert_eq!(
         file_range.data_sequence_number,
         Some(44),
-        "StageFragmentsRequest fixture FileScanRange.data_sequence_number"
+        "TaskFragmentPlan fixture FileScanRange.data_sequence_number"
     );
     assert_eq!(
         file_range
@@ -616,42 +513,42 @@ fn release_stage_fragments_request_fixture_decodes() {
             .as_ref()
             .and_then(|options| options.priority),
         Some(3),
-        "StageFragmentsRequest fixture FileScanRange.datacache_options.priority"
+        "TaskFragmentPlan fixture FileScanRange.datacache_options.priority"
     );
     assert_eq!(
         file_range.included_positions,
         vec![3, 5, 8],
-        "StageFragmentsRequest fixture FileScanRange.included_positions"
+        "TaskFragmentPlan fixture FileScanRange.included_positions"
     );
     assert_eq!(
         file_range.serialized_split.as_deref(),
         Some("{\"split\":1}"),
-        "StageFragmentsRequest fixture FileScanRange.serialized_split"
+        "TaskFragmentPlan fixture FileScanRange.serialized_split"
     );
     assert_eq!(
         file_range.change_op,
         Some(-1),
-        "StageFragmentsRequest fixture FileScanRange.change_op"
+        "TaskFragmentPlan fixture FileScanRange.change_op"
     );
     let pruning = file_range
         .file_pruning_min_max_values
         .get(&1)
-        .expect("StageFragmentsRequest fixture FileScanRange.file_pruning_min_max_values[1]");
+        .expect("TaskFragmentPlan fixture FileScanRange.file_pruning_min_max_values[1]");
     assert_eq!(
         pruning.min_int_value,
         Some(10),
-        "StageFragmentsRequest fixture FileScanRange.file_pruning_min_max_values[1].min_int_value"
+        "TaskFragmentPlan fixture FileScanRange.file_pruning_min_max_values[1].min_int_value"
     );
     assert_eq!(
         pruning.max_int_value,
         Some(20),
-        "StageFragmentsRequest fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
+        "TaskFragmentPlan fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
     );
 
     let destination = params
         .destinations
         .first()
-        .expect("StageFragmentsRequest fixture destination");
+        .expect("TaskFragmentPlan fixture destination");
     assert_eq!(destination.endpoint, "10.0.0.8:8060");
     assert!(destination.finst_id.is_some());
     assert!(
@@ -677,94 +574,6 @@ fn release_fetch_result_response_fixture_decodes() {
     assert_eq!(response.result_arrow_ipc, b"NRX1-fixture");
     assert_eq!(response.packet_seq, 9);
     assert!(response.eos, "FetchResultResponse fixture eos");
-}
-
-#[test]
-fn release_report_query_terminal_request_fixture_decodes() {
-    let request: novarocks::ReportQueryTerminalRequest = decode_fixture(
-        "ReportQueryTerminalRequest",
-        REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX,
-    );
-    let outcome = request
-        .outcome
-        .as_ref()
-        .expect("ReportQueryTerminalRequest fixture outcome");
-    assert!(matches!(
-        outcome.outcome,
-        Some(novarocks::participant_terminal_outcome::Outcome::Proof(_))
-    ));
-    let snapshot = outcome
-        .snapshot
-        .as_ref()
-        .expect("ReportQueryTerminalRequest fixture proof snapshot");
-    assert_eq!(snapshot.version, 1);
-    assert_eq!(
-        snapshot
-            .participant
-            .as_ref()
-            .and_then(|participant| participant.execution_id.as_ref())
-            .and_then(|execution_id| execution_id.query_id.as_ref())
-            .expect("ReportQueryTerminalRequest fixture query id")
-            .hi,
-        1
-    );
-    assert_eq!(
-        snapshot
-            .participant
-            .as_ref()
-            .and_then(|participant| participant.backend_process_id.as_ref())
-            .expect("ReportQueryTerminalRequest fixture backend process identity")
-            .value,
-        vec![0x77; 16]
-    );
-    assert_eq!(snapshot.fragments.len(), 1);
-    let profile_contribution = snapshot
-        .profile_contribution
-        .as_ref()
-        .expect("ReportQueryTerminalRequest fixture profile contribution");
-    let novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
-        profile_contribution,
-    ) = profile_contribution
-        .telemetry
-        .as_ref()
-        .expect("typed telemetry")
-    else {
-        panic!("fixture profile contribution must be available");
-    };
-    assert_eq!(profile_contribution.version, 1);
-    assert!(profile_contribution.channels.is_empty());
-    let fragment = &snapshot.fragments[0];
-    assert_eq!(fragment.backend_num, 9);
-    assert_eq!(
-        fragment.outcome,
-        novarocks::QueryTerminalFragmentOutcome::Succeeded as i32
-    );
-    assert_eq!(fragment.tablet_commit_infos[0].tablet_id, 100);
-    assert_eq!(
-        fragment
-            .load_stats
-            .as_ref()
-            .expect("ReportQueryTerminalRequest fixture load stats")
-            .loaded_bytes,
-        90
-    );
-    assert_eq!(
-        fragment
-            .profile
-            .as_ref()
-            .and_then(|profile| profile.telemetry.as_ref())
-            .and_then(|telemetry| match telemetry {
-                novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(profile) => {
-                    profile.root.as_ref()
-                }
-                novarocks::fragment_terminal_profile_telemetry::Telemetry::Unavailable(_) => None,
-            })
-            .expect("ReportQueryTerminalRequest fixture profile")
-            .info_strings
-            .get("source")
-            .map(String::as_str),
-        Some("terminal-fixture")
-    );
 }
 
 #[test]

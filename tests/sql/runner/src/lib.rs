@@ -1529,48 +1529,6 @@ fn verify_lifecycle_structured_assertion(
             );
         }
     }
-    if let Some(expected) = assertion.participant_outcome.as_ref() {
-        let matched = after
-            .participant_outcomes
-            .iter()
-            .any(|actual| match (expected, actual) {
-                (
-                    ParticipantOutcomeExpectation::Proof,
-                    novarocks_cluster_harness::ParticipantTerminalOutcomeKind::Proof,
-                ) => true,
-                (
-                    ParticipantOutcomeExpectation::NoOutcome,
-                    novarocks_cluster_harness::ParticipantTerminalOutcomeKind::NoOutcome,
-                ) => true,
-                (
-                    ParticipantOutcomeExpectation::Attestation { reason: expected },
-                    novarocks_cluster_harness::ParticipantTerminalOutcomeKind::Attestation {
-                        reason: actual,
-                    },
-                ) => expected == actual,
-                _ => false,
-            });
-        if !matched {
-            bail!(
-                "structured participant outcome mismatch: expected {expected:?}, actual {:?}, execution_id={:?}",
-                after.participant_outcomes,
-                after.execution_id
-            );
-        }
-    }
-    for expected in &assertion.telemetry_unavailable {
-        if !after.telemetry_unavailable.iter().any(|actual| {
-            actual.scope == expected.scope
-                && actual.stage == expected.stage
-                && actual.code == expected.code
-        }) {
-            bail!(
-                "structured lifecycle telemetry-unavailable mismatch: expected {expected:?}, actual {:?}, execution_id={:?}",
-                after.telemetry_unavailable,
-                after.execution_id
-            );
-        }
-    }
     if !assertion.metric_deltas.is_empty() {
         let before = before
             .context("structured lifecycle metric delta assertion requires a pre-step snapshot")?;
@@ -3456,11 +3414,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 .lock()
                 .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
                 .and_then(|mut server_handle| {
-                    server_handle.await_query_execution_resource_convergence(
-                        &baseline,
-                        fault_injection::permits_terminal_retention(&step.meta),
-                        convergence_deadline,
-                    )
+                    server_handle
+                        .await_query_execution_resource_convergence(&baseline, convergence_deadline)
                 });
             match resource_result {
                 Ok(()) => {
@@ -4028,8 +3983,6 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "terminal_snapshot_conflict_be_index",
         "query_lifecycle_fault",
         "expect_lifecycle_error_source",
-        "expect_participant_outcome",
-        "expect_lifecycle_telemetry_unavailable",
         "expect_lifecycle_metric_delta",
         // Structured runtime-filter assertions read the same debug projection
         // as the lifecycle fault assertions, even when the query itself has no
@@ -5433,7 +5386,7 @@ mod tests {
     #[test]
     fn lifecycle_fault_preflight_matches_faults_and_lifecycle_evidence() {
         assert!(sql_text_has_query_lifecycle_fault_directive(
-            "-- @query_lifecycle_fault=terminal-outcome-suppress,1\nSELECT 1;"
+            "-- @query_lifecycle_fault=runtime-filter-contribution-ack-drop,1\nSELECT 1;"
         ));
         assert!(sql_text_has_query_lifecycle_fault_directive(
             "-- @kill_query_after_be_log_contains=NOVAROCKS_TASK_CREATE_APPLIED\nSELECT 1;"
@@ -5474,8 +5427,6 @@ mod tests {
             local_sequence: 2,
             attempt_id: 3,
             error_source: None,
-            participant_outcomes: Vec::new(),
-            telemetry_unavailable: Vec::new(),
             runtime_filter: harness::RuntimeFilterTerminalRollup::Available {
                 participants: vec![harness::RuntimeFilterParticipantTerminalTelemetry {
                     participant: harness::RuntimeFilterTerminalParticipant {
@@ -5527,8 +5478,6 @@ mod tests {
         };
         let delivered = QueryLifecycleStructuredAssertion {
             error_source: None,
-            participant_outcome: None,
-            telemetry_unavailable: Vec::new(),
             metric_deltas: Vec::new(),
             runtime_filter_availability: None,
             runtime_filter_details: vec![RuntimeFilterDetailExpectation::DeliveredConsumer],

@@ -17,26 +17,29 @@
 
 //! Composition of the backend's runtime-filter envelope ingress.
 //!
-//! Two owners install runtime-filter participants on one backend process. The
-//! fragment query lifecycle installs the participant named by an `InitQuery`
-//! manifest, which is what `EXPLAIN ANALYZE` still runs on. The query-context
-//! host installs the participant named by an `EstablishQueryContext`, which is
-//! what every other intent runs on. A participant is reachable only through
-//! the owner that installed it, so the wire ingress has to ask both.
+//! One owner installs runtime-filter participants on this backend process:
+//! the query-context host installs the participant named by an
+//! `EstablishQueryContext`, and every intent runs on the task protocol. A
+//! participant is reachable only through the owner that installed it, so the
+//! wire ingress asks that owner.
 //!
-//! The question each owner answers is ownership, not permission: it returns
+//! The question the owner answers is ownership, not permission: it returns
 //! the participant it installed for the exact attempt, or nothing. Accept,
-//! duplicate and reject remain the participant's own verdict. An envelope is
-//! dispatched only when exactly one owner holds the attempt, so the order the
-//! owners are wired in cannot change the answer -- zero owners is a refusal
-//! rather than a permission, and two is a composition conflict rather than a
-//! race to be won.
+//! duplicate and reject remain the participant's own verdict.
+//!
+//! With one registered owner the composite's two-claimant conflict arm cannot
+//! fire -- one authority produces at most one claimant -- while its
+//! zero-claimant refusal stays live and is the normal answer for an envelope
+//! naming an attempt this backend no longer holds. The composite is kept
+//! anyway because that conflict arm is the reason it exists: whoever adds a
+//! second participant owner needs the arm already in place, so that two
+//! owners claiming one attempt is a refusal rather than a race the wiring
+//! order settles.
 
 use std::sync::Arc;
 
 use tracing::{error, warn};
 
-use crate::query_lifecycle::QueryLifecycleRegistry;
 use crate::runtime_filter::domain::{BackendIngressResult, BackendParticipantIdentity};
 use crate::runtime_filter::participant::RuntimeFilterParticipant;
 use crate::runtime_filter::rpc::{
@@ -69,27 +72,10 @@ pub(crate) trait BackendRuntimeFilterParticipantAuthority: Send + Sync + 'static
     ) -> Option<Arc<RuntimeFilterParticipant>>;
 }
 
-/// The fragment query lifecycle as a participant owner.
-struct LifecycleParticipantAuthority(Arc<QueryLifecycleRegistry>);
-
-impl BackendRuntimeFilterParticipantAuthority for LifecycleParticipantAuthority {
-    fn authority_name(&self) -> &'static str {
-        "the fragment query lifecycle"
-    }
-
-    fn claim_participant(
-        &self,
-        participant: BackendParticipantIdentity,
-    ) -> Option<Arc<RuntimeFilterParticipant>> {
-        self.0.claim_runtime_filter_participant(participant)
-    }
-}
-
 /// The task protocol's query-context host as a participant owner.
 ///
-/// Every intent but `EXPLAIN ANALYZE` runs on the task protocol, which creates
-/// no `InitQuery` manifest at all. Without this owner wired, no runtime-filter
-/// envelope of such a query can reach a participant: each producer
+/// Every intent runs on the task protocol. Without this owner wired, no
+/// runtime-filter envelope can reach a participant at all: each producer
 /// contribution and each materialized artifact is refused at the peer, so
 /// every consumer waits out its whole wait cap and then scans unfiltered.
 struct QueryContextParticipantAuthority(Arc<NativeQueryContextHost>);
@@ -130,6 +116,8 @@ impl BackendRuntimeFilterEnvelopeIngress for CompositeRuntimeFilterEnvelopeIngre
             }
         }
         match claimants.len() {
+            // Live: one owner is registered, and it disclaims every attempt
+            // it did not install.
             0 => {
                 // A runtime filter is a conservative pre-filter, so this
                 // refusal never wrongs a result -- it costs the consumer its
@@ -152,6 +140,10 @@ impl BackendRuntimeFilterEnvelopeIngress for CompositeRuntimeFilterEnvelopeIngre
                 let (_, participant) = claimants.pop().expect("one claimant");
                 participant.dispatch_envelope(envelope)
             }
+            // Unreachable from this process's composition: one registered
+            // authority can contribute at most one claimant. It is kept
+            // because a second owner must land on a refusal here rather than
+            // on whichever answer the wiring order produced first.
             _ => {
                 error!(
                     target: "novarocks::runtime_filter",
@@ -186,17 +178,15 @@ fn rejected(reason: &'static str) -> BackendIngressResult {
 
 /// The one production composition of this backend's runtime-filter ingress.
 ///
-/// Both owners are wired unconditionally. They are not a fallback chain: each
-/// answers only for the attempts it installed, and an envelope is dispatched
-/// only when exactly one of them holds the attempt.
+/// The owner wired here answers only for the attempts it installed; an
+/// envelope naming anything else is refused rather than routed somewhere as a
+/// fallback.
 pub(crate) fn native_runtime_filter_envelope_ingress(
-    query_lifecycle: Arc<QueryLifecycleRegistry>,
     query_contexts: Arc<NativeQueryContextHost>,
 ) -> Arc<dyn BackendRuntimeFilterEnvelopeIngress> {
-    CompositeRuntimeFilterEnvelopeIngress::new(vec![
-        Arc::new(LifecycleParticipantAuthority(query_lifecycle)),
-        Arc::new(QueryContextParticipantAuthority(query_contexts)),
-    ])
+    CompositeRuntimeFilterEnvelopeIngress::new(vec![Arc::new(QueryContextParticipantAuthority(
+        query_contexts,
+    ))])
 }
 
 #[cfg(test)]
