@@ -870,17 +870,17 @@ impl Scenario for DistributedStatisticsDataflow {
         let source_root = hadoop_table_root(&warehouse, DATABASE, SOURCE);
         let source_metadata_before = hadoop_metadata_version(&source_root)?;
         let source_snapshots_before = snapshot_count(&mut control, &source)?;
-        let analyze_fragments_before = fragment_acceptance_counts(context)?;
+        let analyze_tasks_before = task_admission_counts(context)?;
 
         context.action("run ordinary ANALYZE across all three backend processes");
         control
             .query_drop(format!("ANALYZE TABLE {source}"))
             .context("run native distributed ANALYZE")?;
 
-        let analyze_fragments_after = fragment_acceptance_counts(context)?;
-        let analyze_fragment_delta = assert_every_backend_accepted_fragment(
-            &analyze_fragments_before,
-            &analyze_fragments_after,
+        let analyze_tasks_after = task_admission_counts(context)?;
+        let analyze_task_delta = assert_every_backend_accepted_task(
+            &analyze_tasks_before,
+            &analyze_tasks_after,
             "native distributed ANALYZE",
         )?;
         let source_metadata_after = hadoop_metadata_version(&source_root)?;
@@ -924,7 +924,7 @@ impl Scenario for DistributedStatisticsDataflow {
         let before = all_write_counters(context)?;
         let ceiling = peak_ceiling(&before);
         let terminals_before = publication_terminals(context, WRITE_FAMILY)?;
-        let fragments_before = fragment_acceptance_counts(context)?;
+        let tasks_before = task_admission_counts(context)?;
 
         context.action("collect statistics from the same pages written on all three backends");
         control
@@ -964,10 +964,10 @@ impl Scenario for DistributedStatisticsDataflow {
                  crossed a process boundary"
             );
         }
-        let fragments_after = fragment_acceptance_counts(context)?;
-        let write_fragment_delta = assert_every_backend_accepted_fragment(
-            &fragments_before,
-            &fragments_after,
+        let tasks_after = task_admission_counts(context)?;
+        let write_task_delta = assert_every_backend_accepted_task(
+            &tasks_before,
+            &tasks_after,
             "native collect-on-write INSERT",
         )?;
 
@@ -1120,8 +1120,8 @@ impl Scenario for DistributedStatisticsDataflow {
 
         println!(
             "native-statistics-dataflow topology=1FE+3BE \
-             analyze_fragment_delta={analyze_fragment_delta:?} analyze_ndv={analyze_ndv} \
-             write_fragment_delta={write_fragment_delta:?} writing_backends={:?} root_be={} \
+             analyze_task_delta={analyze_task_delta:?} analyze_ndv={analyze_ndv} \
+             write_task_delta={write_task_delta:?} writing_backends={:?} root_be={} \
              commit_fragments={} write_ndv={} metadata_versions={}=>{} \
              wide_channels={} wide_root_be={} wide_partial_delta={wide_partial_delta:?}",
             delta.writing_backends,
@@ -1344,34 +1344,39 @@ fn assert_theta_estimate(actual: f64, expected: f64, label: &str) -> Result<()> 
     Ok(())
 }
 
-fn fragment_acceptance_counts(context: &mut ScenarioContext) -> Result<Vec<usize>> {
+fn task_admission_counts(context: &mut ScenarioContext) -> Result<Vec<f64>> {
     (0..context.handle().be_count())
         .map(|index| {
             context
                 .handle()
-                .be_log_count(index, "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED")
-                .with_context(|| format!("count accepted fragments on BE[{index}]"))
+                .backend_task_execution_tasks_created(index)
+                .with_context(|| format!("read accepted EES tasks on BE[{index}]"))
         })
         .collect()
 }
 
-fn assert_every_backend_accepted_fragment(
-    before: &[usize],
-    after: &[usize],
+fn assert_every_backend_accepted_task(
+    before: &[f64],
+    after: &[f64],
     label: &str,
-) -> Result<Vec<usize>> {
+) -> Result<Vec<f64>> {
     if before.len() != 3 || after.len() != 3 {
-        bail!("{label} fragment evidence is not from exactly three backends");
+        bail!("{label} task-admission evidence is not from exactly three backends");
     }
-    let delta = before
-        .iter()
-        .zip(after)
-        .map(|(before, after)| after.saturating_sub(*before))
-        .collect::<Vec<_>>();
-    if delta.iter().any(|count| *count == 0) {
+    let mut delta = Vec::with_capacity(before.len());
+    for (index, (before, after)) in before.iter().zip(after).enumerate() {
+        if after < before {
+            bail!(
+                "{label} BE[{index}] EES task-admission metric regressed from {before} to \
+                 {after}; backend restart or metric-owner loss invalidates the evidence"
+            );
+        }
+        delta.push(after - before);
+    }
+    if delta.iter().any(|count| *count == 0.0) {
         bail!(
-            "{label} accepted-fragment deltas are {delta:?}; every backend in native 1FE+3BE \
-             must accept at least one fragment from this statement"
+            "{label} accepted-task deltas are {delta:?}; every backend in native 1FE+3BE \
+             must accept at least one EES task from this statement"
         );
     }
     Ok(delta)

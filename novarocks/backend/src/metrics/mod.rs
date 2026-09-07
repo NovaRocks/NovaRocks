@@ -24,7 +24,7 @@ pub(crate) use http::{
     publish_connector_write_root_prepared_set_peak, record_backend_native_authentication_failure,
     record_backend_native_tls_handshake_failure, record_connector_write_writer_abort,
     record_connector_write_writer_finished, record_connector_write_writer_open,
-    record_fragment_result_terminal,
+    record_fragment_result_terminal, record_task_execution_task_created,
 };
 
 #[cfg(debug_assertions)]

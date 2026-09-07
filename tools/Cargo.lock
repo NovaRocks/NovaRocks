@@ -2996,6 +2996,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-native-trust",
  "novarocks-parser",
+ "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-spi",
@@ -3083,10 +3084,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-plan-codec"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-buffer",
+ "novarocks-functions",
+ "novarocks-proto-codec",
+ "novarocks-proto-models",
+ "novarocks-spi",
+ "novarocks-sql",
+ "novarocks-types",
+]
+
+[[package]]
 name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
+ "novarocks-execution",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",

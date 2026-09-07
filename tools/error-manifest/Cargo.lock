@@ -2526,6 +2526,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-buffer",
+ "novarocks-functions",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-spi",

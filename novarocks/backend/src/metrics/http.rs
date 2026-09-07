@@ -26,7 +26,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, IntCounter, IntGaugeVec, Opts, Registry, TextEncoder};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 
@@ -47,6 +47,7 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS).clone()),
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINAL).clone()),
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone()),
+            Box::new(Lazy::force(&BACKEND_TASK_EXECUTION_TASKS_CREATED).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_AUTHENTICATION_FAILURES).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_TLS_FAILURES).clone()),
             Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_OPENS).clone()),
@@ -240,6 +241,18 @@ static BACKEND_QUERY_EXECUTION_RESOURCES: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("construct novarocks_backend_query_execution_resources")
 });
 
+/// Tasks first accepted by the EES task registry in this backend process.
+///
+/// A task is the EES-owned replacement for one admitted fragment. Idempotent
+/// CreateTask replays do not advance this counter.
+static BACKEND_TASK_EXECUTION_TASKS_CREATED: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(Opts::new(
+        "novarocks_backend_task_execution_tasks_created_total",
+        "Cumulative EES tasks first accepted by this backend.",
+    ))
+    .expect("construct novarocks_backend_task_execution_tasks_created_total")
+});
+
 /// Writer opens attempted by this backend's connector write data plane, by
 /// outcome. One driver opens exactly one writer, so this counts drivers.
 static BACKEND_CONNECTOR_WRITE_WRITER_OPENS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
@@ -355,6 +368,10 @@ pub(crate) fn record_connector_write_writer_open(outcome: &'static str) {
     BACKEND_CONNECTOR_WRITE_WRITER_OPENS
         .with_label_values(&[outcome])
         .inc();
+}
+
+pub(crate) fn record_task_execution_task_created() {
+    BACKEND_TASK_EXECUTION_TASKS_CREATED.inc();
 }
 
 /// One connector writer finished: it accepted `rows` rows and produced
@@ -745,6 +762,7 @@ mod tests {
         let backend = BackendMetricsRegistry::new().expect("construct Backend registry");
         let rendered = render_metrics(&backend).expect("render Backend metrics");
         assert!(rendered.contains("novarocks_backend_query_lifecycle_entries"));
+        assert!(rendered.contains("novarocks_backend_task_execution_tasks_created_total"));
         assert!(rendered.contains("novarocks_exchange_shuffle_bytes_total"));
         assert!(!rendered.contains("novarocks_frontend_only_fixture"));
     }

@@ -76,16 +76,7 @@ impl NativeFragmentInstanceInput {
 pub(crate) fn decode_instance_params(
     src: &proto::InstanceParams,
 ) -> Result<NativeFragmentInstanceInput, NativeFragmentIngressError> {
-    let path = FieldPath::root("instance_params");
-    let wire_query_options = src.query_options.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("query_options"),
-            "native InstanceParams requires query_options with explicit pipeline_dop",
-        )
-    })?;
-    let query_options = decode_query_options(wire_query_options)
-        .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
-    decode_instance_params_with_query_options(src, query_options)
+    decode_instance_params_impl(src, None)
 }
 
 /// Decodes task-local instance facts while taking query-wide execution options
@@ -97,6 +88,13 @@ pub(crate) fn decode_instance_params(
 pub(crate) fn decode_instance_params_with_query_options(
     src: &proto::InstanceParams,
     query_options: QueryOptions,
+) -> Result<NativeFragmentInstanceInput, NativeFragmentIngressError> {
+    decode_instance_params_impl(src, Some(query_options))
+}
+
+fn decode_instance_params_impl(
+    src: &proto::InstanceParams,
+    context_query_options: Option<QueryOptions>,
 ) -> Result<NativeFragmentInstanceInput, NativeFragmentIngressError> {
     let path = FieldPath::root("instance_params");
     let query_id = src.query_id.as_ref().ok_or_else(|| {
@@ -125,6 +123,11 @@ pub(crate) fn decode_instance_params_with_query_options(
             "native InstanceParams requires query_options with explicit pipeline_dop",
         )
     })?;
+    let query_options = match context_query_options {
+        Some(query_options) => query_options,
+        None => decode_query_options(wire_query_options)
+            .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?,
+    };
     let pipeline_dop = usize::try_from(wire_query_options.pipeline_dop)
         .ok()
         .and_then(NonZeroUsize::new)

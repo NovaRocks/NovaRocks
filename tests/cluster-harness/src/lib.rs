@@ -1422,6 +1422,8 @@ const RESOURCE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIFECYCLE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const QUERY_EXECUTION_RESOURCE_METRIC: &str = "novarocks_backend_query_execution_resources";
 const QUERY_LIFECYCLE_TERMINAL_METRIC: &str = "novarocks_backend_query_lifecycle_terminal_total";
+const TASK_EXECUTION_TASKS_CREATED_METRIC: &str =
+    "novarocks_backend_task_execution_tasks_created_total";
 const FRONTEND_QUERY_LIFECYCLE_CONTROL_METRIC: &str =
     "novarocks_frontend_query_lifecycle_control_total";
 const DML_PUBLICATION_TERMINAL_METRIC: &str = "novarocks_dml_publication_terminal_total";
@@ -1824,12 +1826,13 @@ const FRONTEND_METRIC_FAMILIES: [&str; 14] = [
     "novarocks_frontend_query_lifecycle_latency_micros",
 ];
 
-const BACKEND_METRIC_FAMILIES: [&str; 5] = [
+const BACKEND_METRIC_FAMILIES: [&str; 6] = [
     "novarocks_backend_query_lifecycle_entries",
     "novarocks_backend_query_lifecycle_rejections",
     "novarocks_backend_query_lifecycle_terminations",
     "novarocks_backend_query_lifecycle_terminal_total",
     "novarocks_backend_query_execution_resources",
+    "novarocks_backend_task_execution_tasks_created_total",
 ];
 
 fn assert_contains_metric_families(body: &str, families: &[&str], endpoint: &str) -> Result<()> {
@@ -3311,6 +3314,19 @@ impl CrossProcessServerHandle {
             TERMINAL_FALLBACK_ACCEPTED_OUTCOME,
         )
         .with_context(|| format!("read BE[{index}] terminal fallback accepted count"))
+    }
+
+    /// Read the cumulative number of EES tasks first accepted by one backend.
+    ///
+    /// This is the task registry's replacement for legacy fragment-admission
+    /// log evidence. Because idempotent CreateTask replays do not advance the
+    /// counter, a statement-level delta proves new work was admitted here.
+    pub fn backend_task_execution_tasks_created(&self, index: usize) -> Result<f64> {
+        self.ensure_be_index(index)?;
+        let metrics = scrape_prometheus_metrics(self.runtime.be[index].http)
+            .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))?;
+        prometheus_labeled_sample(&metrics, TASK_EXECUTION_TASKS_CREATED_METRIC, &[])
+            .with_context(|| format!("read BE[{index}] EES tasks-created count"))
     }
 
     /// Read one labelled connector-write counter from a live backend.
