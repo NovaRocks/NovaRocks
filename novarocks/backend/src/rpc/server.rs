@@ -46,6 +46,7 @@ use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId,
 };
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
+use novarocks_types::BackendProcessId;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -55,11 +56,13 @@ use tonic::server::NamedService;
 use tower::ServiceExt;
 
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
+use crate::connector::catalog_manager::CatalogPruneResult;
+use crate::drain::BackendDrainState;
+use crate::query_lifecycle::QueryLifecycleIngress;
 use crate::query_lifecycle::rpc::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
     handle_stage_fragments, handle_start_prepared_query, handle_task_update,
 };
-use crate::query_lifecycle::{CatalogPruneOutcome, QueryLifecycleIngress};
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
@@ -67,10 +70,49 @@ use crate::runtime_filter::rpc::{
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// What a rejected catalog prune is allowed to say on the wire.
+///
+/// A catalog definition carries credential material. This detail is a fixed
+/// string rather than anything derived from the handles involved, so no part
+/// of a catalog's properties can reach an error, a log, or a status by being
+/// interpolated into a rejection.
+const CATALOG_PRUNE_STALE_SNAPSHOT_DETAIL: &str =
+    "catalog reachability snapshot omits one or more live catalogs";
+
+/// This process's owner of catalog reachability.
+///
+/// The frontend sends one complete reachability snapshot; the owner reconciles
+/// its retained catalog runtimes against it and answers in its own vocabulary.
+/// This port exists so the wire handler never holds a catalog registry of its
+/// own: there is exactly one `CatalogManager` per process, and a second
+/// reconciler would be a second authority over the same leases.
+pub(crate) trait CatalogReachabilityAuthority: Send + Sync + 'static {
+    fn prune_unreachable_catalogs(
+        &self,
+        reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
+    ) -> CatalogPruneResult;
+}
+
 /// Connection-local proof injected only after `NativeIncomingAdapter::accept`
 /// returns. It cannot be claimed by a lifecycle protobuf frame.
 #[derive(Clone, Copy)]
 struct NativeTlsVerified;
+
+/// Everything a heartbeat answers with.
+///
+/// A heartbeat is a question about this process, not about any query: which
+/// process is answering, what it immutably is, and whether it will still take
+/// new work. All three travel together because they are one answer, and
+/// because a reply that mixed one process's identity with another's drain
+/// state would be worse than no reply at all.
+#[derive(Clone)]
+pub(crate) struct BackendProcessFacts {
+    /// The identity minted by this process's composition root. A heartbeat
+    /// naming a different one is a stale peer talking to a replaced process.
+    pub(crate) process_id: BackendProcessId,
+    pub(crate) descriptor: BackendProcessDescriptor,
+    pub(crate) drain: Arc<BackendDrainState>,
+}
 
 /// Backend-owned production Tonic service. Domain owners contribute the narrow
 /// ingress ports while this service composes them with `BackendDataPlane`.
@@ -78,32 +120,34 @@ struct NativeTlsVerified;
 pub(crate) struct BackendRpcService {
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
+    catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
+    process: BackendProcessFacts,
     query_control_shutdown: Option<watch::Receiver<bool>>,
     data_plane: BackendDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
-    process_descriptor: BackendProcessDescriptor,
 }
 
 impl BackendRpcService {
     pub(crate) fn new(
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
         task_execution_ingress: Arc<dyn TaskExecutionIngress>,
+        catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         task_inbound_capabilities: Arc<TaskInboundCapabilities>,
-        process_descriptor: BackendProcessDescriptor,
+        process: BackendProcessFacts,
     ) -> Self {
         Self {
-            query_lifecycle_ingress: Arc::clone(&query_lifecycle_ingress),
+            query_lifecycle_ingress,
             task_execution_ingress,
+            catalog_reachability,
+            process,
             query_control_shutdown: None,
             data_plane: BackendDataPlane::with_exchange_receiver_port(
                 exchange_receiver_port,
-                Arc::clone(&query_lifecycle_ingress),
                 task_inbound_capabilities,
             ),
             runtime_filter_ingress,
-            process_descriptor,
         }
     }
 
@@ -265,19 +309,22 @@ impl NovaRocksGrpc for BackendRpcService {
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?
             .into_iter()
             .collect();
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response =
-            tokio::task::spawn_blocking(move || match ingress.prune_catalogs(reachable) {
-                CatalogPruneOutcome::Accepted => PruneCatalogsResponse::accepted(),
-                CatalogPruneOutcome::Rejected { safe_detail } => {
-                    PruneCatalogsResponse::rejected(safe_detail)
-                        .expect("lifecycle ingress produces a bounded safe catalog-prune detail")
+        let authority = Arc::clone(&self.catalog_reachability);
+        let response = tokio::task::spawn_blocking(move || {
+            match authority.prune_unreachable_catalogs(reachable) {
+                CatalogPruneResult::Pruned { .. } => PruneCatalogsResponse::accepted(),
+                // The rejected handles are deliberately not reported: naming
+                // them would put catalog properties on the wire.
+                CatalogPruneResult::Rejected { .. } => {
+                    PruneCatalogsResponse::rejected(CATALOG_PRUNE_STALE_SNAPSHOT_DETAIL)
+                        .expect("the fixed stale-snapshot detail is a bounded safe detail")
                 }
-            })
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
-            })?;
+            }
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
+        })?;
         Ok(tonic::Response::new(response.as_proto().clone()))
     }
 
@@ -292,7 +339,7 @@ impl NovaRocksGrpc for BackendRpcService {
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?
             .domain()
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        if expected_process_id != self.query_lifecycle_ingress.backend_process_id() {
+        if expected_process_id != self.process.process_id {
             return Err(tonic::Status::failed_precondition(
                 "heartbeat expected backend process id does not match this backend",
             ));
@@ -302,8 +349,8 @@ impl NovaRocksGrpc for BackendRpcService {
             .unwrap_or(1);
         Ok(tonic::Response::new(proto::HeartbeatResponse {
             num_cores,
-            descriptor: Some(self.process_descriptor.as_proto().clone()),
-            reported_state: if self.query_lifecycle_ingress.is_draining() {
+            descriptor: Some(self.process.descriptor.as_proto().clone()),
+            reported_state: if self.process.drain.is_draining() {
                 proto::BackendReportedState::Draining as i32
             } else {
                 proto::BackendReportedState::Running as i32

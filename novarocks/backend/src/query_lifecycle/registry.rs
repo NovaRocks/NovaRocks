@@ -50,9 +50,9 @@ use super::entry::{
     ImmutableQueryTerminalRecord, QueryCatalogLoadState, QueryLifecycleEntry, QueryLifecyclePhase,
 };
 use super::{
-    BackendQueryControl, CatalogPruneOutcome, QueryControlAttachment, QueryHeartbeatDisposition,
-    QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
-    QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+    BackendQueryControl, QueryControlAttachment, QueryHeartbeatDisposition, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminalFallbackTransport,
+    QueryTerminalFallbackTransportError, lifecycle_error_from_runtime_filter_contract,
 };
 use crate::BackendDataRuntime;
 use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
@@ -61,6 +61,7 @@ use crate::metrics::{
     publish_backend_query_lifecycle_terminal_limits,
 };
 use crate::rpc::client::BackendRpcClient;
+#[cfg(test)]
 use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::runtime::profile_codec::encode_runtime_profile_tree;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
@@ -1216,6 +1217,7 @@ impl QueryLifecycleRegistry {
 
     pub(crate) fn new_with_runtime_and_execution_role_binding_factories(
         runtime: BackendDataRuntime,
+        local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
         native_compatibility_id: NativeCompatibilityId,
@@ -1230,7 +1232,7 @@ impl QueryLifecycleRegistry {
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
             runtime.clone(),
-            BackendProcessId::new_v7(),
+            local_process_id,
             local_runtime,
             config,
             Arc::new(SystemMonotonicClock),
@@ -1445,16 +1447,15 @@ impl QueryLifecycleRegistry {
             .draining = true;
     }
 
+    /// Test-only: production reads the process drain flag, and admission
+    /// below reads this registry's own copy directly. A second production
+    /// reader here would be a second opinion about one process.
+    #[cfg(test)]
     pub(crate) fn is_draining(&self) -> bool {
         self.state
             .lock()
             .expect("query lifecycle registry lock")
             .draining
-    }
-
-    pub(crate) fn is_drained(&self) -> bool {
-        let state = self.state.lock().expect("query lifecycle registry lock");
-        state.draining && state.active_entries == 0
     }
 
     /// The terminal owner releases catalog references in the same window as
@@ -1482,6 +1483,18 @@ impl QueryLifecycleRegistry {
         self.local_runtime.release_query_resources(execution_id);
     }
 
+    /// This registry's view of the process catalog lease counts.
+    ///
+    /// Test-only: production reads these through the metrics gauge, and the
+    /// manager is shared, so a second production reader here would be a second
+    /// opinion about one set of leases.
+    #[cfg(test)]
+    pub(crate) fn catalog_lease_snapshot(
+        &self,
+    ) -> crate::connector::catalog_manager::CatalogLeaseSnapshot {
+        self.catalog_manager.lease_snapshot()
+    }
+
     fn publish_catalog_lease_metrics(&self) {
         let snapshot = self.catalog_manager.lease_snapshot();
         publish_backend_query_execution_resource("catalog_query_leases", snapshot.query_leases);
@@ -1498,6 +1511,9 @@ impl QueryLifecycleRegistry {
     /// illegal": the task substrate owns the destinations of every query that
     /// runs on the task protocol, and a lifecycle refusal for one of those
     /// would be this owner deciding another owner's frame.
+    /// Test-only: no wire handler asks this owner for a destination any
+    /// more, because no query is admitted through `InitQuery`.
+    #[cfg(test)]
     pub(crate) fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
         let state = match self.state.lock() {
             Ok(state) => state,
@@ -2845,9 +2861,9 @@ impl QueryLifecycleRegistry {
             state.runtime_filter.clone()
         };
         match participant {
-            Some(participant) => {
-                participant.session_for_fragment(execution_id, fragment_instance_id, required)
-            }
+            Some(participant) => participant
+                .session_for_fragment(execution_id, fragment_instance_id, required)
+                .map_err(lifecycle_error_from_runtime_filter_contract),
             None if required => Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::InvalidManifest,
                 "fragment requires a runtime filter session but this participant has no runtime filter contribution",
@@ -3931,6 +3947,7 @@ impl QueryLifecycleRegistry {
             }
         }
         capture_terminal_profile_contribution(snapshot, runtime_filter_installed)
+            .map_err(lifecycle_error_from_runtime_filter_contract)
     }
 
     fn fail_if_terminal_p1_retention_fault(
@@ -4955,12 +4972,13 @@ impl InitWorkspace {
     fn install_and_publish(self) -> QueryInitAck {
         let contribution = validated(self.entry.manifest.runtime_filter());
         let install_result = contribution.map_or(Ok(None), |contribution| {
-            let contribution =
-                decode_runtime_filter_contribution(self.execution_id, &contribution)?;
+            let contribution = decode_runtime_filter_contribution(self.execution_id, &contribution)
+                .map_err(lifecycle_error_from_runtime_filter_contract)?;
             self.registry
                 .runtime_filter_factory
                 .install(self.execution_id, contribution)
                 .map(Some)
+                .map_err(lifecycle_error_from_runtime_filter_contract)
         });
         if install_result.is_err() {
             let (reason, terminate_locally) = {
@@ -5436,29 +5454,6 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
 
     fn init_query_tls(&self, request: QueryInitRequest) -> QueryInitAck {
         QueryLifecycleRegistry::init_query_tls(self, request)
-    }
-
-    fn prune_catalogs(
-        &self,
-        reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
-    ) -> CatalogPruneOutcome {
-        let outcome = match self.catalog_manager.prune_unreachable(&reachable) {
-            crate::connector::catalog_manager::CatalogPruneResult::Pruned { .. } => {
-                CatalogPruneOutcome::Accepted
-            }
-            crate::connector::catalog_manager::CatalogPruneResult::Rejected { .. } => {
-                CatalogPruneOutcome::Rejected {
-                    safe_detail: "catalog reachability snapshot omits one or more live catalogs"
-                        .to_string(),
-                }
-            }
-        };
-        self.publish_catalog_lease_metrics();
-        outcome
-    }
-
-    fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
-        QueryLifecycleRegistry::claim_exchange_route(self, query)
     }
 
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {

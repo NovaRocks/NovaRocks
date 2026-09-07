@@ -79,8 +79,8 @@ use crate::connector::ConnectorExecutionRoleBinding;
 use crate::connector::catalog_manager::{
     CatalogManager, CatalogManagerError, ConnectorExecutionRoleBindingFactorySet,
 };
-use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use crate::runtime_filter::domain::BackendFrontendFeedbackSink;
+use crate::runtime_filter::error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 use crate::runtime_filter::install_decode::{
     DecodedRuntimeFilterContribution, decode_runtime_filter_contribution,
 };
@@ -442,7 +442,26 @@ impl NativeQueryContextHost {
         // still unwinding, and releasing a query that holds none is a no-op.
         self.catalog_manager
             .release_query(context.query_execution_id());
+        self.publish_catalog_lease_metrics();
         evidence
+    }
+
+    /// Publishes this process's catalog lease counts.
+    ///
+    /// This host is the only owner that takes and releases catalog leases, so
+    /// it is the only place that can say what the gauge should read. It is
+    /// called after each event that changes the count rather than on a timer:
+    /// the manager holds the numbers and nothing else observes them.
+    fn publish_catalog_lease_metrics(&self) {
+        let snapshot = self.catalog_manager.lease_snapshot();
+        crate::metrics::publish_backend_query_execution_resource(
+            "catalog_query_leases",
+            snapshot.query_leases,
+        );
+        crate::metrics::publish_backend_query_execution_resource(
+            "catalog_handle_leases",
+            snapshot.handle_leases,
+        );
     }
 
     /// Refuses to keep installing into a context that was retired under us.
@@ -538,6 +557,10 @@ impl NativeQueryContextHost {
         if catalogs.is_empty() {
             return Ok(());
         }
+        // Both branches below take leases, and the loop can take some and
+        // then refuse, so the gauge is republished on the way out of every
+        // one of them rather than only on success.
+        let _publish_on_exit = PublishCatalogLeasesOnExit(self);
         // The old stack ran every provider bind on this runtime's blocking
         // pool, which also gave the bind an ambient Tokio context. This host is
         // called on a thread the owner chose, so it enters the injected runtime
@@ -604,6 +627,33 @@ impl NativeQueryContextHost {
         {
             contexts.remove(context);
         }
+    }
+}
+
+/// Republishes the catalog lease gauge when a lease-taking scope exits.
+///
+/// A cold install can take some leases and then refuse, so the gauge has to
+/// be republished on the refusal path too; a guard states that once instead
+/// of at every `?`.
+struct PublishCatalogLeasesOnExit<'host>(&'host NativeQueryContextHost);
+
+impl Drop for PublishCatalogLeasesOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.publish_catalog_lease_metrics();
+    }
+}
+
+/// This host reconciles catalog reachability because it is this process's only
+/// catalog lease owner: it takes the leases on establish and drops them on
+/// release, so it is the only owner that can decide what is still needed.
+impl crate::rpc::server::CatalogReachabilityAuthority for NativeQueryContextHost {
+    fn prune_unreachable_catalogs(
+        &self,
+        reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
+    ) -> crate::connector::catalog_manager::CatalogPruneResult {
+        let result = self.catalog_manager.prune_unreachable(&reachable);
+        self.publish_catalog_lease_metrics();
+        result
     }
 }
 
@@ -717,6 +767,11 @@ impl QueryContextHost for NativeQueryContextHost {
                     contexts.insert_released_marker(context);
                     self.catalog_manager
                         .release_query(context.query_execution_id());
+                    // Published after this owner's own lock is released: the
+                    // metrics layer holds no execution resource references and
+                    // must not be reached with one held.
+                    drop(contexts);
+                    self.publish_catalog_lease_metrics();
                     return ReleasedContextEvidence::none();
                 }
             }
@@ -1062,16 +1117,18 @@ fn catalog_rejection(installed: &InstalledContext, error: CatalogManagerError) -
     HostRejection::new(category, safe_detail(&error.to_string()))
 }
 
-fn runtime_filter_rejection(error: QueryLifecycleError) -> HostRejection {
+/// Maps a runtime-filter contract refusal onto this protocol's categories.
+///
+/// The match is exhaustive on purpose: a new contract failure class must be
+/// classified here rather than folded into whichever arm happened to be last.
+fn runtime_filter_rejection(error: RuntimeFilterContractError) -> HostRejection {
     let category = match error.code() {
-        QueryLifecycleErrorCode::InvalidManifest
-        | QueryLifecycleErrorCode::Conflict
-        | QueryLifecycleErrorCode::StaleBackend => TaskFailureCategory::Protocol,
-        QueryLifecycleErrorCode::Capacity => TaskFailureCategory::ResourceExhausted,
-        QueryLifecycleErrorCode::Terminated => TaskFailureCategory::Execution,
-        // The only category that names a peer route failing.
-        QueryLifecycleErrorCode::Transport => TaskFailureCategory::Exchange,
-        QueryLifecycleErrorCode::Internal => TaskFailureCategory::Internal,
+        // Illegal content in a contribution, install, session binding, or
+        // terminal projection. A peer sent it, so it is a protocol failure.
+        RuntimeFilterContractErrorCode::InvalidContract => TaskFailureCategory::Protocol,
+        // The participant that would answer is gone. Nothing about the
+        // request was wrong, so this describes this attempt's own progress.
+        RuntimeFilterContractErrorCode::ParticipantClosed => TaskFailureCategory::Execution,
     };
     HostRejection::new(category, safe_detail(error.detail()))
 }
@@ -1136,8 +1193,10 @@ mod tests {
     use crate::connector::catalog_manager::{
         CatalogManager, ConnectorExecutionRoleBindingFactorySet,
     };
-    use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
     use crate::rpc::runtime::test_backend_data_runtime;
+    use crate::runtime_filter::error::{
+        RuntimeFilterContractError, RuntimeFilterContractErrorCode,
+    };
     use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
     use crate::runtime_filter::participant::{
         BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
@@ -1319,7 +1378,7 @@ mod tests {
             &self,
             execution_id: QueryExecutionId,
             contribution: DecodedRuntimeFilterContribution,
-        ) -> Result<Arc<RuntimeFilterParticipant>, QueryLifecycleError> {
+        ) -> Result<Arc<RuntimeFilterParticipant>, RuntimeFilterContractError> {
             self.ledger.installs.fetch_add(1, Ordering::SeqCst);
             let participant =
                 BackendRuntimeFilterParticipantFactory::new(test_backend_data_runtime())
@@ -1329,8 +1388,8 @@ mod tests {
                 participant.with_close_hook_for_test(Arc::new(move |_participant, _reason| {
                     ledger.closes.fetch_add(1, Ordering::SeqCst);
                     if ledger.fail_close.load(Ordering::SeqCst) {
-                        return Err(QueryLifecycleError::new(
-                            QueryLifecycleErrorCode::Internal,
+                        return Err(RuntimeFilterContractError::new(
+                            RuntimeFilterContractErrorCode::ParticipantClosed,
                             "scripted runtime filter close failure",
                         ));
                     }

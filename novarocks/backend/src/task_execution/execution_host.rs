@@ -2096,43 +2096,7 @@ mod tests {
     /// move a single frame.
     #[test]
     fn the_composed_data_plane_admits_a_frame_only_the_task_substrate_holds() {
-        use crate::query_lifecycle::{
-            QueryControlAttachment, QueryLifecycleError, QueryLifecycleIngress,
-        };
         use crate::rpc::data_plane::BackendDataPlane;
-        use novarocks_proto_codec::lifecycle::{
-            QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest,
-            QueryTerminationAck,
-        };
-        use novarocks_types::BackendProcessId;
-
-        /// A lifecycle owner with no admitted query at all, which is exactly
-        /// its state while a query runs on the task protocol.
-        struct EmptyLifecycleIngress;
-
-        impl QueryLifecycleIngress for EmptyLifecycleIngress {
-            fn backend_process_id(&self) -> BackendProcessId {
-                BackendProcessId::new_v7()
-            }
-
-            fn init_query(&self, _request: QueryInitRequest) -> QueryInitAck {
-                unreachable!("this test initializes no query")
-            }
-
-            fn abort_query(
-                &self,
-                _request: QueryAbortRequest,
-            ) -> Result<QueryTerminationAck, QueryLifecycleError> {
-                unreachable!("this test aborts no query")
-            }
-
-            fn attach_control(
-                &self,
-                _attach: QueryControlAttach,
-            ) -> Result<QueryControlAttachment, QueryLifecycleError> {
-                unreachable!("this test attaches no query control")
-            }
-        }
 
         let consumer = identity(15, 1, 1);
         let producer = identity(15, 2, 1);
@@ -2152,7 +2116,6 @@ mod tests {
 
         let plane = BackendDataPlane::with_exchange_receiver_port(
             Arc::new(UnavailableExchangeReceiverPort),
-            Arc::new(EmptyLifecycleIngress),
             Arc::clone(&capabilities),
         );
         let request = |destination: UniqueId, source: UniqueId| proto::ExchangeRequest {

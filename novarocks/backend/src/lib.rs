@@ -2,6 +2,7 @@
 mod application;
 mod config;
 pub mod connector;
+mod drain;
 mod exchange_receiver;
 mod fragment;
 mod metrics;

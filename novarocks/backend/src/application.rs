@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
+use crate::drain::BackendDrainState;
 use novarocks_connector_binding::ConnectorExecutionRoleBindingFactory;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
@@ -162,12 +163,12 @@ pub struct BackendApplicationHost {
     task_deadline_tick: TaskDeadlineTickTask,
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
+    drain: Arc<BackendDrainState>,
     announce_task: BackendAnnounceTask,
 }
 
 struct BackendAnnounceTask {
     stop: Arc<AtomicBool>,
-    draining: Arc<AtomicBool>,
     wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     join: Option<std::thread::JoinHandle<()>>,
     data_runtime: BackendDataRuntime,
@@ -180,15 +181,15 @@ impl BackendAnnounceTask {
         data_runtime: BackendDataRuntime,
         frontend_endpoint: NativeEndpoint,
         descriptor: BackendProcessDescriptor,
+        drain: Arc<BackendDrainState>,
         interval: Duration,
         initial_backoff: Duration,
         max_backoff: Duration,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let draining = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let thread_stop = Arc::clone(&stop);
-        let thread_draining = Arc::clone(&draining);
+        let thread_drain = drain;
         let thread_wake = Arc::clone(&wake);
         let thread_runtime = data_runtime.clone();
         let thread_frontend_endpoint = frontend_endpoint.clone();
@@ -204,7 +205,7 @@ impl BackendAnnounceTask {
                 let max_backoff = max_backoff.max(initial_backoff);
                 let mut retry_delay = initial_backoff;
                 while !thread_stop.load(Ordering::Acquire) {
-                    let reported_state = if thread_draining.load(Ordering::Acquire) {
+                    let reported_state = if thread_drain.is_draining() {
                         BackendReportedState::Draining
                     } else {
                         BackendReportedState::Running
@@ -249,7 +250,6 @@ impl BackendAnnounceTask {
             .expect("spawn backend announce task");
         Self {
             stop,
-            draining,
             wake,
             join: Some(join),
             data_runtime,
@@ -258,8 +258,12 @@ impl BackendAnnounceTask {
         }
     }
 
-    fn begin_drain(&self) {
-        self.draining.store(true, Ordering::Release);
+    /// Reports the drain the process has already entered.
+    ///
+    /// The flag itself belongs to `BackendDrainState`; the composition root
+    /// sets it before calling this, so the announce below and the heartbeat
+    /// this BE answers cannot disagree about the same process.
+    fn announce_drain(&self) {
         let client = BackendRpcClient::new_native_endpoint(
             self.data_runtime.clone(),
             self.frontend_endpoint.clone(),
@@ -307,6 +311,10 @@ impl fmt::Debug for BackendApplicationHost {
 }
 
 struct BackendApplicationServices {
+    /// This process's immutable identity, minted once by the composition root
+    /// below. Every owner that stamps or checks it reads this one value.
+    backend_process_id: BackendProcessId,
+    drain: Arc<BackendDrainState>,
     native_fragment_service: Arc<NativeFragmentService>,
     query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_runtime: Arc<ExecutionRuntime>,
@@ -509,30 +517,12 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
         self.registry.local_process_id()
     }
 
-    fn is_draining(&self) -> bool {
-        self.registry.is_draining()
-    }
-
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         self.registry.init_query(request)
     }
 
     fn init_query_tls(&self, request: QueryInitRequest) -> QueryInitAck {
         self.registry.init_query_tls(request)
-    }
-
-    fn prune_catalogs(
-        &self,
-        reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
-    ) -> crate::query_lifecycle::CatalogPruneOutcome {
-        self.registry.prune_catalogs(reachable)
-    }
-
-    fn claim_exchange_route(
-        &self,
-        query: crate::rpc::data_plane_handlers::ExchangeRouteQuery,
-    ) -> crate::rpc::data_plane_handlers::ExchangeRouteClaim {
-        self.registry.claim_exchange_route(query)
     }
 
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
@@ -706,6 +696,12 @@ fn compose_backend_application_services(
             |error| BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error),
         )?,
     );
+    // One process identity, minted here. It is what the announce carries,
+    // what a heartbeat is checked against, and what both execution owners
+    // stamp their work with, so it is minted by the composition root rather
+    // than by whichever owner happens to be constructed first.
+    let backend_process_id = BackendProcessId::new_v7();
+    let drain = Arc::new(BackendDrainState::new());
     let controls = Arc::new(FragmentControlRegistry::default());
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
@@ -737,6 +733,7 @@ fn compose_backend_application_services(
     let query_lifecycle_registry =
         QueryLifecycleRegistry::new_with_runtime_and_execution_role_binding_factories(
             data_runtime.clone(),
+            backend_process_id,
             local_runtime,
             query_lifecycle_config,
             native_compatibility_id,
@@ -801,13 +798,15 @@ fn compose_backend_application_services(
         Arc::clone(&execution_runtime),
     ));
     let task_execution_registry = TaskExecutionRegistry::with_process_clock(
-        TaskExecutionRegistryConfig::for_process(query_lifecycle_ingress.backend_process_id()),
+        TaskExecutionRegistryConfig::for_process(backend_process_id),
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::QueryContextHost>,
         execution_host,
     );
     let task_execution_ingress: Arc<dyn TaskExecutionIngress> =
         RegistryTaskExecutionIngress::new(Arc::clone(&task_execution_registry));
     Ok(BackendApplicationServices {
+        backend_process_id,
+        drain,
         native_fragment_service,
         query_lifecycle_registry,
         execution_runtime,
@@ -855,12 +854,11 @@ impl BackendApplicationHost {
     /// SIGTERM makes this BE ineligible for new Init while existing admitted
     /// lifecycle entries remain reachable until their normal terminal state.
     pub fn begin_drain(&self) {
+        // One flag, set once, before anything reports it: the heartbeat this
+        // BE answers and the announce it sends then read the same value.
+        self.drain.begin_drain();
         self._query_lifecycle_registry.begin_drain();
-        self.announce_task.begin_drain();
-    }
-
-    pub fn is_drained(&self) -> bool {
-        self._query_lifecycle_registry.is_drained()
+        self.announce_task.announce_drain();
     }
 
     pub fn poll_failure(
@@ -948,7 +946,7 @@ impl BackendApplicationHost {
             &execution_role_binding_factories,
         )?;
         let process_descriptor = BackendProcessDescriptor::new(
-            services.query_lifecycle_ingress.backend_process_id(),
+            services.backend_process_id,
             QueryControlEndpoint::new(advertise_endpoint.host.clone(), advertise_endpoint.port)
                 .map_err(|error| {
                     BackendApplicationError::new(
@@ -998,25 +996,27 @@ impl BackendApplicationHost {
             TASK_DEADLINE_TICK_INTERVAL,
         );
 
-        // Both participant owners, because an attempt is reachable only
-        // through the one that installed it: the fragment query lifecycle for
-        // EXPLAIN ANALYZE, and the query-context host for every intent that
-        // runs on the task protocol.
+        // The participant owner, because an attempt is reachable only
+        // through the one that installed it, and every intent's participant is
+        // installed by the query-context host.
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
-            native_runtime_filter_envelope_ingress(
-                Arc::clone(&services.query_lifecycle_registry),
-                Arc::clone(&services.query_context_host),
-            );
+            native_runtime_filter_envelope_ingress(Arc::clone(&services.query_context_host));
         let mut grpc_server = match BackendRpcServerHandle::start(
             &bind_host,
             grpc_port,
             BackendRpcService::new(
                 services.query_lifecycle_ingress.clone(),
                 Arc::clone(&services.task_execution_ingress),
+                Arc::clone(&services.query_context_host)
+                    as Arc<dyn crate::rpc::server::CatalogReachabilityAuthority>,
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
                 Arc::clone(&services.task_inbound_capabilities),
-                process_descriptor.clone(),
+                crate::rpc::server::BackendProcessFacts {
+                    process_id: services.backend_process_id,
+                    descriptor: process_descriptor.clone(),
+                    drain: Arc::clone(&services.drain),
+                },
             ),
             native_trust,
             native_transport,
@@ -1056,6 +1056,7 @@ impl BackendApplicationHost {
             readiness_runtime,
             frontend_endpoint,
             process_descriptor.clone(),
+            Arc::clone(&services.drain),
             announce_interval.max(Duration::from_millis(100)),
             announce_initial_backoff,
             announce_max_backoff,
@@ -1075,6 +1076,7 @@ impl BackendApplicationHost {
             task_deadline_tick,
             metrics_http_server,
             process_descriptor,
+            drain: services.drain,
             announce_task,
         })
     }
@@ -1723,10 +1725,8 @@ mod tests {
             ))
             .expect("establishing a query context with a participant is legal");
 
-        let ingress = native_runtime_filter_envelope_ingress(
-            Arc::clone(&services.query_lifecycle_registry),
-            Arc::clone(&services.query_context_host),
-        );
+        let ingress =
+            native_runtime_filter_envelope_ingress(Arc::clone(&services.query_context_host));
         let reason = ingress
             .accept(envelope)
             .rejection_reason()

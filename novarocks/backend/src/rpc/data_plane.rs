@@ -10,7 +10,6 @@ use novarocks_types::UniqueId;
 
 use super::data_plane_handlers;
 use super::data_plane_handlers::{ExchangeRouteAuthority, ExchangeRouteClaim, ExchangeRouteQuery};
-use crate::query_lifecycle::QueryLifecycleIngress;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
 use crate::task_execution::{
     RootResultRoute, StatusAdvance, TaskExecutionRegistry, TaskInboundCapabilities,
@@ -25,22 +24,6 @@ use novarocks_proto_models as proto;
 use std::sync::Arc;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// The fragment-based query lifecycle as an exchange-route authority.
-///
-/// It holds the destinations of every query admitted through `InitQuery`,
-/// which is what `EXPLAIN ANALYZE` still runs on.
-struct LifecycleRouteAuthority(Arc<dyn QueryLifecycleIngress>);
-
-impl ExchangeRouteAuthority for LifecycleRouteAuthority {
-    fn authority_name(&self) -> &'static str {
-        "the fragment query lifecycle"
-    }
-
-    fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
-        self.0.claim_exchange_route(query)
-    }
-}
 
 /// The task substrate as an exchange-route authority.
 ///
@@ -89,22 +72,25 @@ impl BackendDataPlane {
         }
     }
 
-    /// Composes the data plane with both exchange-destination owners.
+    /// Composes the data plane with every exchange-destination owner.
     ///
-    /// Both are wired unconditionally. They are not a fallback chain: each
-    /// answers only for the destinations it holds, and a frame is admitted
-    /// only when exactly one of them claims its destination.
+    /// One owner is wired today, so `settle_exchange_route`'s conflict arm
+    /// cannot fire from this composition -- a single authority can produce at
+    /// most one claimant. Its zero-claimant refusal stays live and is the
+    /// normal answer for a frame naming a destination this backend no longer
+    /// holds. The list is still a list because the conflict arm is the reason
+    /// this shape exists: whoever wires a second owner here needs it to
+    /// already be there, so that two owners claiming one destination is a
+    /// refusal rather than a race the wiring order settles.
     pub fn with_exchange_receiver_port(
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-        query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
         task_inbound_capabilities: Arc<TaskInboundCapabilities>,
     ) -> Self {
         Self {
             exchange_receiver_port,
-            exchange_route_authorities: vec![
-                Arc::new(LifecycleRouteAuthority(query_lifecycle_ingress)),
-                Arc::new(TaskRouteAuthority(task_inbound_capabilities)),
-            ],
+            exchange_route_authorities: vec![Arc::new(TaskRouteAuthority(
+                task_inbound_capabilities,
+            ))],
         }
     }
 

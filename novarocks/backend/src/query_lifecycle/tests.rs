@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
 use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -50,12 +49,12 @@ use super::registry::{
     QueryLifecycleRegistryConfig, StageBuildDecision,
 };
 use super::{
-    CatalogPruneOutcome, QueryControlAttachment, QueryHeartbeatDisposition, QueryLifecycleError,
-    QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminalFallbackTransport,
-    QueryTerminalFallbackTransportError,
+    QueryControlAttachment, QueryHeartbeatDisposition, QueryLifecycleErrorCode,
+    QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
 use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::rpc::runtime::test_backend_data_runtime;
+use crate::runtime_filter::error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::observation::RuntimeFilterObservationSnapshot;
 use crate::runtime_filter::participant::{
@@ -471,7 +470,7 @@ impl RuntimeFilterParticipantFactory for RecordingLocalRuntime {
         contribution: DecodedRuntimeFilterContribution,
     ) -> Result<
         Arc<crate::runtime_filter::participant::RuntimeFilterParticipant>,
-        QueryLifecycleError,
+        RuntimeFilterContractError,
     > {
         {
             let mut gate = self.state.install_gate.lock().expect("install gate");
@@ -491,8 +490,7 @@ impl RuntimeFilterParticipantFactory for RecordingLocalRuntime {
             .expect("install calls")
             .push(execution_id);
         if *self.state.fail_install.lock().expect("fail install") {
-            return Err(QueryLifecycleError::new(
-                QueryLifecycleErrorCode::InvalidManifest,
+            return Err(RuntimeFilterContractError::invalid_contract(
                 "injected runtime-filter participant install failure",
             ));
         }
@@ -512,8 +510,8 @@ impl RuntimeFilterParticipantFactory for RecordingLocalRuntime {
                     .expect("abort calls")
                     .push(execution_id);
                 if *state.fail_abort.lock().expect("fail abort") {
-                    return Err(QueryLifecycleError::new(
-                        QueryLifecycleErrorCode::Internal,
+                    return Err(RuntimeFilterContractError::new(
+                        RuntimeFilterContractErrorCode::ParticipantClosed,
                         "injected runtime-filter participant close failure",
                     ));
                 }
@@ -729,6 +727,7 @@ fn registry_with_blocking_catalog_materializer(
         .expect("test connector execution role factory set");
     QueryLifecycleRegistry::new_with_runtime_and_execution_role_binding_factories(
         test_backend_data_runtime(),
+        BackendProcessId::new_v7(),
         Arc::new(runtime),
         registry_config(8),
         novarocks_types::NativeCompatibilityId::new([0x71; 32]),
@@ -1488,8 +1487,8 @@ fn abort_during_catalog_loading_releases_leases_and_suppresses_ready() {
         )
         .expect("abort is accepted");
     assert_eq!(
-        registry.prune_catalogs(BTreeSet::new()),
-        CatalogPruneOutcome::Accepted,
+        registry.catalog_lease_snapshot().query_leases,
+        0,
         "the aborted query must no longer hold a catalog lease"
     );
 
@@ -2722,7 +2721,10 @@ fn runtime_filter_correctness_evidence_fails_terminal_capture_instead_of_becomin
     )
     .expect_err("sticky Backend observation correctness evidence must fail terminal capture");
 
-    assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
+    assert_eq!(
+        error.code(),
+        RuntimeFilterContractErrorCode::InvalidContract
+    );
     assert!(
         error
             .detail()
