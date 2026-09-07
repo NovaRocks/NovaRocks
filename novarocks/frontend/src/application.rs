@@ -181,30 +181,12 @@ const DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Durati
 /// a `FrontendExecutionConfig` built without a config file still validates.
 #[derive(Clone, Copy, Debug)]
 pub struct FrontendQueryControlTimeouts {
-    pub heartbeat_interval_ms: u64,
-    pub heartbeat_timeout_ms: u64,
-    pub init_rpc_timeout_ms: u64,
-    pub attach_timeout_ms: u64,
-    pub participant_fanout_max_inflight: usize,
-    pub stage_rpc_timeout_ms: u64,
-    pub start_rpc_timeout_ms: u64,
-    pub terminal_drain_timeout_ms: u64,
-    pub terminal_ack_timeout_ms: u64,
     pub pre_start_timeout_ms: u64,
 }
 
 impl Default for FrontendQueryControlTimeouts {
     fn default() -> Self {
         Self {
-            heartbeat_interval_ms: 1_000,
-            heartbeat_timeout_ms: 5_000,
-            init_rpc_timeout_ms: 5_000,
-            attach_timeout_ms: 5_000,
-            participant_fanout_max_inflight: 32,
-            stage_rpc_timeout_ms: 5_000,
-            start_rpc_timeout_ms: 2_000,
-            terminal_drain_timeout_ms: 30_000,
-            terminal_ack_timeout_ms: 5_000,
             pre_start_timeout_ms: 30_000,
         }
     }

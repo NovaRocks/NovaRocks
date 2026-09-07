@@ -397,16 +397,6 @@ fn query_lifecycle_fault_preferred_live_index(
         // reached at all -- which is the difference between a scenario that
         // proves something and one that passes because the fault never fired.
         QueryLifecycleFaultKind::RestartAfterEstablishContext,
-        QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
-        QueryLifecycleFaultKind::ObservationP2BudgetPressure,
-        QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
-        QueryLifecycleFaultKind::TerminalP0BytesExhausted,
-        QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
-        QueryLifecycleFaultKind::TerminalP1EncodeFailure,
-        QueryLifecycleFaultKind::TerminalP1RetentionExhausted,
-        QueryLifecycleFaultKind::TerminalProofStreamDrop,
-        QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
-        QueryLifecycleFaultKind::TerminalOutcomeSuppress,
     ];
     let armed = backends
         .entries

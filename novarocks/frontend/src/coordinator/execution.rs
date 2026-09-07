@@ -43,8 +43,6 @@ use crate::query_execution::contract::{
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
     PreReadyTopologyOutcome, ProfileTerminalBuilder,
 };
-#[cfg(test)]
-use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
@@ -58,12 +56,6 @@ use novarocks_types::{
     QueryIdAttribution, QueryProcessNamespace,
 };
 
-use super::query_lifecycle::FrontendLifecycleMetrics;
-use super::query_lifecycle::{FrontendQueryLifecycleConfig, QueryLifecycleTransport};
-#[cfg(test)]
-use super::query_lifecycle::{
-    QueryControlSession, QueryLifecycleTransportError, QueryLifecycleTransportErrorKind,
-};
 use super::query_registry::{
     FrontendQueryRegistry, QueryFailureCause, QueryLifecycleConvergenceReader,
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
@@ -78,14 +70,14 @@ use super::task_round::{
     AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
 };
 use crate::metrics::{
-    observe_pre_ready_replan, observe_waiting_for_backend, record_pre_ready_effect_gate,
-    record_pre_ready_replan,
+    FrontendProcessQueryCountersSnapshot, observe_pre_ready_replan, observe_waiting_for_backend,
+    record_pre_ready_effect_gate, record_pre_ready_replan,
 };
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::task_transport::AttemptWireFacts;
-use crate::native::transport::{new_fragment_dispatcher, new_query_lifecycle_transport};
+use crate::native::transport::new_fragment_dispatcher;
 use crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions;
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
@@ -104,15 +96,6 @@ use crate::task_execution::status_intake::{CondvarWake, StatusIntakeWake};
 use novarocks_execution::task_execution::{
     AbortCause, FinalTaskInfo, MaxWait, OperationKind, TaskIdentity,
 };
-#[cfg(test)]
-use novarocks_proto_codec::lifecycle::{
-    QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
-    QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest,
-    QueryStartAck, QueryStartOutcome, QueryStartRequest, QueryTerminationAck,
-    QueryTerminationReason, StageDigest,
-};
-#[cfg(test)]
-use novarocks_proto_models::novarocks as protocol;
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> Result<QueryId, DistributedQueryError>;
@@ -305,238 +288,18 @@ enum BackendServicesSource {
     Fixed {
         scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<dyn FragmentDispatcher>,
-        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     },
     #[cfg(test)]
     Sequence {
         schedulers: Mutex<VecDeque<FrontendFragmentScheduler>>,
         dispatcher: Arc<dyn FragmentDispatcher>,
-        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     },
 }
 
 struct QueryBackendServices {
     scheduler: FrontendFragmentScheduler,
     dispatcher: Arc<dyn FragmentDispatcher>,
-    lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     live_backends: Vec<LiveBackendTarget>,
-}
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Coordinator test fixture provides an immediately ready lifecycle transport."
-)]
-pub(crate) fn ready_lifecycle_transport_for_test() -> Arc<dyn QueryLifecycleTransport> {
-    Arc::new(ReadyLifecycleTransportForTest)
-}
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Coordinator test fixture provides the ready lifecycle transport implementation."
-)]
-struct ReadyLifecycleTransportForTest;
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Coordinator test fixture stores ready control events for lifecycle assertions."
-)]
-struct ReadyLifecycleSessionForTest {
-    events: Mutex<VecDeque<QueryControlEvent>>,
-}
-
-#[cfg(test)]
-impl QueryControlSession for ReadyLifecycleSessionForTest {
-    fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
-        use protocol::query_control_request::Command;
-        use protocol::query_control_response::Event;
-
-        let event = match command.as_proto().command.as_ref() {
-            Some(Command::Heartbeat(heartbeat)) => {
-                QueryControlEvent::parse(protocol::QueryControlResponse {
-                    event: Some(Event::HeartbeatAck(protocol::QueryControlHeartbeatAck {
-                        sequence: heartbeat.sequence,
-                    })),
-                })
-            }
-            Some(Command::Abort(_)) => QueryControlEvent::parse(protocol::QueryControlResponse {
-                event: Some(Event::TerminationAccepted(
-                    protocol::QueryControlTerminationAccepted {
-                        reason: QueryTerminationReason::QueryTerminationCoordinatorAbort as i32,
-                    },
-                )),
-            }),
-            Some(Command::Finalize(_)) => {
-                QueryControlEvent::parse(protocol::QueryControlResponse {
-                    event: Some(Event::TerminationAccepted(
-                        protocol::QueryControlTerminationAccepted {
-                            reason: QueryTerminationReason::QueryTerminationCoordinatorFinalize
-                                as i32,
-                        },
-                    )),
-                })
-            }
-            Some(Command::TerminalAck(_)) => return Ok(()),
-            Some(Command::CredentialLeasePrepare(prepare)) => {
-                let envelope = prepare
-                    .envelope
-                    .as_ref()
-                    .expect("validated credential lease prepare envelope");
-                QueryControlEvent::parse(protocol::QueryControlResponse {
-                    event: Some(Event::CredentialLeasePrepared(
-                        protocol::CredentialLeasePrepared {
-                            lease_id: envelope.lease_id.clone(),
-                            epoch: envelope.epoch,
-                        },
-                    )),
-                })
-            }
-            Some(Command::CredentialLeaseCommit(commit)) => {
-                QueryControlEvent::parse(protocol::QueryControlResponse {
-                    event: Some(Event::CredentialLeaseCommitted(
-                        protocol::CredentialLeaseCommitted {
-                            lease_id: commit.lease_id.clone(),
-                            epoch: commit.epoch,
-                        },
-                    )),
-                })
-            }
-            Some(Command::Attach(_)) | None => unreachable!("validated control command"),
-        };
-        let event = event.map_err(protocol_contract_error)?;
-        self.events
-            .lock()
-            .expect("ready lifecycle session")
-            .push_back(event);
-        Ok(())
-    }
-
-    fn recv_timeout(
-        &self,
-        _timeout: Duration,
-    ) -> Result<QueryControlEvent, QueryLifecycleTransportError> {
-        self.events
-            .lock()
-            .expect("ready lifecycle session")
-            .pop_front()
-            .ok_or_else(|| {
-                QueryLifecycleTransportError::new(
-                    QueryLifecycleTransportErrorKind::DeadlineExceeded,
-                    "ready lifecycle session has no pending event",
-                )
-            })
-    }
-}
-
-#[cfg(test)]
-impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
-    fn init_query(
-        &self,
-        _target: QueryLifecycleTarget,
-        request: QueryInitRequest,
-        _timeout: Duration,
-    ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
-        let manifest = request.manifest().map_err(protocol_contract_error)?;
-        let execution_id = manifest.execution_id().map_err(protocol_contract_error)?;
-        let digest = manifest.digest().map_err(protocol_contract_error)?;
-        QueryInitAck::parse(protocol::InitQueryResponse {
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                execution_id,
-            )),
-            init_digest: digest.as_bytes().to_vec(),
-            outcome: QueryInitOutcome::QueryInitApplied as i32,
-        })
-        .map_err(protocol_contract_error)
-    }
-
-    fn attach_control(
-        &self,
-        _target: QueryLifecycleTarget,
-        _attach: QueryControlAttach,
-        _timeout: Duration,
-    ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
-        Ok(Arc::new(ReadyLifecycleSessionForTest {
-            events: Mutex::new(VecDeque::from([QueryControlEvent::parse(
-                protocol::QueryControlResponse {
-                    event: Some(protocol::query_control_response::Event::ControlReady(
-                        protocol::QueryControlReady {
-                            catalog_load_state: Some(
-                                novarocks_proto_models::catalog::CatalogLoadState {
-                                    state: Some(
-                                        novarocks_proto_models::catalog::catalog_load_state::State::Ready(
-                                            novarocks_proto_models::catalog::CatalogReady {},
-                                        ),
-                                    ),
-                                },
-                            ),
-                        },
-                    )),
-                },
-            )
-            .expect("ready lifecycle control-ready event is valid")])),
-        }))
-    }
-
-    fn stage_fragments(
-        &self,
-        _target: QueryLifecycleTarget,
-        request: &QueryStageRequest,
-        _timeout: Duration,
-    ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
-        QueryStageAck::new(
-            request
-                .participant()
-                .execution_id()
-                .map_err(protocol_contract_error)?,
-            StageDigest::compute(request.participant(), &request.fragments())
-                .map_err(protocol_contract_error)?,
-            QueryStageOutcome::Applied,
-            "test participant staged",
-        )
-        .map_err(protocol_contract_error)
-    }
-
-    fn start_prepared_query(
-        &self,
-        _target: QueryLifecycleTarget,
-        request: &QueryStartRequest,
-        _timeout: Duration,
-    ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
-        QueryStartAck::new(
-            request.execution_id(),
-            request.digest(),
-            QueryStartOutcome::Applied,
-            "test participant started",
-        )
-        .map_err(protocol_contract_error)
-    }
-
-    fn abort_query(
-        &self,
-        _target: QueryLifecycleTarget,
-        request: QueryAbortRequest,
-        _timeout: Duration,
-    ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
-        QueryTerminationAck::parse(protocol::AbortQueryResponse {
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                request.execution_id().map_err(protocol_contract_error)?,
-            )),
-            accepted_reason: QueryTerminationReason::QueryTerminationCoordinatorAbort as i32,
-        })
-        .map_err(protocol_contract_error)
-    }
-}
-
-#[cfg(test)]
-fn protocol_contract_error(
-    error: novarocks_proto_codec::ProtocolError,
-) -> QueryLifecycleTransportError {
-    QueryLifecycleTransportError::new(
-        QueryLifecycleTransportErrorKind::InvalidResponse,
-        error.to_string(),
-    )
 }
 
 #[cfg(test)]
@@ -549,18 +312,15 @@ impl BackendServicesSource {
             Self::Fixed {
                 scheduler,
                 dispatcher,
-                lifecycle_transport,
             } => Ok(QueryBackendServices {
                 scheduler: scheduler.clone(),
                 dispatcher: Arc::clone(dispatcher),
-                lifecycle_transport: Arc::clone(lifecycle_transport),
                 live_backends: topology.to_vec(),
             }),
             #[cfg(test)]
             Self::Sequence {
                 schedulers,
                 dispatcher,
-                lifecycle_transport,
             } => {
                 let scheduler = schedulers
                     .lock()
@@ -570,7 +330,6 @@ impl BackendServicesSource {
                 Ok(QueryBackendServices {
                     scheduler,
                     dispatcher: Arc::clone(dispatcher),
-                    lifecycle_transport: Arc::clone(lifecycle_transport),
                     live_backends: topology.to_vec(),
                 })
             }
@@ -595,8 +354,6 @@ fn production_backend_services(
     Ok(QueryBackendServices {
         scheduler: FrontendFragmentScheduler::new(snapshot),
         dispatcher: new_fragment_dispatcher(&entries, data_runtime.clone()).map_err(failed)?,
-        lifecycle_transport: new_query_lifecycle_transport(topology, data_runtime.clone())
-            .map_err(failed)?,
         live_backends: topology.to_vec(),
     })
 }
@@ -659,26 +416,6 @@ impl RoundCredentialLeaseSource {
     }
 }
 
-fn build_lifecycle_config(
-    timeouts: crate::application::FrontendQueryControlTimeouts,
-) -> Result<FrontendQueryLifecycleConfig, DistributedQueryError> {
-    FrontendQueryLifecycleConfig::new(
-        Duration::from_millis(timeouts.heartbeat_interval_ms),
-        Duration::from_millis(timeouts.heartbeat_timeout_ms),
-        Duration::from_millis(timeouts.init_rpc_timeout_ms),
-        Duration::from_millis(timeouts.attach_timeout_ms),
-    )?
-    .with_stage_start_timeouts(
-        Duration::from_millis(timeouts.stage_rpc_timeout_ms),
-        Duration::from_millis(timeouts.start_rpc_timeout_ms),
-    )?
-    .with_terminal_timeouts(
-        Duration::from_millis(timeouts.terminal_drain_timeout_ms),
-        Duration::from_millis(timeouts.terminal_ack_timeout_ms),
-    )?
-    .with_participant_fanout_max_inflight(timeouts.participant_fanout_max_inflight)
-}
-
 impl FrontendDistributedQueryCoordinator {
     #[expect(
         private_interfaces,
@@ -696,9 +433,6 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, DistributedQueryError> {
-        // Reject an unusable `[runtime]` query-control section at startup rather
-        // than on the first query that tries to use it.
-        build_lifecycle_config(query_control_timeouts)?;
         let query_id_source = UniqueQueryIdSource::default();
         let query_namespace = query_id_source.namespace();
         tracing::info!(
@@ -745,7 +479,6 @@ impl FrontendDistributedQueryCoordinator {
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
-        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     ) -> Self {
         let topology = crate::topology::ClusterBackendService::from_captured_targets_for_test(
             &scheduler.live_targets(),
@@ -757,7 +490,6 @@ impl FrontendDistributedQueryCoordinator {
             dispatcher,
             runtime_filter_worker_count,
             _test_fixture,
-            lifecycle_transport,
             Arc::new(topology),
         )
     }
@@ -778,7 +510,6 @@ impl FrontendDistributedQueryCoordinator {
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
-        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
     ) -> Self {
         let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
@@ -793,7 +524,6 @@ impl FrontendDistributedQueryCoordinator {
             backend_services: Some(BackendServicesSource::Fixed {
                 scheduler,
                 dispatcher,
-                lifecycle_transport,
             }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
@@ -822,7 +552,6 @@ impl FrontendDistributedQueryCoordinator {
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
-        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     ) -> Self {
         let targets = schedulers
             .iter()
@@ -837,7 +566,6 @@ impl FrontendDistributedQueryCoordinator {
             dispatcher,
             runtime_filter_worker_count,
             _test_fixture,
-            lifecycle_transport,
             Arc::new(topology),
         )
     }
@@ -854,7 +582,6 @@ impl FrontendDistributedQueryCoordinator {
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
-        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
     ) -> Self {
         let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
@@ -869,7 +596,6 @@ impl FrontendDistributedQueryCoordinator {
             backend_services: Some(BackendServicesSource::Sequence {
                 schedulers: Mutex::new(schedulers.into()),
                 dispatcher,
-                lifecycle_transport,
             }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
@@ -2131,9 +1857,12 @@ impl FrontendDistributedQueryCoordinator {
     /// attempt aborts its contexts instead of releasing them, so it has no
     /// sealed contribution to publish at all.
     ///
-    /// `metrics` carries the process-wide lifecycle counters, which is the
-    /// same set the lifecycle attempt publishes -- neither protocol keeps an
-    /// attempt-scoped copy of them.
+    /// `metrics` carries the process-scoped frontend query counters. The task
+    /// protocol has no producer for that set -- the retired lifecycle chain was
+    /// its only one -- so the rollup reports the default rather than inventing
+    /// a value it does not own. See
+    /// [`crate::metrics::process_query_counters`] for what retiring the set
+    /// would take.
     fn publish_task_round_convergence(
         &self,
         execution_id: QueryExecutionId,
@@ -2165,7 +1894,7 @@ impl FrontendDistributedQueryCoordinator {
                 primary_error: None,
                 participant_outcomes: Vec::new(),
                 runtime_filter,
-                metrics: FrontendLifecycleMetrics::process_shared().snapshot(),
+                metrics: FrontendProcessQueryCountersSnapshot::default(),
             });
     }
 
@@ -2715,8 +2444,8 @@ mod tests {
 
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
-        FrontendReportEndpointBinding, QueryIdSource, ReadyLifecycleTransportForTest,
-        UniqueQueryIdSource, distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
+        FrontendReportEndpointBinding, QueryIdSource, UniqueQueryIdSource,
+        distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
         pre_ready_topology_validation_error,
     };
     use crate::common::backend_topology::CoordinatorReportEndpointSink;
@@ -3218,7 +2947,6 @@ mod tests {
                 Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
                 Arc::new(()),
-                Arc::new(ReadyLifecycleTransportForTest),
                 Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
             );
         // The membership owner replaces the captured process. Published before
@@ -3313,7 +3041,6 @@ mod tests {
                 Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
                 Arc::new(()),
-                Arc::new(ReadyLifecycleTransportForTest),
                 Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
             );
         topology
@@ -3394,7 +3121,6 @@ mod tests {
             Arc::new(FailingAfterStartDispatcher),
             NonZeroUsize::new(1).expect("nonzero workers"),
             Arc::new(()),
-            Arc::new(ReadyLifecycleTransportForTest),
             Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
         );
         let control_ready_closures = Arc::new(AtomicUsize::new(0));

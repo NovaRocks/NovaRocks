@@ -1177,12 +1177,6 @@ pub struct RuntimeConfig {
     pub query_control_heartbeat_interval_ms: u64,
     #[serde(default = "default_query_control_heartbeat_timeout_ms")]
     pub query_control_heartbeat_timeout_ms: u64,
-    #[serde(default = "default_query_control_init_rpc_timeout_ms")]
-    pub query_control_init_rpc_timeout_ms: u64,
-    #[serde(default = "default_query_control_attach_timeout_ms")]
-    pub query_control_attach_timeout_ms: u64,
-    #[serde(default = "default_query_control_participant_fanout_max_inflight")]
-    pub query_control_participant_fanout_max_inflight: usize,
     #[serde(default = "default_catalog_prune_interval_ms")]
     pub catalog_prune_interval_ms: u64,
     #[serde(default = "default_catalog_prune_rpc_timeout_ms")]
@@ -1207,10 +1201,6 @@ pub struct RuntimeConfig {
     pub catalog_bind_provider_max_concurrent: usize,
     #[serde(default = "default_catalog_bind_provider_min_interval_ms")]
     pub catalog_bind_provider_min_interval_ms: u64,
-    #[serde(default = "default_query_control_stage_rpc_timeout_ms")]
-    pub query_control_stage_rpc_timeout_ms: u64,
-    #[serde(default = "default_query_control_start_rpc_timeout_ms")]
-    pub query_control_start_rpc_timeout_ms: u64,
     #[serde(default = "default_query_control_pre_start_timeout_ms")]
     pub query_control_pre_start_timeout_ms: u64,
     #[serde(default = "default_query_control_task_update_rpc_timeout_ms")]
@@ -1475,18 +1465,6 @@ fn default_query_control_heartbeat_timeout_ms() -> u64 {
     5_000
 }
 
-fn default_query_control_init_rpc_timeout_ms() -> u64 {
-    5_000
-}
-
-fn default_query_control_attach_timeout_ms() -> u64 {
-    5_000
-}
-
-fn default_query_control_participant_fanout_max_inflight() -> usize {
-    32
-}
-
 fn default_catalog_prune_interval_ms() -> u64 {
     30_000
 }
@@ -1525,14 +1503,6 @@ fn default_catalog_bind_provider_max_concurrent() -> usize {
 }
 fn default_catalog_bind_provider_min_interval_ms() -> u64 {
     0
-}
-
-fn default_query_control_stage_rpc_timeout_ms() -> u64 {
-    5_000
-}
-
-fn default_query_control_start_rpc_timeout_ms() -> u64 {
-    2_000
 }
 
 fn default_query_control_pre_start_timeout_ms() -> u64 {
@@ -1834,28 +1804,12 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
             runtime.query_control_heartbeat_timeout_ms,
         ),
         (
-            "runtime.query_control_init_rpc_timeout_ms",
-            runtime.query_control_init_rpc_timeout_ms,
-        ),
-        (
-            "runtime.query_control_attach_timeout_ms",
-            runtime.query_control_attach_timeout_ms,
-        ),
-        (
             "runtime.catalog_prune_interval_ms",
             runtime.catalog_prune_interval_ms,
         ),
         (
             "runtime.catalog_prune_rpc_timeout_ms",
             runtime.catalog_prune_rpc_timeout_ms,
-        ),
-        (
-            "runtime.query_control_stage_rpc_timeout_ms",
-            runtime.query_control_stage_rpc_timeout_ms,
-        ),
-        (
-            "runtime.query_control_start_rpc_timeout_ms",
-            runtime.query_control_start_rpc_timeout_ms,
         ),
         (
             "runtime.query_control_pre_start_timeout_ms",
@@ -1909,9 +1863,6 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
     }
     if runtime.query_control_tombstone_capacity == 0 {
         bail!("runtime.query_control_tombstone_capacity must be greater than 0");
-    }
-    if runtime.query_control_participant_fanout_max_inflight == 0 {
-        bail!("runtime.query_control_participant_fanout_max_inflight must be greater than 0");
     }
     if runtime.catalog_prune_max_inflight == 0 {
         bail!("runtime.catalog_prune_max_inflight must be greater than 0");
@@ -2252,10 +2203,6 @@ impl Default for RuntimeConfig {
             exchange_io_max_inflight_bytes: default_exchange_io_max_inflight_bytes(),
             query_control_heartbeat_interval_ms: default_query_control_heartbeat_interval_ms(),
             query_control_heartbeat_timeout_ms: default_query_control_heartbeat_timeout_ms(),
-            query_control_init_rpc_timeout_ms: default_query_control_init_rpc_timeout_ms(),
-            query_control_attach_timeout_ms: default_query_control_attach_timeout_ms(),
-            query_control_participant_fanout_max_inflight:
-                default_query_control_participant_fanout_max_inflight(),
             catalog_prune_interval_ms: default_catalog_prune_interval_ms(),
             catalog_prune_rpc_timeout_ms: default_catalog_prune_rpc_timeout_ms(),
             catalog_prune_max_inflight: default_catalog_prune_max_inflight(),
@@ -2272,8 +2219,6 @@ impl Default for RuntimeConfig {
                 default_catalog_bind_transient_retry_cooldown_ms(),
             catalog_bind_provider_max_concurrent: default_catalog_bind_provider_max_concurrent(),
             catalog_bind_provider_min_interval_ms: default_catalog_bind_provider_min_interval_ms(),
-            query_control_stage_rpc_timeout_ms: default_query_control_stage_rpc_timeout_ms(),
-            query_control_start_rpc_timeout_ms: default_query_control_start_rpc_timeout_ms(),
             query_control_pre_start_timeout_ms: default_query_control_pre_start_timeout_ms(),
             query_control_task_update_rpc_timeout_ms:
                 default_query_control_task_update_rpc_timeout_ms(),
@@ -3051,9 +2996,6 @@ access_key_secret = ""
 
         assert_eq!(runtime.query_control_heartbeat_interval_ms, 1_000);
         assert_eq!(runtime.query_control_heartbeat_timeout_ms, 5_000);
-        assert_eq!(runtime.query_control_init_rpc_timeout_ms, 5_000);
-        assert_eq!(runtime.query_control_attach_timeout_ms, 5_000);
-        assert_eq!(runtime.query_control_participant_fanout_max_inflight, 32);
         assert_eq!(runtime.catalog_prune_interval_ms, 30_000);
         assert_eq!(runtime.catalog_prune_rpc_timeout_ms, 5_000);
         assert_eq!(runtime.catalog_prune_max_inflight, 16);
@@ -3068,8 +3010,6 @@ access_key_secret = ""
         assert_eq!(runtime.catalog_bind_failed_retention_ms, 60_000);
         assert_eq!(runtime.catalog_bind_transient_retry_cooldown_ms, 1_000);
         assert_eq!(runtime.catalog_bind_provider_max_concurrent, 4);
-        assert_eq!(runtime.query_control_stage_rpc_timeout_ms, 5_000);
-        assert_eq!(runtime.query_control_start_rpc_timeout_ms, 2_000);
         assert_eq!(runtime.query_control_pre_start_timeout_ms, 30_000);
         assert_eq!(runtime.query_control_task_update_rpc_timeout_ms, 5_000);
         assert_eq!(
@@ -3131,21 +3071,12 @@ access_key_secret = ""
         reason = "The table-driven validation fixture keeps each field mutator explicit."
     )]
     fn query_control_config_rejects_zero_values() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 16] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 13] = [
             ("query_control_heartbeat_interval_ms", |runtime| {
                 runtime.query_control_heartbeat_interval_ms = 0;
             }),
             ("query_control_heartbeat_timeout_ms", |runtime| {
                 runtime.query_control_heartbeat_timeout_ms = 0;
-            }),
-            ("query_control_init_rpc_timeout_ms", |runtime| {
-                runtime.query_control_init_rpc_timeout_ms = 0;
-            }),
-            ("query_control_attach_timeout_ms", |runtime| {
-                runtime.query_control_attach_timeout_ms = 0;
-            }),
-            ("query_control_participant_fanout_max_inflight", |runtime| {
-                runtime.query_control_participant_fanout_max_inflight = 0;
             }),
             ("catalog_prune_interval_ms", |runtime| {
                 runtime.catalog_prune_interval_ms = 0;

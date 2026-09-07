@@ -18,16 +18,16 @@
 use std::sync::Arc;
 
 use crate::query_execution::contract::DistributedQueryErrorKind;
-use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
+use crate::{QueryTerminalReportError, QueryTerminalReportErrorCode};
 use novarocks_proto_codec::lifecycle::{
     ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
 
 use super::query_registry::FrontendQueryRegistry;
 
-/// Typed unary fallback owner for QLC-4 terminal delivery.  It shares the
-/// query registry with stream delivery but is intentionally not a fragment
-/// execution-status handler.
+/// Typed owner of frontend terminal-outcome delivery.  It writes through the
+/// query registry and is intentionally not a fragment execution-status
+/// handler.
 #[derive(Clone)]
 pub struct FrontendCoordinatorTerminalIngress {
     registry: Arc<FrontendQueryRegistry>,
@@ -39,7 +39,7 @@ pub trait QueryTerminalIngress: Send + Sync + 'static {
     fn report_query_terminal(
         &self,
         outcome: ParticipantTerminalOutcome,
-    ) -> Result<QueryTerminalReportAck, QueryLifecycleError>;
+    ) -> Result<QueryTerminalReportAck, QueryTerminalReportError>;
 }
 
 impl FrontendCoordinatorTerminalIngress {
@@ -52,7 +52,7 @@ impl QueryTerminalIngress for FrontendCoordinatorTerminalIngress {
     fn report_query_terminal(
         &self,
         outcome: ParticipantTerminalOutcome,
-    ) -> Result<QueryTerminalReportAck, QueryLifecycleError> {
+    ) -> Result<QueryTerminalReportAck, QueryTerminalReportError> {
         match self.registry.report_query_terminal(outcome) {
             Ok(true) => terminal_report_ack(
                 QueryTerminalReportOutcome::Accepted,
@@ -71,8 +71,8 @@ impl QueryTerminalIngress for FrontendCoordinatorTerminalIngress {
                     error.message(),
                 )
             }
-            Err(error) => Err(QueryLifecycleError::new(
-                QueryLifecycleErrorCode::Internal,
+            Err(error) => Err(QueryTerminalReportError::new(
+                QueryTerminalReportErrorCode::Internal,
                 error.message(),
             )),
         }
@@ -82,10 +82,10 @@ impl QueryTerminalIngress for FrontendCoordinatorTerminalIngress {
 fn terminal_report_ack(
     outcome: QueryTerminalReportOutcome,
     detail: impl Into<String>,
-) -> Result<QueryTerminalReportAck, QueryLifecycleError> {
+) -> Result<QueryTerminalReportAck, QueryTerminalReportError> {
     QueryTerminalReportAck::new(outcome, detail).map_err(|error| {
-        QueryLifecycleError::new(
-            QueryLifecycleErrorCode::Internal,
+        QueryTerminalReportError::new(
+            QueryTerminalReportErrorCode::Internal,
             format!("failed to construct query terminal report acknowledgement: {error}"),
         )
     })

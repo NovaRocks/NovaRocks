@@ -23,7 +23,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
+use crate::{QueryTerminalReportError, QueryTerminalReportErrorCode};
 use novarocks_proto_codec::lifecycle::QueryTerminalSnapshot;
 use novarocks_proto_models::novarocks;
 
@@ -35,7 +35,9 @@ pub struct QueryTerminalSet {
 }
 
 impl QueryTerminalSet {
-    pub fn new(mut snapshots: Vec<QueryTerminalSnapshot>) -> Result<Self, QueryLifecycleError> {
+    pub fn new(
+        mut snapshots: Vec<QueryTerminalSnapshot>,
+    ) -> Result<Self, QueryTerminalReportError> {
         snapshots.sort_by_key(|snapshot| {
             (
                 snapshot.execution_id(),
@@ -55,8 +57,8 @@ impl QueryTerminalSet {
                     .expect("validated terminal snapshot always has a backend process id"),
             );
             if !identities.insert(identity) {
-                return Err(QueryLifecycleError::new(
-                    QueryLifecycleErrorCode::Conflict,
+                return Err(QueryTerminalReportError::new(
+                    QueryTerminalReportErrorCode::Conflict,
                     "query terminal set contains duplicate participant identity",
                 ));
             }
@@ -67,7 +69,7 @@ impl QueryTerminalSet {
     /// Protocol has already validated every canonical snapshot at ingress.
     pub fn from_protocol_snapshots(
         snapshots: Vec<QueryTerminalSnapshot>,
-    ) -> Result<Self, QueryLifecycleError> {
+    ) -> Result<Self, QueryTerminalReportError> {
         Self::new(snapshots)
     }
 

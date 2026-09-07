@@ -37,7 +37,7 @@ mod native;
 pub mod query;
 pub mod query_control;
 pub mod query_execution;
-mod query_lifecycle_error;
+mod query_terminal_report_error;
 pub mod runtime;
 pub mod runtime_filter;
 mod server;
@@ -79,7 +79,7 @@ pub use native::report_server::FrontendReportServerHandle;
 pub use native::transport::FrontendNativeTransport;
 pub use query::FrontendQueryService;
 pub use query_execution::split_assignment::TaskUpdateRetryPolicy;
-pub use query_lifecycle_error::{QueryLifecycleError, QueryLifecycleErrorCode};
+pub use query_terminal_report_error::{QueryTerminalReportError, QueryTerminalReportErrorCode};
 pub use server::{
     FrontendServerConfig, build_frontend_query_session_factory,
     open_frontend_application_for_server, run_frontend_server, run_frontend_server_until_shutdown,

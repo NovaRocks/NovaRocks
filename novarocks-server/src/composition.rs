@@ -551,16 +551,6 @@ pub fn compose_frontend_server_config(
         .map_err(|error| anyhow::anyhow!("construct catalog materialization configuration: {error}"))?,
     )
     .with_query_control_timeouts(FrontendQueryControlTimeouts {
-        heartbeat_interval_ms: runtime_config.query_control_heartbeat_interval_ms,
-        heartbeat_timeout_ms: runtime_config.query_control_heartbeat_timeout_ms,
-        init_rpc_timeout_ms: runtime_config.query_control_init_rpc_timeout_ms,
-        attach_timeout_ms: runtime_config.query_control_attach_timeout_ms,
-        participant_fanout_max_inflight: runtime_config
-            .query_control_participant_fanout_max_inflight,
-        stage_rpc_timeout_ms: runtime_config.query_control_stage_rpc_timeout_ms,
-        start_rpc_timeout_ms: runtime_config.query_control_start_rpc_timeout_ms,
-        terminal_drain_timeout_ms: runtime_config.query_control_terminal_drain_timeout_ms,
-        terminal_ack_timeout_ms: runtime_config.query_control_terminal_ack_timeout_ms,
         pre_start_timeout_ms: runtime_config.query_control_pre_start_timeout_ms,
     })
     .with_task_update_retry_policy(

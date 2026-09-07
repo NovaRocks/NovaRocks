@@ -7,7 +7,6 @@ pub(crate) mod codec;
 pub(crate) mod data_runtime;
 pub(crate) mod fragment_encoder;
 pub(crate) mod fragment_transport;
-pub(crate) mod query_lifecycle;
 pub(crate) mod report_server;
 pub(crate) mod task_transport;
 pub(crate) mod transport;

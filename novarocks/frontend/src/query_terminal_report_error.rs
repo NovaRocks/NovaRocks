@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-local lifecycle failure vocabulary.
+//! Failure vocabulary for the frontend's terminal-outcome report ingress.
 //!
-//! Protocol contract validation is converted at the Frontend boundary. Query
-//! admission, coordinator state, and native report transport failures stay in
-//! this role-local vocabulary rather than recreating a Core authority.
+//! Protocol contract validation is converted at the Frontend boundary. The
+//! refusals a backend can be told about when it reports a participant terminal
+//! outcome stay in this role-local vocabulary rather than recreating a Core
+//! authority, and [`crate::native::report_server`] maps them to the one gRPC
+//! status the caller sees.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryLifecycleErrorCode {
+pub enum QueryTerminalReportErrorCode {
     InvalidManifest,
     Conflict,
     StaleBackend,
@@ -33,13 +35,13 @@ pub enum QueryLifecycleErrorCode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryLifecycleError {
-    code: QueryLifecycleErrorCode,
+pub struct QueryTerminalReportError {
+    code: QueryTerminalReportErrorCode,
     detail: String,
 }
 
-impl QueryLifecycleError {
-    pub fn new(code: QueryLifecycleErrorCode, detail: impl Into<String>) -> Self {
+impl QueryTerminalReportError {
+    pub fn new(code: QueryTerminalReportErrorCode, detail: impl Into<String>) -> Self {
         Self {
             code,
             detail: detail.into(),
@@ -47,10 +49,10 @@ impl QueryLifecycleError {
     }
 
     pub fn invalid_manifest(detail: impl Into<String>) -> Self {
-        Self::new(QueryLifecycleErrorCode::InvalidManifest, detail)
+        Self::new(QueryTerminalReportErrorCode::InvalidManifest, detail)
     }
 
-    pub const fn code(&self) -> QueryLifecycleErrorCode {
+    pub const fn code(&self) -> QueryTerminalReportErrorCode {
         self.code
     }
 
@@ -59,15 +61,15 @@ impl QueryLifecycleError {
     }
 }
 
-impl std::fmt::Display for QueryLifecycleError {
+impl std::fmt::Display for QueryTerminalReportError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{:?}: {}", self.code, self.detail)
     }
 }
 
-impl std::error::Error for QueryLifecycleError {}
+impl std::error::Error for QueryTerminalReportError {}
 
-impl From<novarocks_proto_codec::ProtocolError> for QueryLifecycleError {
+impl From<novarocks_proto_codec::ProtocolError> for QueryTerminalReportError {
     fn from(error: novarocks_proto_codec::ProtocolError) -> Self {
         Self::invalid_manifest(error.detail())
     }

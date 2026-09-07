@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::common::backend_topology::LiveBackendTarget;
-use crate::metrics::FrontendQueryLifecycleMetricsSnapshot;
+use crate::metrics::FrontendProcessQueryCountersSnapshot;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
@@ -51,7 +51,7 @@ pub(crate) struct QueryLifecycleConvergenceSnapshot {
     /// canonical `QueryTerminalSet`.  The unavailable variant records why no
     /// such set existed for this retained lifecycle snapshot.
     pub(crate) runtime_filter: RuntimeFilterTerminalRollupSnapshot,
-    pub(crate) metrics: FrontendQueryLifecycleMetricsSnapshot,
+    pub(crate) metrics: FrontendProcessQueryCountersSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -956,7 +956,7 @@ mod tests {
                 runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                     RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
                 ),
-                metrics: FrontendQueryLifecycleMetricsSnapshot::default(),
+                metrics: FrontendProcessQueryCountersSnapshot::default(),
             })
         }
     }
@@ -1099,7 +1099,7 @@ mod tests {
             runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                 RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
             ),
-            metrics: FrontendQueryLifecycleMetricsSnapshot::default(),
+            metrics: FrontendProcessQueryCountersSnapshot::default(),
         });
         let latest = QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
             .expect("a published task attempt is readable");

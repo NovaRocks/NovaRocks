@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 
 use crate::coordinator::QueryTerminalIngress;
 use crate::topology::ClusterBackendService;
-use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
+use crate::{QueryTerminalReportError, QueryTerminalReportErrorCode};
 use novarocks_proto_codec::lifecycle::{
     ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
@@ -668,7 +668,7 @@ fn runtime_filter_available_totals_debug(
 }
 
 fn lifecycle_metric_map(
-    metrics: crate::metrics::FrontendQueryLifecycleMetricsSnapshot,
+    metrics: crate::metrics::FrontendProcessQueryCountersSnapshot,
 ) -> BTreeMap<String, i64> {
     [
         ("active_attempts", metrics.active_attempts as i64),
@@ -923,7 +923,7 @@ impl NovaRocksGrpc for FrontendReportService {
             .map_err(|error| {
                 tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
             })?
-            .map_err(status_from_lifecycle_error)?;
+            .map_err(status_from_terminal_report_error)?;
         let response = report_response_from_ack(ack)?;
         Ok(tonic::Response::new(response))
     }
@@ -972,7 +972,7 @@ mod tests {
         QueryLifecycleConvergenceReader, QueryTerminalIngress, RuntimeFilterTerminalRollupSnapshot,
         RuntimeFilterTerminalRollupUnavailable,
     };
-    use crate::metrics::FrontendQueryLifecycleMetricsSnapshot;
+    use crate::metrics::FrontendProcessQueryCountersSnapshot;
     use crate::query_execution::runtime_filter_terminal_rollup::{
         RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
         RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalParticipant,
@@ -1020,7 +1020,7 @@ mod tests {
         fn report_query_terminal(
             &self,
             _outcome: ParticipantTerminalOutcome,
-        ) -> Result<QueryTerminalReportAck, crate::QueryLifecycleError> {
+        ) -> Result<QueryTerminalReportAck, crate::QueryTerminalReportError> {
             Ok(self.ack.clone())
         }
     }
@@ -1080,7 +1080,7 @@ mod tests {
             primary_error: None,
             participant_outcomes: Vec::new(),
             runtime_filter,
-            metrics: FrontendQueryLifecycleMetricsSnapshot::default(),
+            metrics: FrontendProcessQueryCountersSnapshot::default(),
         }
     }
 
@@ -1409,17 +1409,17 @@ mod tests {
     }
 }
 
-fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status {
+fn status_from_terminal_report_error(error: QueryTerminalReportError) -> tonic::Status {
     let detail = error.detail().to_string();
     match error.code() {
-        QueryLifecycleErrorCode::InvalidManifest => tonic::Status::invalid_argument(detail),
-        QueryLifecycleErrorCode::Conflict => tonic::Status::already_exists(detail),
-        QueryLifecycleErrorCode::StaleBackend | QueryLifecycleErrorCode::Terminated => {
+        QueryTerminalReportErrorCode::InvalidManifest => tonic::Status::invalid_argument(detail),
+        QueryTerminalReportErrorCode::Conflict => tonic::Status::already_exists(detail),
+        QueryTerminalReportErrorCode::StaleBackend | QueryTerminalReportErrorCode::Terminated => {
             tonic::Status::failed_precondition(detail)
         }
-        QueryLifecycleErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
-        QueryLifecycleErrorCode::Transport => tonic::Status::unavailable(detail),
-        QueryLifecycleErrorCode::Internal => tonic::Status::internal(detail),
+        QueryTerminalReportErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
+        QueryTerminalReportErrorCode::Transport => tonic::Status::unavailable(detail),
+        QueryTerminalReportErrorCode::Internal => tonic::Status::internal(detail),
     }
 }
 
