@@ -781,6 +781,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             self.queries.connector_cancellation_for_execution(execution),
             Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
             Some(typed_runtime),
+            Arc::clone(self.execution_runtime.function_catalog()),
         )
         .map_err(|error| protocol(format!("task {identity} plan is not decodable: {error}")))?;
 
@@ -796,6 +797,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         }
         let expects_bindings = request.has_runtime_filter_bindings();
         let (delivery_expire, query_expire) = request.query_expire_durations();
+        let exec_mem_limit = request.exec_mem_limit();
         // Profiling is the query's decision, exactly as it is on the
         // fragment-based path. Without it there is no per-operator counter to
         // read, and this task's final info reports no operator statistics
@@ -845,6 +847,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 kernel_key,
                 delivery_expire,
                 query_expire,
+                exec_mem_limit,
                 runtime_filter,
             )
             .map_err(|error| {
@@ -1727,29 +1730,41 @@ mod tests {
     }
 
     fn test_execution_runtime() -> Arc<ExecutionRuntime> {
+        let mut function_set =
+            novarocks_execution::exec::expr::agg::ExecutionFunctionSetBuilder::new();
+        novarocks_sql::compiler::contribute_builtin_functions(function_set.catalog_builder_mut())
+            .expect("builtin function metadata");
+        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+            &mut function_set,
+        )
+        .expect("builtin aggregate implementations");
+        let function_set = Arc::new(function_set.seal().expect("builtin execution function set"));
         Arc::new(
-            ExecutionRuntime::new(ExecutionRuntimeConfig {
-                driver_threads: 1,
-                scan_threads: 1,
-                scan_queue_capacity: 1,
-                spill_io_threads: 1,
-                spill_io_queue_capacity: 1,
-                spill_storage: ExecutionSpillStorageConfig::default(),
-                exchange_wait_ms: 120_000,
-                exchange_io_threads: 1,
-                exchange_io_max_inflight_bytes: 1,
-                exchange_max_transmit_batched_bytes: 1,
-                operator_buffer_chunks: 1,
-                local_exchange_buffer_mem_limit_per_driver: 1,
-                local_exchange_max_buffered_rows: 1,
-                connector_io_tasks_per_scan_operator: 1,
-                scan_submit_fail_max: 1,
-                scan_submit_fail_timeout_ms: 1,
-                runtime_filter_scan_wait_time_ms_override: None,
-                runtime_filter_wait_timeout_ms_override: None,
-                sink_io_worker_threads: 1,
-                sink_io_max_blocking_threads: 1,
-            })
+            ExecutionRuntime::new(
+                ExecutionRuntimeConfig {
+                    driver_threads: 1,
+                    scan_threads: 1,
+                    scan_queue_capacity: 1,
+                    spill_io_threads: 1,
+                    spill_io_queue_capacity: 1,
+                    spill_storage: ExecutionSpillStorageConfig::default(),
+                    exchange_wait_ms: 120_000,
+                    exchange_io_threads: 1,
+                    exchange_io_max_inflight_bytes: 1,
+                    exchange_max_transmit_batched_bytes: 1,
+                    operator_buffer_chunks: 1,
+                    local_exchange_buffer_mem_limit_per_driver: 1,
+                    local_exchange_max_buffered_rows: 1,
+                    connector_io_tasks_per_scan_operator: 1,
+                    scan_submit_fail_max: 1,
+                    scan_submit_fail_timeout_ms: 1,
+                    runtime_filter_scan_wait_time_ms_override: None,
+                    runtime_filter_wait_timeout_ms_override: None,
+                    sink_io_worker_threads: 1,
+                    sink_io_max_blocking_threads: 1,
+                },
+                function_set,
+            )
             .expect("test execution runtime"),
         )
     }
@@ -2696,7 +2711,6 @@ mod tests {
             UniqueId::new(3, 4),
             outcome,
             None,
-            Vec::new(),
         )
     }
 

@@ -43,7 +43,7 @@ use crate::config::{
     load_runner_config, placeholder_variables_with_run_id, resolve_config_path, resolve_path,
     resolve_reference_port, resolve_repo_root, resolve_target_port, suite_default_query_timeout,
 };
-use crate::failure_artifacts::{FailureArtifactContext, persist_cross_process_failure_logs};
+use crate::failure_artifacts::{FailureArtifactContext, FailureArtifactRecorder};
 use crate::parser::load_suite_hook;
 use crate::results::{
     MismatchArtifacts, case_result_path, compare_result_sets, find_legacy_result_paths,
@@ -669,6 +669,7 @@ struct SuiteRunContext {
     marker_re: Regex,
     fail_fast: bool,
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
+    failure_artifacts: Arc<FailureArtifactRecorder>,
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
     benchmark_profile_dir: Option<PathBuf>,
     benchmark_skip_init: bool,
@@ -1750,8 +1751,7 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         "    @publication_catalog_fault before-dispatch hold reached"
     );
 
-    let (companion_ok, _, companion_error) =
-        shell::execute_shell_step(&format!("shell: {shell}"));
+    let (companion_ok, _, companion_error) = shell::execute_shell_step(&format!("shell: {shell}"));
     if !companion_ok {
         if fault_guard.release().is_ok() {
             let _ = query_thread.join();
@@ -2033,6 +2033,56 @@ fn write_benchmark_profile(
         .with_context(|| format!("write benchmark profile {}", path.display()))
 }
 
+fn preserve_case_failure_snapshot(
+    ctx: &SuiteRunContext,
+    case_id: &str,
+    step_number: Option<usize>,
+    log: &mut String,
+) {
+    let result = ctx.failure_artifacts.persist_case_failure(
+        ctx.server_handle.as_ref(),
+        &ctx.suite_name,
+        case_id,
+        step_number,
+    );
+    match result {
+        Ok(Some(path)) => {
+            let _ = writeln!(log, "    failure artifacts captured at {}", path.display());
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = writeln!(
+                log,
+                "    ⚠️ failed to preserve case failure artifacts: {error:#}"
+            );
+        }
+    }
+}
+
+fn preserve_suite_failure_snapshot(ctx: &SuiteRunContext, phase: &str, stdout_lock: &Mutex<()>) {
+    let result = ctx.failure_artifacts.persist_suite_failure(
+        ctx.server_handle.as_ref(),
+        &ctx.suite_name,
+        phase,
+    );
+    let message = match result {
+        Ok(Some(path)) => Some(format!(
+            "[{}] failure artifacts captured at {}",
+            ctx.suite_name,
+            path.display()
+        )),
+        Ok(None) => None,
+        Err(error) => Some(format!(
+            "[{}] ⚠️ failed to preserve suite failure artifacts: {error:#}",
+            ctx.suite_name
+        )),
+    };
+    if let Some(message) = message {
+        let _guard = stdout_lock.lock().unwrap();
+        println!("{message}");
+    }
+}
+
 fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOutcome {
     let mut log = String::with_capacity(2048);
 
@@ -2084,6 +2134,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             if ctx.fail_fast {
                 abort.store(true, Ordering::Relaxed);
             }
+            preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
             return CaseOutcome {
                 case_id: case.case_id.clone(),
                 status: CaseStatus::Fail,
@@ -2106,6 +2157,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 if ctx.fail_fast {
                     abort.store(true, Ordering::Relaxed);
                 }
+                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
                 return CaseOutcome {
                     case_id: case.case_id.clone(),
                     status: CaseStatus::Fail,
@@ -2119,6 +2171,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 if ctx.fail_fast {
                     abort.store(true, Ordering::Relaxed);
                 }
+                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
                 return CaseOutcome {
                     case_id: case.case_id.clone(),
                     status: CaseStatus::Fail,
@@ -2144,6 +2197,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     if ctx.fail_fast {
                         abort.store(true, Ordering::Relaxed);
                     }
+                    preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
                     return CaseOutcome {
                         case_id: case.case_id.clone(),
                         status: CaseStatus::Fail,
@@ -2176,6 +2230,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         if ctx.fail_fast {
             abort.store(true, Ordering::Relaxed);
         }
+        preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
         return CaseOutcome {
             case_id: case.case_id.clone(),
             status: CaseStatus::Fail,
@@ -2236,6 +2291,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             if ctx.fail_fast {
                 abort.store(true, Ordering::Relaxed);
             }
+            preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
             return CaseOutcome {
                 case_id: case.case_id.clone(),
                 status: CaseStatus::Fail,
@@ -2260,6 +2316,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             if ctx.fail_fast {
                 abort.store(true, Ordering::Relaxed);
             }
+            preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
             return CaseOutcome {
                 case_id: case.case_id.clone(),
                 status: CaseStatus::Fail,
@@ -2295,6 +2352,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             if ctx.fail_fast {
                 abort.store(true, Ordering::Relaxed);
             }
+            preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
             return CaseOutcome {
                 case_id: case.case_id.clone(),
                 status: CaseStatus::Fail,
@@ -2317,6 +2375,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 if ctx.fail_fast {
                     abort.store(true, Ordering::Relaxed);
                 }
+                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
                 return CaseOutcome {
                     case_id: case.case_id.clone(),
                     status: CaseStatus::Fail,
@@ -2342,6 +2401,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         if ctx.fail_fast {
             abort.store(true, Ordering::Relaxed);
         }
+        preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
         return CaseOutcome {
             case_id: case.case_id.clone(),
             status: CaseStatus::Fail,
@@ -3370,6 +3430,13 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
         }
 
+        if case_failed {
+            // Freeze the first failing statement's server logs before fault
+            // guards, resource convergence, case cleanup, or later cases can
+            // add unrelated lifecycle traffic.
+            preserve_case_failure_snapshot(ctx, &case.case_id, Some(step.query_number), &mut log);
+        }
+
         if let Some(guard) = publication_catalog_fault_guard {
             match guard.finish() {
                 Ok(()) => {
@@ -3450,6 +3517,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         }
     }
 
+    if case_failed {
+        // Pre-execution failures can break out before the mode dispatch above.
+        // The recorder deduplicates this against an earlier statement capture.
+        preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
+    }
+
     // --- cleanup ---
     drop(target_session);
     drop(reference_session);
@@ -3496,6 +3569,13 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         } else {
             let _ = writeln!(log, "    ✅ RECORDED CASE -> {}", path.display());
         }
+    }
+
+    if case_failed {
+        // Cleanup and record-output failures originate after the earlier
+        // capture points. Preserve them here only when this is the case's
+        // first failure.
+        preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
     }
 
     let status = if case_failed {
@@ -3562,6 +3642,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
         if let Err(exc) =
             execute_suite_hook(&ctx.target_admin_conn, ctx.query_timeout, hook, "target")
         {
+            preserve_suite_failure_snapshot(ctx, "init-target", stdout_lock);
             if let Some(cleanup) = ps.cleanup_hook.as_ref() {
                 let _ = execute_suite_hook(
                     &ctx.target_admin_conn,
@@ -3611,6 +3692,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                 hook,
                 "reference",
             ) {
+                preserve_suite_failure_snapshot(ctx, "init-reference", stdout_lock);
                 if let Some(cleanup) = ps.cleanup_hook.as_ref() {
                     let _ = execute_suite_hook(
                         &ctx.reference_admin_conn,
@@ -3732,6 +3814,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
         if let Err(exc) =
             execute_suite_hook(&ctx.target_admin_conn, ctx.query_timeout, hook, "target")
         {
+            preserve_suite_failure_snapshot(ctx, "cleanup-target", stdout_lock);
             cleanup_errors.push(format!("[{}] {}", ctx.suite_name, exc));
         }
         if ctx.reference_required {
@@ -3749,6 +3832,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                 hook,
                 "reference",
             ) {
+                preserve_suite_failure_snapshot(ctx, "cleanup-reference", stdout_lock);
                 cleanup_errors.push(format!("[{}] {}", ctx.suite_name, exc));
             }
         }
@@ -4251,24 +4335,20 @@ fn shutdown_server_handle(server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>) -> 
 fn finish_run_with_server_cleanup(
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
     primary_result: Result<i32>,
-    failure_artifacts: &FailureArtifactContext,
+    failure_artifacts: &FailureArtifactRecorder,
 ) -> Result<i32> {
-    let preserve_result = if matches!(&primary_result, Ok(0)) {
-        Ok(None)
+    let primary_failed = !matches!(&primary_result, Ok(0));
+    let mut preserve_result = if primary_failed {
+        failure_artifacts.persist_run_failure(server_handle.as_ref())
     } else {
-        match server_handle.lock() {
-            Ok(handle) => persist_cross_process_failure_logs(handle.as_ref(), failure_artifacts),
-            Err(_) => Err(anyhow::anyhow!(
-                "server handle lock poisoned while preserving failure artifacts"
-            )),
-        }
+        Ok(None)
     };
-    match &preserve_result {
-        Ok(Some(path)) => eprintln!("cross-process failure artifacts: {}", path.display()),
-        Ok(None) => {}
-        Err(error) => eprintln!("failed to preserve cross-process failure artifacts: {error:#}"),
-    }
+    report_preserved_failure_artifacts(&preserve_result);
     let cleanup_result = shutdown_server_handle(&server_handle);
+    if !primary_failed && cleanup_result.is_err() {
+        preserve_result = failure_artifacts.persist_run_failure(server_handle.as_ref());
+        report_preserved_failure_artifacts(&preserve_result);
+    }
     let run_result = match (primary_result, cleanup_result) {
         (Ok(exit_code), Ok(())) => Ok(exit_code),
         (Err(primary), Ok(())) => Err(primary),
@@ -4290,6 +4370,14 @@ fn finish_run_with_server_cleanup(
         (Err(run), Err(artifact)) => Err(anyhow::anyhow!(
             "{run:#}; failure artifact preservation failed: {artifact:#}"
         )),
+    }
+}
+
+fn report_preserved_failure_artifacts(result: &Result<Option<PathBuf>>) {
+    match result {
+        Ok(Some(path)) => eprintln!("cross-process failure artifacts: {}", path.display()),
+        Ok(None) => {}
+        Err(error) => eprintln!("failed to preserve cross-process failure artifacts: {error:#}"),
     }
 }
 
@@ -4350,11 +4438,11 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         .or_else(|| env_optional("NOVAROCKS_SQL_TEST_FAILURE_ARTIFACT_DIR"));
     let failure_artifact_root = resolve_path(failure_artifact_override.as_deref(), &base_dir)
         .unwrap_or_else(|| base_dir.join("logs/sql-test-failures"));
-    let failure_artifacts = FailureArtifactContext {
+    let failure_artifacts = Arc::new(FailureArtifactRecorder::new(FailureArtifactContext {
         root: failure_artifact_root,
         lane: lane_label.to_string(),
         suites: suite_names.clone(),
-    };
+    }));
     if !cli.dry_run {
         ensure_iceberg_object_store_prereqs(&runner_config)?;
     }
@@ -4939,6 +5027,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 marker_re: marker_re.clone(),
                 fail_fast: cli.fail_fast,
                 server_handle: Arc::clone(&server_handle),
+                failure_artifacts: Arc::clone(&failure_artifacts),
                 publication_catalog_control: publication_catalog_control.clone(),
                 benchmark_profile_dir: resolve_path(
                     cli.benchmark_profile_dir.as_deref(),
@@ -5100,7 +5189,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 
         Ok(0)
     })();
-    finish_run_with_server_cleanup(server_handle, primary_result, &failure_artifacts)
+    finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref())
 }
 
 fn start_publication_catalog_fixture(
@@ -6063,6 +6152,19 @@ mod tests {
             vec![4242]
         }
 
+        fn be_count(&self) -> usize {
+            1
+        }
+
+        fn fe_log_contents(&self) -> anyhow::Result<String> {
+            Ok("FE shutdown failure".to_string())
+        }
+
+        fn be_log_contents(&self, index: usize) -> anyhow::Result<String> {
+            assert_eq!(index, 0);
+            Ok("BE shutdown failure".to_string())
+        }
+
         fn shutdown(&mut self) -> anyhow::Result<()> {
             anyhow::bail!("injected shutdown failure")
         }
@@ -6073,11 +6175,13 @@ mod tests {
         let server: std::sync::Arc<std::sync::Mutex<Box<dyn crate::cluster::ServerHandle>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Box::new(CleanupFailureServer)));
         let temp = tempfile::TempDir::new().expect("temp dir");
-        let failure_artifacts = crate::failure_artifacts::FailureArtifactContext {
-            root: temp.path().join("artifacts"),
-            lane: "correctness".to_string(),
-            suites: vec!["analytic".to_string()],
-        };
+        let failure_artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: temp.path().join("artifacts"),
+                lane: "correctness".to_string(),
+                suites: vec!["analytic".to_string()],
+            },
+        );
         let error = super::finish_run_with_server_cleanup(
             server,
             Err(anyhow::anyhow!("injected execution failure")),
@@ -6088,6 +6192,46 @@ mod tests {
         assert!(message.contains("injected execution failure"), "{message}");
         assert!(message.contains("injected shutdown failure"), "{message}");
         assert!(message.contains("4242"), "{message}");
+        assert_eq!(
+            fs::read_dir(temp.path().join("artifacts"))
+                .expect("cleanup failure artifacts")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn server_cleanup_failure_captures_a_terminal_snapshot() {
+        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(CleanupFailureServer)));
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let artifact_root = temp.path().join("artifacts");
+        let failure_artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: artifact_root.clone(),
+                lane: "correctness".to_string(),
+                suites: vec!["analytic".to_string()],
+            },
+        );
+
+        let error = super::finish_run_with_server_cleanup(server, Ok(0), &failure_artifacts)
+            .expect_err("cleanup failure must fail a successful run");
+        assert!(
+            format!("{error:#}").contains("injected shutdown failure"),
+            "{error:#}"
+        );
+        let artifact_dirs = fs::read_dir(&artifact_root)
+            .expect("cleanup failure artifacts")
+            .map(|entry| entry.expect("artifact entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(artifact_dirs.len(), 1);
+        assert!(
+            artifact_dirs[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("terminal")
+        );
     }
 
     struct ArtifactCapableServer;
@@ -6119,11 +6263,13 @@ mod tests {
     fn successful_run_does_not_create_failure_artifacts() {
         let temp = tempfile::TempDir::new().expect("temp dir");
         let artifact_root = temp.path().join("must-not-exist");
-        let context = crate::failure_artifacts::FailureArtifactContext {
-            root: artifact_root.clone(),
-            lane: "correctness".to_string(),
-            suites: vec!["analytic".to_string()],
-        };
+        let context = crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: artifact_root.clone(),
+                lane: "correctness".to_string(),
+                suites: vec!["analytic".to_string()],
+            },
+        );
         let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
             Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
 
@@ -6139,11 +6285,13 @@ mod tests {
     fn failed_run_persists_logs_before_server_cleanup() {
         let temp = tempfile::TempDir::new().expect("temp dir");
         let artifact_root = temp.path().join("failures");
-        let context = crate::failure_artifacts::FailureArtifactContext {
-            root: artifact_root.clone(),
-            lane: "correctness".to_string(),
-            suites: vec!["analytic".to_string()],
-        };
+        let context = crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: artifact_root.clone(),
+                lane: "correctness".to_string(),
+                suites: vec!["analytic".to_string()],
+            },
+        );
         let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
             Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
 
@@ -6165,6 +6313,44 @@ mod tests {
             fs::read_to_string(artifact_dirs[0].join("be-000.log")).unwrap(),
             "BE log"
         );
+    }
+
+    #[test]
+    fn failed_run_preserves_terminal_snapshot_after_a_case_snapshot() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let artifact_root = temp.path().join("failures");
+        let context = crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: artifact_root.clone(),
+                lane: "correctness".to_string(),
+                suites: vec!["analytic".to_string()],
+            },
+        );
+        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
+
+        context
+            .persist_case_failure(server.as_ref(), "analytic", "case_one", Some(9))
+            .expect("capture first causal snapshot")
+            .expect("cross-process case snapshot");
+        assert_eq!(
+            super::finish_run_with_server_cleanup(server, Ok(1), &context)
+                .expect("failed test run retains its exit code"),
+            1
+        );
+
+        let mut artifact_dirs = fs::read_dir(&artifact_root)
+            .expect("artifact root")
+            .map(|entry| entry.expect("artifact entry").path())
+            .collect::<Vec<_>>();
+        artifact_dirs.sort();
+        assert_eq!(artifact_dirs.len(), 2);
+        assert!(artifact_dirs.iter().any(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("terminal")
+        }));
     }
 
     #[test]

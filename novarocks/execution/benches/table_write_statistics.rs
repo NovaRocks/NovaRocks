@@ -67,7 +67,7 @@ use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoin
 use novarocks_execution::runtime::exchange::{ExchangeKey, ExecutionExchangeRegistry};
 use novarocks_execution::runtime::execution_runtime::ExecutionSpillStorageConfig;
 use novarocks_execution::runtime::fragment::io::{
-    ExchangeFrame, ExchangeFrameTransmitter, FragmentIoError,
+    ExchangeFrame, ExchangeFrameTransmitter, ExchangeTransmitRejection,
 };
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::{OperatorProfiles, RuntimeProfile};
@@ -336,7 +336,7 @@ impl CapturingExchangeTransmitter {
 }
 
 impl ExchangeFrameTransmitter for CapturingExchangeTransmitter {
-    fn transmit(&self, frame: ExchangeFrame) -> Result<(), FragmentIoError> {
+    fn transmit(&self, frame: ExchangeFrame) -> Result<(), ExchangeTransmitRejection> {
         self.frames
             .lock()
             .expect("exchange capture lock")

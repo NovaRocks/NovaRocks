@@ -1158,6 +1158,7 @@ impl FrontendDistributedQueryCoordinator {
         &self,
         handoff: RoundHandoff<'_>,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let execution_started = Instant::now();
         let RoundHandoff {
             query_id,
             execution_id,
@@ -1421,6 +1422,7 @@ impl FrontendDistributedQueryCoordinator {
         // write commits on the strength of this fact.
         let mut observed_result_eof = false;
         let mut last_root_poll = RootResultPoll::default();
+        let mut root_batch_index = 0_u64;
         // Taken before the loop because the polls run beside it: the schema
         // is shared, immutable and only read, while `expected_output` itself
         // is consumed by this attempt's answer.
@@ -1569,7 +1571,16 @@ impl FrontendDistributedQueryCoordinator {
                     statement_deadline,
                     Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
                 ) {
-                    Ok(polls) => root_result_polls = Some(polls),
+                    Ok(polls) => {
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_poll_enter",
+                            execution_started,
+                            None,
+                        );
+                        root_result_polls = Some(polls);
+                    }
                     Err(error) => {
                         break Err(self.fail_task_round(
                             query_id,
@@ -1602,8 +1613,12 @@ impl FrontendDistributedQueryCoordinator {
                                 format!("root result packet was refused: {error}"),
                             ));
                         }
+                        root_batch_index = root_batch_index.saturating_add(1);
+                        let mut batch_rows = 0;
                         if let Some(decoder) = statistics_decoder.as_mut() {
-                            if let Err(error) = decoder.apply_chunk(&batch.into_chunk()) {
+                            let chunk = batch.into_chunk();
+                            batch_rows = chunk.len();
+                            if let Err(error) = decoder.apply_chunk(&chunk) {
                                 break Err(self.fail_task_round(
                                     query_id,
                                     &mut round,
@@ -1614,7 +1629,9 @@ impl FrontendDistributedQueryCoordinator {
                                 ));
                             }
                         } else if let Some(decoder) = write_decoder.as_mut() {
-                            if let Err(error) = decoder.apply_chunk(&batch.into_chunk()) {
+                            let chunk = batch.into_chunk();
+                            batch_rows = chunk.len();
+                            if let Err(error) = decoder.apply_chunk(&chunk) {
                                 break Err(self.fail_task_round(
                                     query_id,
                                     &mut round,
@@ -1627,6 +1644,13 @@ impl FrontendDistributedQueryCoordinator {
                         } else {
                             batches.push(batch);
                         }
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_batch",
+                            execution_started,
+                            Some((root_batch_index, batch_rows)),
+                        );
                         last_root_poll = RootResultPoll::Packet(packet_sequence);
                         moved = true;
                     }
@@ -1666,6 +1690,13 @@ impl FrontendDistributedQueryCoordinator {
                                 error,
                             ));
                         }
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "root_eof",
+                            execution_started,
+                            None,
+                        );
                         observed_result_eof = true;
                         last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
                         moved = true;
@@ -1764,6 +1795,13 @@ impl FrontendDistributedQueryCoordinator {
         // must never be able to take that completion back, so a drain that
         // does not finish inside the statement's own budget is reported rather
         // than turned into a query failure.
+        emit_distributed_write_phase_marker(
+            intent,
+            execution_id,
+            "drain_enter",
+            execution_started,
+            None,
+        );
         drain_task_round(
             &mut round,
             &split_delivery,
@@ -1775,6 +1813,13 @@ impl FrontendDistributedQueryCoordinator {
                 .frontend_queue_residence(),
             execution_id,
             &mut final_task_info,
+        );
+        emit_distributed_write_phase_marker(
+            intent,
+            execution_id,
+            "drain_exit",
+            execution_started,
+            None,
         );
 
         // Read once the drain has ended: a release acknowledgement is the only
@@ -1792,11 +1837,27 @@ impl FrontendDistributedQueryCoordinator {
         // then keeps it from resending.
         let split_assignment_profile = match split_assignment.take() {
             Some(assignment) => {
+                emit_distributed_write_phase_marker(
+                    intent,
+                    execution_id,
+                    "split_finish_enter",
+                    execution_started,
+                    None,
+                );
                 if !assignment.is_finished() {
                     split_delivery.abandon("split assignment round ended with the attempt");
                 }
                 match assignment.finish() {
-                    Ok(profile) => profile,
+                    Ok(profile) => {
+                        emit_distributed_write_phase_marker(
+                            intent,
+                            execution_id,
+                            "split_finish_exit",
+                            execution_started,
+                            None,
+                        );
+                        profile
+                    }
                     Err(error) => {
                         return Err(self.fail_and_cancel(
                             query_id,
@@ -1854,9 +1915,24 @@ impl FrontendDistributedQueryCoordinator {
                         )
                     })?;
                 }
-                barrier.observe_prepared_write_set(decoder.finish().map_err(|error| {
+                emit_distributed_write_phase_marker(
+                    intent,
+                    execution_id,
+                    "write_decoder_finish_enter",
+                    execution_started,
+                    None,
+                );
+                let prepared_write_set = decoder.finish().map_err(|error| {
                     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-                })?);
+                })?;
+                emit_distributed_write_phase_marker(
+                    intent,
+                    execution_id,
+                    "write_decoder_finish_exit",
+                    execution_started,
+                    None,
+                );
+                barrier.observe_prepared_write_set(prepared_write_set);
                 barrier.observe_task_execution(execution_verdict);
                 if cancellation.is_cancelled() {
                     barrier.observe_cancelled();
@@ -2376,6 +2452,46 @@ fn statement_deadline_for_request(
         })
 }
 
+fn emit_distributed_write_phase_marker(
+    intent: DistributedQueryIntent,
+    execution_id: QueryExecutionId,
+    phase: &str,
+    started: Instant,
+    batch: Option<(u64, usize)>,
+) {
+    if intent != DistributedQueryIntent::Write
+        || !cfg!(debug_assertions)
+        || std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER").is_none()
+    {
+        return;
+    }
+    println!(
+        "{}",
+        distributed_write_phase_marker(execution_id, phase, started.elapsed().as_millis(), batch,)
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn distributed_write_phase_marker(
+    execution_id: QueryExecutionId,
+    phase: &str,
+    elapsed_ms: u128,
+    batch: Option<(u64, usize)>,
+) -> String {
+    let query_id = execution_id.query_id();
+    let marker = format!(
+        "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi={} query_lo={} attempt={} phase={} elapsed_ms={}",
+        query_id.high(),
+        query_id.low(),
+        execution_id.attempt_id().get(),
+        phase,
+        elapsed_ms,
+    );
+    batch.map_or(marker.clone(), |(batch_index, rows)| {
+        format!("{marker} batch_index={batch_index} rows={rows}")
+    })
+}
+
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
@@ -2528,7 +2644,7 @@ mod tests {
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
         FrontendReportEndpointBinding, QueryIdSource, ReadyLifecycleTransportForTest,
-        UniqueQueryIdSource, fail_closed_one_shot_topology_retry,
+        UniqueQueryIdSource, distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
         pre_ready_topology_validation_error,
     };
     use crate::common::backend_topology::CoordinatorReportEndpointSink;
@@ -2566,6 +2682,19 @@ mod tests {
         BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace, UniqueId,
     };
     use novarocks_version::native_build_identity;
+
+    #[test]
+    fn write_phase_marker_identifies_attempt_phase_and_batch_without_query_text() {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(7, 11),
+            AttemptId::new(2).expect("nonzero attempt"),
+        )
+        .expect("nonzero execution identity");
+        assert_eq!(
+            distributed_write_phase_marker(execution_id, "root_batch", 37, Some((3, 19))),
+            "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi=7 query_lo=11 attempt=2 phase=root_batch elapsed_ms=37 batch_index=3 rows=19"
+        );
+    }
 
     #[test]
     fn missing_captured_process_is_typed_pre_ready_not_eligible() {

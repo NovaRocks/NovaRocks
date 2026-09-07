@@ -611,7 +611,7 @@ mod tests {
         .expect("sealed local average fixture");
         let encoded = super::super::encode_distributed_plan_with_context(
             &source,
-            NativePlanEncodeContext {
+            NativePlanEncodeContext::<super::super::scan_facts::NoScanFacts> {
                 scan_facts: None,
                 node_outputs: None,
                 fragment_edge_outputs: None,

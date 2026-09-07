@@ -103,6 +103,43 @@ pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 1;
 /// The operation-kind tag on the evidence envelope.
 pub const ICEBERG_WRITE_SESSION_OPERATION_KIND: &str = "iceberg.connector_write_session.v1";
 
+#[cfg(debug_assertions)]
+fn iceberg_write_phase_marker_enabled() -> bool {
+    std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER").is_some()
+}
+
+#[cfg(not(debug_assertions))]
+const fn iceberg_write_phase_marker_enabled() -> bool {
+    false
+}
+
+fn emit_iceberg_write_phase_marker(
+    session_id: IcebergWriteSessionId,
+    attempt: usize,
+    phase: &str,
+    started: std::time::Instant,
+) {
+    if !iceberg_write_phase_marker_enabled() {
+        return;
+    }
+    println!(
+        "{}",
+        iceberg_write_phase_marker(session_id, attempt, phase, started.elapsed().as_millis())
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn iceberg_write_phase_marker(
+    session_id: IcebergWriteSessionId,
+    attempt: usize,
+    phase: &str,
+    elapsed_ms: u128,
+) -> String {
+    format!(
+        "NOVAROCKS_ICEBERG_WRITE_PHASE session_id={session_id} attempt={attempt} phase={phase} elapsed_ms={elapsed_ms}"
+    )
+}
+
 fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
         .with_retryable_before_progress()
@@ -975,6 +1012,9 @@ impl IcebergWriteSessionControl {
         frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        let phase_started = std::time::Instant::now();
+        let session_id = handle.session_id();
+        emit_iceberg_write_phase_marker(session_id, 0, "publication_enter", phase_started);
         validate_context(context)?;
         let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
         validate_merged_old_references(frozen_old_references, &validated)?;
@@ -982,10 +1022,19 @@ impl IcebergWriteSessionControl {
         if validated.is_empty()
             && handle.empty_write_decision() == IcebergEmptyWriteDecision::SkipExternalCommit
         {
+            emit_iceberg_write_phase_marker(session_id, 0, "publication_empty_exit", phase_started);
             return settle_empty_write_without_commit(handle);
         }
 
+        emit_iceberg_write_phase_marker(
+            session_id,
+            0,
+            "publication_admission_enter",
+            phase_started,
+        );
         handle.begin_commit()?;
+        emit_iceberg_write_phase_marker(session_id, 0, "publication_admission_exit", phase_started);
+        emit_iceberg_write_phase_marker(session_id, 0, "publication_dispatch_enter", phase_started);
         let outcome = if matches!(
             handle.commit_op_kind(),
             CommitOpKind::FastAppend | CommitOpKind::Overwrite
@@ -995,6 +1044,7 @@ impl IcebergWriteSessionControl {
             debug_assert!(statistics.is_empty());
             self.dispatch_commit(handle, &validated, context)
         };
+        emit_iceberg_write_phase_marker(session_id, 0, "publication_dispatch_exit", phase_started);
         match &outcome {
             Ok(ExternalMutationOutcome::KnownCommitted { receipt, .. }) => {
                 let snapshot_id = receipt
@@ -1022,6 +1072,7 @@ impl IcebergWriteSessionControl {
                 })?;
             }
         }
+        emit_iceberg_write_phase_marker(session_id, 0, "publication_settle_exit", phase_started);
         outcome
     }
 
@@ -1331,6 +1382,9 @@ impl IcebergWriteSessionControl {
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        let phase_started = std::time::Instant::now();
+        let session_id = handle.session_id();
+        emit_iceberg_write_phase_marker(session_id, 0, "eager_enter", phase_started);
         let facts = handle.table();
         let session_abort = Arc::new(crate::commit::abort::AbortLog::new());
         for entry in validated {
@@ -1357,6 +1411,7 @@ impl IcebergWriteSessionControl {
                 vec![Arc::clone(&session_abort)],
             );
         };
+        emit_iceberg_write_phase_marker(session_id, 0, "initial_table_load_enter", phase_started);
         let initial = match self.runtime.load_table_for_request(
             facts.namespace(),
             facts.table_name(),
@@ -1368,6 +1423,7 @@ impl IcebergWriteSessionControl {
                 return Err(unavailable(error.to_string()));
             }
         };
+        emit_iceberg_write_phase_marker(session_id, 0, "initial_table_load_exit", phase_started);
         if initial.metadata().uuid().to_string() != facts.table_uuid()
             || initial.metadata().current_schema_id() != facts.schema_id()
         {
@@ -1433,6 +1489,13 @@ impl IcebergWriteSessionControl {
         let mut current = initial;
         const MAX_ATTEMPTS: usize = 3;
         for attempt in 0..MAX_ATTEMPTS {
+            let attempt_number = attempt + 1;
+            emit_iceberg_write_phase_marker(
+                session_id,
+                attempt_number,
+                "attempt_enter",
+                phase_started,
+            );
             if let Err(error) = validate_context(context) {
                 cleanup_session();
                 return Err(error);
@@ -1441,6 +1504,12 @@ impl IcebergWriteSessionControl {
                 self.runtime
                     .control_state()
                     .invalidate_table_cache(facts.namespace(), facts.table_name());
+                emit_iceberg_write_phase_marker(
+                    session_id,
+                    attempt_number,
+                    "retry_table_load_enter",
+                    phase_started,
+                );
                 current = match self.runtime.load_table_for_request(
                     facts.namespace(),
                     facts.table_name(),
@@ -1452,6 +1521,12 @@ impl IcebergWriteSessionControl {
                         return Err(unavailable(error.to_string()));
                     }
                 };
+                emit_iceberg_write_phase_marker(
+                    session_id,
+                    attempt_number,
+                    "retry_table_load_exit",
+                    phase_started,
+                );
                 if current.metadata().uuid() != expected_uuid
                     || current.metadata().current_schema_id() != facts.schema_id()
                 {
@@ -1536,6 +1611,12 @@ impl IcebergWriteSessionControl {
             let dispatch_context = context.clone();
             let dispatch_context_failure = Arc::new(std::sync::OnceLock::new());
             let dispatch_context_failure_for_attempt = Arc::clone(&dispatch_context_failure);
+            emit_iceberg_write_phase_marker(
+                session_id,
+                attempt_number,
+                "runtime_bridge_enter",
+                phase_started,
+            );
             let attempt_result = self
                 .runtime
                 .resources()
@@ -1551,6 +1632,12 @@ impl IcebergWriteSessionControl {
                         target_ref: &target_ref,
                         snapshot_properties: &snapshot_properties,
                     };
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "data_stage_enter",
+                        phase_started,
+                    );
                     let (mut transaction, data_outcome) = match operation {
                         CommitOpKind::FastAppend => {
                             crate::commit::fast_append::stage_eager_fast_append(ctx).await?
@@ -1561,8 +1648,20 @@ impl IcebergWriteSessionControl {
                         }
                         _ => unreachable!("eager write path only accepts append/overwrite"),
                     };
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "data_stage_exit",
+                        phase_started,
+                    );
                     let staged_metadata = transaction.staged_table().metadata().clone();
                     let sequence_number = staged_metadata.last_sequence_number();
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "statistics_merge_enter",
+                        phase_started,
+                    );
                     let merged = artifacts_for_staged_snapshot(
                         &table,
                         &staged_metadata,
@@ -1572,6 +1671,12 @@ impl IcebergWriteSessionControl {
                     )
                     .await
                     .map_err(|error| error.to_string())?;
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "statistics_merge_exit",
+                        phase_started,
+                    );
                     if !merged.is_empty() {
                         let path = crate::stats_assembler::puffin_path_for_statistics_operation(
                             &staged_metadata,
@@ -1579,6 +1684,12 @@ impl IcebergWriteSessionControl {
                             identity,
                         );
                         collector.abort_log.record_manifest(path.clone());
+                        emit_iceberg_write_phase_marker(
+                            session_id,
+                            attempt_number,
+                            "puffin_write_enter",
+                            phase_started,
+                        );
                         let statistics_file = crate::stats_assembler::write_puffin_artifacts(
                             &file_io,
                             &path,
@@ -1590,6 +1701,18 @@ impl IcebergWriteSessionControl {
                         .ok_or_else(|| {
                             "non-empty write statistics produced no Puffin file".to_string()
                         })?;
+                        emit_iceberg_write_phase_marker(
+                            session_id,
+                            attempt_number,
+                            "puffin_write_exit",
+                            phase_started,
+                        );
+                        emit_iceberg_write_phase_marker(
+                            session_id,
+                            attempt_number,
+                            "statistics_stage_enter",
+                            phase_started,
+                        );
                         transaction = transaction
                             .update_statistics()
                             .set_statistics(statistics_file)
@@ -1598,6 +1721,12 @@ impl IcebergWriteSessionControl {
                             .map_err(|error| {
                                 format!("stage Iceberg write SetStatistics: {error}")
                             })?;
+                        emit_iceberg_write_phase_marker(
+                            session_id,
+                            attempt_number,
+                            "statistics_stage_exit",
+                            phase_started,
+                        );
                     }
                     let mut staged = transaction.into_table_commit();
                     staged.add_requirement(crate::iceberg::TableRequirement::UuidMatch {
@@ -1615,7 +1744,20 @@ impl IcebergWriteSessionControl {
                         expected_table_uuid: Some(expected_uuid_string),
                         marker,
                     };
-                    let mut frontier = match provider_catalog.new_transaction(request).await {
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "transaction_admission_enter",
+                        phase_started,
+                    );
+                    let transaction_start = provider_catalog.new_transaction(request).await;
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "transaction_admission_exit",
+                        phase_started,
+                    );
+                    let mut frontier = match transaction_start {
                         CatalogTransactionStart::Ready(frontier) => frontier,
                         CatalogTransactionStart::KnownUncommitted { failure } => {
                             return Ok((
@@ -1636,16 +1778,35 @@ impl IcebergWriteSessionControl {
                         }
                     };
                     frontier.stage(staged).map_err(|error| error.to_string())?;
-                    let outcome =
-                        match commit_eager_frontier(&mut frontier, &dispatch_context).await {
-                            Ok(outcome) => outcome,
-                            Err(error) => {
-                                let _ = dispatch_context_failure_for_attempt.set(error.clone());
-                                return Err(error.to_string());
-                            }
-                        };
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "catalog_dispatch_enter",
+                        phase_started,
+                    );
+                    let dispatch_result =
+                        commit_eager_frontier(&mut frontier, &dispatch_context).await;
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "catalog_dispatch_exit",
+                        phase_started,
+                    );
+                    let outcome = match dispatch_result {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            let _ = dispatch_context_failure_for_attempt.set(error.clone());
+                            return Err(error.to_string());
+                        }
+                    };
                     Ok((outcome, data_outcome, collector))
                 });
+            emit_iceberg_write_phase_marker(
+                session_id,
+                attempt_number,
+                "runtime_bridge_exit",
+                phase_started,
+            );
             let (catalog_outcome, data_outcome, collector) = match attempt_result {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => {
@@ -1680,6 +1841,12 @@ impl IcebergWriteSessionControl {
                     });
                 }
             };
+            emit_iceberg_write_phase_marker(
+                session_id,
+                attempt_number,
+                "attempt_outcome_ready",
+                phase_started,
+            );
             let retry_conflict = permits_fresh_eager_attempt(
                 &catalog_outcome,
                 attempt,
@@ -1693,6 +1860,12 @@ impl IcebergWriteSessionControl {
                     ..
                 } => {
                     collector.mark_committed();
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "receipt_finalization_enter",
+                        phase_started,
+                    );
                     let proof_finalization = eager_proof_finalization(
                         &proof,
                         data_outcome.new_snapshot_id,
@@ -1725,6 +1898,12 @@ impl IcebergWriteSessionControl {
                             .map(|prepared| prepared.committed().clone()),
                     )
                     .map_err(invalid)?;
+                    emit_iceberg_write_phase_marker(
+                        session_id,
+                        attempt_number,
+                        "receipt_finalization_exit",
+                        phase_started,
+                    );
                     return Ok(ExternalMutationOutcome::KnownCommitted {
                         effect,
                         receipt,
@@ -3312,7 +3491,10 @@ mod statistics_contract_tests {
 
     use arrow::datatypes::{DataType, Field};
 
-    use super::{eager_proof_finalization, resolve_statistics_field, validate_theta_properties};
+    use super::{
+        IcebergWriteSessionId, eager_proof_finalization, iceberg_write_phase_marker,
+        resolve_statistics_field, validate_theta_properties,
+    };
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     fn schema(fields: Vec<Arc<NestedField>>) -> Schema {
@@ -3320,6 +3502,15 @@ mod statistics_contract_tests {
             .with_fields(fields)
             .build()
             .expect("schema")
+    }
+
+    #[test]
+    fn write_phase_marker_identifies_session_attempt_and_phase_without_table_facts() {
+        let session_id = IcebergWriteSessionId::from_bytes([1; 16]);
+        assert_eq!(
+            iceberg_write_phase_marker(session_id, 2, "puffin_write_exit", 37),
+            "NOVAROCKS_ICEBERG_WRITE_PHASE session_id=01010101-0101-0101-0101-010101010101 attempt=2 phase=puffin_write_exit elapsed_ms=37"
+        );
     }
 
     #[test]

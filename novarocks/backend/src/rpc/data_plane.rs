@@ -152,7 +152,13 @@ impl BackendDataPlane {
 
         match wait_fetch_typed(finst_id, request.max_wait_ms) {
             TryFetchTypedResult::Ready(result) => {
-                emit_typed_fetch_marker(FetchStatus::Ready as i32);
+                emit_typed_fetch_marker(
+                    Some(finst_id),
+                    FetchStatus::Ready as i32,
+                    result.packet_seq,
+                    result.eos,
+                    result.payload.len(),
+                );
                 fetch_response(
                     FetchStatus::Ready,
                     String::new(),
@@ -162,11 +168,11 @@ impl BackendDataPlane {
                 )
             }
             TryFetchTypedResult::NotReady => {
-                emit_typed_fetch_marker(FetchStatus::NotReady as i32);
+                emit_typed_fetch_marker(Some(finst_id), FetchStatus::NotReady as i32, 0, false, 0);
                 fetch_response(FetchStatus::NotReady, String::new(), 0, false, Vec::new())
             }
             TryFetchTypedResult::Error(error) => {
-                emit_typed_fetch_marker(FetchStatus::Error as i32);
+                emit_typed_fetch_marker(Some(finst_id), FetchStatus::Error as i32, 0, false, 0);
                 fetch_response(FetchStatus::Error, error.message, 0, false, Vec::new())
             }
         }
@@ -209,7 +215,7 @@ pub fn fetch_task_result(
             route = ?route,
             "root result poll refused"
         );
-        emit_typed_fetch_marker(FetchStatus::Error as i32);
+        emit_typed_fetch_marker(None, FetchStatus::Error as i32, 0, false, 0);
         return Ok(fetch_response(
             FetchStatus::Error,
             detail,
@@ -240,7 +246,13 @@ pub fn fetch_task_result(
                     )));
                 }
             }
-            emit_typed_fetch_marker(FetchStatus::Ready as i32);
+            emit_typed_fetch_marker(
+                Some(binding.kernel_key()),
+                FetchStatus::Ready as i32,
+                result.packet_seq,
+                result.eos,
+                result.payload.len(),
+            );
             fetch_response(
                 FetchStatus::Ready,
                 String::new(),
@@ -250,11 +262,23 @@ pub fn fetch_task_result(
             )
         }
         TryFetchTypedResult::NotReady => {
-            emit_typed_fetch_marker(FetchStatus::NotReady as i32);
+            emit_typed_fetch_marker(
+                Some(binding.kernel_key()),
+                FetchStatus::NotReady as i32,
+                0,
+                false,
+                0,
+            );
             fetch_response(FetchStatus::NotReady, String::new(), 0, false, Vec::new())
         }
         TryFetchTypedResult::Error(error) => {
-            emit_typed_fetch_marker(FetchStatus::Error as i32);
+            emit_typed_fetch_marker(
+                Some(binding.kernel_key()),
+                FetchStatus::Error as i32,
+                0,
+                false,
+                0,
+            );
             fetch_response(FetchStatus::Error, error.message, 0, false, Vec::new())
         }
     })
@@ -276,9 +300,48 @@ fn fetch_response(
     }
 }
 
-fn emit_typed_fetch_marker(status: i32) {
+fn emit_typed_fetch_marker(
+    finst_id: Option<UniqueId>,
+    status: i32,
+    packet_seq: i64,
+    eos: bool,
+    payload_bytes: usize,
+) {
     if crate::config::debug_emit_grpc_fragment_marker() {
-        println!("NOVAROCKS_GRPC_FETCH_TYPED status={status}");
+        println!(
+            "{}",
+            typed_fetch_marker(finst_id, status, packet_seq, eos, payload_bytes)
+        );
         let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
+fn typed_fetch_marker(
+    finst_id: Option<UniqueId>,
+    status: i32,
+    packet_seq: i64,
+    eos: bool,
+    payload_bytes: usize,
+) -> String {
+    let identity = finst_id.map_or_else(
+        || "finst_hi=unknown finst_lo=unknown".to_string(),
+        |finst_id| format!("finst_hi={} finst_lo={}", finst_id.high(), finst_id.low()),
+    );
+    format!(
+        "NOVAROCKS_GRPC_FETCH_TYPED {identity} status={status} packet_seq={packet_seq} eos={eos} payload_bytes={payload_bytes}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::typed_fetch_marker;
+    use novarocks_types::UniqueId;
+
+    #[test]
+    fn typed_fetch_marker_identifies_payload_and_eof_without_contents() {
+        assert_eq!(
+            typed_fetch_marker(Some(UniqueId::new(7, 9)), 1, 3, true, 41),
+            "NOVAROCKS_GRPC_FETCH_TYPED finst_hi=7 finst_lo=9 status=1 packet_seq=3 eos=true payload_bytes=41"
+        );
     }
 }
