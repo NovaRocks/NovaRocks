@@ -37,28 +37,20 @@ use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBa
 #[cfg(test)]
 use crate::query_execution::contract::QueryId;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch, StageParticipantBinding};
-use crate::query_execution::lifecycle_plan::{
-    QueryCatalogLease, QueryInitBarrier, QueryInitOptions, QueryLifecycleLease,
-};
+use crate::query_execution::lifecycle_plan::{QueryCatalogLease, QueryInitOptions};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
 };
-use crate::query_execution::schedule::{
-    FragmentInstancePlacement, FragmentLifecycleProjection, SchedulingPlan,
-};
+use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_proto_codec::catalog::CatalogSet;
-use novarocks_proto_codec::lifecycle::{
-    AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
-};
-use novarocks_proto_codec::lifecycle::{ExchangeRouteManifest, QueryExecutionId, StageFragment};
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_proto_models::novarocks;
 use novarocks_proto_models::plan::RuntimeFilterBindingTable;
-use novarocks_proto_models::{common, novarocks};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
 use novarocks_types::{BackendProcessId, SlotId, UniqueId};
 
@@ -69,19 +61,6 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
 
-fn protocol_execution_id(
-    execution_id: QueryExecutionId,
-) -> Result<ProtocolQueryExecutionId, DistributedQueryError> {
-    let attempt = ProtocolAttemptId::new(execution_id.attempt_id().get())
-        .map_err(|error| contract_error(error.to_string()))?;
-    ProtocolQueryExecutionId::new(execution_id.query_id(), attempt)
-        .map_err(|error| contract_error(error.to_string()))
-}
-
-/// Assign connector splits without inventing a byte estimate for an unknown
-/// split. Known-cost splits use deterministic largest-processing-time
-/// placement; unknown-cost splits retain their source order and balance only
-/// split counts. The returned vectors are restored to source split order so a
 static NEXT_HANDOFF_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Opaque identity minted with a sealed prepared handoff. Role crates can
@@ -323,7 +302,6 @@ impl ScheduleBoundDistributedQuery {
     ) -> Result<RuntimeFilterScheduledView<'_>, DistributedQueryError> {
         let frozen_live_backends = self
             .schedule
-            .lifecycle
             .frozen_live_backends
             .values()
             .map(|target| {
@@ -348,13 +326,7 @@ impl ScheduleBoundDistributedQuery {
             artifact_id: RuntimeFilterArtifactId(self.schedule.handoff_id),
             execution_id: self.schedule.execution_id,
             scheduled_backend_ids: self.schedule.backend_ids(),
-            frozen_live_backend_ids: self
-                .schedule
-                .lifecycle
-                .frozen_live_backends
-                .keys()
-                .copied()
-                .collect(),
+            frozen_live_backend_ids: self.schedule.frozen_live_backend_ids(),
             frozen_live_backends,
             has_runtime_filter_channels: self.prepared.runtime_filter_facts().has_channels(),
             deployment_facts: RuntimeFilterDeploymentFactsView::new(
@@ -496,6 +468,8 @@ impl<'a> RuntimeFilterScheduledView<'a> {
     }
 }
 
+/// One backend of the frozen live topology, addressed by its round-local
+/// scheduling ordinal. Runtime-filter deployment turns these into participants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterBackendTopologyEntry {
     backend_idx: usize,
@@ -530,54 +504,6 @@ pub struct RuntimeFilterDeploymentReadyDistributedQuery {
 }
 
 impl RuntimeFilterDeploymentReadyDistributedQuery {
-    /// Enter the generic Init + ControlReady barrier only after the Frontend
-    /// has sealed the opaque runtime-filter contributions for this schedule.
-    /// Core deliberately validates no runtime-filter semantics here.
-    pub fn initialize_query(
-        self,
-        options: QueryInitOptions,
-        barrier: &dyn QueryInitBarrier,
-    ) -> Result<ControlReadyDistributedQuery, DistributedQueryError> {
-        if options.execution_id().query_id() != self.schedule.execution_id.query_id()
-            || options.execution_id().attempt_id().get()
-                != self.schedule.execution_id.attempt_id().get()
-        {
-            return Err(contract_error(
-                "query initialization execution id does not match validated schedule",
-            ));
-        }
-        let query_catalog_lease =
-            freeze_query_catalog_lease(&self.prepared, options.catalog_set())?;
-        let options = options.with_catalog_set(query_catalog_lease.catalog_set().clone());
-        let runtime_filters = self
-            .runtime_filter_contributions
-            .into_iter()
-            .map(|(backend_idx, contribution)| {
-                novarocks_proto_codec::lifecycle::RuntimeFilterContribution::parse(contribution)
-                    .map(|contribution| (backend_idx, contribution))
-                    .map_err(|error| contract_error(error.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let plan = crate::query_execution::lifecycle_plan::compile_query_init_plan(
-            self.schedule.lifecycle_projection(),
-            runtime_filters,
-            &options,
-        )?;
-        let stage_bindings = plan.stage_participant_bindings()?;
-        let query_lifecycle_lease = barrier
-            .initialize_all(plan)?
-            .with_catalog_lease(query_catalog_lease);
-        Ok(ControlReadyDistributedQuery {
-            handoff_id: self.handoff_id,
-            prepared: self.prepared,
-            native_bundle: self.native_bundle,
-            schedule: self.schedule,
-            options,
-            query_lifecycle_lease,
-            stage_bindings,
-        })
-    }
-
     /// Freeze this attempt's shared facts for the task protocol.
     ///
     /// It performs the same admission the lifecycle path performs before it
@@ -613,13 +539,11 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
 
 /// One attempt's frozen inputs for the task protocol.
 ///
-/// It is the task path's counterpart of [`ControlReadyDistributedQuery`], and
-/// it exists because the two paths differ in exactly one thing: the old had to
-/// reach a lifecycle barrier before it was allowed to encode a submission,
-/// while the task path establishes its query contexts from the same frozen
-/// facts and creates tasks directly. Everything else -- the execution-id
-/// check, the query-wide catalog freeze, the retained planning leases -- is
-/// identical and is done here rather than duplicated at the call site.
+/// It exists so that the execution-id check, the query-wide catalog freeze and
+/// the retained planning leases are done once here rather than duplicated at
+/// the call site. A query context is established by the substrate itself, so
+/// this value goes straight from frozen facts to task creation: there is no
+/// barrier between the two for it to sit behind.
 pub struct TaskExecutionPreparedQuery {
     handoff_id: u64,
     prepared: PreparedFragmentSet,
@@ -803,88 +727,6 @@ fn merge_catalog_properties(
     }
     CatalogSet::new(by_handle.into_values())
         .map_err(|error| contract_error(format!("invalid query catalog set: {error}")))
-}
-
-/// Query lifecycle is ready and the complete CatalogSet was established during
-/// Init, before Stage becomes admissible.
-pub struct ControlReadyDistributedQuery {
-    handoff_id: u64,
-    prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentAttachment,
-    schedule: ValidatedFragmentSchedule,
-    options: QueryInitOptions,
-    query_lifecycle_lease: QueryLifecycleLease,
-    stage_bindings: Vec<StageParticipantBinding>,
-}
-
-impl ControlReadyDistributedQuery {
-    pub fn catalog_ready(self) -> CatalogReadyDistributedQuery {
-        CatalogReadyDistributedQuery {
-            handoff_id: self.handoff_id,
-            prepared: self.prepared,
-            native_bundle: self.native_bundle,
-            schedule: self.schedule,
-            options: self.options,
-            query_lifecycle_lease: self.query_lifecycle_lease,
-            stage_bindings: self.stage_bindings,
-        }
-    }
-}
-
-/// The only typestate that can prepare native Stage batches. In particular,
-/// it is impossible to create a submission before every selected BE has
-/// reported its Init-carried catalog set ready.
-pub struct CatalogReadyDistributedQuery {
-    handoff_id: u64,
-    prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentAttachment,
-    schedule: ValidatedFragmentSchedule,
-    options: QueryInitOptions,
-    query_lifecycle_lease: QueryLifecycleLease,
-    stage_bindings: Vec<StageParticipantBinding>,
-}
-
-impl CatalogReadyDistributedQuery {
-    /// Stable placement identity facts for the owner-local native submission
-    /// mapper.  The view carries neither schedule mutation nor lifecycle or
-    /// connector leases.
-    pub fn native_submission_view(
-        &self,
-    ) -> Result<NativeSubmissionEncodingView<'_>, DistributedQueryError> {
-        native_submission_encoding_view(
-            self.handoff_id,
-            self.schedule.execution_id,
-            &self.prepared,
-            &self.native_bundle,
-            &self.schedule.inner,
-            self.options.native_submission_options(),
-        )
-    }
-
-    /// Consume a matching native submission attachment and construct Stage
-    /// batches.  The mapper cannot bypass ControlReady or connector-binding
-    /// readiness because this typestate owns both abort-preserving leases.
-    pub fn finish_stage(
-        self,
-        attachment: NativeSubmissionAttachment,
-    ) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
-        let CatalogReadyDistributedQuery {
-            handoff_id,
-            prepared: _,
-            native_bundle: _,
-            schedule,
-            options: _,
-            query_lifecycle_lease,
-            stage_bindings,
-        } = self;
-        finish_sealed_native_submission(
-            attachment,
-            handoff_id,
-            schedule.execution_id,
-            stage_bindings,
-            query_lifecycle_lease,
-        )
-    }
 }
 
 /// Immutable, scalar-only frontend scheduling projection.
@@ -1118,7 +960,10 @@ pub struct ValidatedFragmentSchedule {
     handoff_id: u64,
     execution_id: QueryExecutionId,
     inner: SchedulingPlan,
-    lifecycle: FragmentLifecycleProjection,
+    /// The live-backend topology this schedule was frozen against, keyed by
+    /// the round-local scheduling ordinal. Runtime-filter deployment reads it
+    /// to decide which backends a contribution set must cover.
+    frozen_live_backends: BTreeMap<usize, LiveBackendTarget>,
 }
 
 impl ValidatedFragmentSchedule {
@@ -1274,13 +1119,11 @@ impl ValidatedFragmentSchedule {
         };
         populate_destinations(&mut inner, view.inner.edges());
         populate_sender_counts(&mut inner, view.inner.edges());
-        let lifecycle =
-            build_fragment_lifecycle_projection(&inner, view.inner.edges(), frozen_live_backends)?;
         Ok(Self {
             handoff_id: view.handoff_id,
             execution_id,
             inner,
-            lifecycle,
+            frozen_live_backends,
         })
     }
 
@@ -1308,8 +1151,8 @@ impl ValidatedFragmentSchedule {
             .collect()
     }
 
-    pub(crate) const fn lifecycle_projection(&self) -> &FragmentLifecycleProjection {
-        &self.lifecycle
+    pub(crate) fn frozen_live_backend_ids(&self) -> Vec<usize> {
+        self.frozen_live_backends.keys().copied().collect()
     }
 
     /// Return the immutable placement result used to freeze a connector write
@@ -1368,83 +1211,6 @@ pub fn fragment_instance_id_for_contract_test(
     .expect("contract fixtures use a nonzero query id");
     derive_fragment_instance_id(execution_id, fragment_id, instance_index)
         .expect("contract fixture fragment identity is representable")
-}
-
-fn build_fragment_lifecycle_projection(
-    schedule: &SchedulingPlan,
-    edges: &[novarocks_sql::plan_read::FragmentEdge],
-    frozen_live_backends: BTreeMap<usize, LiveBackendTarget>,
-) -> Result<FragmentLifecycleProjection, DistributedQueryError> {
-    let mut instances_by_backend = BTreeMap::<usize, BTreeSet<UniqueId>>::new();
-    let mut endpoints_by_backend = BTreeMap::<usize, RuntimeEndpoint>::new();
-    for placement in schedule.by_fragment.values().flatten() {
-        instances_by_backend
-            .entry(placement.backend_idx)
-            .or_default()
-            .insert(placement.finst_id);
-        match endpoints_by_backend.entry(placement.backend_idx) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(placement.endpoint.clone());
-            }
-            std::collections::btree_map::Entry::Occupied(entry)
-                if entry.get() != &placement.endpoint =>
-            {
-                return Err(contract_error(format!(
-                    "scheduled backend {} has inconsistent endpoints",
-                    placement.backend_idx
-                )));
-            }
-            std::collections::btree_map::Entry::Occupied(_) => {}
-        }
-    }
-
-    let mut exchange_routes = Vec::new();
-    for edge in edges {
-        let sources = schedule
-            .by_fragment
-            .get(&edge.source_fragment_id)
-            .ok_or_else(|| {
-                contract_error(format!(
-                    "exchange source fragment {} is absent from schedule",
-                    edge.source_fragment_id
-                ))
-            })?;
-        let destinations = schedule
-            .by_fragment
-            .get(&edge.target_fragment_id)
-            .ok_or_else(|| {
-                contract_error(format!(
-                    "exchange destination fragment {} is absent from schedule",
-                    edge.target_fragment_id
-                ))
-            })?;
-        let sender_count = u32::try_from(sources.len())
-            .map_err(|_| contract_error("exchange sender count exceeds u32 width"))?;
-        for (sender_ordinal, source) in sources.iter().enumerate() {
-            let sender_ordinal = u32::try_from(sender_ordinal)
-                .map_err(|_| contract_error("exchange sender ordinal exceeds u32 width"))?;
-            for destination in destinations {
-                exchange_routes.push(
-                    ExchangeRouteManifest::parse(novarocks::ExchangeRouteManifest {
-                        source_fragment_instance_id: Some(common::UniqueId {
-                            hi: source.finst_id.high(),
-                            lo: source.finst_id.low(),
-                        }),
-                        destination_fragment_instance_id: Some(common::UniqueId {
-                            hi: destination.finst_id.high(),
-                            lo: destination.finst_id.low(),
-                        }),
-                        destination_node_id: edge.target_exchange_node_id,
-                        sender_ordinal,
-                        sender_count,
-                    })
-                    .map_err(|error| contract_error(error.to_string()))?,
-                );
-            }
-        }
-    }
-    FragmentLifecycleProjection::new(instances_by_backend, endpoints_by_backend, exchange_routes)
-        .with_frozen_live_backends(frozen_live_backends.into_values().collect())
 }
 
 /// Numbers every sender of one exchange node across the union of the
@@ -1651,17 +1417,6 @@ impl ValidatedNativeSubmission {
             instance_params: Some(self.instance_params),
         }
     }
-
-    fn into_stage_fragment(self) -> Result<(usize, StageFragment), DistributedQueryError> {
-        let fragment = StageFragment::new(self.plan, self.instance_params)
-            .map_err(|error| contract_error(error.to_string()))?;
-        if fragment.fragment_instance_id() != self.finst_id {
-            return Err(contract_error(
-                "native stage fragment instance identity differs from sealed submission",
-            ));
-        }
-        Ok((self.backend_idx, fragment))
-    }
 }
 
 #[derive(Clone)]
@@ -1730,13 +1485,6 @@ impl ExpectedOutputSchema {
     }
 }
 
-pub struct StagePreparedDistributedQuery {
-    batches: Vec<StageBatch>,
-    root_fetch: RootFetchMetadata,
-    expected_output: ExpectedOutputSchema,
-    query_lifecycle_lease: QueryLifecycleLease,
-}
-
 fn native_submission_encoding_view<'a>(
     handoff_id: u64,
     execution_id: QueryExecutionId,
@@ -1794,190 +1542,6 @@ fn native_submission_encoding_view<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_sealed_native_submission(
-    attachment: NativeSubmissionAttachment,
-    handoff_id: u64,
-    execution_id: QueryExecutionId,
-    stage_bindings: Vec<StageParticipantBinding>,
-    query_lifecycle_lease: QueryLifecycleLease,
-) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
-    if !attachment.matches(handoff_id, execution_id) {
-        let error =
-            contract_error("native submission attachment does not match the sealed query handoff");
-        let kind = error.kind();
-        let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-        return Err(DistributedQueryError::new(kind, message));
-    }
-    let (submissions, root_fetch, expected_output) = attachment.into_parts();
-    let mut fragments_by_backend = BTreeMap::<usize, Vec<StageFragment>>::new();
-    for submission in submissions {
-        let (backend_idx, fragment) = match submission.into_stage_fragment() {
-            Ok(fragment) => fragment,
-            Err(error) => {
-                let kind = error.kind();
-                let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-                return Err(DistributedQueryError::new(kind, message));
-            }
-        };
-        fragments_by_backend
-            .entry(backend_idx)
-            .or_default()
-            .push(fragment);
-    }
-    let mut batches = Vec::with_capacity(stage_bindings.len());
-    for binding in stage_bindings {
-        let fragments = fragments_by_backend
-            .remove(&binding.target().backend_idx())
-            .unwrap_or_default();
-        let protocol_execution_id = match protocol_execution_id(execution_id) {
-            Ok(execution_id) => execution_id,
-            Err(error) => {
-                let kind = error.kind();
-                let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-                return Err(DistributedQueryError::new(kind, message));
-            }
-        };
-        let batch = match StageBatch::new(protocol_execution_id, binding, fragments) {
-            Ok(batch) => batch,
-            Err(error) => {
-                let error = contract_error(error.to_string());
-                let kind = error.kind();
-                let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-                return Err(DistributedQueryError::new(kind, message));
-            }
-        };
-        batches.push(batch);
-    }
-    if !fragments_by_backend.is_empty() {
-        let error = contract_error(format!(
-            "native stage assembly produced fragments for unknown participants: {:?}",
-            fragments_by_backend.keys().collect::<Vec<_>>()
-        ));
-        let kind = error.kind();
-        let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-        return Err(DistributedQueryError::new(kind, message));
-    }
-    Ok(StagePreparedDistributedQuery {
-        batches,
-        root_fetch,
-        expected_output,
-        query_lifecycle_lease,
-    })
-}
-
-impl StagePreparedDistributedQuery {
-    pub fn batches(&self) -> &[StageBatch] {
-        &self.batches
-    }
-
-    pub fn execution_registration_view(&self) -> ExecutionRegistrationView {
-        ExecutionRegistrationView {
-            attempted_instances: self
-                .batches
-                .iter()
-                .flat_map(|batch| {
-                    batch
-                        .request()
-                        .fragments()
-                        .into_iter()
-                        .map(move |fragment| {
-                            (
-                                batch.binding().target().backend_idx(),
-                                fragment.fragment_instance_id(),
-                            )
-                        })
-                })
-                .collect(),
-        }
-    }
-
-    pub fn stage(
-        self,
-        barrier: &dyn QueryLaunchBarrier,
-    ) -> Result<StagedDistributedQuery, DistributedQueryError> {
-        if let Err(error) = barrier.stage_all(&self.batches) {
-            let kind = error.kind();
-            let message = self
-                .query_lifecycle_lease
-                .abort_preserving(error.message().to_string());
-            return Err(DistributedQueryError::new(kind, message));
-        }
-        Ok(StagedDistributedQuery {
-            batches: self.batches,
-            root_fetch: self.root_fetch,
-            expected_output: self.expected_output,
-            query_lifecycle_lease: self.query_lifecycle_lease,
-        })
-    }
-}
-
-/// Read-only pre-Start registration data.  It is intentionally separate from
-/// result/fetch ownership, which remains unavailable until Running.
-pub struct ExecutionRegistrationView {
-    attempted_instances: Vec<(usize, UniqueId)>,
-}
-
-impl ExecutionRegistrationView {
-    pub fn attempted_instances(&self) -> &[(usize, UniqueId)] {
-        &self.attempted_instances
-    }
-}
-
-pub struct StagedDistributedQuery {
-    batches: Vec<StageBatch>,
-    root_fetch: RootFetchMetadata,
-    expected_output: ExpectedOutputSchema,
-    query_lifecycle_lease: QueryLifecycleLease,
-}
-
-impl StagedDistributedQuery {
-    pub fn batches(&self) -> &[StageBatch] {
-        &self.batches
-    }
-
-    pub fn start(
-        self,
-        barrier: &dyn QueryLaunchBarrier,
-    ) -> Result<RunningDistributedQuery, DistributedQueryError> {
-        if let Err(error) = barrier.start_all(&self.batches) {
-            let kind = error.kind();
-            let message = self
-                .query_lifecycle_lease
-                .abort_preserving(error.message().to_string());
-            return Err(DistributedQueryError::new(kind, message));
-        }
-        Ok(RunningDistributedQuery {
-            root_fetch: self.root_fetch,
-            expected_output: self.expected_output,
-            query_lifecycle_lease: self.query_lifecycle_lease,
-        })
-    }
-}
-
-/// Running-only execution ownership. No public constructor or inverse
-/// recombination API exists.
-pub struct RunningDistributedQuery {
-    root_fetch: RootFetchMetadata,
-    expected_output: ExpectedOutputSchema,
-    query_lifecycle_lease: QueryLifecycleLease,
-}
-
-impl RunningDistributedQuery {
-    pub fn into_parts(self) -> RunningNativeExecutionParts {
-        RunningNativeExecutionParts {
-            root_fetch: self.root_fetch,
-            expected_output: self.expected_output,
-            query_lifecycle_lease: self.query_lifecycle_lease,
-        }
-    }
-}
-
-pub struct RunningNativeExecutionParts {
-    pub root_fetch: RootFetchMetadata,
-    pub expected_output: ExpectedOutputSchema,
-    pub query_lifecycle_lease: QueryLifecycleLease,
-}
-
 fn build_expected_output_schema(
     root: &PreparedFragment,
 ) -> Result<ExpectedOutputSchema, DistributedQueryError> {
@@ -2022,23 +1586,16 @@ mod tests {
         ConnectorInstanceId, ConnectorSplit,
     };
 
-    use super::{
-        build_fragment_lifecycle_projection, derive_fragment_instance_id, merge_catalog_properties,
-    };
-    use crate::common::backend_topology::LiveBackendTarget;
+    use super::{derive_fragment_instance_id, merge_catalog_properties};
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_proto_codec::catalog::CatalogSet;
-    use novarocks_proto_codec::lifecycle::{
-        AttemptId, ExchangeRouteManifest, QueryControlEndpoint, QueryExecutionId,
-    };
-    use novarocks_proto_codec::membership::BackendProcessDescriptor;
-    use novarocks_proto_models::{common, novarocks};
+    use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
-    use novarocks_types::{BackendProcessId, UniqueId};
+    use novarocks_types::UniqueId;
 
     fn catalog_properties(name: &str, version: u8, warehouse: &str) -> CatalogProperties {
         CatalogProperties::new(
@@ -2052,19 +1609,6 @@ mod tests {
             Vec::new(),
         )
         .expect("valid catalog properties")
-    }
-
-    fn live_backend(backend_idx: usize, endpoint: std::net::SocketAddr) -> LiveBackendTarget {
-        let descriptor = BackendProcessDescriptor::new(
-            BackendProcessId::new_v7(),
-            QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
-                .expect("valid endpoint"),
-            "artifact-test-deployment",
-            "artifact-test-build",
-            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-        )
-        .expect("valid backend descriptor");
-        LiveBackendTarget::new(backend_idx, descriptor)
     }
 
     fn placement(
@@ -2143,29 +1687,6 @@ mod tests {
                     .collect()
             })
             .collect()
-    }
-
-    fn exchange_route(
-        source: UniqueId,
-        destination: UniqueId,
-        destination_node_id: i32,
-        sender_ordinal: u32,
-        sender_count: u32,
-    ) -> ExchangeRouteManifest {
-        ExchangeRouteManifest::parse(novarocks::ExchangeRouteManifest {
-            source_fragment_instance_id: Some(common::UniqueId {
-                hi: source.high(),
-                lo: source.low(),
-            }),
-            destination_fragment_instance_id: Some(common::UniqueId {
-                hi: destination.high(),
-                lo: destination.low(),
-            }),
-            destination_node_id,
-            sender_ordinal,
-            sender_count,
-        })
-        .expect("valid protocol exchange route")
     }
 
     fn stream_edge(source_fragment_id: u32, target_fragment_id: u32, node_id: i32) -> FragmentEdge {
@@ -2254,55 +1775,5 @@ mod tests {
             schedule.by_fragment[&30][0].per_exch_num_senders[&300], 3,
             "the announced sender count must equal the receiver's expectation"
         );
-    }
-
-    #[test]
-    fn exchange_route_projection_canonicalizes_out_of_order_edges_and_placements() {
-        let schedule = SchedulingPlan {
-            root_fragment_id: 40,
-            by_fragment: BTreeMap::from([
-                (
-                    10,
-                    vec![
-                        placement(10, 0, UniqueId::new(9, 1), 0),
-                        placement(10, 1, UniqueId::new(1, 1), 1),
-                    ],
-                ),
-                (
-                    20,
-                    vec![
-                        placement(20, 0, UniqueId::new(8, 1), 0),
-                        placement(20, 1, UniqueId::new(2, 1), 1),
-                    ],
-                ),
-                (30, vec![placement(30, 0, UniqueId::new(7, 1), 0)]),
-                (40, vec![placement(40, 0, UniqueId::new(6, 1), 1)]),
-            ]),
-            root_finst_id: UniqueId::new(6, 1),
-            root_backend_idx: 1,
-        };
-        let edges = vec![stream_edge(30, 40, 400), stream_edge(10, 20, 200)];
-        let live_backends = BTreeMap::from([
-            (
-                0,
-                live_backend(0, "127.0.0.1:19040".parse().expect("valid endpoint")),
-            ),
-            (
-                1,
-                live_backend(1, "127.0.0.1:19041".parse().expect("valid endpoint")),
-            ),
-        ]);
-
-        let projection = build_fragment_lifecycle_projection(&schedule, &edges, live_backends)
-            .expect("valid lifecycle projection");
-        let expected = vec![
-            exchange_route(UniqueId::new(1, 1), UniqueId::new(2, 1), 200, 1, 2),
-            exchange_route(UniqueId::new(1, 1), UniqueId::new(8, 1), 200, 1, 2),
-            exchange_route(UniqueId::new(7, 1), UniqueId::new(6, 1), 400, 0, 1),
-            exchange_route(UniqueId::new(9, 1), UniqueId::new(2, 1), 200, 0, 2),
-            exchange_route(UniqueId::new(9, 1), UniqueId::new(8, 1), 200, 0, 2),
-        ];
-
-        assert_eq!(projection.exchange_routes, expected);
     }
 }

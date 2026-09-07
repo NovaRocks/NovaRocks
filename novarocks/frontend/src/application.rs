@@ -960,15 +960,6 @@ impl FrontendApplicationHost {
         self.query_control.clone()
     }
 
-    pub fn terminal_ingress(&self) -> Arc<dyn crate::coordinator::QueryTerminalIngress> {
-        Arc::new(
-            self.coordinator
-                .as_ref()
-                .expect("frontend coordinator is installed before host open returns")
-                .terminal_ingress(),
-        )
-    }
-
     pub(crate) fn backend_membership_ingress(&self) -> Arc<ClusterBackendService> {
         Arc::clone(self.topology())
     }
@@ -988,7 +979,6 @@ impl FrontendApplicationHost {
     {
         crate::native::report_server::FrontendReportServerHandle::start(
             bind_addr,
-            self.terminal_ingress(),
             self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
             native_trust,
@@ -1008,7 +998,6 @@ impl FrontendApplicationHost {
         crate::native::report_server::FrontendReportServerHandle::start_from_host(
             host,
             port,
-            self.terminal_ingress(),
             self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
             native_trust,
@@ -1045,21 +1034,12 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn coordinator_report_endpoint_sink(
-        &self,
-    ) -> Arc<dyn crate::common::backend_topology::CoordinatorReportEndpointSink> {
-        self.coordinator
-            .as_ref()
-            .expect("frontend coordinator is installed before host open returns")
-            .report_endpoint_sink()
-    }
-
     /// Frontend composition-time topology leaf used by FE-owned services.
     pub fn backend_topology_port(&self) -> crate::common::backend_topology::BackendTopologyService {
         Arc::clone(self.topology()) as crate::common::backend_topology::BackendTopologyService
     }
 
-    pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {
+    pub async fn shutdown(self) -> Result<(), FrontendApplicationError> {
         self.shutdown_until(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
             .await
     }
@@ -1104,11 +1084,8 @@ impl FrontendApplicationHost {
         let native_compatibility_id = execution.native_compatibility_id();
         let coordinator = Arc::new(
             FrontendDistributedQueryCoordinator::new(
-                execution.advertised_report_host,
-                execution.configured_report_port,
                 execution.runtime_filter_worker_count,
                 native_compatibility_id,
-                execution.query_control_timeouts,
                 execution.task_update_retry_policy,
                 execution.connector_split_initial_dynamic_filter_wait_cap,
                 execution.task_execution_budgets,

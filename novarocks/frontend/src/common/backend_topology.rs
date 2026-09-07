@@ -234,32 +234,6 @@ pub fn record_successful_stage(_backend_idx: usize, fragment_count: usize) {
     crate::metrics::observe_fragments_scheduled(fragment_count);
 }
 
-/// Resolves the report endpoint after the coordinator gRPC listener has bound.
-///
-/// A configured port of zero requests an ephemeral listener, so its actual
-/// bound port must be read at query time rather than frozen during host open.
-pub struct CoordinatorReportEndpoint {
-    endpoint: RuntimeEndpoint,
-}
-
-impl CoordinatorReportEndpoint {
-    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, String> {
-        Ok(Self {
-            endpoint: RuntimeEndpoint::new(host, i32::from(port))?,
-        })
-    }
-
-    pub fn from_socket_addr(endpoint: SocketAddr) -> Self {
-        Self {
-            endpoint: RuntimeEndpoint::from_socket_addr(endpoint),
-        }
-    }
-
-    pub fn into_runtime_endpoint(self) -> RuntimeEndpoint {
-        self.endpoint
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct LiveBackendTarget {
     backend_idx: usize,
@@ -366,22 +340,6 @@ impl BackendTopologySnapshot {
     }
 }
 
-pub trait CoordinatorReportEndpointSink: Send + Sync + 'static {
-    fn set_bound_port(&self, port: u16);
-}
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific frontend integration and regression coverage."
-)]
-pub(crate) struct NoopCoordinatorReportEndpointSink;
-
-#[cfg(test)]
-impl CoordinatorReportEndpointSink for NoopCoordinatorReportEndpointSink {
-    fn set_bound_port(&self, _port: u16) {}
-}
-
 #[cfg(test)]
 #[allow(
     dead_code,
@@ -434,9 +392,7 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use super::{
-        BackendTopologyError, BackendTopologySnapshot, CoordinatorReportEndpoint, LiveBackendTarget,
-    };
+    use super::{BackendTopologyError, BackendTopologySnapshot, LiveBackendTarget};
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_types::BackendProcessId;
@@ -451,12 +407,6 @@ mod tests {
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         )
         .expect("valid descriptor")
-    }
-
-    #[test]
-    fn coordinator_report_endpoint_accepts_advertised_dns_hostnames() {
-        CoordinatorReportEndpoint::new("frontend.internal", 19070)
-            .expect("advertised DNS hostname is a valid same-wire endpoint");
     }
 
     #[test]

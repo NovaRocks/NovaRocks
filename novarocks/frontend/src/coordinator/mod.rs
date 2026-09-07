@@ -18,7 +18,6 @@
 // MIGRATION: wired into the round once the typed producer lands.
 mod execution;
 mod query_registry;
-mod report;
 mod scheduler;
 #[allow(
     dead_code,
@@ -33,5 +32,4 @@ pub(crate) use query_registry::{
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
 };
-pub use report::{FrontendCoordinatorTerminalIngress, QueryTerminalIngress};
 pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};

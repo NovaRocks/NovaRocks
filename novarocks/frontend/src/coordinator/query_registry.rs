@@ -17,7 +17,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use crate::common::backend_topology::LiveBackendTarget;
 use crate::metrics::FrontendProcessQueryCountersSnapshot;
@@ -37,19 +36,18 @@ pub(crate) enum QueryLifecycleConvergenceErrorSource {
     NoOutcome,
 }
 
-/// Immutable, query-scoped terminal convergence evidence retained alongside
-/// the unary terminal ingress.  It is intentionally produced by the attempt
-/// control that owns the control streams, never reconstructed from process
-/// metrics or logs.
+/// Immutable, query-scoped terminal convergence evidence.  It is intentionally
+/// produced by the attempt that owns the execution id, never reconstructed
+/// from process metrics or logs.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct QueryLifecycleConvergenceSnapshot {
     pub(crate) execution_id: QueryExecutionId,
     pub(crate) error_source: Option<QueryLifecycleConvergenceErrorSource>,
     pub(crate) primary_error: Option<String>,
     pub(crate) participant_outcomes: Vec<ParticipantTerminalOutcome>,
-    /// Runtime Filter terminal facts are normalized only from a complete,
-    /// canonical `QueryTerminalSet`.  The unavailable variant records why no
-    /// such set existed for this retained lifecycle snapshot.
+    /// Runtime Filter terminal facts are normalized only from a complete set
+    /// of participant contributions.  The unavailable variant records why no
+    /// such set existed for this attempt.
     pub(crate) runtime_filter: RuntimeFilterTerminalRollupSnapshot,
     pub(crate) metrics: FrontendProcessQueryCountersSnapshot,
 }
@@ -67,60 +65,22 @@ pub(crate) enum RuntimeFilterTerminalRollupSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeFilterTerminalRollupUnavailable {
     TerminalOutcomesIncomplete,
-    NegativeAttestation,
 }
 
 /// Read-only diagnostic seam for the immutable terminal evidence retained by
-/// the query registry.  It deliberately has no access to active streams or
-/// terminal ingress mutation.
+/// the query registry.  It deliberately has no access to attempt mutation.
 pub(crate) trait QueryLifecycleConvergenceReader: Send + Sync {
     fn latest_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot>;
-}
-
-pub(crate) trait ActiveQueryAttemptControl: Send + Sync {
-    fn execution_id(&self) -> QueryExecutionId;
-
-    fn request_abort(&self, failure: LatchedQueryFailure);
-
-    /// The terminal ingress is deliberately routed through the active attempt
-    /// rather than the legacy execution-report registry.  This keeps the
-    /// store-before-ACK identity check in one place for stream and unary
-    /// delivery.
-    fn report_terminal_outcome(
-        &self,
-        outcome: ParticipantTerminalOutcome,
-    ) -> Result<bool, DistributedQueryError>;
-
-    /// Once every participant outcome is stored, retain the FE ingress long
-    /// enough for a BE whose stream ACK was lost to complete unary fallback.
-    fn retain_terminal_ingress(&self) -> bool {
-        false
-    }
-
-    fn convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
-        None
-    }
-}
-
-const TERMINAL_INGRESS_RETENTION: Duration = Duration::from_secs(120);
-const TERMINAL_INGRESS_RETAINED_CAPACITY: usize = 4_096;
-
-struct RetainedTerminalIngress {
-    control: Arc<dyn ActiveQueryAttemptControl>,
-    expires_at: Instant,
 }
 
 /// Typed origin of a query failure retained by the FE query owner.
 ///
 /// The variants deliberately describe evidence, not rendered text. This lets
-/// the registry preserve a concrete query failure when lifecycle supervision
-/// subsequently observes the control stream closing as a consequence of that
-/// failure.
+/// the registry preserve a concrete query failure when transport supervision
+/// subsequently observes a peer going away as a consequence of that failure.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum QueryFailureCause {
-    LifecycleHeartbeatTimeout,
     RemoteTransportObservation,
-    BackendProcessLoss,
     ClientCancellation,
     FrontendExecution,
     BackendLocalFailure,
@@ -129,13 +89,10 @@ pub(crate) enum QueryFailureCause {
 impl QueryFailureCause {
     const fn priority(self) -> QueryFailurePriority {
         match self {
-            Self::LifecycleHeartbeatTimeout | Self::RemoteTransportObservation => {
-                QueryFailurePriority::LifecycleObservation
+            Self::RemoteTransportObservation => QueryFailurePriority::LifecycleObservation,
+            Self::ClientCancellation | Self::FrontendExecution | Self::BackendLocalFailure => {
+                QueryFailurePriority::ConcreteCause
             }
-            Self::BackendProcessLoss
-            | Self::ClientCancellation
-            | Self::FrontendExecution
-            | Self::BackendLocalFailure => QueryFailurePriority::ConcreteCause,
         }
     }
 }
@@ -166,10 +123,6 @@ impl LatchedQueryFailure {
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
-
-    pub(crate) const fn id(&self) -> u64 {
-        self.id
-    }
 }
 
 struct ActiveQuery {
@@ -185,9 +138,6 @@ struct ActiveQuery {
     /// convergence snapshot instead of discarding it at the first latch.
     secondary_failures: BTreeSet<(QueryFailureCause, String)>,
     next_failure_id: u64,
-    cancellation_requested: bool,
-    cancellation_dispatched: bool,
-    active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
 }
 
 impl ActiveQuery {
@@ -233,62 +183,17 @@ struct BackendTopologyState {
 pub(crate) struct FrontendQueryRegistry {
     namespace: QueryProcessNamespace,
     active: Mutex<BTreeMap<QueryKey, ActiveQuery>>,
-    retained_terminal_ingress: Mutex<BTreeMap<QueryExecutionId, RetainedTerminalIngress>>,
-    latest_retained_execution: Mutex<Option<QueryExecutionId>>,
-    /// The convergence evidence of the most recent attempt to finish, whatever
-    /// protocol ran it.
+    /// The convergence evidence of the most recent attempt to finish.
     ///
-    /// One slot, last publication wins. The two protocols each publish their
-    /// own attempt's immutable evidence into it, which is not two authorities
-    /// over one decision: an execution id is owned by exactly one attempt, and
-    /// an attempt runs on exactly one protocol. What the slot must not become
-    /// is a place where a reader chooses between two candidates for the same
-    /// attempt.
-    latest_convergence: Mutex<Option<RetainedConvergenceEvidence>>,
+    /// One slot, last publication wins. An execution id is owned by exactly
+    /// one attempt, so the slot never becomes a place where a reader chooses
+    /// between two candidates for the same attempt.
+    ///
+    /// The evidence is published frozen: the task protocol has no late
+    /// ingress, so an attempt's contribution set is complete when its last
+    /// query context releases.
+    latest_convergence: Mutex<Option<Box<QueryLifecycleConvergenceSnapshot>>>,
     backend_topology: Mutex<BackendTopologyState>,
-}
-
-/// Where the latest attempt's convergence evidence is read from.
-///
-/// The lifecycle variant is deliberately lazy. That attempt keeps folding late
-/// unary terminal outcomes in after its registry binding drops, so freezing a
-/// snapshot at retention time would publish evidence that is complete only by
-/// accident of timing. The task protocol has no late ingress: its evidence is
-/// complete when the last release settles, so it is published frozen.
-enum RetainedConvergenceEvidence {
-    LifecycleAttempt(Arc<dyn ActiveQueryAttemptControl>),
-    TaskRound(Box<QueryLifecycleConvergenceSnapshot>),
-}
-
-impl RetainedConvergenceEvidence {
-    fn snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
-        match self {
-            Self::LifecycleAttempt(control) => control.convergence_snapshot(),
-            Self::TaskRound(snapshot) => Some((**snapshot).clone()),
-        }
-    }
-}
-
-pub(crate) struct AttemptBackendOwnershipError {
-    error: DistributedQueryError,
-    backend_process_mismatch: bool,
-}
-
-impl AttemptBackendOwnershipError {
-    fn new(error: DistributedQueryError, backend_process_mismatch: bool) -> Self {
-        Self {
-            error,
-            backend_process_mismatch,
-        }
-    }
-
-    pub(crate) const fn is_backend_process_mismatch(&self) -> bool {
-        self.backend_process_mismatch
-    }
-
-    pub(crate) fn into_error(self) -> DistributedQueryError {
-        self.error
-    }
 }
 
 impl FrontendQueryRegistry {
@@ -296,8 +201,6 @@ impl FrontendQueryRegistry {
         Self {
             namespace,
             active: Mutex::new(BTreeMap::new()),
-            retained_terminal_ingress: Mutex::new(BTreeMap::new()),
-            latest_retained_execution: Mutex::new(None),
             latest_convergence: Mutex::new(None),
             backend_topology: Mutex::new(BackendTopologyState::default()),
         }
@@ -349,9 +252,6 @@ impl FrontendQueryRegistry {
                     first_failure: None,
                     secondary_failures: BTreeSet::new(),
                     next_failure_id: 1,
-                    cancellation_requested: false,
-                    cancellation_dispatched: false,
-                    active_attempt: None,
                 });
             }
             Entry::Occupied(_) => {
@@ -365,138 +265,6 @@ impl FrontendQueryRegistry {
             registry: Arc::clone(self),
             key,
         })
-    }
-
-    pub(crate) fn bind_active_attempt(
-        self: &Arc<Self>,
-        execution_id: QueryExecutionId,
-        control: Arc<dyn ActiveQueryAttemptControl>,
-    ) -> Result<ActiveQueryAttemptBinding, DistributedQueryError> {
-        if control.execution_id() != execution_id {
-            return Err(contract_violation(
-                "frontend active attempt control execution id differs from binding",
-            ));
-        }
-        let query_id = execution_id.query_id();
-        let mut active = self.active.lock().expect("frontend query registry lock");
-        let query = active
-            .get_mut(&query_key(query_id))
-            .ok_or_else(|| self.inactive_query(query_id))?;
-        if let Some(failure) = &query.first_failure {
-            return Err(failed(failure.message.clone()));
-        }
-        if query.cancellation_requested {
-            return Err(failed(
-                "frontend query cancellation was requested before lifecycle initialization",
-            ));
-        }
-        if query.active_attempt.is_some() {
-            return Err(contract_violation(
-                "frontend query already has an active attempt control binding",
-            ));
-        }
-        query.active_attempt = Some(control);
-        Ok(ActiveQueryAttemptBinding {
-            registry: Arc::downgrade(self),
-            key: query_key(query_id),
-            execution_id,
-        })
-    }
-
-    pub(crate) fn extend_attempt_backend_ownership(
-        &self,
-        query_id: QueryId,
-        backend_ownership: &[(usize, BackendProcessId)],
-    ) -> Result<(), AttemptBackendOwnershipError> {
-        let topology = self
-            .backend_topology
-            .lock()
-            .expect("frontend backend topology gate lock");
-        if topology.initialized {
-            for &(backend_idx, process_id) in backend_ownership {
-                match topology.live_process_ids.get(&backend_idx) {
-                    Some(current_process_id) if *current_process_id == process_id => {}
-                    Some(current_process_id) => {
-                        return Err(AttemptBackendOwnershipError::new(
-                            DistributedQueryError::new(
-                                DistributedQueryErrorKind::Rejected,
-                                format!(
-                                    "query lifecycle backend ordinal {backend_idx} process identity {process_id} is stale; current process identity is {current_process_id}"
-                                ),
-                            ),
-                            true,
-                        ));
-                    }
-                    None => {
-                        return Err(AttemptBackendOwnershipError::new(
-                            DistributedQueryError::new(
-                                DistributedQueryErrorKind::Rejected,
-                                format!(
-                                    "query lifecycle backend ordinal {backend_idx} process identity {process_id} is no longer live in the current frontend topology"
-                                ),
-                            ),
-                            false,
-                        ));
-                    }
-                }
-            }
-        }
-        drop(topology);
-
-        let mut active = self.active.lock().expect("frontend query registry lock");
-        let query = active.get_mut(&query_key(query_id)).ok_or_else(|| {
-            AttemptBackendOwnershipError::new(self.inactive_query(query_id), false)
-        })?;
-        for &(_, process_id) in backend_ownership {
-            query.scheduled_backends.insert(process_id);
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn request_active_attempt_abort(
-        &self,
-        query_id: QueryId,
-        reason: String,
-    ) -> Result<(), DistributedQueryError> {
-        let control = self
-            .active
-            .lock()
-            .expect("frontend query registry lock")
-            .get(&query_key(query_id))
-            .ok_or_else(|| self.inactive_query(query_id))?
-            .active_attempt
-            .clone()
-            .ok_or_else(|| {
-                DistributedQueryError::new(
-                    DistributedQueryErrorKind::Rejected,
-                    "frontend query has no active attempt control binding",
-                )
-            })?;
-        control.request_abort(LatchedQueryFailure::new(
-            0,
-            QueryFailureCause::ClientCancellation,
-            reason,
-        ));
-        Ok(())
-    }
-
-    pub(crate) fn report_query_terminal(
-        &self,
-        outcome: ParticipantTerminalOutcome,
-    ) -> Result<bool, DistributedQueryError> {
-        let query_id = outcome.execution_id().query_id();
-        let active = self
-            .active
-            .lock()
-            .expect("frontend query registry lock")
-            .get(&query_key(query_id))
-            .and_then(|query| query.active_attempt.clone());
-        let control = match active {
-            Some(control) if control.execution_id() == outcome.execution_id() => control,
-            Some(_) | None => self.retained_terminal_control(outcome.execution_id())?,
-        };
-        control.report_terminal_outcome(outcome)
     }
 
     pub(crate) fn set_scheduled_backend_ownership(
@@ -609,21 +377,12 @@ impl FrontendQueryRegistry {
             })
     }
 
-    pub(crate) fn retained_convergence_snapshot(
-        &self,
-        execution_id: QueryExecutionId,
-    ) -> Option<QueryLifecycleConvergenceSnapshot> {
-        self.retained_terminal_control(execution_id)
-            .ok()
-            .and_then(|control| control.convergence_snapshot())
-    }
-
     fn latest_retained_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
         self.latest_convergence
             .lock()
             .expect("frontend latest convergence evidence lock")
-            .as_ref()
-            .and_then(RetainedConvergenceEvidence::snapshot)
+            .as_deref()
+            .cloned()
     }
 
     /// Publishes the immutable convergence evidence of one task-protocol
@@ -640,99 +399,26 @@ impl FrontendQueryRegistry {
         *self
             .latest_convergence
             .lock()
-            .expect("frontend latest convergence evidence lock") =
-            Some(RetainedConvergenceEvidence::TaskRound(Box::new(snapshot)));
+            .expect("frontend latest convergence evidence lock") = Some(Box::new(snapshot));
     }
 
-    pub(crate) fn preserve_failure_context(
-        &self,
-        query_id: QueryId,
-        failure_id: u64,
-        message: String,
-    ) -> Result<(), DistributedQueryError> {
-        let mut active = self.active.lock().expect("frontend query registry lock");
-        let query = active
-            .get_mut(&query_key(query_id))
-            .ok_or_else(|| self.inactive_query(query_id))?;
-        if let Some(primary) = query.first_failure.as_mut()
-            && primary.id == failure_id
-        {
-            primary.message = message;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn latch_failure_and_cancel(
+    /// Records why this query failed and returns the primary cause the
+    /// registry selected.
+    ///
+    /// Standing the attempt's participants down is deliberately not done here:
+    /// a task round aborts its own tasks, so this owner holds the causal record
+    /// and nothing else.
+    pub(crate) fn latch_failure(
         &self,
         query_id: QueryId,
         cause: QueryFailureCause,
         message: impl Into<String>,
     ) -> Result<LatchedQueryFailure, DistributedQueryError> {
-        let (message, cancellation) = self.latch_failure(query_id, cause, message.into())?;
-        dispatch_cancellation(Some(cancellation));
-        Ok(message)
-    }
-
-    /// Records the failure before moving potentially blocking abort work off
-    /// the caller. Control-stream readers use this form so observing a typed
-    /// LocalFailure is linearized before that same reader continues receiving
-    /// termination events.
-    pub(crate) fn latch_failure_and_cancel_async(
-        &self,
-        query_id: QueryId,
-        cause: QueryFailureCause,
-        message: impl Into<String>,
-    ) -> Result<LatchedQueryFailure, DistributedQueryError> {
-        let (message, cancellation) = self.latch_failure(query_id, cause, message.into())?;
-        if cancellation.active_attempt.is_some() {
-            std::thread::spawn(move || dispatch_cancellation(Some(cancellation)));
-        }
-        Ok(message)
-    }
-
-    fn latch_failure(
-        &self,
-        query_id: QueryId,
-        cause: QueryFailureCause,
-        message: String,
-    ) -> Result<(LatchedQueryFailure, CancellationDispatch), DistributedQueryError> {
         let mut active = self.active.lock().expect("frontend query registry lock");
         let query = active
             .get_mut(&query_key(query_id))
             .ok_or_else(|| self.inactive_query(query_id))?;
-        let failure = query.record_failure(cause, message);
-        let cancellation = request_cancellation(query);
-        Ok((failure, cancellation))
-    }
-
-    pub(crate) fn backend_failed(
-        &self,
-        process_id: BackendProcessId,
-        message: String,
-    ) -> Vec<QueryId> {
-        let (affected, cancellations) = {
-            let mut active = self.active.lock().expect("frontend query registry lock");
-            let mut affected = Vec::new();
-            let mut cancellations = Vec::new();
-            for (&(high, low), query) in active.iter_mut() {
-                if !query.scheduled_backends.contains(&process_id) {
-                    continue;
-                }
-                if query.first_failure.is_none() {
-                    query.record_failure(QueryFailureCause::BackendProcessLoss, message.clone());
-                    affected.push(QueryId::new(high, low));
-                } else {
-                    query.record_failure(QueryFailureCause::BackendProcessLoss, message.clone());
-                }
-                cancellations.push(request_cancellation(query));
-            }
-            (affected, cancellations)
-        };
-
-        for cancellation in cancellations {
-            dispatch_cancellation(Some(cancellation));
-        }
-        affected
+        Ok(query.record_failure(cause, message.into()))
     }
 
     fn unregister(&self, key: QueryKey) {
@@ -740,96 +426,6 @@ impl FrontendQueryRegistry {
             .lock()
             .expect("frontend query registry lock")
             .remove(&key);
-    }
-
-    fn clear_active_attempt(&self, key: QueryKey, execution_id: QueryExecutionId) {
-        let control = {
-            let mut active = self.active.lock().expect("frontend query registry lock");
-            let Some(query) = active.get_mut(&key) else {
-                return;
-            };
-            if query
-                .active_attempt
-                .as_ref()
-                .is_some_and(|control| control.execution_id() == execution_id)
-            {
-                query.active_attempt.take()
-            } else {
-                None
-            }
-        };
-        if let Some(control) = control
-            && control.retain_terminal_ingress()
-        {
-            self.retain_terminal_control(control);
-        }
-    }
-
-    fn retain_terminal_control(&self, control: Arc<dyn ActiveQueryAttemptControl>) {
-        let execution_id = control.execution_id();
-        let convergence = Arc::clone(&control);
-        let now = Instant::now();
-        let mut retained = self
-            .retained_terminal_ingress
-            .lock()
-            .expect("frontend retained terminal ingress lock");
-        retained.retain(|_, ingress| ingress.expires_at > now);
-        if retained.len() >= TERMINAL_INGRESS_RETAINED_CAPACITY
-            && let Some(oldest) = retained
-                .iter()
-                .min_by_key(|(_, ingress)| ingress.expires_at)
-                .map(|(execution_id, _)| *execution_id)
-        {
-            retained.remove(&oldest);
-        }
-        retained.insert(
-            execution_id,
-            RetainedTerminalIngress {
-                control,
-                expires_at: now + TERMINAL_INGRESS_RETENTION,
-            },
-        );
-        *self
-            .latest_retained_execution
-            .lock()
-            .expect("frontend latest retained terminal ingress lock") = Some(execution_id);
-        *self
-            .latest_convergence
-            .lock()
-            .expect("frontend latest convergence evidence lock") =
-            Some(RetainedConvergenceEvidence::LifecycleAttempt(convergence));
-    }
-
-    fn retained_terminal_control(
-        &self,
-        execution_id: QueryExecutionId,
-    ) -> Result<Arc<dyn ActiveQueryAttemptControl>, DistributedQueryError> {
-        let now = Instant::now();
-        let mut retained = self
-            .retained_terminal_ingress
-            .lock()
-            .expect("frontend retained terminal ingress lock");
-        retained.retain(|_, ingress| ingress.expires_at > now);
-        if self
-            .latest_retained_execution
-            .lock()
-            .expect("frontend latest retained terminal ingress lock")
-            .is_some_and(|latest| !retained.contains_key(&latest))
-        {
-            *self
-                .latest_retained_execution
-                .lock()
-                .expect("frontend latest retained terminal ingress lock") = None;
-        }
-        retained
-            .get(&execution_id)
-            .map(|ingress| Arc::clone(&ingress.control))
-            .ok_or_else(|| {
-                DistributedQueryError::new(
-                    DistributedQueryErrorKind::Rejected,
-                    "query terminal snapshot execution id is stale or has no retained ingress",
-                )
-            })
     }
 }
 
@@ -844,59 +440,9 @@ pub(crate) struct ActiveQueryGuard {
     key: QueryKey,
 }
 
-pub(crate) struct ActiveQueryAttemptBinding {
-    registry: std::sync::Weak<FrontendQueryRegistry>,
-    key: QueryKey,
-    execution_id: QueryExecutionId,
-}
-
-impl Drop for ActiveQueryAttemptBinding {
-    fn drop(&mut self) {
-        if let Some(registry) = self.registry.upgrade() {
-            registry.clear_active_attempt(self.key, self.execution_id);
-        }
-    }
-}
-
 impl Drop for ActiveQueryGuard {
     fn drop(&mut self) {
         self.registry.unregister(self.key);
-    }
-}
-
-struct CancellationDispatch {
-    active_attempt: Option<Arc<dyn ActiveQueryAttemptControl>>,
-    failure: LatchedQueryFailure,
-}
-
-fn request_cancellation(query: &mut ActiveQuery) -> CancellationDispatch {
-    query.cancellation_requested = true;
-    let active_attempt = if query.cancellation_dispatched {
-        None
-    } else {
-        let control = query.active_attempt.clone();
-        if control.is_some() {
-            query.cancellation_dispatched = true;
-        }
-        control
-    };
-    CancellationDispatch {
-        active_attempt,
-        failure: query.first_failure.clone().unwrap_or_else(|| {
-            LatchedQueryFailure::new(
-                0,
-                QueryFailureCause::ClientCancellation,
-                "frontend query cancellation requested".to_string(),
-            )
-        }),
-    }
-}
-
-fn dispatch_cancellation(cancellation: Option<CancellationDispatch>) {
-    if let Some(cancellation) = cancellation
-        && let Some(control) = cancellation.active_attempt
-    {
-        control.request_abort(cancellation.failure);
     }
 }
 
@@ -908,219 +454,54 @@ fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
 
-fn failed(message: impl Into<String>) -> DistributedQueryError {
-    DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks_proto_codec::lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantTerminalOutcome, QueryControlEndpoint,
-        QueryTerminalSnapshot, TerminalizationProof,
-    };
-    use novarocks_proto_models::{common, novarocks as proto};
+    use novarocks_proto_codec::lifecycle::AttemptId;
 
-    struct RetainedControl {
-        execution_id: QueryExecutionId,
-        reports: AtomicUsize,
-    }
+    /// The one convergence slot answers with the evidence the latest attempt
+    /// published.
+    ///
+    /// The defect this catches: a reader wired to a producer that no longer
+    /// exists. Every query then leaves the endpoint reporting nothing, which
+    /// reads as "this attempt produced no evidence" rather than as a missing
+    /// publisher.
+    #[test]
+    fn the_convergence_reader_answers_with_the_latest_published_attempt() {
+        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(41));
+        let first =
+            QueryExecutionId::new(QueryId::new(41, 42), AttemptId::new(1).expect("attempt"))
+                .expect("execution id");
+        let second =
+            QueryExecutionId::new(QueryId::new(41, 43), AttemptId::new(1).expect("attempt"))
+                .expect("execution id");
 
-    impl ActiveQueryAttemptControl for RetainedControl {
-        fn execution_id(&self) -> QueryExecutionId {
-            self.execution_id
-        }
+        assert!(
+            QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry).is_none(),
+            "a registry that has published nothing reports no evidence"
+        );
 
-        fn request_abort(&self, _failure: LatchedQueryFailure) {}
-
-        fn report_terminal_outcome(
-            &self,
-            _outcome: ParticipantTerminalOutcome,
-        ) -> Result<bool, DistributedQueryError> {
-            self.reports.fetch_add(1, Ordering::SeqCst);
-            Ok(false)
-        }
-
-        fn retain_terminal_ingress(&self) -> bool {
-            true
-        }
-
-        fn convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
-            Some(QueryLifecycleConvergenceSnapshot {
-                execution_id: self.execution_id,
+        for execution_id in [first, second] {
+            registry.publish_task_round_convergence(QueryLifecycleConvergenceSnapshot {
+                execution_id,
                 error_source: None,
-                primary_error: Some("stable test failure".to_string()),
+                primary_error: None,
                 participant_outcomes: Vec::new(),
                 runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
                     RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
                 ),
                 metrics: FrontendProcessQueryCountersSnapshot::default(),
-            })
+            });
         }
-    }
 
-    fn terminal_outcome(execution_id: QueryExecutionId) -> ParticipantTerminalOutcome {
-        let backend = ParticipantBackendIdentity::new(
-            BackendProcessId::new_v7(),
-            QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
-        )
-        .expect("valid backend identity")
-        .as_proto()
-        .clone();
-        let fragment = proto::QueryTerminalFragmentSnapshot {
-            fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
-            backend_num: 7,
-            outcome: proto::QueryTerminalFragmentOutcome::Succeeded as i32,
-            load_stats: Some(proto::QueryTerminalLoadStats::default()),
-            profile: Some(proto::FragmentTerminalProfileTelemetry {
-                telemetry: Some(
-                    proto::fragment_terminal_profile_telemetry::Telemetry::Unavailable(
-                        proto::TerminalTelemetryUnavailable {
-                            stage: "test".into(),
-                            code: "UNAVAILABLE".into(),
-                        },
-                    ),
-                ),
-            }),
-            ..Default::default()
-        };
-        let participant = proto::ParticipantAttemptRef {
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                execution_id,
-            )),
-            backend_process_id: backend.process_id.clone(),
-        };
-        let snapshot = QueryTerminalSnapshot::parse(proto::QueryTerminalSnapshot {
-            version: 1,
-            fragments: vec![fragment],
-            profile_contribution: Some(proto::QueryTerminalProfileContributionTelemetry {
-                telemetry: Some(
-                    proto::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
-                        proto::TerminalTelemetryUnavailable {
-                            stage: "test".into(),
-                            code: "UNAVAILABLE".into(),
-                        },
-                    ),
-                ),
-            }),
-            participant: Some(participant.clone()),
-        })
-        .expect("terminal snapshot");
-        let proof = TerminalizationProof::parse(proto::TerminalizationProof {
-            version: 1,
-            fragments: vec![proto::TerminalizationProofFragment {
-                fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
-                backend_num: 7,
-                outcome: proto::QueryTerminalFragmentOutcome::Succeeded as i32,
-                ..Default::default()
-            }],
-            participant: Some(participant),
-        })
-        .expect("terminal proof");
-        ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
-            outcome: Some(proto::participant_terminal_outcome::Outcome::Proof(
-                proof.as_proto().clone(),
-            )),
-            snapshot: Some(snapshot.as_proto().clone()),
-        })
-        .expect("participant terminal outcome")
-    }
-
-    #[test]
-    fn retained_terminal_ingress_accepts_same_execution_after_active_query_unregistered() {
-        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(41));
-        let execution_id =
-            QueryExecutionId::new(QueryId::new(41, 42), AttemptId::new(1).expect("attempt"))
-                .expect("execution id");
-        let control = Arc::new(RetainedControl {
-            execution_id,
-            reports: AtomicUsize::new(0),
-        });
-        registry.retain_terminal_control(control.clone());
-
-        assert!(
-            !registry
-                .report_query_terminal(terminal_outcome(execution_id))
-                .expect("retained ingress accepts duplicate terminal delivery")
-        );
-        assert_eq!(control.reports.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            registry
-                .retained_convergence_snapshot(execution_id)
-                .expect("retained control exposes its immutable convergence snapshot")
-                .primary_error
-                .as_deref(),
-            Some("stable test failure")
-        );
-        assert_eq!(
-            QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
-                .expect("latest retained control exposes convergence snapshot")
-                .execution_id,
-            execution_id,
-            "the read-only diagnostic seam returns retained attempt evidence"
-        );
-    }
-
-    /// The one convergence slot answers for whichever protocol ran the latest
-    /// attempt.
-    ///
-    /// The defect this catches: a reader wired only to the retired lifecycle's
-    /// retention. Every task-protocol query then leaves the endpoint reporting
-    /// the last lifecycle attempt -- a real snapshot of the wrong query --
-    /// which reads as stale data rather than as a missing producer.
-    #[test]
-    fn the_convergence_reader_answers_for_the_protocol_that_ran_the_latest_attempt() {
-        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(41));
-        let lifecycle_execution =
-            QueryExecutionId::new(QueryId::new(41, 42), AttemptId::new(1).expect("attempt"))
-                .expect("execution id");
-        let task_execution =
-            QueryExecutionId::new(QueryId::new(41, 43), AttemptId::new(1).expect("attempt"))
-                .expect("execution id");
-
-        registry.retain_terminal_control(Arc::new(RetainedControl {
-            execution_id: lifecycle_execution,
-            reports: AtomicUsize::new(0),
-        }));
-        assert_eq!(
-            QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
-                .expect("a retained lifecycle attempt is readable")
-                .execution_id,
-            lifecycle_execution
-        );
-
-        registry.publish_task_round_convergence(QueryLifecycleConvergenceSnapshot {
-            execution_id: task_execution,
-            error_source: None,
-            primary_error: None,
-            participant_outcomes: Vec::new(),
-            runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
-                RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
-            ),
-            metrics: FrontendProcessQueryCountersSnapshot::default(),
-        });
         let latest = QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
-            .expect("a published task attempt is readable");
-        assert_eq!(latest.execution_id, task_execution);
+            .expect("a published attempt is readable");
+        assert_eq!(latest.execution_id, second);
         assert!(
             latest.participant_outcomes.is_empty(),
             "the task protocol mints no participant terminal outcome, and none \
              may be invented for it"
-        );
-
-        // And back the other way: the slot is last-publication-wins, not
-        // first-protocol-wins.
-        registry.retain_terminal_control(Arc::new(RetainedControl {
-            execution_id: lifecycle_execution,
-            reports: AtomicUsize::new(0),
-        }));
-        assert_eq!(
-            QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
-                .expect("the retained lifecycle attempt is readable again")
-                .execution_id,
-            lifecycle_execution
         );
     }
 
@@ -1140,14 +521,11 @@ mod tests {
                         first_failure: None,
                         secondary_failures: BTreeSet::new(),
                         next_failure_id: 1,
-                        cancellation_requested: false,
-                        cancellation_dispatched: false,
-                        active_attempt: None,
                     },
                 );
             for message in messages {
                 registry
-                    .latch_failure_and_cancel(
+                    .latch_failure(
                         query_id,
                         QueryFailureCause::FrontendExecution,
                         (*message).to_string(),
@@ -1191,21 +569,18 @@ mod tests {
     }
 
     #[test]
-    fn concrete_failure_supersedes_lifecycle_observation_in_either_arrival_order() {
+    fn concrete_failure_supersedes_a_transport_observation_in_either_arrival_order() {
         fn primary_for_order(observation_first: bool) -> (QueryFailureCause, String) {
             let mut query = ActiveQuery {
                 scheduled_backends: BTreeSet::new(),
                 first_failure: None,
                 secondary_failures: BTreeSet::new(),
                 next_failure_id: 1,
-                cancellation_requested: false,
-                cancellation_dispatched: false,
-                active_attempt: None,
             };
             let observation = || {
                 (
-                    QueryFailureCause::LifecycleHeartbeatTimeout,
-                    "aaa heartbeat timeout".to_string(),
+                    QueryFailureCause::RemoteTransportObservation,
+                    "aaa control transport closed".to_string(),
                 )
             };
             let concrete = || {
@@ -1232,66 +607,6 @@ mod tests {
         );
         assert_eq!(primary_for_order(true), expected);
         assert_eq!(primary_for_order(false), expected);
-    }
-
-    #[test]
-    fn stale_abort_context_cannot_overwrite_upgraded_concrete_failure() {
-        let registry = Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(73)));
-        let query_id = QueryId::new(73, 74);
-        registry
-            .active
-            .lock()
-            .expect("frontend query registry lock")
-            .insert(
-                query_key(query_id),
-                ActiveQuery {
-                    scheduled_backends: BTreeSet::new(),
-                    first_failure: None,
-                    secondary_failures: BTreeSet::new(),
-                    next_failure_id: 1,
-                    cancellation_requested: false,
-                    cancellation_dispatched: false,
-                    active_attempt: None,
-                },
-            );
-
-        let observation = registry
-            .latch_failure_and_cancel(
-                query_id,
-                QueryFailureCause::LifecycleHeartbeatTimeout,
-                "aaa heartbeat timeout",
-            )
-            .expect("latch lifecycle observation");
-        let concrete = registry
-            .latch_failure_and_cancel(
-                query_id,
-                QueryFailureCause::BackendLocalFailure,
-                "zzz fragment scan failed",
-            )
-            .expect("latch concrete failure");
-        registry
-            .preserve_failure_context(
-                query_id,
-                observation.id(),
-                "aaa heartbeat timeout; rollback failed".to_string(),
-            )
-            .expect("ignore stale lifecycle context");
-        assert_eq!(
-            registry.first_failure(query_id).as_deref(),
-            Some("zzz fragment scan failed")
-        );
-
-        registry
-            .preserve_failure_context(
-                query_id,
-                concrete.id(),
-                "zzz fragment scan failed; rollback failed".to_string(),
-            )
-            .expect("enrich selected concrete failure");
-        assert_eq!(
-            registry.first_failure(query_id).as_deref(),
-            Some("zzz fragment scan failed; rollback failed")
-        );
     }
 
     #[test]

@@ -18,13 +18,11 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
-use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::common::backend_topology::{
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
@@ -61,7 +59,6 @@ use super::query_registry::{
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
 };
-use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentRoundGuard, assignment_endpoints, assignment_targets,
@@ -224,61 +221,6 @@ impl FrontendLiveBackendTopology {
     }
 }
 
-struct FrontendReportEndpointBinding {
-    advertised_host: String,
-    configured_port: u16,
-    bound_port: AtomicU16,
-}
-
-impl FrontendReportEndpointBinding {
-    fn new(advertised_host: String, configured_port: u16) -> Self {
-        Self {
-            advertised_host,
-            configured_port,
-            bound_port: AtomicU16::new(0),
-        }
-    }
-
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "Coordinator test fixture builds the report endpoint from a socket address."
-    )]
-    fn from_socket_addr(endpoint: SocketAddr) -> Self {
-        Self::new(endpoint.ip().to_string(), endpoint.port())
-    }
-
-    fn resolve(
-        &self,
-    ) -> Result<crate::common::backend_topology::CoordinatorReportEndpoint, DistributedQueryError>
-    {
-        let port = if self.configured_port == 0 {
-            let bound = self.bound_port.load(Ordering::Acquire);
-            if bound == 0 {
-                return Err(failed(
-                    "frontend coordinator report endpoint is not bound yet",
-                ));
-            }
-            bound
-        } else {
-            self.configured_port
-        };
-        crate::common::backend_topology::CoordinatorReportEndpoint::new(
-            self.advertised_host.clone(),
-            port,
-        )
-        .map_err(failed)
-    }
-}
-
-impl crate::common::backend_topology::CoordinatorReportEndpointSink
-    for FrontendReportEndpointBinding
-{
-    fn set_bound_port(&self, port: u16) {
-        self.bound_port.store(port, Ordering::Release);
-    }
-}
-
 #[cfg(test)]
 #[allow(
     dead_code,
@@ -359,7 +301,6 @@ fn production_backend_services(
 }
 
 pub struct FrontendDistributedQueryCoordinator {
-    report_endpoint: Arc<FrontendReportEndpointBinding>,
     backend_topology: crate::common::backend_topology::BackendTopologyService,
     #[cfg(test)]
     backend_services: Option<BackendServicesSource>,
@@ -378,7 +319,6 @@ pub struct FrontendDistributedQueryCoordinator {
     /// frontend's contexts from a restarted frontend's. Minting it per process
     /// rather than per query is what makes that distinction meaningful.
     frontend_process_id: FrontendProcessId,
-    pre_start_timeout: Duration,
     task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
     connector_split_initial_dynamic_filter_wait_cap: Duration,
     native_compatibility_id: NativeCompatibilityId,
@@ -422,11 +362,8 @@ impl FrontendDistributedQueryCoordinator {
         reason = "The public composition entrypoint receives the frontend-owned native runtime."
     )]
     pub fn new(
-        advertised_report_host: String,
-        configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
-        query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
         task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
         connector_split_initial_dynamic_filter_wait_cap: Duration,
         task_execution_budgets: novarocks_execution::task_execution::TaskExecutionBudgets,
@@ -447,10 +384,6 @@ impl FrontendDistributedQueryCoordinator {
             );
         }
         Ok(Self {
-            report_endpoint: Arc::new(FrontendReportEndpointBinding::new(
-                advertised_report_host,
-                configured_report_port,
-            )),
             backend_topology,
             #[cfg(test)]
             backend_services: None,
@@ -460,7 +393,6 @@ impl FrontendDistributedQueryCoordinator {
             data_runtime,
             task_execution_budgets,
             frontend_process_id: FrontendProcessId::new_v7(),
-            pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
             task_update_retry_policy,
             connector_split_initial_dynamic_filter_wait_cap,
             native_compatibility_id,
@@ -474,7 +406,6 @@ impl FrontendDistributedQueryCoordinator {
     )]
     pub(crate) fn new_for_test(
         query_id: QueryId,
-        report_endpoint: SocketAddr,
         scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
@@ -485,7 +416,6 @@ impl FrontendDistributedQueryCoordinator {
         );
         Self::new_for_test_with_topology(
             query_id,
-            report_endpoint,
             scheduler,
             dispatcher,
             runtime_filter_worker_count,
@@ -505,21 +435,16 @@ impl FrontendDistributedQueryCoordinator {
     )]
     pub(crate) fn new_for_test_with_topology(
         query_id: QueryId,
-        report_endpoint: SocketAddr,
         scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
     ) -> Self {
-        let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
             task_execution_budgets:
                 novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
             frontend_process_id: FrontendProcessId::new_v7(),
-            report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
-                report_endpoint,
-            )),
             backend_topology,
             backend_services: Some(BackendServicesSource::Fixed {
                 scheduler,
@@ -531,7 +456,6 @@ impl FrontendDistributedQueryCoordinator {
                 query_id.high() as u64,
             ))),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
-            pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
@@ -547,7 +471,6 @@ impl FrontendDistributedQueryCoordinator {
     )]
     pub(crate) fn new_for_test_with_backend_sequence(
         query_id: QueryId,
-        report_endpoint: SocketAddr,
         schedulers: Vec<FrontendFragmentScheduler>,
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
@@ -561,7 +484,6 @@ impl FrontendDistributedQueryCoordinator {
             crate::topology::ClusterBackendService::from_captured_targets_for_test(&targets);
         Self::new_for_test_with_backend_sequence_and_topology(
             query_id,
-            report_endpoint,
             schedulers,
             dispatcher,
             runtime_filter_worker_count,
@@ -577,21 +499,16 @@ impl FrontendDistributedQueryCoordinator {
     )]
     pub(crate) fn new_for_test_with_backend_sequence_and_topology(
         query_id: QueryId,
-        report_endpoint: SocketAddr,
         schedulers: Vec<FrontendFragmentScheduler>,
         dispatcher: Arc<dyn FragmentDispatcher>,
         runtime_filter_worker_count: NonZeroUsize,
         _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
     ) -> Self {
-        let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
             task_execution_budgets:
                 novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
             frontend_process_id: FrontendProcessId::new_v7(),
-            report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
-                report_endpoint,
-            )),
             backend_topology,
             backend_services: Some(BackendServicesSource::Sequence {
                 schedulers: Mutex::new(schedulers.into()),
@@ -603,7 +520,6 @@ impl FrontendDistributedQueryCoordinator {
                 query_id.high() as u64,
             ))),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
-            pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
@@ -612,18 +528,8 @@ impl FrontendDistributedQueryCoordinator {
         }
     }
 
-    pub fn terminal_ingress(&self) -> FrontendCoordinatorTerminalIngress {
-        FrontendCoordinatorTerminalIngress::new(Arc::clone(&self.registry))
-    }
-
     pub(crate) fn convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
         Arc::clone(&self.registry) as Arc<dyn QueryLifecycleConvergenceReader>
-    }
-
-    pub fn report_endpoint_sink(
-        &self,
-    ) -> Arc<dyn crate::common::backend_topology::CoordinatorReportEndpointSink> {
-        self.report_endpoint.clone()
     }
 
     pub fn execute(
@@ -803,13 +709,6 @@ impl FrontendDistributedQueryCoordinator {
                 "query deadline elapsed before native lifecycle initialization",
             ));
         }
-        let query_deadline_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| failed(format!("system clock precedes Unix epoch: {error}")))?
-            .as_millis()
-            .saturating_add(remaining_budget.as_millis())
-            .try_into()
-            .map_err(|_| failed("query deadline exceeds u64 milliseconds"))?;
         let init_options = QueryInitOptions::new(
             execution_id,
             self.native_compatibility_id,
@@ -821,9 +720,6 @@ impl FrontendDistributedQueryCoordinator {
                         "query options protocol projection is invalid: {error}"
                     ))
                 })?,
-            query_deadline_unix_ms,
-            self.pre_start_timeout,
-            self.report_endpoint.resolve()?,
         )?
         .with_credential_leases(credential_leases);
         // A write session's catalog is a materialization input like any typed
@@ -1820,7 +1716,7 @@ impl FrontendDistributedQueryCoordinator {
             }
         })();
         if let Err(error) = &outcome {
-            let _ = self.registry.latch_failure_and_cancel(
+            let _ = self.registry.latch_failure(
                 query_id,
                 QueryFailureCause::FrontendExecution,
                 error.message().to_string(),
@@ -1830,18 +1726,6 @@ impl FrontendDistributedQueryCoordinator {
         outcome
     }
 
-    /// Stands every query context of this attempt down, then classifies why it
-    /// failed.
-    ///
-    /// A dropped round would leave the backends holding tasks until their
-    /// lease expired; an explicit abort is what makes a failed attempt release
-    /// its resources at the moment the frontend gave up on it.
-    ///
-    /// A failure that arrived before every query context was established gets
-    /// the same treatment the old barrier gave a pre-ControlReady one: it is
-    /// marked as needing a topology observation, and the membership owner --
-    /// not this failure's text -- decides whether an exact captured process
-    /// was replaced. Nothing is latched in that case, because a replanned
     /// Publishes this task-protocol attempt's immutable convergence evidence.
     ///
     /// Called once, after the drain, because that is the point at which every
@@ -1898,6 +1782,18 @@ impl FrontendDistributedQueryCoordinator {
             });
     }
 
+    /// Stands every query context of this attempt down, then classifies why it
+    /// failed.
+    ///
+    /// A dropped round would leave the backends holding tasks until their
+    /// lease expired; an explicit abort is what makes a failed attempt release
+    /// its resources at the moment the frontend gave up on it.
+    ///
+    /// A failure that arrived before every query context was established gets
+    /// the same treatment the old barrier gave a pre-ControlReady one: it is
+    /// marked as needing a topology observation, and the membership owner --
+    /// not this failure's text -- decides whether an exact captured process
+    /// was replaced. Nothing is latched in that case, because a replanned
     /// round registers its own attempt and the failure belongs to the one
     /// being abandoned.
     fn fail_task_round(
@@ -1959,10 +1855,7 @@ impl FrontendDistributedQueryCoordinator {
         cause: QueryFailureCause,
         message: impl Into<String>,
     ) -> DistributedQueryError {
-        match self
-            .registry
-            .latch_failure_and_cancel(query_id, cause, message)
-        {
+        match self.registry.latch_failure(query_id, cause, message) {
             Ok(failure) => failed(failure.message().to_string()),
             Err(error) => error,
         }
@@ -2444,11 +2337,9 @@ mod tests {
 
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
-        FrontendReportEndpointBinding, QueryIdSource, UniqueQueryIdSource,
-        distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
-        pre_ready_topology_validation_error,
+        QueryIdSource, UniqueQueryIdSource, distributed_write_phase_marker,
+        fail_closed_one_shot_topology_retry, pre_ready_topology_validation_error,
     };
-    use crate::common::backend_topology::CoordinatorReportEndpointSink;
     use crate::common::backend_topology::{
         BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
     };
@@ -2613,23 +2504,6 @@ mod tests {
             error.message(),
             "frontend query id local sequence is exhausted"
         );
-    }
-
-    #[test]
-    fn ephemeral_report_endpoint_is_unavailable_until_the_bound_port_is_published() {
-        let binding = FrontendReportEndpointBinding::new("frontend.internal".to_string(), 0);
-
-        let error = binding
-            .resolve()
-            .err()
-            .expect("port zero must gate query submission until listener bind");
-        assert!(error.message().contains("not bound yet"), "{error}");
-
-        binding.set_bound_port(19070);
-
-        binding
-            .resolve()
-            .expect("bound port publication makes the DNS endpoint available");
     }
 
     struct FailingAfterStartDispatcher;
@@ -2942,7 +2816,6 @@ mod tests {
         let coordinator =
             FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
                 QueryId::new(7, 11),
-                "127.0.0.1:19070".parse().expect("report endpoint"),
                 vec![old_scheduler, replacement_scheduler],
                 Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
@@ -3036,7 +2909,6 @@ mod tests {
         let coordinator =
             FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
                 QueryId::new(7, 13),
-                "127.0.0.1:19070".parse().expect("report endpoint"),
                 vec![old_scheduler, replacement_scheduler],
                 Arc::new(FailingAfterStartDispatcher),
                 NonZeroUsize::new(1).expect("nonzero workers"),
@@ -3116,7 +2988,6 @@ mod tests {
         );
         let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_topology(
             QueryId::new(7, 12),
-            "127.0.0.1:19070".parse().expect("report endpoint"),
             scheduler,
             Arc::new(FailingAfterStartDispatcher),
             NonZeroUsize::new(1).expect("nonzero workers"),

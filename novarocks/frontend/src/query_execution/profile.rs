@@ -23,11 +23,9 @@ use std::collections::HashMap;
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::outcome::FragmentProfileSet;
-use crate::query_execution::terminal_codec::decode_runtime_profile_tree;
 use novarocks_execution::task_execution::FinalTaskInfo;
+use novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionV1;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
-use novarocks_proto_codec::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
-use novarocks_proto_models::novarocks;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 use novarocks_types::{BackendProcessId, QueryExecutionId};
 
@@ -99,18 +97,6 @@ impl FragmentProfileTree {
         }
     }
 
-    /// A tree built by the execution-side fragment root profiler, which writes
-    /// the fragment's root plan-node id into the root node's name
-    /// (`execute_fragment_native (plan_node_id=N)`). Reading it back here is
-    /// reading that producer's declared key, not inferring one: a tree that
-    /// does not carry it stays unattributed.
-    pub(crate) fn from_fragment_profiler(tree: RuntimeProfileTree) -> Self {
-        Self {
-            fragment_root_plan_node_id: parse_plan_node_id(&tree.root.name),
-            tree,
-        }
-    }
-
     pub(crate) const fn fragment_root_plan_node_id(&self) -> Option<i32> {
         self.fragment_root_plan_node_id
     }
@@ -136,54 +122,6 @@ impl ProfileTerminalBuilder {
             profiles: Vec::new(),
             runtime_filter_totals: RuntimeFilterProfileTotals::default(),
         }
-    }
-
-    /// Applies the immutable runtime-filter contribution for one accepted
-    /// lifecycle participant. The terminal set owns participant de-duplication;
-    /// this builder only performs deterministic profile projection.
-    pub fn apply_profile_contribution(
-        &mut self,
-        snapshot: &QueryTerminalSnapshot,
-    ) -> Result<(), DistributedQueryError> {
-        let telemetry = snapshot.profile_contribution_telemetry();
-        let Some(contribution) = telemetry.available() else {
-            return Ok(());
-        };
-        if contribution.as_proto().channels.is_empty()
-            && contribution.as_proto().producer_streams.is_empty()
-            && contribution.as_proto().transport_routes.is_empty()
-            && contribution.as_proto().consumers.is_empty()
-        {
-            return Ok(());
-        }
-
-        let participant_totals = RuntimeFilterProfileTotals::from_contribution(&contribution)?;
-        let execution_totals = self
-            .runtime_filter_totals
-            .checked_merged(participant_totals)?;
-        execution_totals.validate_profile_range()?;
-
-        let process_id = snapshot
-            .participant()
-            .backend_process_id()
-            .map_err(|error| {
-                DistributedQueryError::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    error.to_string(),
-                )
-            })?;
-        // One participant's runtime-filter totals span every fragment it ran,
-        // so this tree belongs to no single fragment and names none.
-        self.profiles.push(FragmentProfileTree::unattributed(
-            runtime_filter_profile_tree(
-                snapshot.execution_id(),
-                process_id,
-                &contribution,
-                participant_totals,
-            )?,
-        ));
-        self.runtime_filter_totals = execution_totals;
-        Ok(())
     }
 
     /// Applies one backend's runtime-filter contribution as the task protocol
@@ -224,34 +162,6 @@ impl ProfileTerminalBuilder {
             )?,
         ));
         self.runtime_filter_totals = execution_totals;
-        Ok(())
-    }
-
-    /// P2 profile telemetry is allowed to be unavailable without changing the
-    /// query result or fabricating an empty profile tree.
-    pub fn apply_terminal(
-        &mut self,
-        fragment: &novarocks::QueryTerminalFragmentSnapshot,
-    ) -> Result<(), DistributedQueryError> {
-        if fragment.outcome != novarocks::QueryTerminalFragmentOutcome::Succeeded as i32 {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::Failed,
-                "fragment terminal snapshot reports a non-successful outcome",
-            ));
-        }
-        let telemetry = fragment
-            .profile
-            .as_ref()
-            .expect("validated terminal fragment always has profile telemetry");
-        if let Some(novarocks::fragment_terminal_profile_telemetry::Telemetry::Available(profile)) =
-            telemetry.telemetry.as_ref()
-        {
-            let tree = decode_runtime_profile_tree(profile).map_err(|error| {
-                DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-            })?;
-            self.profiles
-                .push(FragmentProfileTree::from_fragment_profiler(tree));
-        }
         Ok(())
     }
 
@@ -1376,6 +1286,23 @@ mod tests {
         BackendProcessId::try_from_bytes(bytes).expect("the fixture process id is a legal UUIDv7")
     }
 
+    /// Applies one fixture snapshot's contribution the way the task protocol
+    /// does: addressed to the backend whose query context released it.
+    fn apply_snapshot(
+        builder: &mut ProfileTerminalBuilder,
+        snapshot: &QueryTerminalSnapshot,
+    ) -> Result<(), crate::query_execution::contract::DistributedQueryError> {
+        let process_id = snapshot
+            .participant()
+            .backend_process_id()
+            .expect("the fixture participant carries a backend process id");
+        builder.apply_runtime_filter_contribution(
+            snapshot.execution_id(),
+            process_id,
+            &snapshot.profile_contribution_telemetry(),
+        )
+    }
+
     fn runtime_filter_snapshot(
         participant_seed: u64,
         channel_binding_id: u32,
@@ -1444,11 +1371,9 @@ mod tests {
     #[test]
     fn profile_terminal_builder_projects_participants_in_order_and_sums_effects() {
         let mut builder = ProfileTerminalBuilder::new();
-        builder
-            .apply_profile_contribution(&runtime_filter_snapshot(1, 11, 40, 10))
+        apply_snapshot(&mut builder, &runtime_filter_snapshot(1, 11, 40, 10))
             .expect("first participant contribution");
-        builder
-            .apply_profile_contribution(&runtime_filter_snapshot(2, 22, 60, 20))
+        apply_snapshot(&mut builder, &runtime_filter_snapshot(2, 22, 60, 20))
             .expect("second participant contribution");
 
         let profiles = builder.finish().into_profiles();
@@ -1538,9 +1463,7 @@ mod tests {
         .expect("terminal snapshot");
         let mut builder = ProfileTerminalBuilder::new();
 
-        builder
-            .apply_profile_contribution(&snapshot)
-            .expect("empty contribution is valid");
+        apply_snapshot(&mut builder, &snapshot).expect("empty contribution is valid");
 
         assert!(builder.finish().into_profiles().is_empty());
     }
@@ -1577,12 +1500,13 @@ mod tests {
     #[test]
     fn profile_terminal_builder_rejects_cross_participant_i64_overflow() {
         let mut builder = ProfileTerminalBuilder::new();
-        builder
-            .apply_profile_contribution(&runtime_filter_snapshot(1, 11, i64::MAX as u64, 0))
-            .expect("maximum profile counter is representable");
+        apply_snapshot(
+            &mut builder,
+            &runtime_filter_snapshot(1, 11, i64::MAX as u64, 0),
+        )
+        .expect("maximum profile counter is representable");
 
-        let error = builder
-            .apply_profile_contribution(&runtime_filter_snapshot(2, 22, 1, 0))
+        let error = apply_snapshot(&mut builder, &runtime_filter_snapshot(2, 22, 1, 0))
             .expect_err("cross-participant sum must not saturate or truncate");
 
         assert!(
@@ -2266,7 +2190,11 @@ mod tests {
 
         let trees = [make_a(10_000, 100), make_a(20_000, 200), make_b()]
             .into_iter()
-            .map(super::FragmentProfileTree::from_fragment_profiler)
+            .map(|tree| {
+                let root_plan_node_id = super::parse_plan_node_id(&tree.root.name)
+                    .expect("the fixture root names its fragment's plan node");
+                super::FragmentProfileTree::for_fragment(root_plan_node_id, tree)
+            })
             .collect::<Vec<_>>();
         let by_fragment = collect_per_fragment_profile_summaries(&trees);
 

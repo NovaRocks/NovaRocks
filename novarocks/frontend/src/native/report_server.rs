@@ -9,12 +9,7 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
-use crate::coordinator::QueryTerminalIngress;
 use crate::topology::ClusterBackendService;
-use crate::{QueryTerminalReportError, QueryTerminalReportErrorCode};
-use novarocks_proto_codec::lifecycle::{
-    ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
-};
 use novarocks_proto_codec::membership::{
     BackendAnnounceRejectionReason, BackendAnnounceRequest, BackendAnnounceResult,
 };
@@ -419,7 +414,6 @@ fn runtime_filter_rollup_unavailable_reason(
         RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete => {
             "terminal-outcomes-incomplete"
         }
-        RuntimeFilterTerminalRollupUnavailable::NegativeAttestation => "negative-attestation",
     }
 }
 
@@ -713,7 +707,6 @@ fn lifecycle_metric_map(
 
 #[derive(Clone)]
 struct FrontendReportService {
-    ingress: Arc<dyn QueryTerminalIngress>,
     membership: Arc<ClusterBackendService>,
     deployment_id: String,
 }
@@ -908,68 +901,48 @@ impl NovaRocksGrpc for FrontendReportService {
         Err(Self::rejected("QueryControlStream"))
     }
 
+    /// Participant terminal reports have no owner on this frontend.
+    ///
+    /// The task protocol mints no `ParticipantTerminalOutcome`: a task's
+    /// terminal is its own status, read back through the task status stream and
+    /// `GetFinalTaskInfo`. There is therefore nothing for a report to be
+    /// delivered into, and refusing it here says so at the boundary instead of
+    /// answering with an acknowledgement no store stands behind.
     async fn report_query_terminal(
         &self,
-        request: tonic::Request<proto::ReportQueryTerminalRequest>,
+        _request: tonic::Request<proto::ReportQueryTerminalRequest>,
     ) -> Result<tonic::Response<proto::ReportQueryTerminalResponse>, tonic::Status> {
-        let outcome = request.into_inner().outcome.ok_or_else(|| {
-            tonic::Status::invalid_argument("ReportQueryTerminalRequest missing outcome")
-        })?;
-        let outcome =
-            ParticipantTerminalOutcome::parse(outcome).map_err(status_from_contract_error)?;
-        let ingress = Arc::clone(&self.ingress);
-        let ack = tokio::task::spawn_blocking(move || ingress.report_query_terminal(outcome))
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!("query terminal ingress panicked: {error}"))
-            })?
-            .map_err(status_from_terminal_report_error)?;
-        let response = report_response_from_ack(ack)?;
-        Ok(tonic::Response::new(response))
+        Err(Self::rejected("ReportQueryTerminal"))
     }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "The gRPC boundary returns tonic status directly."
-)]
-fn report_response_from_ack(
-    ack: QueryTerminalReportAck,
-) -> Result<proto::ReportQueryTerminalResponse, tonic::Status> {
-    let outcome = match ack.outcome().map_err(status_from_contract_error)? {
-        QueryTerminalReportOutcome::Accepted => proto::ReportQueryTerminalOutcome::Accepted,
-        QueryTerminalReportOutcome::AlreadyAccepted => {
-            proto::ReportQueryTerminalOutcome::AlreadyAccepted
-        }
-        QueryTerminalReportOutcome::RejectedConflict => {
-            proto::ReportQueryTerminalOutcome::RejectedConflict
-        }
-        QueryTerminalReportOutcome::RejectedGone => proto::ReportQueryTerminalOutcome::RejectedGone,
-        QueryTerminalReportOutcome::Unspecified => {
-            return Err(tonic::Status::internal(
-                "validated query terminal report acknowledgement has an unspecified outcome",
-            ));
-        }
-    };
-    Ok(proto::ReportQueryTerminalResponse {
-        outcome: outcome as i32,
-        detail: ack.detail().to_string(),
-    })
+fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
+    let detail = error.detail().to_string();
+    match error.kind() {
+        ProtocolErrorKind::MissingField
+        | ProtocolErrorKind::InvalidEnum
+        | ProtocolErrorKind::InvalidValue
+        | ProtocolErrorKind::OutOfRange
+        | ProtocolErrorKind::DuplicateField
+        | ProtocolErrorKind::InconsistentFields
+        | ProtocolErrorKind::Unsupported
+        | ProtocolErrorKind::VersionMismatch => tonic::Status::invalid_argument(detail),
+        ProtocolErrorKind::Conflict => tonic::Status::already_exists(detail),
+        ProtocolErrorKind::Capacity => tonic::Status::resource_exhausted(detail),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use super::super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use super::{
         FrontendNativeTransport, FrontendReportServerHandle, lifecycle_convergence_debug_snapshot,
-        report_response_from_ack,
     };
     use crate::coordinator::{
-        QueryLifecycleConvergenceReader, QueryTerminalIngress, RuntimeFilterTerminalRollupSnapshot,
+        QueryLifecycleConvergenceReader, RuntimeFilterTerminalRollupSnapshot,
         RuntimeFilterTerminalRollupUnavailable,
     };
     use crate::metrics::FrontendProcessQueryCountersSnapshot;
@@ -981,12 +954,11 @@ mod tests {
     };
     use crate::topology::ClusterBackendService;
     use novarocks_native_trust::{
-        DeploymentId, NativeCallerSubject, NativeClientAuthInterceptor, NativeTransportMode,
-        NativeTrust, ValidatedSharedSecret,
+        DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
     };
     use novarocks_proto_codec::lifecycle::{
         AttemptId, NegativeAttestation, ParticipantBackendIdentity, ParticipantTerminalOutcome,
-        QueryExecutionId, QueryTerminalReportAck, QueryTerminalReportOutcome,
+        QueryExecutionId,
     };
     use novarocks_proto_models::novarocks as proto;
     use novarocks_secret::SecretValue;
@@ -1002,10 +974,6 @@ mod tests {
         ))
     }
 
-    struct FixedIngress {
-        ack: QueryTerminalReportAck,
-    }
-
     struct EmptyConvergenceReader;
 
     impl QueryLifecycleConvergenceReader for EmptyConvergenceReader {
@@ -1013,15 +981,6 @@ mod tests {
             &self,
         ) -> Option<crate::coordinator::QueryLifecycleConvergenceSnapshot> {
             None
-        }
-    }
-
-    impl QueryTerminalIngress for FixedIngress {
-        fn report_query_terminal(
-            &self,
-            _outcome: ParticipantTerminalOutcome,
-        ) -> Result<QueryTerminalReportAck, crate::QueryTerminalReportError> {
-            Ok(self.ack.clone())
         }
     }
 
@@ -1215,13 +1174,16 @@ mod tests {
     fn query_lifecycle_convergence_debug_marks_incomplete_terminal_rollup_unavailable() {
         let value = serde_json::to_value(lifecycle_convergence_debug_snapshot(
             debug_snapshot_with_runtime_filter(RuntimeFilterTerminalRollupSnapshot::Unavailable(
-                RuntimeFilterTerminalRollupUnavailable::NegativeAttestation,
+                RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
             )),
         ))
         .expect("serialize debug snapshot");
 
         assert_eq!(value["runtime_filter"]["kind"], "unavailable");
-        assert_eq!(value["runtime_filter"]["reason"], "negative-attestation");
+        assert_eq!(
+            value["runtime_filter"]["reason"],
+            "terminal-outcomes-incomplete"
+        );
     }
 
     #[test]
@@ -1247,87 +1209,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminal_report_ack_preserves_every_typed_wire_outcome() {
-        for outcome in [
-            QueryTerminalReportOutcome::Accepted,
-            QueryTerminalReportOutcome::AlreadyAccepted,
-            QueryTerminalReportOutcome::RejectedConflict,
-            QueryTerminalReportOutcome::RejectedGone,
-        ] {
-            let response = report_response_from_ack(
-                QueryTerminalReportAck::new(outcome, "test").expect("valid report ack"),
-            )
-            .expect("encode report response");
-            assert_eq!(response.outcome, outcome as i32);
-            assert_eq!(response.detail, "test");
-        }
-    }
-
-    #[tokio::test]
-    async fn terminal_report_grpc_round_trip_preserves_every_typed_wire_outcome() {
-        for outcome in [
-            QueryTerminalReportOutcome::Accepted,
-            QueryTerminalReportOutcome::AlreadyAccepted,
-            QueryTerminalReportOutcome::RejectedConflict,
-            QueryTerminalReportOutcome::RejectedGone,
-        ] {
-            let ingress = Arc::new(FixedIngress {
-                ack: QueryTerminalReportAck::new(outcome, "wire outcome")
-                    .expect("valid report acknowledgement"),
-            });
-            let convergence_reader: Arc<dyn QueryLifecycleConvergenceReader> =
-                Arc::new(EmptyConvergenceReader);
-            let trust = test_trust();
-            let mut server = FrontendReportServerHandle::start(
-                SocketAddr::from(([127, 0, 0, 1], 0)),
-                ingress,
-                Arc::new(ClusterBackendService::new_transient_for_test(1)),
-                convergence_reader,
-                Arc::clone(&trust),
-                FrontendNativeTransport::plaintext(),
-            )
-            .expect("start frontend report server");
-            let channel = tokio::time::timeout(
-                Duration::from_secs(3),
-                tonic::transport::Endpoint::from_shared(format!("http://{}", server.bound_addr()))
-                    .expect("report endpoint")
-                    .connect(),
-            )
-            .await
-            .expect("report client connect timeout")
-            .expect("connect report client");
-            let mut client = NovaRocksGrpcClient::with_interceptor(
-                channel,
-                NativeClientAuthInterceptor::new(trust.as_ref().clone()),
-            );
-            let response = tokio::time::timeout(
-                Duration::from_secs(3),
-                client.report_query_terminal(proto::ReportQueryTerminalRequest {
-                    outcome: Some(terminal_outcome().as_proto().clone()),
-                }),
-            )
-            .await
-            .expect("terminal report RPC timeout")
-            .expect("report terminal outcome")
-            .into_inner();
-            assert_eq!(response.outcome, outcome as i32);
-            assert_eq!(response.detail, "wire outcome");
-            drop(client);
-            server.stop().expect("stop frontend report server");
-        }
-    }
-
     #[tokio::test]
     async fn report_listener_rejects_missing_invalid_and_duplicate_authorization_before_dispatch() {
-        let ingress = Arc::new(FixedIngress {
-            ack: QueryTerminalReportAck::new(QueryTerminalReportOutcome::Accepted, "accepted")
-                .expect("valid report acknowledgement"),
-        });
         let trust = test_trust();
         let mut server = FrontendReportServerHandle::start(
             SocketAddr::from(([127, 0, 0, 1], 0)),
-            ingress,
             Arc::new(ClusterBackendService::new_transient_for_test(1)),
             Arc::new(EmptyConvergenceReader),
             Arc::clone(&trust),
@@ -1373,16 +1259,11 @@ mod tests {
     #[tokio::test]
     async fn report_listener_rejects_unauthenticated_requests_without_exposing_management_metrics()
     {
-        let ingress = Arc::new(FixedIngress {
-            ack: QueryTerminalReportAck::new(QueryTerminalReportOutcome::Accepted, "unused")
-                .expect("valid report acknowledgement"),
-        });
         let convergence_reader: Arc<dyn QueryLifecycleConvergenceReader> =
             Arc::new(EmptyConvergenceReader);
         let trust = test_trust();
         let mut server = FrontendReportServerHandle::start(
             SocketAddr::from(([127, 0, 0, 1], 0)),
-            ingress,
             Arc::new(ClusterBackendService::new_transient_for_test(1)),
             convergence_reader,
             trust,
@@ -1409,36 +1290,6 @@ mod tests {
     }
 }
 
-fn status_from_terminal_report_error(error: QueryTerminalReportError) -> tonic::Status {
-    let detail = error.detail().to_string();
-    match error.code() {
-        QueryTerminalReportErrorCode::InvalidManifest => tonic::Status::invalid_argument(detail),
-        QueryTerminalReportErrorCode::Conflict => tonic::Status::already_exists(detail),
-        QueryTerminalReportErrorCode::StaleBackend | QueryTerminalReportErrorCode::Terminated => {
-            tonic::Status::failed_precondition(detail)
-        }
-        QueryTerminalReportErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
-        QueryTerminalReportErrorCode::Transport => tonic::Status::unavailable(detail),
-        QueryTerminalReportErrorCode::Internal => tonic::Status::internal(detail),
-    }
-}
-
-fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
-    let detail = error.detail().to_string();
-    match error.kind() {
-        ProtocolErrorKind::MissingField
-        | ProtocolErrorKind::InvalidEnum
-        | ProtocolErrorKind::InvalidValue
-        | ProtocolErrorKind::OutOfRange
-        | ProtocolErrorKind::DuplicateField
-        | ProtocolErrorKind::InconsistentFields
-        | ProtocolErrorKind::Unsupported
-        | ProtocolErrorKind::VersionMismatch => tonic::Status::invalid_argument(detail),
-        ProtocolErrorKind::Conflict => tonic::Status::already_exists(detail),
-        ProtocolErrorKind::Capacity => tonic::Status::resource_exhausted(detail),
-    }
-}
-
 /// Instance-owned report listener. The host exposes only lifecycle methods,
 /// never a Tonic service or a Core listener handle.
 pub struct FrontendReportServerHandle {
@@ -1452,7 +1303,6 @@ pub struct FrontendReportServerHandle {
 impl FrontendReportServerHandle {
     pub(crate) fn start(
         address: SocketAddr,
-        ingress: Arc<dyn QueryTerminalIngress>,
         membership: Arc<ClusterBackendService>,
         _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
         native_trust: Arc<NativeTrust>,
@@ -1521,7 +1371,6 @@ impl FrontendReportServerHandle {
                             }
                         });
                         let service = NovaRocksGrpcServer::new(FrontendReportService {
-                            ingress,
                             membership,
                             deployment_id: native_trust.deployment_id().as_str().to_string(),
                         })
@@ -1583,7 +1432,6 @@ impl FrontendReportServerHandle {
     pub(crate) fn start_from_host(
         host: &str,
         port: u16,
-        ingress: Arc<dyn QueryTerminalIngress>,
         membership: Arc<ClusterBackendService>,
         convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
         native_trust: Arc<NativeTrust>,
@@ -1591,7 +1439,6 @@ impl FrontendReportServerHandle {
     ) -> Result<Self, String> {
         Self::start(
             parse_bind_addr(host, port)?,
-            ingress,
             membership,
             convergence_reader,
             native_trust,

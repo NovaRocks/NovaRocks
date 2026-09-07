@@ -19,7 +19,7 @@
 //!
 //! The view exposes only a stable identity/key projection.  The attachment is
 //! consuming and verifies that a mapper returns exactly one native submission
-//! for every sealed placement before Core creates `StageBatch` values.
+//! for every sealed placement before any task descriptor is built from it.
 
 use std::collections::BTreeSet;
 
@@ -300,7 +300,7 @@ impl NativeSubmissionFragmentRole {
 }
 
 /// Consuming, artifact-bound native submission payload.  Core validates this
-/// attachment before it constructs lifecycle `StageBatch` values.
+/// attachment before it builds any task fragment plan from it.
 pub struct NativeSubmissionAttachment {
     handoff_id: u64,
     execution_id: QueryExecutionId,

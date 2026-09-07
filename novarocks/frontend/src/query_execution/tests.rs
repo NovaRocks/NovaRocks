@@ -20,30 +20,18 @@ use crate::common::backend_topology::BackendTopologySnapshot;
 use crate::common::query_cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
-use crate::query_execution::artifact::{
-    BackendPlacement, FragmentScheduleDraft, ValidatedFragmentSchedule, ValidatedNativeSubmission,
-};
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
     build_distributed_query_request_with_execution,
 };
-use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch};
-use crate::query_execution::lifecycle_plan::{
-    QueryInitBarrier, QueryInitOptions, QueryInitPlan, QueryLifecycleAbortOutcome,
-    QueryLifecycleLease, QueryLifecycleLeaseGuard,
-};
 use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::statistics::{StatisticsExecutionMode, StatisticsExecutionPolicy};
-use crate::query_execution::terminal_set::QueryTerminalSet;
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
-use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
-use novarocks_types::BackendProcessId;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext {
     QueryExecutionContext::new(
@@ -53,100 +41,6 @@ fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext 
         cancellation,
         novarocks_sql::compiler::SessionOptimizerSettings::default(),
     )
-}
-
-struct RecordingQueryLifecycleGuard {
-    finalizes: Arc<AtomicUsize>,
-    aborts: Arc<AtomicUsize>,
-    armed: bool,
-}
-
-impl QueryLifecycleLeaseGuard for RecordingQueryLifecycleGuard {
-    fn finalize(mut self: Box<Self>) -> Result<QueryTerminalSet, DistributedQueryError> {
-        self.armed = false;
-        self.finalizes.fetch_add(1, Ordering::SeqCst);
-        Ok(QueryTerminalSet::new(Vec::new()).expect("an empty test terminal set is valid"))
-    }
-
-    fn abort_preserving(mut self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome {
-        self.armed = false;
-        self.aborts.fetch_add(1, Ordering::SeqCst);
-        QueryLifecycleAbortOutcome::new(
-            format!("{primary_error}; query lifecycle rollback completed"),
-            None,
-        )
-    }
-}
-
-impl Drop for RecordingQueryLifecycleGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.aborts.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-}
-
-struct RecordingQueryInitBarrier {
-    calls: Arc<AtomicUsize>,
-    participants: Arc<AtomicUsize>,
-    finalizes: Arc<AtomicUsize>,
-    aborts: Arc<AtomicUsize>,
-}
-
-#[allow(
-    dead_code,
-    reason = "Lifecycle test fixture captures the initialized plan for cross-module assertions."
-)]
-struct CapturingQueryInitBarrier {
-    plan: Arc<Mutex<Option<QueryInitPlan>>>,
-    finalizes: Arc<AtomicUsize>,
-    aborts: Arc<AtomicUsize>,
-}
-
-impl QueryInitBarrier for CapturingQueryInitBarrier {
-    fn initialize_all(
-        &self,
-        plan: QueryInitPlan,
-    ) -> Result<QueryLifecycleLease, DistributedQueryError> {
-        *self.plan.lock().expect("capture plan") = Some(plan);
-        Ok(QueryLifecycleLease::new(Box::new(
-            RecordingQueryLifecycleGuard {
-                finalizes: self.finalizes.clone(),
-                aborts: self.aborts.clone(),
-                armed: true,
-            },
-        )))
-    }
-}
-
-impl QueryInitBarrier for RecordingQueryInitBarrier {
-    fn initialize_all(
-        &self,
-        plan: QueryInitPlan,
-    ) -> Result<QueryLifecycleLease, DistributedQueryError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.participants
-            .store(plan.participant_count(), Ordering::SeqCst);
-        Ok(QueryLifecycleLease::new(Box::new(
-            RecordingQueryLifecycleGuard {
-                finalizes: self.finalizes.clone(),
-                aborts: self.aborts.clone(),
-                armed: true,
-            },
-        )))
-    }
-}
-
-struct RecordingQueryLaunchBarrier;
-
-impl QueryLaunchBarrier for RecordingQueryLaunchBarrier {
-    fn stage_all(&self, _batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
-        Ok(())
-    }
-
-    fn start_all(&self, _batches: &[StageBatch]) -> Result<(), DistributedQueryError> {
-        Ok(())
-    }
 }
 
 fn real_execution_artifacts() -> (
@@ -177,11 +71,6 @@ fn real_execution_artifacts() -> (
         )
         .expect("seal production execution artifact");
     (prepared, native_bundle)
-}
-
-fn execution_id(query_id: crate::query_execution::contract::QueryId) -> QueryExecutionId {
-    QueryExecutionId::new(query_id, AttemptId::new(9).expect("nonzero attempt"))
-        .expect("valid execution id")
 }
 
 #[test]
@@ -219,143 +108,6 @@ fn request_owns_prepared_and_native_artifacts() {
     let completion = parts.completion;
     assert!(!cancellation.is_cancelled());
     assert_eq!(completion.intent(), DistributedQueryIntent::Result);
-}
-
-#[test]
-fn query_control_typestate_initializes_before_native_assembly() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let participants = Arc::new(AtomicUsize::new(0));
-    let finalizes = Arc::new(AtomicUsize::new(0));
-    let aborts = Arc::new(AtomicUsize::new(0));
-    let barrier = RecordingQueryInitBarrier {
-        calls: calls.clone(),
-        participants: participants.clone(),
-        finalizes: finalizes.clone(),
-        aborts: aborts.clone(),
-    };
-    let (prepared, native_bundle) = real_execution_artifacts();
-    let request = build_distributed_query_request_with_execution(
-        prepared,
-        native_bundle,
-        None,
-        DistributedQueryIntent::Result,
-        &test_execution(QueryCancellationSource::new().view()),
-    )
-    .expect("build request");
-    let parts = request.into_parts();
-    let query_id = crate::query_execution::contract::QueryId::new(41, 73);
-    let execution_id = execution_id(query_id);
-    let protocol_execution_id = novarocks_proto_codec::lifecycle::QueryExecutionId::new(
-        query_id,
-        novarocks_proto_codec::lifecycle::AttemptId::new(9).expect("nonzero protocol attempt"),
-    )
-    .expect("valid protocol execution id");
-    let wire_query_options = novarocks_proto_codec::lifecycle::QueryOptions::parse(
-        novarocks_proto_models::novarocks::QueryOptions::default(),
-    )
-    .expect("valid protocol query options");
-    let endpoint = "127.0.0.1:19031".parse().expect("valid endpoint");
-    let descriptor = BackendProcessDescriptor::new(
-        BackendProcessId::new_v7(),
-        novarocks_proto_codec::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19031)
-            .expect("valid endpoint"),
-        "test-deployment",
-        "test-build",
-        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-    )
-    .expect("valid test descriptor");
-    let mut draft = FragmentScheduleDraft::new();
-    draft
-        .freeze_live_backends(vec![
-            crate::common::backend_topology::LiveBackendTarget::new(3, descriptor.clone()),
-        ])
-        .expect("freeze live topology");
-    draft
-        .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
-        .expect("assign fragment");
-    let schedule =
-        ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), execution_id, draft)
-            .expect("validate schedule");
-    let options = QueryInitOptions::new(
-        protocol_execution_id,
-        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-        vec![crate::common::backend_topology::LiveBackendTarget::new(
-            3, descriptor,
-        )],
-        &parts.options,
-        wire_query_options,
-        1_000,
-        std::time::Duration::from_secs(30),
-        crate::common::backend_topology::CoordinatorReportEndpoint::from_socket_addr(
-            "127.0.0.1:19030".parse().expect("valid report endpoint"),
-        ),
-    )
-    .expect("valid init options");
-
-    let attachment = parts
-        .artifacts
-        .runtime_filter_binding_view()
-        .seal_empty()
-        .expect("seal explicit empty runtime-filter bindings");
-    let scheduled = parts
-        .artifacts
-        .attach_runtime_filter_bindings(attachment)
-        .expect("bind explicit empty runtime-filter tables")
-        .bind_schedule(schedule)
-        .expect("bind schedule");
-    let deployment = scheduled
-        .seal_runtime_filter_deployment(std::iter::empty())
-        .expect("seal explicit empty runtime-filter deployment");
-    let ready = scheduled
-        .attach_runtime_filter_deployment(deployment)
-        .expect("attach empty runtime-filter deployment")
-        .initialize_query(options, &barrier)
-        .expect("initialize query")
-        .catalog_ready();
-    let submission_view = ready
-        .native_submission_view()
-        .expect("obtain sealed native submission view");
-    let key = submission_view.root_key();
-    let template = submission_view
-        .native_fragments_in_id_order()
-        .find_map(|(fragment_id, fragment)| {
-            (fragment_id == key.fragment_id()).then(|| fragment.clone())
-        })
-        .expect("sealed root template");
-    let instance_params = novarocks_proto_models::novarocks::InstanceParams {
-        fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
-            hi: key.fragment_instance_id().high(),
-            lo: key.fragment_instance_id().low(),
-        }),
-        ..Default::default()
-    };
-    let attachment = submission_view
-        .seal(vec![ValidatedNativeSubmission::new(
-            key.backend_idx(),
-            key.fragment_instance_id(),
-            submission_view.execution_id(),
-            template,
-            instance_params,
-        )])
-        .expect("seal explicit test submission attachment");
-    let execution = ready
-        .finish_stage(attachment)
-        .expect("prepare exact stage batches")
-        .stage(&RecordingQueryLaunchBarrier)
-        .expect("stage after control ready")
-        .start(&RecordingQueryLaunchBarrier)
-        .expect("start after all participants stage")
-        .into_parts();
-
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(participants.load(Ordering::SeqCst), 1);
-    assert_eq!(execution.root_fetch.fragment_id(), 7);
-    assert_eq!(aborts.load(Ordering::SeqCst), 0);
-    execution
-        .query_lifecycle_lease
-        .finalize()
-        .expect("finalize lifecycle");
-    assert_eq!(finalizes.load(Ordering::SeqCst), 1);
 }
 
 #[test]

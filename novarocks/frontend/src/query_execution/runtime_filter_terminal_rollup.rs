@@ -17,21 +17,18 @@
 
 //! Frontend-only Runtime Filter terminal projection.
 //!
-//! The lifecycle ingress and [`super::terminal_set::QueryTerminalSet`] own
-//! participant admission and de-duplication.  This module deliberately only
-//! reads that complete set: it preserves each participant's validated wire
-//! facts and computes diagnostic query totals without introducing another
-//! lifecycle owner.
+//! Participant admission and de-duplication belong to the caller.  This module
+//! deliberately only reads the set it is handed: it preserves each
+//! participant's validated wire facts and computes diagnostic query totals
+//! without introducing another owner of participant identity.
 
 use novarocks_proto_models::novarocks;
 use novarocks_types::BackendProcessId;
 
-use super::terminal_set::QueryTerminalSet;
-
 /// A deterministic, query-scoped projection of Runtime Filter terminal facts.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RuntimeFilterTerminalRollup {
-    /// Ordered by backend process id, as provided by `QueryTerminalSet`.
+    /// In the order the caller supplied the contributions.
     pub(crate) participants: Vec<RuntimeFilterParticipantTerminalTelemetry>,
     pub(crate) totals: RuntimeFilterTerminalTotalsTelemetry,
 }
@@ -233,18 +230,6 @@ impl RuntimeFilterTerminalRollupBuilder {
     }
 }
 
-pub(crate) fn rollup(set: &QueryTerminalSet) -> RuntimeFilterTerminalRollup {
-    let mut builder = RuntimeFilterTerminalRollupBuilder::with_capacity(set.snapshots().len());
-    for snapshot in set.snapshots() {
-        let process_id = snapshot
-            .participant()
-            .backend_process_id()
-            .expect("validated terminal snapshot always has a backend process id");
-        builder.absorb(process_id, &snapshot.profile_contribution_telemetry());
-    }
-    builder.finish()
-}
-
 /// Folds the contributions the task protocol's release acknowledgements
 /// carried, one per backend that released.
 ///
@@ -420,13 +405,52 @@ fn checked_add(current: &mut u64, delta: u64) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalTotalsTelemetry,
-        RuntimeFilterTerminalTotalsUnavailable,
+        RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalRollup,
+        RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
     };
     use crate::query_execution::contract::QueryId;
-    use crate::query_execution::terminal_set::QueryTerminalSet;
-    use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
+    use novarocks_proto_codec::lifecycle::{
+        AttemptId, QueryExecutionId, QueryTerminalProfileContributionTelemetry,
+        QueryTerminalSnapshot,
+    };
     use novarocks_proto_models::{common, novarocks};
+
+    /// Turns one fixture snapshot into the release-acknowledgement pair the
+    /// live rollup consumes.
+    fn release_contribution(
+        participant_seed: u64,
+        snapshot: &QueryTerminalSnapshot,
+    ) -> (
+        novarocks_types::BackendProcessId,
+        QueryTerminalProfileContributionTelemetry,
+    ) {
+        let telemetry = QueryTerminalProfileContributionTelemetry::parse(
+            snapshot
+                .as_proto()
+                .profile_contribution
+                .clone()
+                .expect("the fixture carries a contribution"),
+        )
+        .expect("the fixture contribution is valid");
+        let bytes: [u8; 16] = test_backend_process_id(participant_seed)
+            .value
+            .try_into()
+            .expect("sixteen bytes");
+        (
+            novarocks_types::BackendProcessId::try_from_bytes(bytes).expect("a legal UUIDv7"),
+            telemetry,
+        )
+    }
+
+    fn rollup_of(
+        participants: impl IntoIterator<Item = (u64, QueryTerminalSnapshot)>,
+    ) -> RuntimeFilterTerminalRollup {
+        let contributions = participants
+            .into_iter()
+            .map(|(seed, snapshot)| release_contribution(seed, &snapshot))
+            .collect::<Vec<_>>();
+        super::rollup_from_release_contributions(&contributions)
+    }
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
@@ -551,59 +575,12 @@ mod tests {
         .expect("terminal snapshot")
     }
 
-    /// The task protocol's release-carried contributions fold to the same
-    /// rollup the lifecycle's terminal set folds to.
-    ///
-    /// The two carriers must not sum the same counters differently: this
-    /// rollup is what every structured runtime-filter assertion reads, so a
-    /// second fold would make the same query answer differently depending on
-    /// which protocol ran it.
-    #[test]
-    fn release_carried_contributions_fold_to_the_same_rollup_as_a_terminal_set() {
-        let set = QueryTerminalSet::new(vec![
-            available_snapshot(2, 101, 1),
-            available_snapshot(1, 101, 1),
-        ])
-        .expect("terminal set");
-        let from_set = set.runtime_filter_terminal_rollup();
-
-        let contributions = [1_u64, 2]
-            .into_iter()
-            .map(|seed| {
-                let snapshot = available_snapshot(seed, 101, 1);
-                let telemetry = novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
-                    snapshot
-                        .as_proto()
-                        .profile_contribution
-                        .clone()
-                        .expect("the fixture carries a contribution"),
-                )
-                .expect("the fixture contribution is valid");
-                let bytes: [u8; 16] = test_backend_process_id(seed)
-                    .value
-                    .try_into()
-                    .expect("sixteen bytes");
-                (
-                    novarocks_types::BackendProcessId::try_from_bytes(bytes)
-                        .expect("a legal UUIDv7"),
-                    telemetry,
-                )
-            })
-            .collect::<Vec<_>>();
-        let from_releases = super::rollup_from_release_contributions(&contributions);
-
-        assert_eq!(from_releases, from_set);
-    }
-
     #[test]
     fn runtime_filter_terminal_rollup_preserves_all_sections_and_checked_totals() {
-        let set = QueryTerminalSet::new(vec![
-            available_snapshot(2, 101, 1),
-            available_snapshot(1, 101, 1),
-        ])
-        .expect("terminal set");
-
-        let rollup = set.runtime_filter_terminal_rollup();
+        let rollup = rollup_of([
+            (1, available_snapshot(1, 101, 1)),
+            (2, available_snapshot(2, 101, 1)),
+        ]);
         assert_eq!(rollup.participants.len(), 2);
         assert_eq!(
             rollup.participants[0].participant.process_id.to_bytes()[15],
@@ -645,13 +622,10 @@ mod tests {
 
     #[test]
     fn runtime_filter_terminal_rollup_keeps_equal_local_ids_from_distinct_participants() {
-        let set = QueryTerminalSet::new(vec![
-            available_snapshot(1, 101, 1),
-            available_snapshot(2, 101, 1),
-        ])
-        .expect("terminal set");
-
-        let rollup = set.runtime_filter_terminal_rollup();
+        let rollup = rollup_of([
+            (1, available_snapshot(1, 101, 1)),
+            (2, available_snapshot(2, 101, 1)),
+        ]);
         let mut route_prefixes = rollup
             .participants
             .iter()
@@ -671,11 +645,10 @@ mod tests {
 
     #[test]
     fn runtime_filter_terminal_rollup_keeps_unavailable_participant_and_hides_partial_totals() {
-        let set =
-            QueryTerminalSet::new(vec![available_snapshot(1, 101, 1), unavailable_snapshot(2)])
-                .expect("terminal set");
-
-        let rollup = set.runtime_filter_terminal_rollup();
+        let rollup = rollup_of([
+            (1, available_snapshot(1, 101, 1)),
+            (2, unavailable_snapshot(2)),
+        ]);
         let RuntimeFilterParticipantTerminalTelemetryValue::Unavailable(unavailable) =
             &rollup.participants[1].telemetry
         else {
@@ -705,10 +678,7 @@ mod tests {
         };
         contribution.channels[0].published_count = u64::MAX;
         let first = QueryTerminalSnapshot::parse(first).expect("maximum valid terminal snapshot");
-        let set = QueryTerminalSet::new(vec![first, available_snapshot(2, 102, 1)])
-            .expect("terminal set");
-
-        let rollup = set.runtime_filter_terminal_rollup();
+        let rollup = rollup_of([(1, first), (2, available_snapshot(2, 102, 1))]);
         assert_eq!(rollup.participants.len(), 2);
         assert_eq!(
             rollup.totals,
@@ -734,20 +704,10 @@ mod tests {
             ),
         );
         let snapshot = QueryTerminalSnapshot::parse(snapshot).expect("empty terminal snapshot");
-        let set = QueryTerminalSet::new(vec![snapshot]).expect("terminal set");
-
-        let rollup = set.runtime_filter_terminal_rollup();
+        let rollup = rollup_of([(1, snapshot)]);
         let RuntimeFilterTerminalTotalsTelemetry::Available(totals) = rollup.totals else {
             panic!("empty available contribution must have zero totals");
         };
         assert_eq!(totals, Default::default());
-    }
-
-    #[test]
-    fn runtime_filter_terminal_rollup_leaves_duplicate_participant_rejection_to_terminal_set() {
-        let snapshot = available_snapshot(1, 101, 1);
-        let error = QueryTerminalSet::new(vec![snapshot.clone(), snapshot])
-            .expect_err("terminal set owns duplicate participant rejection");
-        assert!(error.to_string().contains("duplicate participant identity"));
     }
 }
