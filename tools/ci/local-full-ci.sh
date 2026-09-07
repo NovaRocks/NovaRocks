@@ -438,6 +438,8 @@ run_cargo_gates() {
     docker/iceberg-rest/tests/sql-helper-env-file-test.sh
   run_fail_fast_stage "shared benchmark environment guard" "shared-benchmark-environment.log" \
     docker/iceberg-rest/tests/shared-benchmark-environment-test.sh
+  run_fail_fast_stage "isolated fixture current link" "isolated-fixture-current-link.log" \
+    docker/iceberg-rest/tests/isolated-fixture-current-link-test.sh
   run_fail_fast_stage "shared benchmark fixture lifecycle" "shared-benchmark-fixture-lifecycle.log" \
     tests/sql/fixtures/benchmarks/tests/bootstrap-lifecycle-test.sh
   run_fail_fast_stage "shared benchmark fixture contract" "shared-benchmark-fixture-contract.log" \

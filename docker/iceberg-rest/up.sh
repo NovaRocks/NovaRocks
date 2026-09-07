@@ -68,6 +68,23 @@ else
   compose_project="${NOVA_ENV_COMPOSE_PROJECT:-nr-${env_id}}"
 fi
 
+# `runtime/current` is the single documented entrypoint every agent and
+# developer sources for this worktree.  A normal worktree environment owns it,
+# but a throwaway isolated fixture must never repoint it: doing so silently
+# redirects every later command in the worktree at ports that disappear with
+# the fixture.  Such a caller sets NOVA_ENV_UPDATE_CURRENT=false and addresses
+# its generated entry by path instead.
+update_current_link="${NOVA_ENV_UPDATE_CURRENT:-true}"
+if [[ "$update_current_link" != "true" && "$update_current_link" != "false" ]]; then
+  echo "NOVA_ENV_UPDATE_CURRENT must be 'true' or 'false'; got: $update_current_link" >&2
+  exit 2
+fi
+if [[ "$update_current_link" == "true" ]]; then
+  entry_dir="$current_link"
+else
+  entry_dir="$runtime_dir"
+fi
+
 shared_benchmark_root="${NOVA_ENV_SHARED_BENCHMARK_ROOT:-s3://novarocks/shared/benchmarks}"
 benchmark_build_timeout_seconds="${NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS:-3600}"
 
@@ -569,7 +586,7 @@ export NOVA_ENV_ID="$env_id"
 export NOVA_ENV_SHARED_DOCKER="$shared_docker"
 export NOVA_ENV_COMPOSE_PROJECT="$compose_project"
 export NOVA_ENV_RUNTIME_DIR="$runtime_dir"
-export NOVA_ENV_CURRENT_DIR="$current_link"
+export NOVA_ENV_CURRENT_DIR="$entry_dir"
 export NOVA_ENV_MANIFEST="$manifest_file"
 export NOVA_ENV_README="$readme_file"
 export NOVA_ENV_COMPOSE_FILE="$compose_file"
@@ -628,7 +645,7 @@ cat > "$manifest_file" <<EOF
     "build_timeout_seconds": $benchmark_build_timeout_seconds
   },
   "runtime_dir": "$runtime_dir",
-  "current_dir": "$current_link",
+  "current_dir": "$entry_dir",
   "compose_file": "$compose_file",
   "compose_env": "$compose_env",
   "minio": {
@@ -716,7 +733,7 @@ the same runtime entry and StateStore path are retained.
 Use:
 
 \`\`\`bash
-source "$current_link/env.sh"
+source "$entry_dir/env.sh"
 docker/iceberg-rest/up.sh  # start or reuse shared Docker services when needed
 cargo run -p novarocks-server -- standalone --role all-in-one \\
   --fe-config "\$NOVAROCKS_FE_CONFIG" --be-config "\$NOVAROCKS_BE_CONFIG"
@@ -727,8 +744,10 @@ docker/iceberg-rest/spark-sql.sh "\$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 \`\`\`
 EOF
 
-rm -rf "$current_link"
-ln -s "$env_id" "$current_link"
+if [[ "$update_current_link" == "true" ]]; then
+  rm -rf "$current_link"
+  ln -s "$env_id" "$current_link"
+fi
 
 if [[ "$prepare_only" != true ]]; then
   docker compose \
@@ -770,7 +789,7 @@ NovaRocks workspace environment is $environment_state.
 Workspace: $WORKSPACE_ROOT
 Environment id: $env_id
 Runtime dir: $runtime_dir
-Current entry: $current_link
+Current entry: $entry_dir
 Compose project: $compose_project
 Shared Docker: $shared_docker
 Shared config: $config_file
@@ -785,7 +804,7 @@ Spark UI: http://127.0.0.1:$spark_ui_port
 $docker_state
 
 Use:
-  source "$current_link/env.sh"
+  source "$entry_dir/env.sh"
 $docker_start_hint
   cargo run -p novarocks-server -- standalone --role all-in-one \\
     --fe-config "\$NOVAROCKS_FE_CONFIG" --be-config "\$NOVAROCKS_BE_CONFIG"
