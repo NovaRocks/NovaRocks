@@ -28,6 +28,7 @@ use anyhow::{Context, Result, bail, ensure};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -39,6 +40,12 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const FIXTURE_PREFIX: &str = "cca1-vended-rest";
+/// Every Docker project this fixture may ever create or reclaim.  Both the
+/// per-fixture teardown and the startup sweep refuse to address anything that
+/// does not carry this exact prefix.
+const FIXTURE_PROJECT_PREFIX: &str = "nr-cca1-vended-rest-";
+/// Every generated runtime entry this fixture may ever create or reclaim.
+const FIXTURE_ENTRY_PREFIX: &str = "cca1-vended-rest-";
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MINIO_STS_DURATION_SECONDS: u32 = 900;
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
@@ -128,10 +135,21 @@ pub struct IsolatedIcebergRestFixture {
     workspace_root: PathBuf,
     config_file: PathBuf,
     compose_project: String,
+    /// The generated runtime entry this fixture owns, recorded as soon as
+    /// `up.sh` creates it.  Teardown addresses it directly instead of
+    /// re-deriving it from a workspace path that may already be gone.
+    runtime_entry: Option<RuntimeEntry>,
     endpoints: IsolatedIcebergRestEndpoints,
     minio_root_identity: IsolatedS3Identity,
     vended_s3_identities: Option<IsolatedVendedS3Identities>,
     active: bool,
+}
+
+/// The identity of one generated `docker/iceberg-rest/runtime/<id>` entry.
+#[derive(Clone, Debug)]
+struct RuntimeEntry {
+    id: String,
+    directory: PathBuf,
 }
 
 impl IsolatedIcebergRestFixture {
@@ -140,6 +158,11 @@ impl IsolatedIcebergRestFixture {
     /// lifetime of any cluster that uses the returned endpoints.
     pub fn start(scenario_root: impl AsRef<Path>) -> Result<Self> {
         let repo_root = repository_root()?;
+        // A previous run that crashed, timed out, or was interrupted leaves its
+        // Docker project and generated runtime entry behind with nothing left to
+        // reclaim them.  Sweep those before adding another one, so one bad run
+        // cannot accumulate into an unusable machine.
+        sweep_stale_fixtures(&repo_root);
         let scenario_root = ensure_absolute_directory(scenario_root.as_ref())?;
         let fixture_id = unique_fixture_id();
         let workspace_root = scenario_root.join(&fixture_id);
@@ -163,6 +186,7 @@ impl IsolatedIcebergRestFixture {
             workspace_root,
             config_file,
             compose_project,
+            runtime_entry: None,
             endpoints: IsolatedIcebergRestEndpoints {
                 rest_uri: String::new(),
                 rest_warehouse: String::new(),
@@ -177,7 +201,12 @@ impl IsolatedIcebergRestFixture {
             active: true,
         };
 
-        if let Err(error) = fixture.run_script("up.sh", &[]) {
+        let started = fixture.run_script("up.sh", &[]);
+        // Record the generated entry before inspecting the outcome: a partially
+        // created environment still has to be reclaimed, and only the manifest
+        // knows which entry `up.sh` chose.
+        fixture.record_runtime_entry();
+        if let Err(error) = started {
             let cleanup = fixture.shutdown();
             return match cleanup {
                 Ok(()) => Err(error),
@@ -281,14 +310,71 @@ impl IsolatedIcebergRestFixture {
 
     /// Stops the exact compose project created by this fixture and removes its
     /// generated runtime entry.  It never addresses `nr-iceberg-rest`.
+    ///
+    /// Teardown is idempotent and does its best to leave nothing behind: the
+    /// orderly script path runs first, and a direct label-driven reclaim runs
+    /// unconditionally after it.  The script can fail for reasons unrelated to
+    /// whether anything actually leaked — a workspace root that no longer
+    /// exists, a half-written manifest, a Compose hiccup — and a scenario must
+    /// not strand a Docker project on the machine because of one.
     pub fn shutdown(&mut self) -> Result<()> {
         if !self.active {
             return Ok(());
         }
         self.assert_owned_paths()?;
-        let result = self.run_script("down.sh", &["--docker", "--purge"]);
+        // Claim the teardown before running it.  A second attempt against a
+        // project that is already gone has nothing to do, and the reclaim below
+        // is what actually guarantees removal.
         self.active = false;
-        result
+        let ordered = self.run_script("down.sh", &["--docker", "--purge"]);
+        let reclaimed = reclaim_fixture(
+            &self.repo_root,
+            &self.compose_project,
+            self.runtime_entry
+                .as_ref()
+                .map(|entry| entry.directory.as_path()),
+        );
+        match (ordered, reclaimed) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(script), Ok(())) => {
+                // Nothing leaked, so this is a diagnostic rather than a
+                // scenario failure.
+                eprintln!(
+                    "isolated Iceberg REST fixture teardown script failed for {}, \
+                     but its Docker project and runtime entry were reclaimed \
+                     directly: {script:#}",
+                    self.compose_project
+                );
+                Ok(())
+            }
+            (Ok(()), Err(reclaim)) => Err(reclaim),
+            (Err(script), Err(reclaim)) => Err(reclaim.context(format!(
+                "isolated fixture teardown script also failed: {script:#}"
+            ))),
+        }
+    }
+
+    /// Remembers which generated runtime entry `up.sh` produced for this
+    /// fixture.  Best effort: an unreadable manifest only costs teardown its
+    /// shortcut, because the label-driven reclaim does not depend on it.
+    fn record_runtime_entry(&mut self) {
+        let Ok(manifest_path) = self.find_manifest() else {
+            return;
+        };
+        let Some(directory) = manifest_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(id) = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        if !id.starts_with(FIXTURE_ENTRY_PREFIX) {
+            return;
+        }
+        self.runtime_entry = Some(RuntimeEntry { id, directory });
     }
 
     fn read_endpoints(&self) -> Result<(IsolatedIcebergRestEndpoints, IsolatedS3Identity)> {
@@ -553,16 +639,21 @@ impl IsolatedIcebergRestFixture {
 
     fn run_script(&self, script: &str, args: &[&str]) -> Result<()> {
         let script_path = self.repo_root.join("docker/iceberg-rest").join(script);
-        let output = fixture_command(
+        let mut command = fixture_command(
             &script_path,
             &self.repo_root,
             &self.workspace_root,
             &self.config_file,
             &self.compose_project,
             args,
-        )
-        .output()
-        .with_context(|| {
+        );
+        // Once the entry is known, address it by name.  The scripts otherwise
+        // derive it by hashing the workspace root, which stops resolving as soon
+        // as that temporary directory is removed.
+        if let Some(entry) = &self.runtime_entry {
+            command.env("NOVA_ENV_ID", &entry.id);
+        }
+        let output = command.output().with_context(|| {
             format!(
                 "run isolated Iceberg REST fixture script {}",
                 script_path.display()
@@ -602,6 +693,314 @@ impl Drop for IsolatedIcebergRestFixture {
             eprintln!("isolated Iceberg REST fixture cleanup failed: {error:#}");
         }
     }
+}
+
+/// Removes one fixture's Docker project and generated runtime entry without
+/// depending on any generated file.
+///
+/// The compose file and env file may already be gone by the time teardown runs,
+/// so this addresses containers, volumes, and networks through the
+/// `com.docker.compose.project` label that Compose itself writes.  That makes
+/// the reclaim safe to repeat and immune to a partially created environment.
+fn reclaim_fixture(
+    repo_root: &Path,
+    compose_project: &str,
+    runtime_dir: Option<&Path>,
+) -> Result<()> {
+    ensure!(
+        compose_project.starts_with(FIXTURE_PROJECT_PREFIX),
+        "refusing to reclaim unexpected Docker project {compose_project}"
+    );
+    let mut failures = Vec::new();
+
+    if let Err(error) = remove_project_docker_state(repo_root, compose_project) {
+        failures.push(format!("{error:#}"));
+    }
+    if let Some(runtime_dir) = runtime_dir
+        && let Err(error) = remove_runtime_entry(repo_root, runtime_dir)
+    {
+        failures.push(format!("{error:#}"));
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "reclaim isolated Iceberg REST fixture {compose_project}: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+/// Force-removes every container, volume, and network Compose labelled with
+/// this project. Returns an error only if something survives.
+fn remove_project_docker_state(repo_root: &Path, compose_project: &str) -> Result<()> {
+    let label = format!("label=com.docker.compose.project={compose_project}");
+
+    let containers = docker_ids(repo_root, &["ps", "-aq", "--filter", &label])?;
+    if !containers.is_empty() {
+        let mut args = vec!["rm", "-f", "-v"];
+        args.extend(containers.iter().map(String::as_str));
+        let _ = run_docker(repo_root, &args);
+    }
+    let networks = docker_ids(repo_root, &["network", "ls", "-q", "--filter", &label])?;
+    for network in &networks {
+        let _ = run_docker(repo_root, &["network", "rm", network]);
+    }
+    // Volumes must go last: Docker refuses to remove one that a container still
+    // references.
+    let volumes = docker_ids(repo_root, &["volume", "ls", "-q", "--filter", &label])?;
+    for volume in &volumes {
+        let _ = run_docker(repo_root, &["volume", "rm", volume]);
+    }
+
+    let mut remaining = Vec::new();
+    if let Ok(left) = docker_ids(repo_root, &["ps", "-aq", "--filter", &label])
+        && !left.is_empty()
+    {
+        remaining.push(format!("{} container(s)", left.len()));
+    }
+    if let Ok(left) = docker_ids(repo_root, &["volume", "ls", "-q", "--filter", &label])
+        && !left.is_empty()
+    {
+        remaining.push(format!("volume(s) {}", left.join(", ")));
+    }
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "Docker project {compose_project} still holds {}",
+            remaining.join(" and ")
+        )
+    }
+}
+
+/// Removes one generated `runtime/<id>` entry, refusing anything that is not a
+/// fixture entry inside this repository's runtime base.
+fn remove_runtime_entry(repo_root: &Path, runtime_dir: &Path) -> Result<()> {
+    let runtime_base = repo_root.join("docker/iceberg-rest/runtime");
+    ensure!(
+        runtime_dir.starts_with(&runtime_base),
+        "refusing to remove runtime entry outside {}: {}",
+        runtime_base.display(),
+        runtime_dir.display()
+    );
+    let name = runtime_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    ensure!(
+        name.starts_with(FIXTURE_ENTRY_PREFIX),
+        "refusing to remove unexpected runtime entry {}",
+        runtime_dir.display()
+    );
+    match fs::remove_dir_all(runtime_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove runtime entry {}", runtime_dir.display()))
+        }
+    }
+}
+
+/// Reclaims fixture Docker projects and runtime entries left behind by runs
+/// that never reached teardown.
+///
+/// Ownership is decided by the process id embedded in the fixture id: an entry
+/// whose creating process is gone can no longer be cleaned up by anyone else,
+/// while a live process id is left strictly alone.  That keeps the sweep safe
+/// for concurrent runners and for process-id reuse, at the cost of deferring a
+/// reclaim to a later run.
+fn sweep_stale_fixtures(repo_root: &Path) {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        for project in stale_docker_projects(repo_root) {
+            eprintln!("reclaiming stale isolated Iceberg REST Docker project {project}");
+            if let Err(error) = remove_project_docker_state(repo_root, &project) {
+                eprintln!("could not reclaim stale Docker project {project}: {error:#}");
+            }
+        }
+        for entry in stale_runtime_entries(repo_root) {
+            eprintln!(
+                "reclaiming stale isolated Iceberg REST runtime entry {}",
+                entry.display()
+            );
+            if let Err(error) = remove_runtime_entry(repo_root, &entry) {
+                eprintln!(
+                    "could not reclaim stale runtime entry {}: {error:#}",
+                    entry.display()
+                );
+            }
+        }
+        remove_dangling_fixture_current_link(repo_root);
+    });
+}
+
+/// Every fixture Docker project whose creating process is gone, gathered from
+/// container, volume, and network labels so a partially removed project is
+/// still found.
+fn stale_docker_projects(repo_root: &Path) -> Vec<String> {
+    let mut projects = BTreeSet::new();
+    let listings: [&[&str]; 3] = [
+        &[
+            "ps",
+            "-a",
+            "--format",
+            "{{.Label \"com.docker.compose.project\"}}",
+        ],
+        &[
+            "volume",
+            "ls",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{.Label \"com.docker.compose.project\"}}",
+        ],
+        &[
+            "network",
+            "ls",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            "{{.Label \"com.docker.compose.project\"}}",
+        ],
+    ];
+    for args in listings {
+        let Ok(values) = docker_ids(repo_root, args) else {
+            continue;
+        };
+        for value in values {
+            if value.starts_with(FIXTURE_PROJECT_PREFIX) && !fixture_owner_is_alive(&value) {
+                projects.insert(value);
+            }
+        }
+    }
+    projects.into_iter().collect()
+}
+
+/// Every generated fixture runtime entry whose creating process is gone.
+fn stale_runtime_entries(repo_root: &Path) -> Vec<PathBuf> {
+    let runtime_base = repo_root.join("docker/iceberg-rest/runtime");
+    let Ok(entries) = fs::read_dir(&runtime_base) else {
+        return Vec::new();
+    };
+    let mut stale = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `current` is a symlink; only real generated directories qualify.
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(FIXTURE_ENTRY_PREFIX) {
+            continue;
+        }
+        // Prefer the manifest's untruncated project name: the directory name is
+        // a shortened slug plus a path hash, so it carries less identity.
+        let owner = read_manifest(&path.join("manifest.json"))
+            .ok()
+            .filter(|manifest| {
+                !manifest.shared_docker
+                    && manifest.compose_project.starts_with(FIXTURE_PROJECT_PREFIX)
+            })
+            .map(|manifest| manifest.compose_project)
+            .unwrap_or_else(|| name.to_owned());
+        if !fixture_owner_is_alive(&owner) {
+            stale.push(path);
+        }
+    }
+    stale
+}
+
+/// Removes `runtime/current` only when it is a symlink to a fixture entry that
+/// no longer exists.
+///
+/// A live worktree link is never touched.  A dangling link into a removed
+/// fixture entry is this fixture's own litter from before it stopped claiming
+/// the link, and leaving it in place makes every later `source
+/// runtime/current/env.sh` fail with an error that points nowhere near the
+/// cause.
+fn remove_dangling_fixture_current_link(repo_root: &Path) {
+    let link = repo_root.join("docker/iceberg-rest/runtime/current");
+    let Ok(metadata) = fs::symlink_metadata(&link) else {
+        return;
+    };
+    if !metadata.file_type().is_symlink() {
+        return;
+    }
+    let Ok(target) = fs::read_link(&link) else {
+        return;
+    };
+    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    if !name.starts_with(FIXTURE_ENTRY_PREFIX) {
+        return;
+    }
+    if link.exists() {
+        // Still resolves, so a fixture entry is genuinely present; the sweep
+        // above owns removing it and will run before this.
+        return;
+    }
+    eprintln!(
+        "removing dangling runtime/current symlink left pointing at removed fixture entry {name}"
+    );
+    let _ = fs::remove_file(&link);
+}
+
+/// Whether the process that created a fixture project or entry is still
+/// running.  An unparsable name is treated as alive so the sweep never removes
+/// something it does not understand.
+fn fixture_owner_is_alive(name: &str) -> bool {
+    let Some(pid) = fixture_owner_pid(name) else {
+        return true;
+    };
+    // `ps -p` reports existence regardless of the owning user, unlike `kill -0`,
+    // which cannot distinguish "gone" from "not permitted".
+    Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+/// Extracts the creating process id from `nr-cca1-vended-rest-<pid>-...` or
+/// `cca1-vended-rest-<pid>-...`.
+fn fixture_owner_pid(name: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix(FIXTURE_PROJECT_PREFIX)
+        .or_else(|| name.strip_prefix(FIXTURE_ENTRY_PREFIX))?;
+    let digits = rest.split('-').next()?;
+    digits.parse().ok()
+}
+
+/// Runs one `docker` command and returns its non-empty output lines.
+fn docker_ids(repo_root: &Path, args: &[&str]) -> Result<Vec<String>> {
+    let output = run_docker(repo_root, args)?;
+    ensure!(
+        output.status.success(),
+        "docker {} exited with {}",
+        args.join(" "),
+        output.status
+    );
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn run_docker(repo_root: &Path, args: &[&str]) -> Result<Output> {
+    Command::new("docker")
+        .current_dir(repo_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("run docker {}", args.join(" ")))
 }
 
 /// Mints a real temporary MinIO credential through its AWS-compatible STS
@@ -910,6 +1309,11 @@ fn fixture_command(
         .env("NOVA_ENV_CONFIG_FILE", config_file)
         .env("NOVA_ENV_SHARED_DOCKER", "false")
         .env("NOVA_ENV_COMPOSE_PROJECT", compose_project)
+        // `runtime/current` is the worktree's documented environment entrypoint
+        // and belongs to whoever created that worktree.  This fixture is
+        // throwaway, so it must neither repoint the link on the way up nor
+        // remove it on the way down.
+        .env("NOVA_ENV_UPDATE_CURRENT", "false")
         // The fixture creates this exact non-shared project and no other.
         // `down.sh --docker --purge` requires both pieces of this proof before
         // it will remove the project's MinIO volume.
@@ -1042,5 +1446,74 @@ mod tests {
         assert!(validate_sql_identifier("table", "vended-rest").is_err());
         assert!(validate_sql_identifier("table", "vended_rest; DROP TABLE t").is_err());
         assert!(validate_sql_identifier("table", "1vended").is_err());
+    }
+
+    #[test]
+    fn fixture_owner_pid_is_read_from_both_project_and_entry_names() {
+        // The compose project keeps the full fixture id.
+        assert_eq!(
+            fixture_owner_pid("nr-cca1-vended-rest-11940-1788320173510947000-1"),
+            Some(11940)
+        );
+        // The generated runtime entry truncates the id to a slug plus a path
+        // hash, so the process id must still be read from the shortened form.
+        assert_eq!(
+            fixture_owner_pid("cca1-vended-rest-11940-1-264f2c9f"),
+            Some(11940)
+        );
+    }
+
+    #[test]
+    fn fixture_owner_pid_refuses_names_this_fixture_does_not_own() {
+        // An unparsable owner makes the sweep treat the project as live, so a
+        // foreign project must never yield a process id.
+        assert_eq!(fixture_owner_pid("nr-iceberg-rest"), None);
+        assert_eq!(fixture_owner_pid("nr-tst10-ce44a1d2c2"), None);
+        assert_eq!(fixture_owner_pid("cca1-vended-rest-notapid-1"), None);
+    }
+
+    #[test]
+    fn an_unparsable_owner_is_treated_as_alive_so_the_sweep_leaves_it_alone() {
+        assert!(fixture_owner_is_alive("nr-iceberg-rest"));
+        // Process id 1 always exists, standing in for a concurrent runner.
+        assert!(fixture_owner_is_alive("nr-cca1-vended-rest-1-1-1"));
+    }
+
+    #[test]
+    fn reclaim_refuses_a_project_outside_this_fixture() {
+        let repo_root = repository_root().expect("repository root");
+        let error = reclaim_fixture(&repo_root, "nr-iceberg-rest", None)
+            .expect_err("the shared project must never be reclaimable");
+        assert!(
+            format!("{error:#}").contains("refusing to reclaim"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn removing_a_runtime_entry_refuses_paths_this_fixture_does_not_own() {
+        let repo_root = repository_root().expect("repository root");
+        let runtime_base = repo_root.join("docker/iceberg-rest/runtime");
+        let error = remove_runtime_entry(&repo_root, &runtime_base.join("some-worktree-entry"))
+            .expect_err("a worktree entry must never be reclaimable");
+        assert!(
+            format!("{error:#}").contains("refusing to remove unexpected runtime entry"),
+            "unexpected error: {error:#}"
+        );
+        let error = remove_runtime_entry(&repo_root, Path::new("/tmp/cca1-vended-rest-1-2-3"))
+            .expect_err("an entry outside the runtime base must never be reclaimable");
+        assert!(
+            format!("{error:#}").contains("refusing to remove runtime entry outside"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn removing_a_missing_runtime_entry_succeeds_so_teardown_can_repeat() {
+        let repo_root = repository_root().expect("repository root");
+        let missing = repo_root
+            .join("docker/iceberg-rest/runtime")
+            .join("cca1-vended-rest-0-0-0");
+        remove_runtime_entry(&repo_root, &missing).expect("removing a missing entry is a no-op");
     }
 }

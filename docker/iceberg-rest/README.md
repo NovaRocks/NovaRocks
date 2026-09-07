@@ -49,6 +49,15 @@ project, service ports, credentials, or NovaRocks port allocation range.
 Set `NOVA_ENV_SHARED_DOCKER=false` in the config file when a fully isolated
 per-worktree Docker project is required.
 
+`up.sh` normally claims `docker/iceberg-rest/runtime/current`, because that link
+is how a worktree publishes its environment: `CLAUDE.md` tells every agent and
+developer to `source docker/iceberg-rest/runtime/current/env.sh`. A throwaway
+environment whose ports die with it must not claim that link, so set
+`NOVA_ENV_UPDATE_CURRENT=false`. `up.sh` then leaves the link untouched, `down.sh`
+refuses to remove it, and the caller addresses its generated entry by path
+instead. The isolated system-test fixture in
+`tests/cluster-harness/src/isolated_iceberg_rest.rs` always sets this.
+
 ## Prepare Runtime Only
 
 Generate this worktree's runtime entry and configs without starting Docker:
@@ -186,6 +195,14 @@ docker/iceberg-rest/down.sh --docker --volumes
 `docker/iceberg-rest/runtime/<env-id>/` and removes
 `docker/iceberg-rest/runtime/current` when that entry points at the purged
 worktree environment. It does not stop or remove shared Docker services.
+A caller that ran `up.sh` with `NOVA_ENV_UPDATE_CURRENT=false` never claimed the
+link, so `down.sh` leaves it alone.
+
+Teardown is designed to be repeatable. `down.sh` derives its environment id by
+hashing the workspace root, which stops resolving once a temporary workspace is
+removed; pass `NOVA_ENV_ID=<env-id>` to address a known entry exactly. A
+workspace root that no longer exists is a warning rather than a fatal error, so
+a crashed run's Docker project and runtime entry can still be reclaimed.
 
 ## Required Images
 

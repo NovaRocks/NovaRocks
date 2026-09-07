@@ -19,7 +19,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
+requested_workspace_root="${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}"
+# Teardown must survive a workspace root that no longer exists.  A throwaway
+# fixture roots its workspace in a temporary directory, and once that directory
+# is gone an aborting `cd` here would strand the generated runtime entry and the
+# Docker project forever.  Fall back to the literal path so cleanup still runs.
+if ! WORKSPACE_ROOT="$(cd "$requested_workspace_root" 2>/dev/null && pwd)"; then
+  WORKSPACE_ROOT="$requested_workspace_root"
+  echo "workspace root no longer exists; continuing teardown for: $WORKSPACE_ROOT" >&2
+fi
 
 slug="$(basename "$WORKSPACE_ROOT" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//;s/--*/-/g')"
 if [[ -z "$slug" ]]; then
@@ -28,6 +36,18 @@ fi
 slug="$(printf '%s' "$slug" | cut -c1-24)"
 hash="$(printf '%s' "$WORKSPACE_ROOT" | shasum -a 1 | awk '{print substr($1, 1, 8)}')"
 env_id="${slug}-${hash}"
+# The derived id is only a guess once the workspace root is gone, because it
+# hashes that exact path.  A caller that already knows which generated entry it
+# owns passes it explicitly so teardown stays exact and repeatable.
+if [[ -n "${NOVA_ENV_ID:-}" ]]; then
+  case "${NOVA_ENV_ID}" in
+    ""|*/*|"."|"..")
+      echo "NOVA_ENV_ID must be a single path segment; got: ${NOVA_ENV_ID}" >&2
+      exit 2
+      ;;
+  esac
+  env_id="${NOVA_ENV_ID}"
+fi
 runtime_base="$SCRIPT_DIR/runtime"
 runtime_dir="$runtime_base/$env_id"
 current_link="$runtime_base/current"
@@ -184,7 +204,10 @@ else
 fi
 
 if [[ "$remove_runtime" == true ]]; then
-  if [[ -L "$current_link" || -e "$current_link" ]]; then
+  # A caller that never claimed `runtime/current` must not remove it either:
+  # the link still belongs to the surrounding worktree environment.
+  if [[ "${NOVA_ENV_UPDATE_CURRENT:-true}" == "true" ]] &&
+    [[ -L "$current_link" || -e "$current_link" ]]; then
     current_target="$(cd "$current_link" 2>/dev/null && pwd || true)"
     current_ref="$(readlink "$current_link" 2>/dev/null || true)"
     if [[ "$current_target" == "$runtime_dir" || "$current_ref" == "$env_id" ]]; then
