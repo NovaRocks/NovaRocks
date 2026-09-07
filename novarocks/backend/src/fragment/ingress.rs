@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-local ingress contracts for native fragment control.
+//! What a fragment ingress recovers from the wire before it can be run.
+//!
+//! Decoding a fragment produces two things this backend keeps: the splits an
+//! attempt was given, and the provider-private read executions those splits
+//! resolve against. Both outlive any one protocol, so they live here rather
+//! than inside whichever owner submits the work.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-use novarocks_types::{QueryId, UniqueId};
 
 /// A split received by this backend after the exact binding codec recovered
 /// its provider-private SPI payload. Scheduling retains only sequence and
@@ -61,8 +64,9 @@ impl novarocks_execution::connector::ScheduledSplitFacts for ReceivedReadSplit {
 }
 
 /// Provisional per-attempt read contexts collected while the fragment plan is
-/// decoded. They become visible to TaskUpdate only after the existing fragment
-/// admission/registration path succeeds.
+/// decoded. They stay invisible until whoever decoded them calls `publish`, so
+/// a split that arrives mid-decode cannot resolve against a binding set that a
+/// later refusal is still allowed to roll back.
 pub(crate) struct TypedReadAttemptContext {
     entries: Mutex<BTreeMap<i32, crate::connector::ConnectorExecutionReadBinding>>,
     published: AtomicBool,
@@ -108,44 +112,7 @@ impl TypedReadAttemptContext {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-pub(crate) struct NativeFragmentCancelRequest {
-    query_id: QueryId,
-    fragment_instance_ids: Vec<UniqueId>,
-    reason: String,
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-impl NativeFragmentCancelRequest {
-    pub(crate) fn new(
-        query_id: QueryId,
-        fragment_instance_ids: Vec<UniqueId>,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            query_id,
-            fragment_instance_ids,
-            reason: reason.into(),
-        }
-    }
-    pub(crate) const fn query_id(&self) -> QueryId {
-        self.query_id
-    }
-    pub(crate) fn fragment_instance_ids(&self) -> &[UniqueId] {
-        &self.fragment_instance_ids
-    }
-    pub(crate) fn reason(&self) -> &str {
-        &self.reason
-    }
-}
-
+/// Why a fragment could not be recovered from its wire form.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeFragmentIngressError {
     message: String,
@@ -164,14 +131,3 @@ impl fmt::Display for NativeFragmentIngressError {
     }
 }
 impl std::error::Error for NativeFragmentIngressError {}
-
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-pub(crate) trait NativeFragmentIngress: Send + Sync + 'static {
-    fn cancel(
-        &self,
-        request: NativeFragmentCancelRequest,
-    ) -> Result<(), NativeFragmentIngressError>;
-}

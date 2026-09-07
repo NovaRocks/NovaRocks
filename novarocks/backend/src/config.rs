@@ -49,11 +49,6 @@ pub fn debug_fault_inject_fetch_not_ready_count() -> Option<usize> {
         .filter(|count| *count > 0)
 }
 
-pub fn debug_emit_cancel_marker() -> bool {
-    debug_env_flag("NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER")
-        || sql_test_fragment_failure_harness_enabled()
-}
-
 pub fn debug_emit_grpc_fragment_marker() -> bool {
     debug_env_flag("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER")
         || sql_test_fragment_failure_harness_enabled()

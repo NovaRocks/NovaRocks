@@ -3458,7 +3458,6 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 .and_then(|mut server_handle| {
                     server_handle.await_query_execution_resource_convergence(
                         &baseline,
-                        fault_injection::permits_terminal_retention(&step.meta),
                         convergence_deadline,
                     )
                 });

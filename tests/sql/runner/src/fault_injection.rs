@@ -200,14 +200,6 @@ fn configured_query_lifecycle_faults(
     }
 }
 
-/// A frontend crash may leave bounded terminal delivery records after the FE
-/// process is restarted. They are not execution resources and must therefore
-/// be checked against their published limits rather than a pre-fault zero.
-pub(crate) fn permits_terminal_retention(meta: &QueryMeta) -> bool {
-    meta.kill_fe_after_mv_known_committed_before_projector_cas
-        || meta.kill_fe_after_be_log_contains.is_some()
-}
-
 pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -> Result<()> {
     if let Some(kind) = &meta.cleanup_fault {
         server.arm_cleanup_fault(kind)?;
@@ -1764,16 +1756,4 @@ mod tests {
         assert!(server.events.is_empty());
     }
 
-    /// An FE crash may leave bounded terminal delivery records behind, so a
-    /// step that kills the frontend has to be allowed to have them. Without
-    /// this the runner would compare them against a pre-fault zero and fail a
-    /// case for retention the crash itself caused.
-    #[test]
-    fn killing_the_frontend_from_a_be_marker_permits_terminal_retention() {
-        assert!(permits_terminal_retention(&QueryMeta {
-            kill_fe_after_be_log_contains: Some("NOVAROCKS_TASK_TERMINAL_RETAINED".to_string()),
-            ..QueryMeta::default()
-        }));
-        assert!(!permits_terminal_retention(&QueryMeta::default()));
-    }
 }

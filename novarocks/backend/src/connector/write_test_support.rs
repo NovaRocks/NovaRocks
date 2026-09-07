@@ -159,10 +159,6 @@ impl RecordingWriteExecution {
     pub(crate) fn opened(&self) -> Vec<(u32, u32, u32)> {
         self.opened.lock().expect("opened writers").clone()
     }
-
-    pub(crate) fn terminals(&self) -> WriterTerminals {
-        *self.terminals.lock().expect("writer terminals")
-    }
 }
 
 struct RecordingWriter {

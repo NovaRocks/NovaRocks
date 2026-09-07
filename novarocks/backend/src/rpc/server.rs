@@ -38,9 +38,7 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
-use novarocks_native_trust::{
-    NativeIncomingAdapter, NativeServerAdmission, NativeTransportMode, NativeTrust,
-};
+use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, NativeTrust};
 use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId,
@@ -58,11 +56,6 @@ use tower::ServiceExt;
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 use crate::connector::catalog_manager::CatalogPruneResult;
 use crate::drain::BackendDrainState;
-use crate::query_lifecycle::QueryLifecycleIngress;
-use crate::query_lifecycle::rpc::{
-    QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
-    handle_stage_fragments, handle_start_prepared_query, handle_task_update,
-};
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
@@ -93,11 +86,6 @@ pub(crate) trait CatalogReachabilityAuthority: Send + Sync + 'static {
     ) -> CatalogPruneResult;
 }
 
-/// Connection-local proof injected only after `NativeIncomingAdapter::accept`
-/// returns. It cannot be claimed by a lifecycle protobuf frame.
-#[derive(Clone, Copy)]
-struct NativeTlsVerified;
-
 /// Everything a heartbeat answers with.
 ///
 /// A heartbeat is a question about this process, not about any query: which
@@ -118,18 +106,15 @@ pub(crate) struct BackendProcessFacts {
 /// ingress ports while this service composes them with `BackendDataPlane`.
 #[derive(Clone)]
 pub(crate) struct BackendRpcService {
-    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
     catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
     process: BackendProcessFacts,
-    query_control_shutdown: Option<watch::Receiver<bool>>,
     data_plane: BackendDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
 }
 
 impl BackendRpcService {
     pub(crate) fn new(
-        query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
         task_execution_ingress: Arc<dyn TaskExecutionIngress>,
         catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
@@ -138,22 +123,15 @@ impl BackendRpcService {
         process: BackendProcessFacts,
     ) -> Self {
         Self {
-            query_lifecycle_ingress,
             task_execution_ingress,
             catalog_reachability,
             process,
-            query_control_shutdown: None,
             data_plane: BackendDataPlane::with_exchange_receiver_port(
                 exchange_receiver_port,
                 task_inbound_capabilities,
             ),
             runtime_filter_ingress,
         }
-    }
-
-    fn with_query_control_shutdown(mut self, shutdown: watch::Receiver<bool>) -> Self {
-        self.query_control_shutdown = Some(shutdown);
-        self
     }
 }
 
@@ -167,6 +145,8 @@ impl NovaRocksGrpc for BackendRpcService {
         >,
     >;
     type SubscribeTaskStatusStream = TaskStatusEventStream;
+    // Named only because the generated trait requires a type here. The RPC it
+    // belongs to is refused below, so this stream is never constructed.
     type QueryControlStreamStream = std::pin::Pin<
         Box<
             dyn tokio_stream::Stream<Item = Result<proto::QueryControlResponse, tonic::Status>>
@@ -280,21 +260,6 @@ impl NovaRocksGrpc for BackendRpcService {
                 .map_err(|error| {
                     tonic::Status::internal(format!("fetch_result handler panicked: {error}"))
                 })?;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn task_update(
-        &self,
-        request: tonic::Request<proto::TaskUpdateRequest>,
-    ) -> Result<tonic::Response<proto::TaskUpdateResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_task_update(ingress.as_ref(), request.into_inner())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("task_update handler panicked: {error}"))
-        })??;
         Ok(tonic::Response::new(response))
     }
 
@@ -432,82 +397,6 @@ impl NovaRocksGrpc for BackendRpcService {
         Ok(tonic::Response::new(response))
     }
 
-    async fn init_query(
-        &self,
-        request: tonic::Request<proto::InitQueryRequest>,
-    ) -> Result<tonic::Response<proto::InitQueryResponse>, tonic::Status> {
-        let tls_verified = request.extensions().get::<NativeTlsVerified>().is_some();
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_init_query(ingress.as_ref(), request.into_inner(), tls_verified)
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("init_query handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn stage_fragments(
-        &self,
-        request: tonic::Request<proto::StageFragmentsRequest>,
-    ) -> Result<tonic::Response<proto::StageFragmentsResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_stage_fragments(ingress.as_ref(), request.into_inner())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("stage_fragments handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn start_prepared_query(
-        &self,
-        request: tonic::Request<proto::StartPreparedQueryRequest>,
-    ) -> Result<tonic::Response<proto::StartPreparedQueryResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_start_prepared_query(ingress.as_ref(), request.into_inner())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("start_prepared_query handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn abort_query(
-        &self,
-        request: tonic::Request<proto::AbortQueryRequest>,
-    ) -> Result<tonic::Response<proto::AbortQueryResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.query_lifecycle_ingress);
-        let response = tokio::task::spawn_blocking(move || {
-            handle_abort_query(ingress.as_ref(), request.into_inner())
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("abort_query handler panicked: {error}"))
-        })??;
-        Ok(tonic::Response::new(response))
-    }
-
-    async fn query_control_stream(
-        &self,
-        request: tonic::Request<tonic::Streaming<proto::QueryControlRequest>>,
-    ) -> Result<tonic::Response<Self::QueryControlStreamStream>, tonic::Status> {
-        let tls_verified = request.extensions().get::<NativeTlsVerified>().is_some();
-        let stream: QueryControlResponseStream = handle_query_control_stream(
-            Arc::clone(&self.query_lifecycle_ingress),
-            request.into_inner(),
-            self.query_control_shutdown.clone(),
-            tls_verified,
-        )
-        .await?;
-        Ok(tonic::Response::new(Box::pin(stream)))
-    }
-
     async fn report_query_terminal(
         &self,
         request: tonic::Request<proto::ReportQueryTerminalRequest>,
@@ -519,6 +408,72 @@ impl NovaRocksGrpc for BackendRpcService {
                 .to_string(),
         }))
     }
+
+    // The six RPCs below belonged to the retired fragment lifecycle. Nothing in
+    // this process owns them any more: a query becomes work here through
+    // `apply_task_operations`, and its participants are terminated through the
+    // same owner. They stay only because the service definition still declares
+    // them, and each refuses rather than answering, so a caller that still
+    // dials one is told the truth instead of receiving a fabricated
+    // acknowledgement it would treat as admission.
+    async fn init_query(
+        &self,
+        request: tonic::Request<proto::InitQueryRequest>,
+    ) -> Result<tonic::Response<proto::InitQueryResponse>, tonic::Status> {
+        let _ = request;
+        Err(retired_lifecycle_rpc("InitQuery"))
+    }
+
+    async fn stage_fragments(
+        &self,
+        request: tonic::Request<proto::StageFragmentsRequest>,
+    ) -> Result<tonic::Response<proto::StageFragmentsResponse>, tonic::Status> {
+        let _ = request;
+        Err(retired_lifecycle_rpc("StageFragments"))
+    }
+
+    async fn start_prepared_query(
+        &self,
+        request: tonic::Request<proto::StartPreparedQueryRequest>,
+    ) -> Result<tonic::Response<proto::StartPreparedQueryResponse>, tonic::Status> {
+        let _ = request;
+        Err(retired_lifecycle_rpc("StartPreparedQuery"))
+    }
+
+    async fn task_update(
+        &self,
+        request: tonic::Request<proto::TaskUpdateRequest>,
+    ) -> Result<tonic::Response<proto::TaskUpdateResponse>, tonic::Status> {
+        let _ = request;
+        Err(retired_lifecycle_rpc("TaskUpdate"))
+    }
+
+    async fn abort_query(
+        &self,
+        request: tonic::Request<proto::AbortQueryRequest>,
+    ) -> Result<tonic::Response<proto::AbortQueryResponse>, tonic::Status> {
+        let _ = request;
+        Err(retired_lifecycle_rpc("AbortQuery"))
+    }
+
+    async fn query_control_stream(
+        &self,
+        request: tonic::Request<tonic::Streaming<proto::QueryControlRequest>>,
+    ) -> Result<tonic::Response<Self::QueryControlStreamStream>, tonic::Status> {
+        let _ = request;
+        Err(retired_lifecycle_rpc("QueryControlStream"))
+    }
+}
+
+/// Refuses one RPC of the retired fragment lifecycle.
+///
+/// `Unimplemented` is the exact answer: the method is reachable because the
+/// service definition still lists it, and this process implements no owner
+/// behind it.
+fn retired_lifecycle_rpc(method: &str) -> tonic::Status {
+    tonic::Status::unimplemented(format!(
+        "{method} belonged to the retired fragment query lifecycle and is not served by this backend"
+    ))
 }
 
 /// A backend application owns exactly one native listener.  Unlike the legacy
@@ -572,12 +527,9 @@ impl BackendRpcServerHandle {
                         let listener = TokioTcpListener::from_std(listener).map_err(|error| {
                             format!("create Tokio native backend gRPC listener: {error}")
                         })?;
-                        let service = NovaRocksGrpcServer::new(
-                            service.with_query_control_shutdown(shutdown_rx.clone()),
-                        )
-                        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                        let shutdown_rx = shutdown_rx;
+                        let service = NovaRocksGrpcServer::new(service)
+                            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
                         let grpc_path = format!(
                             "/{}/*rest",
                             <NovaRocksGrpcServer<BackendRpcService> as NamedService>::NAME
@@ -686,7 +638,6 @@ where
                 let app = app.clone();
                 let incoming = incoming.clone();
                 tokio::spawn(async move {
-                    let tls_verified = incoming.mode() != NativeTransportMode::Disabled;
                     let stream = match incoming.accept(stream).await {
                         Ok(stream) => stream,
                         Err(_) => {
@@ -694,12 +645,9 @@ where
                             return;
                         }
                     };
-                    let service = service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
+                    let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                         let app = app.clone();
                         async move {
-                            if tls_verified {
-                                request.extensions_mut().insert(NativeTlsVerified);
-                            }
                             let response = app
                                 .oneshot(request.map(axum::body::Body::new))
                                 .await

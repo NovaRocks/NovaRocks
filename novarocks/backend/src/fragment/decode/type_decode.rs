@@ -196,6 +196,7 @@ fn scalar_desc(
     scalar_desc_with_zone(primitive, precision, scale, time_unit, None)
 }
 
+#[cfg(test)]
 fn scalar_desc_with_zone(
     primitive: common::PrimitiveType,
     precision: Option<i32>,

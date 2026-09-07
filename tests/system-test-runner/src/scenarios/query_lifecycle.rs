@@ -76,7 +76,7 @@ impl Scenario for DistributedBaseline {
             third.local_sequence,
         ));
 
-        await_resource_convergence(context, &baseline, false)
+        await_resource_convergence(context, &baseline)
     }
 }
 
@@ -107,7 +107,7 @@ impl Scenario for MysqlDisconnect {
             .context("close raw public MySQL client connection")?;
         context.action("closed the raw public MySQL client connection");
 
-        await_resource_convergence(context, &baseline, true)
+        await_resource_convergence(context, &baseline)
     }
 }
 
@@ -152,7 +152,7 @@ impl Scenario for QueryTimeout {
         );
         context.action(format!("received expected MySQL timeout error: {error}"));
 
-        await_resource_convergence(context, &baseline, true)
+        await_resource_convergence(context, &baseline)
     }
 }
 
@@ -353,7 +353,7 @@ fn run_nid2_fence(context: &mut ScenarioContext, fence: &Nid2Fence) -> Result<()
         .with_context(|| format!("clear {} tokens", fence.fault));
     let (backend, error) = observed?;
     cleared?;
-    await_resource_convergence(context, &baseline, true)?;
+    await_resource_convergence(context, &baseline)?;
     context.action(format!(
         "BE[{backend}] published {} and the frontend fenced {}: {error}",
         fence.marker, fence.subject
@@ -617,12 +617,12 @@ fn await_resource_activity(
 fn await_resource_convergence(
     context: &mut ScenarioContext,
     baseline: &QueryExecutionResourceSnapshot,
-    permits_terminal_retention: bool,
 ) -> Result<()> {
     let deadline = context.deadline();
     context
         .handle()
-        .await_query_execution_resource_convergence(baseline, permits_terminal_retention, deadline)
+        .await_query_execution_resource_convergence(
+            baseline, deadline)
         .context("await query-resource convergence after terminal lifecycle outcome")?;
     context.action("verified query resources converged after the terminal lifecycle outcome");
     Ok(())

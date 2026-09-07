@@ -41,12 +41,8 @@ impl BackendMetricsRegistry {
     pub(crate) fn new() -> Result<Self, String> {
         let registry = Registry::new();
         let collectors = [
-            Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES).clone())
+            Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone())
                 as Box<dyn prometheus::core::Collector>,
-            Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS).clone()),
-            Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS).clone()),
-            Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINAL).clone()),
-            Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone()),
             Box::new(Lazy::force(&BACKEND_TASK_EXECUTION_TASKS_CREATED).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_AUTHENTICATION_FAILURES).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_TLS_FAILURES).clone()),
@@ -185,50 +181,6 @@ impl MetricsHttpServer {
         Ok(())
     }
 }
-
-static BACKEND_QUERY_LIFECYCLE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        Opts::new(
-            "novarocks_backend_query_lifecycle_entries",
-            "Number of backend query lifecycle entries by state.",
-        ),
-        &["state"],
-    )
-    .expect("construct novarocks_backend_query_lifecycle_entries")
-});
-
-static BACKEND_QUERY_LIFECYCLE_REJECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        Opts::new(
-            "novarocks_backend_query_lifecycle_rejections",
-            "Cumulative backend query lifecycle rejections by reason.",
-        ),
-        &["reason"],
-    )
-    .expect("construct novarocks_backend_query_lifecycle_rejections")
-});
-
-static BACKEND_QUERY_LIFECYCLE_TERMINATIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        Opts::new(
-            "novarocks_backend_query_lifecycle_terminations",
-            "Cumulative backend query lifecycle terminations by reason.",
-        ),
-        &["reason"],
-    )
-    .expect("construct novarocks_backend_query_lifecycle_terminations")
-});
-
-static BACKEND_QUERY_LIFECYCLE_TERMINAL: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(
-        Opts::new(
-            "novarocks_backend_query_lifecycle_terminal_total",
-            "Cumulative backend query terminal lifecycle outcomes.",
-        ),
-        &["outcome"],
-    )
-    .expect("construct novarocks_backend_query_lifecycle_terminal_total")
-});
 
 static BACKEND_QUERY_EXECUTION_RESOURCES: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
@@ -484,86 +436,12 @@ fn parse_metrics_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> 
         .map_err(|error| format!("parse metrics bind addr '{formatted}' failed: {error}"))
 }
 
-pub fn publish_backend_query_lifecycle_metrics(
-    snapshot: crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot,
-    termination_reasons: [u64; 6],
-) {
-    for (state_name, count) in [
-        ("initializing", snapshot.initializing),
-        ("initialized", snapshot.initialized),
-        ("control_attached", snapshot.control_attached),
-        ("terminating", snapshot.terminating),
-        ("tombstone", snapshot.tombstones),
-    ] {
-        BACKEND_QUERY_LIFECYCLE_ENTRIES
-            .with_label_values(&[state_name])
-            .set(count as i64);
-    }
-    for (reason, count) in [
-        ("admission", snapshot.admission_rejected),
-        ("init_conflict", snapshot.init_conflicts),
-        ("heartbeat_timeout", snapshot.heartbeat_timeouts),
-        (
-            "terminal_fallback_rejected",
-            snapshot.terminal_fallback_rejected,
-        ),
-    ] {
-        BACKEND_QUERY_LIFECYCLE_REJECTIONS
-            .with_label_values(&[reason])
-            .set(count as i64);
-    }
-    for (reason, count) in [
-        ("coordinator_abort", termination_reasons[0]),
-        ("coordinator_finalize", termination_reasons[1]),
-        ("coordinator_stream_lost", termination_reasons[2]),
-        ("coordinator_heartbeat_timeout", termination_reasons[3]),
-        ("local_failure", termination_reasons[4]),
-        ("pre_start_timeout", termination_reasons[5]),
-    ] {
-        BACKEND_QUERY_LIFECYCLE_TERMINATIONS
-            .with_label_values(&[reason])
-            .set(count as i64);
-    }
-    for (outcome, count) in [
-        ("terminal_fact", snapshot.terminal_facts),
-        ("terminal_local_drained", snapshot.terminal_locally_drained),
-        ("terminal_record_frozen", snapshot.terminal_records_frozen),
-        ("terminal_acknowledged", snapshot.terminal_acknowledged),
-        (
-            "terminal_retention_expired",
-            snapshot.terminal_retention_expired,
-        ),
-        (
-            "terminal_fallback_accepted",
-            snapshot.terminal_fallback_accepted,
-        ),
-        ("terminal_retained", snapshot.terminal_retained as u64),
-        (
-            "terminal_retained_bytes",
-            snapshot.terminal_retained_bytes as u64,
-        ),
-    ] {
-        BACKEND_QUERY_LIFECYCLE_TERMINAL
-            .with_label_values(&[outcome])
-            .set(count as i64);
-    }
-}
-
 /// Publish a scalar snapshot after its owner has released its own lock. The
 /// metrics layer deliberately holds no execution resource references.
 pub fn publish_backend_query_execution_resource(resource: &'static str, value: usize) {
     BACKEND_QUERY_EXECUTION_RESOURCES
         .with_label_values(&[resource])
         .set(value as i64);
-}
-
-pub fn publish_backend_query_lifecycle_terminal_limits(capacity: usize, max_bytes: usize) {
-    BACKEND_QUERY_LIFECYCLE_TERMINAL
-        .with_label_values(&["terminal_retained_capacity"])
-        .set(capacity as i64);
-    BACKEND_QUERY_LIFECYCLE_TERMINAL
-        .with_label_values(&["terminal_max_retained_bytes"])
-        .set(max_bytes as i64);
 }
 
 async fn handle_metrics(
@@ -657,10 +535,6 @@ pub(crate) fn render_metrics_json(metrics: &BackendMetricsRegistry) -> Result<St
 }
 
 fn refresh_backend_gauges() {
-    Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES);
-    Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS);
-    Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS);
-    Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINAL);
     Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES);
     ensure_backend_metric_label_families();
 }
@@ -668,47 +542,6 @@ fn refresh_backend_gauges() {
 /// Make the documented BE metric families observable before their first event
 /// without resetting values already published by their application owner.
 fn ensure_backend_metric_label_families() {
-    for state in [
-        "initializing",
-        "initialized",
-        "control_attached",
-        "terminating",
-        "tombstone",
-    ] {
-        let _ = BACKEND_QUERY_LIFECYCLE_ENTRIES.get_metric_with_label_values(&[state]);
-    }
-    for reason in [
-        "admission",
-        "init_conflict",
-        "heartbeat_timeout",
-        "terminal_fallback_rejected",
-    ] {
-        let _ = BACKEND_QUERY_LIFECYCLE_REJECTIONS.get_metric_with_label_values(&[reason]);
-    }
-    for reason in [
-        "coordinator_abort",
-        "coordinator_finalize",
-        "coordinator_stream_lost",
-        "coordinator_heartbeat_timeout",
-        "local_failure",
-        "pre_start_timeout",
-    ] {
-        let _ = BACKEND_QUERY_LIFECYCLE_TERMINATIONS.get_metric_with_label_values(&[reason]);
-    }
-    for outcome in [
-        "terminal_fact",
-        "terminal_local_drained",
-        "terminal_record_frozen",
-        "terminal_acknowledged",
-        "terminal_retention_expired",
-        "terminal_fallback_accepted",
-        "terminal_retained",
-        "terminal_retained_bytes",
-        "terminal_retained_capacity",
-        "terminal_max_retained_bytes",
-    ] {
-        let _ = BACKEND_QUERY_LIFECYCLE_TERMINAL.get_metric_with_label_values(&[outcome]);
-    }
     for resource in ["catalog_query_leases", "catalog_handle_leases"] {
         let _ = BACKEND_QUERY_EXECUTION_RESOURCES.get_metric_with_label_values(&[resource]);
     }
@@ -761,7 +594,7 @@ mod tests {
 
         let backend = BackendMetricsRegistry::new().expect("construct Backend registry");
         let rendered = render_metrics(&backend).expect("render Backend metrics");
-        assert!(rendered.contains("novarocks_backend_query_lifecycle_entries"));
+        assert!(rendered.contains("novarocks_backend_query_execution_resources"));
         assert!(rendered.contains("novarocks_backend_task_execution_tasks_created_total"));
         assert!(rendered.contains("novarocks_exchange_shuffle_bytes_total"));
         assert!(!rendered.contains("novarocks_frontend_only_fixture"));

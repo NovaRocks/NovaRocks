@@ -2614,7 +2614,7 @@ pub(super) fn await_resource_convergence(
     ));
     context
         .handle()
-        .await_query_execution_resource_convergence(baseline, true, deadline)
+        .await_query_execution_resource_convergence(baseline, deadline)
         .with_context(|| format!("resource convergence after {operation}"))
 }
 

@@ -3,7 +3,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -12,10 +12,6 @@ use novarocks_connector_binding::ConnectorExecutionRoleBindingFactory;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
 use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
-use novarocks_proto_codec::lifecycle::{
-    QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
-    QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
-};
 use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_proto_codec::membership::{
     BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
@@ -24,16 +20,10 @@ use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId
 
 use crate::BackendDataRuntime;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
-use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
-    NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
-    native_result_writer,
+    grpc_exchange_transmitter, grpc_fragment_lookup_client, native_result_writer,
 };
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
-use crate::query_lifecycle::{
-    NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleError,
-    QueryLifecycleIngress, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
-};
 use crate::rpc::client::BackendRpcClient;
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
@@ -97,8 +87,6 @@ pub struct BackendServerConfig {
     pub announce_interval: Duration,
     pub announce_initial_backoff: Duration,
     pub announce_max_backoff: Duration,
-    pub query_lifecycle_sweep_interval: Duration,
-    pub query_lifecycle_config: QueryLifecycleRegistryConfig,
     /// Server-resolved per-fragment terminal write evidence budget.
     pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
@@ -156,10 +144,7 @@ impl std::error::Error for BackendApplicationError {}
 pub struct BackendApplicationHost {
     ready_marker: String,
     grpc_server: BackendRpcServerHandle,
-    _native_fragment_service: Arc<NativeFragmentService>,
-    _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     _execution_runtime: Arc<ExecutionRuntime>,
-    query_lifecycle_sweep: QueryLifecycleSweepTask,
     task_deadline_tick: TaskDeadlineTickTask,
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
@@ -315,11 +300,8 @@ struct BackendApplicationServices {
     /// below. Every owner that stamps or checks it reads this one value.
     backend_process_id: BackendProcessId,
     drain: Arc<BackendDrainState>,
-    native_fragment_service: Arc<NativeFragmentService>,
-    query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
     execution_runtime: Arc<ExecutionRuntime>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-    query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     task_execution_registry: Arc<TaskExecutionRegistry>,
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
     /// The task substrate's exchange-destination authority. The RPC data
@@ -504,166 +486,6 @@ impl Drop for TaskDeadlineTickTask {
     }
 }
 
-/// Backend composition root for the QLC-3 Stage/Start transaction.  The
-/// registry owns lifecycle linearization while the fragment service owns
-/// dormant local workers; neither exposes a direct production submit path.
-struct BackendStageLifecycleIngress {
-    registry: Arc<QueryLifecycleRegistry>,
-    fragments: Arc<NativeFragmentService>,
-}
-
-impl QueryLifecycleIngress for BackendStageLifecycleIngress {
-    fn backend_process_id(&self) -> BackendProcessId {
-        self.registry.local_process_id()
-    }
-
-    fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
-        self.registry.init_query(request)
-    }
-
-    fn init_query_tls(&self, request: QueryInitRequest) -> QueryInitAck {
-        self.registry.init_query_tls(request)
-    }
-
-    fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
-        match self.registry.begin_stage(request.clone()) {
-            crate::query_lifecycle::StageBuildDecision::Complete(ack) => ack,
-            crate::query_lifecycle::StageBuildDecision::Build(permit) => {
-                let execution_id = request.execution_id();
-                let fragments = request.fragments();
-                let stage_digest = permit.digest();
-                let build = self
-                    .fragments
-                    .stage_fragments(execution_id, &fragments, permit.gate());
-                match build {
-                    Ok(()) => permit.commit(),
-                    Err(error) => QueryStageAck::new(
-                        request.execution_id(),
-                        stage_digest,
-                        QueryStageOutcome::RejectedLocalFailure,
-                        error.to_string(),
-                    )
-                    .expect("validated Stage request has a valid failure acknowledgement"),
-                }
-            }
-        }
-    }
-
-    fn task_update(
-        &self,
-        request: crate::query_lifecycle::task_update::TaskUpdateRequest,
-    ) -> crate::query_lifecycle::task_update::TaskUpdateAck {
-        // Admission and delivery are deliberately separate: the lifecycle
-        // decides whether this exact attempt may still receive work, and the
-        // fragment runtime owns the queue the work lands in.
-        if let Err(error) = self
-            .registry
-            .admit_task_update(request.execution_id(), request.fragment_instance_id())
-        {
-            return crate::query_lifecycle::task_update::rejection_from_lifecycle_error(&error);
-        }
-        self.fragments.deliver_split_assignments(
-            request.execution_id(),
-            request.fragment_instance_id(),
-            request.assignments(),
-        )
-    }
-
-    fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
-        self.registry.start_prepared_query(request)
-    }
-
-    fn abort_query(
-        &self,
-        request: QueryAbortRequest,
-    ) -> Result<QueryTerminationAck, QueryLifecycleError> {
-        self.registry.abort_query(request)
-    }
-
-    fn attach_control(
-        &self,
-        attach: QueryControlAttach,
-    ) -> Result<QueryControlAttachment, QueryLifecycleError> {
-        self.registry.attach_control(attach)
-    }
-}
-
-struct QueryLifecycleSweepTask {
-    stop_tx: Option<std::sync::mpsc::Sender<()>>,
-    failure_rx: mpsc::Receiver<String>,
-    join_handle: Option<std::thread::JoinHandle<()>>,
-    stop_requested: Arc<AtomicBool>,
-}
-
-impl QueryLifecycleSweepTask {
-    fn start(registry: Arc<QueryLifecycleRegistry>, interval: Duration) -> Result<Self, String> {
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-        let (failure_tx, failure_rx) = mpsc::channel();
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let thread_stop_requested = Arc::clone(&stop_requested);
-        let join_handle = std::thread::Builder::new()
-            .name("query-lifecycle-sweep".to_string())
-            .spawn(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-                        stop_rx.recv_timeout(interval)
-                    {
-                        registry.sweep_expired(Instant::now());
-                    }
-                }));
-                if thread_stop_requested.load(Ordering::Acquire) {
-                    return;
-                }
-                let error = match outcome {
-                    Ok(()) => "query lifecycle sweep task exited unexpectedly".to_string(),
-                    Err(payload) => payload
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| {
-                            payload
-                                .downcast_ref::<&str>()
-                                .map(|value| (*value).to_string())
-                        })
-                        .unwrap_or_else(|| "query lifecycle sweep task panicked".to_string()),
-                };
-                let _ = failure_tx.send(error);
-            })
-            .map_err(|error| format!("spawn query lifecycle sweep task: {error}"))?;
-        Ok(Self {
-            stop_tx: Some(stop_tx),
-            failure_rx,
-            join_handle: Some(join_handle),
-            stop_requested,
-        })
-    }
-
-    fn poll_failure(&mut self) -> Result<Option<String>, String> {
-        match self.failure_rx.try_recv() {
-            Ok(error) => Ok(Some(error)),
-            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => Ok(None),
-        }
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        self.stop_requested.store(true, Ordering::Release);
-        if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
-        let Some(join_handle) = self.join_handle.take() else {
-            return Ok(());
-        };
-        join_handle
-            .join()
-            .map_err(|_| "query lifecycle sweep task panicked".to_string())
-    }
-}
-
-impl Drop for QueryLifecycleSweepTask {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
 struct BackendExecutionRuntimeInput {
     config: ExecutionRuntimeConfig,
     function_set: Arc<SealedExecutionFunctionSet>,
@@ -681,8 +503,6 @@ impl BackendExecutionRuntimeInput {
 fn compose_backend_application_services(
     data_runtime: BackendDataRuntime,
     execution: BackendExecutionRuntimeInput,
-    query_lifecycle_config: QueryLifecycleRegistryConfig,
-    native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
@@ -702,11 +522,9 @@ fn compose_backend_application_services(
     // than by whichever owner happens to be constructed first.
     let backend_process_id = BackendProcessId::new_v7();
     let drain = Arc::new(BackendDrainState::new());
-    let controls = Arc::new(FragmentControlRegistry::default());
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );
-    let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(Arc::clone(&controls)));
     let execution_role_binding_factories = Arc::new(
         crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet::try_new(
             execution_role_binding_factories.iter().cloned(),
@@ -718,9 +536,8 @@ fn compose_backend_application_services(
             )
         })?,
     );
-    // One catalog manager per process, composed here rather than inside the
-    // lifecycle registry: a catalog lease belongs to the process, and two
-    // managers would be two authorities over the same leases.
+    // One catalog manager per process: a catalog lease belongs to the process,
+    // and two managers would be two authorities over the same leases.
     let catalog_manager = Arc::new(
         crate::connector::catalog_manager::CatalogManager::try_new(catalog_manager_config)
             .map_err(|error| {
@@ -730,47 +547,10 @@ fn compose_backend_application_services(
                 )
             })?,
     );
-    let query_lifecycle_registry =
-        QueryLifecycleRegistry::new_with_runtime_and_execution_role_binding_factories(
-            data_runtime.clone(),
-            backend_process_id,
-            local_runtime,
-            query_lifecycle_config,
-            native_compatibility_id,
-            Arc::clone(&execution_role_binding_factories),
-            Arc::clone(&catalog_manager),
-        );
-    let native_fragment_service = Arc::new(
-        NativeFragmentService::new_with_controls(
-            grpc_exchange_transmitter(data_runtime.clone()),
-            grpc_fragment_lookup_client(data_runtime.clone()),
-            native_result_writer(),
-            Arc::clone(&controls),
-            Arc::clone(&query_lifecycle_registry),
-            Arc::clone(&execution_runtime),
-        )
-        .with_write_commit_evidence_limits(write_commit_evidence_limits)
-        .with_exchange_receiver_port(Arc::clone(&exchange_receiver_port)),
-    );
-    let terminal_cleanup: Arc<dyn crate::query_lifecycle::QueryLifecycleTerminalCleanup> =
-        native_fragment_service.clone();
-    query_lifecycle_registry.install_terminal_cleanup(Arc::downgrade(&terminal_cleanup));
-    controls.publish_resource_snapshot();
     crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global()
         .publish_resource_snapshot();
-    let query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress> =
-        Arc::new(BackendStageLifecycleIngress {
-            registry: Arc::clone(&query_lifecycle_registry),
-            fragments: Arc::clone(&native_fragment_service),
-        });
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
-    //
-    // The runtime-filter participant factory is built here rather than shared
-    // with the lifecycle registry because it holds nothing but the data
-    // runtime: the participants it makes are per-query and belong to whoever
-    // installed them, so a second factory instance creates no second
-    // authority.
     let context_host = Arc::new(crate::task_execution::NativeQueryContextHost::new(
         Arc::clone(&catalog_manager),
         Arc::clone(&execution_role_binding_factories),
@@ -807,11 +587,8 @@ fn compose_backend_application_services(
     Ok(BackendApplicationServices {
         backend_process_id,
         drain,
-        native_fragment_service,
-        query_lifecycle_registry,
         execution_runtime,
         exchange_receiver_port,
-        query_lifecycle_ingress,
         task_execution_registry,
         task_execution_ingress,
         task_inbound_capabilities: inbound_capabilities,
@@ -857,7 +634,6 @@ impl BackendApplicationHost {
         // One flag, set once, before anything reports it: the heartbeat this
         // BE answers and the announce it sends then read the same value.
         self.drain.begin_drain();
-        self._query_lifecycle_registry.begin_drain();
         self.announce_task.announce_drain();
     }
 
@@ -867,7 +643,6 @@ impl BackendApplicationHost {
         for failure in [
             self.grpc_server.poll_failure(),
             self.metrics_http_server.poll_failure(),
-            self.query_lifecycle_sweep.poll_failure(),
             Ok(self.task_deadline_tick.poll_failure()),
         ] {
             match failure {
@@ -893,13 +668,10 @@ impl BackendApplicationHost {
         self.announce_task.stop();
         self.task_deadline_tick.stop();
         let listener_shutdown = self.grpc_server.stop();
-        let sweep_result = self.query_lifecycle_sweep.stop();
         let metrics_result = self.metrics_http_server.stop();
-        combine_shutdown_results(listener_shutdown, sweep_result)
-            .and(metrics_result)
-            .map_err(|error| {
-                BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
-            })
+        combine_shutdown_results(listener_shutdown, metrics_result).map_err(|error| {
+            BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
+        })
     }
 
     fn open_with_readiness_timeout(
@@ -920,8 +692,6 @@ impl BackendApplicationHost {
             announce_interval,
             announce_initial_backoff,
             announce_max_backoff,
-            query_lifecycle_sweep_interval,
-            query_lifecycle_config,
             write_commit_evidence_limits,
             execution_runtime_config,
             catalog_manager_config,
@@ -939,8 +709,6 @@ impl BackendApplicationHost {
         let services = compose_backend_application_services(
             data_runtime,
             BackendExecutionRuntimeInput::new(execution_runtime_config, function_set),
-            query_lifecycle_config,
-            native_compatibility_id,
             write_commit_evidence_limits,
             catalog_manager_config,
             &execution_role_binding_factories,
@@ -971,23 +739,6 @@ impl BackendApplicationHost {
             MetricsHttpServer::start(&bind_host, metrics_http_port, metrics_registry).map_err(
                 |error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error),
             )?;
-        let native_fragment_service = Arc::clone(&services.native_fragment_service);
-        let mut query_lifecycle_sweep = match QueryLifecycleSweepTask::start(
-            Arc::clone(&services.query_lifecycle_registry),
-            query_lifecycle_sweep_interval,
-        ) {
-            Ok(sweep) => sweep,
-            Err(error) => {
-                let metrics_result = metrics_http_server.stop();
-                let primary =
-                    BackendApplicationError::new(BackendApplicationErrorKind::Start, error);
-                return Err(match metrics_result {
-                    Ok(()) => primary,
-                    Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
-                });
-            }
-        };
-
         // Started before the listener: the owner is reachable the moment its
         // RPCs are, and a deadline that elapses must already be decidable.
         let task_deadline_tick = TaskDeadlineTickTask::start(
@@ -1005,7 +756,6 @@ impl BackendApplicationHost {
             &bind_host,
             grpc_port,
             BackendRpcService::new(
-                services.query_lifecycle_ingress.clone(),
                 Arc::clone(&services.task_execution_ingress),
                 Arc::clone(&services.query_context_host)
                     as Arc<dyn crate::rpc::server::CatalogReachabilityAuthority>,
@@ -1023,16 +773,15 @@ impl BackendApplicationHost {
         ) {
             Ok(server) => server,
             Err(error) => {
-                let sweep_result = query_lifecycle_sweep.stop();
                 let metrics_result = metrics_http_server.stop();
                 let primary = BackendApplicationError::new(
                     BackendApplicationErrorKind::Start,
                     format!("start native backend gRPC server on {bind_host}:{grpc_port}: {error}"),
                 );
-                return Err(append_cleanup_results(
-                    primary,
-                    [sweep_result, metrics_result],
-                ));
+                return Err(match metrics_result {
+                    Ok(()) => primary,
+                    Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
+                });
             }
         };
 
@@ -1040,7 +789,6 @@ impl BackendApplicationHost {
             wait_for_native_ready(&readiness_runtime, readiness_endpoint, readiness_timeout)
         {
             let listener_result = grpc_server.stop();
-            let sweep_result = query_lifecycle_sweep.stop();
             let metrics_result = metrics_http_server.stop();
             let primary = BackendApplicationError::new(
                 BackendApplicationErrorKind::Readiness,
@@ -1048,7 +796,7 @@ impl BackendApplicationHost {
             );
             return Err(append_cleanup_results(
                 primary,
-                [listener_result, sweep_result, metrics_result],
+                [listener_result, metrics_result],
             ));
         }
 
@@ -1069,10 +817,7 @@ impl BackendApplicationHost {
                 std::process::id()
             ),
             grpc_server,
-            _native_fragment_service: native_fragment_service,
-            _query_lifecycle_registry: services.query_lifecycle_registry,
             _execution_runtime: services.execution_runtime,
-            query_lifecycle_sweep,
             task_deadline_tick,
             metrics_http_server,
             process_descriptor,
@@ -1251,10 +996,9 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendExecutionRuntimeInput, BackendServerConfig, QueryContextRef,
-        QueryLifecycleRegistryConfig, TaskDeadlineTickTask, TaskExecutionRegistryConfig,
-        UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
-        compose_backend_application_services,
+        BackendExecutionRuntimeInput, BackendServerConfig, QueryContextRef, TaskDeadlineTickTask,
+        TaskExecutionRegistryConfig, UnroutedQueryContextHost, UnroutedTaskExecutionHost,
+        combine_primary_and_shutdown, compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
     use crate::rpc::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
@@ -1262,23 +1006,10 @@ mod tests {
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
-    use novarocks_native_trust::NativeClientAuthInterceptor;
-    use novarocks_proto_codec::lifecycle as protocol_lifecycle;
-    use novarocks_proto_codec::lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
-        QueryAbortRequest, QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,
-        QueryTerminationReason,
-    };
     use novarocks_proto_models::novarocks as protocol;
-    use novarocks_proto_models::novarocks::{
-        AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest, HeartbeatResponse,
-        InitQueryRequest as ProtoInitQueryRequest, QueryControlAttach as ProtoQueryControlAttach,
-        QueryControlRequest as ProtoQueryControlRequest,
-    };
+    use novarocks_proto_models::novarocks::{HeartbeatRequest, HeartbeatResponse};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
-    use novarocks_types::QueryId;
     use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
-    use tokio_stream::wrappers::ReceiverStream;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -1411,33 +1142,6 @@ mod tests {
         Ok(response)
     }
 
-    fn query_lifecycle_registry_config(
-        heartbeat_timeout: Duration,
-    ) -> QueryLifecycleRegistryConfig {
-        QueryLifecycleRegistryConfig::new(
-            4_096,
-            16_384,
-            Duration::from_millis(120_000),
-            heartbeat_timeout,
-            Duration::from_millis(30_000),
-            256,
-            32,
-            48 * 1024 * 1024,
-            256 * 1024 * 1024,
-            512,
-            48 * 1024 * 1024,
-            Duration::from_millis(30_000),
-            Duration::from_millis(5_000),
-            Duration::from_millis(5_000),
-            5,
-            Duration::from_millis(100),
-            Duration::from_millis(1_000),
-            Duration::from_millis(120_000),
-            4_096,
-            256 * 1024 * 1024,
-        )
-    }
-
     fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         BackendServerConfig {
             bind_host: "127.0.0.1".to_string(),
@@ -1456,8 +1160,6 @@ mod tests {
             announce_interval: Duration::from_secs(60),
             announce_initial_backoff: Duration::from_millis(100),
             announce_max_backoff: Duration::from_secs(2),
-            query_lifecycle_sweep_interval: Duration::from_millis(1_000),
-            query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
             execution_runtime_config: execution_runtime_config(),
             catalog_manager_config:
@@ -1466,168 +1168,12 @@ mod tests {
         }
     }
 
-    fn live_query_init_request(process_id: BackendProcessId, query_low: i64) -> QueryInitRequest {
-        let execution_id = QueryExecutionId::new(
-            QueryId::new(0x514c_4302, query_low),
-            AttemptId::new(1).expect("nonzero attempt"),
-        )
-        .expect("valid execution id");
-        QueryInitRequest::from_manifest(
-            ParticipantManifest::new(
-                execution_id,
-                ParticipantBackendIdentity::new(
-                    process_id,
-                    QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid backend endpoint"),
-                )
-                .expect("valid backend identity"),
-                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-                [novarocks_proto_models::common::UniqueId {
-                    hi: query_low,
-                    lo: 1,
-                }],
-                QueryOptions::parse(protocol::QueryOptions::default())
-                    .expect("valid default query options"),
-                10_000,
-                [],
-                None,
-                std::time::Duration::from_secs(30),
-                QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
-            )
-            .expect("valid participant manifest"),
-        )
-    }
-
-    fn protocol_init_request(request: &QueryInitRequest) -> protocol_lifecycle::QueryInitRequest {
-        request.clone()
-    }
-
-    fn heartbeat_command(sequence: u64, sent_mono_ns: u64) -> ProtoQueryControlRequest {
-        ProtoQueryControlRequest {
-            command: Some(protocol::query_control_request::Command::Heartbeat(
-                protocol::QueryControlHeartbeat {
-                    sequence,
-                    sent_mono_ns,
-                },
-            )),
-        }
-    }
-
-    fn abort_command(reason: impl Into<String>) -> ProtoQueryControlRequest {
-        ProtoQueryControlRequest {
-            command: Some(protocol::query_control_request::Command::Abort(
-                protocol::QueryControlAbort {
-                    reason: reason.into(),
-                },
-            )),
-        }
-    }
-
-    fn assert_event(
-        event: protocol::QueryControlResponse,
-        predicate: impl FnOnce(protocol::query_control_response::Event) -> bool,
-    ) {
-        assert!(predicate(event.event.expect("query control event")));
-    }
-
-    fn protocol_control_attach(
-        init: &protocol_lifecycle::QueryInitRequest,
-    ) -> ProtoQueryControlRequest {
-        let manifest = init.manifest().expect("validated InitQuery has manifest");
-        let participant = protocol_lifecycle::ParticipantAttemptRef::new(
-            manifest
-                .execution_id()
-                .expect("validated InitQuery has execution"),
-            manifest
-                .backend()
-                .expect("validated InitQuery has backend")
-                .process_id()
-                .expect("validated InitQuery has backend process"),
-        )
-        .expect("validated InitQuery creates participant attempt ref");
-        ProtoQueryControlRequest {
-            command: Some(protocol::query_control_request::Command::Attach(
-                ProtoQueryControlAttach {
-                    participant: Some(participant.as_proto().clone()),
-                },
-            )),
-        }
-    }
-
-    fn protocol_abort_request(
-        init: &protocol_lifecycle::QueryInitRequest,
-        digest: &[u8],
-        reason: impl Into<String>,
-    ) -> ProtoAbortQueryRequest {
-        let manifest = init.manifest().expect("validated InitQuery has manifest");
-        let participant = protocol_lifecycle::ParticipantAttemptRef::new(
-            manifest
-                .execution_id()
-                .expect("validated InitQuery has execution"),
-            manifest
-                .backend()
-                .expect("validated InitQuery has backend")
-                .process_id()
-                .expect("validated InitQuery has backend process"),
-        )
-        .expect("validated InitQuery creates participant attempt ref");
-        ProtoAbortQueryRequest {
-            participant: Some(participant.as_proto().clone()),
-            init_digest: digest.to_vec(),
-            reason: reason.into(),
-        }
-    }
-
-    async fn connect_live_client(
-        grpc_port: u16,
-    ) -> NovaRocksGrpcClient<
-        tonic::service::interceptor::InterceptedService<
-            tonic::transport::Channel,
-            NativeClientAuthInterceptor,
-        >,
-    > {
-        let channel =
-            tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{grpc_port}"))
-                .expect("construct native backend test endpoint")
-                .connect()
-                .await
-                .expect("connect native backend gRPC");
-        NovaRocksGrpcClient::with_interceptor(
-            channel,
-            test_backend_native_trust().client_interceptor(),
-        )
-        .max_encoding_message_size(64 * 1024 * 1024)
-        .max_decoding_message_size(64 * 1024 * 1024)
-    }
-
     async fn connect_live_channel(grpc_port: u16) -> tonic::transport::Channel {
         tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{grpc_port}"))
             .expect("construct native backend test endpoint")
             .connect()
             .await
             .expect("connect native backend gRPC")
-    }
-
-    #[test]
-    fn application_composition_owns_one_query_lifecycle_registry() {
-        let services = compose_backend_application_services(
-            test_data_runtime(),
-            BackendExecutionRuntimeInput::new(
-                execution_runtime_config(),
-                test_execution_function_set(),
-            ),
-            query_lifecycle_registry_config(Duration::from_millis(5_000)),
-            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-            WriteCommitEvidenceLimits::default(),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
-            &[],
-        )
-        .expect("compose backend application services");
-
-        assert_eq!(
-            Arc::strong_count(&services.query_lifecycle_registry),
-            3,
-            "application, Stage ingress, and fragment service must share exactly one registry"
-        );
     }
 
     /// Every cross-backend runtime-filter envelope arrives through the ingress
@@ -1663,8 +1209,6 @@ mod tests {
                 execution_runtime_config(),
                 test_execution_function_set(),
             ),
-            query_lifecycle_registry_config(Duration::from_millis(5_000)),
-            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             WriteCommitEvidenceLimits::default(),
             crate::connector::catalog_manager::CatalogManagerConfig::default(),
             &[],
@@ -1764,297 +1308,6 @@ mod tests {
         clippy::await_holding_lock,
         reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
     )]
-    async fn application_query_control_attachment_live_loopback_round_trip() {
-        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
-        let grpc_port = unused_port();
-        let host =
-            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
-                .expect("native backend host starts");
-        let mut client = connect_live_client(grpc_port).await;
-        let process_id = host
-            .process_descriptor()
-            .process_id()
-            .expect("host process identity");
-        let init = live_query_init_request(process_id, 901);
-        let protocol_init = protocol_init_request(&init);
-        client
-            .init_query(protocol_init.as_proto().clone())
-            .await
-            .expect("InitQuery succeeds");
-
-        let (commands, command_rx) = tokio::sync::mpsc::channel(4);
-        commands
-            .send(protocol_control_attach(&protocol_init))
-            .await
-            .expect("send Attach");
-        let mut events = client
-            .query_control_stream(ReceiverStream::new(command_rx))
-            .await
-            .expect("attach QueryControlStream")
-            .into_inner();
-        assert_event(
-            events
-                .message()
-                .await
-                .expect("read ControlReady")
-                .expect("ControlReady"),
-            |event| {
-                matches!(
-                    event,
-                    protocol::query_control_response::Event::ControlReady(_)
-                )
-            },
-        );
-        commands
-            .send(heartbeat_command(77, 123))
-            .await
-            .expect("send heartbeat");
-        assert_event(
-            events
-                .message()
-                .await
-                .expect("read HeartbeatAck")
-                .expect("HeartbeatAck"),
-            |event| {
-                matches!(
-                    event,
-                    protocol::query_control_response::Event::HeartbeatAck(
-                        protocol::QueryControlHeartbeatAck { sequence: 77 }
-                    )
-                )
-            },
-        );
-        commands
-            .send(abort_command("live loopback cancellation"))
-            .await
-            .expect("send Abort");
-        assert_event(
-            events
-                .message()
-                .await
-                .expect("read TerminationAccepted")
-                .expect("TerminationAccepted"),
-            |event| {
-                matches!(
-                    event,
-                    protocol::query_control_response::Event::TerminationAccepted(
-                        protocol::QueryControlTerminationAccepted { reason }
-                    ) if reason == QueryTerminationReason::QueryTerminationCoordinatorAbort as i32
-                )
-            },
-        );
-        drop(events);
-        drop(commands);
-        host.shutdown().expect("native backend shutdown");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
-    )]
-    async fn application_query_control_heartbeat_timeout_fails_closed_with_open_socket() {
-        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
-        let grpc_port = unused_port();
-        let mut config = backend_config(grpc_port, grpc_port);
-        config.query_lifecycle_sweep_interval = Duration::from_millis(50);
-        config.query_lifecycle_config = query_lifecycle_registry_config(Duration::from_millis(250));
-        let host = BackendApplicationHost::open(config, test_data_runtime())
-            .expect("native backend host starts");
-        let mut client = connect_live_client(grpc_port).await;
-        let process_id = host
-            .process_descriptor()
-            .process_id()
-            .expect("host process identity");
-        let init = live_query_init_request(process_id, 902);
-        let protocol_init = protocol_init_request(&init);
-        client
-            .init_query(protocol_init.as_proto().clone())
-            .await
-            .expect("InitQuery succeeds");
-        let (commands, command_rx) = tokio::sync::mpsc::channel(1);
-        commands
-            .send(protocol_control_attach(&protocol_init))
-            .await
-            .expect("send Attach");
-        let mut events = client
-            .query_control_stream(ReceiverStream::new(command_rx))
-            .await
-            .expect("attach QueryControlStream")
-            .into_inner();
-        let _ = events
-            .message()
-            .await
-            .expect("read ControlReady")
-            .expect("ControlReady");
-
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        assert_event(
-            tokio::time::timeout(std::time::Duration::from_secs(1), events.message())
-                .await
-                .expect("timeout termination event arrives")
-                .expect("read timeout termination event")
-                .expect("timeout TerminationAccepted"),
-            |event| {
-                matches!(
-                    event,
-                    protocol::query_control_response::Event::TerminationAccepted(
-                        protocol::QueryControlTerminationAccepted { reason }
-                    ) if reason == QueryTerminationReason::QueryTerminationCoordinatorHeartbeatTimeout as i32
-                )
-            },
-        );
-        let termination = client
-            .abort_query(protocol_abort_request(
-                &protocol_init,
-                protocol_init
-                    .manifest()
-                    .expect("validated init manifest")
-                    .digest()
-                    .expect("validated InitQuery has digest")
-                    .as_bytes(),
-                "probe latched timeout",
-            ))
-            .await
-            .expect("AbortQuery observes termination")
-            .into_inner();
-        assert_eq!(
-            termination.accepted_reason,
-            novarocks_proto_models::novarocks::QueryTerminationReason::
-                QueryTerminationCoordinatorHeartbeatTimeout as i32
-        );
-
-        drop(events);
-        drop(commands);
-        host.shutdown().expect("native backend shutdown");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
-    )]
-    async fn application_shutdown_closes_live_query_control_stream_and_fails_closed() {
-        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
-        let grpc_port = unused_port();
-        let host =
-            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
-                .expect("native backend host starts");
-        let registry = Arc::clone(&host._query_lifecycle_registry);
-        let mut client = connect_live_client(grpc_port).await;
-        let process_id = host
-            .process_descriptor()
-            .process_id()
-            .expect("host process identity");
-        let init = live_query_init_request(process_id, 903);
-        let protocol_init = protocol_init_request(&init);
-        client
-            .init_query(protocol_init.as_proto().clone())
-            .await
-            .expect("InitQuery succeeds");
-        let (commands, command_rx) = tokio::sync::mpsc::channel(1);
-        commands
-            .send(protocol_control_attach(&protocol_init))
-            .await
-            .expect("send Attach");
-        let mut events = client
-            .query_control_stream(ReceiverStream::new(command_rx))
-            .await
-            .expect("attach QueryControlStream")
-            .into_inner();
-        let _ = events
-            .message()
-            .await
-            .expect("read ControlReady")
-            .expect("ControlReady");
-        for sequence in 1..=17 {
-            commands
-                .send(heartbeat_command(sequence, sequence))
-                .await
-                .expect("send heartbeat without draining ACKs");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(1);
-        let shutdown_thread = std::thread::spawn(move || {
-            let _ = shutdown_tx.send(host.shutdown());
-        });
-        let early_shutdown = shutdown_rx.recv_timeout(std::time::Duration::from_millis(500));
-        let returned_while_stream_live = early_shutdown.is_ok();
-
-        // Always release the old implementation's graceful-shutdown wait so RED
-        // leaves no global listener or detached thread behind.
-        drop(events);
-        drop(commands);
-        let shutdown = match early_shutdown {
-            Ok(result) => result,
-            Err(_) => shutdown_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("shutdown completes after releasing the stream"),
-        };
-        shutdown_thread.join().expect("join shutdown thread");
-        shutdown.expect("native backend shutdown");
-        assert!(
-            returned_while_stream_live,
-            "host shutdown must not wait indefinitely for a live bidi stream"
-        );
-
-        let termination = registry
-            .abort_query(QueryAbortRequest::new(
-                protocol_lifecycle::ParticipantAttemptRef::new(
-                    init.manifest()
-                        .expect("validated init manifest")
-                        .execution_id()
-                        .expect("validated manifest execution id"),
-                    process_id,
-                )
-                .expect("validated manifest creates participant attempt ref"),
-                ParticipantManifestDigest::new(
-                    *protocol_init
-                        .manifest()
-                        .expect("validated init manifest")
-                        .digest()
-                        .expect("validated InitQuery has digest")
-                        .as_bytes(),
-                ),
-                "observe fail-closed shutdown",
-            ))
-            .expect("observe latched shutdown termination");
-        assert_eq!(
-            termination
-                .accepted_reason()
-                .expect("validated termination reason"),
-            QueryTerminationReason::QueryTerminationCoordinatorStreamLost
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
-    )]
-    async fn application_malformed_init_query_returns_invalid_argument() {
-        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
-        let grpc_port = unused_port();
-        let host =
-            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
-                .expect("native backend host starts");
-        let mut client = connect_live_client(grpc_port).await;
-
-        let error = client
-            .init_query(ProtoInitQueryRequest::default())
-            .await
-            .expect_err("malformed InitQuery must be a transport-visible error");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-
-        host.shutdown().expect("native backend shutdown");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
-    )]
     async fn application_authenticates_complete_native_route_set_before_domain_or_fallback() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
@@ -2104,30 +1357,15 @@ mod tests {
         host.shutdown().expect("native backend shutdown");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
-    )]
-    async fn application_malformed_abort_query_returns_invalid_argument() {
-        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
-        let grpc_port = unused_port();
-        let host =
-            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
-                .expect("native backend host starts");
-        let mut client = connect_live_client(grpc_port).await;
-
-        let error = client
-            .abort_query(ProtoAbortQueryRequest::default())
-            .await
-            .expect_err("malformed AbortQuery must be a transport-visible error");
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-
-        host.shutdown().expect("native backend shutdown");
-    }
-
+    /// The probe is a family only the BE role registry holds, and one that
+    /// renders before any query runs: `..._tasks_created_total` is a counter,
+    /// so a freshly opened host already publishes it at zero. That makes an
+    /// empty result on the management port a real failure rather than an idle
+    /// process, and its presence on the native port a real leak.
     #[test]
     fn application_exposes_metrics_only_on_the_management_listener() {
+        const BACKEND_OWNED_FAMILY: &str = "novarocks_backend_task_execution_tasks_created_total";
+
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
         let metrics_port = unused_port();
@@ -2137,83 +1375,14 @@ mod tests {
             .expect("native backend host starts");
 
         if let Ok(native_response) = http_get(grpc_port, "/metrics") {
-            assert!(!native_response.contains("novarocks_backend_query_lifecycle_entries"));
+            assert!(!native_response.contains(BACKEND_OWNED_FAMILY));
         }
 
         let management_response =
             http_get(metrics_port, "/metrics").expect("read management metrics");
         assert!(management_response.starts_with("HTTP/1.1 200"));
-        assert!(management_response.contains("novarocks_backend_query_lifecycle_entries"));
+        assert!(management_response.contains(BACKEND_OWNED_FAMILY));
 
-        host.shutdown().expect("native backend shutdown");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
-    )]
-    async fn application_abort_digest_mismatch_is_rejected_without_terminating_entry() {
-        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
-        let grpc_port = unused_port();
-        let host =
-            BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
-                .expect("native backend host starts");
-        let mut client = connect_live_client(grpc_port).await;
-        let process_id = host
-            .process_descriptor()
-            .process_id()
-            .expect("host process identity");
-        let init = live_query_init_request(process_id, 904);
-        let different = live_query_init_request(process_id, 905);
-        let protocol_init = protocol_init_request(&init);
-        let protocol_different = protocol_init_request(&different);
-        client
-            .init_query(protocol_init.as_proto().clone())
-            .await
-            .expect("InitQuery succeeds");
-
-        let error = client
-            .abort_query(protocol_abort_request(
-                &protocol_init,
-                protocol_different
-                    .manifest()
-                    .expect("validated init manifest")
-                    .digest()
-                    .expect("validated InitQuery has digest")
-                    .as_bytes(),
-                "mismatched digest",
-            ))
-            .await
-            .expect_err("digest mismatch must be rejected");
-        assert_eq!(error.code(), tonic::Code::AlreadyExists);
-
-        let (commands, command_rx) = tokio::sync::mpsc::channel(1);
-        commands
-            .send(protocol_control_attach(&protocol_init))
-            .await
-            .expect("send Attach");
-        let mut events = client
-            .query_control_stream(ReceiverStream::new(command_rx))
-            .await
-            .expect("mismatched abort leaves entry attachable")
-            .into_inner();
-        assert_event(
-            events
-                .message()
-                .await
-                .expect("read ControlReady")
-                .expect("ControlReady"),
-            |event| {
-                matches!(
-                    event,
-                    protocol::query_control_response::Event::ControlReady(_)
-                )
-            },
-        );
-
-        drop(events);
-        drop(commands);
         host.shutdown().expect("native backend shutdown");
     }
 

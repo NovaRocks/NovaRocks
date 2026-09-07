@@ -308,10 +308,6 @@ impl RuntimeFilterParticipant {
         }
     }
 
-    pub(crate) const fn local_participant_id(&self) -> u32 {
-        self.install.local_participant_id()
-    }
-
     fn dispatch_delivery_envelope(
         &self,
         envelope: BackendNativeRuntimeFilterEnvelope,
