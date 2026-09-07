@@ -73,6 +73,15 @@ INSERT INTO ${case_db}.fe_crash VALUES (3, 15);
 -- query 5
 -- @kill_fe_after_be_log_contains=NOVAROCKS_TASK_LEASE_RENEWED
 -- @expect_error=server disconnected
+-- Every context's lease expires, and this count stays at the cluster size
+-- because that is the property: a frontend that dies must be noticed by each
+-- backend holding a context, not by a quorum of them. It is therefore the one
+-- assertion here that is load-sensitive rather than placement-sensitive --
+-- the expiry has to land inside the step's evidence budget, and under load
+-- the tick that detects it stretches. Measured: 6 of 6 suite runs green at
+-- load average 2-8, and 2 of 3 at load 25-31 with another cluster competing
+-- for the machine. If this times out with the marker on two of three
+-- backends, read the load average before reading the code.
 -- @be_log_be_count_at_least=NOVAROCKS_TASK_CONTEXT_LEASE_EXPIRED,3
 -- Termination completes on a backend only after its own work stops, and
 -- `sleep()` is an uninterruptible `std::thread::sleep`: a backend inside one
