@@ -98,25 +98,6 @@ fn parquet_writer_properties(
     Ok(properties.build())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StagedContent {
-    Data,
-    PositionDeletes,
-}
-
-#[derive(Clone, Debug)]
-pub struct StagedWriteOptions {
-    pub content: StagedContent,
-}
-
-impl Default for StagedWriteOptions {
-    fn default() -> Self {
-        Self {
-            content: StagedContent::Data,
-        }
-    }
-}
-
 pub struct StagedDataFile {
     pub data_file: DataFile,
     pub metadata: Arc<TableMetadata>,
@@ -125,18 +106,15 @@ pub struct StagedDataFile {
 
 pub struct StagedDataFileWriter {
     ctx: StagedWriteContext,
-    opts: StagedWriteOptions,
     buffered: Vec<RecordBatch>,
 }
 
 impl StagedDataFileWriter {
-    pub fn new(ctx: StagedWriteContext, opts: StagedWriteOptions) -> Result<Self, String> {
-        ensure_data_file_staged_content(opts.content)?;
-        Ok(Self {
+    pub fn new(ctx: StagedWriteContext) -> Self {
+        Self {
             ctx,
-            opts,
             buffered: Vec::new(),
-        })
+        }
     }
 
     pub async fn write_batch(&mut self, batch: RecordBatch) -> Result<(), String> {
@@ -150,7 +128,7 @@ impl StagedDataFileWriter {
         if self.buffered.is_empty() {
             return Ok(Vec::new());
         }
-        write_record_batches(&self.ctx, self.buffered, &self.opts).await
+        write_record_batches(&self.ctx, self.buffered).await
     }
 }
 
@@ -299,7 +277,7 @@ pub struct IcebergStreamingDataFileWriter {
 impl IcebergStreamingDataFileWriter {
     pub fn new(table: novarocks_connector_iceberg::iceberg::table::Table) -> Result<Self, String> {
         let ctx = StagedWriteContext::from_table(&table)?;
-        let writer = StagedDataFileWriter::new(ctx, StagedWriteOptions::default())?;
+        let writer = StagedDataFileWriter::new(ctx);
         Ok(Self { writer })
     }
 
@@ -318,16 +296,14 @@ pub async fn write_record_batches_as_data_files(
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<Vec<DataFile>, String> {
     let ctx = StagedWriteContext::from_table(table)?;
-    let staged = write_record_batches(&ctx, batches, &StagedWriteOptions::default()).await?;
+    let staged = write_record_batches(&ctx, batches).await?;
     Ok(staged.into_iter().map(to_iceberg_data_file).collect())
 }
 
 pub async fn write_record_batches(
     ctx: &StagedWriteContext,
     batches: impl IntoIterator<Item = RecordBatch>,
-    opts: &StagedWriteOptions,
 ) -> Result<Vec<StagedDataFile>, String> {
-    ensure_data_file_staged_content(opts.content)?;
     let data_file_builder = ctx.data_file_writer_builder()?;
     // Parquet checks its row-group byte threshold between RecordBatch writes.
     // The SQL sink can hand us a much larger batch, so preserve the configured
@@ -441,15 +417,6 @@ pub async fn write_record_batches(
         }
     }
     Ok(staged_files)
-}
-
-fn ensure_data_file_staged_content(content: StagedContent) -> Result<(), String> {
-    match content {
-        StagedContent::Data => Ok(()),
-        unsupported => Err(format!(
-            "unsupported staged content {unsupported:?} for staged data-file writer kernel; this writer only produces DATA files"
-        )),
-    }
 }
 
 pub async fn cleanup_staged_files(
@@ -568,7 +535,7 @@ async fn write_record_batches_as_data_files_with_schema(
     annotated_schema: arrow::datatypes::SchemaRef,
 ) -> Result<Vec<DataFile>, String> {
     let ctx = StagedWriteContext::from_table_with_schema(table, writer_schema, annotated_schema)?;
-    let staged = write_record_batches(&ctx, batches, &StagedWriteOptions::default()).await?;
+    let staged = write_record_batches(&ctx, batches).await?;
     Ok(staged.into_iter().map(to_iceberg_data_file).collect())
 }
 
@@ -1417,13 +1384,9 @@ mod tests {
             table.metadata().default_partition_spec().fields().len()
         );
 
-        let staged = write_record_batches(
-            &ctx,
-            vec![test_batch(&[4, 4])],
-            &StagedWriteOptions::default(),
-        )
-        .await
-        .expect("write through context from parts");
+        let staged = write_record_batches(&ctx, vec![test_batch(&[4, 4])])
+            .await
+            .expect("write through context from parts");
         assert_eq!(staged.len(), 1);
         let path = staged[0].data_file.file_path().to_string();
         assert!(
@@ -1437,13 +1400,9 @@ mod tests {
     async fn write_record_batches_unpartitioned_produces_one_file() {
         let table = build_unpartitioned_test_table("kernel_unpart").await;
         let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let staged = write_record_batches(
-            &ctx,
-            vec![test_batch(&[1, 2]), test_batch(&[3])],
-            &StagedWriteOptions::default(),
-        )
-        .await
-        .expect("write");
+        let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2]), test_batch(&[3])])
+            .await
+            .expect("write");
         assert_eq!(staged.len(), 1, "one file for unpartitioned batches");
         assert_eq!(staged[0].data_file.record_count(), 3);
         assert!(staged[0].data_file.file_size_in_bytes() > 0);
@@ -1458,13 +1417,9 @@ mod tests {
     async fn cleanup_staged_files_removes_written_files() {
         let table = build_unpartitioned_test_table("kernel_cleanup").await;
         let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let staged = write_record_batches(
-            &ctx,
-            vec![test_batch(&[1, 2, 3])],
-            &StagedWriteOptions::default(),
-        )
-        .await
-        .expect("write");
+        let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 3])])
+            .await
+            .expect("write");
         let path = staged[0].data_file.file_path().to_string();
         assert!(ctx.file_io().exists(&path).await.expect("exists before"));
         cleanup_staged_files(&ctx, std::slice::from_ref(&path))
@@ -1477,44 +1432,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_data_file_writer_rejects_position_delete_content() {
-        let table = build_unpartitioned_test_table("kernel_position_delete_content").await;
-        let opts = StagedWriteOptions {
-            content: StagedContent::PositionDeletes,
-        };
-
-        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let write_err = match write_record_batches(&ctx, vec![test_batch(&[1])], &opts).await {
-            Ok(_) => panic!("position delete content should be rejected by batch writer"),
-            Err(err) => err,
-        };
-        assert!(
-            write_err.contains("PositionDeletes"),
-            "error should mention unsupported content, got: {write_err}"
-        );
-
-        let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let new_err = match StagedDataFileWriter::new(ctx, opts) {
-            Ok(_) => panic!("position delete content should be rejected by staged writer"),
-            Err(err) => err,
-        };
-        assert!(
-            new_err.contains("PositionDeletes"),
-            "error should mention unsupported content, got: {new_err}"
-        );
-    }
-
-    #[tokio::test]
     async fn to_iceberg_data_file_is_identity() {
         let table = build_unpartitioned_test_table("kernel_id").await;
         let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let mut staged = write_record_batches(
-            &ctx,
-            vec![test_batch(&[1, 2, 3])],
-            &StagedWriteOptions::default(),
-        )
-        .await
-        .expect("write");
+        let mut staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 3])])
+            .await
+            .expect("write");
         let one = staged.remove(0);
         let path = one.data_file.file_path().to_string();
         let count = one.data_file.record_count();
@@ -1527,8 +1450,7 @@ mod tests {
     async fn staged_data_file_to_writer_report_maps_fields() {
         let table = build_unpartitioned_test_table("kernel_commit").await;
         let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let opts = StagedWriteOptions::default();
-        let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 2, 3])], &opts)
+        let staged = write_record_batches(&ctx, vec![test_batch(&[1, 2, 2, 3])])
             .await
             .expect("write");
         let s = &staged[0];
@@ -1621,7 +1543,7 @@ mod tests {
     async fn streaming_writer_matches_batch_form() {
         let table = build_unpartitioned_test_table("kernel_stream").await;
         let ctx = StagedWriteContext::from_table(&table).expect("ctx");
-        let mut w = StagedDataFileWriter::new(ctx, StagedWriteOptions::default()).expect("new");
+        let mut w = StagedDataFileWriter::new(ctx);
         w.write_batch(test_batch(&[1, 2])).await.expect("b1");
         w.write_batch(test_batch(&[3])).await.expect("b2");
         let staged = w.finish().await.expect("finish");
@@ -1754,7 +1676,7 @@ mod tests {
         let table = build_local_fs_test_table("kernel_part", true).await;
         let ctx = StagedWriteContext::from_table(&table).expect("ctx");
         let batch = test_batch(&[0, 0, 1, 1]);
-        let staged = write_record_batches(&ctx, vec![batch], &StagedWriteOptions::default())
+        let staged = write_record_batches(&ctx, vec![batch])
             .await
             .expect("write");
         assert_eq!(staged.len(), 2, "one file per distinct partition value");
