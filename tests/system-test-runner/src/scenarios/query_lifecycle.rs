@@ -533,7 +533,7 @@ fn assert_process_attribution(snapshots: &[&QueryLifecycleStructuredSnapshot]) -
         // because their subject no longer exists: the task protocol mints no
         // `ParticipantTerminalOutcome` at all, and the frontend deliberately
         // publishes an empty list instead of inventing proofs the protocol
-        // never made (ADR-0134). What they were proving -- that a backend
+        // never made (ADR-0135). What they were proving -- that a backend
         // really executed the attempt and its work completed -- is now proved
         // per query by `assert_query_completed_across_boundary`, from the
         // establish and release receipts and the frontend's own report that

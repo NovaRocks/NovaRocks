@@ -1134,7 +1134,7 @@ impl Scenario for DistributedWriterRowLevel {
 /// `QueryLifecycleRegistry`, which no production query reaches, and the
 /// outcome it suppressed does not exist: `publish_task_round_convergence`
 /// publishes an empty participant-outcome list because the task protocol's
-/// per-domain receipts and termination latch replaced that funnel (ADR-0134).
+/// per-domain receipts and termination latch replaced that funnel (ADR-0135).
 ///
 /// And its property is one the task protocol deliberately inverts. A lost
 /// terminal acknowledgement is *recovered* here, by replaying the exact

@@ -19,7 +19,7 @@
 
 -- The terminal P0 admission contract belongs to the query lifecycle chain, and
 -- `DistributedQueryIntent::Statistics` is now the only intent that runs on it
--- (ADR-0134). A plain SELECT reaches the task protocol, where no retained
+-- (ADR-0135). A plain SELECT reaches the task protocol, where no retained
 -- slot, byte bound or delivery permit exists to exhaust, so the statements
 -- under fault here are ANALYZE: this case's subject is still reachable, only
 -- through that intent. When the statistics program moves onto the task

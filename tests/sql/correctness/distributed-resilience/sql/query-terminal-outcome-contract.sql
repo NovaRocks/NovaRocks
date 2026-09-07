@@ -19,7 +19,7 @@
 
 -- The terminal outcome contract belongs to the query lifecycle chain, and
 -- `DistributedQueryIntent::Statistics` is now the only intent that runs on it
--- (ADR-0134). A plain SELECT reaches the task protocol, whose per-domain
+-- (ADR-0135). A plain SELECT reaches the task protocol, whose per-domain
 -- receipts and termination latch replace this chain's separate terminal
 -- evidence funnel, so every statement under fault here is ANALYZE: this
 -- case's subject is still reachable, only through that intent. The statements

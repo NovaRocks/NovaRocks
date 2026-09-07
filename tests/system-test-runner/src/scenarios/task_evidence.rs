@@ -27,7 +27,7 @@
 //!
 //! Neither fact exists any more. The task protocol mints no
 //! `ParticipantTerminalOutcome` at all -- its per-domain receipts and
-//! termination latch replace the retired terminal-evidence funnel (ADR-0134),
+//! termination latch replace the retired terminal-evidence funnel (ADR-0135),
 //! and `publish_task_round_convergence` in
 //! `novarocks/frontend/src/coordinator/execution.rs` deliberately publishes an
 //! empty outcome list rather than inventing proofs this protocol never made.

@@ -769,7 +769,7 @@ fn assert_authentication_order(
 ///
 /// * Participant outcomes are gone as a concept. The task protocol mints no
 ///   `ParticipantTerminalOutcome`, and the frontend publishes an empty list
-///   rather than fabricating proofs (ADR-0134), so both the "not empty" and
+///   rather than fabricating proofs (ADR-0135), so both the "not empty" and
 ///   the "all proofs" assertions are unsatisfiable rather than merely false.
 /// * `error_source` is structurally `None` here. A task round publishes its
 ///   convergence evidence only after the client-visible answer is already

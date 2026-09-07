@@ -19,7 +19,7 @@
 //!
 //! [`WireFragmentPlan`] is the one place in this protocol where a generated
 //! message is the stored representation of a value. The reason is recorded in
-//! ADR-0134: the only transport-neutral plan form in this engine, `ExecPlan`,
+//! ADR-0135: the only transport-neutral plan form in this engine, `ExecPlan`,
 //! is not a value — its scan, writer, and finish nodes hold `Arc<dyn ..>`
 //! leaves implemented only in the backend, and it carries no serde — so the
 //! frontend has nothing neutral to author instead.
@@ -30,7 +30,7 @@
 //! the descriptor. The backend's own plan decoder is the single consumer that
 //! reads the message back out, which is what [`WireFragmentPlan::plan`] and
 //! [`WireFragmentPlan::instance_params`] exist for.
-// Design: ADR-0134 (docs/adr/ADR-0134-native-distributed-work-as-tasks.md)
+// Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;

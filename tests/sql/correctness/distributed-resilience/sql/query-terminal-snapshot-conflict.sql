@@ -25,7 +25,7 @@
 -- error rather than for the contract being broken.
 --
 -- The frontend fragment-backend limit is dropped with it: that directive
--- rests on the participant/service-only shape, which ADR-0134 removed.
+-- rests on the participant/service-only shape, which ADR-0135 removed.
 
 -- query 1
 -- @skip_result_check=true

@@ -32,7 +32,7 @@
 //!
 //! Nothing in this module is routed into production yet. The existing
 //! coordinator keeps owning distributed query execution untouched.
-// Design: ADR-0134 (docs/adr/ADR-0134-native-distributed-work-as-tasks.md)
+// Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
 
 pub mod clock;
 pub mod completion;
