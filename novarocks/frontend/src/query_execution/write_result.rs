@@ -36,6 +36,8 @@
 //! backend already charged are charged again here, because a frontend that
 //! trusted a backend's arithmetic would have no way to notice a backend that
 //! got it wrong.
+//!
+//! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
 use std::collections::{BTreeMap, BTreeSet};
 
