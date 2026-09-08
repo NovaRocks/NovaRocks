@@ -417,7 +417,11 @@ impl Scenario for VendedCredentialTlsGate {
         match self.fixture.mode() {
             NativeTrustFixtureMode::Plaintext => {
                 let init_counts = (0..REQUIRED_BACKENDS)
-                    .map(|index| context.handle().be_log_count(index, "NOVAROCKS_QUERY_INIT"))
+                    .map(|index| {
+                        context
+                            .handle()
+                            .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let error = connection
                     .query::<i64, _>(&query)
@@ -433,12 +437,12 @@ impl Scenario for VendedCredentialTlsGate {
                     ensure!(
                         context
                             .handle()
-                            .be_log_count(index, "NOVAROCKS_QUERY_INIT")?
+                            .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)?
                             == before,
-                        "plaintext vended catalog query reached BE[{index}] Init ingress after FE rejection"
+                        "plaintext vended catalog query established a context on BE[{index}] after FE rejection"
                     );
                 }
-                context.action("proved h2c rejects the real vended definition at FE admission before any BE Init");
+                context.action("proved h2c rejects the real vended definition at FE admission before any BE context establish");
             }
             NativeTrustFixtureMode::Automatic | NativeTrustFixtureMode::Pem => {
                 let rows: Vec<i64> = connection

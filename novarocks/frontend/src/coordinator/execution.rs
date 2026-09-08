@@ -664,6 +664,17 @@ impl FrontendDistributedQueryCoordinator {
         // resolver and collect one exact vended response. Seal that collector
         // only after every source is open, then hand its leases to Init.
         let credential_leases = credential_lease_source.into_credential_leases()?;
+        if !credential_leases.is_empty()
+            && !self
+                .data_runtime
+                .native_transport()
+                .permits_confidential_credential_leases()
+        {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "vended credential lease admission requires TLS Native transport",
+            ));
+        }
         let binding_attachment =
             encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
         let scheduled = parts
