@@ -33,21 +33,25 @@ class ArtifactFixture:
         self.run_id = "1" * 64
         self.source = "a" * 40
         self.hashes = {name: sha(name.encode()) for name in (
-            "binary", "manifest", "fixture", "config", "tool", "lock", "tree"
+            "binary", "runner", "manifest", "fixture", "config", "tool", "lock", "tree"
         )}
         self.run_manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "formal": True,
             "run_id": self.run_id,
             "scenario": "performance/uea1-short-concurrent",
+            "command": ["novarocks-system-tests"],
             "started_unix_millis": 1,
             "ended_unix_millis": 2,
             "exit_code": 0,
             "status": "completed",
             "source_revision": self.source,
+            "native_build_identity": self.source,
             "source_tree_sha256": self.hashes["tree"],
             "source_dirty": False,
             "binary_sha256": self.hashes["binary"],
+            "runner_executable_path": "/checkout/target/release/novarocks-system-tests",
+            "runner_executable_sha256": self.hashes["runner"],
             "config_sha256": self.hashes["config"],
             "workload_manifest_sha256": self.hashes["manifest"],
             "fixture_sha256": self.hashes["fixture"],
@@ -184,7 +188,20 @@ class ArtifactProtocolTest(unittest.TestCase):
     def test_schema_four_and_exact_run_manifest_reference_are_accepted(self):
         document = self.fixture.extract()
         self.assertEqual(document["provenance"]["run_id"], self.fixture.run_id)
+        self.assertEqual(
+            document["provenance"]["runner_binary_sha256"],
+            self.fixture.hashes["runner"],
+        )
         self.assertEqual(document["compatibility"]["build_profile"], "release")
+
+    def test_comparison_input_requires_runner_binary_hash(self):
+        document = self.fixture.extract()
+        document["provenance"]["runner_binary_sha256"] = "not-a-hash"
+        with self.assertRaisesRegex(
+            PROTOCOL.ProtocolError,
+            "provenance.runner_binary_sha256 must be lowercase SHA-256",
+        ):
+            PROTOCOL.validate_comparison_input(document)
 
     def test_old_performance_schema_is_rejected(self):
         self.fixture.performance["schema_version"] = 2
@@ -217,6 +234,40 @@ class ArtifactProtocolTest(unittest.TestCase):
     def test_dirty_or_tampered_run_manifest_is_rejected(self):
         self.fixture.run_manifest["source_dirty"] = True
         with self.assertRaisesRegex(PROTOCOL.ProtocolError, "clean completed"):
+            self.fixture.extract()
+
+    def test_formal_native_build_identity_must_equal_source_revision(self):
+        self.fixture.run_manifest["native_build_identity"] = "stale-build"
+        with self.assertRaisesRegex(
+            PROTOCOL.ProtocolError,
+            "native_build_identity must equal source_revision",
+        ):
+            self.fixture.extract()
+
+    def test_run_manifest_schema_and_keys_are_exact(self):
+        self.fixture.run_manifest["schema_version"] = 1
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "schema_version 2"):
+            self.fixture.extract()
+        self.fixture.run_manifest["schema_version"] = 2
+        self.fixture.run_manifest["unexpected"] = True
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "keys mismatch"):
+            self.fixture.extract()
+
+    def test_formal_runner_identity_is_required(self):
+        self.fixture.run_manifest["runner_executable_path"] = "/tmp/novarocks-system-tests"
+        with self.assertRaisesRegex(
+            PROTOCOL.ProtocolError,
+            "checkout-local release runner",
+        ):
+            self.fixture.extract()
+        self.fixture.run_manifest[
+            "runner_executable_path"
+        ] = "/checkout/target/release/novarocks-system-tests"
+        self.fixture.run_manifest["runner_executable_sha256"] = "not-a-hash"
+        with self.assertRaisesRegex(
+            PROTOCOL.ProtocolError,
+            "runner_executable_sha256 must be lowercase SHA-256",
+        ):
             self.fixture.extract()
 
     def test_success_completed_outside_window_is_rejected(self):

@@ -15,6 +15,7 @@ from typing import Any
 
 INPUT_SCHEMA_VERSION = 1
 INPUT_KIND = "uea1-performance-comparison-input"
+RUN_MANIFEST_SCHEMA_VERSION = 2
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 QUERY_RELATIVE_METRICS = {
@@ -296,6 +297,41 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         _load_json(artifact_paths["run_manifest"], "run manifest"),
         "run manifest",
     )
+    _expect_exact_keys(
+        run_manifest,
+        {
+            "schema_version",
+            "formal",
+            "run_id",
+            "scenario",
+            "command",
+            "started_unix_millis",
+            "ended_unix_millis",
+            "exit_code",
+            "status",
+            "source_revision",
+            "native_build_identity",
+            "source_tree_sha256",
+            "source_dirty",
+            "binary_sha256",
+            "runner_executable_path",
+            "runner_executable_sha256",
+            "config_sha256",
+            "workload_manifest_sha256",
+            "fixture_sha256",
+            "tool_tree_sha256",
+            "cargo_lock_sha256",
+            "rustc_version",
+            "cargo_version",
+            "build_profile",
+            "platform",
+        },
+        "run manifest",
+    )
+    if run_manifest["schema_version"] != RUN_MANIFEST_SCHEMA_VERSION:
+        raise ProtocolError(
+            f"run manifest must use schema_version {RUN_MANIFEST_SCHEMA_VERSION}"
+        )
     if not isinstance(resources, list):
         raise ProtocolError("resource artifact must be an array")
     if performance.get("schema_version") != 4:
@@ -315,8 +351,31 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     )
     if not SOURCE_RE.fullmatch(source_sha):
         raise ProtocolError("run manifest source_revision must be a full lowercase Git SHA")
+    native_build_identity = _nonempty_string(
+        run_manifest.get("native_build_identity"),
+        "run manifest native_build_identity",
+    )
+    if native_build_identity != source_sha:
+        raise ProtocolError(
+            "formal run manifest native_build_identity must equal source_revision"
+        )
+    runner_executable_path = Path(
+        _nonempty_string(
+            run_manifest.get("runner_executable_path"),
+            "run manifest runner_executable_path",
+        )
+    )
+    if (
+        not runner_executable_path.is_absolute()
+        or tuple(part for part in runner_executable_path.parts[-3:])
+        != ("target", "release", "novarocks-system-tests")
+    ):
+        raise ProtocolError(
+            "formal run manifest runner_executable_path must identify the checkout-local release runner"
+        )
     hash_fields = {
         "binary": "binary_sha256",
+        "runner_executable": "runner_executable_sha256",
         "manifest": "workload_manifest_sha256",
         "fixture": "fixture_sha256",
         "config": "config_sha256",
@@ -651,6 +710,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             "run_id": run_id,
             "source_sha": source_sha,
             "binary_sha256": input_hashes["binary"],
+            "runner_binary_sha256": input_hashes["runner_executable"],
             "descriptor_sha256": _sha256_file(descriptor_path),
             "performance_sha256": _sha256_file(artifact_paths["performance"]),
             "resources_sha256": _sha256_file(artifact_paths["resources"]),
@@ -691,13 +751,13 @@ def validate_comparison_input(document: Any) -> dict[str, Any]:
     provenance = _expect_object(model["provenance"], "provenance")
     _expect_exact_keys(
         provenance,
-        {"run_id", "source_sha", "binary_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256", "started_unix_millis", "ended_unix_millis"},
+        {"run_id", "source_sha", "binary_sha256", "runner_binary_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256", "started_unix_millis", "ended_unix_millis"},
         "provenance",
     )
     _nonempty_string(provenance["run_id"], "provenance.run_id")
     if not SOURCE_RE.fullmatch(str(provenance["source_sha"])):
         raise ProtocolError("provenance.source_sha must be a full lowercase Git SHA")
-    for field in ("binary_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256"):
+    for field in ("binary_sha256", "runner_binary_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256"):
         if not SHA256_RE.fullmatch(str(provenance[field])):
             raise ProtocolError(f"provenance.{field} must be lowercase SHA-256")
     started = provenance["started_unix_millis"]

@@ -53,9 +53,16 @@ select samples between `started_elapsed_millis` and `ended_elapsed_millis`;
 setup, warmup, cleanup, and post-window drain samples remain diagnostic only.
 Every performance and startup run also writes `run-manifest.json`. Formal runs
 require a clean checkout and that checkout's exact
-`target/release/novarocks`; the manifest records source, binary, config,
-workload, fixture, tool tree, Cargo.lock, toolchain, platform, power mode, and
-start/end identity. Formal extraction rejects a missing preparation event,
+`target/release/novarocks`. After the real cluster starts, the runner reads the
+structured `SHOW BACKENDS` projection, requires all three live BEs to report
+one embedded native build identity equal to the source revision, and records
+that identity in run-manifest schema 2. Smoke runs record one uniform live-BE
+identity without requiring source equality. The manifest also records source,
+binary, the canonical runner executable and its hash, config, workload, fixture,
+tool tree, Cargo.lock, toolchain, platform, power mode, and start/end identity.
+Formal runs require the runner itself to be this checkout's release executable.
+The tool-tree hash covers the complete UEA-1 benchmark tree, system-test runner
+source and manifest, and cluster-harness source and manifest. Formal extraction rejects a missing preparation event,
 any incomplete FE/three-BE resource window, and any artifact that does not
 reference the exact completed run manifest.
 

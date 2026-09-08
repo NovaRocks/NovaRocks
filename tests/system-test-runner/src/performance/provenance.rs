@@ -19,6 +19,7 @@ use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,9 +49,12 @@ struct RunManifest {
     exit_code: Option<i32>,
     status: String,
     source_revision: String,
+    native_build_identity: String,
     source_tree_sha256: String,
     source_dirty: bool,
     binary_sha256: String,
+    runner_executable_path: String,
+    runner_executable_sha256: String,
     config_sha256: String,
     workload_manifest_sha256: String,
     fixture_sha256: String,
@@ -74,7 +78,7 @@ struct PlatformIdentity {
 }
 
 pub fn begin_run_manifest(
-    context: &ScenarioContext,
+    context: &mut ScenarioContext,
     scenario: &str,
     workload_manifest_sha256: &str,
     workload_manifest_bytes: &[u8],
@@ -99,8 +103,11 @@ pub fn begin_run_manifest(
     if formal {
         ensure_checkout_release_binary(&repository, context.primary_binary())?;
     }
+    let native_build_identity = observe_native_build_identity(context, &source_revision, formal)?;
     let source_tree_sha256 = source_tree_sha256(&repository, &source_revision, &status)?;
     let binary_sha256 = sha256_file(context.primary_binary())?;
+    let (runner_executable_path, runner_executable_sha256) =
+        runner_executable_identity(&repository, formal)?;
     let config_sha256 = sha256_file(context.base_config_path())?;
     let fixture_sha256 = sha256_bytes(fixture_spec);
     let tool_tree_sha256 = tool_tree_sha256(&repository)?;
@@ -115,7 +122,7 @@ pub fn begin_run_manifest(
     );
     let run_id = sha256_bytes(identity_material.as_bytes());
     let manifest = RunManifest {
-        schema_version: 1,
+        schema_version: 2,
         formal,
         run_id: run_id.clone(),
         scenario: scenario.to_string(),
@@ -125,9 +132,12 @@ pub fn begin_run_manifest(
         exit_code: None,
         status: "running".to_string(),
         source_revision,
+        native_build_identity,
         source_tree_sha256,
         source_dirty: !status.is_empty(),
         binary_sha256,
+        runner_executable_path,
+        runner_executable_sha256,
         config_sha256,
         workload_manifest_sha256: workload_manifest_sha256.to_string(),
         fixture_sha256,
@@ -155,6 +165,59 @@ pub fn begin_run_manifest(
         manifest,
         finished: false,
     })
+}
+
+fn observe_native_build_identity(
+    context: &mut ScenarioContext,
+    source_revision: &str,
+    formal: bool,
+) -> Result<String> {
+    let expected_backends = context.process_ids().backends.len();
+    let topology = context
+        .handle()
+        .frontend_backend_topology()
+        .context("read live BE build identities through structured SHOW BACKENDS")?;
+    let live = topology
+        .iter()
+        .filter(|row| row.is_eligible_live())
+        .collect::<Vec<_>>();
+    ensure!(
+        live.len() == expected_backends,
+        "UEA-1 provenance requires every launched BE to be live: launched={expected_backends}, live={}, topology={topology:?}",
+        live.len()
+    );
+    if formal {
+        ensure!(
+            live.len() == 3,
+            "formal UEA-1 provenance requires exactly three live BEs, observed {}",
+            live.len()
+        );
+    }
+    let identities = live
+        .into_iter()
+        .map(|row| row.build_identity.clone())
+        .collect::<BTreeSet<_>>();
+    validate_native_build_identities(&identities, source_revision, formal)
+}
+
+fn validate_native_build_identities(
+    identities: &BTreeSet<String>,
+    source_revision: &str,
+    formal: bool,
+) -> Result<String> {
+    ensure!(
+        identities.len() == 1,
+        "UEA-1 provenance requires one native build identity across all live BEs, observed {identities:?}"
+    );
+    let identity = identities
+        .first()
+        .expect("one native build identity was checked")
+        .clone();
+    ensure!(
+        !formal || identity == source_revision,
+        "formal UEA-1 provenance requires live BE native build identity {identity:?} to equal source revision {source_revision}"
+    );
+    Ok(identity)
 }
 
 impl RunManifestHandle {
@@ -235,6 +298,48 @@ fn ensure_checkout_release_binary(repository: &Path, binary: &Path) -> Result<()
     Ok(())
 }
 
+fn runner_executable_identity(repository: &Path, formal: bool) -> Result<(String, String)> {
+    let executable = std::env::current_exe().context("resolve current system-test runner")?;
+    let actual = fs::canonicalize(&executable).with_context(|| {
+        format!(
+            "resolve current system-test runner executable {}",
+            executable.display()
+        )
+    })?;
+    let actual_sha256 = sha256_file(&actual)?;
+    if formal {
+        ensure_checkout_release_runner(repository, &actual, &actual_sha256)?;
+    }
+    let actual_path = actual
+        .to_str()
+        .context("current system-test runner path is not UTF-8")?
+        .to_string();
+    Ok((actual_path, actual_sha256))
+}
+
+fn ensure_checkout_release_runner(
+    repository: &Path,
+    actual: &Path,
+    actual_sha256: &str,
+) -> Result<()> {
+    let expected_path = repository.join("target/release/novarocks-system-tests");
+    let expected = fs::canonicalize(&expected_path).with_context(|| {
+        format!(
+            "resolve checkout-local release runner {}",
+            expected_path.display()
+        )
+    })?;
+    ensure!(
+        actual == expected,
+        "formal UEA-1 measurement requires this checkout's target/release/novarocks-system-tests"
+    );
+    ensure!(
+        actual_sha256 == sha256_file(&expected)?,
+        "formal UEA-1 runner executable hash does not match the checkout-local release runner"
+    );
+    Ok(())
+}
+
 fn source_tree_sha256(repository: &Path, revision: &str, status: &str) -> Result<String> {
     let tracked = command_bytes(repository, "git", &["ls-files", "-s"])?;
     let diff = command_bytes(repository, "git", &["diff", "--binary", "HEAD"])?;
@@ -253,13 +358,7 @@ fn source_tree_sha256(repository: &Path, revision: &str, status: &str) -> Result
 }
 
 fn tool_tree_sha256(repository: &Path) -> Result<String> {
-    let mut paths = Vec::new();
-    collect_files(&repository.join("tests/benchmarks/uea1"), &mut paths)?;
-    collect_files(
-        &repository.join("tests/system-test-runner/src/performance"),
-        &mut paths,
-    )?;
-    paths.sort();
+    let paths = tool_tree_paths(repository)?;
     let mut hasher = Sha256::new();
     for path in paths {
         let relative = path.strip_prefix(repository).unwrap_or(&path);
@@ -269,6 +368,31 @@ fn tool_tree_sha256(repository: &Path) -> Result<String> {
         hasher.update([0]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn tool_tree_paths(repository: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for root in [
+        repository.join("tests/benchmarks/uea1"),
+        repository.join("tests/system-test-runner/src"),
+        repository.join("tests/cluster-harness/src"),
+    ] {
+        collect_files(&root, &mut paths)?;
+    }
+    for path in [
+        repository.join("tests/system-test-runner/Cargo.toml"),
+        repository.join("tests/cluster-harness/Cargo.toml"),
+    ] {
+        ensure!(
+            path.is_file(),
+            "UEA-1 tool input {} is missing",
+            path.display()
+        );
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 fn collect_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
@@ -424,6 +548,79 @@ mod tests {
 
         ensure_checkout_release_binary(&repository, &expected).expect("checkout binary");
         assert!(ensure_checkout_release_binary(&repository, &external).is_err());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn formal_native_build_identity_must_equal_source_revision() {
+        let identities = BTreeSet::from(["old-revision".to_string()]);
+        let error = validate_native_build_identities(
+            &identities,
+            "0123456789abcdef0123456789abcdef01234567",
+            true,
+        )
+        .expect_err("formal run must reject a stale embedded build identity");
+        assert!(
+            error
+                .to_string()
+                .contains("to equal source revision 0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn nonformal_native_build_identity_is_recorded_without_source_equality() {
+        let identities = BTreeSet::from(["smoke-build".to_string()]);
+        assert_eq!(
+            validate_native_build_identities(
+                &identities,
+                "0123456789abcdef0123456789abcdef01234567",
+                false,
+            )
+            .expect("smoke run may execute a different embedded build identity"),
+            "smoke-build"
+        );
+    }
+
+    #[test]
+    fn tool_tree_includes_complete_runner_and_cluster_harness_inputs() {
+        let repository = repository_root().expect("repository root");
+        let paths = tool_tree_paths(&repository).expect("tool tree inputs");
+        for expected in [
+            "tests/benchmarks/uea1/artifact_protocol.py",
+            "tests/system-test-runner/Cargo.toml",
+            "tests/system-test-runner/src/scenarios/uea1_performance.rs",
+            "tests/cluster-harness/Cargo.toml",
+            "tests/cluster-harness/src/process_resources.rs",
+        ] {
+            assert!(
+                paths.contains(&repository.join(expected)),
+                "tool tree omitted {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn formal_runner_must_be_checkout_local_with_its_exact_hash() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-uea1-runner-provenance-{}-{}",
+            std::process::id(),
+            now_unix_millis().expect("clock")
+        ));
+        let repository = root.join("checkout");
+        let expected = repository.join("target/release/novarocks-system-tests");
+        let external = root.join("external/release/novarocks-system-tests");
+        fs::create_dir_all(expected.parent().expect("expected parent")).expect("expected dir");
+        fs::create_dir_all(external.parent().expect("external parent")).expect("external dir");
+        fs::write(&expected, b"expected runner").expect("expected runner");
+        fs::write(&external, b"external runner").expect("external runner");
+        let expected = fs::canonicalize(expected).expect("canonical expected runner");
+        let external = fs::canonicalize(external).expect("canonical external runner");
+        let expected_sha = sha256_file(&expected).expect("expected runner hash");
+
+        ensure_checkout_release_runner(&repository, &expected, &expected_sha)
+            .expect("checkout runner");
+        assert!(ensure_checkout_release_runner(&repository, &external, &expected_sha).is_err());
+        assert!(ensure_checkout_release_runner(&repository, &expected, &"0".repeat(64)).is_err());
         fs::remove_dir_all(root).expect("remove fixture");
     }
 }
