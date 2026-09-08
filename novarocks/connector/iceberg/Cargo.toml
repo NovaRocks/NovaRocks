@@ -38,6 +38,7 @@ crc32fast = "1"
 futures = "0.3"
 ordered-float = "4"
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
+prost = "0.13"
 rand = "0.8"
 roaring = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -58,3 +59,7 @@ novarocks-types = { path = "../../types" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"

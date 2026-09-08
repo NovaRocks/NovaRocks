@@ -23,6 +23,10 @@ pub mod connector_read {
     include!(concat!(env!("OUT_DIR"), "/novarocks.connector_read.rs"));
 }
 
+pub mod connector_common {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.connector_common.rs"));
+}
+
 pub mod connector_write {
     include!(concat!(env!("OUT_DIR"), "/novarocks.connector_write.rs"));
 }
@@ -43,7 +47,9 @@ pub mod plan {
 
 #[allow(clippy::large_enum_variant)]
 pub mod novarocks {
-    pub use super::{catalog, common, connector_read, connector_write, filter, plan};
+    pub use super::{
+        catalog, common, connector_common, connector_read, connector_write, filter, plan,
+    };
 
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
 }

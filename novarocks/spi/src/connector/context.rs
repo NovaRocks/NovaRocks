@@ -25,9 +25,10 @@ use novarocks_secret::SecretValue;
 
 use super::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
-    ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
-    CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
+    ConnectorRequestResources, ConnectorVendedCredentialLeaseCollectionPort,
+    ConnectorVendedCredentialLeaseSink, CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES,
+    StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 
 pub trait ConnectorCancellation: Send + Sync {
@@ -235,6 +236,7 @@ pub struct ConnectorRequestContext {
     vended_credential_lease_sink: Option<Arc<dyn ConnectorVendedCredentialLeaseSink>>,
     vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
     request_scope: ConnectorRequestScope,
+    resources: Option<ConnectorRequestResources>,
 }
 
 impl ConnectorRequestContext {
@@ -264,6 +266,7 @@ impl ConnectorRequestContext {
             vended_credential_lease_sink: None,
             vended_credential_lease_collection: None,
             request_scope: ConnectorRequestScope::new(),
+            resources: None,
         })
     }
 
@@ -282,6 +285,12 @@ impl ConnectorRequestContext {
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
     ) -> Self {
         self.storage_resolver = Some(storage_resolver);
+        self
+    }
+
+    /// Installs the host ledger after this query or task has been admitted.
+    pub fn with_resources(mut self, resources: ConnectorRequestResources) -> Self {
+        self.resources = Some(resources);
         self
     }
 
@@ -345,6 +354,17 @@ impl ConnectorRequestContext {
 
     pub fn storage_resolver(&self) -> Option<&Arc<dyn ConnectorStorageResolver>> {
         self.storage_resolver.as_ref()
+    }
+
+    /// Runtime readers fail closed when the host did not install a ledger;
+    /// absence never means an unlimited or untracked request.
+    pub fn resources(&self) -> Result<&ConnectorRequestResources, ConnectorError> {
+        self.resources.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector request resources were not installed after admission",
+            )
+        })
     }
 
     /// The base query-attempt sink before a metadata call decorates it with

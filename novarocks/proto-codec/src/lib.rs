@@ -14,6 +14,9 @@ pub mod arrow_physical;
 /// Validated catalog identity, materialization, and reachability carriers.
 pub mod catalog;
 
+/// Strict public envelope codec for provider-owned connector formats.
+pub mod connector_common;
+
 /// Structural validation and canonical encoding for the typed connector read wire.
 pub mod connector_read;
 

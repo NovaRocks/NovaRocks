@@ -18,6 +18,7 @@
 mod catalog;
 mod catalog_runtime;
 mod cleanup_maintenance;
+mod codec;
 mod context;
 mod control;
 mod credential;
@@ -35,10 +36,12 @@ mod metadata_maintenance;
 mod mutation;
 mod mv_storage_observation;
 mod predicate;
+pub mod provider;
 mod provider_binding;
 mod publication;
 mod read;
 mod read_session;
+mod resources;
 mod row_mutation;
 mod scalar;
 mod staged_create;
@@ -69,6 +72,13 @@ pub use cleanup_maintenance::{
     MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
     MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
     PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
+};
+pub use codec::{
+    ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
+    ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload,
+    ConnectorEnvelopeHeader, ConnectorFieldPath, ConnectorFieldPathSegment,
+    ConnectorPrivateDecoder, ConnectorPrivateEncoder, MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES,
+    MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
 };
 pub use context::{
     ConnectorCancellation, ConnectorRequestContext, ConnectorRequestScope,
@@ -235,6 +245,11 @@ pub use read::{
 pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,
     ConnectorReadSessionOutcome,
+};
+pub use resources::{
+    ConnectorOutputMemoryToken, ConnectorRequestResources, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    ConnectorResourceReservation,
 };
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,

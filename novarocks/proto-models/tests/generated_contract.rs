@@ -2,7 +2,8 @@ use prost::Message;
 use prost_reflect::DescriptorPool;
 
 use novarocks_proto_models::{
-    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, catalog, common, expr, novarocks, plan,
+    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, catalog, common, connector_common, expr, novarocks,
+    plan,
 };
 
 #[test]
@@ -11,6 +12,7 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
 
     let _ = common::UniqueId::default();
     let _ = catalog::CatalogSet::default();
+    let _ = connector_common::ConnectorEncodedPayload::default();
     let _ = expr::Expr::default();
     let _ = plan::PlanFragment::default();
     let _ = novarocks::CreateTaskRequest::default();
@@ -25,6 +27,28 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
         pool.get_service_by_name("novarocks.NovaRocksGrpc")
             .is_some()
     );
+}
+
+#[test]
+fn connector_common_envelope_has_an_exact_purpose_and_catalog_generation() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let header = pool
+        .get_message_by_name("novarocks.connector_common.ConnectorEnvelopeHeader")
+        .expect("connector envelope header descriptor");
+    for (name, number) in [
+        ("provider_id", 1),
+        ("catalog", 2),
+        ("category", 3),
+        ("codec_revision", 4),
+    ] {
+        assert_eq!(header.get_field_by_name(name).expect(name).number(), number);
+    }
+    let payload = pool
+        .get_message_by_name("novarocks.connector_common.ConnectorEncodedPayload")
+        .expect("connector encoded payload descriptor");
+    assert_eq!(payload.get_field_by_name("header").unwrap().number(), 1);
+    assert_eq!(payload.get_field_by_name("payload").unwrap().number(), 2);
 }
 
 #[test]

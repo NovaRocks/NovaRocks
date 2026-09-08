@@ -24,6 +24,7 @@
 mod binding;
 mod materialization;
 mod properties;
+mod provider_definition;
 
 pub use binding::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
@@ -35,3 +36,7 @@ pub use materialization::{
     ConnectorMaterializationRetryDisposition, MaterializationContext,
 };
 pub use properties::NormalizedCatalogProperties;
+pub use provider_definition::{
+    ProviderControlRoleFactory, ProviderExecutionRoleFactory, ProviderRoleDefinition,
+    SealedProviderRoleRegistry,
+};

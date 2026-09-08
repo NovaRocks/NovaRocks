@@ -3243,6 +3243,9 @@ dependencies = [
  "opendal",
  "ordered-float 4.6.0",
  "parquet",
+ "prost 0.13.5",
+ "prost-build",
+ "protoc-bin-vendored",
  "rand 0.8.5",
  "roaring 0.10.12",
  "serde",
@@ -3482,6 +3485,7 @@ name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
+ "bytes",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",

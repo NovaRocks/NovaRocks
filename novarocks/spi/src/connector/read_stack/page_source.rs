@@ -25,7 +25,7 @@ use std::fmt::Debug;
 
 use arrow::array::ArrayRef;
 
-use crate::connector::{ConnectorError, ConnectorErrorKind};
+use crate::connector::{ConnectorError, ConnectorErrorKind, ConnectorOutputMemoryToken};
 
 /// A column whose materialization can be deferred until it is read.
 pub trait LazyBlockLoader: Send {
@@ -63,6 +63,7 @@ impl Debug for PageChannel {
 pub struct SourcePage {
     position_count: usize,
     channels: Vec<PageChannel>,
+    output_memory: Option<ConnectorOutputMemoryToken>,
 }
 
 impl SourcePage {
@@ -79,7 +80,19 @@ impl SourcePage {
         Ok(Self {
             position_count,
             channels: columns.into_iter().map(PageChannel::Materialized).collect(),
+            output_memory: None,
         })
+    }
+
+    /// A page whose Arrow buffers carry their admitted host reservation.
+    pub fn try_new_accounted(
+        position_count: usize,
+        columns: Vec<ArrayRef>,
+        output_memory: ConnectorOutputMemoryToken,
+    ) -> Result<Self, ConnectorError> {
+        let mut page = Self::try_new(position_count, columns)?;
+        page.output_memory = Some(output_memory);
+        Ok(page)
     }
 
     /// A page that reports positions without producing any column.
@@ -87,6 +100,7 @@ impl SourcePage {
         Self {
             position_count,
             channels: Vec::new(),
+            output_memory: None,
         }
     }
 
@@ -130,11 +144,33 @@ impl SourcePage {
 
     /// Materialize every channel and hand back the columns in order.
     pub fn into_columns(mut self) -> Result<(usize, Vec<ArrayRef>), ConnectorError> {
+        if self.output_memory.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "accounted connector page requires move-aware column extraction",
+            ));
+        }
         let mut columns = Vec::with_capacity(self.channels.len());
         for index in 0..self.channels.len() {
             columns.push(self.block(index)?.clone());
         }
         Ok((self.position_count, columns))
+    }
+
+    /// Materialize every channel and move its existing host charge to the
+    /// engine adapter together with the Arrow buffers.
+    pub fn into_accounted_columns(
+        mut self,
+    ) -> Result<(usize, Vec<ArrayRef>, Option<ConnectorOutputMemoryToken>), ConnectorError> {
+        let mut columns = Vec::with_capacity(self.channels.len());
+        for index in 0..self.channels.len() {
+            columns.push(self.block(index)?.clone());
+        }
+        Ok((self.position_count, columns, self.output_memory.take()))
+    }
+
+    pub fn output_memory_bytes(&self) -> Option<u64> {
+        self.output_memory.as_ref().map(|token| token.bytes())
     }
 
     /// Keep only a prefix of the channels.

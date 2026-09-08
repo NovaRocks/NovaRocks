@@ -55,6 +55,7 @@ pub mod planning_facts;
 pub mod position_delete;
 pub mod position_delete_descriptor;
 pub mod provider_binding;
+pub mod provider_types;
 pub mod read_snapshot;
 pub mod reconcile_payload;
 pub mod ref_snapshot;
@@ -75,6 +76,7 @@ pub mod table_definition;
 pub mod typed_boundary;
 pub mod typed_provider_factory;
 pub mod typed_read;
+pub mod wire;
 pub mod write_codec;
 pub mod write_descriptor;
 
