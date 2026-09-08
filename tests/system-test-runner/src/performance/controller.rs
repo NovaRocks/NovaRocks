@@ -32,8 +32,8 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::LaunchProfile;
 use novarocks_cluster_harness::process_resources::ProcessResourceMonitor;
+use novarocks_cluster_harness::{LaunchProfile, QueryExecutionResourceSnapshot, ServerHandle};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,6 +111,16 @@ pub fn run(
         Duration::from_millis(100),
     )?;
     let timeline = MonotonicTimeline::new(&monitor);
+    let mixed_resource_baseline = if matches!(scenario, PerformanceScenario::Mixed) {
+        Some(
+            context
+                .handle()
+                .query_execution_resource_snapshot()?
+                .context("mixed performance requires the query resource oracle")?,
+        )
+    } else {
+        None
+    };
     let execution = (|| {
         let diagnostic = run_diagnostic_prelude(
             scenario,
@@ -132,6 +142,9 @@ pub fn run(
                 manifest.purpose == ManifestPurpose::Formal,
                 &monitor,
                 timeline,
+                mixed_resource_baseline
+                    .as_ref()
+                    .context("mixed performance resource baseline is missing")?,
             )?,
             PerformanceScenario::SlowOutput => {
                 let (samples, windows) =
@@ -486,12 +499,13 @@ fn run_short(
 }
 
 fn run_mixed(
-    context: &ScenarioContext,
+    context: &mut ScenarioContext,
     workload: &MixedWorkload,
     binding: &MixedFixtureBinding,
     require_sustained_producers: bool,
     monitor: &ProcessResourceMonitor,
     timeline: MonotonicTimeline,
+    resource_baseline: &QueryExecutionResourceSnapshot,
 ) -> Result<(
     Vec<QuerySample>,
     Vec<MeasurementWindow>,
@@ -509,6 +523,7 @@ fn run_mixed(
             .scenario_root()
             .join(format!("mixed-fixture-{window_index}.json"));
         std::fs::write(fixture_path, serde_json::to_vec_pretty(&prepared)?)?;
+        await_mixed_setup_convergence(context, resource_baseline, workload, window_index)?;
         let result = run_mixed_window(
             context,
             workload,
@@ -539,6 +554,44 @@ fn run_mixed(
         }
     }
     Ok((all, measurement_windows, fixture_identities))
+}
+
+fn await_mixed_setup_convergence(
+    context: &mut ScenarioContext,
+    resource_baseline: &QueryExecutionResourceSnapshot,
+    workload: &MixedWorkload,
+    window_index: usize,
+) -> Result<()> {
+    let budget = Duration::from_millis(workload.job_timeout_ms)
+        .min(context.remaining("await mixed setup convergence")?);
+    let deadline = Instant::now() + budget;
+    context.action(format!(
+        "await mixed window {window_index} setup resource convergence"
+    ));
+    context
+        .handle()
+        .await_query_execution_resource_convergence(resource_baseline, deadline)
+        .with_context(|| format!("mixed window {window_index} setup resource convergence"))?;
+
+    loop {
+        let active = context
+            .handle()
+            .frontend_query_lifecycle_active_attempts()
+            .with_context(|| {
+                format!("read FE active attempts before mixed window {window_index}")
+            })?;
+        if active == 0.0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("mixed window {window_index} setup retained {active} frontend query attempt(s)");
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(20)),
+        );
+    }
 }
 
 enum MixedSample {
