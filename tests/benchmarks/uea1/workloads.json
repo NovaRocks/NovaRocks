@@ -28,17 +28,17 @@
     "producers": [
       {
         "kind": "mv-refresh",
-        "jobs": 256,
+        "jobs": 32,
         "minimum_completions": 1
       },
       {
         "kind": "analyze",
-        "jobs": 256,
+        "jobs": 32,
         "minimum_completions": 1
       },
       {
         "kind": "optimize",
-        "jobs": 256,
+        "jobs": 16,
         "minimum_completions": 1
       }
     ]

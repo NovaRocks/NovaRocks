@@ -103,6 +103,7 @@ impl Scenario for StartupBaseline {
             &fixture_spec,
             &fixture_spec,
             true,
+            crate::performance::provenance::RunManifestKind::StartupBaseline,
         )?;
         require_backends(context)?;
 

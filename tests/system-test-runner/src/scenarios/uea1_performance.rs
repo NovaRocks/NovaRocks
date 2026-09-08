@@ -171,14 +171,15 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
             .to_path_buf();
         let manifest = Uea1WorkloadManifest::load(&path)?;
         let mixed_binding = if self.is_mixed() {
-            let create_catalog_sql = self
+            let fixture = self
                 .mixed_fixture
                 .lock()
-                .map_err(|_| anyhow::anyhow!("UEA-1 mixed fixture lock poisoned"))?
+                .map_err(|_| anyhow::anyhow!("UEA-1 mixed fixture lock poisoned"))?;
+            let fixture = fixture
                 .as_ref()
-                .context("UEA-1 mixed fixture is missing after cluster launch")?
-                .create_catalog_sql
-                .clone();
+                .context("UEA-1 mixed fixture is missing after cluster launch")?;
+            let create_catalog_sql = fixture.create_catalog_sql.clone();
+            let provider_runtime = fixture.rest.runtime_identity()?;
             let mut connection = mysql_actor::connect(
                 context.mysql_user(),
                 context.mysql_port(),
@@ -187,7 +188,10 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
             connection
                 .query_drop(create_catalog_sql)
                 .context("create private UEA-1 mixed catalog")?;
-            Some(MixedFixtureBinding::new(MIXED_CATALOG.to_string())?)
+            Some(MixedFixtureBinding::with_provider_runtime(
+                MIXED_CATALOG.to_string(),
+                provider_runtime,
+            )?)
         } else {
             None
         };

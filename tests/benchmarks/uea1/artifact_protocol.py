@@ -15,7 +15,7 @@ from typing import Any
 
 INPUT_SCHEMA_VERSION = 1
 INPUT_KIND = "uea1-performance-comparison-input"
-RUN_MANIFEST_SCHEMA_VERSION = 2
+RUN_MANIFEST_SCHEMA_VERSION = 4
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 QUERY_RELATIVE_METRICS = {
@@ -47,6 +47,12 @@ KNOWN_ABSOLUTE_METRICS = {
     "max_be_peak_threads": "threads",
 }
 FORMAL_ROLES = ["fe", "be-0", "be-1", "be-2"]
+CANONICAL_DESCRIPTOR_BY_SCENARIO = {
+    "performance/uea1-short-concurrent": "short.json",
+    "performance/uea1-mixed": "mixed.json",
+    "performance/uea1-slow-output": "slow-output.json",
+}
+CANONICAL_DESCRIPTOR_ROOT = Path(__file__).resolve().parent / "descriptors"
 
 
 class ProtocolError(ValueError):
@@ -101,10 +107,24 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+
 def _load_json(path: Path, context: str) -> Any:
     try:
         return json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
+        raise ProtocolError(f"cannot read {context} {path}: {error}") from error
+
+
+def _load_json_bytes(path: Path, context: str) -> tuple[Any, bytes]:
+    try:
+        raw = path.read_bytes()
+        return json.loads(raw), raw
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ProtocolError(f"cannot read {context} {path}: {error}") from error
 
 
@@ -264,8 +284,143 @@ def _validate_preparation_diagnostic_frame(
             raise ProtocolError("timed measurement overlaps preparation diagnostic prelude")
 
 
+def _project_fixture_window(raw: Any, context: str) -> dict[str, Any]:
+    window = _expect_object(raw, context)
+    _expect_exact_keys(
+        window,
+        {"schema_version", "window_index", "foreground", "jobs"},
+        context,
+    )
+    foreground = _expect_object(window["foreground"], f"{context}.foreground")
+    _expect_exact_keys(
+        foreground,
+        {"raw", "raw_bundle_sha256", "semantic"},
+        f"{context}.foreground",
+    )
+    if not SHA256_RE.fullmatch(str(foreground["raw_bundle_sha256"])):
+        raise ProtocolError(f"{context}.foreground has a malformed raw identity")
+    jobs = window["jobs"]
+    if not isinstance(jobs, list):
+        raise ProtocolError(f"{context}.jobs must be an array")
+    projected_jobs = []
+    for offset, raw_job in enumerate(jobs):
+        job = _expect_object(raw_job, f"{context}.jobs[{offset}]")
+        _expect_exact_keys(
+            job,
+            {"kind", "ordinal", "input", "initial_state"},
+            f"{context}.jobs[{offset}]",
+        )
+        input_identity = _expect_object(job["input"], f"{context}.jobs[{offset}].input")
+        _expect_exact_keys(
+            input_identity,
+            {"raw", "raw_bundle_sha256", "semantic"},
+            f"{context}.jobs[{offset}].input",
+        )
+        if not SHA256_RE.fullmatch(str(input_identity["raw_bundle_sha256"])):
+            raise ProtocolError(f"{context}.jobs[{offset}] has a malformed raw identity")
+        projected_jobs.append(
+            {
+                "kind": job["kind"],
+                "ordinal": job["ordinal"],
+                "input": input_identity["semantic"],
+                "initial_state": job["initial_state"],
+            }
+        )
+    return {
+        "schema_version": window["schema_version"],
+        "window_index": window["window_index"],
+        "foreground": foreground["semantic"],
+        "jobs": projected_jobs,
+    }
+
+
+def _validate_fixture_realization(
+    artifact_path: Path,
+    fixture: dict[str, Any],
+    scenario: str,
+    window_count: int,
+) -> tuple[str, str]:
+    if fixture.get("scenario") != scenario:
+        raise ProtocolError("fixture realization scenario mismatch")
+    source_artifacts = fixture.get("source_artifacts")
+    if not isinstance(source_artifacts, list):
+        raise ProtocolError("fixture realization source_artifacts must be an array")
+    normalized_sources = []
+    source_documents = []
+    for offset, raw in enumerate(source_artifacts):
+        source = _expect_object(raw, f"fixture source_artifacts[{offset}]")
+        _expect_exact_keys(source, {"path", "sha256"}, f"fixture source_artifacts[{offset}]")
+        name = _nonempty_string(source["path"], f"fixture source_artifacts[{offset}].path")
+        if Path(name).name != name or name in {".", ".."}:
+            raise ProtocolError("fixture source artifact must be a sibling file name")
+        expected_sha = _nonempty_string(
+            source["sha256"], f"fixture source_artifacts[{offset}].sha256"
+        )
+        if not SHA256_RE.fullmatch(expected_sha):
+            raise ProtocolError("fixture source artifact has a malformed SHA-256")
+        path = artifact_path.parent / name
+        if _sha256_file(path) != expected_sha:
+            raise ProtocolError("fixture source artifact bytes changed")
+        source_documents.append(_load_json(path, f"fixture source artifact {name}"))
+        normalized_sources.append(source)
+
+    raw = _expect_object(fixture.get("raw"), "fixture realization raw")
+    semantic = _expect_object(fixture.get("semantic"), "fixture realization semantic")
+    raw_bundle = {"realization": raw, "source_artifacts": normalized_sources}
+    raw_bundle_sha256 = _nonempty_string(
+        fixture.get("raw_bundle_sha256"), "fixture realization raw_bundle_sha256"
+    )
+    semantics_sha256 = _nonempty_string(
+        fixture.get("semantics_sha256"), "fixture realization semantics_sha256"
+    )
+    if _canonical_sha256(raw_bundle) != raw_bundle_sha256:
+        raise ProtocolError("fixture realization raw bundle hash mismatch")
+    if _canonical_sha256(semantic) != semantics_sha256:
+        raise ProtocolError("fixture realization semantic hash mismatch")
+
+    if scenario == "performance/uea1-mixed":
+        _expect_exact_keys(
+            raw,
+            {"kind", "provider_runtime", "diagnostic", "timed"},
+            "mixed fixture raw realization",
+        )
+        _expect_exact_keys(
+            semantic,
+            {"kind", "provider_runtime", "diagnostic", "timed"},
+            "mixed fixture semantic realization",
+        )
+        if raw["kind"] != "mixed" or semantic["kind"] != "mixed":
+            raise ProtocolError("mixed scenario requires mixed fixture realization")
+        if raw["provider_runtime"] != semantic["provider_runtime"]:
+            raise ProtocolError("fixture provider runtime differs between raw and semantic facts")
+        timed = raw["timed"]
+        semantic_timed = semantic["timed"]
+        if (
+            not isinstance(timed, list)
+            or not isinstance(semantic_timed, list)
+            or len(timed) != window_count
+            or len(source_documents) != window_count
+        ):
+            raise ProtocolError("mixed fixture realization does not cover every timed window")
+        if _project_fixture_window(raw["diagnostic"], "fixture diagnostic") != semantic["diagnostic"]:
+            raise ProtocolError("fixture diagnostic semantic projection mismatch")
+        for offset, (raw_window, semantic_window, source_document) in enumerate(
+            zip(timed, semantic_timed, source_documents)
+        ):
+            if _project_fixture_window(raw_window, f"fixture timed[{offset}]") != semantic_window:
+                raise ProtocolError("fixture timed semantic projection mismatch")
+            source = _expect_object(source_document, f"fixture source document[{offset}]")
+            if source.get("fixture_identity") != raw_window:
+                raise ProtocolError("fixture source artifact does not bind its timed raw identity")
+    else:
+        if raw != {"kind": "none"} or semantic != {"kind": "none"} or source_artifacts:
+            raise ProtocolError("non-mixed scenario requires an explicit empty fixture realization")
+    return _sha256_file(artifact_path), semantics_sha256
+
+
 def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
-    descriptor = _expect_object(_load_json(descriptor_path, "descriptor"), "descriptor")
+    descriptor_value, descriptor_bytes = _load_json_bytes(descriptor_path, "descriptor")
+    descriptor = _expect_object(descriptor_value, "descriptor")
     _expect_exact_keys(
         descriptor,
         {
@@ -280,10 +435,25 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     if descriptor["schema_version"] != INPUT_SCHEMA_VERSION:
         raise ProtocolError("unsupported descriptor schema_version")
 
+    expected = _expect_object(descriptor["expected"], "expected")
+    _expect_exact_keys(expected, {"scenario", "window_count", "roles"}, "expected")
+    scenario = _nonempty_string(expected["scenario"], "expected.scenario")
+    canonical_name = CANONICAL_DESCRIPTOR_BY_SCENARIO.get(scenario)
+    if canonical_name is None:
+        raise ProtocolError("formal evidence has an unsupported scenario descriptor")
+
     artifacts = _expect_object(descriptor["artifacts"], "artifacts")
-    _expect_exact_keys(artifacts, {"run_manifest", "performance", "resources"}, "artifacts")
+    artifact_names = {
+        "run_manifest",
+        "performance",
+        "resources",
+        "effective_launch_config",
+        "fixture_realization",
+        "completion",
+    }
+    _expect_exact_keys(artifacts, artifact_names, "artifacts")
     artifact_paths: dict[str, Path] = {}
-    for name in ("run_manifest", "performance", "resources"):
+    for name in artifact_names:
         artifact_path = Path(_nonempty_string(artifacts[name], f"artifacts.{name}"))
         if not artifact_path.is_absolute():
             artifact_path = descriptor_path.parent / artifact_path
@@ -292,7 +462,43 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         _load_json(artifact_paths["performance"], "performance artifact"),
         "performance artifact",
     )
+    _expect_exact_keys(
+        performance,
+        {
+            "schema_version",
+            "run_id",
+            "run_manifest_sha256",
+            "resources_sha256",
+            "effective_launch_config_sha256",
+            "effective_launch_config_semantics_sha256",
+            "fixture_realization_sha256",
+            "fixture_realization_semantics_sha256",
+            "manifest_sha256",
+            "scenario",
+            "query_samples",
+            "measurement_windows",
+            "preparation_diagnostic",
+            "preparation_events_status",
+            "preparation_events",
+        },
+        "performance artifact",
+    )
     resources = _load_json(artifact_paths["resources"], "resource artifact")
+    effective_launch_config = _expect_object(
+        _load_json(
+            artifact_paths["effective_launch_config"],
+            "effective launch config artifact",
+        ),
+        "effective launch config artifact",
+    )
+    fixture_realization = _expect_object(
+        _load_json(artifact_paths["fixture_realization"], "fixture realization artifact"),
+        "fixture realization artifact",
+    )
+    completion = _expect_object(
+        _load_json(artifact_paths["completion"], "completion marker"),
+        "completion marker",
+    )
     run_manifest = _expect_object(
         _load_json(artifact_paths["run_manifest"], "run manifest"),
         "run manifest",
@@ -301,6 +507,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         run_manifest,
         {
             "schema_version",
+            "kind",
             "formal",
             "run_id",
             "scenario",
@@ -316,11 +523,19 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             "binary_sha256",
             "runner_executable_path",
             "runner_executable_sha256",
+            "process_identities",
             "config_sha256",
             "workload_manifest_sha256",
             "fixture_sha256",
             "tool_tree_sha256",
             "cargo_lock_sha256",
+            "third_party_build_graph_sha256",
+            "descriptor_sha256",
+            "effective_launch_config_sha256",
+            "effective_launch_config_semantics_sha256",
+            "fixture_realization_sha256",
+            "fixture_realization_semantics_sha256",
+            "resources_sha256",
             "rustc_version",
             "cargo_version",
             "build_profile",
@@ -332,13 +547,59 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         raise ProtocolError(
             f"run manifest must use schema_version {RUN_MANIFEST_SCHEMA_VERSION}"
         )
-    if not isinstance(resources, list):
-        raise ProtocolError("resource artifact must be an array")
-    if performance.get("schema_version") != 4:
-        raise ProtocolError("performance artifact must use schema_version 4")
+    resources = _expect_object(resources, "resource artifact")
+    _expect_exact_keys(
+        resources,
+        {"schema_version", "run_id", "processes", "samples"},
+        "resource artifact",
+    )
+    if resources["schema_version"] != 2:
+        raise ProtocolError("resource artifact must use schema_version 2")
+    _expect_exact_keys(
+        effective_launch_config,
+        {"schema_version", "semantics"},
+        "effective launch config artifact",
+    )
+    if effective_launch_config["schema_version"] != 1:
+        raise ProtocolError("effective launch config artifact must use schema_version 1")
+    _expect_exact_keys(
+        fixture_realization,
+        {
+            "schema_version",
+            "scenario",
+            "source_artifacts",
+            "raw_bundle_sha256",
+            "semantics_sha256",
+            "raw",
+            "semantic",
+        },
+        "fixture realization artifact",
+    )
+    if fixture_realization["schema_version"] != 1:
+        raise ProtocolError("fixture realization artifact must use schema_version 1")
+    _expect_exact_keys(
+        completion,
+        {
+            "schema_version",
+            "run_id",
+            "scenario",
+            "run_manifest_sha256",
+            "performance_sha256",
+            "resources_sha256",
+            "descriptor_sha256",
+            "effective_launch_config_sha256",
+            "fixture_realization_sha256",
+        },
+        "completion marker",
+    )
+    if completion["schema_version"] != 1:
+        raise ProtocolError("completion marker must use schema_version 1")
+    if performance.get("schema_version") != 6:
+        raise ProtocolError("performance artifact must use schema_version 6")
     run_manifest_sha256 = _sha256_file(artifact_paths["run_manifest"])
     if (
         run_manifest.get("formal") is not True
+        or run_manifest.get("kind") != "performance"
         or run_manifest.get("status") != "completed"
         or run_manifest.get("exit_code") != 0
         or not run_manifest.get("ended_unix_millis")
@@ -381,6 +642,12 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         "config": "config_sha256",
         "tool": "tool_tree_sha256",
         "cargo_lock": "cargo_lock_sha256",
+        "third_party_build_graph": "third_party_build_graph_sha256",
+        "descriptor": "descriptor_sha256",
+        "effective_launch_config": "effective_launch_config_sha256",
+        "effective_launch_config_semantics": "effective_launch_config_semantics_sha256",
+        "fixture_realization": "fixture_realization_sha256",
+        "fixture_realization_semantics": "fixture_realization_semantics_sha256",
     }
     input_hashes = {
         name: _nonempty_string(run_manifest.get(field), f"run manifest {field}")
@@ -389,7 +656,83 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     for name, value in input_hashes.items():
         if not SHA256_RE.fullmatch(value):
             raise ProtocolError(f"run manifest {hash_fields[name]} must be lowercase SHA-256")
+    process_identities = run_manifest.get("process_identities")
+    if not isinstance(process_identities, list):
+        raise ProtocolError("run manifest process_identities must be an array")
+    manifest_process_by_role: dict[str, tuple[int, str]] = {}
+    application_process_ids: set[str] = set()
+    for offset, raw in enumerate(process_identities):
+        process = _expect_object(raw, f"run manifest process_identities[{offset}]")
+        _expect_exact_keys(
+            process,
+            {
+                "role",
+                "os_pid",
+                "process_start_token",
+                "application_process_id",
+                "build_identity",
+                "binary_sha256",
+                "executable_size_bytes",
+                "executable_modified_unix_nanos",
+            },
+            f"run manifest process_identities[{offset}]",
+        )
+        role = _nonempty_string(
+            process["role"], f"run manifest process_identities[{offset}].role"
+        )
+        pid = process["os_pid"]
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ProtocolError(
+                f"run manifest process_identities[{offset}].os_pid is invalid"
+            )
+        process_start_token = _nonempty_string(
+            process["process_start_token"],
+            f"run manifest process_identities[{offset}].process_start_token",
+        )
+        if role in manifest_process_by_role or pid in {
+            identity[0] for identity in manifest_process_by_role.values()
+        }:
+            raise ProtocolError("run manifest contains duplicate process roles or PIDs")
+        application_process_id = process["application_process_id"]
+        if application_process_id is not None:
+            application_process_id = _nonempty_string(
+                application_process_id,
+                f"run manifest process_identities[{offset}].application_process_id",
+            )
+            if application_process_id in application_process_ids:
+                raise ProtocolError("run manifest contains duplicate application process identities")
+            application_process_ids.add(application_process_id)
+        if role == "fe" and application_process_id is not None:
+            raise ProtocolError("frontend process identity must not claim a backend application identity")
+        if role.startswith("be-") and application_process_id is None:
+            raise ProtocolError("backend process identity requires an application process identity")
+        if process["build_identity"] != native_build_identity:
+            raise ProtocolError("run manifest process build identity is inconsistent")
+        if process["binary_sha256"] != input_hashes["binary"]:
+            raise ProtocolError("run manifest process binary hash is inconsistent")
+        for field in ("executable_size_bytes", "executable_modified_unix_nanos"):
+            value = process[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ProtocolError(
+                    f"run manifest process_identities[{offset}].{field} is invalid"
+                )
+        manifest_process_by_role[role] = (pid, process_start_token)
+    if set(manifest_process_by_role) != set(FORMAL_ROLES):
+        raise ProtocolError("run manifest requires the exact 1FE+3BE process identity set")
     run_platform = _expect_object(run_manifest.get("platform"), "run manifest platform")
+    _expect_exact_keys(
+        run_platform,
+        {
+            "os",
+            "os_version",
+            "architecture",
+            "cpu_model",
+            "logical_cpu_count",
+            "physical_memory_bytes",
+            "power_mode",
+        },
+        "run manifest platform",
+    )
     platform = {
         "system": run_platform.get("os"),
         "release": run_platform.get("os_version"),
@@ -416,14 +759,87 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     )
     if performance.get("run_id") != run_id or run_manifest.get("run_id") != run_id:
         raise ProtocolError("performance and run manifest identity mismatch")
+    if resources.get("run_id") != run_id:
+        raise ProtocolError("resource artifact and run manifest identity mismatch")
     _validate_preparation_diagnostic_frame(performance, run_id)
     if performance.get("run_manifest_sha256") != run_manifest_sha256:
         raise ProtocolError("performance artifact does not reference its exact run manifest")
     if performance.get("manifest_sha256") != input_hashes["manifest"]:
         raise ProtocolError("performance artifact manifest hash does not match run identity")
-    expected = _expect_object(descriptor["expected"], "expected")
-    _expect_exact_keys(expected, {"scenario", "window_count", "roles"}, "expected")
-    scenario = _nonempty_string(expected["scenario"], "expected.scenario")
+    resources_sha256 = _sha256_file(artifact_paths["resources"])
+    if (
+        performance.get("resources_sha256") != resources_sha256
+        or run_manifest.get("resources_sha256") != resources_sha256
+    ):
+        raise ProtocolError(
+            "performance and run manifest must reference the exact resource artifact"
+        )
+    if not isinstance(expected["window_count"], int) or expected["window_count"] <= 0:
+        raise ProtocolError("expected.window_count must be a positive integer")
+    descriptor_sha256 = hashlib.sha256(descriptor_bytes).hexdigest()
+    effective_launch_config_sha256 = _sha256_file(
+        artifact_paths["effective_launch_config"]
+    )
+    fixture_realization_sha256, fixture_realization_semantics_sha256 = (
+        _validate_fixture_realization(
+            artifact_paths["fixture_realization"],
+            fixture_realization,
+            scenario,
+            expected["window_count"],
+        )
+    )
+    if (
+        run_manifest.get("descriptor_sha256") != descriptor_sha256
+        or run_manifest.get("effective_launch_config_sha256")
+        != effective_launch_config_sha256
+        or run_manifest.get("effective_launch_config_semantics_sha256")
+        != effective_launch_config_sha256
+        or run_manifest.get("fixture_realization_sha256")
+        != fixture_realization_sha256
+        or run_manifest.get("fixture_realization_semantics_sha256")
+        != fixture_realization_semantics_sha256
+    ):
+        raise ProtocolError("run manifest does not bind the exact config, fixture, and descriptor artifacts")
+    if (
+        performance.get("effective_launch_config_sha256")
+        != effective_launch_config_sha256
+        or performance.get("effective_launch_config_semantics_sha256")
+        != effective_launch_config_sha256
+        or performance.get("fixture_realization_sha256")
+        != fixture_realization_sha256
+        or performance.get("fixture_realization_semantics_sha256")
+        != fixture_realization_semantics_sha256
+    ):
+        raise ProtocolError("performance artifact does not bind the exact config and fixture artifacts")
+    performance_sha256 = _sha256_file(artifact_paths["performance"])
+    _expect_exact_keys(
+        completion,
+        {
+            "schema_version",
+            "run_id",
+            "scenario",
+            "run_manifest_sha256",
+            "performance_sha256",
+            "resources_sha256",
+            "descriptor_sha256",
+            "effective_launch_config_sha256",
+            "fixture_realization_sha256",
+        },
+        "completion marker",
+    )
+    expected_completion = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "scenario": scenario,
+        "run_manifest_sha256": run_manifest_sha256,
+        "performance_sha256": performance_sha256,
+        "resources_sha256": resources_sha256,
+        "descriptor_sha256": descriptor_sha256,
+        "effective_launch_config_sha256": effective_launch_config_sha256,
+        "fixture_realization_sha256": fixture_realization_sha256,
+    }
+    if completion != expected_completion:
+        raise ProtocolError("terminal completion marker does not bind the exact completed artifact set")
     if performance.get("scenario") != scenario or run_manifest.get("scenario") != scenario:
         raise ProtocolError("performance scenario does not match expected.scenario")
     if not isinstance(expected["window_count"], int) or expected["window_count"] <= 0:
@@ -445,15 +861,18 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     seen_window_indices: set[int] = set()
     for offset, raw in enumerate(windows_raw):
         window = _expect_object(raw, f"measurement_windows[{offset}]")
-        required = {
-            "workload",
-            "window_index",
-            "configured_concurrency",
-            "started_elapsed_millis",
-            "ended_elapsed_millis",
-        }
-        if not required.issubset(window):
-            raise ProtocolError(f"measurement_windows[{offset}] is incomplete")
+        _expect_exact_keys(
+            window,
+            {
+                "workload",
+                "window_index",
+                "configured_concurrency",
+                "started_elapsed_millis",
+                "ended_elapsed_millis",
+                "drain_ended_elapsed_millis",
+            },
+            f"measurement_windows[{offset}]",
+        )
         workload = _nonempty_string(window["workload"], f"measurement_windows[{offset}].workload")
         index = window["window_index"]
         concurrency = window["configured_concurrency"]
@@ -482,6 +901,23 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     slow_observers_by_window: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for offset, raw in enumerate(samples_raw):
         sample = _expect_object(raw, f"query_samples[{offset}]")
+        _expect_exact_keys(
+            sample,
+            {
+                "workload",
+                "window_index",
+                "configured_concurrency",
+                "client",
+                "started_elapsed_micros",
+                "ended_elapsed_micros",
+                "first_row_micros",
+                "total_micros",
+                "rows",
+                "bytes_read",
+                "outcome",
+            },
+            f"query_samples[{offset}]",
+        )
         try:
             sample_workload = str(sample["workload"])
             window_index = int(sample["window_index"])
@@ -532,13 +968,74 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         else:
             raise ProtocolError(f"query_samples[{offset}] has an unsupported outcome")
 
+    processes = resources["processes"]
+    samples = resources["samples"]
+    processes = _expect_object(processes, "resource artifact processes")
+    if not isinstance(samples, list):
+        raise ProtocolError("resource artifact samples must be an array")
+    process_by_role: dict[str, tuple[int, str]] = {}
+    process_identities: set[tuple[int, str]] = set()
+    for role, raw in processes.items():
+        process = _expect_object(raw, f"resource process {role!r}")
+        _expect_exact_keys(
+            process,
+            {"pid", "process_start_token"},
+            f"resource process {role!r}",
+        )
+        pid = process["pid"]
+        if not role or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ProtocolError(f"resource process {role!r} has an invalid pid")
+        process_start_token = _nonempty_string(
+            process["process_start_token"],
+            f"resource process {role!r}.process_start_token",
+        )
+        identity = (pid, process_start_token)
+        if identity in process_identities or pid in {
+            existing[0] for existing in process_by_role.values()
+        }:
+            raise ProtocolError("resource artifact contains duplicate process identities")
+        process_by_role[role] = identity
+        process_identities.add(identity)
+    if set(process_by_role) != set(roles):
+        raise ProtocolError("resource artifact process identities do not match expected roles")
+    if process_by_role != manifest_process_by_role:
+        raise ProtocolError(
+            "resource artifact process identities do not match the run manifest"
+        )
+
     resource_by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for offset, raw in enumerate(resources):
+    for offset, raw in enumerate(samples):
         sample = _expect_object(raw, f"resources[{offset}]")
+        _expect_exact_keys(
+            sample,
+            {
+                "elapsed_millis",
+                "role",
+                "pid",
+                "process_start_token",
+                "rss_bytes",
+                "threads",
+                "unavailable_reason",
+            },
+            f"resources[{offset}]",
+        )
         role = sample.get("role")
+        pid = sample.get("pid")
+        process_start_token = sample.get("process_start_token")
         elapsed = sample.get("elapsed_millis")
-        if not isinstance(role, str) or isinstance(elapsed, bool) or not isinstance(elapsed, int):
-            raise ProtocolError(f"resources[{offset}] has invalid role or timestamp")
+        if (
+            not isinstance(role, str)
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or not isinstance(process_start_token, str)
+            or not process_start_token
+            or process_by_role.get(role) != (pid, process_start_token)
+            or isinstance(elapsed, bool)
+            or not isinstance(elapsed, int)
+        ):
+            raise ProtocolError(
+                f"resources[{offset}] has invalid role, pid, process start token, or timestamp"
+            )
         resource_by_role[role].append(sample)
 
     resolutions = _expect_object(descriptor["metric_resolutions"], "metric_resolutions")
@@ -703,6 +1200,16 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             }
         )
 
+    canonical_path = CANONICAL_DESCRIPTOR_ROOT / canonical_name
+    try:
+        canonical_bytes = canonical_path.read_bytes()
+    except OSError as error:
+        raise ProtocolError(f"cannot read canonical descriptor {canonical_path}: {error}") from error
+    if descriptor_bytes != canonical_bytes:
+        raise ProtocolError(
+            f"formal descriptor must be byte-identical to canonical {canonical_name}"
+        )
+
     result = {
         "schema_version": INPUT_SCHEMA_VERSION,
         "kind": INPUT_KIND,
@@ -711,20 +1218,25 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             "source_sha": source_sha,
             "binary_sha256": input_hashes["binary"],
             "runner_binary_sha256": input_hashes["runner_executable"],
-            "descriptor_sha256": _sha256_file(descriptor_path),
-            "performance_sha256": _sha256_file(artifact_paths["performance"]),
-            "resources_sha256": _sha256_file(artifact_paths["resources"]),
+            "cargo_lock_sha256": input_hashes["cargo_lock"],
+            "descriptor_sha256": descriptor_sha256,
+            "performance_sha256": performance_sha256,
+            "resources_sha256": resources_sha256,
             "run_manifest_sha256": run_manifest_sha256,
+            "effective_launch_config_sha256": effective_launch_config_sha256,
+            "fixture_realization_sha256": fixture_realization_sha256,
+            "completion_sha256": _sha256_file(artifact_paths["completion"]),
             "started_unix_millis": run_manifest["started_unix_millis"],
             "ended_unix_millis": run_manifest["ended_unix_millis"],
         },
         "compatibility": {
             "scenario": scenario,
             "manifest_sha256": input_hashes["manifest"],
-            "fixture_sha256": input_hashes["fixture"],
-            "config_sha256": input_hashes["config"],
+            "fixture_spec_sha256": input_hashes["fixture"],
+            "effective_launch_config_semantics_sha256": effective_launch_config_sha256,
+            "fixture_realization_semantics_sha256": fixture_realization_semantics_sha256,
             "tool_sha256": input_hashes["tool"],
-            "cargo_lock_sha256": input_hashes["cargo_lock"],
+            "third_party_build_graph_sha256": input_hashes["third_party_build_graph"],
             "platform": platform,
             "toolchain": toolchain,
             "build_profile": _nonempty_string(
@@ -751,13 +1263,13 @@ def validate_comparison_input(document: Any) -> dict[str, Any]:
     provenance = _expect_object(model["provenance"], "provenance")
     _expect_exact_keys(
         provenance,
-        {"run_id", "source_sha", "binary_sha256", "runner_binary_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256", "started_unix_millis", "ended_unix_millis"},
+        {"run_id", "source_sha", "binary_sha256", "runner_binary_sha256", "cargo_lock_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256", "effective_launch_config_sha256", "fixture_realization_sha256", "completion_sha256", "started_unix_millis", "ended_unix_millis"},
         "provenance",
     )
     _nonempty_string(provenance["run_id"], "provenance.run_id")
     if not SOURCE_RE.fullmatch(str(provenance["source_sha"])):
         raise ProtocolError("provenance.source_sha must be a full lowercase Git SHA")
-    for field in ("binary_sha256", "runner_binary_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256"):
+    for field in ("binary_sha256", "runner_binary_sha256", "cargo_lock_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256", "effective_launch_config_sha256", "fixture_realization_sha256", "completion_sha256"):
         if not SHA256_RE.fullmatch(str(provenance[field])):
             raise ProtocolError(f"provenance.{field} must be lowercase SHA-256")
     started = provenance["started_unix_millis"]
@@ -775,13 +1287,13 @@ def validate_comparison_input(document: Any) -> dict[str, Any]:
     compatibility = _expect_object(model["compatibility"], "compatibility")
     _expect_exact_keys(
         compatibility,
-        {"scenario", "manifest_sha256", "fixture_sha256", "config_sha256", "tool_sha256", "cargo_lock_sha256", "platform", "toolchain", "build_profile"},
+        {"scenario", "manifest_sha256", "fixture_spec_sha256", "effective_launch_config_semantics_sha256", "fixture_realization_semantics_sha256", "tool_sha256", "third_party_build_graph_sha256", "platform", "toolchain", "build_profile"},
         "compatibility",
     )
     _nonempty_string(compatibility["scenario"], "compatibility.scenario")
     _nonempty_string(compatibility["toolchain"], "compatibility.toolchain")
     _nonempty_string(compatibility["build_profile"], "compatibility.build_profile")
-    for field in ("manifest_sha256", "fixture_sha256", "config_sha256", "tool_sha256", "cargo_lock_sha256"):
+    for field in ("manifest_sha256", "fixture_spec_sha256", "effective_launch_config_semantics_sha256", "fixture_realization_semantics_sha256", "tool_sha256", "third_party_build_graph_sha256"):
         if not SHA256_RE.fullmatch(str(compatibility[field])):
             raise ProtocolError(f"compatibility.{field} must be lowercase SHA-256")
     platform = _expect_object(compatibility["platform"], "compatibility.platform")

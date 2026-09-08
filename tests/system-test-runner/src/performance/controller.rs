@@ -16,6 +16,8 @@
 // under the License.
 
 use super::business::{self, BusinessSample, MixedFixtureBinding};
+use super::fixture_identity::PreparedWindowIdentity;
+use super::fixture_realization::write_fixture_realization;
 use super::manifest::{
     ManifestPurpose, MixedWorkload, SlowOutputWorkload, Uea1WorkloadManifest, Window,
 };
@@ -23,7 +25,9 @@ use super::metrics::{
     MeasurementWindow, PerformanceDiagnosticResponse, PerformanceReportInput,
     PreparationDiagnosticFrame, PreparationEvent, QuerySample, write_report,
 };
-use super::provenance::begin_run_manifest;
+use super::provenance::{
+    RunManifestKind, begin_run_manifest, sha256_file, write_run_completion_marker,
+};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, bail, ensure};
@@ -99,38 +103,83 @@ pub fn run(
         &workload_manifest_bytes,
         &fixture_spec,
         manifest.purpose == ManifestPurpose::Formal,
+        RunManifestKind::Performance,
     )?;
-    let monitor = ProcessResourceMonitor::start(context.process_ids(), Duration::from_millis(100))?;
-    let timeline = MonotonicTimeline::new(&monitor);
-    let diagnostic = run_diagnostic_prelude(
-        scenario,
-        context,
-        manifest,
-        mixed_fixture,
+    let monitor = ProcessResourceMonitor::start_with_identities(
+        context.process_resource_identities()?,
         run_manifest.run_id(),
-        timeline,
+        Duration::from_millis(100),
     )?;
-    let (samples, measurement_windows) = match scenario {
-        PerformanceScenario::ShortConcurrent => run_short(context, manifest, &monitor, timeline)?,
-        PerformanceScenario::Mixed => run_mixed(
+    let timeline = MonotonicTimeline::new(&monitor);
+    let execution = (|| {
+        let diagnostic = run_diagnostic_prelude(
+            scenario,
             context,
-            &manifest.mixed,
-            mixed_fixture.context("mixed performance fixture is missing")?,
-            manifest.purpose == ManifestPurpose::Formal,
-            &monitor,
+            manifest,
+            mixed_fixture,
+            run_manifest.run_id(),
             timeline,
-        )?,
-        PerformanceScenario::SlowOutput => {
-            run_slow_output(context, &manifest.slow_output, &monitor, timeline)?
-        }
-    };
+        )?;
+        let (samples, measurement_windows, timed_fixture_identities) = match scenario {
+            PerformanceScenario::ShortConcurrent => {
+                let (samples, windows) = run_short(context, manifest, &monitor, timeline)?;
+                (samples, windows, Vec::new())
+            }
+            PerformanceScenario::Mixed => run_mixed(
+                context,
+                &manifest.mixed,
+                mixed_fixture.context("mixed performance fixture is missing")?,
+                manifest.purpose == ManifestPurpose::Formal,
+                &monitor,
+                timeline,
+            )?,
+            PerformanceScenario::SlowOutput => {
+                let (samples, windows) =
+                    run_slow_output(context, &manifest.slow_output, &monitor, timeline)?;
+                (samples, windows, Vec::new())
+            }
+        };
+        Ok::<_, anyhow::Error>((
+            diagnostic,
+            samples,
+            measurement_windows,
+            timed_fixture_identities,
+        ))
+    })();
     let resource_path = context.scenario_root().join("process-resources.json");
-    let resources = monitor.finish(&resource_path)?;
+    let resources = monitor.finish(&resource_path);
+    let (diagnostic, samples, measurement_windows, timed_fixture_identities, resources) = match (
+        execution, resources,
+    ) {
+        (Ok((diagnostic, samples, windows, identities)), Ok(resources)) => {
+            (diagnostic, samples, windows, identities, resources)
+        }
+        (Err(execution_error), Ok(_)) => {
+            return Err(execution_error).with_context(|| {
+                format!(
+                    "partial process resources were preserved at {}",
+                    resource_path.display()
+                )
+            });
+        }
+        (Ok(_), Err(resource_error)) => return Err(resource_error),
+        (Err(execution_error), Err(resource_error)) => bail!(
+            "performance execution failed: {execution_error:#}; process resource collection also failed: {resource_error:#}"
+        ),
+    };
+    let resources_sha256 = sha256_file(&resource_path)?;
     ensure!(
         !resources.samples().is_empty(),
         "{} collected no process resource samples",
         scenario.name()
     );
+    let fixture_realization = write_fixture_realization(
+        context.scenario_root(),
+        scenario.name(),
+        mixed_fixture.and_then(MixedFixtureBinding::provider_runtime),
+        diagnostic.fixture_identity.as_ref(),
+        &timed_fixture_identities,
+    )?;
     ensure!(
         measurement_windows
             .iter()
@@ -144,11 +193,27 @@ pub fn run(
         "{} produced no valid work",
         scenario.name()
     );
-    let run_manifest = run_manifest.finish_success()?;
-    write_report(PerformanceReportInput {
+    let run_manifest = run_manifest.finish_performance(
+        &resources_sha256,
+        &fixture_realization.artifact_sha256,
+        &fixture_realization.semantics_sha256,
+    )?;
+    let performance_sha256 = write_report(PerformanceReportInput {
         root: context.scenario_root(),
         run_id: &run_manifest.run_id,
         run_manifest_sha256: &run_manifest.sha256,
+        resources_sha256: &resources_sha256,
+        effective_launch_config_sha256: &run_manifest.effective_launch_config_sha256,
+        effective_launch_config_semantics_sha256: &run_manifest
+            .effective_launch_config_semantics_sha256,
+        fixture_realization_sha256: run_manifest
+            .fixture_realization_sha256
+            .as_deref()
+            .context("completed performance manifest omitted fixture realization")?,
+        fixture_realization_semantics_sha256: run_manifest
+            .fixture_realization_semantics_sha256
+            .as_deref()
+            .context("completed performance manifest omitted fixture semantics")?,
         manifest_sha256: &manifest.sha256,
         scenario: scenario.name(),
         samples: &samples,
@@ -156,6 +221,13 @@ pub fn run(
         preparation_diagnostic: &diagnostic.frame,
         preparation_events: &diagnostic.events,
     })?;
+    write_run_completion_marker(
+        context.scenario_root(),
+        scenario.name(),
+        &run_manifest,
+        &performance_sha256,
+        &resources_sha256,
+    )?;
     context.action(format!(
         "{} completed {} valid samples using manifest {}",
         scenario.name(),
@@ -191,6 +263,7 @@ impl MonotonicTimeline {
 struct CollectedDiagnosticPrelude {
     frame: PreparationDiagnosticFrame,
     events: Vec<PreparationEvent>,
+    fixture_identity: Option<PreparedWindowIdentity>,
 }
 
 fn run_diagnostic_prelude(
@@ -219,7 +292,7 @@ fn run_diagnostic_prelude(
         run_token,
     );
     let ended_elapsed_micros = timeline.elapsed_micros();
-    prelude_result?;
+    let fixture_identity = prelude_result?;
     let response = drained?.context("preparation diagnostic drain returned no document")?;
     ensure!(
         response.schema_version == 1 && response.run_token == run_token,
@@ -237,6 +310,7 @@ fn run_diagnostic_prelude(
             ended_elapsed_micros,
         },
         events: response.events,
+        fixture_identity,
     })
 }
 
@@ -245,7 +319,7 @@ fn execute_diagnostic_work(
     context: &ScenarioContext,
     manifest: &Uea1WorkloadManifest,
     mixed_fixture: Option<&MixedFixtureBinding>,
-) -> Result<()> {
+) -> Result<Option<PreparedWindowIdentity>> {
     let timeout = context.remaining("run UEA-1 preparation diagnostic prelude")?;
     let mut connection = mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
     match scenario {
@@ -255,6 +329,7 @@ fn execute_diagnostic_work(
                     .query_drop(query)
                     .context("execute short preparation diagnostic query")?;
             }
+            Ok(None)
         }
         PerformanceScenario::SlowOutput => {
             connection
@@ -269,6 +344,7 @@ fn execute_diagnostic_work(
                     manifest.slow_output.query
                 ))
                 .context("execute bounded slow-output preparation diagnostic query")?;
+            Ok(None)
         }
         PerformanceScenario::Mixed => {
             let binding = mixed_fixture.context("mixed diagnostic fixture is missing")?;
@@ -283,6 +359,7 @@ fn execute_diagnostic_work(
                 &diagnostic_workload,
                 diagnostic_workload.repetitions,
             )?;
+            let fixture_identity = prepared.fixture_identity.clone();
             let result = (|| {
                 business::assert_rows(
                     &mut connection,
@@ -309,9 +386,9 @@ fn execute_diagnostic_work(
                 prepared.cleanup(&mut connection)?;
             }
             result?;
+            Ok(Some(fixture_identity))
         }
     }
-    Ok(())
 }
 
 fn post_preparation_diagnostic_control(
@@ -415,10 +492,15 @@ fn run_mixed(
     require_sustained_producers: bool,
     monitor: &ProcessResourceMonitor,
     timeline: MonotonicTimeline,
-) -> Result<(Vec<QuerySample>, Vec<MeasurementWindow>)> {
+) -> Result<(
+    Vec<QuerySample>,
+    Vec<MeasurementWindow>,
+    Vec<PreparedWindowIdentity>,
+)> {
     let mut all = Vec::new();
     let mut measurement_windows = Vec::new();
     let mut business_samples = Vec::new();
+    let mut fixture_identities = Vec::new();
     for window_index in 0..workload.repetitions {
         let timeout = context.remaining("prepare private mixed performance window")?;
         let mut setup = mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
@@ -441,6 +523,7 @@ fn run_mixed(
                 all.extend(queries);
                 business_samples.extend(completed);
                 measurement_windows.push(measurement_window);
+                fixture_identities.push(prepared.fixture_identity.clone());
                 std::fs::write(
                     context.scenario_root().join("mixed-business.json"),
                     serde_json::to_vec_pretty(&business_samples)?,
@@ -455,7 +538,7 @@ fn run_mixed(
             }
         }
     }
-    Ok((all, measurement_windows))
+    Ok((all, measurement_windows, fixture_identities))
 }
 
 enum MixedSample {
@@ -605,6 +688,12 @@ fn run_mixed_window(
             .scenario_root()
             .join(format!("mixed-business-{window_index}.json")),
         serde_json::to_vec_pretty(&business)?,
+    )?;
+    std::fs::write(
+        context
+            .scenario_root()
+            .join(format!("mixed-query-{window_index}.json")),
+        serde_json::to_vec_pretty(&queries)?,
     )?;
     if let Some(error) = failure {
         return Err(error);

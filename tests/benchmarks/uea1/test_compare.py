@@ -1,6 +1,11 @@
+import contextlib
 import importlib.util
+import io
+import json
 import pathlib
+import sys
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("compare.py")
@@ -21,6 +26,8 @@ def comparison_input(
     source_sha=HASH_A,
     binary_sha=HASH_B,
     runner_binary_sha=HASH_B,
+    cargo_lock_sha=HASH_C,
+    third_party_build_graph_sha=HASH_C,
 ):
     query_metrics = {
         "first_row_p50_micros": ("microseconds", "lower_is_better"),
@@ -59,20 +66,25 @@ def comparison_input(
             "source_sha": source_sha,
             "binary_sha256": binary_sha,
             "runner_binary_sha256": runner_binary_sha,
+            "cargo_lock_sha256": cargo_lock_sha,
             "descriptor_sha256": HASH_C,
             "performance_sha256": HASH_C,
             "resources_sha256": HASH_C,
             "run_manifest_sha256": HASH_C,
+            "effective_launch_config_sha256": HASH_C,
+            "fixture_realization_sha256": HASH_C,
+            "completion_sha256": HASH_C,
             "started_unix_millis": started,
             "ended_unix_millis": started + 50,
         },
         "compatibility": {
             "scenario": "performance/uea1-short-concurrent",
             "manifest_sha256": HASH_C,
-            "fixture_sha256": HASH_C,
-            "config_sha256": HASH_C,
+            "fixture_spec_sha256": HASH_C,
+            "effective_launch_config_semantics_sha256": HASH_C,
+            "fixture_realization_semantics_sha256": HASH_C,
             "tool_sha256": HASH_C,
-            "cargo_lock_sha256": HASH_C,
+            "third_party_build_graph_sha256": third_party_build_graph_sha,
             "platform": {
                 "system": "TestOS",
                 "release": "1",
@@ -170,6 +182,7 @@ class CompareTest(unittest.TestCase):
             ("source_sha", HASH_C, "source_sha mismatch"),
             ("binary_sha256", HASH_C, "binary_sha256 mismatch"),
             ("runner_binary_sha256", HASH_C, "runner_binary_sha256 mismatch"),
+            ("cargo_lock_sha256", HASH_B, "cargo_lock_sha256 mismatch"),
         ]
         for field, value, message in cases:
             with self.subTest(field=field):
@@ -294,6 +307,96 @@ class CompareTest(unittest.TestCase):
             COMPARE.compare_protocol_inputs(
                 baseline_a, candidate_a, baseline_b, candidate_b
             )
+
+    def test_four_run_requires_raw_cargo_lock_within_each_source(self):
+        baseline_a = comparison_input("baseline-a", 100)
+        candidate_a = comparison_input(
+            "candidate-a", 200, source_sha="d" * 64, binary_sha="e" * 64
+        )
+        baseline_b = comparison_input("baseline-b", 300, cargo_lock_sha=HASH_B)
+        candidate_b = comparison_input(
+            "candidate-b", 400, source_sha="d" * 64, binary_sha="e" * 64
+        )
+        with self.assertRaisesRegex(
+            COMPARE.ProtocolError, "baseline A/A cargo_lock_sha256 mismatch"
+        ):
+            COMPARE.compare_protocol_inputs(
+                baseline_a, candidate_a, baseline_b, candidate_b
+            )
+
+    def test_four_run_requires_cross_source_third_party_build_graph(self):
+        baseline_a = comparison_input("baseline-a", 100)
+        candidate_a = comparison_input(
+            "candidate-a",
+            200,
+            source_sha="d" * 64,
+            binary_sha="e" * 64,
+            third_party_build_graph_sha=HASH_B,
+        )
+        baseline_b = comparison_input("baseline-b", 300)
+        candidate_b = comparison_input(
+            "candidate-b",
+            400,
+            source_sha="d" * 64,
+            binary_sha="e" * 64,
+            third_party_build_graph_sha=HASH_B,
+        )
+        with self.assertRaisesRegex(COMPARE.ProtocolError, "build graph, toolchain"):
+            COMPARE.compare_protocol_inputs(
+                baseline_a, candidate_a, baseline_b, candidate_b
+            )
+
+    def test_four_run_absolute_gate_requires_baseline_preflight(self):
+        baseline_a = comparison_input("baseline-a", 100)
+        baseline_a["absolute_gates"][0]["values"] = [201]
+        baseline_a["absolute_gates"][0]["passed"] = False
+        candidate_a = comparison_input(
+            "candidate-a", 200, source_sha="d" * 64, binary_sha="e" * 64
+        )
+        baseline_b = comparison_input("baseline-b", 300)
+        candidate_b = comparison_input(
+            "candidate-b", 400, source_sha="d" * 64, binary_sha="e" * 64
+        )
+        result = COMPARE.compare_protocol_inputs(
+            baseline_a, candidate_a, baseline_b, candidate_b
+        )
+        self.assertTrue(result["valid"])
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["absolute_gates"][0]["baseline_a_passed"])
+
+    def test_structured_cli_routes_all_four_descriptors_through_extraction(self):
+        documents = [
+            comparison_input("baseline-a", 100),
+            comparison_input(
+                "candidate-a", 200, source_sha="d" * 64, binary_sha="e" * 64
+            ),
+            comparison_input("baseline-b", 300),
+            comparison_input(
+                "candidate-b", 400, source_sha="d" * 64, binary_sha="e" * 64
+            ),
+        ]
+        arguments = [
+            "compare.py",
+            "--structured",
+            "--baseline-a",
+            "b0-a/descriptor.json",
+            "--candidate-a",
+            "candidate-a/descriptor.json",
+            "--baseline-b",
+            "b0-b/descriptor.json",
+            "--candidate-b",
+            "candidate-b/descriptor.json",
+        ]
+        output = io.StringIO()
+        with mock.patch.object(
+            COMPARE, "load_descriptor_input", side_effect=documents
+        ) as loader, mock.patch.object(
+            sys, "argv", arguments
+        ), contextlib.redirect_stdout(output):
+            exit_code = COMPARE.main()
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(loader.call_count, 4)
+        self.assertTrue(json.loads(output.getvalue())["passed"])
 
 
 if __name__ == "__main__":

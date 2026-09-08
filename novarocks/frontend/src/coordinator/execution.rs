@@ -91,7 +91,7 @@ use crate::task_execution::round::{TaskRound, TurnReport};
 use crate::task_execution::split_transport::SplitDeliveryBridge;
 use crate::task_execution::status_intake::{CondvarWake, StatusIntakeWake};
 use novarocks_execution::task_execution::{
-    AbortCause, FinalTaskInfo, MaxWait, OperationKind, TaskIdentity,
+    AbortCause, FinalTaskInfo, MaxWait, OperationKind, TaskIdentity, TaskState, TerminationDetail,
 };
 
 trait QueryIdSource: Send + Sync + 'static {
@@ -1700,20 +1700,8 @@ impl FrontendDistributedQueryCoordinator {
                 completion.profile(result, builder.finish())
             }
             DistributedQueryIntent::Statistics => {
-                let all_tasks_finished = round.execution().graph().tasks().all(|task| {
-                    round
-                        .execution()
-                        .task(task.task_id())
-                        .is_some_and(|remote| {
-                            remote.task_state()
-                                == novarocks_execution::task_execution::TaskState::Finished
-                        })
-                });
-                if !all_tasks_finished || round.failure_cause().is_some() {
-                    return Err(DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "statistics execution did not reach all-success on its frozen task set",
-                    ));
+                if let Some(error) = statistics_all_success_error(&round) {
+                    return Err(error);
                 }
                 let mut decoder = statistics_decoder.take().ok_or_else(|| {
                     DistributedQueryError::new(
@@ -2200,6 +2188,86 @@ fn distributed_write_phase_marker(
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StatisticsTaskCompletionFact {
+    identity: TaskIdentity,
+    terminal: bool,
+    state: Option<TaskState>,
+    failure_cause: Option<TerminationDetail>,
+}
+
+fn statistics_all_success_error(round: &TaskRound) -> Option<DistributedQueryError> {
+    let facts = round
+        .execution()
+        .graph()
+        .tasks()
+        .map(|task| {
+            let remote = round.execution().task(task.task_id());
+            StatisticsTaskCompletionFact {
+                identity: task.identity(),
+                terminal: remote.is_some_and(|remote| remote.is_terminal()),
+                state: remote.map(|remote| remote.task_state()),
+                failure_cause: remote
+                    .and_then(|remote| remote.status())
+                    .and_then(|status| status.termination())
+                    .cloned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    statistics_all_success_failure_message(&facts, round.failure_cause()).map(|message| {
+        DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
+    })
+}
+
+fn statistics_all_success_failure_message(
+    facts: &[StatisticsTaskCompletionFact],
+    round_failure_cause: Option<&TerminationDetail>,
+) -> Option<String> {
+    let non_finished = facts
+        .iter()
+        .filter(|fact| fact.state != Some(TaskState::Finished))
+        .map(format_statistics_task_completion_fact)
+        .collect::<Vec<_>>();
+    if non_finished.is_empty() && round_failure_cause.is_none() {
+        return None;
+    }
+    Some(format!(
+        "statistics execution did not reach all-success on its frozen task set; \
+         non_finished_tasks=[{}]; round_failure_cause={}",
+        non_finished.join(", "),
+        format_termination_detail(round_failure_cause),
+    ))
+}
+
+fn format_statistics_task_completion_fact(fact: &StatisticsTaskCompletionFact) -> String {
+    let execution_id = fact.identity.query_execution_id();
+    format!(
+        "{{identity={{query_id={}, attempt_id={}, stage_id={}, task_id={}, \
+         backend_process_id={}}}, terminal={}, state={}, failure_cause={}}}",
+        execution_id.query_id(),
+        execution_id.attempt_id().get(),
+        fact.identity.stage_id(),
+        fact.identity.task_id(),
+        fact.identity.backend_process_id(),
+        fact.terminal,
+        fact.state.map_or("MISSING", TaskState::as_str),
+        format_termination_detail(fact.failure_cause.as_ref()),
+    )
+}
+
+fn format_termination_detail(detail: Option<&TerminationDetail>) -> String {
+    match detail {
+        Some(TerminationDetail::Canceled(reason)) => format!("CANCELED(reason={reason})"),
+        Some(TerminationDetail::Aborted(cause)) => format!("ABORTED(cause={cause})"),
+        Some(TerminationDetail::Failed(failure)) => format!(
+            "FAILED(category={}, detail={})",
+            failure.category(),
+            failure.detail()
+        ),
+        None => "NONE".to_owned(),
+    }
+}
+
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
@@ -2351,8 +2419,9 @@ mod tests {
 
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
-        QueryIdSource, UniqueQueryIdSource, distributed_write_phase_marker,
-        fail_closed_one_shot_topology_retry, pre_ready_topology_validation_error,
+        QueryIdSource, StatisticsTaskCompletionFact, UniqueQueryIdSource,
+        distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
+        pre_ready_topology_validation_error, statistics_all_success_failure_message,
     };
     use crate::common::backend_topology::{
         BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
@@ -2378,7 +2447,10 @@ mod tests {
     use crate::query_execution::preparation::{ScanPreparationOptions, prepare_fragments};
     use crate::topology::ClusterBackendService;
     use novarocks_execution::task_execution::domain::DomainVersion;
-    use novarocks_execution::task_execution::{MaxWait, TaskIdentity};
+    use novarocks_execution::task_execution::{
+        AbortCause, MaxWait, SafeDetail, TaskFailure, TaskFailureCategory, TaskIdentity, TaskState,
+        TerminationDetail,
+    };
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
@@ -2399,6 +2471,79 @@ mod tests {
         assert_eq!(
             distributed_write_phase_marker(execution_id, "root_eof", 37, Some((3, 19))),
             "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi=7 query_lo=11 attempt=2 phase=root_eof elapsed_ms=37 root_batches=3 root_rows=19"
+        );
+    }
+
+    #[test]
+    fn statistics_failure_preserves_every_non_finished_task_and_round_cause() {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(7, 11),
+            AttemptId::new(2).expect("nonzero attempt"),
+        )
+        .expect("nonzero execution identity");
+        let stage_id = StageId::new(3).expect("nonzero stage");
+        let finished_identity = TaskIdentity::new(
+            execution_id,
+            stage_id,
+            TaskId::new(1).expect("nonzero task"),
+            BackendProcessId::new_v7(),
+        );
+        let failed_identity = TaskIdentity::new(
+            execution_id,
+            stage_id,
+            TaskId::new(2).expect("nonzero task"),
+            BackendProcessId::new_v7(),
+        );
+        let aborted_identity = TaskIdentity::new(
+            execution_id,
+            stage_id,
+            TaskId::new(3).expect("nonzero task"),
+            BackendProcessId::new_v7(),
+        );
+        let task_failure = TerminationDetail::Failed(TaskFailure::new(
+            TaskFailureCategory::ResourceExhausted,
+            SafeDetail::new("memory pool exhausted").expect("bounded safe detail"),
+        ));
+        let facts = vec![
+            StatisticsTaskCompletionFact {
+                identity: finished_identity,
+                terminal: true,
+                state: Some(TaskState::Finished),
+                failure_cause: None,
+            },
+            StatisticsTaskCompletionFact {
+                identity: failed_identity,
+                terminal: true,
+                state: Some(TaskState::Failed),
+                failure_cause: Some(task_failure.clone()),
+            },
+            StatisticsTaskCompletionFact {
+                identity: aborted_identity,
+                terminal: true,
+                state: Some(TaskState::Aborted),
+                failure_cause: Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+            },
+        ];
+
+        let message = statistics_all_success_failure_message(&facts, Some(&task_failure))
+            .expect("non-finished tasks reject statistics completion");
+        assert!(!message.contains("task_id=1,"));
+        assert!(message.contains(&format!(
+            "identity={{query_id={}, attempt_id=2, stage_id=3, task_id=2, backend_process_id={}}}, terminal=true, state=FAILED, failure_cause=FAILED(category=RESOURCE_EXHAUSTED, detail=memory pool exhausted)",
+            execution_id.query_id(),
+            failed_identity.backend_process_id(),
+        )));
+        assert!(message.contains(&format!(
+            "identity={{query_id={}, attempt_id=2, stage_id=3, task_id=3, backend_process_id={}}}, terminal=true, state=ABORTED, failure_cause=ABORTED(cause=PEER_TASK_FAILED)",
+            execution_id.query_id(),
+            aborted_identity.backend_process_id(),
+        )));
+        assert!(message.ends_with(
+            "round_failure_cause=FAILED(category=RESOURCE_EXHAUSTED, detail=memory pool exhausted)"
+        ));
+        assert!(
+            statistics_all_success_failure_message(&facts[..1], None).is_none(),
+            "an all-FINISHED task set with no round failure is successful"
         );
     }
 

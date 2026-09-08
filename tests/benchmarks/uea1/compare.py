@@ -12,7 +12,11 @@ from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).parent))
-from artifact_protocol import ProtocolError, validate_comparison_input  # noqa: E402
+from artifact_protocol import (  # noqa: E402
+    ProtocolError,
+    extract_comparison_input,
+    validate_comparison_input,
+)
 
 
 def derive_epsilon(values: list[float], resolution: float) -> float:
@@ -86,14 +90,19 @@ def _validate_baseline_pair(baseline_a: dict, baseline_b: dict) -> tuple[dict, d
         raise ProtocolError("baseline A/A run identities must be distinct")
     if provenance_a["ended_unix_millis"] > provenance_b["started_unix_millis"]:
         raise ProtocolError("baseline A/A runs must be non-overlapping and ordered A then B")
-    for field in ("source_sha", "binary_sha256", "runner_binary_sha256"):
+    for field in (
+        "source_sha",
+        "binary_sha256",
+        "runner_binary_sha256",
+        "cargo_lock_sha256",
+    ):
         if provenance_a[field] != provenance_b[field]:
             raise ProtocolError(f"baseline A/A {field} mismatch")
     if provenance_a["descriptor_sha256"] != provenance_b["descriptor_sha256"]:
         raise ProtocolError("baseline A/A descriptor_sha256 mismatch")
     if baseline_a["compatibility"] != baseline_b["compatibility"]:
         raise ProtocolError(
-            "baseline A/A manifest, fixture, config, tool, lock, toolchain, scenario, or platform mismatch"
+            "baseline A/A manifest, fixture, config, tool, third-party build graph, toolchain, scenario, or platform mismatch"
         )
     if _window_signature(baseline_a) != _window_signature(baseline_b):
         raise ProtocolError("baseline A/A measurement window count or shape mismatch")
@@ -229,6 +238,16 @@ def compare_protocol_inputs(
         != candidate_b["provenance"]["runner_binary_sha256"]
     ):
         raise ProtocolError("candidate A/A runner_binary_sha256 mismatch")
+    if (
+        baseline_a["provenance"]["cargo_lock_sha256"]
+        != baseline_b["provenance"]["cargo_lock_sha256"]
+    ):
+        raise ProtocolError("baseline A/A cargo_lock_sha256 mismatch")
+    if (
+        candidate_a["provenance"]["cargo_lock_sha256"]
+        != candidate_b["provenance"]["cargo_lock_sha256"]
+    ):
+        raise ProtocolError("candidate A/A cargo_lock_sha256 mismatch")
     if any(
         document["provenance"]["descriptor_sha256"]
         != baseline_a["provenance"]["descriptor_sha256"]
@@ -237,7 +256,7 @@ def compare_protocol_inputs(
         raise ProtocolError("all four runs must use the same descriptor_sha256")
     if any(document["compatibility"] != baseline_a["compatibility"] for document in inputs[1:]):
         raise ProtocolError(
-            "manifest, fixture, config, tool, lock, toolchain, scenario, or platform mismatch"
+            "manifest, fixture, config, tool, third-party build graph, toolchain, scenario, or platform mismatch"
         )
     signatures = [_window_signature(document) for document in inputs]
     if any(signature != signatures[0] for signature in signatures[1:]):
@@ -281,7 +300,7 @@ def compare_protocol_inputs(
         spec = lambda entry: (entry["unit"], entry["direction"], entry["limit"])
         if any(spec(entry) != spec(entries[0]) for entry in entries[1:]):
             raise ProtocolError(f"absolute gate definition mismatch for {metric}")
-        passed = bool(entries[1]["passed"]) and bool(entries[3]["passed"])
+        passed = all(bool(entry["passed"]) for entry in entries)
         all_absolute_passed = all_absolute_passed and passed
         absolute_results.append(
             {
@@ -292,6 +311,10 @@ def compare_protocol_inputs(
                 "baseline_b_worst": max(entries[2]["values"]),
                 "candidate_a_worst": max(entries[1]["values"]),
                 "candidate_b_worst": max(entries[3]["values"]),
+                "baseline_a_passed": bool(entries[0]["passed"]),
+                "candidate_a_passed": bool(entries[1]["passed"]),
+                "baseline_b_passed": bool(entries[2]["passed"]),
+                "candidate_b_passed": bool(entries[3]["passed"]),
                 "passed": passed,
             }
         )
@@ -314,6 +337,12 @@ def load_protocol_input(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ProtocolError(f"{path} must contain a structured comparison input")
     return validate_comparison_input(value)
+
+
+def load_descriptor_input(path: Path) -> dict:
+    """Re-extract a comparison input from raw, hash-bound artifacts."""
+
+    return extract_comparison_input(path)
 
 
 def main() -> int:
@@ -350,8 +379,8 @@ def main() -> int:
                     "baseline noise comparison accepts only --baseline-a and --baseline-b"
                 )
             result = compare_baseline_noise(
-                load_protocol_input(args.baseline_a),
-                load_protocol_input(args.baseline_b),
+                load_descriptor_input(args.baseline_a),
+                load_descriptor_input(args.baseline_b),
             )
         elif args.structured:
             if (
@@ -365,10 +394,10 @@ def main() -> int:
                     "structured comparison requires --candidate-a and --candidate-b and carries its own resolution and direction"
                 )
             result = compare_protocol_inputs(
-                load_protocol_input(args.baseline_a),
-                load_protocol_input(args.candidate_a),
-                load_protocol_input(args.baseline_b),
-                load_protocol_input(args.candidate_b),
+                load_descriptor_input(args.baseline_a),
+                load_descriptor_input(args.candidate_a),
+                load_descriptor_input(args.baseline_b),
+                load_descriptor_input(args.candidate_b),
             )
         else:
             if args.resolution is None or args.candidate is None:

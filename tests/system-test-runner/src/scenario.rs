@@ -139,6 +139,33 @@ impl ScenarioContext {
         self.handle.process_ids()
     }
 
+    pub fn process_launch_identities(
+        &self,
+    ) -> (
+        &novarocks_cluster_harness::process_resources::ProcessLaunchIdentity,
+        &[novarocks_cluster_harness::process_resources::ProcessLaunchIdentity],
+    ) {
+        self.handle.process_launch_identities()
+    }
+
+    pub fn process_resource_identities(
+        &self,
+    ) -> Result<novarocks_cluster_harness::process_resources::ClusterProcessIdentities> {
+        self.handle.process_resource_identities()
+    }
+
+    pub fn recheck_live_process_launch_identities(
+        &self,
+    ) -> Result<Vec<novarocks_cluster_harness::process_resources::ProcessLaunchIdentity>> {
+        self.handle.recheck_live_process_launch_identities()
+    }
+
+    pub fn effective_launch_config_evidence(
+        &self,
+    ) -> &novarocks_cluster_harness::EffectiveLaunchConfigEvidence {
+        self.handle.effective_launch_config_evidence()
+    }
+
     pub fn mysql_port(&self) -> u16 {
         self.handle.runtime().fe_mysql_port
     }

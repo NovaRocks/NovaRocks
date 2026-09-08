@@ -17,6 +17,8 @@
 
 mod business;
 mod controller;
+mod fixture_identity;
+mod fixture_realization;
 mod manifest;
 mod metrics;
 pub(crate) mod provenance;

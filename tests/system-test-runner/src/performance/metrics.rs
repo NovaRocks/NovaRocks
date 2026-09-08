@@ -17,6 +17,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
@@ -81,6 +82,11 @@ pub struct PerformanceReport<'a> {
     pub schema_version: u32,
     pub run_id: &'a str,
     pub run_manifest_sha256: &'a str,
+    pub resources_sha256: &'a str,
+    pub effective_launch_config_sha256: &'a str,
+    pub effective_launch_config_semantics_sha256: &'a str,
+    pub fixture_realization_sha256: &'a str,
+    pub fixture_realization_semantics_sha256: &'a str,
     pub manifest_sha256: &'a str,
     pub scenario: &'a str,
     pub query_samples: &'a [QuerySample],
@@ -94,6 +100,11 @@ pub struct PerformanceReportInput<'a> {
     pub root: &'a Path,
     pub run_id: &'a str,
     pub run_manifest_sha256: &'a str,
+    pub resources_sha256: &'a str,
+    pub effective_launch_config_sha256: &'a str,
+    pub effective_launch_config_semantics_sha256: &'a str,
+    pub fixture_realization_sha256: &'a str,
+    pub fixture_realization_semantics_sha256: &'a str,
     pub manifest_sha256: &'a str,
     pub scenario: &'a str,
     pub samples: &'a [QuerySample],
@@ -102,11 +113,16 @@ pub struct PerformanceReportInput<'a> {
     pub preparation_events: &'a [PreparationEvent],
 }
 
-pub fn write_report(input: PerformanceReportInput<'_>) -> Result<()> {
+pub fn write_report(input: PerformanceReportInput<'_>) -> Result<String> {
     let PerformanceReportInput {
         root,
         run_id,
         run_manifest_sha256,
+        resources_sha256,
+        effective_launch_config_sha256,
+        effective_launch_config_semantics_sha256,
+        fixture_realization_sha256,
+        fixture_realization_semantics_sha256,
         manifest_sha256,
         scenario,
         samples,
@@ -115,9 +131,14 @@ pub fn write_report(input: PerformanceReportInput<'_>) -> Result<()> {
         preparation_events,
     } = input;
     let report = PerformanceReport {
-        schema_version: 4,
+        schema_version: 6,
         run_id,
         run_manifest_sha256,
+        resources_sha256,
+        effective_launch_config_sha256,
+        effective_launch_config_semantics_sha256,
+        fixture_realization_sha256,
+        fixture_realization_semantics_sha256,
         manifest_sha256,
         scenario,
         query_samples: samples,
@@ -131,8 +152,10 @@ pub fn write_report(input: PerformanceReportInput<'_>) -> Result<()> {
         preparation_events,
     };
     let bytes = serde_json::to_vec_pretty(&report).context("serialize performance report")?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
     fs::write(root.join("uea1-performance.json"), bytes)
-        .with_context(|| format!("write performance report under {}", root.display()))
+        .with_context(|| format!("write performance report under {}", root.display()))?;
+    Ok(sha256)
 }
 
 #[cfg(test)]
@@ -157,5 +180,49 @@ mod tests {
         let json = serde_json::to_value(event).expect("serialize event");
         assert!(json["attempt_id"].is_null());
         assert!(json["io_wait_ns"].is_null());
+    }
+
+    #[test]
+    fn performance_report_binds_the_exact_resource_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-uea1-performance-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create report fixture");
+        let frame = PreparationDiagnosticFrame {
+            schema_version: 1,
+            run_token: "run".to_string(),
+            started_elapsed_micros: 1,
+            ended_elapsed_micros: 2,
+        };
+        write_report(PerformanceReportInput {
+            root: &root,
+            run_id: "run",
+            run_manifest_sha256: &"a".repeat(64),
+            resources_sha256: &"b".repeat(64),
+            effective_launch_config_sha256: &"d".repeat(64),
+            effective_launch_config_semantics_sha256: &"e".repeat(64),
+            fixture_realization_sha256: &"f".repeat(64),
+            fixture_realization_semantics_sha256: &"0".repeat(64),
+            manifest_sha256: &"c".repeat(64),
+            scenario: "performance/fixture",
+            samples: &[],
+            measurement_windows: &[],
+            preparation_diagnostic: &frame,
+            preparation_events: &[],
+        })
+        .expect("write performance report");
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("uea1-performance.json")).expect("read report"),
+        )
+        .expect("decode report");
+        assert_eq!(report["schema_version"], 6);
+        assert_eq!(report["resources_sha256"], "b".repeat(64));
+        assert_eq!(report["run_manifest_sha256"], "a".repeat(64));
+        fs::remove_dir_all(root).expect("remove report fixture");
     }
 }

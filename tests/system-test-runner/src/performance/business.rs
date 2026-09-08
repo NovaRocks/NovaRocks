@@ -21,10 +21,15 @@
 //! This module uses only public SQL against that catalog. No application owner,
 //! fault marker, or controller label can manufacture a completed business job.
 
+use super::fixture_identity::{
+    BusinessInitialState, FixtureTableIdentity, PartitionShape, PreparedJobIdentity,
+    PreparedWindowIdentity, RawFileFact, RawSnapshotFact, freeze_table_identity,
+};
 use super::manifest::{BusinessKind, MixedWorkload};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use mysql::{Conn, Row, Value};
+use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestRuntimeIdentity;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +45,7 @@ static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone)]
 pub struct MixedFixtureBinding {
     catalog: String,
+    provider_runtime: Option<IsolatedIcebergRestRuntimeIdentity>,
 }
 
 impl MixedFixtureBinding {
@@ -48,7 +54,23 @@ impl MixedFixtureBinding {
             valid_identifier(&catalog),
             "invalid private fixture catalog identifier"
         );
-        Ok(Self { catalog })
+        Ok(Self {
+            catalog,
+            provider_runtime: None,
+        })
+    }
+
+    pub fn with_provider_runtime(
+        catalog: String,
+        provider_runtime: IsolatedIcebergRestRuntimeIdentity,
+    ) -> Result<Self> {
+        let mut binding = Self::new(catalog)?;
+        binding.provider_runtime = Some(provider_runtime);
+        Ok(binding)
+    }
+
+    pub(crate) fn provider_runtime(&self) -> Option<&IsolatedIcebergRestRuntimeIdentity> {
+        self.provider_runtime.as_ref()
     }
 }
 
@@ -94,6 +116,7 @@ pub(super) struct PreparedWindow {
     pub foreground: String,
     pub foreground_rows: u64,
     pub jobs: BTreeMap<BusinessKind, Vec<PreparedJob>>,
+    pub fixture_identity: PreparedWindowIdentity,
     #[serde(skip)]
     cleanup: Vec<String>,
 }
@@ -129,18 +152,23 @@ pub(super) fn prepare_window(
     connection.query_drop(format!("CREATE DATABASE {catalog}.{namespace}"))?;
     let (rows_per_file, files_per_table, foreground_rows) = workload.fixture.dimensions();
     let foreground = format!("{catalog}.{namespace}.foreground");
-    let mut prepared = PreparedWindow {
-        catalog,
-        namespace,
-        foreground: foreground.clone(),
-        foreground_rows,
-        jobs: BTreeMap::new(),
-        cleanup: Vec::new(),
-    };
     // On setup failure retain the partially prepared namespace. The scenario
     // tears down its exact isolated storage fixture after stopping the cluster.
     seed_table(connection, &foreground, foreground_rows, 1)?;
-    prepared.cleanup.push(format!("DROP TABLE {foreground}"));
+    let foreground_sum = sequence_sum(foreground_rows)?;
+    let foreground_identity = collect_table_identity(
+        connection,
+        &foreground,
+        format!("window/{window_index}/foreground"),
+        window_index,
+        None,
+        None,
+        foreground_rows,
+        foreground_sum,
+    )?;
+    let mut cleanup = vec![format!("DROP TABLE {foreground}")];
+    let mut jobs_by_kind = BTreeMap::new();
+    let mut job_identities = Vec::new();
     let base_rows = rows_per_file
         .checked_mul(files_per_table as u64)
         .context("fixture row overflow")?;
@@ -153,12 +181,9 @@ pub(super) fn prepare_window(
             } else {
                 table.clone()
             };
-            let source = format!(
-                "{}.{}.{}",
-                prepared.catalog, prepared.namespace, source_table
-            );
+            let source = format!("{catalog}.{namespace}.{source_table}");
             seed_table(connection, &source, rows_per_file, files_per_table)?;
-            prepared.cleanup.push(format!("DROP TABLE {source}"));
+            cleanup.push(format!("DROP TABLE {source}"));
             let (expected_rows, expected_sum) = if producer.kind == BusinessKind::Optimize {
                 // Exercise the production-proven v3 rewrite path with live
                 // deletion vectors as well as multiple small data files.
@@ -189,21 +214,54 @@ pub(super) fn prepare_window(
                 (base_rows, sequence_sum(base_rows)?)
             };
             assert_rows(connection, &source, expected_rows, expected_sum)?;
-            let input_files = data_files(connection, &source)?;
+            let input_identity = collect_table_identity(
+                connection,
+                &source,
+                format!("window/{window_index}/{}/{}", producer.kind.name(), ordinal),
+                window_index,
+                Some(producer.kind),
+                Some(ordinal),
+                expected_rows,
+                expected_sum,
+            )?;
+            let input_files = input_identity
+                .raw
+                .files
+                .iter()
+                .filter(|file| file.content == 0)
+                .count() as u64;
             ensure!(
                 input_files >= 2,
                 "mixed job fixture must contain multiple actual data files"
             );
-            let input_snapshots = snapshots(connection, &source)?;
-            let input_artifacts = physical_files(connection, &source)?;
-            let input_data_paths = file_paths(connection, &source, 0)?;
-            let input_delete_paths = file_paths(connection, &source, 1)?;
+            let input_snapshots = input_identity
+                .raw
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_id)
+                .collect::<BTreeSet<_>>();
+            let input_artifacts = input_identity.raw.files.len() as u64;
+            let input_data_paths = input_identity
+                .raw
+                .files
+                .iter()
+                .filter(|file| file.content == 0)
+                .map(|file| file.file_path.clone())
+                .collect::<BTreeSet<_>>();
+            let input_delete_paths = input_identity
+                .raw
+                .files
+                .iter()
+                .filter(|file| file.content == 1)
+                .map(|file| file.file_path.clone())
+                .collect::<BTreeSet<_>>();
             if producer.kind == BusinessKind::Optimize {
                 ensure!(
                     !input_delete_paths.is_empty(),
                     "mixed OPTIMIZE fixture has no live deletion vector"
                 );
             }
+            let live_delete_files = input_delete_paths.len();
             ensure!(
                 !input_snapshots.is_empty(),
                 "mixed job fixture has no committed input snapshot"
@@ -211,8 +269,8 @@ pub(super) fn prepare_window(
             let job = PreparedJob {
                 kind: producer.kind,
                 ordinal,
-                catalog: prepared.catalog.clone(),
-                namespace: prepared.namespace.clone(),
+                catalog: catalog.clone(),
+                namespace: namespace.clone(),
                 table,
                 source,
                 expected_rows,
@@ -223,41 +281,55 @@ pub(super) fn prepare_window(
                 input_delete_paths,
                 input_snapshots,
             };
-            if job.kind == BusinessKind::MvRefresh {
+            let initial_state = if job.kind == BusinessKind::MvRefresh {
                 connection.query_drop(format!("SET CATALOG {}", job.catalog))?;
                 connection.query_drop(format!("USE {}", job.namespace))?;
                 connection.query_drop(format!(
                     "CREATE MATERIALIZED VIEW {} DISTRIBUTED BY HASH(v) BUCKETS 3 AS SELECT v FROM {}",
                     job.table, job.source,
                 ))?;
-                prepared.cleanup.push(format!(
+                cleanup.push(format!(
                     "DROP MATERIALIZED VIEW {}.{}",
                     job.namespace, job.table
                 ));
-                ensure!(
-                    mv_observation(connection, &job)?.refresh_time.is_none(),
-                    "mixed MV must start with no completed refresh"
-                );
+                let observed = mv_observation(connection, &job)?;
+                BusinessInitialState::MvRefresh {
+                    refresh_time: observed.refresh_time,
+                    refresh_rows: observed.rows,
+                }
             } else if job.kind == BusinessKind::Analyze {
-                ensure!(
-                    analyze_jobs(connection, &job)?.is_empty(),
-                    "mixed ANALYZE target already has job history"
-                );
-                ensure!(
-                    !has_theta_statistics(connection, &job)?,
-                    "mixed ANALYZE target already has provider statistics"
-                );
+                BusinessInitialState::Analyze {
+                    matching_jobs: analyze_jobs(connection, &job)?.len(),
+                    theta_statistics_available: has_theta_statistics(connection, &job)?,
+                }
             } else {
-                ensure!(
-                    optimize_jobs(connection, &job)?.is_empty(),
-                    "mixed OPTIMIZE target already has job history"
-                );
-            }
+                BusinessInitialState::Optimize {
+                    matching_jobs: optimize_jobs(connection, &job)?.len(),
+                    live_delete_files,
+                }
+            };
+            initial_state.validate_for(job.kind)?;
+            job_identities.push(PreparedJobIdentity {
+                kind: job.kind,
+                ordinal: job.ordinal,
+                input: input_identity,
+                initial_state,
+            });
             jobs.push(job);
         }
-        prepared.jobs.insert(producer.kind, jobs);
+        jobs_by_kind.insert(producer.kind, jobs);
     }
-    Ok(prepared)
+    let fixture_identity =
+        PreparedWindowIdentity::try_new(window_index, foreground_identity, job_identities)?;
+    Ok(PreparedWindow {
+        catalog,
+        namespace,
+        foreground,
+        foreground_rows,
+        jobs: jobs_by_kind,
+        fixture_identity,
+        cleanup,
+    })
 }
 
 fn seed_table(connection: &mut Conn, table: &str, rows_per_file: u64, files: usize) -> Result<()> {
@@ -301,6 +373,105 @@ pub(super) fn assert_rows(
         "mixed fixture/result aggregate differs from its frozen non-empty oracle"
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_table_identity(
+    connection: &mut Conn,
+    table: &str,
+    symbol: String,
+    window_index: usize,
+    business_kind: Option<BusinessKind>,
+    job_ordinal: Option<usize>,
+    expected_rows: u64,
+    expected_sum: u64,
+) -> Result<FixtureTableIdentity> {
+    let aggregate: Option<(u64, Option<u64>)> = connection.query_first(format!(
+        "SELECT COUNT(*), CAST(SUM(v) AS BIGINT) FROM {table}"
+    ))?;
+    let (rows, sum) = aggregate
+        .and_then(|(rows, sum)| sum.map(|sum| (rows, sum)))
+        .context("mixed fixture identity aggregate is empty")?;
+    ensure!(
+        rows == expected_rows && sum == expected_sum,
+        "mixed fixture identity aggregate differs from its frozen oracle"
+    );
+
+    // Query the whole frozen relation so column presence is observed from the
+    // provider schema. The current benchmark recipe is unpartitioned and its
+    // `$files` relation must therefore omit the schema-derived `partition`
+    // column. A partitioned relation cannot be normalized until the SQL
+    // protocol exposes the nested partition field shape, so it fails closed.
+    let file_rows: Vec<Row> = connection.query(format!("SELECT * FROM {table}$files"))?;
+    ensure!(
+        !file_rows.is_empty(),
+        "mixed fixture identity has no `$files` rows"
+    );
+    let mut files = Vec::with_capacity(file_rows.len());
+    for row in file_rows {
+        let has_partition = row
+            .columns_ref()
+            .iter()
+            .any(|column| column.name_str().eq_ignore_ascii_case("partition"));
+        ensure!(
+            !has_partition,
+            "partitioned `$files` identity cannot be normalized because the MySQL surface does not expose nested partition field shape"
+        );
+        let content = required_number::<i32>(&row, "content")?;
+        let spec_id = required_number::<i32>(&row, "spec_id")?;
+        let record_count = u64::try_from(required_number::<i64>(&row, "record_count")?)
+            .context("mixed `$files` record_count is negative")?;
+        let file_size_in_bytes = u64::try_from(required_number::<i64>(&row, "file_size_in_bytes")?)
+            .context("mixed `$files` file_size_in_bytes is negative")?;
+        files.push(RawFileFact {
+            content,
+            file_path: required(&row, "file_path")?,
+            file_format: required(&row, "file_format")?,
+            spec_id,
+            record_count,
+            file_size_in_bytes,
+            partition_shape: PartitionShape::Unpartitioned,
+        });
+    }
+
+    let snapshot_rows: Vec<Row> = connection.query(format!(
+        "SELECT snapshot_id, parent_id, operation FROM {table}$snapshots"
+    ))?;
+    ensure!(
+        !snapshot_rows.is_empty(),
+        "mixed fixture identity has no `$snapshots` rows"
+    );
+    let snapshots = snapshot_rows
+        .iter()
+        .map(|row| {
+            Ok(RawSnapshotFact {
+                snapshot_id: required_number(row, "snapshot_id")?,
+                parent_id: number(row, "parent_id")?,
+                operation: required(row, "operation")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    freeze_table_identity(
+        table.to_string(),
+        symbol,
+        window_index,
+        business_kind,
+        job_ordinal,
+        rows,
+        sum,
+        files,
+        snapshots,
+    )
+}
+
+fn required_number<T>(row: &Row, name: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    required(row, name)?
+        .parse()
+        .with_context(|| format!("parse mixed fixture identity column {name}"))
 }
 
 fn snapshots(connection: &mut Conn, table: &str) -> Result<BTreeSet<i64>> {

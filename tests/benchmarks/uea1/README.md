@@ -38,8 +38,9 @@ Business duration starts before the command and ends after its success oracle:
   output-count field, so that defect is retained as a diagnostic while
   `$files` is the physical output oracle. Failed or empty jobs do not count.
 
-`mixed-fixture-N.json` records the initial input facts and `mixed-business-N.json`
-records each proven completion, identity and publication. `mixed-business.json`
+`mixed-fixture-N.json` records the initial input facts, `mixed-business-N.json`
+records each proven completion, identity and publication, and `mixed-query-N.json`
+preserves foreground samples even when a worker fails. `mixed-business.json`
 combines successful windows. Jobs completing after the window are reported as
 drain work and excluded from window completions. Exhausting a producer's finite
 sequence before a formal window ends invalidates the window; it never loops over
@@ -56,15 +57,35 @@ require a clean checkout and that checkout's exact
 `target/release/novarocks`. After the real cluster starts, the runner reads the
 structured `SHOW BACKENDS` projection, requires all three live BEs to report
 one embedded native build identity equal to the source revision, and records
-that identity in run-manifest schema 2. Smoke runs record one uniform live-BE
+that identity in run-manifest schema 4. Smoke runs record one uniform live-BE
 identity without requiring source equality. The manifest also records source,
 binary, the canonical runner executable and its hash, config, workload, fixture,
-tool tree, Cargo.lock, toolchain, platform, power mode, and start/end identity.
+tool tree, raw Cargo.lock, third-party build graph, toolchain, platform,
+power mode, and start/end identity. Raw Cargo.lock may differ between B0 and
+candidate but must repeat exactly within each source; the provider-independent
+third-party build graph must match across all four runs. That graph is the
+current-target `normal,build` closure reached from the server and system-test
+runner roots as reported by `cargo tree --locked`. It binds each reachable
+external package's version, source, checksum, active feature set, and external
+dependency edges. Workspace packages are transparent so a crate split or rename
+does not change the graph by itself; a reachable non-workspace path dependency
+is instead bound by a content hash. This deliberately describes the two measured
+build roots rather than Cargo metadata's workspace-wide unified feature set.
 Formal runs require the runner itself to be this checkout's release executable.
 The tool-tree hash covers the complete UEA-1 benchmark tree, system-test runner
 source and manifest, and cluster-harness source and manifest. Formal extraction rejects a missing preparation event,
 any incomplete FE/three-BE resource window, and any artifact that does not
-reference the exact completed run manifest.
+reference the exact completed run manifest. Performance runs also bind the
+canonical descriptor, a secret-free semantic projection of the rendered FE/BE
+configs, and a recomputable fixture realization. `run-completion.json` is written
+last and binds every required artifact hash; its absence means the run is incomplete.
+`process-resources.json` schema 2 contains the run identity, the exact
+`(role, pid, process_start_token)` process set, and its samples. The run manifest
+also binds every role to the frozen executable hash, size, mtime, and process
+birth token. Every sample must name that exact process instance, so PID reuse is
+rejected. Both the performance report and run manifest bind the resource file
+hash. If execution fails, partial resource samples remain available for diagnosis
+without producing a completion marker.
 
 Preparation measurements use an authenticated, run-scoped diagnostic prelude.
 The runner arms the otherwise absent collector with the run-manifest identity,
@@ -87,18 +108,22 @@ delivery observation.
 sets using pooled median and MAD. It rejects zero-valued positive metrics and
 noise above five percent. Formal comparison uses four non-overlapping runs in
 the exact order B0-A, candidate-A, B0-B, candidate-B; it verifies both source
-and binary repeats before pooling the two candidate samples. First create one
+and binary repeats before pooling the two candidate samples. Place one
 descriptor beside each run's artifacts with only `artifacts`, `expected`,
-`metric_resolutions`, and the closed sampled thread gates. Then run:
+`metric_resolutions`, and the closed sampled thread gates. The extract command
+creates a derived report for review. Formal comparison reads the descriptors
+and re-extracts every value from the hash-bound raw artifacts; it never accepts
+the editable derived report as evidence. All four runs must pass every absolute
+gate, including the two B0 preflight runs:
 
 ```bash
 python3 tests/benchmarks/uea1/artifact_protocol.py extract \
   --descriptor <run>/descriptor.json --output <run>/comparison-input.json
 python3 tests/benchmarks/uea1/compare.py --structured \
-  --baseline-a <b0-a>/comparison-input.json \
-  --candidate-a <candidate-a>/comparison-input.json \
-  --baseline-b <b0-b>/comparison-input.json \
-  --candidate-b <candidate-b>/comparison-input.json
+  --baseline-a <b0-a>/descriptor.json \
+  --candidate-a <candidate-a>/descriptor.json \
+  --baseline-b <b0-b>/descriptor.json \
+  --candidate-b <candidate-b>/descriptor.json
 ```
 
 `build_feedback.py` samples one same-tick process snapshot repeatedly and
@@ -107,9 +132,11 @@ complete visible descendant tree. Missing samples stay unavailable rather
 than becoming zero.
 
 The checked-in descriptors under `descriptors/` freeze the formal scenario
-shape, resolutions, role set, and current-source thread ceilings. Copy the
-matching file into each scenario artifact directory as `descriptor.json`; do
-not rewrite its relative artifact paths. The thread ceilings follow
+shape, resolutions, role set, and current-source thread ceilings. The runner
+copies the matching canonical bytes into each performance artifact directory as
+`descriptor.json`; formal extraction resolves the closed scenario mapping and
+rejects any descriptor whose bytes differ from that checkout's canonical file.
+Do not rewrite its relative artifact paths. The thread ceilings follow
 `1 + configured pool maxima + fixed service threads`: FE is
 `1 + 1106 + 7 = 1114`, and each BE is `1 + 103570 + 7 = 103578`. Legacy
 per-query, per-Task, per-Fragment, and provider bridge threads are excluded from
@@ -122,6 +149,6 @@ own:
 
 ```bash
 python3 tests/benchmarks/uea1/compare.py --baseline-noise \
-  --baseline-a <b0-a>/comparison-input.json \
-  --baseline-b <b0-b>/comparison-input.json
+  --baseline-a <b0-a>/descriptor.json \
+  --baseline-b <b0-b>/descriptor.json
 ```
