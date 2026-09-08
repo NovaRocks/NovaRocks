@@ -1089,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_source_mode_and_provider_fail_closed_before_materialization() {
+    fn unsupported_source_mode_fails_closed_while_provider_identity_stays_neutral() {
         let entry = entry("catalog.analytics", "analytics");
         assert_eq!(
             entry
@@ -1111,12 +1111,13 @@ mod tests {
             )
             .expect("valid unsupported-provider logical config"),
         );
+        let properties = unsupported
+            .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)
+            .expect("desired state must preserve provider identity for the sealed registry");
+        assert_eq!(properties.provider_id().as_str(), "fixture");
         assert_eq!(
-            unsupported
-                .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)
-                .expect_err("unknown provider cannot produce a BE catalog definition")
-                .kind(),
-            CatalogApplicationErrorKind::InvalidRequest
+            properties.config_format_version(),
+            u32::from(DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION)
         );
     }
 
