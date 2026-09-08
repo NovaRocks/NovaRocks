@@ -334,6 +334,23 @@ fn convert_page(
         )
     })?;
 
+    let output_memory = if let Some(mut output_memory) = output_memory {
+        let visible_bytes = batch
+            .columns()
+            .iter()
+            .map(|column| column.get_array_memory_size() as u64)
+            .fold(0_u64, u64::saturating_add);
+        output_memory.shrink_to(visible_bytes).map_err(|error| {
+            PageAdapterError::from_connector(error, "connector page visible output accounting")
+        })?;
+        if visible_bytes > 0 {
+            Some(output_memory)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut chunk = Chunk::try_new_with_chunk_schema(batch, schema)
         .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
     if let Some(output_memory) = output_memory {
@@ -597,6 +614,60 @@ mod tests {
         drop(shared);
         assert_eq!(retained.load(Ordering::Acquire), 0);
         assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn accounted_page_releases_hidden_materialized_channels_before_chunk_handoff() {
+        let retained = Arc::new(AtomicU64::new(0));
+        let resources = ConnectorRequestResources::new(Arc::new(OutputLedger {
+            retained: Arc::clone(&retained),
+        }));
+        let visible: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
+        let hidden: ArrayRef = Arc::new(Int64Array::from((0_i64..1024).collect::<Vec<_>>()));
+        let hidden = hidden.slice(0, 3);
+        let visible_bytes = visible.get_array_memory_size() as u64;
+        let total_bytes = visible_bytes + hidden.get_array_memory_size() as u64;
+        let output_memory = resources
+            .try_reserve(ConnectorResourceClass::ReaderOutput, total_bytes)
+            .expect("reserve visible and hidden provider output")
+            .into_output(total_bytes)
+            .expect("freeze full provider output charge");
+        let page = SourcePage::try_new_accounted(3, vec![visible, hidden], output_memory)
+            .expect("accounted source page");
+        let (mut adapter, _) = adapter(vec![SlotId::new(1)], vec![Some(page)]);
+
+        let chunk = match adapter.pull().expect("convert projected page") {
+            PageConversion::Chunk(chunk) => chunk,
+            PageConversion::Idle | PageConversion::Finished => panic!("expected a chunk"),
+        };
+        assert_eq!(retained.load(Ordering::Acquire), visible_bytes);
+        drop(chunk);
+        assert_eq!(retained.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn accounted_count_only_projection_releases_the_complete_page_charge() {
+        let retained = Arc::new(AtomicU64::new(0));
+        let resources = ConnectorRequestResources::new(Arc::new(OutputLedger {
+            retained: Arc::clone(&retained),
+        }));
+        let hidden: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
+        let bytes = hidden.get_array_memory_size() as u64;
+        let output_memory = resources
+            .try_reserve(ConnectorResourceClass::ReaderOutput, bytes)
+            .expect("reserve hidden provider output")
+            .into_output(bytes)
+            .expect("freeze hidden provider output charge");
+        let page = SourcePage::try_new_accounted(3, vec![hidden], output_memory)
+            .expect("accounted source page");
+        let (mut adapter, _) = adapter(Vec::new(), vec![Some(page)]);
+
+        let chunk = match adapter.pull().expect("convert count-only page") {
+            PageConversion::Chunk(chunk) => chunk,
+            PageConversion::Idle | PageConversion::Finished => panic!("expected a chunk"),
+        };
+        assert_eq!(chunk.len(), 3);
+        assert_eq!(retained.load(Ordering::Acquire), 0);
     }
 
     #[test]

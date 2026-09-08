@@ -431,4 +431,19 @@ mod tests {
         assert_eq!(shared + additional, record_batch_bytes(&projection));
         assert!(shared < record_batch_bytes(&owner));
     }
+
+    #[test]
+    fn offset_slice_uses_the_same_underlying_buffer_allocation_identity() {
+        let source_values = Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as Arc<dyn Array>;
+        let owner =
+            RecordBatch::try_from_iter(vec![("value", Arc::clone(&source_values))]).unwrap();
+        let sliced = source_values.slice(1, 2);
+        let projection = RecordBatch::try_from_iter(vec![("value", sliced)]).unwrap();
+
+        assert_eq!(record_batch_additional_bytes(&projection, &owner), 0);
+        assert_eq!(
+            record_batch_shared_owner_bytes(&projection, &owner),
+            record_batch_bytes(&projection)
+        );
+    }
 }
