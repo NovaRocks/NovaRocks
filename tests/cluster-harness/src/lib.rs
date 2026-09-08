@@ -6553,7 +6553,7 @@ static_file_path = "catalogs.toml"
     }
 
     #[test]
-    fn resource_convergence_allows_bounded_terminal_retention_after_frontend_crash() {
+    fn resource_convergence_accepts_an_unchanged_live_backend_snapshot() {
         let baseline = QueryExecutionResourceSnapshot {
             fe_running: true,
             frontend_control_ready: 0.0,
@@ -6574,7 +6574,6 @@ static_file_path = "catalogs.toml"
         };
 
         assert!(retained.convergence_failure(&baseline).is_none());
-        assert!(retained.convergence_failure(&baseline).is_some());
     }
 
     #[test]
