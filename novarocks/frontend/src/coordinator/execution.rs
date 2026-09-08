@@ -2192,6 +2192,7 @@ fn distributed_write_phase_marker(
 struct StatisticsTaskCompletionFact {
     identity: TaskIdentity,
     terminal: bool,
+    success_compatible_terminal: bool,
     state: Option<TaskState>,
     failure_cause: Option<TerminationDetail>,
 }
@@ -2206,6 +2207,9 @@ fn statistics_all_success_error(round: &TaskRound) -> Option<DistributedQueryErr
             StatisticsTaskCompletionFact {
                 identity: task.identity(),
                 terminal: remote.is_some_and(|remote| remote.is_terminal()),
+                success_compatible_terminal: remote
+                    .and_then(|remote| remote.status())
+                    .is_some_and(|status| status.is_success_compatible_terminal()),
                 state: remote.map(|remote| remote.task_state()),
                 failure_cause: remote
                     .and_then(|remote| remote.status())
@@ -2223,20 +2227,33 @@ fn statistics_all_success_failure_message(
     facts: &[StatisticsTaskCompletionFact],
     round_failure_cause: Option<&TerminationDetail>,
 ) -> Option<String> {
-    let non_finished = facts
+    let incompatible = facts
         .iter()
-        .filter(|fact| fact.state != Some(TaskState::Finished))
+        .filter(|fact| !statistics_task_is_success_compatible(fact))
         .map(format_statistics_task_completion_fact)
         .collect::<Vec<_>>();
-    if non_finished.is_empty() && round_failure_cause.is_none() {
+    if incompatible.is_empty() && round_failure_cause.is_none() {
         return None;
     }
     Some(format!(
-        "statistics execution did not reach all-success on its frozen task set; \
-         non_finished_tasks=[{}]; round_failure_cause={}",
-        non_finished.join(", "),
+        "statistics execution did not reach a success-compatible terminal set; \
+         incompatible_tasks=[{}]; round_failure_cause={}",
+        incompatible.join(", "),
         format_termination_detail(round_failure_cause),
     ))
+}
+
+/// Whether this task's terminal is compatible with the already-complete Root
+/// result remaining successful.
+///
+/// The Root reached `FINISHED` before this predicate can run. A non-root task
+/// may then be stood down with `UPSTREAM_NO_LONGER_NEEDED`: the Root aggregate
+/// has already consumed every sender through exchange EOS, so that terminal
+/// closes work the result no longer depends on. An abort, a failure, a missing
+/// status, or a task that has not reached a terminal still refuses statistics
+/// publication.
+fn statistics_task_is_success_compatible(fact: &StatisticsTaskCompletionFact) -> bool {
+    fact.terminal && fact.success_compatible_terminal
 }
 
 fn format_statistics_task_completion_fact(fact: &StatisticsTaskCompletionFact) -> String {
@@ -2448,8 +2465,8 @@ mod tests {
     use crate::topology::ClusterBackendService;
     use novarocks_execution::task_execution::domain::DomainVersion;
     use novarocks_execution::task_execution::{
-        AbortCause, MaxWait, SafeDetail, TaskFailure, TaskFailureCategory, TaskIdentity, TaskState,
-        TerminationDetail,
+        AbortCause, CancelReason, MaxWait, SafeDetail, TaskFailure, TaskFailureCategory,
+        TaskIdentity, TaskState, TerminationDetail,
     };
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
@@ -2475,7 +2492,7 @@ mod tests {
     }
 
     #[test]
-    fn statistics_failure_preserves_every_non_finished_task_and_round_cause() {
+    fn statistics_failure_preserves_every_incompatible_task_and_round_cause() {
         let execution_id = QueryExecutionId::new(
             QueryId::new(7, 11),
             AttemptId::new(2).expect("nonzero attempt"),
@@ -2508,18 +2525,21 @@ mod tests {
             StatisticsTaskCompletionFact {
                 identity: finished_identity,
                 terminal: true,
+                success_compatible_terminal: true,
                 state: Some(TaskState::Finished),
                 failure_cause: None,
             },
             StatisticsTaskCompletionFact {
                 identity: failed_identity,
                 terminal: true,
+                success_compatible_terminal: false,
                 state: Some(TaskState::Failed),
                 failure_cause: Some(task_failure.clone()),
             },
             StatisticsTaskCompletionFact {
                 identity: aborted_identity,
                 terminal: true,
+                success_compatible_terminal: false,
                 state: Some(TaskState::Aborted),
                 failure_cause: Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
             },
@@ -2543,8 +2563,69 @@ mod tests {
         ));
         assert!(
             statistics_all_success_failure_message(&facts[..1], None).is_none(),
-            "an all-FINISHED task set with no round failure is successful"
+            "a FINISHED task set with no round failure is successful"
         );
+    }
+
+    #[test]
+    fn statistics_accepts_only_the_closed_success_compatible_cancel_terminal() {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(13, 17),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("nonzero execution identity");
+        let stage_id = StageId::new(2).expect("nonzero stage");
+        let finished_root = StatisticsTaskCompletionFact {
+            identity: TaskIdentity::new(
+                execution_id,
+                stage_id,
+                TaskId::new(1).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            ),
+            terminal: true,
+            success_compatible_terminal: true,
+            state: Some(TaskState::Finished),
+            failure_cause: None,
+        };
+        let canceled_producer = StatisticsTaskCompletionFact {
+            identity: TaskIdentity::new(
+                execution_id,
+                stage_id,
+                TaskId::new(2).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            ),
+            terminal: true,
+            success_compatible_terminal: true,
+            state: Some(TaskState::Canceled),
+            failure_cause: Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+        };
+        assert!(
+            statistics_all_success_failure_message(
+                &[finished_root.clone(), canceled_producer],
+                None,
+            )
+            .is_none(),
+            "a producer stood down after Root EOF is success-compatible"
+        );
+
+        let aborted_producer = StatisticsTaskCompletionFact {
+            identity: TaskIdentity::new(
+                execution_id,
+                stage_id,
+                TaskId::new(3).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            ),
+            terminal: true,
+            success_compatible_terminal: false,
+            state: Some(TaskState::Aborted),
+            failure_cause: Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
+        };
+        let message =
+            statistics_all_success_failure_message(&[finished_root, aborted_producer], None)
+                .expect("query cancellation is not a success-compatible stand-down");
+        assert!(message.contains("ABORTED(cause=QUERY_FAILED)"));
     }
 
     #[test]
