@@ -917,6 +917,10 @@ enum TaskOperationOutcome {
   // it is what the client concludes when no receipt arrives at all.
   reserved 16;
   reserved "TASK_OPERATION_OUTCOME_RETRYABLE_TRANSPORT_UNKNOWN";
+  // The request belongs to a different immutable Native compatibility island.
+  // The backend proves it did not apply the operation and the frontend fails
+  // the current attempt without retrying it on another process.
+  TASK_OPERATION_OUTCOME_COMPATIBILITY_MISMATCH = 17;
 }
 
 // Per plan node, the highest sequence this task has accepted and whether that

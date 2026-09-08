@@ -60,9 +60,9 @@ use novarocks_execution::task_execution::operation::QueryContextDomainUpdate;
 use novarocks_execution::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_codec::lifecycle::{QueryTerminationReason, RuntimeFilterContribution};
-use novarocks_proto_codec::task_execution::domain::WireCredential;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::{CatalogProperties, ConnectorStorageResolver};
+use novarocks_task_codec::domain::WireCredential;
 use novarocks_types::QueryExecutionId;
 use tracing::error;
 
@@ -1179,13 +1179,13 @@ mod tests {
         CredentialLeaseSecretEnvelope, encode_credential_lease_descriptor,
         encode_credential_lease_secret_envelope,
     };
-    use novarocks_proto_codec::task_execution::domain::{WireContent, WireCredential};
     use novarocks_proto_models::{filter, novarocks as proto};
     use novarocks_spi::connector::{
         CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
         CredentialLeaseDescriptor, CredentialLeaseProvider, StorageAccessDomainId,
         StorageAccessRequest, StorageCredentialScopePrefix,
     };
+    use novarocks_task_codec::domain::{WireContent, WireCredential};
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
@@ -2498,8 +2498,8 @@ mod tests {
 use novarocks_execution::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
-use novarocks_proto_codec::task_execution::domain::stored_message;
 use novarocks_proto_models::filter;
+use novarocks_task_codec::domain::stored_message;
 use novarocks_types::UniqueId;
 
 use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};

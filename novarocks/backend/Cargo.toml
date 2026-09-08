@@ -17,6 +17,7 @@ novarocks-proto-codec = { path = "../proto-codec" }
 novarocks-proto-models = { path = "../proto-models" }
 novarocks-secret = { path = "../secret" }
 novarocks-spi = { path = "../spi" }
+novarocks-task-codec = { path = "../task-codec" }
 bytes = "1"
 arrow = "58.2.0"
 arrow-buffer = "58.2.0"

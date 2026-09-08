@@ -51,11 +51,9 @@ use novarocks_proto_models::{novarocks, plan};
 use prost::Message;
 use sha2::{Digest, Sha256};
 
-use crate::task_execution::identity::{decode_task_identity, encode_task_identity};
-use crate::task_execution::{
-    duplicate, inconsistent, invalid, invalid_enum, missing, out_of_range,
-};
-use crate::{FieldPath, ProtocolError};
+use crate::identity::{decode_task_identity, encode_task_identity};
+use crate::{duplicate, inconsistent, invalid, invalid_enum, missing, out_of_range};
+use novarocks_proto_codec::{FieldPath, ProtocolError};
 
 /// Largest number of destinations on one exchange edge.
 pub const MAX_EDGE_DESTINATIONS: usize = 4096;

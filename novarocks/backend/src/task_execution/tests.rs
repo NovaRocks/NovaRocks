@@ -2120,9 +2120,9 @@ fn poll_root_result(
     crate::rpc::data_plane::fetch_task_result(
         registry,
         novarocks_proto_models::novarocks::FetchTaskResultRequest {
-            root_task: Some(
-                novarocks_proto_codec::task_execution::identity::encode_task_identity(identity),
-            ),
+            root_task: Some(novarocks_task_codec::identity::encode_task_identity(
+                identity,
+            )),
             max_wait_millis: 1,
         },
     )

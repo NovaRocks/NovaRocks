@@ -56,14 +56,16 @@ use novarocks_execution::task_execution::operation::{
 };
 use novarocks_execution::task_execution::status::{SafeDetail, TaskFailureCategory};
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::task_execution::operation::{
-    DecodedOperation, decode_fetch_dynamic_filters, decode_get_final_task_info,
-    decode_operation_batch, decode_subscribe_task_status, encode_abort_cause_field,
-    encode_create_task_ack, encode_operation_outcome, encode_query_context_ack, encode_receipt,
-    encode_release_ack, encode_status_event, encode_task_gone_event, encode_update_task_ack,
-};
-use novarocks_proto_codec::task_execution::status::{encode_final_task_info, encode_task_status};
 use novarocks_proto_models::novarocks as proto;
+use novarocks_task_codec::operation::{
+    DecodedOperation, DecodedUpdateQueryContext, decode_fetch_dynamic_filters,
+    decode_get_final_task_info, decode_operation_batch, decode_subscribe_task_status,
+    encode_abort_cause_field, encode_create_task_ack, encode_operation_outcome,
+    encode_query_context_ack, encode_receipt, encode_release_ack, encode_status_event,
+    encode_task_gone_event, encode_update_task_ack,
+};
+use novarocks_task_codec::status::{encode_final_task_info, encode_task_status};
+use novarocks_types::NativeCompatibilityId;
 use tokio_stream::Stream;
 
 use super::fault;
@@ -79,11 +81,18 @@ type ReceiptAck = proto::task_operation_receipt::Ack;
 /// The wire adapter of one backend's task protocol owner.
 pub(crate) struct RegistryTaskExecutionIngress {
     registry: Arc<TaskExecutionRegistry>,
+    native_compatibility_id: NativeCompatibilityId,
 }
 
 impl RegistryTaskExecutionIngress {
-    pub(crate) fn new(registry: Arc<TaskExecutionRegistry>) -> Arc<Self> {
-        Arc::new(Self { registry })
+    pub(crate) fn new(
+        registry: Arc<TaskExecutionRegistry>,
+        native_compatibility_id: NativeCompatibilityId,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            registry,
+            native_compatibility_id,
+        })
     }
 
     /// Dispatches one decoded item and encodes its receipt.
@@ -94,6 +103,20 @@ impl RegistryTaskExecutionIngress {
         &self,
         operation: &DecodedOperation,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
+        if let DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::Establish(request)) =
+            operation
+            && request.native_compatibility_id() != self.native_compatibility_id
+        {
+            return encode_receipt(
+                request.envelope().operation_id(),
+                OperationOutcome::CompatibilityMismatch,
+                "native compatibility identity does not match this backend process",
+                None,
+            )
+            .ok_or_else(|| {
+                tonic::Status::internal("compatibility mismatch outcome has no wire representation")
+            });
+        }
         match operation {
             DecodedOperation::CreateTask(request) => {
                 let identity = request.request().identity();
@@ -475,10 +498,10 @@ mod tests {
         TaskStatusVersion,
     };
     use novarocks_execution::task_execution::transition::QueryContextState;
-    use novarocks_proto_codec::task_execution::identity::{
+    use novarocks_proto_models::{catalog, common, plan};
+    use novarocks_task_codec::identity::{
         encode_query_context_ref, encode_task_identity, encode_task_operation_id,
     };
-    use novarocks_proto_models::{catalog, common, plan};
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
@@ -598,6 +621,7 @@ mod tests {
         task_host: Arc<AcceptingTaskHost>,
         backend: BackendProcessId,
         frontend: FrontendProcessId,
+        native_compatibility_id: NativeCompatibilityId,
     }
 
     impl Fixture {
@@ -608,6 +632,7 @@ mod tests {
             // elapsed wall time.
             config.gate_poll_interval = Duration::from_secs(3600);
             let task_host = Arc::new(AcceptingTaskHost::default());
+            let native_compatibility_id = NativeCompatibilityId::new([0x71; 32]);
             let registry = TaskExecutionRegistry::new(
                 config,
                 Arc::new(ManualClock::new()) as Arc<dyn BackendMonotonicClock>,
@@ -615,11 +640,15 @@ mod tests {
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
             );
             Self {
-                ingress: RegistryTaskExecutionIngress::new(Arc::clone(&registry)),
+                ingress: RegistryTaskExecutionIngress::new(
+                    Arc::clone(&registry),
+                    native_compatibility_id,
+                ),
                 registry,
                 task_host,
                 backend,
                 frontend: FrontendProcessId::new_v7(),
+                native_compatibility_id,
             }
         }
 
@@ -633,6 +662,18 @@ mod tests {
 
         fn context(&self) -> QueryContextRef {
             QueryContextRef::new(self.execution(), self.frontend, self.backend)
+        }
+
+        fn other_context(&self) -> QueryContextRef {
+            QueryContextRef::new(
+                QueryExecutionId::new(
+                    QueryId::new(18, 24),
+                    AttemptId::new(1).expect("nonzero attempt"),
+                )
+                .expect("nonzero query"),
+                self.frontend,
+                self.backend,
+            )
         }
 
         fn identity(&self, stage: u32, task: u32) -> TaskIdentity {
@@ -665,7 +706,11 @@ mod tests {
         }
     }
 
-    fn establish(context: QueryContextRef, operation: TaskOperationId) -> proto::TaskOperation {
+    fn establish_with_compatibility(
+        context: QueryContextRef,
+        operation: TaskOperationId,
+        native_compatibility_id: NativeCompatibilityId,
+    ) -> proto::TaskOperation {
         proto::TaskOperation {
             envelope: Some(envelope(operation)),
             operation: Some(proto::task_operation::Operation::UpdateQueryContext(
@@ -688,12 +733,18 @@ mod tests {
                                 valid_for_millis: 30_000,
                             }),
                             query_options: Some(query_options()),
-                            native_compatibility_id: None,
+                            native_compatibility_id: Some(proto::NativeCompatibilityId {
+                                value: native_compatibility_id.as_bytes().to_vec(),
+                            }),
                         },
                     )),
                 },
             )),
         }
+    }
+
+    fn establish(context: QueryContextRef, operation: TaskOperationId) -> proto::TaskOperation {
+        establish_with_compatibility(context, operation, NativeCompatibilityId::new([0x71; 32]))
     }
 
     fn renew_lease(
@@ -830,6 +881,109 @@ mod tests {
 
     fn outcome_of(receipt: &proto::TaskOperationReceipt) -> proto::TaskOperationOutcome {
         proto::TaskOperationOutcome::try_from(receipt.outcome).expect("a known outcome")
+    }
+
+    #[test]
+    fn a_foreign_compatibility_identity_is_rejected_before_context_side_effects() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let response = fixture.apply(vec![establish_with_compatibility(
+            context,
+            TaskOperationId::new_v7(),
+            NativeCompatibilityId::new([0x72; 32]),
+        )]);
+
+        assert_eq!(response.receipts.len(), 1);
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::CompatibilityMismatch
+        );
+        assert!(
+            response.receipts[0].ack.is_none(),
+            "a compatibility rejection cannot acknowledge an establishment"
+        );
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::Absent
+        );
+
+        let response = fixture.apply(vec![renew_lease(context, TaskOperationId::new_v7(), 1)]);
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::ContextNotEstablished,
+            "the rejected establish must leave no context for a later operation"
+        );
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::Absent
+        );
+    }
+
+    #[test]
+    fn the_exact_native_compatibility_identity_establishes_the_context() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let response = fixture.apply(vec![establish_with_compatibility(
+            context,
+            TaskOperationId::new_v7(),
+            fixture.native_compatibility_id,
+        )]);
+
+        assert_eq!(response.receipts.len(), 1);
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::Accepted
+        );
+        assert!(matches!(
+            response.receipts[0].ack,
+            Some(ReceiptAck::QueryContext(_))
+        ));
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::Active
+        );
+    }
+
+    #[test]
+    fn a_compatibility_rejection_does_not_refuse_an_independent_valid_batch_item() {
+        let fixture = Fixture::new();
+        let rejected_context = fixture.context();
+        let accepted_context = fixture.other_context();
+        let response = fixture.apply(vec![
+            establish_with_compatibility(
+                rejected_context,
+                TaskOperationId::new_v7(),
+                NativeCompatibilityId::new([0x72; 32]),
+            ),
+            establish_with_compatibility(
+                accepted_context,
+                TaskOperationId::new_v7(),
+                fixture.native_compatibility_id,
+            ),
+        ]);
+
+        assert_eq!(response.receipts.len(), 2);
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::CompatibilityMismatch
+        );
+        assert_eq!(
+            outcome_of(&response.receipts[1]),
+            proto::TaskOperationOutcome::Accepted,
+            "a rejected item must not carry the valid establish down with it"
+        );
+        assert!(matches!(
+            response.receipts[1].ack,
+            Some(ReceiptAck::QueryContext(_))
+        ));
+        assert_eq!(
+            fixture.registry.context_state(rejected_context),
+            QueryContextState::Absent
+        );
+        assert_eq!(
+            fixture.registry.context_state(accepted_context),
+            QueryContextState::Active
+        );
     }
 
     #[test]
@@ -996,11 +1150,9 @@ mod tests {
             .ingress
             .subscribe_task_status(proto::SubscribeTaskStatusRequest {
                 query_context: Some(encode_query_context_ref(context)),
-                cursors: vec![
-                    novarocks_proto_codec::task_execution::status::encode_task_status_cursor(
-                        TaskStatusCursor::unobserved(identity),
-                    ),
-                ],
+                cursors: vec![novarocks_task_codec::status::encode_task_status_cursor(
+                    TaskStatusCursor::unobserved(identity),
+                )],
             })
             .expect("an active context accepts a subscription");
 
@@ -1039,11 +1191,9 @@ mod tests {
             .ingress
             .subscribe_task_status(proto::SubscribeTaskStatusRequest {
                 query_context: Some(encode_query_context_ref(context)),
-                cursors: vec![
-                    novarocks_proto_codec::task_execution::status::encode_task_status_cursor(
-                        TaskStatusCursor::unobserved(identity),
-                    ),
-                ],
+                cursors: vec![novarocks_task_codec::status::encode_task_status_cursor(
+                    TaskStatusCursor::unobserved(identity),
+                )],
             })
             .expect("an active context accepts a subscription");
         // Proves the stream was really live before it was dropped.
@@ -1208,12 +1358,10 @@ mod tests {
             .advertise_dynamic_filters(
                 DomainVersion::new(4).expect("nonzero version"),
                 2,
-                Arc::new(
-                    novarocks_proto_codec::task_execution::domain::WireContent::new(
-                        b"novarocks.task_execution.task_dynamic_filter.v1",
-                        envelope.clone(),
-                    ),
-                ) as Arc<dyn CodecOwnedContent>,
+                Arc::new(novarocks_task_codec::domain::WireContent::new(
+                    b"novarocks.task_execution.task_dynamic_filter.v1",
+                    envelope.clone(),
+                )) as Arc<dyn CodecOwnedContent>,
             );
 
         let response = fixture

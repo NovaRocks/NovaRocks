@@ -68,7 +68,7 @@ use novarocks_execution::task_execution::{
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_proto_codec::task_execution::domain::{split_offer, wire_split_assignment};
+use novarocks_task_codec::domain::{split_offer, wire_split_assignment};
 use novarocks_types::UniqueId;
 use novarocks_types::identity::TaskId;
 

@@ -31,7 +31,6 @@ use novarocks_proto_codec::lifecycle::{
 use novarocks_proto_codec::lifecycle::{
     encode_credential_lease_descriptor, encode_credential_lease_secret_envelope,
 };
-use novarocks_proto_codec::task_execution::domain::WireCredential;
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
     CatalogProviderKind, CatalogStorageAccessDomainInput, ConnectorControlPlanningLease,
@@ -41,6 +40,7 @@ use novarocks_spi::connector::{
     ResolvedVendedS3Access, StorageAccessRequest, StorageCredentialScopePrefix,
     VendedS3CredentialLeaseContribution,
 };
+use novarocks_task_codec::domain::WireCredential;
 use novarocks_types::NativeCompatibilityId;
 use sha2::{Digest, Sha256};
 

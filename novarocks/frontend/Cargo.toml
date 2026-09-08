@@ -34,6 +34,7 @@ novarocks-parser = { path = "../parser" }
 novarocks-plan-codec = { path = "../plan-codec" }
 novarocks-spi = { path = "../spi" }
 novarocks-sql = { path = "../sql" }
+novarocks-task-codec = { path = "../task-codec" }
 novarocks-types = { path = "../types" }
 novarocks-user-error = { path = "../user-error" }
 novarocks-version = { path = "../version" }

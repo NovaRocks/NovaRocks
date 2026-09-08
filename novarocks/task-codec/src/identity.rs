@@ -23,10 +23,12 @@ use novarocks_execution::task_execution::identity::{
 use novarocks_proto_models::novarocks;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, StageId, TaskId};
 
-use crate::FieldPath;
-use crate::ProtocolError;
-use crate::lifecycle::identity::{decode_query_execution_id, encode_query_execution_id};
-use crate::task_execution::{invalid, missing};
+use novarocks_proto_codec::lifecycle::identity::{
+    decode_query_execution_id, encode_query_execution_id,
+};
+use novarocks_proto_codec::{FieldPath, ProtocolError};
+
+use crate::{invalid, missing};
 
 /// Every process and operation identity on this wire is exactly 16 bytes of a
 /// non-nil UUIDv7. The width is checked before anything interprets the value.

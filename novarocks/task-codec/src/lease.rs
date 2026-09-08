@@ -22,8 +22,9 @@ use std::time::Duration;
 use novarocks_execution::task_execution::lease::{LeaseReceipt, LeaseSequence, LeaseValidFor};
 use novarocks_proto_models::novarocks;
 
-use crate::task_execution::{invalid, out_of_range};
-use crate::{FieldPath, ProtocolError};
+use novarocks_proto_codec::{FieldPath, ProtocolError};
+
+use crate::{invalid, out_of_range};
 
 /// One grant of the query execution lease.
 ///

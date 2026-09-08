@@ -30,9 +30,10 @@ use novarocks_execution::task_execution::status::{
 };
 use novarocks_proto_models::novarocks;
 
-use crate::task_execution::identity::{decode_task_identity, encode_task_identity};
-use crate::task_execution::{inconsistent, invalid, invalid_enum, missing, out_of_range};
-use crate::{FieldPath, ProtocolError};
+use novarocks_proto_codec::{FieldPath, ProtocolError};
+
+use crate::identity::{decode_task_identity, encode_task_identity};
+use crate::{inconsistent, invalid, invalid_enum, missing, out_of_range};
 
 /// Largest number of per-task cursors one subscription may carry.
 pub const MAX_SUBSCRIPTION_CURSORS: usize = 4096;

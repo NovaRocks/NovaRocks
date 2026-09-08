@@ -501,6 +501,7 @@ impl BackendExecutionRuntimeInput {
 fn compose_backend_application_services(
     data_runtime: BackendDataRuntime,
     execution: BackendExecutionRuntimeInput,
+    native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
@@ -579,8 +580,10 @@ fn compose_backend_application_services(
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::QueryContextHost>,
         execution_host,
     );
-    let task_execution_ingress: Arc<dyn TaskExecutionIngress> =
-        RegistryTaskExecutionIngress::new(Arc::clone(&task_execution_registry));
+    let task_execution_ingress: Arc<dyn TaskExecutionIngress> = RegistryTaskExecutionIngress::new(
+        Arc::clone(&task_execution_registry),
+        native_compatibility_id,
+    );
     Ok(BackendApplicationServices {
         backend_process_id,
         drain,
@@ -706,6 +709,7 @@ impl BackendApplicationHost {
         let services = compose_backend_application_services(
             data_runtime,
             BackendExecutionRuntimeInput::new(execution_runtime_config, function_set),
+            native_compatibility_id,
             write_commit_evidence_limits,
             catalog_manager_config,
             &execution_role_binding_factories,
@@ -1196,8 +1200,8 @@ mod tests {
         };
         use novarocks_proto_codec::FieldPath;
         use novarocks_proto_codec::catalog::CatalogSet;
-        use novarocks_proto_codec::task_execution::domain::{WireContent, WireCredential};
         use novarocks_proto_models::filter;
+        use novarocks_task_codec::domain::{WireContent, WireCredential};
         use novarocks_types::identity::FrontendProcessId;
 
         let services = compose_backend_application_services(
@@ -1206,6 +1210,7 @@ mod tests {
                 execution_runtime_config(),
                 test_execution_function_set(),
             ),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             WriteCommitEvidenceLimits::default(),
             crate::connector::catalog_manager::CatalogManagerConfig::default(),
             &[],

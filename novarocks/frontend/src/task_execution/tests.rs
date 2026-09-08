@@ -2884,11 +2884,11 @@ fn refreshable_credential_storage_with_refresher(
         CredentialLeaseSecretEnvelope, encode_credential_lease_descriptor,
         encode_credential_lease_secret_envelope,
     };
-    use novarocks_proto_codec::task_execution::domain::WireCredential;
     use novarocks_spi::connector::{
         CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor, CredentialLeaseProvider,
         StorageAccessDomainId, StorageCredentialScopePrefix,
     };
+    use novarocks_task_codec::domain::WireCredential;
 
     let owner = novarocks_spi::connector::CatalogHandle::new(
         ConnectorInstanceId::try_from_canonical("catalog.analytics").expect("catalog id"),

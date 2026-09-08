@@ -37,13 +37,13 @@ use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::{
     encode_credential_lease_descriptor, encode_credential_lease_secret_envelope,
 };
-use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
-use novarocks_proto_codec::task_execution::domain::{WireContent, WireCredential};
-use novarocks_proto_codec::task_execution::operation::{
-    ESTABLISH_CATALOG_DOMAIN_TAG, ESTABLISH_FILTER_DOMAIN_TAG, ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
-};
 use novarocks_proto_models::catalog::CatalogSet;
 use novarocks_proto_models::novarocks::{QueryOptions, RuntimeFilterContribution};
+use novarocks_task_codec::descriptor::WireFragmentPlan;
+use novarocks_task_codec::domain::{WireContent, WireCredential};
+use novarocks_task_codec::operation::{
+    ESTABLISH_CATALOG_DOMAIN_TAG, ESTABLISH_FILTER_DOMAIN_TAG, ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
+};
 use novarocks_types::identity::BackendProcessId;
 
 use novarocks_sql::plan_read::FragmentId;
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn each_backend_establishes_its_own_filter_contribution() {
         use novarocks_execution::task_execution::identity::QueryContextRef;
-        use novarocks_proto_codec::task_execution::domain::stored_message;
+        use novarocks_task_codec::domain::stored_message;
         use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
         use crate::query_execution::lifecycle_plan::QueryCredentialLeases;

@@ -76,12 +76,12 @@ use novarocks_execution::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
 };
 use novarocks_proto_codec::connector_read::{MAX_ASSIGNMENT_RETAINED_BYTES, SplitAssignment};
-use novarocks_proto_codec::task_execution::domain::{WireContent, stored_message};
-use novarocks_proto_codec::task_execution::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
 use novarocks_proto_models::connector_read as connector_dto;
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorStorageResolver, read_stack::ConnectorSession,
 };
+use novarocks_task_codec::domain::{WireContent, stored_message};
+use novarocks_task_codec::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
 use novarocks_types::{QueryExecutionId, UniqueId};
 use tracing::debug;
 
@@ -1489,7 +1489,6 @@ mod tests {
         AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
     };
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
     use novarocks_proto_models::{
         common, connector_read as connector_dto, novarocks as proto, plan,
     };
@@ -1497,6 +1496,7 @@ mod tests {
         CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorStorageResolver,
         ResolvedVendedS3Access, StorageAccessRequest,
     };
+    use novarocks_task_codec::descriptor::WireFragmentPlan;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -2557,12 +2557,10 @@ mod tests {
             &descriptor,
             &TaskDomainUpdate::TaskDynamicFilter {
                 version: DomainVersion::new(1).expect("nonzero"),
-                payload: Arc::new(
-                    novarocks_proto_codec::task_execution::domain::WireContent::new(
-                        b"filter",
-                        novarocks_proto_models::filter::RuntimeFilterEnvelope::default(),
-                    ),
-                ),
+                payload: Arc::new(novarocks_task_codec::domain::WireContent::new(
+                    b"filter",
+                    novarocks_proto_models::filter::RuntimeFilterEnvelope::default(),
+                )),
             },
         )
         .expect("the context host accepts it");
@@ -2610,7 +2608,7 @@ mod tests {
             no_more_splits: no_more,
         };
         let payload: Arc<dyn CodecOwnedContent> = Arc::new(
-            novarocks_proto_codec::task_execution::domain::WireContent::new(b"split", assignment),
+            novarocks_task_codec::domain::WireContent::new(b"split", assignment),
         );
         TaskDomainUpdate::SplitAssignment(
             novarocks_execution::task_execution::operation::SplitAssignmentIntent::new(
@@ -2634,12 +2632,10 @@ mod tests {
             novarocks_execution::task_execution::operation::SplitAssignmentIntent::new(
                 PlanNodeId::new(10).expect("nonnegative node"),
                 SplitOffer::Seal,
-                Arc::new(
-                    novarocks_proto_codec::task_execution::domain::WireContent::new(
-                        b"filter",
-                        novarocks_proto_models::filter::RuntimeFilterEnvelope::default(),
-                    ),
-                ),
+                Arc::new(novarocks_task_codec::domain::WireContent::new(
+                    b"filter",
+                    novarocks_proto_models::filter::RuntimeFilterEnvelope::default(),
+                )),
             ),
         );
         let rejection = host

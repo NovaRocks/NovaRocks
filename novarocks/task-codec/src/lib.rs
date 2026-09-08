@@ -37,7 +37,7 @@ pub mod lease;
 pub mod operation;
 pub mod status;
 
-use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 
 pub(crate) fn missing(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
     ProtocolError::new(path, ProtocolErrorKind::MissingField, detail)
@@ -75,12 +75,12 @@ mod tests {
         encode_lease_receipt,
     };
     use super::operation::{
-        DecodedOperation, decode_fetch_task_result, decode_get_final_task_info,
-        decode_operation_batch, decode_receipt_batch, encode_fetch_task_result,
-        encode_get_final_task_info, encode_operation_outcome, encode_query_context_state,
+        DecodedOperation, DecodedUpdateQueryContext, decode_fetch_task_result,
+        decode_get_final_task_info, decode_operation_batch, decode_receipt_batch,
+        encode_fetch_task_result, encode_get_final_task_info, encode_operation_outcome,
+        encode_query_context_state,
     };
     use super::status::{decode_task_status, encode_task_status};
-    use crate::{FieldPath, ProtocolErrorKind};
     use novarocks_execution::task_execution::domain::{
         CredentialEpoch, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId,
     };
@@ -96,7 +96,9 @@ mod tests {
         TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
     };
     use novarocks_execution::task_execution::transition::QueryContextState;
+    use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
     use novarocks_proto_models::{catalog, common, filter, novarocks, plan};
+    use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
@@ -141,7 +143,7 @@ mod tests {
             StorageCredentialScopePrefix,
         };
 
-        crate::lifecycle::encode_credential_lease_descriptor(
+        novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor(
             &CredentialLeaseDescriptor::try_new(
                 CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
                 epoch,
@@ -165,8 +167,8 @@ mod tests {
     fn credential_envelope(epoch: u64, secret: &str) -> novarocks::CredentialLeaseSecretEnvelope {
         use novarocks_spi::connector::CredentialLeaseId;
 
-        crate::lifecycle::encode_credential_lease_secret_envelope(
-            &crate::lifecycle::CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
+        novarocks_proto_codec::lifecycle::encode_credential_lease_secret_envelope(
+            &novarocks_proto_codec::lifecycle::CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
                 CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
                 epoch,
                 "access-key-id".to_owned(),
@@ -1071,7 +1073,11 @@ mod tests {
                                             valid_for_millis: 30_000,
                                         }),
                                         query_options: Some(query_options(1)),
-                                        native_compatibility_id: None,
+                                        native_compatibility_id: Some(
+                                            novarocks::NativeCompatibilityId {
+                                                value: [0x71; 32].to_vec(),
+                                            },
+                                        ),
                                     },
                                 ),
                             ),
@@ -1081,15 +1087,80 @@ mod tests {
             }
         };
 
-        assert!(
-            decode_operation_batch(
-                &establish(0, 1, 1),
-                TransportBudget::DEFAULT,
-                FieldPath::root("batch")
-            )
-            .is_ok(),
-            "sequence zero with matched descriptors is the legal shape"
+        let decoded = decode_operation_batch(
+            &establish(0, 1, 1),
+            TransportBudget::DEFAULT,
+            FieldPath::root("batch"),
+        )
+        .expect("sequence zero with matched descriptors is the legal shape");
+        let DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::Establish(request)) =
+            &decoded[0]
+        else {
+            panic!("fixture carries an establish");
+        };
+        assert_eq!(
+            request.native_compatibility_id(),
+            NativeCompatibilityId::new([0x71; 32]),
+            "the exact typed compatibility identity reaches admission"
         );
+
+        let mut missing_compatibility = establish(0, 1, 1);
+        let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+            missing_compatibility.operations[0].operation.as_mut()
+        else {
+            panic!("fixture carries an update query context");
+        };
+        let Some(novarocks::update_query_context_request::Command::Establish(establish_request)) =
+            update.command.as_mut()
+        else {
+            panic!("fixture carries an establish");
+        };
+        establish_request.native_compatibility_id = None;
+        let error = decode_operation_batch(
+            &missing_compatibility,
+            TransportBudget::DEFAULT,
+            FieldPath::root("batch"),
+        )
+        .expect_err("an establish must carry its native compatibility identity");
+        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(
+            error.path().to_string(),
+            "batch.operations[0].update_query_context.establish.native_compatibility_id"
+        );
+
+        for invalid_len in [31, 33] {
+            let mut invalid_compatibility = establish(0, 1, 1);
+            let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+                invalid_compatibility.operations[0].operation.as_mut()
+            else {
+                panic!("fixture carries an update query context");
+            };
+            let Some(novarocks::update_query_context_request::Command::Establish(
+                establish_request,
+            )) = update.command.as_mut()
+            else {
+                panic!("fixture carries an establish");
+            };
+            establish_request.native_compatibility_id = Some(novarocks::NativeCompatibilityId {
+                value: vec![0x71; invalid_len],
+            });
+            let error = decode_operation_batch(
+                &invalid_compatibility,
+                TransportBudget::DEFAULT,
+                FieldPath::root("batch"),
+            )
+            .expect_err("a native compatibility identity has an exact wire width");
+            assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+            assert_eq!(
+                error.path().to_string(),
+                "batch.operations[0].update_query_context.establish.native_compatibility_id.value"
+            );
+            assert!(
+                error.detail().contains(&format!("got {invalid_len}")),
+                "unexpected detail: {}",
+                error.detail()
+            );
+        }
         let mut missing_options = establish(0, 1, 1);
         let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
             missing_options.operations[0].operation.as_mut()
@@ -1921,12 +1992,12 @@ mod tests {
         // backend's terminal runtime-filter observation. A codec that dropped
         // it would leave every part of the carrier correct and the frontend
         // with nothing.
-        let sealed = crate::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
+        let sealed = novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
             novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
                         novarocks::QueryTerminalProfileContributionV1 {
-                            version: crate::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+                            version: novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
                             channels: vec![novarocks::QueryTerminalRuntimeFilterChannelV1 {
                                 channel_binding_id: 1,
                                 channel_id: 7,

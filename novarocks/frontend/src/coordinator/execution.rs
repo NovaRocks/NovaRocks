@@ -933,11 +933,7 @@ impl FrontendDistributedQueryCoordinator {
 
         let wake = Arc::new(CondvarWake::default());
         let attempt = AttemptWireFacts {
-            native_compatibility_id: Some(
-                novarocks_proto_models::novarocks::NativeCompatibilityId {
-                    value: self.native_compatibility_id.as_bytes().to_vec(),
-                },
-            ),
+            native_compatibility_id: self.native_compatibility_id,
         };
         let AssembledRound {
             mut round,

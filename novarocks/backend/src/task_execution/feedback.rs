@@ -49,8 +49,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use novarocks_execution::runtime_filter::RuntimeFilterChannelId;
 use novarocks_execution::task_execution::domain::DomainVersion;
 use novarocks_execution::task_execution::identity::TaskIdentity;
-use novarocks_proto_codec::task_execution::domain::wire_task_dynamic_filter;
 use novarocks_proto_models::filter;
+use novarocks_task_codec::domain::wire_task_dynamic_filter;
 
 use crate::runtime_filter::domain::{
     BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication, BackendFrontendFeedbackSink,

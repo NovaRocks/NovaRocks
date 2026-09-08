@@ -45,13 +45,14 @@ use novarocks_proto_models::novarocks;
 use prost::Message;
 use sha2::{Digest, Sha256};
 
-use crate::connector_read::SplitAssignment;
-use crate::lifecycle::{
+use novarocks_proto_codec::connector_read::SplitAssignment;
+use novarocks_proto_codec::lifecycle::{
     decode_credential_lease_descriptor, decode_credential_lease_secret_envelope,
     validate_initial_credential_lease_envelopes,
 };
-use crate::task_execution::{invalid, missing, out_of_range};
-use crate::{FieldPath, ProtocolError};
+use novarocks_proto_codec::{FieldPath, ProtocolError};
+
+use crate::{invalid, missing, out_of_range};
 use novarocks_spi::connector::{CredentialLeaseDescriptor, CredentialLeaseSecretEnvelope};
 
 /// Largest number of domain changes one operation may carry.
@@ -961,8 +962,8 @@ mod tests {
     };
     use novarocks_proto_models::{catalog, filter, novarocks};
 
-    use crate::FieldPath;
-    use crate::lifecycle::{
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::lifecycle::{
         CredentialLeaseSecretEnvelope, encode_credential_lease_descriptor,
         encode_credential_lease_secret_envelope,
     };

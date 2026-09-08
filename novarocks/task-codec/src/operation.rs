@@ -44,10 +44,11 @@ use novarocks_execution::task_execution::operation::{
 };
 use novarocks_execution::task_execution::transition::QueryContextState;
 use novarocks_proto_models::novarocks;
+use novarocks_types::NativeCompatibilityId;
 use prost::Message;
 
-use crate::task_execution::descriptor::{WireFragmentPlan, decode_task_descriptor};
-use crate::task_execution::domain::{
+use crate::descriptor::{WireFragmentPlan, decode_task_descriptor};
+use crate::domain::{
     DecodedQueryContextDomain, DecodedTaskDomain, MAX_DOMAIN_UPDATES, WireContent,
     decode_credential_domain, decode_plan_node_split_receipt, decode_query_context_domain,
     decode_task_domain,
@@ -62,17 +63,18 @@ pub const ESTABLISH_FILTER_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.initial_runtime_filter.v1";
 pub const ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.query_options.v1";
-use crate::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
-use crate::task_execution::identity::{
+use crate::identity::{
     decode_query_context_ref, decode_task_operation_id, encode_query_context_ref,
     encode_task_operation_id,
 };
-use crate::task_execution::lease::decode_duration_millis;
-use crate::task_execution::status::{
+use crate::lease::decode_duration_millis;
+use crate::status::{
     decode_abort_cause, decode_cancel_reason, encode_abort_cause, encode_cancel_reason,
 };
-use crate::task_execution::{invalid, invalid_enum, missing, out_of_range};
-use crate::{FieldPath, ProtocolError};
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
+use novarocks_proto_codec::{FieldPath, ProtocolError};
+
+use crate::{invalid, invalid_enum, missing, out_of_range};
 
 /// Decodes an operation envelope.
 pub fn decode_envelope(
@@ -155,6 +157,7 @@ pub struct DecodedEstablishQueryContext {
     query_options: Arc<WireContent<novarocks::QueryOptions>>,
     initial_credential: DecodedQueryContextDomain,
     initial_lease_valid_for: LeaseValidFor,
+    native_compatibility_id: NativeCompatibilityId,
 }
 
 impl DecodedEstablishQueryContext {
@@ -193,6 +196,10 @@ impl DecodedEstablishQueryContext {
 
     pub const fn initial_lease_valid_for(&self) -> LeaseValidFor {
         self.initial_lease_valid_for
+    }
+
+    pub const fn native_compatibility_id(&self) -> NativeCompatibilityId {
+        self.native_compatibility_id
     }
 }
 
@@ -507,7 +514,7 @@ fn decode_identity_field(
     detail: &'static str,
 ) -> Result<TaskIdentity, ProtocolError> {
     let identity = src.ok_or_else(|| missing(path.clone().field("identity"), detail))?;
-    crate::task_execution::identity::decode_task_identity(identity, path.field("identity"))
+    crate::identity::decode_task_identity(identity, path.field("identity"))
 }
 
 fn decode_update_query_context(
@@ -556,12 +563,14 @@ fn decode_update_query_context(
                     "establish requires query options",
                 )
             })?;
-            crate::lifecycle::QueryOptions::parse(query_options).map_err(|error| {
-                invalid(
-                    establish_path.clone().field("query_options"),
-                    error.detail(),
-                )
-            })?;
+            novarocks_proto_codec::lifecycle::QueryOptions::parse(query_options).map_err(
+                |error| {
+                    invalid(
+                        establish_path.clone().field("query_options"),
+                        error.detail(),
+                    )
+                },
+            )?;
             let query_options = Arc::new(WireContent::new(
                 ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
                 query_options,
@@ -609,6 +618,25 @@ fn decode_update_query_context(
                     error.to_string(),
                 )
             })?;
+            let native_compatibility_id =
+                establish.native_compatibility_id.as_ref().ok_or_else(|| {
+                    missing(
+                        establish_path.clone().field("native_compatibility_id"),
+                        "establish requires a native compatibility identity",
+                    )
+                })?;
+            let native_compatibility_id = NativeCompatibilityId::try_from_slice(
+                &native_compatibility_id.value,
+            )
+            .map_err(|error| {
+                invalid(
+                    establish_path
+                        .clone()
+                        .field("native_compatibility_id")
+                        .field("value"),
+                    error.to_string(),
+                )
+            })?;
             Ok(DecodedUpdateQueryContext::Establish(
                 DecodedEstablishQueryContext {
                     context,
@@ -618,6 +646,7 @@ fn decode_update_query_context(
                     query_options,
                     initial_credential,
                     initial_lease_valid_for,
+                    native_compatibility_id,
                 },
             ))
         }
@@ -660,8 +689,7 @@ fn decode_update_query_context(
                     "renew requires a lease grant",
                 )
             })?;
-            let grant =
-                crate::task_execution::lease::decode_lease_grant(lease, renew_path.field("lease"))?;
+            let grant = crate::lease::decode_lease_grant(lease, renew_path.field("lease"))?;
             Ok(DecodedUpdateQueryContext::RenewLease {
                 context,
                 envelope,
@@ -704,6 +732,9 @@ fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, Proto
         }
         Ok(novarocks::TaskOperationOutcome::IdentityMismatch) => {
             Ok(OperationOutcome::IdentityMismatch)
+        }
+        Ok(novarocks::TaskOperationOutcome::CompatibilityMismatch) => {
+            Ok(OperationOutcome::CompatibilityMismatch)
         }
         Ok(novarocks::TaskOperationOutcome::CreateConflict) => Ok(OperationOutcome::CreateConflict),
         Ok(novarocks::TaskOperationOutcome::ContextNotEstablished) => {
@@ -750,6 +781,9 @@ fn encode_outcome(value: OperationOutcome) -> Option<i32> {
         OperationOutcome::Idempotent => novarocks::TaskOperationOutcome::Idempotent,
         OperationOutcome::OperationTimedOut => novarocks::TaskOperationOutcome::OperationTimedOut,
         OperationOutcome::IdentityMismatch => novarocks::TaskOperationOutcome::IdentityMismatch,
+        OperationOutcome::CompatibilityMismatch => {
+            novarocks::TaskOperationOutcome::CompatibilityMismatch
+        }
         OperationOutcome::CreateConflict => novarocks::TaskOperationOutcome::CreateConflict,
         OperationOutcome::ContextNotEstablished => {
             novarocks::TaskOperationOutcome::ContextNotEstablished
@@ -883,10 +917,8 @@ pub fn decode_receipt_header(
     })?;
     let operation_id = decode_task_operation_id(operation_id, path.clone().field("operation_id"))?;
     let outcome = decode_outcome(src.outcome, path.clone().field("outcome"))?;
-    let detail = crate::task_execution::status::decode_safe_detail(
-        &src.safe_detail,
-        path.clone().field("safe_detail"),
-    )?;
+    let detail =
+        crate::status::decode_safe_detail(&src.safe_detail, path.clone().field("safe_detail"))?;
     if let Some(field_path) = src.safe_field_path.as_deref()
         && field_path.len() > novarocks_execution::task_execution::status::SAFE_FIELD_PATH_MAX_BYTES
     {
@@ -983,10 +1015,7 @@ pub fn decode_fetch_task_result(
             "a result poll requires a root task identity",
         )
     })?;
-    let root = crate::task_execution::identity::decode_task_identity(
-        root,
-        path.clone().field("root_task"),
-    )?;
+    let root = crate::identity::decode_task_identity(root, path.clone().field("root_task"))?;
     let max_wait = decode_duration_millis(
         src.max_wait_millis,
         path.field("max_wait_millis"),
@@ -1016,9 +1045,7 @@ pub fn encode_fetch_dynamic_filters(
     request: FetchTaskDynamicFilters,
 ) -> novarocks::FetchTaskDynamicFiltersRequest {
     novarocks::FetchTaskDynamicFiltersRequest {
-        identity: Some(crate::task_execution::identity::encode_task_identity(
-            request.identity(),
-        )),
+        identity: Some(crate::identity::encode_task_identity(request.identity())),
         acknowledged_version: request.acknowledged_version().map_or(0, DomainVersion::get),
     }
 }
@@ -1026,9 +1053,7 @@ pub fn encode_fetch_dynamic_filters(
 /// Encodes a final info read request.
 pub fn encode_get_final_task_info(identity: TaskIdentity) -> novarocks::GetFinalTaskInfoRequest {
     novarocks::GetFinalTaskInfoRequest {
-        identity: Some(crate::task_execution::identity::encode_task_identity(
-            identity,
-        )),
+        identity: Some(crate::identity::encode_task_identity(identity)),
     }
 }
 
@@ -1038,9 +1063,7 @@ pub fn encode_fetch_task_result(
     max_wait: MaxWait,
 ) -> novarocks::FetchTaskResultRequest {
     novarocks::FetchTaskResultRequest {
-        root_task: Some(crate::task_execution::identity::encode_task_identity(
-            root_task,
-        )),
+        root_task: Some(crate::identity::encode_task_identity(root_task)),
         // `MaxWait` is already bounded by `MAX_REPRESENTABLE`, so this cannot
         // narrow a wait the caller asked for.
         max_wait_millis: u64::try_from(max_wait.get().as_millis()).unwrap_or(u64::MAX),
@@ -1198,7 +1221,7 @@ pub fn encode_create_task(
         operation: Some(novarocks::task_operation::Operation::CreateTask(
             novarocks::CreateTaskRequest {
                 query_context: Some(encode_query_context_ref(request.context())),
-                descriptor: Some(crate::task_execution::descriptor::encode_task_descriptor(
+                descriptor: Some(crate::descriptor::encode_task_descriptor(
                     request.descriptor(),
                     fragment,
                 )),
@@ -1216,9 +1239,7 @@ pub fn encode_update_task(
         envelope: Some(encode_envelope(request.envelope())),
         operation: Some(novarocks::task_operation::Operation::UpdateTask(
             novarocks::UpdateTaskRequest {
-                identity: Some(crate::task_execution::identity::encode_task_identity(
-                    request.identity(),
-                )),
+                identity: Some(crate::identity::encode_task_identity(request.identity())),
                 domains,
             },
         )),
@@ -1230,9 +1251,7 @@ pub fn encode_cancel_task(request: CancelTask) -> novarocks::TaskOperation {
         envelope: Some(encode_envelope(request.envelope())),
         operation: Some(novarocks::task_operation::Operation::CancelTask(
             novarocks::CancelTaskRequest {
-                identity: Some(crate::task_execution::identity::encode_task_identity(
-                    request.identity(),
-                )),
+                identity: Some(crate::identity::encode_task_identity(request.identity())),
                 reason: encode_cancel_reason(request.reason()),
             },
         )),
@@ -1272,8 +1291,8 @@ pub fn encode_renew_lease(request: &RenewQueryExecutionLease) -> novarocks::Task
                     novarocks::update_query_context_request::Command::RenewLease(
                         novarocks::RenewQueryExecutionLeaseRequest {
                             query_context: Some(encode_query_context_ref(request.context())),
-                            lease: Some(crate::task_execution::lease::encode_lease_grant(
-                                crate::task_execution::lease::LeaseGrant::new(
+                            lease: Some(crate::lease::encode_lease_grant(
+                                crate::lease::LeaseGrant::new(
                                     request.sequence(),
                                     request.valid_for(),
                                 ),
@@ -1315,7 +1334,7 @@ pub fn encode_establish_query_context(
     initial_runtime_filter: novarocks::RuntimeFilterContribution,
     initial_credential: novarocks::QueryContextCredentialDomain,
     query_options: novarocks::QueryOptions,
-    native_compatibility_id: Option<novarocks::NativeCompatibilityId>,
+    native_compatibility_id: NativeCompatibilityId,
 ) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
         envelope: Some(encode_envelope(request.envelope())),
@@ -1327,14 +1346,16 @@ pub fn encode_establish_query_context(
                         catalog_set: Some(catalog_set),
                         initial_runtime_filter: Some(initial_runtime_filter),
                         initial_credential: Some(initial_credential),
-                        initial_lease: Some(crate::task_execution::lease::encode_lease_grant(
-                            crate::task_execution::lease::LeaseGrant::new(
+                        initial_lease: Some(crate::lease::encode_lease_grant(
+                            crate::lease::LeaseGrant::new(
                                 request.initial_lease_sequence(),
                                 request.initial_lease_valid_for(),
                             ),
                         )),
                         query_options: Some(query_options),
-                        native_compatibility_id,
+                        native_compatibility_id: Some(novarocks::NativeCompatibilityId {
+                            value: native_compatibility_id.as_bytes().to_vec(),
+                        }),
                     },
                 )),
             },
@@ -1516,7 +1537,7 @@ pub fn encode_task_domain_receipt(
                     nodes: nodes
                         .iter()
                         .copied()
-                        .map(crate::task_execution::domain::encode_plan_node_split_receipt)
+                        .map(crate::domain::encode_plan_node_split_receipt)
                         .collect(),
                 },
             )
@@ -1592,13 +1613,9 @@ pub fn encode_query_context_domain_receipt(
 /// carry, so a conflict can never be shipped as part of an applied create.
 pub fn encode_create_task_ack(value: &CreateTaskReceipt) -> Option<novarocks::CreateTaskAck> {
     Some(novarocks::CreateTaskAck {
-        identity: Some(crate::task_execution::identity::encode_task_identity(
-            value.identity(),
-        )),
+        identity: Some(crate::identity::encode_task_identity(value.identity())),
         accepted_domains: encode_task_domain_receipts(value.domains())?,
-        current_status: Some(crate::task_execution::status::encode_task_status(
-            value.current_status(),
-        )),
+        current_status: Some(crate::status::encode_task_status(value.current_status())),
     })
 }
 
@@ -1607,9 +1624,7 @@ pub fn encode_create_task_ack(value: &CreateTaskReceipt) -> Option<novarocks::Cr
 /// Returns `None` for the same reason a create acknowledgement does.
 pub fn encode_update_task_ack(value: &UpdateTaskReceipt) -> Option<novarocks::UpdateTaskAck> {
     Some(novarocks::UpdateTaskAck {
-        identity: Some(crate::task_execution::identity::encode_task_identity(
-            value.identity(),
-        )),
+        identity: Some(crate::identity::encode_task_identity(value.identity())),
         accepted_domains: encode_task_domain_receipts(value.domains())?,
     })
 }
@@ -1652,7 +1667,7 @@ pub fn decode_create_task_ack(
         )
     })?;
     let status_path = path.field("current_status");
-    let status = crate::task_execution::status::decode_task_status(status, status_path.clone())?;
+    let status = crate::status::decode_task_status(status, status_path.clone())?;
     if status.identity() != expected {
         return Err(invalid(
             status_path.field("identity"),
@@ -1736,7 +1751,7 @@ pub fn decode_query_context_ack(
     let state = decode_context_state(src.state, path.clone().field("state"))?;
     let mut receipt = QueryContextReceipt::new(context, state);
     if let Some(lease) = src.lease.as_ref() {
-        receipt = receipt.with_lease(crate::task_execution::lease::decode_lease_receipt(
+        receipt = receipt.with_lease(crate::lease::decode_lease_receipt(
             lease,
             path.clone().field("lease"),
         )?);
@@ -1774,9 +1789,7 @@ pub fn encode_query_context_ack(
     Some(novarocks::QueryContextAck {
         query_context: Some(encode_query_context_ref(value.context())),
         state: encode_context_state(value.state())?,
-        lease: value
-            .lease()
-            .map(crate::task_execution::lease::encode_lease_receipt),
+        lease: value.lease().map(crate::lease::encode_lease_receipt),
         accepted_domains: value
             .domains()
             .iter()
@@ -1812,7 +1825,7 @@ pub fn encode_status_event(
 ) -> novarocks::TaskStatusStreamEvent {
     novarocks::TaskStatusStreamEvent {
         event: Some(novarocks::task_status_stream_event::Event::TaskStatus(
-            crate::task_execution::status::encode_task_status(value),
+            crate::status::encode_task_status(value),
         )),
     }
 }
@@ -1822,9 +1835,7 @@ pub fn encode_task_gone_event(identity: TaskIdentity) -> novarocks::TaskStatusSt
     novarocks::TaskStatusStreamEvent {
         event: Some(novarocks::task_status_stream_event::Event::TaskGone(
             novarocks::TaskGone {
-                identity: Some(crate::task_execution::identity::encode_task_identity(
-                    identity,
-                )),
+                identity: Some(crate::identity::encode_task_identity(identity)),
             },
         )),
     }
@@ -1840,12 +1851,11 @@ pub fn decode_status_event(
         .as_ref()
         .ok_or_else(|| missing(path.clone(), "a status event requires a body"))?;
     match event {
-        novarocks::task_status_stream_event::Event::TaskStatus(status) => Ok(
-            StatusStreamEvent::Status(crate::task_execution::status::decode_task_status(
-                status,
-                path.field("task_status"),
-            )?),
-        ),
+        novarocks::task_status_stream_event::Event::TaskStatus(status) => {
+            Ok(StatusStreamEvent::Status(
+                crate::status::decode_task_status(status, path.field("task_status"))?,
+            ))
+        }
         novarocks::task_status_stream_event::Event::TaskGone(gone) => {
             let gone_path = path.field("task_gone");
             let identity = decode_identity_field(
@@ -1870,7 +1880,7 @@ pub fn encode_subscribe_task_status(
     context: QueryContextRef,
     cursors: &[novarocks_execution::task_execution::status::TaskStatusCursor],
 ) -> Result<novarocks::SubscribeTaskStatusRequest, ProtocolError> {
-    if cursors.len() > crate::task_execution::status::MAX_SUBSCRIPTION_CURSORS {
+    if cursors.len() > crate::status::MAX_SUBSCRIPTION_CURSORS {
         return Err(out_of_range(
             FieldPath::root("subscribe_task_status").field("cursors"),
             "cursor count exceeds the hard limit",
@@ -1881,7 +1891,7 @@ pub fn encode_subscribe_task_status(
         cursors: cursors
             .iter()
             .copied()
-            .map(crate::task_execution::status::encode_task_status_cursor)
+            .map(crate::status::encode_task_status_cursor)
             .collect(),
     })
 }
@@ -1904,7 +1914,7 @@ pub fn decode_subscribe_task_status(
         )
     })?;
     let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
-    if src.cursors.len() > crate::task_execution::status::MAX_SUBSCRIPTION_CURSORS {
+    if src.cursors.len() > crate::status::MAX_SUBSCRIPTION_CURSORS {
         return Err(out_of_range(
             path.clone().field("cursors"),
             "cursor count exceeds the hard limit",
@@ -1912,7 +1922,7 @@ pub fn decode_subscribe_task_status(
     }
     let mut cursors = Vec::with_capacity(src.cursors.len());
     for (index, cursor) in src.cursors.iter().enumerate() {
-        cursors.push(crate::task_execution::status::decode_task_status_cursor(
+        cursors.push(crate::status::decode_task_status_cursor(
             cursor,
             path.clone().field("cursors").index(index),
         )?);

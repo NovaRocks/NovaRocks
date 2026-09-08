@@ -3168,6 +3168,7 @@ dependencies = [
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-task-codec",
  "novarocks-types",
  "novarocks-version",
  "once_cell",
@@ -3372,6 +3373,7 @@ dependencies = [
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-task-codec",
  "novarocks-types",
  "novarocks-user-error",
  "novarocks-version",
@@ -3480,7 +3482,6 @@ name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
- "novarocks-execution",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",
@@ -3661,6 +3662,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "novarocks-task-codec"
+version = "0.1.0"
+dependencies = [
+ "novarocks-execution",
+ "novarocks-proto-codec",
+ "novarocks-proto-models",
+ "novarocks-spi",
+ "novarocks-types",
+ "prost 0.13.5",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]

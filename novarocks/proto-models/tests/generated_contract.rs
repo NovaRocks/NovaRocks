@@ -1364,6 +1364,7 @@ fn the_operation_outcome_enum_reserves_the_client_only_category() {
         "TASK_OPERATION_OUTCOME_IDEMPOTENT",
         "TASK_OPERATION_OUTCOME_OPERATION_TIMED_OUT",
         "TASK_OPERATION_OUTCOME_IDENTITY_MISMATCH",
+        "TASK_OPERATION_OUTCOME_COMPATIBILITY_MISMATCH",
         "TASK_OPERATION_OUTCOME_CREATE_CONFLICT",
         "TASK_OPERATION_OUTCOME_DOMAIN_CONFLICT",
         "TASK_OPERATION_OUTCOME_LEASE_EXPIRED",
@@ -1376,6 +1377,13 @@ fn the_operation_outcome_enum_reserves_the_client_only_category() {
             "{expected} must exist"
         );
     }
+    assert_eq!(
+        outcome
+            .get_value_by_name("TASK_OPERATION_OUTCOME_COMPATIBILITY_MISMATCH")
+            .expect("compatibility mismatch outcome")
+            .number(),
+        17
+    );
 }
 
 /// A batch is a transport convenience. Its response carries one receipt per
