@@ -329,41 +329,45 @@ prepare_runtime() {
   start="$(ci_epoch)"
   {
     echo "+ docker/iceberg-rest/up.sh"
-    docker/iceberg-rest/up.sh
-    echo "+ source docker/iceberg-rest/runtime/current/env.sh"
-    . docker/iceberg-rest/runtime/current/env.sh
-    require_runtime_var NOVAROCKS_FE_CONFIG
-    require_runtime_var NOVAROCKS_BE_CONFIG
-    require_runtime_var NOVAROCKS_SQL_TEST_CONFIG
-    require_runtime_var NOVA_ENV_RUNTIME_DIR
-    require_runtime_var NOVA_ENV_MYSQL_PORT
-    require_runtime_var NOVAROCKS_ICEBERG_REST_URI
-    require_runtime_var NOVA_ENV_REST_ENV_FILE
-    PAIMON_FIXTURE_DIR="$CI_RUN_DIR/paimon-fixture"
-    PAIMON_FIXTURE_RUN_ID="ci-${CI_COMMIT_SHA:0:12}-$(basename "$CI_RUN_DIR")"
-    echo "+ docker/paimon-read/prepare.sh --env-file <runtime-env> --run-id $PAIMON_FIXTURE_RUN_ID --output-dir <ci-run>/paimon-fixture"
-    docker/paimon-read/prepare.sh \
-      --env-file "$NOVA_ENV_REST_ENV_FILE" \
-      --run-id "$PAIMON_FIXTURE_RUN_ID" \
-      --output-dir "$PAIMON_FIXTURE_DIR"
-    export NOVAROCKS_PAIMON_FIXTURE_MANIFEST="$PAIMON_FIXTURE_DIR/manifest.json"
-    export SYSTEM_SCENARIO_BASE_CONFIG="$PAIMON_FIXTURE_DIR/base-server.toml"
-    export NOVAROCKS_SQL_TEST_CONFIG="$PAIMON_FIXTURE_DIR/sql-runner.toml"
-    PAIMON_FIXTURE_PREPARED="true"
-    echo "NOVAROCKS_FE_CONFIG=$NOVAROCKS_FE_CONFIG"
-    echo "NOVAROCKS_BE_CONFIG=$NOVAROCKS_BE_CONFIG"
-    echo "NOVAROCKS_SQL_TEST_CONFIG=$NOVAROCKS_SQL_TEST_CONFIG"
-    echo "NOVA_ENV_RUNTIME_DIR=$NOVA_ENV_RUNTIME_DIR"
-    echo "NOVA_ENV_MYSQL_PORT=$NOVA_ENV_MYSQL_PORT"
-    echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
-    echo "NOVAROCKS_PAIMON_FIXTURE_MANIFEST=$NOVAROCKS_PAIMON_FIXTURE_MANIFEST"
-    echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
-    echo "NOVA_CI_CARGO_PROFILE=$NOVA_CI_CARGO_PROFILE"
-    echo "SQL_CLUSTER_MODE=$SQL_CLUSTER_MODE"
-    echo "SQL_CLUSTER_SIZE=$SQL_CLUSTER_SIZE"
-    echo "NOVA_CI_NATIVE_CROSS_PROCESS_CORE=$NOVA_CI_NATIVE_CROSS_PROCESS_CORE"
-    echo "NOVA_CI_NATIVE_CROSS_PROCESS_FULL=$NOVA_CI_NATIVE_CROSS_PROCESS_FULL"
-    echo "NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED"
+    docker/iceberg-rest/up.sh &&
+      echo "+ source docker/iceberg-rest/runtime/current/env.sh" &&
+      . docker/iceberg-rest/runtime/current/env.sh &&
+      require_runtime_var NOVAROCKS_FE_CONFIG &&
+      require_runtime_var NOVAROCKS_BE_CONFIG &&
+      require_runtime_var NOVAROCKS_SQL_TEST_CONFIG &&
+      require_runtime_var NOVA_ENV_RUNTIME_DIR &&
+      require_runtime_var NOVA_ENV_MYSQL_PORT &&
+      require_runtime_var NOVAROCKS_ICEBERG_REST_URI &&
+      require_runtime_var NOVA_ENV_REST_ENV_FILE &&
+      PAIMON_FIXTURE_DIR="$CI_RUN_DIR/paimon-fixture" &&
+      PAIMON_FIXTURE_RUN_ID="ci-${CI_COMMIT_SHA:0:12}-$(basename "$CI_RUN_DIR")" &&
+      echo "+ docker/paimon-read/prepare.sh --env-file <runtime-env> --run-id $PAIMON_FIXTURE_RUN_ID --output-dir <ci-run>/paimon-fixture" &&
+      docker/paimon-read/prepare.sh \
+        --env-file "$NOVA_ENV_REST_ENV_FILE" \
+        --run-id "$PAIMON_FIXTURE_RUN_ID" \
+        --output-dir "$PAIMON_FIXTURE_DIR"
+    code=$?
+    if [ "$code" -eq 0 ]; then
+      export NOVAROCKS_PAIMON_FIXTURE_MANIFEST="$PAIMON_FIXTURE_DIR/manifest.json"
+      export SYSTEM_SCENARIO_BASE_CONFIG="$PAIMON_FIXTURE_DIR/base-server.toml"
+      export NOVAROCKS_SQL_TEST_CONFIG="$PAIMON_FIXTURE_DIR/sql-runner.toml"
+      PAIMON_FIXTURE_PREPARED="true"
+      echo "NOVAROCKS_FE_CONFIG=$NOVAROCKS_FE_CONFIG"
+      echo "NOVAROCKS_BE_CONFIG=$NOVAROCKS_BE_CONFIG"
+      echo "NOVAROCKS_SQL_TEST_CONFIG=$NOVAROCKS_SQL_TEST_CONFIG"
+      echo "NOVA_ENV_RUNTIME_DIR=$NOVA_ENV_RUNTIME_DIR"
+      echo "NOVA_ENV_MYSQL_PORT=$NOVA_ENV_MYSQL_PORT"
+      echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
+      echo "NOVAROCKS_PAIMON_FIXTURE_MANIFEST=$NOVAROCKS_PAIMON_FIXTURE_MANIFEST"
+      echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
+      echo "NOVA_CI_CARGO_PROFILE=$NOVA_CI_CARGO_PROFILE"
+      echo "SQL_CLUSTER_MODE=$SQL_CLUSTER_MODE"
+      echo "SQL_CLUSTER_SIZE=$SQL_CLUSTER_SIZE"
+      echo "NOVA_CI_NATIVE_CROSS_PROCESS_CORE=$NOVA_CI_NATIVE_CROSS_PROCESS_CORE"
+      echo "NOVA_CI_NATIVE_CROSS_PROCESS_FULL=$NOVA_CI_NATIVE_CROSS_PROCESS_FULL"
+      echo "NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED"
+    fi
+    test "$code" -eq 0
   } >"$log_path" 2>&1
   code=$?
   duration=$(($(ci_epoch) - start))
