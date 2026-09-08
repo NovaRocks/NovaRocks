@@ -81,7 +81,7 @@ use crate::runtime_filter::compiler::{
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
-use crate::task_execution::completion::{WriteCompletionTracker, accept_final_info};
+use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict, accept_final_info};
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::ReleasedRuntimeFilterContributions;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
@@ -1067,7 +1067,13 @@ impl FrontendDistributedQueryCoordinator {
         let root_output_schema = Arc::clone(expected_output.fetch_view().chunk_schema());
         let mut root_result_polls: Option<RootResultPolls> = None;
         let mut wait_witness = TaskRoundWaitWitness::new(
-            task_round_wait_facts(&round, root_task, 0, last_root_poll),
+            task_round_wait_facts(
+                &round,
+                root_task,
+                0,
+                last_root_poll,
+                write_completion.as_mut(),
+            ),
             Instant::now(),
         );
         let outcome = loop {
@@ -1107,8 +1113,13 @@ impl FrontendDistributedQueryCoordinator {
                 // time. A completion rule that waits on absent facts has to
                 // say which one was absent, or its timeout is indistinguishable
                 // from every other timeout.
-                let waiting_on =
-                    task_round_wait_facts(&round, root_task, batches.len(), last_root_poll);
+                let waiting_on = task_round_wait_facts(
+                    &round,
+                    root_task,
+                    batches.len(),
+                    last_root_poll,
+                    write_completion.as_mut(),
+                );
                 break Err(self.fail_task_round(
                     query_id,
                     &mut round,
@@ -1443,23 +1454,40 @@ impl FrontendDistributedQueryCoordinator {
 
             wait_witness.observe(
                 execution_id,
-                task_round_wait_facts(&round, root_task, batches.len(), last_root_poll),
+                task_round_wait_facts(
+                    &round,
+                    root_task,
+                    batches.len(),
+                    last_root_poll,
+                    write_completion.as_mut(),
+                ),
                 Instant::now(),
             );
 
             if round.client_visible_completion() {
                 match write_completion.as_mut() {
                     // A write's completion is not the read's. Every declared
-                    // writer must prove successful output completion and the
-                    // root finish task must publish FINISHED, so this keeps
-                    // turning while one has not.
+                    // writer must reach a success-compatible terminal and the
+                    // root finish task must publish FINISHED. The independently
+                    // decoded Root prepared set later proves that every writer
+                    // output actually arrived.
                     Some(tracker) => {
                         observe_write_statuses(&round, tracker);
-                        if tracker
-                            .execution_verdict(round.failure_cause().is_some())
-                            .is_complete()
-                        {
+                        let verdict = tracker.execution_verdict(round.failure_cause().is_some());
+                        if verdict.is_complete() {
                             break Ok(());
+                        }
+                        if !verdict.is_pending() {
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                format!(
+                                    "distributed write reached a non-committable terminal: {verdict}"
+                                ),
+                            ));
                         }
                     }
                     None if intent == DistributedQueryIntent::Statistics
@@ -1598,7 +1626,7 @@ impl FrontendDistributedQueryCoordinator {
                         "distributed write execution has no write completion tracker",
                     )
                 })?;
-                let mut decoder = write_decoder.take().ok_or_else(|| {
+                let decoder = write_decoder.take().ok_or_else(|| {
                     DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
                         "distributed write execution lost its Root decoder",
@@ -1608,21 +1636,6 @@ impl FrontendDistributedQueryCoordinator {
                 let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
                 observe_write_statuses(&round, tracker);
                 let execution_verdict = tracker.execution_verdict(round.failure_cause().is_some());
-                if execution_verdict.is_complete() {
-                    decoder.observe_execution_success().map_err(|error| {
-                        emit_distributed_write_phase_marker(
-                            intent,
-                            execution_id,
-                            "root_failure",
-                            execution_started,
-                            Some((root_batch_count, root_row_count)),
-                        );
-                        DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            error,
-                        )
-                    })?;
-                }
                 emit_distributed_write_phase_marker(
                     intent,
                     execution_id,
@@ -3541,6 +3554,7 @@ struct TaskRoundWaitFacts {
     contexts_established: bool,
     tasks_created: bool,
     read: crate::task_execution::completion::ReadVerdict,
+    write: Option<WriteVerdict>,
     /// `None` means no task of the root's id is in this attempt's state at
     /// all, which is a different fault from a root that is still creating.
     root_create: Option<RemoteTaskState>,
@@ -3550,6 +3564,7 @@ struct TaskRoundWaitFacts {
         TaskIdentity,
         RemoteTaskState,
         novarocks_execution::task_execution::TaskState,
+        bool,
     )>,
 }
 
@@ -3557,9 +3572,13 @@ impl std::fmt::Display for TaskRoundWaitFacts {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "read={:?} contexts_established={} tasks_created={} root_create={} \
+            "read={:?} write={} contexts_established={} tasks_created={} root_create={} \
              last_root_poll={} packets={} tasks=[",
             self.read,
+            self.write.map_or_else(
+                || "not-applicable".to_owned(),
+                |verdict| verdict.to_string(),
+            ),
             self.contexts_established,
             self.tasks_created,
             match self.root_create {
@@ -3569,11 +3588,14 @@ impl std::fmt::Display for TaskRoundWaitFacts {
             self.last_root_poll,
             self.packets,
         )?;
-        for (index, (identity, create, state)) in self.tasks.iter().enumerate() {
+        for (index, (identity, create, state, output_complete)) in self.tasks.iter().enumerate() {
             if index > 0 {
                 formatter.write_str(", ")?;
             }
-            write!(formatter, "{identity} {create:?}/{state}")?;
+            write!(
+                formatter,
+                "{identity} {create:?}/{state}/output_complete={output_complete}"
+            )?;
         }
         formatter.write_str("]")
     }
@@ -3586,6 +3608,7 @@ fn task_round_wait_facts(
     root_task: TaskIdentity,
     packets: usize,
     last_root_poll: RootResultPoll,
+    write_completion: Option<&mut WriteCompletionTracker>,
 ) -> TaskRoundWaitFacts {
     let mut tasks = Vec::new();
     for stage in round.execution().graph().stages() {
@@ -3593,13 +3616,23 @@ fn task_round_wait_facts(
             continue;
         };
         for (_, task) in execution_stage.tasks() {
-            tasks.push((task.identity(), task.state(), task.task_state()));
+            tasks.push((
+                task.identity(),
+                task.state(),
+                task.task_state(),
+                task.output_released(),
+            ));
         }
     }
+    let write = write_completion.map(|tracker| {
+        observe_write_statuses(round, tracker);
+        tracker.execution_verdict(round.failure_cause().is_some())
+    });
     TaskRoundWaitFacts {
         contexts_established: round.contexts_established(),
         tasks_created: round.tasks_created(),
         read: round.execution().read_completion(),
+        write,
         root_create: round
             .execution()
             .task(root_task.task_id())

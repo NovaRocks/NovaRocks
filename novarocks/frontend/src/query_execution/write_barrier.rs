@@ -24,11 +24,11 @@
 //!   finished, every sender reached EOS, the finish node emitted, and the
 //!   frontend received all of it. It says nothing about whether some other
 //!   participant failed.
-//! * **Execution succeeded.** Proved by the task substrate's verdict over the
-//!   frozen writer set and root finish task. It refuses a writer that stood
-//!   down before completing its output responsibility or a task that
-//!   published undeclared writer facts, while saying nothing about whether
-//!   the frontend received the complete write data.
+//! * **Execution reached a success-compatible terminal set.** Proved by the
+//!   task substrate's verdict over the frozen writer set and root finish task.
+//!   A writer may finish normally or be canceled by the one normal downstream
+//!   release after `TableFinish` consumed every sender. The separate prepared
+//!   set proof is what establishes that no writer output was lost.
 //!
 //! Before this split, one signal stood for both, and a query could reach a
 //! commit on the strength of half the evidence. Keeping them separate is the
@@ -47,7 +47,8 @@ use crate::task_execution::completion::WriteVerdict;
 pub(crate) enum WriteCommitBlocked {
     /// The root result never reached end of stream, so no complete set exists.
     PreparedWriteSetIncomplete,
-    /// At least one participant of this attempt did not succeed.
+    /// At least one participant of this attempt did not reach a
+    /// success-compatible terminal.
     ExecutionDidNotSucceed,
     /// The statement was cancelled before commit.
     Cancelled,
@@ -64,7 +65,7 @@ impl WriteCommitBlocked {
                 "connector write did not receive a complete prepared write set"
             }
             Self::ExecutionDidNotSucceed => {
-                "connector write execution did not succeed on every participant"
+                "connector write execution did not reach a success-compatible terminal on every participant"
             }
             Self::Cancelled => "connector write was cancelled before its external commit",
             Self::TaskExecutionIncomplete => {
@@ -144,11 +145,7 @@ impl WriteCommitBarrier {
             None | Some(WriteVerdict::AttemptFailed) => {
                 return Err(WriteCommitBlocked::ExecutionDidNotSucceed);
             }
-            Some(
-                WriteVerdict::TaskNotFinished { .. }
-                | WriteVerdict::WriterCanceled(_)
-                | WriteVerdict::UndeclaredWriter(_),
-            ) => {
+            Some(WriteVerdict::TaskNotFinished { .. } | WriteVerdict::UndeclaredWriter(_)) => {
                 return Err(WriteCommitBlocked::TaskExecutionIncomplete);
             }
             Some(WriteVerdict::Complete) => {}
@@ -313,12 +310,14 @@ mod tests {
             7
         );
 
-        // A writer that stood down normally is compatible with a read's early
-        // completion and never with a write: the rows it had not written yet
-        // are simply missing. The terminal-counting rule cannot see this.
+        // A terminal that the tracker did not classify as success-compatible
+        // remains incomplete even when a prepared set exists.
         let mut barrier = WriteCommitBarrier::new();
         barrier.observe_prepared_write_set(complete_set());
-        barrier.observe_task_execution(WriteVerdict::WriterCanceled(identity));
+        barrier.observe_task_execution(WriteVerdict::TaskNotFinished {
+            task: identity,
+            state: TaskState::Aborted,
+        });
         assert_eq!(
             barrier.into_committable().expect_err("must not commit"),
             WriteCommitBlocked::TaskExecutionIncomplete
