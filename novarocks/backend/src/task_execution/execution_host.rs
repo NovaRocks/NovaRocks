@@ -1923,7 +1923,7 @@ mod tests {
             consumer,
             kernel_key,
             1,
-            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
             wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
         );
         let capabilities = TaskInboundCapabilities::new();
@@ -1941,7 +1941,7 @@ mod tests {
             capabilities.authorize_frame(kernel_key, node, producer_key, 0, 1),
             Ok(InboundFrameAdmission {
                 destination: consumer,
-                source: ExchangeSource::new(producer, producer_key),
+                source: ExchangeSource::new(producer, producer_key, 0),
             })
         );
 
@@ -1967,7 +1967,7 @@ mod tests {
                 consumer,
                 kernel_key,
                 1,
-                inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+                inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
                 wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
             )))
             .expect("a legal install");
@@ -2007,7 +2007,7 @@ mod tests {
             consumer,
             kernel_key,
             1,
-            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
             wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
         );
         let capabilities = TaskInboundCapabilities::new();
@@ -2124,7 +2124,7 @@ mod tests {
                 consumer,
                 kernel_key,
                 1,
-                inbound_topology(node, vec![ExchangeSource::new(producer, producer_key)]),
+                inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
                 wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
             )))
             .expect("a legal install");

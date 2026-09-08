@@ -57,8 +57,8 @@ use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, ret
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::observable::Observable;
-use novarocks_types::SlotId;
 use novarocks_types::format_uuid;
+use novarocks_types::{SlotId, UniqueId};
 use tracing::debug;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -72,6 +72,65 @@ impl ExchangeKey {
     #[inline]
     pub fn finst_uuid(&self) -> String {
         format_uuid(self.finst_id_hi, self.finst_id_lo)
+    }
+}
+
+/// The sender whose schema and end-of-stream facts this receiver observes.
+///
+/// Native frames use the immutable source fragment identity and the ordinal
+/// frozen by the task graph. Local execution has no native fragment identity,
+/// so it remains an explicit, disjoint identity instead of overloading a
+/// native sender field.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ExchangeSenderIdentity {
+    Native {
+        source_fragment_instance_id: UniqueId,
+        sender_ordinal: u32,
+    },
+    Local {
+        sender_id: i32,
+        backend_number: i32,
+    },
+}
+
+impl ExchangeSenderIdentity {
+    pub const fn native(source_fragment_instance_id: UniqueId, sender_ordinal: u32) -> Self {
+        Self::Native {
+            source_fragment_instance_id,
+            sender_ordinal,
+        }
+    }
+
+    pub const fn local(sender_id: i32, backend_number: i32) -> Self {
+        Self::Local {
+            sender_id,
+            backend_number,
+        }
+    }
+}
+
+impl std::fmt::Display for ExchangeSenderIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native {
+                source_fragment_instance_id,
+                sender_ordinal,
+            } => write!(
+                formatter,
+                "native(source_finst={}, ordinal={sender_ordinal})",
+                format_uuid(
+                    source_fragment_instance_id.high(),
+                    source_fragment_instance_id.low()
+                )
+            ),
+            Self::Local {
+                sender_id,
+                backend_number,
+            } => write!(
+                formatter,
+                "local(sender_id={sender_id}, backend_number={backend_number})"
+            ),
+        }
     }
 }
 
@@ -189,8 +248,8 @@ struct DecodedExchangePayload<'a> {
 struct ReceiverState {
     expected_senders: usize,
     expected_chunk_schema: Option<ChunkSchemaRef>,
-    sender_wire_meta: HashMap<(i32, i32), ExchangeWireMeta>,
-    finished: HashSet<(i32, i32)>, // (sender_id, be_number)
+    sender_wire_meta: HashMap<ExchangeSenderIdentity, ExchangeWireMeta>,
+    finished: HashSet<ExchangeSenderIdentity>,
     chunks: VecDeque<Chunk>,
     recv_request_count: u128,
     recv_payload_bytes: u128,
@@ -439,12 +498,11 @@ impl ExecutionExchangeRegistry {
     pub fn push_chunks(
         &self,
         key: ExchangeKey,
-        sender_id: i32,
-        be_number: i32,
+        sender: ExchangeSenderIdentity,
         chunks: Vec<Chunk>,
         eos: bool,
     ) {
-        self.push_chunks_with_stats(key, sender_id, be_number, chunks, eos, 0, 0);
+        self.push_chunks_with_stats(key, sender, chunks, eos, 0, 0);
     }
 
     #[expect(
@@ -454,8 +512,7 @@ impl ExecutionExchangeRegistry {
     pub fn push_chunks_with_stats(
         &self,
         key: ExchangeKey,
-        sender_id: i32,
-        be_number: i32,
+        sender: ExchangeSenderIdentity,
         mut chunks: Vec<Chunk>,
         eos: bool,
         payload_bytes: usize,
@@ -470,11 +527,10 @@ impl ExecutionExchangeRegistry {
         let should_notify = chunks_len != 0 || eos;
 
         debug!(
-            "push_chunks: finst={} node_id={} sender_id={} be_number={} chunks={} rows={} eos={}",
+            "push_chunks: finst={} node_id={} sender={} chunks={} rows={} eos={}",
             key.finst_uuid(),
             key.node_id,
-            sender_id,
-            be_number,
+            sender,
             chunks_len,
             row_count,
             eos
@@ -496,8 +552,8 @@ impl ExecutionExchangeRegistry {
         let hold_start = Instant::now();
         if st.canceled {
             debug!(
-                "push_chunks: CANCELED, dropping {} chunks ({} rows) from sender_id={}",
-                chunks_len, row_count, sender_id
+                "push_chunks: CANCELED, dropping {} chunks ({} rows) from sender={}",
+                chunks_len, row_count, sender
             );
             return;
         }
@@ -515,11 +571,10 @@ impl ExecutionExchangeRegistry {
             st.chunks.extend(chunks);
         }
         let eos_snapshot = if eos {
-            st.finished.insert((sender_id, be_number));
+            st.finished.insert(sender);
             debug!(
-                "push_chunks: sender_id={} be_number={} marked as FINISHED, total finished={}/{}",
-                sender_id,
-                be_number,
+                "push_chunks: sender={} marked as FINISHED, total finished={}/{}",
+                sender,
                 st.finished.len(),
                 st.expected_senders
             );
@@ -551,11 +606,10 @@ impl ExecutionExchangeRegistry {
         {
             emit_exchange_snapshot_marker(|| {
                 format!(
-                    "event=push_eos finst={} node_id={} sender_id={} be_number={} expected_senders={} finished_senders={:?} queued_chunks={} queued_rows={} receiver_generation_before_notify={}",
+                    "event=push_eos finst={} node_id={} sender={} expected_senders={} finished_senders={:?} queued_chunks={} queued_rows={} receiver_generation_before_notify={}",
                     key.finst_uuid(),
                     key.node_id,
-                    sender_id,
-                    be_number,
+                    sender,
                     expected_senders,
                     finished,
                     queued_chunks,
@@ -1482,8 +1536,7 @@ impl ExecutionExchangeRegistry {
     pub fn decode_chunks_for_sender(
         &self,
         key: ExchangeKey,
-        sender_id: i32,
-        be_number: i32,
+        sender: ExchangeSenderIdentity,
         bytes: &[u8],
     ) -> Result<Vec<Chunk>, String> {
         let DecodedExchangePayload {
@@ -1500,35 +1553,32 @@ impl ExecutionExchangeRegistry {
         {
             let mut st = receiver.mu.lock().expect("exchange receiver lock");
             if let Some(meta) = decoded_wire_meta {
-                match st.sender_wire_meta.get(&(sender_id, be_number)) {
+                match st.sender_wire_meta.get(&sender) {
                     Some(existing) if existing != &meta => {
                         return Err(format!(
-                            "exchange sender wire meta changed unexpectedly: finst={} node_id={} sender_id={} be_number={}",
+                            "exchange sender wire meta changed unexpectedly: finst={} node_id={} sender={}",
                             key.finst_uuid(),
                             key.node_id,
-                            sender_id,
-                            be_number
+                            sender
                         ));
                     }
                     Some(_) => {}
                     None => {
-                        st.sender_wire_meta
-                            .insert((sender_id, be_number), meta.clone());
+                        st.sender_wire_meta.insert(sender, meta.clone());
                     }
                 }
                 wire_meta = meta;
             } else {
                 wire_meta = st
                 .sender_wire_meta
-                .get(&(sender_id, be_number))
+                    .get(&sender)
                 .cloned()
                 .ok_or_else(|| {
                     format!(
-                        "exchange wire meta missing before first data chunk: finst={} node_id={} sender_id={} be_number={}",
+                        "exchange wire meta missing before first data chunk: finst={} node_id={} sender={}",
                         key.finst_uuid(),
                         key.node_id,
-                        sender_id,
-                        be_number
+                        sender
                     )
                 })?;
             }
@@ -1587,7 +1637,12 @@ pub fn push_chunks(
     chunks: Vec<Chunk>,
     eos: bool,
 ) {
-    test_registry().push_chunks(key, sender_id, backend_number, chunks, eos);
+    test_registry().push_chunks(
+        key,
+        ExchangeSenderIdentity::local(sender_id, backend_number),
+        chunks,
+        eos,
+    );
 }
 
 #[cfg(test)]
@@ -1610,7 +1665,11 @@ pub fn decode_chunks_for_sender(
     backend_number: i32,
     bytes: &[u8],
 ) -> Result<Vec<Chunk>, String> {
-    test_registry().decode_chunks_for_sender(key, sender_id, backend_number, bytes)
+    test_registry().decode_chunks_for_sender(
+        key,
+        ExchangeSenderIdentity::local(sender_id, backend_number),
+        bytes,
+    )
 }
 
 #[cfg(test)]
@@ -1627,12 +1686,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ExchangeKey, ExchangePopResult, cancel_exchange_key, decode_chunks,
-        decode_chunks_for_sender, decode_root_result_chunks, encode_chunks, get_receiver_handle,
-        push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
+        ExchangeKey, ExchangePopResult, ExchangeSenderIdentity, ExecutionExchangeRegistry,
+        cancel_exchange_key, decode_chunks, decode_chunks_for_sender, decode_root_result_chunks,
+        encode_chunks, get_receiver_handle, push_chunks, register_expected_chunk_schema,
+        set_expected_senders, snapshot_receiver_state,
     };
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-    use novarocks_types::SlotId;
+    use novarocks_types::{SlotId, UniqueId};
 
     const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
         SlotId::new(33),
@@ -2612,5 +2672,44 @@ mod tests {
         assert_eq!(snapshot.finished_senders, 2);
 
         cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn native_senders_keep_independent_wire_metadata_by_exact_identity() {
+        let key = ExchangeKey {
+            finst_id_hi: 501,
+            finst_id_lo: 502,
+            node_id: 31,
+        };
+        let registry = ExecutionExchangeRegistry::default();
+        let first = exchange_test_chunk("_cse_0");
+        let second_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            first.batch.schema().as_ref(),
+            &[
+                SlotId::new(133),
+                SlotId::new(134),
+                SlotId::new(131),
+                SlotId::new(132),
+            ],
+        )
+        .expect("second sender schema");
+        let second = Chunk::new_with_chunk_schema(first.batch.clone(), second_schema);
+        let first_payload = encode_chunks(&[first], true).expect("first sender payload");
+        let second_payload = encode_chunks(&[second], true).expect("second sender payload");
+        let first_sender = ExchangeSenderIdentity::native(UniqueId::new(1, 1), 0);
+        let second_sender = ExchangeSenderIdentity::native(UniqueId::new(2, 2), 1);
+
+        registry
+            .decode_chunks_for_sender(key, first_sender, &first_payload)
+            .expect("first sender establishes its own wire metadata");
+        registry
+            .decode_chunks_for_sender(key, second_sender, &second_payload)
+            .expect("second sender may carry different wire metadata");
+        assert!(
+            registry
+                .decode_chunks_for_sender(key, first_sender, &second_payload)
+                .expect_err("one exact sender cannot change its wire metadata")
+                .contains("sender wire meta changed unexpectedly")
+        );
     }
 }

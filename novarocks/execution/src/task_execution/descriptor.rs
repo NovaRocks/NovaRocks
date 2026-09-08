@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use novarocks_types::UniqueId;
 use novarocks_types::identity::BackendProcessId;
+use sha2::{Digest, Sha256};
 
 use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId, FragmentSinkKind};
 use crate::exec::fragment::sink::DataStreamPartitionType;
@@ -212,13 +213,19 @@ impl ExchangeEdge {
 pub struct ExchangeSource {
     task: TaskIdentity,
     fragment_instance_id: UniqueId,
+    sender_ordinal: u32,
 }
 
 impl ExchangeSource {
-    pub const fn new(task: TaskIdentity, fragment_instance_id: UniqueId) -> Self {
+    pub const fn new(
+        task: TaskIdentity,
+        fragment_instance_id: UniqueId,
+        sender_ordinal: u32,
+    ) -> Self {
         Self {
             task,
             fragment_instance_id,
+            sender_ordinal,
         }
     }
 
@@ -228,6 +235,10 @@ impl ExchangeSource {
 
     pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
+    }
+
+    pub const fn sender_ordinal(self) -> u32 {
+        self.sender_ordinal
     }
 }
 
@@ -269,6 +280,19 @@ impl ExchangeInbound {
         // inflate the expected sender count.
         if by_task.len() != sources.len() || by_key.len() != sources.len() {
             return Err(DescriptorError::DuplicateInboundSource(node_id));
+        }
+        let mut ordinals = sources
+            .iter()
+            .map(|source| source.sender_ordinal())
+            .collect::<Vec<_>>();
+        ordinals.sort_unstable();
+        let expected = (0..sources.len() as u32).collect::<Vec<_>>();
+        if ordinals != expected {
+            return Err(DescriptorError::InvalidInboundSenderOrdinals {
+                node: node_id,
+                expected,
+                received: ordinals,
+            });
         }
         Ok(Self { node_id, sources })
     }
@@ -365,6 +389,11 @@ pub enum DescriptorError {
     DuplicateEdgeDestination(ExchangeEdgeId),
     InboundWithoutSources(FragmentNodeId),
     DuplicateInboundSource(FragmentNodeId),
+    InvalidInboundSenderOrdinals {
+        node: FragmentNodeId,
+        expected: Vec<u32>,
+        received: Vec<u32>,
+    },
     DuplicateEdgeId,
     DuplicateInboundNode,
     DuplicateSplitPlanNode(PlanNodeId),
@@ -401,6 +430,14 @@ impl fmt::Display for DescriptorError {
             Self::DuplicateInboundSource(node) => write!(
                 formatter,
                 "inbound exchange node {node:?} repeats a source task"
+            ),
+            Self::InvalidInboundSenderOrdinals {
+                node,
+                expected,
+                received,
+            } => write!(
+                formatter,
+                "inbound exchange node {node:?} sender ordinals must be contiguous {expected:?}, received {received:?}"
             ),
             Self::DuplicateEdgeId => formatter.write_str("topology repeats an exchange edge id"),
             Self::DuplicateInboundNode => {
@@ -441,6 +478,8 @@ pub enum IngressRejection {
     SenderCountMismatch { expected: u32, received: u32 },
     /// The frame's sender ordinal is not below the expected sender count.
     SenderOrdinalOutOfRange { ordinal: u32, expected: u32 },
+    /// The sending instance used the ordinal frozen for another source.
+    SenderOrdinalMismatch { expected: u32, received: u32 },
 }
 
 impl fmt::Display for IngressRejection {
@@ -463,6 +502,10 @@ impl fmt::Display for IngressRejection {
                 formatter,
                 "inbound frame sender ordinal {ordinal} is not below {expected}"
             ),
+            Self::SenderOrdinalMismatch { expected, received } => write!(
+                formatter,
+                "inbound frame sender ordinal {received} does not match its frozen ordinal {expected}"
+            ),
         }
     }
 }
@@ -471,6 +514,9 @@ impl std::error::Error for IngressRejection {}
 
 /// Largest encoded plan a descriptor may carry.
 pub const TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Domain separation tag for the complete descriptor fingerprint.
+const TASK_DESCRIPTOR_FINGERPRINT_DOMAIN: &[u8] = b"novarocks.task_execution.task_descriptor.v2";
 
 /// The immutable creation contract of one task.
 #[derive(Clone, Debug)]
@@ -573,10 +619,31 @@ impl TaskDescriptor {
 
     /// A secret-free content identity of the whole descriptor.
     ///
-    /// This is what a create replay is compared on. It deliberately folds the
-    /// plan's own fingerprint rather than any part of its representation.
+    /// This is what a create replay is compared on. It covers every immutable
+    /// descriptor fact, including the complete exchange topology, and folds
+    /// the plan's own fingerprint rather than any part of its representation.
+    /// A replay therefore cannot change a source ordinal or any other frozen
+    /// routing fact while retaining the same plan and task identity.
     pub fn fingerprint(&self) -> ContentFingerprint {
-        self.plan.fingerprint()
+        let mut hasher = Sha256::new();
+        hasher.update(TASK_DESCRIPTOR_FINGERPRINT_DOMAIN);
+        fingerprint_task_identity(&mut hasher, self.identity);
+        fingerprint_unique_id(&mut hasher, self.fragment_instance_id);
+        hasher.update(self.contract_version.get().to_le_bytes());
+        hasher.update((self.pipeline_dop.get() as u64).to_le_bytes());
+
+        fingerprint_len(&mut hasher, self.split_plan_nodes.len());
+        for node in &self.split_plan_nodes {
+            hasher.update(node.get().to_le_bytes());
+        }
+
+        fingerprint_topology(&mut hasher, &self.topology);
+        hasher.update(self.plan.fingerprint().to_bytes());
+
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        ContentFingerprint::from_bytes(bytes)
     }
 
     /// Whether an inbound exchange frame may be admitted.
@@ -620,6 +687,12 @@ impl TaskDescriptor {
                 expected,
             });
         }
+        if sender_ordinal != source.sender_ordinal() {
+            return Err(IngressRejection::SenderOrdinalMismatch {
+                expected: source.sender_ordinal(),
+                received: sender_ordinal,
+            });
+        }
         Ok(source)
     }
 
@@ -644,6 +717,61 @@ impl PartialEq for TaskDescriptor {
 }
 
 impl Eq for TaskDescriptor {}
+
+fn fingerprint_len(hasher: &mut Sha256, len: usize) {
+    hasher.update((len as u64).to_le_bytes());
+}
+
+fn fingerprint_unique_id(hasher: &mut Sha256, value: UniqueId) {
+    hasher.update(value.high().to_le_bytes());
+    hasher.update(value.low().to_le_bytes());
+}
+
+fn fingerprint_task_identity(hasher: &mut Sha256, value: TaskIdentity) {
+    let execution = value.query_execution_id();
+    hasher.update(execution.query_id().high().to_le_bytes());
+    hasher.update(execution.query_id().low().to_le_bytes());
+    hasher.update(execution.attempt_id().get().to_le_bytes());
+    hasher.update(value.stage_id().get().to_le_bytes());
+    hasher.update(value.task_id().get().to_le_bytes());
+    hasher.update(value.backend_process_id().to_bytes());
+}
+
+fn fingerprint_topology(hasher: &mut Sha256, topology: &ExchangeTopology) {
+    fingerprint_len(hasher, topology.outbound().len());
+    for edge in topology.outbound() {
+        hasher.update(edge.edge_id().get().to_le_bytes());
+        hasher.update(edge.destination_node_id().get().to_le_bytes());
+        hasher.update([match edge.partitioning() {
+            DataStreamPartitionType::Unpartitioned => 1,
+            DataStreamPartitionType::Random => 2,
+            DataStreamPartitionType::HashPartitioned => 3,
+            DataStreamPartitionType::BucketShuffleHashPartitioned => 4,
+        }]);
+        fingerprint_len(hasher, edge.destinations().len());
+        for destination in edge.destinations() {
+            fingerprint_task_identity(hasher, destination.task());
+            fingerprint_unique_id(hasher, destination.fragment_instance_id());
+            fingerprint_len(hasher, destination.endpoint().host().len());
+            hasher.update(destination.endpoint().host().as_bytes());
+            hasher.update(destination.endpoint().port().to_le_bytes());
+            hasher.update(destination.destination_node_id().get().to_le_bytes());
+            hasher.update(destination.sender_ordinal().to_le_bytes());
+            hasher.update(destination.sender_count().get().to_le_bytes());
+        }
+    }
+
+    fingerprint_len(hasher, topology.inbound().len());
+    for inbound in topology.inbound() {
+        hasher.update(inbound.node_id().get().to_le_bytes());
+        fingerprint_len(hasher, inbound.sources().len());
+        for source in inbound.sources() {
+            fingerprint_task_identity(hasher, source.task());
+            fingerprint_unique_id(hasher, source.fragment_instance_id());
+            hasher.update(source.sender_ordinal().to_le_bytes());
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -765,7 +893,11 @@ mod tests {
     }
 
     fn source(from: TaskIdentity) -> ExchangeSource {
-        ExchangeSource::new(from, key(from.stage_id().get(), from.task_id().get()))
+        ExchangeSource::new(
+            from,
+            key(from.stage_id().get(), from.task_id().get()),
+            from.task_id().get() - 1,
+        )
     }
 
     fn descriptor(
@@ -926,8 +1058,8 @@ mod tests {
             ExchangeInbound::try_new(
                 FragmentNodeId::new(10),
                 vec![
-                    ExchangeSource::new(task(1, 1, backend), key(9, 9)),
-                    ExchangeSource::new(task(1, 2, backend), key(9, 9)),
+                    ExchangeSource::new(task(1, 1, backend), key(9, 9), 0),
+                    ExchangeSource::new(task(1, 2, backend), key(9, 9), 1),
                 ]
             ),
             Err(DescriptorError::DuplicateInboundSource(
@@ -947,6 +1079,32 @@ mod tests {
             Some(task(1, 2, backend))
         );
         assert_eq!(inbound.source_by_kernel_key(key(4, 4)), None);
+
+        for (invalid, received) in [
+            (
+                vec![
+                    ExchangeSource::new(task(1, 1, backend), key(1, 1), 0),
+                    ExchangeSource::new(task(1, 2, backend), key(1, 2), 0),
+                ],
+                vec![0, 0],
+            ),
+            (
+                vec![
+                    ExchangeSource::new(task(1, 1, backend), key(1, 1), 0),
+                    ExchangeSource::new(task(1, 2, backend), key(1, 2), 2),
+                ],
+                vec![0, 2],
+            ),
+        ] {
+            assert_eq!(
+                ExchangeInbound::try_new(FragmentNodeId::new(11), invalid),
+                Err(DescriptorError::InvalidInboundSenderOrdinals {
+                    node: FragmentNodeId::new(11),
+                    expected: vec![0, 1],
+                    received,
+                })
+            );
+        }
     }
 
     #[test]
@@ -1066,6 +1224,50 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_fingerprint_covers_the_frozen_sender_assignment() {
+        let backend = BackendProcessId::new_v7();
+        let identity = task(9, 1, backend);
+        let source_a = task(1, 1, backend);
+        let source_b = task(1, 2, backend);
+        let first = descriptor(
+            identity,
+            vec![
+                ExchangeInbound::try_new(
+                    FragmentNodeId::new(20),
+                    vec![
+                        ExchangeSource::new(source_a, key(1, 1), 0),
+                        ExchangeSource::new(source_b, key(1, 2), 1),
+                    ],
+                )
+                .expect("legal inbound"),
+            ],
+            Vec::new(),
+            7,
+        );
+        let reassigned = descriptor(
+            identity,
+            vec![
+                ExchangeInbound::try_new(
+                    FragmentNodeId::new(20),
+                    vec![
+                        ExchangeSource::new(source_a, key(1, 1), 1),
+                        ExchangeSource::new(source_b, key(1, 2), 0),
+                    ],
+                )
+                .expect("legal inbound"),
+            ],
+            Vec::new(),
+            7,
+        );
+
+        assert_ne!(
+            first.fingerprint(),
+            reassigned.fingerprint(),
+            "a CreateTask replay cannot change source-to-ordinal ownership"
+        );
+    }
+
+    #[test]
     fn the_descriptor_exposes_only_typed_plan_facts() {
         let descriptor = descriptor(
             task(1, 1, BackendProcessId::new_v7()),
@@ -1078,9 +1280,10 @@ mod tests {
             FragmentContractVersion::CURRENT
         );
         assert_eq!(descriptor.sink_kind(), FragmentSinkKind::DataStream);
-        assert_eq!(
+        assert_ne!(
             descriptor.fingerprint(),
-            ContentFingerprint::from_bytes([3; 16])
+            descriptor.plan().fingerprint(),
+            "the descriptor fingerprint covers more than the plan"
         );
         assert_eq!(descriptor.plan().encoded_len(), 1024);
         assert_eq!(descriptor.fragment_instance_id(), OWN_KEY);
@@ -1150,6 +1353,13 @@ mod tests {
             Err(IngressRejection::SenderOrdinalOutOfRange {
                 ordinal: 2,
                 expected: 2
+            })
+        );
+        assert_eq!(
+            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 2), 0, 2),
+            Err(IngressRejection::SenderOrdinalMismatch {
+                expected: 1,
+                received: 0
             })
         );
     }

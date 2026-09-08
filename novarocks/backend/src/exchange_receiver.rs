@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use novarocks_execution::runtime::exchange::ExchangeKey;
+use novarocks_execution::runtime::exchange::{ExchangeKey, ExchangeSenderIdentity};
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
@@ -45,16 +45,12 @@ impl ExchangeReceiverPort for BackendExchangeReceiverPort {
         let exchange_key = Self::key(key);
         let decode_start = Instant::now();
         let registry = self.runtime.exchange_registry();
-        let chunks = registry.decode_chunks_for_sender(
-            exchange_key,
-            frame.sender_id,
-            frame.backend_number,
-            &frame.payload,
-        )?;
+        let sender =
+            ExchangeSenderIdentity::native(frame.source_fragment_instance_id, frame.sender_ordinal);
+        let chunks = registry.decode_chunks_for_sender(exchange_key, sender, &frame.payload)?;
         registry.push_chunks_with_stats(
             exchange_key,
-            frame.sender_id,
-            frame.backend_number,
+            sender,
             chunks,
             frame.eos,
             frame.payload.len(),
@@ -111,8 +107,7 @@ impl ExchangeReceiverPort for BackendExchangeReceiverPort {
     ) {
         self.runtime.exchange_registry().push_chunks(
             Self::key(key),
-            sender_id,
-            backend_number,
+            ExchangeSenderIdentity::local(sender_id, backend_number),
             chunks,
             eos,
         );

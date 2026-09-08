@@ -27,9 +27,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use novarocks_execution::exec::fragment::program::{FragmentContractVersion, FragmentSinkKind};
+use novarocks_execution::exec::fragment::program::{
+    FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
+};
 use novarocks_execution::task_execution::descriptor::{
-    ExchangeTopology, PhysicalFragmentPlan, TaskDescriptor,
+    ExchangeInbound, ExchangeSource, ExchangeTopology, PhysicalFragmentPlan, TaskDescriptor,
 };
 use novarocks_execution::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
@@ -788,6 +790,62 @@ fn a_conflicting_descriptor_fails_closed() {
     assert!(fixture.registry.has_live_task(identity));
     assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 0);
+}
+
+#[test]
+fn a_changed_sender_assignment_is_a_create_conflict_even_with_the_same_plan() {
+    let fixture = Fixture::new();
+    let context = fixture.establish(1);
+    let identity = fixture.identity(1, 3, 1);
+    let source_a = fixture.identity(1, 1, 1);
+    let source_b = fixture.identity(1, 1, 2);
+    let descriptor = |a_ordinal, b_ordinal| {
+        TaskDescriptor::try_new(
+            identity,
+            UniqueId::new(3, 1),
+            std::num::NonZeroUsize::new(2).expect("nonzero dop"),
+            vec![PlanNodeId::new(3).expect("nonnegative node")],
+            ExchangeTopology::try_new(
+                Vec::new(),
+                vec![
+                    ExchangeInbound::try_new(
+                        FragmentNodeId::new(20),
+                        vec![
+                            ExchangeSource::new(source_a, UniqueId::new(1, 1), a_ordinal),
+                            ExchangeSource::new(source_b, UniqueId::new(1, 2), b_ordinal),
+                        ],
+                    )
+                    .expect("legal inbound"),
+                ],
+            )
+            .expect("legal topology"),
+            FakePlan::arc(5),
+        )
+        .expect("legal descriptor")
+    };
+
+    let accepted = fixture.registry.create_task(
+        &CreateTask::try_new(
+            TaskOperationId::new_v7(),
+            context,
+            descriptor(0, 1),
+            Vec::new(),
+        )
+        .expect("legal create"),
+    );
+    assert_eq!(accepted.outcome(), OperationOutcome::Accepted);
+
+    let conflicting = fixture.registry.create_task(
+        &CreateTask::try_new(
+            TaskOperationId::new_v7(),
+            context,
+            descriptor(1, 0),
+            Vec::new(),
+        )
+        .expect("legal create"),
+    );
+    assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
+    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
 }
 
 #[test]

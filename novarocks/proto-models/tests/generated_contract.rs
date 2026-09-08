@@ -1112,7 +1112,8 @@ fn the_task_operation_and_query_context_command_sets_are_closed() {
 
 /// A frozen exchange endpoint carries both addresses. The task identity is the
 /// process fence; the fragment instance id is what an actual exchange frame
-/// carries. Losing either one makes a frame uncheckable.
+/// carries. A source also freezes the sender ordinal used for receiver
+/// completion. Losing any of these facts makes a frame uncheckable.
 #[test]
 fn the_task_exchange_topology_freezes_both_addresses() {
     let pool =
@@ -1148,6 +1149,18 @@ fn the_task_exchange_topology_freezes_both_addresses() {
             "{message_name} must carry the kernel key an exchange frame uses"
         );
     }
+
+    let source = pool
+        .get_message_by_name("novarocks.TaskExchangeSource")
+        .expect("TaskExchangeSource descriptor");
+    assert_eq!(
+        source
+            .get_field_by_name("sender_ordinal")
+            .expect("the frozen sender ordinal")
+            .number(),
+        3,
+        "TaskExchangeSource.sender_ordinal must retain field number 3"
+    );
 
     // The sender count of an inbound node is its frozen source set, so there
     // is deliberately no separate count field that could disagree with it.

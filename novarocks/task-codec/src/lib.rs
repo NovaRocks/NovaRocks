@@ -393,10 +393,18 @@ mod tests {
             }],
             inbound: vec![novarocks::TaskExchangeInbound {
                 destination_node_id: 30,
-                sources: vec![novarocks::TaskExchangeSource {
-                    task: Some(encode_task_identity(identity(1, 1, process))),
-                    fragment_instance_id: Some(unique(1, 1)),
-                }],
+                sources: vec![
+                    novarocks::TaskExchangeSource {
+                        task: Some(encode_task_identity(identity(1, 1, process))),
+                        fragment_instance_id: Some(unique(1, 1)),
+                        sender_ordinal: 0,
+                    },
+                    novarocks::TaskExchangeSource {
+                        task: Some(encode_task_identity(identity(1, 2, process))),
+                        fragment_instance_id: Some(unique(1, 2)),
+                        sender_ordinal: 1,
+                    },
+                ],
             }],
         };
         let decoded = decode_topology(&wire, FieldPath::root("topology")).expect("legal topology");
@@ -405,7 +413,7 @@ mod tests {
             decoded.outbound()[0].destinations()[0].fragment_instance_id(),
             novarocks_types::UniqueId::new(3, 1)
         );
-        assert_eq!(decoded.inbound()[0].expected_sender_count().get(), 1);
+        assert_eq!(decoded.inbound()[0].expected_sender_count().get(), 2);
         assert_eq!(encode_topology(&decoded), wire);
 
         let mut duplicate = wire.clone();
@@ -414,12 +422,22 @@ mod tests {
             .push(novarocks::TaskExchangeSource {
                 task: Some(encode_task_identity(identity(1, 1, process))),
                 fragment_instance_id: Some(unique(1, 1)),
+                sender_ordinal: 0,
             });
         assert_eq!(
             decode_topology(&duplicate, FieldPath::root("topology"))
                 .expect_err("a repeated source inflates the sender count")
                 .kind(),
             ProtocolErrorKind::DuplicateField
+        );
+
+        let mut wrong_ordinal = wire.clone();
+        wrong_ordinal.inbound[0].sources[1].sender_ordinal = 0;
+        assert_eq!(
+            decode_topology(&wrong_ordinal, FieldPath::root("topology"))
+                .expect_err("each source owns exactly one ordinal")
+                .kind(),
+            ProtocolErrorKind::InconsistentFields
         );
 
         let mut unspecified = wire;

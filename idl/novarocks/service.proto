@@ -621,6 +621,7 @@ message TaskExchangeDestination {
 message TaskExchangeSource {
   TaskIdentity task = 1;
   novarocks.common.UniqueId fragment_instance_id = 2;
+  uint32 sender_ordinal = 3;  // exact ordinal frozen for this source
 }
 
 // One outbound push exchange edge. The destination set is frozen here and

@@ -709,9 +709,16 @@ fn build_topologies(
                 .entry((consumer, fragment_edge.target_exchange_node_id))
                 .or_default();
             for &producer in &producers {
+                let sender_ordinal = *senders.ordinals.get(&producer).ok_or_else(|| {
+                    TaskExecutionError::Schedule(format!(
+                        "producer task {producer} is absent from the sender set of exchange node {}",
+                        fragment_edge.target_exchange_node_id
+                    ))
+                })?;
                 sources.push(ExchangeSource::new(
                     tasks[&producer].identity,
                     tasks[&producer].fragment_instance_id,
+                    sender_ordinal,
                 ));
             }
         }

@@ -415,9 +415,17 @@ fn decode_inbound(
             source_path.field("fragment_instance_id"),
             "exchange source requires a fragment instance id",
         )?;
-        sources.push(ExchangeSource::new(task, key));
+        sources.push(ExchangeSource::new(task, key, source.sender_ordinal));
     }
-    ExchangeInbound::try_new(node, sources).map_err(|error| duplicate(path, error.to_string()))
+    ExchangeInbound::try_new(node, sources).map_err(|error| match error {
+        novarocks_execution::task_execution::descriptor::DescriptorError::DuplicateInboundSource(
+            _,
+        ) => duplicate(path, error.to_string()),
+        novarocks_execution::task_execution::descriptor::DescriptorError::InvalidInboundSenderOrdinals {
+            ..
+        } => inconsistent(path, error.to_string()),
+        _ => inconsistent(path, error.to_string()),
+    })
 }
 
 fn encode_inbound(value: &ExchangeInbound) -> novarocks::TaskExchangeInbound {
@@ -429,6 +437,7 @@ fn encode_inbound(value: &ExchangeInbound) -> novarocks::TaskExchangeInbound {
             .map(|source| novarocks::TaskExchangeSource {
                 task: Some(encode_task_identity(source.task())),
                 fragment_instance_id: Some(encode_unique_id(source.fragment_instance_id())),
+                sender_ordinal: source.sender_ordinal(),
             })
             .collect(),
     }
