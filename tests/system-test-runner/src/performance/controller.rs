@@ -555,15 +555,20 @@ fn run_mixed_window(
     monitor: &ProcessResourceMonitor,
     timeline: MonotonicTimeline,
 ) -> Result<(Vec<QuerySample>, Vec<BusinessSample>, MeasurementWindow)> {
-    let timeout = Duration::from_millis(workload.job_timeout_ms)
-        .min(context.remaining("run mixed performance window")?);
+    let scenario_remaining = context.remaining("run mixed performance window")?;
+    let timeout = Duration::from_millis(workload.job_timeout_ms).min(scenario_remaining);
+    let transport_timeout = mixed_transport_timeout(timeout, scenario_remaining);
     let configured_concurrency = workload.foreground_clients + workload.producers.len();
     // Connect before releasing the start barrier. A failed connection cannot
     // leave the other clients parked forever on an unreachable barrier count.
     let mut connections = Vec::with_capacity(configured_concurrency);
     for _ in 0..configured_concurrency {
-        let mut connection =
-            mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
+        let mut connection = mysql_actor::connect_with_io_timeout(
+            context.mysql_user(),
+            context.mysql_port(),
+            timeout,
+            transport_timeout,
+        )?;
         connection.query_drop(format!(
             "SET query_timeout = {}",
             timeout.as_millis().div_ceil(1000).max(1)
@@ -1021,6 +1026,14 @@ fn completion_outcome(completed: Instant, deadline: Instant) -> &'static str {
     }
 }
 
+fn mixed_transport_timeout(job_timeout: Duration, scenario_remaining: Duration) -> Duration {
+    const TRANSPORT_GRACE: Duration = Duration::from_secs(5);
+    job_timeout
+        .checked_add(TRANSPORT_GRACE)
+        .unwrap_or(Duration::MAX)
+        .min(scenario_remaining)
+}
+
 fn completion_outcome_micros(completed: u128, deadline: u128) -> &'static str {
     if completed <= deadline {
         "success"
@@ -1132,6 +1145,22 @@ mod tests {
     fn completion_after_window_is_not_success() {
         assert_eq!(completion_outcome_micros(100, 100), "success");
         assert_eq!(completion_outcome_micros(101, 100), "drained-after-window");
+    }
+
+    #[test]
+    fn mixed_transport_timeout_preserves_business_deadline_and_respects_scenario_bound() {
+        assert_eq!(
+            mixed_transport_timeout(Duration::from_secs(15), Duration::from_secs(90)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            mixed_transport_timeout(Duration::from_secs(15), Duration::from_secs(17)),
+            Duration::from_secs(17)
+        );
+        assert_eq!(
+            mixed_transport_timeout(Duration::MAX, Duration::from_secs(90)),
+            Duration::from_secs(90)
+        );
     }
 
     #[test]
