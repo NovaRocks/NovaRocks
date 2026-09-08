@@ -3212,20 +3212,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-connector-starrocks"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "base64 0.22.1",
- "bytes",
- "futures",
- "novarocks-spi",
- "reqwest",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "novarocks-execution"
 version = "0.1.0"
 dependencies = [
@@ -3442,7 +3428,6 @@ dependencies = [
  "novarocks-connector-iceberg",
  "novarocks-connector-iceberg-functions",
  "novarocks-connector-paimon",
- "novarocks-connector-starrocks",
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-frontend",
@@ -4848,7 +4833,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
