@@ -397,26 +397,19 @@ fn collect_table_identity(
         "mixed fixture identity aggregate differs from its frozen oracle"
     );
 
-    // Query the whole frozen relation so column presence is observed from the
-    // provider schema. The current benchmark recipe is unpartitioned and its
-    // `$files` relation must therefore omit the schema-derived `partition`
-    // column. A partitioned relation cannot be normalized until the SQL
-    // protocol exposes the nested partition field shape, so it fails closed.
-    let file_rows: Vec<Row> = connection.query(format!("SELECT * FROM {table}$files"))?;
+    // The closed benchmark fixture is created without a partition transform.
+    // Read only the scalar `$files` facts needed for identity; selecting the
+    // optional nested `partition` column would make an unpartitioned fixture
+    // depend on an unrelated MySQL nested-value representation.
+    let file_rows: Vec<Row> = connection.query(format!(
+        "SELECT content, file_path, file_format, spec_id, record_count, file_size_in_bytes FROM {table}$files"
+    ))?;
     ensure!(
         !file_rows.is_empty(),
         "mixed fixture identity has no `$files` rows"
     );
     let mut files = Vec::with_capacity(file_rows.len());
     for row in file_rows {
-        let has_partition = row
-            .columns_ref()
-            .iter()
-            .any(|column| column.name_str().eq_ignore_ascii_case("partition"));
-        ensure!(
-            !has_partition,
-            "partitioned `$files` identity cannot be normalized because the MySQL surface does not expose nested partition field shape"
-        );
         let content = required_number::<i32>(&row, "content")?;
         let spec_id = required_number::<i32>(&row, "spec_id")?;
         let record_count = u64::try_from(required_number::<i64>(&row, "record_count")?)
