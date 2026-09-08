@@ -26,8 +26,9 @@
 //!   participant failed.
 //! * **Execution succeeded.** Proved by the task substrate's verdict over the
 //!   frozen writer set and root finish task. It refuses a writer that stood
-//!   down or a task that published undeclared writer facts, while saying
-//!   nothing about whether the frontend received the complete write data.
+//!   down before completing its output responsibility or a task that
+//!   published undeclared writer facts, while saying nothing about whether
+//!   the frontend received the complete write data.
 //!
 //! Before this split, one signal stood for both, and a query could reach a
 //! commit on the strength of half the evidence. Keeping them separate is the

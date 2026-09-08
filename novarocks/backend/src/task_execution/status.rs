@@ -566,10 +566,26 @@ impl TaskStatusReporter {
     }
 
     pub fn canceled(&self, reason: CancelReason) -> StatusAdvance {
+        self.canceled_with_output(reason, TaskOutputFacts::default())
+    }
+
+    /// Completes a normal stand-down while preserving whether the fragment
+    /// had already satisfied its output responsibility.
+    ///
+    /// The terminal remains `CANCELED` because the stand-down won the
+    /// lifecycle race. The output fact is independent evidence used by
+    /// consumers, such as the distributed-write commit gate, that must tell a
+    /// completed sink from one that stopped before publishing all of its
+    /// output.
+    pub fn canceled_with_output(
+        &self,
+        reason: CancelReason,
+        output: TaskOutputFacts,
+    ) -> StatusAdvance {
         self.owner.advance(
             TaskState::Canceled,
             Some(TerminationDetail::Canceled(reason)),
-            TaskOutputFacts::default(),
+            output,
         )
     }
 

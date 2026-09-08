@@ -1359,7 +1359,18 @@ fn report_terminal(
         match stand_down {
             StandDown::Cancel(reason) => {
                 reporter.canceling(reason);
-                reporter.canceled(reason);
+                let output = if matches!(fact.outcome(), FragmentOutcome::Succeeded)
+                    && !matches!(sink_kind, FragmentSinkKind::Result)
+                {
+                    // The cancellation won the lifecycle race, but the
+                    // non-root sink still ran to success. Preserve that
+                    // independent fact so a consumer can distinguish this
+                    // race from a sink that actually stopped early.
+                    TaskOutputFacts::new(true)
+                } else {
+                    TaskOutputFacts::default()
+                };
+                reporter.canceled_with_output(reason, output);
             }
             StandDown::Abort(cause) => {
                 reporter.aborting(cause);
@@ -2946,6 +2957,30 @@ mod tests {
         );
 
         assert_eq!(owner.state(), TaskState::Canceled);
+        assert!(
+            owner.current().output().responsibility_complete(),
+            "a non-root sink that reached success preserves output completion despite the cancel race"
+        );
+        assert!(owner.output_released());
+    }
+
+    #[test]
+    fn a_stood_down_task_that_did_not_succeed_cannot_claim_output_completion() {
+        let task = identity(33, 2, 1);
+        let (owner, reporter) = reporter_for(task);
+        reporter.running();
+
+        report_terminal(
+            &reporter,
+            FragmentSinkKind::Noop,
+            &terminal_fact(FragmentOutcome::Cancelled {
+                reason: FragmentCancelReason::new("cancel reached the fragment"),
+            }),
+            Some(StandDown::Cancel(CancelReason::UpstreamNoLongerNeeded)),
+        );
+
+        assert_eq!(owner.state(), TaskState::Canceled);
+        assert!(!owner.current().output().responsibility_complete());
         assert!(owner.output_released());
     }
 

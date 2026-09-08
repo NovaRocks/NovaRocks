@@ -41,6 +41,16 @@ use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContribution
 use super::error::TaskExecutionError;
 use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
 
+/// Backoff for a release that reached a backend before its local in-flight
+/// operations finished settling.
+///
+/// `NotReady` is an observed outcome, so retrying the exact immutable request
+/// is safe. The lower bound prevents the coordinator's 5 ms turn cadence from
+/// becoming an RPC loop; the cap keeps a context converging well inside its
+/// lease and the attempt's drain budget.
+const RELEASE_RETRY_INITIAL: Duration = Duration::from_millis(50);
+const RELEASE_RETRY_MAX: Duration = Duration::from_secs(1);
+
 /// The shared facts an establish installs atomically.
 ///
 /// All four are codec-owned content: the frontend can size and pass them
@@ -103,7 +113,7 @@ pub enum ReleaseSettlement {
     /// Shared resources are gone and this context is retained terminal.
     Released,
     /// Something is still draining. The owner keeps renewing and resends the
-    /// identical request once local state advances.
+    /// identical request after local progress or a bounded backoff.
     NotReadyKeepRenewing,
     /// The outcome was genuinely unknown; the identical request must be resent.
     RetryExactRequest,
@@ -129,6 +139,8 @@ pub struct QueryContextOwner {
     release: Option<ReleaseQueryContext>,
     release_in_flight: bool,
     release_blocked_at: Option<u64>,
+    release_retry_at: Option<MonotonicInstant>,
+    release_retry_delay: Duration,
     released: bool,
     abort: Option<AbortQueryContext>,
     progress: u64,
@@ -162,6 +174,8 @@ impl QueryContextOwner {
             release: None,
             release_in_flight: false,
             release_blocked_at: None,
+            release_retry_at: None,
+            release_retry_delay: RELEASE_RETRY_INITIAL,
             released: false,
             abort: None,
             progress: 0,
@@ -311,7 +325,7 @@ impl QueryContextOwner {
     }
 
     /// The release request, once every local obligation has closed.
-    pub fn release_intent(&mut self) -> Option<OperationIntent> {
+    pub fn release_intent(&mut self, now: MonotonicInstant) -> Option<OperationIntent> {
         if self.released || self.release_in_flight {
             return None;
         }
@@ -322,7 +336,15 @@ impl QueryContextOwner {
             return None;
         }
         if self.release_blocked_at == Some(self.progress) {
-            return None;
+            if self.release_retry_at.is_none_or(|retry_at| now < retry_at) {
+                return None;
+            }
+        } else {
+            // Frontend-visible progress is stronger than the timer: retry
+            // immediately, and begin again at the initial delay if the
+            // backend still has a local operation settling.
+            self.release_retry_at = None;
+            self.release_retry_delay = RELEASE_RETRY_INITIAL;
         }
         let request = *self.release.get_or_insert_with(|| {
             ReleaseQueryContext::new(TaskOperationId::new_v7(), self.context)
@@ -477,6 +499,7 @@ impl QueryContextOwner {
     pub fn on_release_ack(
         &mut self,
         ack: &OperationAcknowledgement,
+        now: MonotonicInstant,
     ) -> Result<ReleaseSettlement, TaskExecutionError> {
         if self
             .release
@@ -513,19 +536,29 @@ impl QueryContextOwner {
                 }
                 ReleaseOutcome::NotReady => {
                     // Not applied and not first-wins, so the identical request
-                    // is resent once local state has advanced. The lease keeps
-                    // being renewed in the meantime.
-                    self.release_blocked_at = Some(self.progress);
+                    // is resent after local progress or a bounded backoff. A
+                    // backend-local operation can finish without producing a
+                    // new frontend progress fact, so progress alone cannot be
+                    // the retry trigger. The lease keeps being renewed in the
+                    // meantime.
+                    self.defer_release_retry(now);
                     ReleaseSettlement::NotReadyKeepRenewing
                 }
             });
         }
         match ack.outcome() {
             OperationOutcome::ReleaseNotReady => {
-                self.release_blocked_at = Some(self.progress);
+                self.defer_release_retry(now);
                 Ok(ReleaseSettlement::NotReadyKeepRenewing)
             }
-            OperationOutcome::RetryableTransportUnknown => Ok(ReleaseSettlement::RetryExactRequest),
+            OperationOutcome::RetryableTransportUnknown => {
+                // The backend outcome is unknown, so preserve the existing
+                // exact-request replay behavior without adding a NotReady
+                // delay that was never observed.
+                self.release_blocked_at = None;
+                self.release_retry_at = None;
+                Ok(ReleaseSettlement::RetryExactRequest)
+            }
             OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone => {
                 self.state = QueryContextState::TerminalRetained;
                 self.released = true;
@@ -565,6 +598,15 @@ impl QueryContextOwner {
     /// How long this owner may sleep before its next renewal is due.
     pub fn renew_delay(&self, now: MonotonicInstant) -> Option<Duration> {
         self.renew_schedule.map(|schedule| schedule.delay_from(now))
+    }
+
+    fn defer_release_retry(&mut self, now: MonotonicInstant) {
+        self.release_blocked_at = Some(self.progress);
+        self.release_retry_at = Some(now.saturating_add(self.release_retry_delay));
+        self.release_retry_delay = self
+            .release_retry_delay
+            .saturating_mul(2)
+            .min(RELEASE_RETRY_MAX);
     }
 
     fn request_id(request: &Arc<UpdateQueryContext>) -> TaskOperationId {

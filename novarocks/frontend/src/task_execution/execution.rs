@@ -325,7 +325,7 @@ impl QueryTaskExecution {
             if let Some(intent) = owner.renew_intent(now)? {
                 lifecycle.push((OperationTarget::Context(context), intent));
             }
-            if let Some(intent) = owner.release_intent() {
+            if let Some(intent) = owner.release_intent(now) {
                 lifecycle.push((OperationTarget::Context(context), intent));
             }
         }
@@ -499,6 +499,7 @@ impl QueryTaskExecution {
         context: QueryContextRef,
         ack: &OperationAcknowledgement,
     ) -> Result<(), TaskExecutionError> {
+        let now = self.clock.now();
         let owner = self
             .owners
             .get_mut(&context)
@@ -507,7 +508,7 @@ impl QueryTaskExecution {
             OperationKind::UpdateQueryContext => owner.on_context_ack(ack),
             OperationKind::ReleaseQueryContext => {
                 owner
-                    .on_release_ack(ack)
+                    .on_release_ack(ack, now)
                     .and_then(|settlement| match settlement {
                         ReleaseSettlement::FailedClosed(outcome) => {
                             Err(TaskExecutionError::OperationFailed {

@@ -1450,8 +1450,9 @@ impl FrontendDistributedQueryCoordinator {
             if round.client_visible_completion() {
                 match write_completion.as_mut() {
                     // A write's completion is not the read's. Every declared
-                    // writer and the root finish task must have published
-                    // FINISHED, so this keeps turning while one has not.
+                    // writer must prove successful output completion and the
+                    // root finish task must publish FINISHED, so this keeps
+                    // turning while one has not.
                     Some(tracker) => {
                         observe_write_statuses(&round, tracker);
                         if tracker

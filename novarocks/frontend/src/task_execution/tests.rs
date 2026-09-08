@@ -1319,7 +1319,7 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
     );
     let mut owner = QueryContextOwner::new(context, 2);
     assert!(
-        owner.release_intent().is_none(),
+        owner.release_intent(MonotonicInstant::ORIGIN).is_none(),
         "a release may not precede the establish acknowledgement"
     );
 
@@ -1349,13 +1349,13 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
 
     owner.note_create_acknowledged();
     assert!(
-        owner.release_intent().is_none(),
+        owner.release_intent(MonotonicInstant::ORIGIN).is_none(),
         "creates are not closed while one is outstanding"
     );
     owner.note_create_acknowledged();
     assert!(owner.creates_closed());
     assert!(
-        owner.release_intent().is_none(),
+        owner.release_intent(MonotonicInstant::ORIGIN).is_none(),
         "closure alone is not drain"
     );
 
@@ -1363,12 +1363,12 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
     owner.note_task_drained();
     owner.note_output_released();
     assert!(
-        owner.release_intent().is_none(),
+        owner.release_intent(MonotonicInstant::ORIGIN).is_none(),
         "one output responsibility is still open"
     );
     owner.note_output_released();
     let release = owner
-        .release_intent()
+        .release_intent(MonotonicInstant::ORIGIN)
         .expect("closure and drain release the context");
 
     let not_ready = OperationAcknowledgement::new(
@@ -1385,7 +1385,7 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
     );
     assert_eq!(
         owner
-            .on_release_ack(&not_ready)
+            .on_release_ack(&not_ready, MonotonicInstant::ORIGIN)
             .expect("a not-ready answer settles"),
         ReleaseSettlement::NotReadyKeepRenewing
     );
@@ -1399,28 +1399,65 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
         "a not-ready release keeps the lease alive"
     );
     assert!(
-        owner.release_intent().is_none(),
-        "the identical release waits for local state to advance"
+        owner
+            .release_intent(MonotonicInstant::from_origin(Duration::from_millis(49)))
+            .is_none(),
+        "the identical release observes its retry backoff"
     );
 
-    // Once local state advances the identical request goes out again.
-    owner.note_output_released();
+    // Backend-local in-flight work can settle without advancing a frontend
+    // progress fact. The timer still releases the exact same request.
     let retry = owner
-        .release_intent()
-        .expect("progress re-releases the identical request");
+        .release_intent(MonotonicInstant::from_origin(Duration::from_millis(50)))
+        .expect("the retry timer re-releases the identical request");
     assert_eq!(retry.operation_id(), release.operation_id());
 
+    assert_eq!(
+        owner
+            .on_release_ack(
+                &not_ready,
+                MonotonicInstant::from_origin(Duration::from_millis(50)),
+            )
+            .expect("a second not-ready answer settles"),
+        ReleaseSettlement::NotReadyKeepRenewing
+    );
+    assert!(
+        owner
+            .release_intent(MonotonicInstant::from_origin(Duration::from_millis(149)))
+            .is_none(),
+        "a repeated not-ready answer increases the retry backoff"
+    );
+    let backed_off_retry = owner
+        .release_intent(MonotonicInstant::from_origin(Duration::from_millis(150)))
+        .expect("the increased retry backoff eventually expires");
+    assert_eq!(backed_off_retry.operation_id(), release.operation_id());
+
     owner
-        .on_release_ack(&OperationAcknowledgement::new(
-            retry.operation_id(),
-            OperationKind::ReleaseQueryContext,
-            OperationOutcome::Accepted,
-            AckPayload::Release {
-                receipt: QueryContextReceipt::new(context, QueryContextState::TerminalRetained),
-                outcome: ReleaseOutcome::Released,
-                runtime_filter: Some(fixture_runtime_filter_contribution()),
-            },
-        ))
+        .on_release_ack(
+            &not_ready,
+            MonotonicInstant::from_origin(Duration::from_millis(150)),
+        )
+        .expect("a third not-ready answer settles");
+    owner.note_output_released();
+    let progress_retry = owner
+        .release_intent(MonotonicInstant::from_origin(Duration::from_millis(150)))
+        .expect("frontend progress bypasses the outstanding retry timer");
+    assert_eq!(progress_retry.operation_id(), release.operation_id());
+
+    owner
+        .on_release_ack(
+            &OperationAcknowledgement::new(
+                progress_retry.operation_id(),
+                OperationKind::ReleaseQueryContext,
+                OperationOutcome::Accepted,
+                AckPayload::Release {
+                    receipt: QueryContextReceipt::new(context, QueryContextState::TerminalRetained),
+                    outcome: ReleaseOutcome::Released,
+                    runtime_filter: Some(fixture_runtime_filter_contribution()),
+                },
+            ),
+            MonotonicInstant::from_origin(Duration::from_millis(50)),
+        )
         .expect("a released answer settles");
     assert!(!owner.must_keep_renewing());
     assert!(owner.is_released());

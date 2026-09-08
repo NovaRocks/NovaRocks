@@ -29,11 +29,12 @@
 //!   or abort was latched. It does not wait for upstream tasks to finish
 //!   standing down, which is what makes a `LIMIT` return without waiting on
 //!   whatever was still scanning.
-//! * A **write** gets none of that. Every writer and the root finish task must
-//!   be `FINISHED`, the prepared write set must be complete, and the external
-//!   commit must have succeeded. A cancelled writer can never be counted as
-//!   success, because a write that stood down early published less than the
-//!   statement asked for.
+//! * A **write** gets none of that. Every writer must either be `FINISHED` or
+//!   publish the narrowly equivalent pair of a success-compatible cancellation
+//!   plus completed output responsibility; the root finish task must be
+//!   `FINISHED`, the prepared write set must be complete, and the external
+//!   commit must have succeeded. A writer that actually stood down early can
+//!   never be counted as success.
 //!
 //! Draining the attempt is a third, separate question owned by
 //! [`AttemptDrainFacts`](novarocks_execution::task_execution::AttemptDrainFacts):
@@ -161,9 +162,8 @@ pub enum WriteVerdict {
         task: TaskIdentity,
         state: TaskState,
     },
-    /// A writer stood down normally. That is compatible with a read's early
-    /// completion and never with a write: rows it had not written yet are
-    /// simply missing.
+    /// A writer stood down normally before proving its output responsibility
+    /// complete. Rows it had not written yet may be missing.
     WriterCanceled(TaskIdentity),
     /// A task outside the declared writer set reported writer facts, so the
     /// declared set is not the real one and "every writer finished" cannot be
@@ -188,8 +188,7 @@ impl WriteVerdict {
 pub struct WriteCompletionTracker {
     writers: BTreeSet<TaskIdentity>,
     root_finish: TaskIdentity,
-    states: BTreeMap<TaskIdentity, TaskState>,
-    canceled_writers: BTreeSet<TaskIdentity>,
+    statuses: BTreeMap<TaskIdentity, TaskStatus>,
     undeclared_writers: BTreeSet<TaskIdentity>,
 }
 
@@ -212,8 +211,7 @@ impl WriteCompletionTracker {
         Ok(Self {
             writers,
             root_finish,
-            states: BTreeMap::new(),
-            canceled_writers: BTreeSet::new(),
+            statuses: BTreeMap::new(),
             undeclared_writers: BTreeSet::new(),
         })
     }
@@ -235,10 +233,7 @@ impl WriteCompletionTracker {
         let identity = status.identity();
         let is_declared = self.writers.contains(&identity) || identity == self.root_finish;
         if is_declared {
-            self.states.insert(identity, status.state());
-            if self.writers.contains(&identity) && status.state() == TaskState::Canceled {
-                self.canceled_writers.insert(identity);
-            }
+            self.statuses.insert(identity, status.clone());
             return;
         }
         if status.writer().is_some() {
@@ -258,20 +253,40 @@ impl WriteCompletionTracker {
         if let Some(&undeclared) = self.undeclared_writers.iter().next() {
             return WriteVerdict::UndeclaredWriter(undeclared);
         }
-        if let Some(&canceled) = self.canceled_writers.iter().next() {
-            return WriteVerdict::WriterCanceled(canceled);
-        }
-        for task in self.writers.iter().copied().chain([self.root_finish]) {
+        for task in self.writers.iter().copied() {
             // An unobserved task is `PLANNED` here rather than absent: not
             // having heard from a writer is not evidence that it finished.
-            let state = self
-                .states
-                .get(&task)
-                .copied()
-                .unwrap_or(TaskState::Planned);
-            if state != TaskState::Finished {
-                return WriteVerdict::TaskNotFinished { task, state };
+            let Some(status) = self.statuses.get(&task) else {
+                return WriteVerdict::TaskNotFinished {
+                    task,
+                    state: TaskState::Planned,
+                };
+            };
+            if status.state() == TaskState::Finished {
+                continue;
             }
+            if status.state() == TaskState::Canceled {
+                if status.is_success_compatible_terminal()
+                    && status.output().responsibility_complete()
+                {
+                    continue;
+                }
+                return WriteVerdict::WriterCanceled(task);
+            }
+            return WriteVerdict::TaskNotFinished {
+                task,
+                state: status.state(),
+            };
+        }
+        let root_state = self
+            .statuses
+            .get(&self.root_finish)
+            .map_or(TaskState::Planned, TaskStatus::state);
+        if root_state != TaskState::Finished {
+            return WriteVerdict::TaskNotFinished {
+                task: self.root_finish,
+                state: root_state,
+            };
         }
         WriteVerdict::Complete
     }
@@ -512,6 +527,30 @@ mod tests {
             tracker.execution_verdict(false),
             WriteVerdict::WriterCanceled(writer)
         );
+    }
+
+    #[test]
+    fn a_successful_writer_cancel_race_preserves_a_complete_write() {
+        let backend = BackendProcessId::new_v7();
+        let writer = identity(2, 1, backend);
+        let root = identity(1, 3, backend);
+        let mut tracker =
+            WriteCompletionTracker::try_new(root, [writer]).expect("a declared writer set");
+
+        let completed_then_canceled = TaskStatus::try_new(
+            writer,
+            TaskStatusVersion::new(2).expect("nonzero version"),
+            TaskState::Canceled,
+            Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+            TaskOutputFacts::new(true),
+        )
+        .expect("a legal terminal");
+        tracker.observe_status(&completed_then_canceled);
+        tracker.observe_status(&status(root, 3, TaskState::Finished));
+
+        assert!(tracker.execution_verdict(false).is_complete());
     }
 
     #[test]
