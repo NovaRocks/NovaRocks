@@ -24,7 +24,9 @@
 //! only by an exact create acknowledgement, and the accumulated facts then
 //! drain one at a time in the order their domains progressed. `Terminal`
 //! discards what was never sent and lets what is already in flight converge
-//! on its own retained receipt.
+//! on its own retained receipt. An update rejected because the backend task
+//! already terminated stops further sends while the owner waits for the
+//! terminal status; the rejection itself is not a second terminal authority.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -130,6 +132,7 @@ pub struct RemoteTask {
     status: Option<TaskStatus>,
     cursor: TaskStatusCursor,
     progress: DomainProgress,
+    awaiting_terminal_status: bool,
     discarded_updates: usize,
     converged_after_terminal: usize,
 }
@@ -199,6 +202,7 @@ impl RemoteTask {
                 edges,
                 ..DomainProgress::default()
             },
+            awaiting_terminal_status: false,
             discarded_updates: 0,
             converged_after_terminal: 0,
         })
@@ -294,7 +298,7 @@ impl RemoteTask {
         &mut self,
         update: TaskDomainUpdate,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
-        if matches!(self.state, RemoteTaskState::Terminal) {
+        if matches!(self.state, RemoteTaskState::Terminal) || self.awaiting_terminal_status {
             return Ok(UpdateAdmission::DiscardedTerminal);
         }
         self.admit_domain(&update)?;
@@ -316,7 +320,7 @@ impl RemoteTask {
         &mut self,
         edge: ExchangeEdgeId,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
-        if matches!(self.state, RemoteTaskState::Terminal) {
+        if matches!(self.state, RemoteTaskState::Terminal) || self.awaiting_terminal_status {
             return Ok(UpdateAdmission::DiscardedTerminal);
         }
         let version =
@@ -430,7 +434,7 @@ impl RemoteTask {
     /// keeps a receipt attributable to exactly one domain and keeps a slow
     /// task from accumulating unacknowledged work.
     pub fn next_update_intent(&mut self) -> Result<Option<OperationIntent>, TaskExecutionError> {
-        if !matches!(self.state, RemoteTaskState::Created) {
+        if !matches!(self.state, RemoteTaskState::Created) || self.awaiting_terminal_status {
             return Ok(None);
         }
         if let Some(released) = &mut self.released_update {
@@ -461,7 +465,10 @@ impl RemoteTask {
 
     /// Stands this task down normally, once.
     pub fn cancel_intent(&mut self, reason: CancelReason) -> Option<OperationIntent> {
-        if self.cancel_requested || matches!(self.state, RemoteTaskState::Terminal) {
+        if self.cancel_requested
+            || matches!(self.state, RemoteTaskState::Terminal)
+            || self.awaiting_terminal_status
+        {
             return None;
         }
         let operation_id = TaskOperationId::new_v7();
@@ -545,25 +552,32 @@ impl RemoteTask {
             self.released_update = None;
             return Ok(UpdateSettlement::Applied);
         }
-        if matches!(
-            ack.outcome().frontend_action(),
-            FrontendAction::RetryExactRequest
-        ) {
-            if matches!(self.state, RemoteTaskState::Terminal) {
-                // A terminal task owes nothing further, so an unknown outcome
-                // is abandoned rather than replayed at a task that can no
-                // longer apply it.
+        match ack.outcome().frontend_action() {
+            FrontendAction::RetryExactRequest => {
+                if matches!(self.state, RemoteTaskState::Terminal) {
+                    // A terminal task owes nothing further, so an unknown
+                    // outcome is abandoned rather than replayed at a task that
+                    // can no longer apply it.
+                    self.released_update = None;
+                    self.converged_after_terminal += 1;
+                    return Ok(UpdateSettlement::ConvergedAfterTerminal);
+                }
+                return Ok(UpdateSettlement::RetryExactRequest);
+            }
+            FrontendAction::StopSendingAndReconcile | FrontendAction::Settled => {
                 self.released_update = None;
                 self.converged_after_terminal += 1;
+                if !matches!(self.state, RemoteTaskState::Terminal) {
+                    self.await_terminal_status();
+                }
                 return Ok(UpdateSettlement::ConvergedAfterTerminal);
             }
-            return Ok(UpdateSettlement::RetryExactRequest);
+            FrontendAction::ResubscribeObservation
+            | FrontendAction::FailOperationClosed
+            | FrontendAction::FailAttempt
+            | FrontendAction::RetryAfterProgress => {}
         }
         self.released_update = None;
-        if matches!(self.state, RemoteTaskState::Terminal) {
-            self.converged_after_terminal += 1;
-            return Ok(UpdateSettlement::ConvergedAfterTerminal);
-        }
         self.enter_terminal();
         Ok(UpdateSettlement::FailedClosed(ack.outcome()))
     }
@@ -652,6 +666,13 @@ impl RemoteTask {
 
     fn enter_terminal(&mut self) {
         self.state = RemoteTaskState::Terminal;
+        self.awaiting_terminal_status = false;
+        self.discarded_updates += self.pending.len();
+        self.pending.clear();
+    }
+
+    fn await_terminal_status(&mut self) {
+        self.awaiting_terminal_status = true;
         self.discarded_updates += self.pending.len();
         self.pending.clear();
     }

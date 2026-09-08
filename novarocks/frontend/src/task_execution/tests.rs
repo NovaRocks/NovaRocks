@@ -60,7 +60,7 @@ use super::intent::{
     AckPayload, DispatchBatch, OPERATION_FIXED_BYTES, OperationAcknowledgement, OperationIntent,
     TaskOperationSink,
 };
-use super::remote_task::RemoteTaskState;
+use super::remote_task::{RemoteTaskState, UpdateAdmission};
 use super::split_domain::{assignment_targets, delivery_action};
 use super::status_intake::{
     CountingWake, StatusEvent, StatusIntake, StatusIntakeAdmission, StatusIntakeWake,
@@ -1205,6 +1205,62 @@ fn a_terminal_task_discards_never_sent_updates_and_converges_what_is_in_flight()
     harness
         .update_ack(&in_flight, OperationOutcome::Accepted)
         .expect("a released update still settles after the task went terminal");
+}
+
+#[test]
+fn a_terminal_rejected_update_waits_for_the_task_status_authority() {
+    let mut harness = Harness::new(&[0], &[0], 512);
+    harness.settle_until_quiet(Duration::from_secs(10));
+
+    let leaf = harness.stage_tasks(1)[0];
+    harness
+        .execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
+        .expect("the first split batch is recorded");
+    harness
+        .execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 2, true))
+        .expect("the second split batch is recorded");
+    let in_flight = harness
+        .released()
+        .into_iter()
+        .find(|intent| matches!(intent.kind(), OperationKind::UpdateTask))
+        .expect("one update is released");
+
+    harness
+        .update_ack(&in_flight, OperationOutcome::TerminalRejected)
+        .expect("a terminal rejection stops delivery without failing the attempt");
+    let task = harness.execution.task(leaf).expect("the leaf is owned");
+    assert_eq!(task.state(), RemoteTaskState::Created);
+    assert!(!task.is_terminal(), "only a task status proves termination");
+    assert_eq!(task.pending_updates(), 0);
+    assert_eq!(task.discarded_updates(), 1);
+    assert_eq!(task.converged_after_terminal(), 1);
+
+    assert_eq!(
+        harness
+            .execution
+            .enqueue_task_update(leaf, split_update(SCAN_NODE, 3, true))
+            .expect("a late split is classified"),
+        UpdateAdmission::DiscardedTerminal
+    );
+    assert!(
+        harness
+            .released()
+            .iter()
+            .all(|intent| !matches!(intent.kind(), OperationKind::UpdateTask)),
+        "the owner must not send after the backend says the task terminated"
+    );
+
+    harness.publish(leaf, TaskState::Running, None, false);
+    harness.publish(leaf, TaskState::Flushing, None, false);
+    harness.publish(leaf, TaskState::Finished, None, true);
+    let task = harness.execution.task(leaf).expect("the leaf is owned");
+    assert_eq!(task.state(), RemoteTaskState::Terminal);
+    assert_eq!(
+        task.terminal_report().expect("terminal facts").state,
+        TaskState::Finished
+    );
 }
 
 // ---------------------------------------------------------------------------
