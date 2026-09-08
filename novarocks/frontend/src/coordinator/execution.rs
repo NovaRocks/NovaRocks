@@ -1169,7 +1169,15 @@ impl FrontendDistributedQueryCoordinator {
                 cancellation: &cancellation,
             };
             if let Some(detail) = round.failure_cause() {
-                let detail = format!("task execution terminated: {detail:?}");
+                let waiting_on = task_round_wait_facts(
+                    &round,
+                    root_task,
+                    batches.len(),
+                    last_root_poll,
+                    write_completion.as_mut(),
+                );
+                let detail =
+                    format!("task execution terminated: {detail:?}; terminal_round={waiting_on}");
                 break Err(self.fail_task_round(
                     query_id,
                     &mut round,
