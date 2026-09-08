@@ -2129,6 +2129,7 @@ fn an_accepted_create_without_its_receipt_is_refused() {
 #[derive(Debug, Default)]
 struct RecordingSubscriptions {
     ensured: Mutex<Vec<(QueryContextRef, usize)>>,
+    resubscribed: Mutex<Vec<(QueryContextRef, usize)>>,
     /// What a settled subscription reports, so a test can put a backend out
     /// of observation without a transport.
     settled: Mutex<Option<crate::native::task_transport::SubscriptionState>>,
@@ -2143,6 +2144,18 @@ impl crate::task_execution::round::StatusSubscriptions for RecordingSubscription
         self.ensured
             .lock()
             .expect("subscription ledger")
+            .push((context, cursors.len()));
+        Ok(())
+    }
+
+    fn resubscribe(
+        &self,
+        context: QueryContextRef,
+        cursors: Vec<novarocks_execution::task_execution::TaskStatusCursor>,
+    ) -> Result<(), String> {
+        self.resubscribed
+            .lock()
+            .expect("resubscription ledger")
             .push((context, cursors.len()));
         Ok(())
     }
@@ -2471,6 +2484,65 @@ fn a_turn_starts_one_subscription_per_context_and_reports_what_moved() {
     // is a gap rather than something to absorb.
     assert!(round.consume_root_result_packet(1, false).is_err());
     let _ = round.execution_mut();
+}
+
+#[test]
+fn a_turn_replaces_every_established_subscription_after_local_observation_loss() {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+
+    let processes = backends(2);
+    let schedule = chain_schedule(&[0, 1], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+    let contexts = graph.contexts().count();
+    let harness = Harness::from_graph(graph);
+    let sink = Arc::clone(&harness.sink);
+    let wake = Arc::clone(&harness.wake);
+    let status_handle = harness.execution.intake().handle();
+    let identity = harness.identity(harness.stage_tasks(1)[0]);
+    let subscriptions = Arc::new(RecordingSubscriptions::default());
+    let intake = TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>);
+    let acks = intake.handle();
+    let mut round = TaskRound::new(
+        harness.execution,
+        intake,
+        Box::new(FakeEstablish),
+        Arc::clone(&subscriptions) as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+    round.seal_pumps();
+
+    round.turn().expect("a turn releases context establishes");
+    for intent in released_establishes(&sink) {
+        acks.publish(establish_ack(&intent));
+    }
+    round.turn().expect("the contexts become established");
+
+    for _ in 0..64 {
+        assert_eq!(
+            status_handle.publish(StatusEvent::Published(TaskStatus::created(identity))),
+            StatusIntakeAdmission::Enqueued
+        );
+    }
+    assert_eq!(
+        status_handle.publish(StatusEvent::Published(TaskStatus::created(identity))),
+        StatusIntakeAdmission::Overflowed
+    );
+
+    let report = round
+        .turn()
+        .expect("observation loss replaces the subscriptions");
+    assert_eq!(report.resubscriptions, contexts);
+    let resubscribed = subscriptions
+        .resubscribed
+        .lock()
+        .expect("resubscription ledger");
+    assert_eq!(resubscribed.len(), contexts);
+    assert!(
+        resubscribed
+            .iter()
+            .all(|(_, cursor_count)| *cursor_count > 0),
+        "every replacement replays the runner's task cursors"
+    );
 }
 
 #[test]

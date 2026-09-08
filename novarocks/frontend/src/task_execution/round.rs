@@ -103,6 +103,14 @@ pub(crate) trait StatusSubscriptions: Send + Sync {
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String>;
 
+    /// Replaces a subscription after the local intake reported observation
+    /// loss, replaying from the serial runner's authoritative cursors.
+    fn resubscribe(
+        &self,
+        context: QueryContextRef,
+        cursors: Vec<TaskStatusCursor>,
+    ) -> Result<(), String>;
+
     /// The subscription's state once it has settled somewhere resubscribing
     /// cannot repair, and `None` while it can still recover.
     ///
@@ -121,6 +129,14 @@ impl StatusSubscriptions for TaskStatusSubscriber {
         cursors: Vec<TaskStatusCursor>,
     ) -> Result<(), String> {
         Self::ensure(self, context, cursors)
+    }
+
+    fn resubscribe(
+        &self,
+        context: QueryContextRef,
+        cursors: Vec<TaskStatusCursor>,
+    ) -> Result<(), String> {
+        Self::resubscribe(self, context, cursors)
     }
 
     fn settled_fatally(&self, context: QueryContextRef) -> Option<SubscriptionState> {
@@ -142,6 +158,7 @@ pub(crate) struct TurnReport {
     pub(crate) operations: usize,
     pub(crate) acknowledgements: usize,
     pub(crate) status_events: usize,
+    pub(crate) resubscriptions: usize,
     /// What the per-attempt pumps moved: filter versions ingested, credential
     /// rotations started or advanced.
     pub(crate) pumped: usize,
@@ -157,6 +174,7 @@ impl TurnReport {
         self.operations == 0
             && self.acknowledgements == 0
             && self.status_events == 0
+            && self.resubscriptions == 0
             && self.pumped == 0
     }
 }
@@ -283,6 +301,21 @@ impl TaskRound {
 
         let status = self.execution.apply_status(STATUS_EVENTS_PER_TURN)?;
         report.status_events = status.accepted + status.ignored;
+        if status.resubscribe {
+            for &context in self.execution.graph().contexts() {
+                if self
+                    .execution
+                    .owner(context)
+                    .is_none_or(QueryContextOwner::needs_establish)
+                {
+                    continue;
+                }
+                self.subscriber
+                    .resubscribe(context, self.execution.status_cursors(context))
+                    .map_err(TaskExecutionError::Schedule)?;
+                report.resubscriptions += 1;
+            }
+        }
 
         for pump in &mut self.pumps {
             report.pumped += pump.drive(&mut self.execution)?;
