@@ -1,11 +1,12 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "artifacts": {
     "run_manifest": "run-manifest.json",
     "performance": "uea1-performance.json",
     "resources": "process-resources.json",
     "effective_launch_config": "effective-launch-config.json",
     "fixture_realization": "fixture-realization.json",
+    "raw_artifact_inventory": "raw-artifact-inventory.json",
     "completion": "run-completion.json"
   },
   "expected": {

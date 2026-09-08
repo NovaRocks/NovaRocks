@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 
-INPUT_SCHEMA_VERSION = 1
+INPUT_SCHEMA_VERSION = 2
 INPUT_KIND = "uea1-performance-comparison-input"
-RUN_MANIFEST_SCHEMA_VERSION = 4
+RUN_MANIFEST_SCHEMA_VERSION = 5
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 QUERY_RELATIVE_METRICS = {
@@ -126,6 +126,67 @@ def _load_json_bytes(path: Path, context: str) -> tuple[Any, bytes]:
         return json.loads(raw), raw
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ProtocolError(f"cannot read {context} {path}: {error}") from error
+
+
+def _validate_raw_artifact_inventory(
+    artifact_path: Path, inventory: dict[str, Any], scenario: str, window_count: int
+) -> str:
+    _expect_exact_keys(
+        inventory,
+        {"schema_version", "scenario", "window_count", "artifacts"},
+        "raw artifact inventory",
+    )
+    if inventory["schema_version"] != 1:
+        raise ProtocolError("raw artifact inventory must use schema_version 1")
+    if inventory["scenario"] != scenario or inventory["window_count"] != window_count:
+        raise ProtocolError("raw artifact inventory scenario or window count mismatch")
+    expected = []
+    if scenario == "performance/uea1-mixed":
+        for window_index in range(window_count):
+            expected.extend(
+                [
+                    ("business", window_index, f"mixed-business-{window_index}.json"),
+                    ("query", window_index, f"mixed-query-{window_index}.json"),
+                ]
+            )
+        expected.append(("business-aggregate", None, "mixed-business.json"))
+    raw_artifacts = inventory["artifacts"]
+    if not isinstance(raw_artifacts, list) or len(raw_artifacts) != len(expected):
+        raise ProtocolError("raw artifact inventory is not the exact closed artifact set")
+    root = artifact_path.parent.resolve()
+    normalized = []
+    for offset, (raw, expected_entry) in enumerate(zip(raw_artifacts, expected)):
+        entry = _expect_object(raw, f"raw artifact inventory artifacts[{offset}]")
+        _expect_exact_keys(
+            entry,
+            {"kind", "window_index", "path", "sha256"},
+            f"raw artifact inventory artifacts[{offset}]",
+        )
+        actual = (entry["kind"], entry["window_index"], entry["path"])
+        if actual != expected_entry:
+            raise ProtocolError("raw artifact inventory is not canonically ordered")
+        path = Path(entry["path"])
+        if path.is_absolute() or len(path.parts) != 1 or path.name != entry["path"]:
+            raise ProtocolError("raw artifact inventory path must be a safe artifact filename")
+        digest = _nonempty_string(entry["sha256"], f"raw artifact {path} sha256")
+        if not SHA256_RE.fullmatch(digest):
+            raise ProtocolError(f"raw artifact {path} sha256 must be lowercase SHA-256")
+        resolved = (root / path).resolve()
+        if resolved.parent != root or _sha256_file(resolved) != digest:
+            raise ProtocolError(f"raw artifact {path} is missing or has changed")
+        normalized.append(path.name)
+    known_raw = {
+        path.name
+        for path in root.iterdir()
+        if path.is_file()
+        and (
+            path.name == "mixed-business.json"
+            or re.fullmatch(r"mixed-(?:business|query)-[0-9]+\.json", path.name)
+        )
+    }
+    if known_raw != set(normalized):
+        raise ProtocolError("raw artifact directory does not match its closed inventory")
+    return _sha256_file(artifact_path)
 
 
 def _percentile(values: list[float], percentile: int) -> float:
@@ -449,6 +510,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         "resources",
         "effective_launch_config",
         "fixture_realization",
+        "raw_artifact_inventory",
         "completion",
     }
     _expect_exact_keys(artifacts, artifact_names, "artifacts")
@@ -473,6 +535,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             "effective_launch_config_semantics_sha256",
             "fixture_realization_sha256",
             "fixture_realization_semantics_sha256",
+            "raw_artifact_inventory_sha256",
             "manifest_sha256",
             "scenario",
             "query_samples",
@@ -494,6 +557,10 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     fixture_realization = _expect_object(
         _load_json(artifact_paths["fixture_realization"], "fixture realization artifact"),
         "fixture realization artifact",
+    )
+    raw_artifact_inventory = _expect_object(
+        _load_json(artifact_paths["raw_artifact_inventory"], "raw artifact inventory"),
+        "raw artifact inventory",
     )
     completion = _expect_object(
         _load_json(artifact_paths["completion"], "completion marker"),
@@ -535,6 +602,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             "effective_launch_config_semantics_sha256",
             "fixture_realization_sha256",
             "fixture_realization_semantics_sha256",
+            "raw_artifact_inventory_sha256",
             "resources_sha256",
             "rustc_version",
             "cargo_version",
@@ -589,13 +657,14 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             "descriptor_sha256",
             "effective_launch_config_sha256",
             "fixture_realization_sha256",
+            "raw_artifact_inventory_sha256",
         },
         "completion marker",
     )
-    if completion["schema_version"] != 1:
-        raise ProtocolError("completion marker must use schema_version 1")
-    if performance.get("schema_version") != 6:
-        raise ProtocolError("performance artifact must use schema_version 6")
+    if completion["schema_version"] != 2:
+        raise ProtocolError("completion marker must use schema_version 2")
+    if performance.get("schema_version") != 7:
+        raise ProtocolError("performance artifact must use schema_version 7")
     run_manifest_sha256 = _sha256_file(artifact_paths["run_manifest"])
     if (
         run_manifest.get("formal") is not True
@@ -648,6 +717,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         "effective_launch_config_semantics": "effective_launch_config_semantics_sha256",
         "fixture_realization": "fixture_realization_sha256",
         "fixture_realization_semantics": "fixture_realization_semantics_sha256",
+        "raw_artifact_inventory": "raw_artifact_inventory_sha256",
     }
     input_hashes = {
         name: _nonempty_string(run_manifest.get(field), f"run manifest {field}")
@@ -788,6 +858,12 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             expected["window_count"],
         )
     )
+    raw_artifact_inventory_sha256 = _validate_raw_artifact_inventory(
+        artifact_paths["raw_artifact_inventory"],
+        raw_artifact_inventory,
+        scenario,
+        expected["window_count"],
+    )
     if (
         run_manifest.get("descriptor_sha256") != descriptor_sha256
         or run_manifest.get("effective_launch_config_sha256")
@@ -798,6 +874,8 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         != fixture_realization_sha256
         or run_manifest.get("fixture_realization_semantics_sha256")
         != fixture_realization_semantics_sha256
+        or run_manifest.get("raw_artifact_inventory_sha256")
+        != raw_artifact_inventory_sha256
     ):
         raise ProtocolError("run manifest does not bind the exact config, fixture, and descriptor artifacts")
     if (
@@ -809,6 +887,8 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         != fixture_realization_sha256
         or performance.get("fixture_realization_semantics_sha256")
         != fixture_realization_semantics_sha256
+        or performance.get("raw_artifact_inventory_sha256")
+        != raw_artifact_inventory_sha256
     ):
         raise ProtocolError("performance artifact does not bind the exact config and fixture artifacts")
     performance_sha256 = _sha256_file(artifact_paths["performance"])
@@ -824,11 +904,12 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             "descriptor_sha256",
             "effective_launch_config_sha256",
             "fixture_realization_sha256",
+            "raw_artifact_inventory_sha256",
         },
         "completion marker",
     )
     expected_completion = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "scenario": scenario,
         "run_manifest_sha256": run_manifest_sha256,
@@ -837,6 +918,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         "descriptor_sha256": descriptor_sha256,
         "effective_launch_config_sha256": effective_launch_config_sha256,
         "fixture_realization_sha256": fixture_realization_sha256,
+        "raw_artifact_inventory_sha256": raw_artifact_inventory_sha256,
     }
     if completion != expected_completion:
         raise ProtocolError("terminal completion marker does not bind the exact completed artifact set")
@@ -1225,6 +1307,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
             "run_manifest_sha256": run_manifest_sha256,
             "effective_launch_config_sha256": effective_launch_config_sha256,
             "fixture_realization_sha256": fixture_realization_sha256,
+            "raw_artifact_inventory_sha256": raw_artifact_inventory_sha256,
             "completion_sha256": _sha256_file(artifact_paths["completion"]),
             "started_unix_millis": run_manifest["started_unix_millis"],
             "ended_unix_millis": run_manifest["ended_unix_millis"],
@@ -1263,13 +1346,13 @@ def validate_comparison_input(document: Any) -> dict[str, Any]:
     provenance = _expect_object(model["provenance"], "provenance")
     _expect_exact_keys(
         provenance,
-        {"run_id", "source_sha", "binary_sha256", "runner_binary_sha256", "cargo_lock_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256", "effective_launch_config_sha256", "fixture_realization_sha256", "completion_sha256", "started_unix_millis", "ended_unix_millis"},
+        {"run_id", "source_sha", "binary_sha256", "runner_binary_sha256", "cargo_lock_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256", "effective_launch_config_sha256", "fixture_realization_sha256", "raw_artifact_inventory_sha256", "completion_sha256", "started_unix_millis", "ended_unix_millis"},
         "provenance",
     )
     _nonempty_string(provenance["run_id"], "provenance.run_id")
     if not SOURCE_RE.fullmatch(str(provenance["source_sha"])):
         raise ProtocolError("provenance.source_sha must be a full lowercase Git SHA")
-    for field in ("binary_sha256", "runner_binary_sha256", "cargo_lock_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256", "effective_launch_config_sha256", "fixture_realization_sha256", "completion_sha256"):
+    for field in ("binary_sha256", "runner_binary_sha256", "cargo_lock_sha256", "descriptor_sha256", "performance_sha256", "resources_sha256", "run_manifest_sha256", "effective_launch_config_sha256", "fixture_realization_sha256", "raw_artifact_inventory_sha256", "completion_sha256"):
         if not SHA256_RE.fullmatch(str(provenance[field])):
             raise ProtocolError(f"provenance.{field} must be lowercase SHA-256")
     started = provenance["started_unix_millis"]

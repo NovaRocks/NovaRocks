@@ -22,6 +22,7 @@ mod fixture_realization;
 mod manifest;
 mod metrics;
 pub(crate) mod provenance;
+mod raw_artifact_inventory;
 
 pub use business::MixedFixtureBinding;
 pub use controller::{PerformanceScenario, run};

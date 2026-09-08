@@ -59,7 +59,7 @@ def comparison_input(
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "uea1-performance-comparison-input",
         "provenance": {
             "run_id": run_id,
@@ -73,6 +73,7 @@ def comparison_input(
             "run_manifest_sha256": HASH_C,
             "effective_launch_config_sha256": HASH_C,
             "fixture_realization_sha256": HASH_C,
+            "raw_artifact_inventory_sha256": HASH_C,
             "completion_sha256": HASH_C,
             "started_unix_millis": started,
             "ended_unix_millis": started + 50,

@@ -28,6 +28,7 @@ use super::metrics::{
 use super::provenance::{
     RunManifestKind, begin_run_manifest, sha256_file, write_run_completion_marker,
 };
+use super::raw_artifact_inventory::write_raw_artifact_inventory;
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, bail, ensure};
@@ -206,10 +207,16 @@ pub fn run(
         "{} produced no valid work",
         scenario.name()
     );
+    let raw_artifact_inventory = write_raw_artifact_inventory(
+        context.scenario_root(),
+        scenario.name(),
+        measurement_windows.len(),
+    )?;
     let run_manifest = run_manifest.finish_performance(
         &resources_sha256,
         &fixture_realization.artifact_sha256,
         &fixture_realization.semantics_sha256,
+        &raw_artifact_inventory.artifact_sha256,
     )?;
     let performance_sha256 = write_report(PerformanceReportInput {
         root: context.scenario_root(),
@@ -227,6 +234,10 @@ pub fn run(
             .fixture_realization_semantics_sha256
             .as_deref()
             .context("completed performance manifest omitted fixture semantics")?,
+        raw_artifact_inventory_sha256: run_manifest
+            .raw_artifact_inventory_sha256
+            .as_deref()
+            .context("completed performance manifest omitted raw artifact inventory")?,
         manifest_sha256: &manifest.sha256,
         scenario: scenario.name(),
         samples: &samples,

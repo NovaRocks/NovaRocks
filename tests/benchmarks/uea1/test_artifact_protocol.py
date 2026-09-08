@@ -40,7 +40,7 @@ class ArtifactFixture:
             "binary", "runner", "manifest", "fixture", "config", "tool", "lock", "third-party", "tree"
         )}
         self.run_manifest = {
-            "schema_version": 4,
+            "schema_version": 5,
             "kind": "performance",
             "formal": True,
             "run_id": self.run_id,
@@ -81,6 +81,7 @@ class ArtifactFixture:
             "effective_launch_config_semantics_sha256": "",
             "fixture_realization_sha256": "",
             "fixture_realization_semantics_sha256": "",
+            "raw_artifact_inventory_sha256": "",
             "resources_sha256": "",
             "rustc_version": "rustc test",
             "cargo_version": "cargo test",
@@ -96,7 +97,7 @@ class ArtifactFixture:
             },
         }
         self.performance = {
-            "schema_version": 6,
+            "schema_version": 7,
             "run_id": self.run_id,
             "run_manifest_sha256": "",
             "manifest_sha256": self.hashes["manifest"],
@@ -105,6 +106,7 @@ class ArtifactFixture:
             "effective_launch_config_semantics_sha256": "",
             "fixture_realization_sha256": "",
             "fixture_realization_semantics_sha256": "",
+            "raw_artifact_inventory_sha256": "",
             "scenario": "performance/uea1-short-concurrent",
             "query_samples": [
                 {
@@ -232,6 +234,13 @@ class ArtifactFixture:
         self.performance["fixture_realization_sha256"] = fixture_sha256
         self.performance["fixture_realization_semantics_sha256"] = fixture["semantics_sha256"]
 
+        inventory = self._write_raw_artifact_inventory()
+        inventory_path = self.root / "raw-artifact-inventory.json"
+        inventory_path.write_text(json.dumps(inventory))
+        inventory_sha256 = hashlib.sha256(inventory_path.read_bytes()).hexdigest()
+        self.run_manifest["raw_artifact_inventory_sha256"] = inventory_sha256
+        self.performance["raw_artifact_inventory_sha256"] = inventory_sha256
+
         resource_path = self.root / "process-resources.json"
         resource_path.write_text(json.dumps(self.resources))
         resource_sha256 = hashlib.sha256(resource_path.read_bytes()).hexdigest()
@@ -243,7 +252,7 @@ class ArtifactFixture:
         performance_path = self.root / "uea1-performance.json"
         performance_path.write_text(json.dumps(self.performance))
         completion = {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": self.run_id,
             "scenario": self.run_manifest["scenario"],
             "run_manifest_sha256": hashlib.sha256(run_path.read_bytes()).hexdigest(),
@@ -252,9 +261,48 @@ class ArtifactFixture:
             "descriptor_sha256": descriptor_sha256,
             "effective_launch_config_sha256": effective_sha256,
             "fixture_realization_sha256": fixture_sha256,
+            "raw_artifact_inventory_sha256": inventory_sha256,
         }
         (self.root / "run-completion.json").write_text(json.dumps(completion))
         return descriptor
+
+    def _write_raw_artifact_inventory(self):
+        scenario = self.run_manifest["scenario"]
+        window_count = self.descriptor["expected"]["window_count"]
+        artifacts = []
+        if scenario == "performance/uea1-mixed":
+            aggregate = []
+            for index in range(window_count):
+                for kind in ("business", "query"):
+                    name = f"mixed-{kind}-{index}.json"
+                    value = [{"window_index": index, "kind": kind}]
+                    (self.root / name).write_text(json.dumps(value))
+                    artifacts.append(
+                        {
+                            "kind": kind,
+                            "window_index": index,
+                            "path": name,
+                            "sha256": hashlib.sha256((self.root / name).read_bytes()).hexdigest(),
+                        }
+                    )
+                    if kind == "business":
+                        aggregate.extend(value)
+            name = "mixed-business.json"
+            (self.root / name).write_text(json.dumps(aggregate))
+            artifacts.append(
+                {
+                    "kind": "business-aggregate",
+                    "window_index": None,
+                    "path": name,
+                    "sha256": hashlib.sha256((self.root / name).read_bytes()).hexdigest(),
+                }
+            )
+        return {
+            "schema_version": 1,
+            "scenario": scenario,
+            "window_count": window_count,
+            "artifacts": artifacts,
+        }
 
     def _write_fixture_realization(self):
         scenario = self.run_manifest["scenario"]
@@ -324,6 +372,44 @@ class ArtifactProtocolTest(unittest.TestCase):
 
     def tearDown(self):
         self.fixture.close()
+
+    def write_mixed_artifacts(self):
+        scenario = "performance/uea1-mixed"
+        self.fixture.run_manifest["scenario"] = scenario
+        self.fixture.performance["scenario"] = scenario
+        self.fixture.descriptor = json.loads((ROOT / "descriptors" / "mixed.json").read_text())
+        self.fixture.performance["measurement_windows"] = self.fixture.performance[
+            "measurement_windows"
+        ][:5]
+        self.fixture.performance["query_samples"] = self.fixture.performance["query_samples"][:5]
+        for window in self.fixture.performance["measurement_windows"]:
+            window["workload"] = "mixed"
+        for sample in self.fixture.performance["query_samples"]:
+            sample["workload"] = "mixed-foreground"
+        for phase in ("metadata_observation", "connector_planning_negotiation"):
+            event = copy.deepcopy(self.fixture.performance["preparation_events"][0])
+            event["phase"] = phase
+            event["operation"] = phase
+            self.fixture.performance["preparation_events"].append(event)
+        return self.fixture.write()
+
+    def test_raw_artifact_inventory_rejects_missing_artifact(self):
+        descriptor = self.write_mixed_artifacts()
+        (self.fixture.root / "mixed-query-0.json").unlink()
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "cannot hash"):
+            PROTOCOL.extract_comparison_input(descriptor)
+
+    def test_raw_artifact_inventory_rejects_tampered_artifact(self):
+        descriptor = self.write_mixed_artifacts()
+        (self.fixture.root / "mixed-business-0.json").write_text("[]")
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "missing or has changed"):
+            PROTOCOL.extract_comparison_input(descriptor)
+
+    def test_raw_artifact_inventory_rejects_added_artifact(self):
+        descriptor = self.write_mixed_artifacts()
+        (self.fixture.root / "mixed-query-5.json").write_text("[]")
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "closed inventory"):
+            PROTOCOL.extract_comparison_input(descriptor)
 
     def test_formal_descriptors_freeze_scenario_shape_and_thread_ceilings(self):
         expected = {
@@ -419,7 +505,7 @@ class ArtifactProtocolTest(unittest.TestCase):
 
     def test_old_performance_schema_is_rejected(self):
         self.fixture.performance["schema_version"] = 2
-        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "schema_version 6"):
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "schema_version 7"):
             self.fixture.extract()
 
     def test_diagnostic_run_token_must_match_run_manifest(self):
@@ -460,9 +546,9 @@ class ArtifactProtocolTest(unittest.TestCase):
 
     def test_run_manifest_schema_and_keys_are_exact(self):
         self.fixture.run_manifest["schema_version"] = 1
-        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "schema_version 4"):
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "schema_version 5"):
             self.fixture.extract()
-        self.fixture.run_manifest["schema_version"] = 4
+        self.fixture.run_manifest["schema_version"] = 5
         self.fixture.run_manifest["unexpected"] = True
         with self.assertRaisesRegex(PROTOCOL.ProtocolError, "keys mismatch"):
             self.fixture.extract()
@@ -682,6 +768,11 @@ class ArtifactProtocolTest(unittest.TestCase):
         derived.write_text(json.dumps(tampered))
         loaded = COMPARE.load_descriptor_input(descriptor)
         self.assertNotEqual(loaded["metrics"][0]["values"], [0.0001])
+
+        mixed_descriptor = self.write_mixed_artifacts()
+        (self.fixture.root / "mixed-query-0.json").write_text("[]")
+        with self.assertRaisesRegex(COMPARE.ProtocolError, "missing or has changed"):
+            COMPARE.load_descriptor_input(mixed_descriptor)
 
     def test_baseline_cli_accepts_descriptors_and_reextracts_artifacts(self):
         baseline_b = ArtifactFixture()

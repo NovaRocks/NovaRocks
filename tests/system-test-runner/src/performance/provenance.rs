@@ -38,6 +38,7 @@ pub struct RunManifestReference {
     pub effective_launch_config_semantics_sha256: String,
     pub fixture_realization_sha256: Option<String>,
     pub fixture_realization_semantics_sha256: Option<String>,
+    pub raw_artifact_inventory_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -99,6 +100,7 @@ struct RunManifest {
     effective_launch_config_semantics_sha256: String,
     fixture_realization_sha256: Option<String>,
     fixture_realization_semantics_sha256: Option<String>,
+    raw_artifact_inventory_sha256: Option<String>,
     resources_sha256: Option<String>,
     rustc_version: String,
     cargo_version: String,
@@ -229,7 +231,7 @@ pub fn begin_run_manifest(
     );
     let run_id = sha256_bytes(identity_material.as_bytes());
     let manifest = RunManifest {
-        schema_version: 4,
+        schema_version: 5,
         kind,
         formal,
         run_id: run_id.clone(),
@@ -258,6 +260,7 @@ pub fn begin_run_manifest(
         effective_launch_config_semantics_sha256,
         fixture_realization_sha256: None,
         fixture_realization_semantics_sha256: None,
+        raw_artifact_inventory_sha256: None,
         resources_sha256: None,
         rustc_version: command_text(&repository, "rustc", &["-vV"])?,
         cargo_version: command_text(&repository, "cargo", &["-vV"])?,
@@ -475,7 +478,7 @@ impl RunManifestHandle {
             self.manifest.kind == RunManifestKind::StartupBaseline,
             "performance run manifests require resource and fixture realization artifacts"
         );
-        self.finish_success_with_artifacts(None, None, None)
+        self.finish_success_with_artifacts(None, None, None, None)
     }
 
     pub fn finish_performance(
@@ -483,6 +486,7 @@ impl RunManifestHandle {
         resources_sha256: &str,
         fixture_realization_sha256: &str,
         fixture_realization_semantics_sha256: &str,
+        raw_artifact_inventory_sha256: &str,
     ) -> Result<RunManifestReference> {
         ensure!(
             self.manifest.kind == RunManifestKind::Performance,
@@ -492,6 +496,7 @@ impl RunManifestHandle {
             Some(resources_sha256),
             Some(fixture_realization_sha256),
             Some(fixture_realization_semantics_sha256),
+            Some(raw_artifact_inventory_sha256),
         )
     }
 
@@ -500,6 +505,7 @@ impl RunManifestHandle {
         resources_sha256: Option<&str>,
         fixture_realization_sha256: Option<&str>,
         fixture_realization_semantics_sha256: Option<&str>,
+        raw_artifact_inventory_sha256: Option<&str>,
     ) -> Result<RunManifestReference> {
         let mut this = self;
         if let Some(resources_sha256) = resources_sha256 {
@@ -523,6 +529,23 @@ impl RunManifestHandle {
             }
             (None, None) => {}
             _ => bail!("fixture realization requires artifact and semantic identities"),
+        }
+        if let Some(raw_artifact_inventory_sha256) = raw_artifact_inventory_sha256 {
+            ensure!(
+                is_sha256(raw_artifact_inventory_sha256),
+                "raw artifact inventory SHA256 is missing or malformed"
+            );
+            let inventory_path = this
+                .path
+                .parent()
+                .context("run manifest path has no artifact directory")?
+                .join("raw-artifact-inventory.json");
+            ensure!(
+                sha256_file(&inventory_path)? == raw_artifact_inventory_sha256,
+                "raw artifact inventory changed before run completion"
+            );
+            this.manifest.raw_artifact_inventory_sha256 =
+                Some(raw_artifact_inventory_sha256.to_string());
         }
         if let Some(expected) = &this.manifest.fixture_realization_sha256 {
             let fixture_path = this
@@ -554,7 +577,8 @@ impl RunManifestHandle {
                 || (this.manifest.resources_sha256.is_some()
                     && this.manifest.descriptor_sha256.is_some()
                     && this.manifest.fixture_realization_sha256.is_some()
-                    && this.manifest.fixture_realization_semantics_sha256.is_some()),
+                    && this.manifest.fixture_realization_semantics_sha256.is_some()
+                    && this.manifest.raw_artifact_inventory_sha256.is_some()),
             "completed performance manifest is missing a required artifact identity"
         );
         this.validate_unchanged_inputs()?;
@@ -577,6 +601,7 @@ impl RunManifestHandle {
                 .manifest
                 .fixture_realization_semantics_sha256
                 .clone(),
+            raw_artifact_inventory_sha256: this.manifest.raw_artifact_inventory_sha256.clone(),
         };
         fs::write(&this.path, bytes).context("write completed UEA-1 run manifest")?;
         this.finished = true;
@@ -704,6 +729,7 @@ struct RunCompletionMarker<'a> {
     descriptor_sha256: &'a str,
     effective_launch_config_sha256: &'a str,
     fixture_realization_sha256: &'a str,
+    raw_artifact_inventory_sha256: &'a str,
 }
 
 pub fn write_run_completion_marker(
@@ -721,6 +747,10 @@ pub fn write_run_completion_marker(
         .fixture_realization_sha256
         .as_deref()
         .context("performance run omitted fixture realization identity")?;
+    let raw_artifact_inventory_sha256 = run
+        .raw_artifact_inventory_sha256
+        .as_deref()
+        .context("performance run omitted raw artifact inventory identity")?;
     ensure!(
         [
             run.sha256.as_str(),
@@ -729,13 +759,14 @@ pub fn write_run_completion_marker(
             descriptor_sha256,
             run.effective_launch_config_sha256.as_str(),
             fixture_realization_sha256,
+            raw_artifact_inventory_sha256,
         ]
         .into_iter()
         .all(is_sha256),
         "completion marker contains a malformed artifact identity"
     );
     let marker = RunCompletionMarker {
-        schema_version: 1,
+        schema_version: 2,
         run_id: &run.run_id,
         scenario,
         run_manifest_sha256: &run.sha256,
@@ -744,6 +775,7 @@ pub fn write_run_completion_marker(
         descriptor_sha256,
         effective_launch_config_sha256: &run.effective_launch_config_sha256,
         fixture_realization_sha256,
+        raw_artifact_inventory_sha256,
     };
     let bytes = serde_json::to_vec_pretty(&marker)
         .context("serialize terminal UEA-1 run completion marker")?;
@@ -1274,7 +1306,7 @@ pub(super) fn sha256_file(path: &Path) -> Result<String> {
     })?))
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
@@ -1731,6 +1763,8 @@ checksum = "abc"
             format!(r#"{{"semantics_sha256":"{}"}}"#, "e".repeat(64)),
         )
         .expect("write fixture realization artifact");
+        let raw_artifact_inventory = artifacts.join("raw-artifact-inventory.json");
+        fs::write(&raw_artifact_inventory, b"raw-inventory").expect("write raw artifact inventory");
         let runner = fs::canonicalize(std::env::current_exe().expect("current test executable"))
             .expect("canonical test executable");
         let source_revision = command_text(&repository, "git", &["rev-parse", "HEAD"])
@@ -1740,7 +1774,7 @@ checksum = "abc"
         let binary_sha256 = sha256_file(&binary).expect("hash measured server");
         let cargo_lock = repository.join("Cargo.lock");
         let manifest = RunManifest {
-            schema_version: 4,
+            schema_version: 5,
             kind: RunManifestKind::Performance,
             formal: false,
             run_id: "run-finish-drift".to_string(),
@@ -1782,6 +1816,7 @@ checksum = "abc"
             effective_launch_config_semantics_sha256: "c".repeat(64),
             fixture_realization_sha256: None,
             fixture_realization_semantics_sha256: None,
+            raw_artifact_inventory_sha256: None,
             resources_sha256: None,
             rustc_version: "rustc fixture".to_string(),
             cargo_version: "cargo fixture".to_string(),
@@ -1823,6 +1858,7 @@ checksum = "abc"
                 &"a".repeat(64),
                 &sha256_file(&fixture_realization).expect("hash fixture realization"),
                 &"e".repeat(64),
+                &sha256_file(&raw_artifact_inventory).expect("hash raw artifact inventory"),
             )
             .expect_err("changed measured binary must prevent completion");
         assert!(error.to_string().contains("server binary changed"));
