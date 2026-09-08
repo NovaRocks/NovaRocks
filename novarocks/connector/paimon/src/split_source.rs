@@ -29,8 +29,8 @@ use paimon::spec::TableSchema;
 
 use crate::catalog::map_sdk_error;
 use crate::domain::{
-    PaimonBinaryTableStats, PaimonColumn, PaimonDataFile, PaimonDataFileFacts, PaimonDeletionFile,
-    PaimonMergeEngine, PaimonRowRange, PaimonSplit,
+    PaimonBinaryTableStats, PaimonColumn, PaimonDataFile, PaimonDataFileFacts, PaimonMergeEngine,
+    PaimonSplit,
 };
 use crate::metadata::{PaimonFrozenRead, validate_schema_evolution};
 use crate::resources::PaimonRequestResources;
@@ -203,7 +203,7 @@ pub async fn plan_splits(
                 "Paimon historical schemas exceed the metadata byte limit",
             ));
         }
-        reservation.try_grow(schema_bytes)?;
+        reservation.try_grow(estimate_historical_schema_entry_bytes())?;
         historical_schemas.insert(schema_id, schema);
     }
     let historical_schemas = Arc::new(historical_schemas);
@@ -290,47 +290,21 @@ fn convert_split(
     if files.is_empty() || total_bytes == 0 {
         return Err(corrupt("Paimon SDK emitted an empty data split"));
     }
-    let contains_delete_rows = sdk_split.data_deletion_files().is_some()
-        || sdk_split.data_files().iter().any(|file| {
-            file.delete_row_count.is_some_and(|count| count > 0)
-                || (frozen.table().merge_engine() == PaimonMergeEngine::Deduplicate
-                    && file.delete_row_count.is_none())
-        });
-    let data_deletion_files = sdk_split
-        .data_deletion_files()
-        .map(|files| {
-            files
-                .iter()
-                .map(|file| {
-                    file.as_ref()
-                        .map(|file| {
-                            PaimonDeletionFile::try_new(
-                                file.path(),
-                                u64::try_from(file.offset()).map_err(|_| {
-                                    corrupt("Paimon deletion file offset is negative")
-                                })?,
-                                u64::try_from(file.length()).map_err(|_| {
-                                    corrupt("Paimon deletion file length is negative")
-                                })?,
-                                file.cardinality().map(u64::try_from).transpose().map_err(
-                                    |_| corrupt("Paimon deletion file cardinality is negative"),
-                                )?,
-                            )
-                        })
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?;
-    let row_ranges = sdk_split
-        .row_ranges()
-        .map(|ranges| {
-            ranges
-                .iter()
-                .map(|range| PaimonRowRange::try_new(range.from(), range.to()))
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?;
+    if sdk_split.data_deletion_files().is_some() {
+        return Err(unsupported(
+            "Paimon deletion-vector reads are unsupported in PAI-1",
+        ));
+    }
+    if sdk_split.row_ranges().is_some() {
+        return Err(unsupported(
+            "Paimon row-range reads are unsupported in PAI-1",
+        ));
+    }
+    let contains_delete_rows = sdk_split.data_files().iter().any(|file| {
+        file.delete_row_count.is_some_and(|count| count > 0)
+            || (frozen.table().merge_engine() == PaimonMergeEngine::Deduplicate
+                && file.delete_row_count.is_none())
+    });
     PaimonSplit::try_new(
         sdk_split.snapshot_id(),
         frozen.view().schema_id(),
@@ -340,8 +314,8 @@ fn convert_split(
         sdk_split.bucket_path(),
         sdk_split.total_buckets(),
         files,
-        data_deletion_files,
-        row_ranges,
+        None,
+        None,
         sdk_split.raw_convertible(),
         contains_delete_rows,
         SplitWeight::from_proportion(total_bytes as f64 / target_split_bytes as f64)?,
@@ -464,6 +438,14 @@ fn estimate_schema_bytes(schema: &TableSchema) -> u64 {
         })
 }
 
+fn estimate_historical_schema_entry_bytes() -> u64 {
+    // The schema heap is already charged by SchemaManager and its reservation
+    // follows every TableSchema clone. This lease owns only the map entry and
+    // one additional Arc; two tuple widths conservatively cover BTree links
+    // and node metadata amortized across entries.
+    u64::try_from(size_of::<(i64, Arc<TableSchema>)>().saturating_mul(2)).unwrap_or(u64::MAX)
+}
+
 fn invalid(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
 }
@@ -474,4 +456,8 @@ fn corrupt(message: &'static str) -> ConnectorError {
 
 fn exhausted(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
+}
+
+fn unsupported(message: &'static str) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unsupported, message)
 }

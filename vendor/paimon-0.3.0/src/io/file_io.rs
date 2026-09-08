@@ -1085,6 +1085,10 @@ mod file_action_test {
         fn bytes(&self) -> u64 {
             self.bytes
         }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
     }
 
     impl Drop for ObservedReservation {

@@ -22,7 +22,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use novarocks_spi::connector::read_stack::ConnectorTableHandle;
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorResourceReservation};
 use paimon::DataSplit;
 use paimon::spec::{DataField, DataType};
 use paimon::table::{ArrowRecordBatchStream, Table, TableRead};
@@ -30,14 +30,48 @@ use paimon::table::{ArrowRecordBatchStream, Table, TableRead};
 use crate::domain::{PaimonColumn, PaimonMergeEngine, PaimonReadView, PaimonSplit, PaimonTable};
 use crate::metadata::PaimonFrozenRead;
 use crate::schema::PaimonDataType;
+use crate::sdk_control::PaimonSdkReadControl;
 use crate::split_source::PaimonPlannedSplit;
+
+/// One SDK output batch and the exact host reservation transferred with it.
+pub struct PaimonReadBatch {
+    batch: RecordBatch,
+    output_reservation: Option<ConnectorResourceReservation>,
+}
+
+impl PaimonReadBatch {
+    pub fn unreserved(batch: RecordBatch) -> Self {
+        Self {
+            batch,
+            output_reservation: None,
+        }
+    }
+
+    pub fn with_output_reservation(
+        batch: RecordBatch,
+        output_reservation: ConnectorResourceReservation,
+    ) -> Self {
+        Self {
+            batch,
+            output_reservation: Some(output_reservation),
+        }
+    }
+
+    pub fn num_rows(&self) -> usize {
+        self.batch.num_rows()
+    }
+
+    pub(crate) fn into_parts(self) -> (RecordBatch, Option<ConnectorResourceReservation>) {
+        (self.batch, self.output_reservation)
+    }
+}
 
 /// Pull boundary used by the page source.
 ///
 /// Production uses [`PaimonReader`]. The trait keeps lifecycle tests at the
 /// connector boundary without replacing SDK merge behavior.
 pub trait PaimonBatchReader: Send {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError>;
+    fn next_batch(&mut self) -> Result<Option<PaimonReadBatch>, ConnectorError>;
     fn close(&mut self) -> Result<(), ConnectorError>;
 }
 
@@ -47,6 +81,7 @@ pub struct PaimonReader {
     stream: Option<ArrowRecordBatchStream>,
     output_schema: SchemaRef,
     runtime: Option<tokio::runtime::Handle>,
+    output_control: Option<PaimonSdkReadControl>,
 }
 
 impl PaimonReader {
@@ -114,6 +149,29 @@ impl PaimonReader {
         projected_columns: &[PaimonColumn],
         runtime: Option<tokio::runtime::Handle>,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_runtime_and_control(
+            sdk_table,
+            table,
+            view,
+            split,
+            sdk_split,
+            projected_columns,
+            runtime,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_with_runtime_and_control(
+        sdk_table: Arc<Table>,
+        table: &PaimonTable,
+        view: &PaimonReadView,
+        split: &PaimonSplit,
+        sdk_split: DataSplit,
+        projected_columns: &[PaimonColumn],
+        runtime: Option<tokio::runtime::Handle>,
+        output_control: Option<PaimonSdkReadControl>,
+    ) -> Result<Self, ConnectorError> {
         validate_frozen_input(
             sdk_table.as_ref(),
             table,
@@ -134,6 +192,7 @@ impl PaimonReader {
             stream: Some(stream),
             output_schema,
             runtime,
+            output_control,
         })
     }
 
@@ -179,7 +238,7 @@ fn validate_historical_schemas(
 }
 
 impl PaimonBatchReader for PaimonReader {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+    fn next_batch(&mut self) -> Result<Option<PaimonReadBatch>, ConnectorError> {
         let Some(stream) = self.stream.as_mut() else {
             return Ok(None);
         };
@@ -192,8 +251,17 @@ impl PaimonBatchReader for PaimonReader {
         };
         match next {
             Some(Ok(batch)) => {
+                let output_reservation = self
+                    .output_control
+                    .as_ref()
+                    .map(PaimonSdkReadControl::take_output_reservation)
+                    .transpose()?
+                    .flatten();
                 self.validate_output(&batch)?;
-                Ok(Some(batch))
+                Ok(Some(PaimonReadBatch {
+                    batch,
+                    output_reservation,
+                }))
             }
             Some(Err(error)) => Err(map_paimon_error(error)),
             None => Ok(None),
@@ -202,6 +270,9 @@ impl PaimonBatchReader for PaimonReader {
 
     fn close(&mut self) -> Result<(), ConnectorError> {
         self.stream.take();
+        if let Some(control) = &self.output_control {
+            drop(control.take_output_reservation()?);
+        }
         Ok(())
     }
 }

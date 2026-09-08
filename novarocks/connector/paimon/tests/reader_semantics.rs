@@ -19,6 +19,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, Int32Array};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
@@ -30,13 +31,14 @@ use novarocks_connector_paimon::domain::{
     PaimonBucketMode, PaimonColumn, PaimonMergeEngine, PaimonReadView, PaimonSplit, PaimonTable,
 };
 use novarocks_connector_paimon::page_source::PaimonPageSource;
-use novarocks_connector_paimon::reader::{PaimonBatchReader, PaimonReader};
+use novarocks_connector_paimon::reader::{PaimonBatchReader, PaimonReadBatch, PaimonReader};
 use novarocks_connector_paimon::resources::PaimonRequestResources;
 use novarocks_connector_paimon::schema::PaimonDataType;
 use novarocks_spi::connector::read_stack::{ConnectorPageSource, SchemaTableName, SplitWeight};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorRequestResources, ConnectorResourceCheckpoint,
-    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorRequestResources,
+    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
+    ConnectorResourceLedger,
 };
 use paimon::catalog::Identifier;
 use paimon::io::{
@@ -47,6 +49,8 @@ use paimon::table::Table;
 
 enum Step {
     Batch(RecordBatch),
+    Transferred(PaimonReadBatch),
+    TransferThenCancel(PaimonReadBatch, Arc<Ledger>),
     Error(ConnectorError),
     Eof,
 }
@@ -57,9 +61,14 @@ struct ScriptedReader {
 }
 
 impl PaimonBatchReader for ScriptedReader {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+    fn next_batch(&mut self) -> Result<Option<PaimonReadBatch>, ConnectorError> {
         match self.steps.pop_front().unwrap_or(Step::Eof) {
-            Step::Batch(batch) => Ok(Some(batch)),
+            Step::Batch(batch) => Ok(Some(PaimonReadBatch::unreserved(batch))),
+            Step::Transferred(batch) => Ok(Some(batch)),
+            Step::TransferThenCancel(batch, ledger) => {
+                ledger.cancelled.store(true, Ordering::Release);
+                Ok(Some(batch))
+            }
             Step::Error(error) => Err(error),
             Step::Eof => Ok(None),
         }
@@ -74,6 +83,7 @@ impl PaimonBatchReader for ScriptedReader {
 struct Ledger {
     retained: Arc<AtomicU64>,
     peak: AtomicU64,
+    reservations: AtomicUsize,
     checkpoints: AtomicUsize,
     cancelled: AtomicBool,
     limit: u64,
@@ -98,6 +108,7 @@ impl ConnectorResourceLedger for Ledger {
         bytes: u64,
     ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
         assert_eq!(class, ConnectorResourceClass::ReaderOutput);
+        self.reservations.fetch_add(1, Ordering::AcqRel);
         let old = self.retained.fetch_add(bytes, Ordering::AcqRel);
         if old.saturating_add(bytes) > self.limit {
             self.retained.fetch_sub(bytes, Ordering::AcqRel);
@@ -111,6 +122,33 @@ impl ConnectorResourceLedger for Ledger {
             bytes,
             retained: Arc::clone(&self.retained),
         }))
+    }
+}
+
+fn ledger(budget: u64) -> Arc<Ledger> {
+    Arc::new(Ledger {
+        retained: Arc::new(AtomicU64::new(0)),
+        peak: AtomicU64::new(0),
+        reservations: AtomicUsize::new(0),
+        checkpoints: AtomicUsize::new(0),
+        cancelled: AtomicBool::new(false),
+        limit: budget,
+    })
+}
+
+fn request_resources(ledger: &Arc<Ledger>) -> (ConnectorRequestResources, PaimonRequestResources) {
+    let resources = ConnectorRequestResources::new(ledger.clone());
+    let paimon_resources = PaimonRequestResources::new(
+        resources.clone(),
+        ledger.clone(),
+        Instant::now() + Duration::from_secs(60),
+    );
+    (resources, paimon_resources)
+}
+
+impl ConnectorCancellation for Ledger {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -150,24 +188,14 @@ fn fixture(
     budget: u64,
 ) -> (PaimonPageSource, Arc<Ledger>, Arc<AtomicUsize>) {
     let closes = Arc::new(AtomicUsize::new(0));
-    let ledger = Arc::new(Ledger {
-        retained: Arc::new(AtomicU64::new(0)),
-        peak: AtomicU64::new(0),
-        checkpoints: AtomicUsize::new(0),
-        cancelled: AtomicBool::new(false),
-        limit: budget,
-    });
+    let ledger = ledger(budget);
     let reader = ScriptedReader {
         steps: steps.into(),
         closes: Arc::clone(&closes),
     };
-    let resources = ConnectorRequestResources::new(ledger.clone());
+    let (_, resources) = request_resources(&ledger);
     (
-        PaimonPageSource::new(
-            Box::new(reader),
-            PaimonRequestResources::new(resources),
-            row_limit,
-        ),
+        PaimonPageSource::new(Box::new(reader), resources, row_limit),
         ledger,
         closes,
     )
@@ -249,6 +277,101 @@ fn output_charge_moves_with_page_and_releases_on_drop() {
     assert_eq!(ledger.retained.load(Ordering::Acquire), charged);
     drop(page);
     assert_eq!(ledger.retained.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn transferred_output_uses_one_charge_with_only_one_batch_of_budget() {
+    let batch = int_batch(&[1, 2, 3]);
+    let retained_bytes = batch
+        .columns()
+        .iter()
+        .map(|column| column.get_array_memory_size() as u64)
+        .sum();
+    let ledger = ledger(retained_bytes);
+    let (resources, paimon_resources) = request_resources(&ledger);
+    let reservation = resources
+        .try_reserve(ConnectorResourceClass::ReaderOutput, retained_bytes)
+        .expect("SDK output reservation");
+    let closes = Arc::new(AtomicUsize::new(0));
+    let reader = ScriptedReader {
+        steps: vec![Step::Transferred(PaimonReadBatch::with_output_reservation(
+            batch,
+            reservation,
+        ))]
+        .into(),
+        closes: Arc::clone(&closes),
+    };
+    let mut source = PaimonPageSource::new(Box::new(reader), paimon_resources, None);
+
+    let page = source.next_source_page().unwrap().expect("page");
+    assert_eq!(page.output_memory_bytes(), Some(retained_bytes));
+    assert_eq!(ledger.reservations.load(Ordering::Acquire), 1);
+    assert_eq!(ledger.peak.load(Ordering::Acquire), retained_bytes);
+    assert_eq!(ledger.retained.load(Ordering::Acquire), retained_bytes);
+
+    drop(page);
+    assert_eq!(ledger.retained.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn transferred_output_is_released_when_post_poll_checkpoint_fails() {
+    let batch = int_batch(&[1, 2, 3]);
+    let retained_bytes = batch
+        .columns()
+        .iter()
+        .map(|column| column.get_array_memory_size() as u64)
+        .sum();
+    let ledger = ledger(retained_bytes);
+    let (resources, paimon_resources) = request_resources(&ledger);
+    let reservation = resources
+        .try_reserve(ConnectorResourceClass::ReaderOutput, retained_bytes)
+        .expect("SDK output reservation");
+    let closes = Arc::new(AtomicUsize::new(0));
+    let reader = ScriptedReader {
+        steps: vec![Step::TransferThenCancel(
+            PaimonReadBatch::with_output_reservation(batch, reservation),
+            Arc::clone(&ledger),
+        )]
+        .into(),
+        closes: Arc::clone(&closes),
+    };
+    let mut source = PaimonPageSource::new(Box::new(reader), paimon_resources, None);
+
+    let error = source.next_source_page().unwrap_err();
+    assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+    assert_eq!(ledger.reservations.load(Ordering::Acquire), 1);
+    assert_eq!(ledger.retained.load(Ordering::Acquire), 0);
+    assert_eq!(closes.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn close_releases_transferred_output_still_owned_by_reader() {
+    let batch = int_batch(&[1, 2, 3]);
+    let retained_bytes = batch
+        .columns()
+        .iter()
+        .map(|column| column.get_array_memory_size() as u64)
+        .sum();
+    let ledger = ledger(retained_bytes);
+    let (resources, paimon_resources) = request_resources(&ledger);
+    let reservation = resources
+        .try_reserve(ConnectorResourceClass::ReaderOutput, retained_bytes)
+        .expect("SDK output reservation");
+    let closes = Arc::new(AtomicUsize::new(0));
+    let reader = ScriptedReader {
+        steps: vec![Step::Transferred(PaimonReadBatch::with_output_reservation(
+            batch,
+            reservation,
+        ))]
+        .into(),
+        closes: Arc::clone(&closes),
+    };
+    let mut source = PaimonPageSource::new(Box::new(reader), paimon_resources, None);
+
+    source.close().unwrap();
+    assert_eq!(ledger.reservations.load(Ordering::Acquire), 1);
+    assert_eq!(ledger.retained.load(Ordering::Acquire), 0);
+    assert_eq!(closes.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -369,6 +492,10 @@ struct NoReservation(u64);
 impl ReadReservation for NoReservation {
     fn bytes(&self) -> u64 {
         self.0
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
     }
 }
 

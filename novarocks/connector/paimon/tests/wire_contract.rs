@@ -185,16 +185,8 @@ fn split_round_trip_requires_exact_public_scheduling_facts() {
         "s3://warehouse/db.db/events/bucket-0",
         8,
         vec![file],
-        Some(vec![Some(
-            PaimonDeletionFile::try_new(
-                "s3://warehouse/db.db/events/bucket-0/data.parquet.dv",
-                12,
-                24,
-                Some(2),
-            )
-            .unwrap(),
-        )]),
-        Some(vec![PaimonRowRange::try_new(100, 109).unwrap()]),
+        None,
+        None,
         false,
         true,
         SplitWeight::STANDARD,
@@ -227,7 +219,7 @@ fn split_round_trip_requires_exact_public_scheduling_facts() {
 }
 
 #[test]
-fn split_rejects_misaligned_deletion_vector_and_invalid_nested_facts() {
+fn split_rejects_unsupported_pruning_carriers_and_invalid_nested_facts() {
     assert!(
         PaimonSplit::try_new(
             1,
@@ -240,6 +232,24 @@ fn split_rejects_misaligned_deletion_vector_and_invalid_nested_facts() {
             vec![minimal_file(Vec::new())],
             Some(Vec::new()),
             None,
+            true,
+            false,
+            SplitWeight::STANDARD,
+        )
+        .is_err()
+    );
+    assert!(
+        PaimonSplit::try_new(
+            1,
+            0,
+            0,
+            Vec::new(),
+            0,
+            "s3://warehouse/table/bucket-0",
+            1,
+            vec![minimal_file(Vec::new())],
+            None,
+            Some(vec![PaimonRowRange::try_new(0, 0).unwrap()]),
             true,
             false,
             SplitWeight::STANDARD,
@@ -278,6 +288,26 @@ fn split_rejects_misaligned_deletion_vector_and_invalid_nested_facts() {
         )
         .is_err()
     );
+    for (bucket, total_buckets) in [(-2, 1), (-1, 1), (0, 0), (0, -2), (1, 1)] {
+        assert!(
+            PaimonSplit::try_new(
+                1,
+                0,
+                0,
+                Vec::new(),
+                bucket,
+                "s3://warehouse/table/bucket-0",
+                total_buckets,
+                vec![minimal_file(Vec::new())],
+                None,
+                None,
+                true,
+                false,
+                SplitWeight::STANDARD,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -393,6 +423,36 @@ fn inject_into_first_file(payload: Vec<u8>, suffix: &[u8]) -> Vec<u8> {
     panic!("split payload did not contain a data file")
 }
 
+fn inject_into_column_type(payload: Vec<u8>, suffix: &[u8]) -> Vec<u8> {
+    let mut cursor = 0usize;
+    while cursor < payload.len() {
+        let (key, key_end) = decode_varint(&payload, cursor);
+        cursor = key_end;
+        let field = key >> 3;
+        let wire = key & 7;
+        if wire == 2 {
+            let length_start = cursor;
+            let (length, content_start) = decode_varint(&payload, cursor);
+            let content_end = content_start + length as usize;
+            if field == 3 {
+                let mut nested = payload[content_start..content_end].to_vec();
+                nested.extend_from_slice(suffix);
+                let mut output = payload[..length_start].to_vec();
+                encode_varint(nested.len() as u64, &mut output);
+                output.extend_from_slice(&nested);
+                output.extend_from_slice(&payload[content_end..]);
+                return output;
+            }
+            cursor = content_end;
+        } else if wire == 0 {
+            cursor = decode_varint(&payload, cursor).1;
+        } else {
+            panic!("unexpected column root wire type {wire}");
+        }
+    }
+    panic!("column payload did not contain a data type")
+}
+
 fn decode_varint(bytes: &[u8], mut offset: usize) -> (u64, usize) {
     let mut value = 0u64;
     let mut shift = 0;
@@ -430,6 +490,46 @@ fn decoder_rejects_unknown_and_duplicate_singular_root_fields_before_materializa
             error.kind(),
             ConnectorCodecErrorKind::UnknownField | ConnectorCodecErrorKind::DuplicateField
         ));
+    }
+}
+
+#[test]
+fn column_decoder_rejects_unknown_and_duplicate_nested_type_fields() {
+    let codec = PaimonReadWireCodec;
+    for (column, suffix, expected) in [
+        (
+            PaimonColumn::try_new(1, "id", PaimonDataType::Int64, false, 0).unwrap(),
+            vec![0x28, 0x01],
+            ConnectorCodecErrorKind::UnknownField,
+        ),
+        (
+            PaimonColumn::try_new(1, "id", PaimonDataType::Int64, false, 0).unwrap(),
+            vec![0x08, 0x04],
+            ConnectorCodecErrorKind::DuplicateField,
+        ),
+        (
+            PaimonColumn::try_new(
+                1,
+                "amount",
+                PaimonDataType::decimal(18, 2).unwrap(),
+                false,
+                0,
+            )
+            .unwrap(),
+            vec![0x10, 0x26],
+            ConnectorCodecErrorKind::DuplicateField,
+        ),
+    ] {
+        let payload =
+            inject_into_column_type(codec.encode_private(&column).unwrap().to_vec(), &suffix);
+        let (header, mut ledger) = decode_context(ConnectorCodecCategory::ReadColumn);
+        let error = <PaimonReadWireCodec as ConnectorPrivateDecoder<PaimonColumn>>::decode_private(
+            &codec,
+            &payload,
+            &mut ConnectorDecodeContext::new(&header, &mut ledger),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), expected);
     }
 }
 

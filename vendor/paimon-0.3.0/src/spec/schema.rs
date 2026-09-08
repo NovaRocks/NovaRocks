@@ -28,10 +28,42 @@ use crate::spec::{
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
+use std::sync::{Arc, Mutex};
+
+use crate::io::ReadReservation;
 
 const BLOB_FIELD_DIRECTIVE: &str = "__BLOB_FIELD";
 const BLOB_DESCRIPTOR_FIELD_DIRECTIVE: &str = "__BLOB_DESCRIPTOR_FIELD";
 const BLOB_VIEW_FIELD_DIRECTIVE: &str = "__BLOB_VIEW_FIELD";
+
+#[derive(Debug)]
+struct TableSchemaReservationOwner {
+    _reservation: Mutex<Box<dyn ReadReservation>>,
+}
+
+/// Resource ownership is operational metadata and does not participate in
+/// schema equality or serialization. Cloning a schema shares the same owner so
+/// a returned schema cannot outlive its cache reservation.
+#[derive(Clone, Default)]
+struct TableSchemaRetention(Option<Arc<TableSchemaReservationOwner>>);
+
+impl Debug for TableSchemaRetention {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TableSchemaRetention")
+            .field("reserved", &self.0.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for TableSchemaRetention {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TableSchemaRetention {}
 
 /// The table schema for paimon table.
 ///
@@ -49,6 +81,8 @@ pub struct TableSchema {
     options: HashMap<String, String>,
     comment: Option<String>,
     time_millis: i64,
+    #[serde(skip)]
+    read_retention: TableSchemaRetention,
 }
 
 impl TableSchema {
@@ -71,7 +105,34 @@ impl TableSchema {
             options: schema.options().clone(),
             comment: schema.comment().map(|s| s.to_string()),
             time_millis: chrono::Utc::now().timestamp_millis(),
+            read_retention: TableSchemaRetention::default(),
         }
+    }
+
+    pub(crate) fn attach_read_reservation(
+        &mut self,
+        reservation: Option<Box<dyn ReadReservation>>,
+    ) {
+        self.read_retention = TableSchemaRetention(reservation.map(|reservation| {
+            Arc::new(TableSchemaReservationOwner {
+                _reservation: Mutex::new(reservation),
+            })
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_read_bytes(&self) -> u64 {
+        self.read_retention
+            .0
+            .as_ref()
+            .map(|owner| {
+                owner
+                    ._reservation
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .bytes()
+            })
+            .unwrap_or(0)
     }
 
     /// Get the highest field ID from a list of fields, including fields nested

@@ -227,7 +227,7 @@ fn map_file_error(error: FileError) -> paimon::Error {
         FileErrorKind::Unsupported => paimon::Error::IoUnsupported {
             message: error.to_string(),
         },
-        FileErrorKind::Invalid | FileErrorKind::Permission => paimon::Error::ConfigInvalid {
+        FileErrorKind::Invalid => paimon::Error::ConfigInvalid {
             message: error.to_string(),
         },
         _ => paimon::Error::UnexpectedError {
@@ -258,7 +258,7 @@ mod tests {
     use novarocks_fs::FileError;
     use novarocks_spi::connector::ConnectorErrorKind;
 
-    use super::connector_error_from_file_error;
+    use super::{connector_error_from_file_error, map_file_error};
 
     #[test]
     fn preserves_host_cancellation_and_deadline_classification() {
@@ -270,5 +270,20 @@ mod tests {
             connector_error_from_file_error(&FileError::deadline("deadline")).kind(),
             ConnectorErrorKind::DeadlineExceeded
         );
+    }
+
+    #[test]
+    fn preserves_host_permission_through_sdk_error_mapping() {
+        let metadata = crate::catalog::map_sdk_error(map_file_error(FileError::new(
+            novarocks_fs::FileErrorKind::Permission,
+            "credential scope rejected",
+        )));
+        let reader = crate::reader::map_paimon_error(map_file_error(FileError::new(
+            novarocks_fs::FileErrorKind::Permission,
+            "credential scope rejected",
+        )));
+
+        assert_eq!(metadata.kind(), ConnectorErrorKind::PermissionDenied);
+        assert_eq!(reader.kind(), ConnectorErrorKind::PermissionDenied);
     }
 }

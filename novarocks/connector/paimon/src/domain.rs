@@ -491,7 +491,10 @@ impl PaimonSplit {
         if snapshot_id == -1
             || schema_id < 0
             || partition_arity < 0
-            || bucket == -1
+            || bucket < 0
+            || total_buckets == 0
+            || total_buckets < -1
+            || (total_buckets > 0 && bucket >= total_buckets)
             || files.len() > MAX_PAIMON_FILES_PER_SPLIT
         {
             return Err(invalid("Paimon split facts are invalid or unbounded"));
@@ -503,36 +506,20 @@ impl PaimonSplit {
         {
             return Err(invalid("Paimon partition BinaryRow body is truncated"));
         }
-        if let Some(deletions) = &data_deletion_files {
-            if deletions.len() != files.len() {
-                return Err(invalid(
-                    "Paimon deletion-file vector must align exactly with data files",
-                ));
-            }
-            if deletions.iter().zip(&files).any(|(deletion, file)| {
-                deletion
-                    .as_ref()
-                    .and_then(PaimonDeletionFile::cardinality)
-                    .is_some_and(|count| count > file.row_count())
-            }) {
-                return Err(invalid(
-                    "Paimon deletion-file cardinality exceeds its data-file row count",
-                ));
-            }
+        if data_deletion_files.is_some() {
+            return Err(unsupported(
+                "Paimon deletion-vector reads are unsupported in PAI-1",
+            ));
         }
-        if row_ranges
-            .as_ref()
-            .is_some_and(|ranges| ranges.len() > MAX_PAIMON_ROW_RANGES)
-        {
-            return Err(invalid("Paimon row-range vector is unbounded"));
+        if row_ranges.is_some() {
+            return Err(unsupported(
+                "Paimon row-range reads are unsupported in PAI-1",
+            ));
         }
         if !contains_delete_rows
-            && (files
+            && files
                 .iter()
                 .any(|file| file.facts.delete_row_count.is_some_and(|count| count > 0))
-                || data_deletion_files
-                    .as_ref()
-                    .is_some_and(|files| files.iter().any(Option::is_some)))
         {
             return Err(invalid("Paimon split contradicts its delete-row summary"));
         }
@@ -688,4 +675,8 @@ fn validate_field_ids(ids: &[i32]) -> Result<(), ConnectorError> {
 
 fn invalid(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+}
+
+fn unsupported(message: &'static str) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unsupported, message)
 }

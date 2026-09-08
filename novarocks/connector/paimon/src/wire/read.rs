@@ -150,6 +150,18 @@ static SPLIT_SCHEMA: StrictSchema = StrictSchema {
         (11, &ROW_RANGE_LIST_SCHEMA),
     ],
 };
+static DATA_TYPE_SCHEMA: StrictSchema = StrictSchema {
+    name: "paimon_read_column.data_type",
+    fields: &[(1, 0), (2, 0), (3, 0), (4, 0)],
+    repeated: &[],
+    children: &[],
+};
+static COLUMN_SCHEMA: StrictSchema = StrictSchema {
+    name: "paimon_read_column",
+    fields: &[(1, 0), (2, 2), (3, 2), (4, 0), (5, 0)],
+    repeated: &[],
+    children: &[(3, &DATA_TYPE_SCHEMA)],
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PaimonReadWireCodec;
@@ -220,13 +232,7 @@ impl ConnectorPrivateDecoder<PaimonColumn> for PaimonReadWireCodec {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<PaimonColumn, ConnectorCodecError> {
-        let raw = decode_root::<dto::PaimonColumnPayload>(
-            payload,
-            context,
-            "paimon_read_column",
-            &[1, 2, 3, 4, 5],
-            &[],
-        )?;
+        let raw = decode_strict_root::<dto::PaimonColumnPayload>(payload, context, &COLUMN_SCHEMA)?;
         let data_type = raw
             .data_type
             .as_ref()

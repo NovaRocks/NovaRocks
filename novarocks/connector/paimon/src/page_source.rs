@@ -18,11 +18,10 @@
 use std::time::Instant;
 
 use arrow::array::ArrayRef;
-use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::read_stack::{ConnectorPageSource, PageSourceMetrics, SourcePage};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
-use crate::reader::PaimonBatchReader;
+use crate::reader::{PaimonBatchReader, PaimonReadBatch};
 use crate::resources::PaimonRequestResources;
 
 /// Page-source lifecycle for one already-merged Paimon SDK stream.
@@ -64,7 +63,8 @@ impl PaimonPageSource {
         }
     }
 
-    fn page_from_batch(&mut self, batch: RecordBatch) -> Result<SourcePage, ConnectorError> {
+    fn page_from_batch(&mut self, batch: PaimonReadBatch) -> Result<SourcePage, ConnectorError> {
+        let (batch, output_reservation) = batch.into_parts();
         let available = batch.num_rows();
         let rows = match self.remaining_rows {
             Some(remaining) => usize::try_from(remaining.min(available as u64)).map_err(|_| {
@@ -95,7 +95,10 @@ impl PaimonPageSource {
                 .iter()
                 .map(|column| column.get_array_memory_size() as u64)
                 .fold(0_u64, u64::saturating_add);
-            let reservation = self.resources.reserve_output(retained_bytes.max(1))?;
+            let reservation = match output_reservation {
+                Some(reservation) => reservation,
+                None => self.resources.reserve_output(retained_bytes.max(1))?,
+            };
             let output = self
                 .resources
                 .transfer_output(reservation, retained_bytes)?;

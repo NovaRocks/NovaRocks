@@ -24,7 +24,9 @@ use novarocks_execution::exec::expr::agg::{
     contribute_builtin_aggregate_implementations,
 };
 use novarocks_server::app_config::NovaRocksConfig;
-use novarocks_server::{composition, launch, logging, native_compatibility};
+use novarocks_server::{
+    composition, launch, logging, native_compatibility, provider_manifest::ServerProviderManifest,
+};
 use novarocks_types::NativeCompatibilityId;
 
 fn usage() {
@@ -122,6 +124,7 @@ fn run_frontend(
     role: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
+    provider_manifest: Arc<ServerProviderManifest>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
     let frontend = composition::compose_frontend_server_config(
@@ -130,6 +133,7 @@ fn run_frontend(
         None,
         native_compatibility_id,
         function_catalog,
+        provider_manifest,
         runtime.handle().clone(),
     )?;
     runtime
@@ -145,6 +149,7 @@ fn run_backend(
     role: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
+    provider_manifest: Arc<ServerProviderManifest>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&role.config);
@@ -153,6 +158,7 @@ fn run_backend(
         &role.native_trust,
         native_compatibility_id,
         function_set,
+        provider_manifest,
         runtime.handle().clone(),
     )?;
     let data_runtime = novarocks_backend::BackendDataRuntime::new(
@@ -182,6 +188,7 @@ async fn run_all_in_one(
     be: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
+    provider_manifest: Arc<ServerProviderManifest>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&be.config);
@@ -191,6 +198,7 @@ async fn run_all_in_one(
         None,
         native_compatibility_id,
         std::sync::Arc::clone(function_set.catalog()),
+        Arc::clone(&provider_manifest),
         runtime.clone(),
     )?;
     let backend = composition::compose_backend_server_config(
@@ -198,6 +206,7 @@ async fn run_all_in_one(
         &be.native_trust,
         native_compatibility_id,
         function_set,
+        provider_manifest,
         runtime.clone(),
     )?;
     let backend_runtime = novarocks_backend::BackendDataRuntime::new(
@@ -264,10 +273,12 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         }
         launch::ResolvedServerLaunch::AllInOne { fe, .. } => &fe.config,
     };
+    let provider_manifest = Arc::new(ServerProviderManifest::seal()?);
     let runtime = init_process(process_config)?;
     let function_set = compose_process_function_set()?;
     let functions = std::sync::Arc::clone(function_set.catalog());
     let native_compatibility = native_compatibility::resolve_native_compatibility_material(
+        provider_manifest.contracts(),
         functions.digest(),
         function_set.implementation_manifest_digest(),
     )?;
@@ -279,17 +290,26 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         "resolved native compatibility material"
     );
     match resolved {
-        launch::ResolvedServerLaunch::Fe(role) => {
-            run_frontend(role, native_compatibility.id(), functions, &runtime)
-        }
-        launch::ResolvedServerLaunch::Be(role) => {
-            run_backend(role, native_compatibility.id(), function_set, &runtime)
-        }
+        launch::ResolvedServerLaunch::Fe(role) => run_frontend(
+            role,
+            native_compatibility.id(),
+            functions,
+            provider_manifest,
+            &runtime,
+        ),
+        launch::ResolvedServerLaunch::Be(role) => run_backend(
+            role,
+            native_compatibility.id(),
+            function_set,
+            provider_manifest,
+            &runtime,
+        ),
         launch::ResolvedServerLaunch::AllInOne { fe, be } => runtime.block_on(run_all_in_one(
             fe,
             be,
             native_compatibility.id(),
             function_set,
+            provider_manifest,
             runtime.handle().clone(),
         )),
     }

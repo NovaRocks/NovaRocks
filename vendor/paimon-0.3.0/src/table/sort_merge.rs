@@ -1025,6 +1025,26 @@ fn reserve(
         .transpose()
 }
 
+fn reserve_output(
+    control: &Option<Arc<dyn ReadControl>>,
+    bytes: usize,
+) -> crate::Result<Option<Box<dyn ReadReservation>>> {
+    control
+        .as_ref()
+        .map(|control| control.try_reserve_output(u64::try_from(bytes).unwrap_or(u64::MAX).max(1)))
+        .transpose()
+}
+
+fn handoff_output(
+    control: &Option<Arc<dyn ReadControl>>,
+    reservation: Option<Box<dyn ReadReservation>>,
+) -> crate::Result<Option<Box<dyn ReadReservation>>> {
+    match (control, reservation) {
+        (Some(control), Some(reservation)) => control.handoff_output(reservation),
+        (_, reservation) => Ok(reservation),
+    }
+}
+
 fn make_cursor(
     batch: RecordBatch,
     key_indices: &[usize],
@@ -1412,7 +1432,8 @@ fn sort_merge_stream(
                     &source_output_col_indices,
                     &output_indices,
                 )?;
-                let output_reservation = reserve(&read_control, batch.get_array_memory_size())?;
+                let output_reservation =
+                    reserve_output(&read_control, batch.get_array_memory_size())?;
                 drop(construction_reservation);
                 output_indices.clear();
                 // Compact batch buffer after the pending output rows have been
@@ -1426,6 +1447,7 @@ fn sort_merge_stream(
                     &mut batch_reservations,
                 );
                 checkpoint(&read_control)?;
+                let output_reservation = handoff_output(&read_control, output_reservation)?;
                 yield batch;
                 drop(output_reservation);
             }
@@ -1446,9 +1468,11 @@ fn sort_merge_stream(
                 &source_output_col_indices,
                 &output_indices,
             )?;
-            let output_reservation = reserve(&read_control, batch.get_array_memory_size())?;
+            let output_reservation =
+                reserve_output(&read_control, batch.get_array_memory_size())?;
             drop(construction_reservation);
             checkpoint(&read_control)?;
+            let output_reservation = handoff_output(&read_control, output_reservation)?;
             yield batch;
             drop(output_reservation);
         }
@@ -1550,7 +1574,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct ObservedReadState {
         retained: AtomicU64,
+        output_retained: AtomicU64,
         peak: AtomicU64,
+        output_reservations: AtomicUsize,
         checkpoints: AtomicUsize,
         cancel_after: AtomicUsize,
     }
@@ -1575,6 +1601,22 @@ mod tests {
             let retained = self.state.retained.fetch_add(bytes, AtomicOrdering::SeqCst) + bytes;
             self.state.peak.fetch_max(retained, AtomicOrdering::SeqCst);
             Ok(Box::new(ObservedReservation {
+                state: self.state.clone(),
+                bytes,
+            }))
+        }
+
+        fn try_reserve_output(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
+            self.fail_if_cancelled()?;
+            let retained = self.state.retained.fetch_add(bytes, AtomicOrdering::SeqCst) + bytes;
+            self.state.peak.fetch_max(retained, AtomicOrdering::SeqCst);
+            self.state
+                .output_retained
+                .fetch_add(bytes, AtomicOrdering::SeqCst);
+            self.state
+                .output_reservations
+                .fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Box::new(ObservedOutputReservation {
                 state: self.state.clone(),
                 bytes,
             }))
@@ -1606,12 +1648,43 @@ mod tests {
         fn bytes(&self) -> u64 {
             self.bytes
         }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
     }
 
     impl Drop for ObservedReservation {
         fn drop(&mut self) {
             self.state
                 .retained
+                .fetch_sub(self.bytes, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct ObservedOutputReservation {
+        state: Arc<ObservedReadState>,
+        bytes: u64,
+    }
+
+    impl ReadReservation for ObservedOutputReservation {
+        fn bytes(&self) -> u64 {
+            self.bytes
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
+    }
+
+    impl Drop for ObservedOutputReservation {
+        fn drop(&mut self) {
+            self.state
+                .retained
+                .fetch_sub(self.bytes, AtomicOrdering::SeqCst);
+            self.state
+                .output_retained
                 .fetch_sub(self.bytes, AtomicOrdering::SeqCst);
         }
     }
@@ -1800,6 +1873,44 @@ mod tests {
             state: state.clone(),
         });
         (state, control)
+    }
+
+    #[tokio::test]
+    async fn default_control_keeps_output_reservation_across_yield() {
+        let schema = make_schema();
+        let stream = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1],
+            vec![1],
+            vec![Some("one")],
+        )]);
+        let (state, control) = observed_control(0);
+        let mut output = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(DeduplicateMergeFunction),
+        )
+        .with_batch_size(1)
+        .with_read_control(Some(control))
+        .build()
+        .unwrap();
+
+        let batch = output.next().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(state.output_reservations.load(AtomicOrdering::SeqCst), 1);
+        assert!(state.output_retained.load(AtomicOrdering::SeqCst) > 0);
+
+        drop(batch);
+        assert!(state.output_retained.load(AtomicOrdering::SeqCst) > 0);
+        drop(output);
+        assert_eq!(state.output_retained.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(state.retained.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[tokio::test]

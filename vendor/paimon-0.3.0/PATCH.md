@@ -18,7 +18,11 @@ The read control also covers SDK-retained data after I/O returns: range and
 whole-file `Bytes` own their reservation until their final clone is dropped;
 Avro schema caches reserve a conservative bound for the owned JSON key, parser
 workspace, and recursive writer schema before parsing, install one lease per
-cache entry under the cache lock, and retain it until cache drop; every Avro OCF
+cache entry under the cache lock, and retain it until cache drop; the versioned
+`SchemaManager` cache reserves each parsed `TableSchema` with a conservative
+recursive retained-size estimate, installs only one charged value per schema ID,
+and embeds the shared lease in the schema so returned `Arc` and owned schema
+clones remain charged after a temporary manager or its cache is dropped; every Avro OCF
 block reserves its actual borrowed or decompressed payload, and that reservation
 moves together with the fixed decoded-object reservation through manifest
 pruning and split construction into the returned `Plan`, then remains live until
@@ -30,7 +34,10 @@ per-value workspace, and keeps it through stream drop; and the primary-key
 sort-merge reader charges cursor batches,
 arrow-row keys, same-key histories (including user sequence values), buffered
 batches, output indices, materialized rows, output construction, and yielded
-batches. The merge loop checkpoints each history row and the no-output omit
+batches. A neutral output handoff lets the embedding host adopt the exact
+yielded-batch reservation without charging the same Arrow buffers again; hosts
+that do not accept the handoff retain the SDK default, which keeps the
+reservation across the yield. The merge loop checkpoints each history row and the no-output omit
 path so large delete-only key histories remain cancellable. Reservations move
 with retained buffers and are released on compaction, error, cancellation, or
 stream drop.

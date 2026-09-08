@@ -229,15 +229,24 @@ fn exhausted(message: &'static str) -> ConnectorError {
 mod tests {
     use std::ops::Range;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorRequestResources, ConnectorResourceCheckpoint, ConnectorResourceClass,
-        ConnectorResourceLease, ConnectorResourceLedger,
+        ConnectorCancellation, ConnectorRequestResources, ConnectorResourceCheckpoint,
+        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
     };
     use paimon::io::{FileStatus, FileStatusStream, ReadControl, ReadOnlyFileIO};
 
     use super::*;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
 
     #[derive(Debug)]
     struct LedgerState {
@@ -393,7 +402,11 @@ mod tests {
         let sdk_bytes = (std::mem::size_of::<FileStatus>() + database_path.len() + 1) as u64;
         let ledger = ObservedLedger::new(limit);
         let request_resources = ConnectorRequestResources::new(Arc::new(ledger.clone()));
-        let resources = PaimonRequestResources::new(request_resources);
+        let resources = PaimonRequestResources::new(
+            request_resources,
+            Arc::new(NeverCancelled),
+            Instant::now() + Duration::from_secs(60),
+        );
         let control: Arc<dyn ReadControl> = Arc::new(PaimonSdkReadControl::new(resources.clone()));
         let backend = DatabaseListingIo {
             warehouse: warehouse.to_string(),

@@ -17,6 +17,7 @@
 
 //! Host-injected, read-only I/O and cooperative resource control.
 
+use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
@@ -26,8 +27,15 @@ use futures::Stream;
 
 use super::FileStatus;
 
-pub trait ReadReservation: Debug + Send {
+pub trait ReadReservation: Any + Debug + Send {
     fn bytes(&self) -> u64;
+
+    /// Convert an opaque reservation into `Any` without losing ownership.
+    ///
+    /// An embedding host can use this only after its own [`ReadControl`]
+    /// accepted an output handoff. SDK code otherwise keeps reservations
+    /// opaque and tied to the value that owns them.
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
 }
 
 /// Reservations that travel with an SDK-owned retained value.
@@ -115,6 +123,28 @@ pub trait ReadControl: Debug + Send + Sync {
     fn check_active(&self) -> crate::Result<()>;
     fn checkpoint(&self) -> crate::Result<()>;
     fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>>;
+
+    /// Reserve a batch that is about to cross the SDK output boundary.
+    ///
+    /// The default uses the normal retained-state budget. Hosts that classify
+    /// output separately may override this while preserving the same owner.
+    fn try_reserve_output(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
+        self.try_reserve(bytes)
+    }
+
+    /// Offer ownership of an output reservation to the embedding host.
+    ///
+    /// Returning `Some` declines the handoff, so the SDK retains the returned
+    /// reservation across `yield` and drops it only after the stream resumes.
+    /// Returning `None` accepts ownership; the host must keep the charge live
+    /// until it attaches the same reservation to the delivered output or drops
+    /// that output.
+    fn handoff_output(
+        &self,
+        reservation: Box<dyn ReadReservation>,
+    ) -> crate::Result<Option<Box<dyn ReadReservation>>> {
+        Ok(Some(reservation))
+    }
 }
 
 pub type FileStatusStream = Pin<Box<dyn Stream<Item = crate::Result<FileStatus>> + Send + 'static>>;

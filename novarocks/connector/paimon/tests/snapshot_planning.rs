@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arrow::array::Int32Array;
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -29,8 +30,9 @@ use novarocks_connector_paimon::split_source::{
 };
 use novarocks_spi::connector::read_stack::{ConnectorSplitSource, SchemaTableName};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorRequestResources, ConnectorResourceCheckpoint,
-    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorRequestResources,
+    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
+    ConnectorResourceLedger,
 };
 use paimon::Table;
 use paimon::catalog::Identifier;
@@ -40,16 +42,18 @@ use paimon::spec::{DataType, IntType, Schema, TableSchema};
 #[derive(Default)]
 struct Ledger {
     retained: Arc<Mutex<HashMap<ConnectorResourceClass, u64>>>,
+    growths: Arc<Mutex<Vec<(ConnectorResourceClass, u64)>>>,
     cancelled: AtomicBool,
-    limit: AtomicU64,
+    limit: Arc<AtomicU64>,
 }
 
 impl Ledger {
     fn new(limit: u64) -> Arc<Self> {
         Arc::new(Self {
             retained: Arc::new(Mutex::new(HashMap::new())),
+            growths: Arc::new(Mutex::new(Vec::new())),
             cancelled: AtomicBool::new(false),
-            limit: AtomicU64::new(limit),
+            limit: Arc::new(AtomicU64::new(limit)),
         })
     }
 
@@ -97,7 +101,15 @@ impl ConnectorResourceLedger for Ledger {
             class,
             bytes,
             retained: Arc::clone(&self.retained),
+            growths: Arc::clone(&self.growths),
+            limit: Arc::clone(&self.limit),
         }))
+    }
+}
+
+impl ConnectorCancellation for Ledger {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -105,6 +117,8 @@ struct Lease {
     class: ConnectorResourceClass,
     bytes: u64,
     retained: Arc<Mutex<HashMap<ConnectorResourceClass, u64>>>,
+    growths: Arc<Mutex<Vec<(ConnectorResourceClass, u64)>>>,
+    limit: Arc<AtomicU64>,
 }
 
 impl ConnectorResourceLease for Lease {
@@ -113,7 +127,18 @@ impl ConnectorResourceLease for Lease {
     }
 
     fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
-        *self.retained.lock().unwrap().entry(self.class).or_default() += additional;
+        let mut retained = self.retained.lock().unwrap();
+        let total: u64 = retained.values().sum();
+        let limit = self.limit.load(Ordering::Acquire);
+        if total.saturating_add(additional) > limit {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "test metadata budget exhausted while growing",
+            ));
+        }
+        *retained.entry(self.class).or_default() += additional;
+        drop(retained);
+        self.growths.lock().unwrap().push((self.class, additional));
         self.bytes += additional;
         Ok(())
     }
@@ -132,7 +157,11 @@ impl Drop for Lease {
 }
 
 fn resources(ledger: &Arc<Ledger>) -> PaimonRequestResources {
-    PaimonRequestResources::new(ConnectorRequestResources::new(ledger.clone()))
+    PaimonRequestResources::new(
+        ConnectorRequestResources::new(ledger.clone()),
+        ledger.clone(),
+        Instant::now() + Duration::from_secs(60),
+    )
 }
 
 fn append_table(path: &str) -> Table {
@@ -244,6 +273,15 @@ async fn frozen_s1_plan_never_switches_to_newly_published_s2() {
             .map(|split| split.sdk_split().row_count())
             .sum::<i64>(),
         1
+    );
+    let historical_entry_bytes =
+        std::mem::size_of::<(i64, Arc<TableSchema>)>().saturating_mul(2) as u64;
+    assert!(
+        ledger.growths.lock().unwrap().contains(&(
+            ConnectorResourceClass::SplitPlanning,
+            historical_entry_bytes
+        )),
+        "split planning must charge only its historical-schema map ownership"
     );
     drop(planned);
     drop(frozen);

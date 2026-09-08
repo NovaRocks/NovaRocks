@@ -193,7 +193,7 @@ fn reject_unknown_read_properties(
         .copied()
         .collect::<BTreeSet<_>>();
     for key in properties.keys() {
-        if recognized.contains(key.as_str()) || key.starts_with("fields.") {
+        if recognized.contains(key.as_str()) {
             continue;
         }
         return Err(unsupported(format!(
@@ -268,6 +268,10 @@ mod tests {
             BTreeMap::from([("deletion-vectors.enabled".to_string(), "true".to_string())]),
             BTreeMap::from([("file.format".to_string(), "orc".to_string())]),
             BTreeMap::from([("unknown.read.option".to_string(), "x".to_string())]),
+            BTreeMap::from([(
+                "fields.payload.unknown-read-switch".to_string(),
+                "x".to_string(),
+            )]),
         ] {
             assert!(PaimonReadOptions::analyze(&properties, &columns(), &[], &[]).is_err());
         }

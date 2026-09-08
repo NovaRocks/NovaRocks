@@ -19,7 +19,7 @@
 //! Server-owned static manifest for the Native compatibility contract.
 
 use anyhow::Context;
-use novarocks_spi::connector::provider::ProviderContractDefinition;
+use novarocks_spi::connector::provider::{ProviderContractDefinition, SealedProviderRegistry};
 use novarocks_version::{
     NativeCarrierDeclaration, NativeCompatibilityMaterial,
     derive_repository_native_compatibility_material,
@@ -28,17 +28,14 @@ use novarocks_version::{
 /// Builds the one closed carrier manifest for this server binary.
 ///
 /// This is intentionally independent of config and runtime connector state.
-pub fn native_carrier_declarations() -> anyhow::Result<Vec<NativeCarrierDeclaration>> {
-    [
-        novarocks_connector_iceberg::iceberg_contract_definition()
-            .context("build Iceberg provider contract")
-            .and_then(|contract| native_carrier_from_contract(&contract)),
-        novarocks_connector_paimon::definition::paimon_contract_definition()
-            .context("build Paimon provider contract")
-            .and_then(|contract| native_carrier_from_contract(&contract)),
-    ]
-    .into_iter()
-    .collect()
+pub fn native_carrier_declarations(
+    provider_registry: &SealedProviderRegistry,
+) -> anyhow::Result<Vec<NativeCarrierDeclaration>> {
+    provider_registry
+        .definitions()
+        .iter()
+        .map(native_carrier_from_contract)
+        .collect()
 }
 
 fn native_carrier_from_contract(
@@ -74,10 +71,11 @@ fn native_carrier_from_contract(
 /// Resolves the immutable compatibility material for this binary before role
 /// application composition opens listeners or runtime services.
 pub fn resolve_native_compatibility_material(
+    provider_registry: &SealedProviderRegistry,
     function_catalog_digest: [u8; 32],
     execution_implementation_manifest_digest: [u8; 32],
 ) -> anyhow::Result<NativeCompatibilityMaterial> {
-    let declarations = native_carrier_declarations()?;
+    let declarations = native_carrier_declarations(provider_registry)?;
     derive_repository_native_compatibility_material(
         declarations,
         function_catalog_digest,
@@ -100,9 +98,16 @@ mod tests {
         native_carrier_declarations, native_carrier_from_contract,
         resolve_native_compatibility_material,
     };
+
+    fn server_manifest() -> crate::provider_manifest::ServerProviderManifest {
+        crate::provider_manifest::ServerProviderManifest::seal().expect("server provider manifest")
+    }
+
     #[test]
     fn static_manifest_contains_exact_private_provider_descriptors() {
-        let declarations = native_carrier_declarations().expect("server carrier declarations");
+        let manifest = server_manifest();
+        let declarations =
+            native_carrier_declarations(manifest.contracts()).expect("server carrier declarations");
         let declared = declarations
             .iter()
             .map(|declaration| declaration.provider_id())
@@ -124,13 +129,18 @@ mod tests {
 
     #[test]
     fn repository_material_is_nonempty_and_uses_the_server_manifest() {
-        let material = resolve_native_compatibility_material([0x31; 32], [0x41; 32])
-            .expect("compatibility material");
+        let manifest = server_manifest();
+        let material =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x41; 32])
+                .expect("compatibility material");
         let implementation_only_change =
-            resolve_native_compatibility_material([0x31; 32], [0x42; 32])
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], [0x42; 32])
                 .expect("implementation-only compatibility material");
 
-        assert_eq!(material.carriers(), native_carrier_declarations().unwrap());
+        assert_eq!(
+            material.carriers(),
+            native_carrier_declarations(manifest.contracts()).unwrap()
+        );
         assert_eq!(material.id().to_string().len(), 64);
         assert_ne!(material.id(), implementation_only_change.id());
     }
