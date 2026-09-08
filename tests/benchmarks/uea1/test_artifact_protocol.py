@@ -185,6 +185,38 @@ class ArtifactProtocolTest(unittest.TestCase):
     def tearDown(self):
         self.fixture.close()
 
+    def test_formal_descriptors_freeze_scenario_shape_and_thread_ceilings(self):
+        expected = {
+            "short.json": ("performance/uea1-short-concurrent", 15),
+            "mixed.json": ("performance/uea1-mixed", 5),
+            "slow-output.json": ("performance/uea1-slow-output", 5),
+        }
+        for name, (scenario, window_count) in expected.items():
+            descriptor = json.loads((ROOT / "descriptors" / name).read_text())
+            self.assertEqual(
+                set(descriptor),
+                {
+                    "schema_version",
+                    "artifacts",
+                    "expected",
+                    "metric_resolutions",
+                    "absolute_gates",
+                },
+            )
+            self.assertEqual(descriptor["expected"]["scenario"], scenario)
+            self.assertEqual(descriptor["expected"]["window_count"], window_count)
+            self.assertEqual(descriptor["expected"]["roles"], PROTOCOL.FORMAL_ROLES)
+            self.assertEqual(
+                set(descriptor["metric_resolutions"]), set(PROTOCOL.RELATIVE_METRICS)
+            )
+            self.assertEqual(
+                descriptor["absolute_gates"]["fe_peak_threads"]["limit"], 1114
+            )
+            self.assertEqual(
+                descriptor["absolute_gates"]["max_be_peak_threads"]["limit"],
+                103578,
+            )
+
     def test_schema_four_and_exact_run_manifest_reference_are_accepted(self):
         document = self.fixture.extract()
         self.assertEqual(document["provenance"]["run_id"], self.fixture.run_id)

@@ -105,3 +105,23 @@ python3 tests/benchmarks/uea1/compare.py --structured \
 records command duration plus peak RSS for the isolated process group and its
 complete visible descendant tree. Missing samples stay unavailable rather
 than becoming zero.
+
+The checked-in descriptors under `descriptors/` freeze the formal scenario
+shape, resolutions, role set, and current-source thread ceilings. Copy the
+matching file into each scenario artifact directory as `descriptor.json`; do
+not rewrite its relative artifact paths. The thread ceilings follow
+`1 + configured pool maxima + fixed service threads`: FE is
+`1 + 1106 + 7 = 1114`, and each BE is `1 + 103570 + 7 = 103578`. Legacy
+per-query, per-Task, per-Fragment, and provider bridge threads are excluded from
+the fixed-service term but remain visible in the sampled process total. Tighter
+candidate architecture limits require their own concurrency gate after those
+dynamic thread sources are removed.
+
+Before comparing a candidate, validate each scenario's two B0 runs on their
+own:
+
+```bash
+python3 tests/benchmarks/uea1/compare.py --baseline-noise \
+  --baseline-a <b0-a>/comparison-input.json \
+  --baseline-b <b0-b>/comparison-input.json
+```
