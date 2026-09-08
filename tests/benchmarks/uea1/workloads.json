@@ -6,7 +6,7 @@
       "SELECT SUM(i) FROM TABLE(generate_series(1, 1000)) AS t(i)",
       "SELECT COUNT(*) FROM TABLE(generate_series(1, 1000)) AS t(i) WHERE i % 7 = 0"
     ],
-    "plan_contains": ["Physical"],
+    "plan_contains": ["HASH", "aggr"],
     "windows": [
       {"concurrency": 1, "duration_ms": 120000, "warmup_ms": 5000, "repetitions": 5},
       {"concurrency": 8, "duration_ms": 120000, "warmup_ms": 5000, "repetitions": 5},

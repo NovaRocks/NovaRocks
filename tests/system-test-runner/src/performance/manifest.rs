@@ -377,12 +377,18 @@ mod tests {
 
     #[test]
     fn shipped_manifests_use_real_typed_jobs() {
-        for json in [
-            include_str!("../../../benchmarks/uea1/workloads.json"),
-            include_str!("../../../benchmarks/uea1/workloads-smoke.json"),
+        let formal: Uea1WorkloadManifest =
+            serde_json::from_str(include_str!("../../../benchmarks/uea1/workloads.json"))
+                .expect("typed formal workload manifest");
+        assert_eq!(formal.short.plan_contains, ["HASH", "aggr"]);
+
+        for manifest in [
+            formal,
+            serde_json::from_str(include_str!(
+                "../../../benchmarks/uea1/workloads-smoke.json"
+            ))
+            .expect("typed smoke workload manifest"),
         ] {
-            let manifest: Uea1WorkloadManifest =
-                serde_json::from_str(json).expect("typed workload manifest");
             manifest.validate().expect("valid workload manifest");
             assert_eq!(manifest.mixed.producers.len(), 3);
             assert!(
