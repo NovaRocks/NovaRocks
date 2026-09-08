@@ -21,9 +21,9 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ManifestPurpose {
     Smoke,
@@ -31,37 +31,86 @@ pub enum ManifestPurpose {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Window {
     pub concurrency: usize,
     pub duration_ms: u64,
     #[serde(default)]
     pub warmup_ms: u64,
+    pub repetitions: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShortWorkload {
     pub queries: Vec<String>,
     pub plan_contains: Vec<String>,
     pub windows: Vec<Window>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BusinessKind {
+    MvRefresh,
+    Analyze,
+    Optimize,
+}
+
+impl BusinessKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MvRefresh => "mv-refresh",
+            Self::Analyze => "analyze",
+            Self::Optimize => "optimize",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProducerWorkload {
-    pub kind: String,
-    pub statements: Vec<String>,
-    pub completion_query: String,
+    pub kind: BusinessKind,
+    /// A finite sequence of independent, identically seeded job targets.
+    pub jobs: usize,
     pub minimum_completions: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum MixedFixtureRecipe {
+    IcebergRest {
+        rows_per_file: u64,
+        files_per_table: usize,
+        foreground_rows: u64,
+    },
+}
+
+impl MixedFixtureRecipe {
+    pub fn dimensions(&self) -> (u64, usize, u64) {
+        match *self {
+            Self::IcebergRest {
+                rows_per_file,
+                files_per_table,
+                foreground_rows,
+            } => (rows_per_file, files_per_table, foreground_rows),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MixedWorkload {
-    pub foreground_sql: String,
+    pub fixture: MixedFixtureRecipe,
     pub foreground_clients: usize,
     pub duration_ms: u64,
+    pub repetitions: usize,
+    pub job_timeout_ms: u64,
+    pub poll_interval_ms: u64,
     pub producers: Vec<ProducerWorkload>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlowOutputWorkload {
     pub query: String,
     pub bytes_per_interval: usize,
@@ -70,6 +119,7 @@ pub struct SlowOutputWorkload {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Uea1WorkloadManifest {
     pub schema_version: u32,
     pub purpose: ManifestPurpose,
@@ -113,12 +163,20 @@ impl Uea1WorkloadManifest {
             validate_window(window)?;
         }
         ensure!(
-            !self.mixed.foreground_sql.trim().is_empty(),
-            "mixed foreground SQL is empty"
+            (1..=32).contains(&self.mixed.foreground_clients)
+                && (1..=300_000).contains(&self.mixed.duration_ms)
+                && (1..=20).contains(&self.mixed.repetitions)
+                && (1..=300_000).contains(&self.mixed.job_timeout_ms)
+                && self.mixed.poll_interval_ms > 0
+                && self.mixed.poll_interval_ms < self.mixed.job_timeout_ms,
+            "mixed workload requires bounded clients, repetitions, duration and polling"
         );
+        let (rows_per_file, files_per_table, foreground_rows) = self.mixed.fixture.dimensions();
         ensure!(
-            self.mixed.foreground_clients > 0 && self.mixed.duration_ms > 0,
-            "mixed workload requires positive clients and duration"
+            (1..=1_000_000).contains(&rows_per_file)
+                && (2..=32).contains(&files_per_table)
+                && (1..=10_000_000).contains(&foreground_rows),
+            "mixed fixture requires positive bounded rows and at least two input files"
         );
         ensure!(
             self.mixed.producers.len() == 3,
@@ -128,21 +186,25 @@ impl Uea1WorkloadManifest {
             .mixed
             .producers
             .iter()
-            .map(|producer| producer.kind.as_str())
+            .map(|producer| producer.kind)
             .collect::<Vec<_>>();
         kinds.sort_unstable();
         ensure!(
-            kinds == ["maintenance", "mv-refresh", "statistics"],
-            "mixed producer kinds must be maintenance, mv-refresh and statistics"
+            kinds
+                == [
+                    BusinessKind::MvRefresh,
+                    BusinessKind::Analyze,
+                    BusinessKind::Optimize
+                ],
+            "mixed producer kinds must be mv-refresh, analyze and optimize"
         );
         for producer in &self.mixed.producers {
             ensure!(
-                !producer.statements.is_empty()
-                    && producer.statements.iter().all(|sql| !sql.trim().is_empty())
-                    && !producer.completion_query.trim().is_empty()
-                    && producer.minimum_completions > 0,
-                "producer {} has an empty or zero-valued contract",
-                producer.kind
+                (1..=4096).contains(&producer.jobs)
+                    && producer.minimum_completions > 0
+                    && producer.minimum_completions <= producer.jobs as u64,
+                "producer {} has an invalid finite job sequence",
+                producer.kind.name()
             );
         }
         ensure!(
@@ -167,12 +229,14 @@ impl Uea1WorkloadManifest {
                 self.short
                     .windows
                     .iter()
-                    .all(|window| window.duration_ms >= 120_000),
-                "formal short workload windows must run for at least 120 seconds"
+                    .all(|window| window.duration_ms >= 120_000 && window.repetitions >= 5),
+                "formal short workload requires five windows of at least 120 seconds per concurrency"
             );
             ensure!(
-                self.mixed.foreground_clients == 8 && self.mixed.duration_ms >= 120_000,
-                "formal mixed workload requires eight clients and a 120 second window"
+                self.mixed.foreground_clients == 8
+                    && self.mixed.duration_ms >= 120_000
+                    && self.mixed.repetitions >= 5,
+                "formal mixed workload requires eight clients and five 120 second windows"
             );
         }
         Ok(())
@@ -180,7 +244,8 @@ impl Uea1WorkloadManifest {
 }
 
 fn validate_window(window: &Window) -> Result<()> {
-    if window.concurrency == 0 || window.duration_ms == 0 {
+    if window.concurrency == 0 || window.duration_ms == 0 || !(1..=20).contains(&window.repetitions)
+    {
         bail!("workload windows require positive concurrency and duration");
     }
     ensure!(
@@ -196,7 +261,7 @@ mod tests {
 
     fn smoke() -> Uea1WorkloadManifest {
         Uea1WorkloadManifest {
-            schema_version: 1,
+            schema_version: 2,
             purpose: ManifestPurpose::Smoke,
             short: ShortWorkload {
                 queries: vec!["SELECT 1".to_string()],
@@ -205,21 +270,32 @@ mod tests {
                     concurrency: 1,
                     duration_ms: 10,
                     warmup_ms: 0,
+                    repetitions: 1,
                 }],
             },
             mixed: MixedWorkload {
-                foreground_sql: "SELECT 1".to_string(),
+                fixture: MixedFixtureRecipe::IcebergRest {
+                    rows_per_file: 4,
+                    files_per_table: 2,
+                    foreground_rows: 8,
+                },
                 foreground_clients: 1,
                 duration_ms: 10,
-                producers: ["maintenance", "mv-refresh", "statistics"]
-                    .into_iter()
-                    .map(|kind| ProducerWorkload {
-                        kind: kind.to_string(),
-                        statements: vec!["SELECT 1".to_string()],
-                        completion_query: "SELECT 1".to_string(),
-                        minimum_completions: 1,
-                    })
-                    .collect(),
+                repetitions: 1,
+                job_timeout_ms: 1000,
+                poll_interval_ms: 10,
+                producers: [
+                    BusinessKind::MvRefresh,
+                    BusinessKind::Analyze,
+                    BusinessKind::Optimize,
+                ]
+                .into_iter()
+                .map(|kind| ProducerWorkload {
+                    kind,
+                    jobs: 2,
+                    minimum_completions: 1,
+                })
+                .collect(),
             },
             slow_output: SlowOutputWorkload {
                 query: "SELECT 1".to_string(),
@@ -248,5 +324,61 @@ mod tests {
         let mut manifest = smoke();
         manifest.purpose = ManifestPurpose::Formal;
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_free_sql_as_a_business_completion_contract() {
+        let mut value = serde_json::to_value(smoke()).expect("serialize smoke");
+        value["mixed"]["producers"][0]["completion_query"] = "SELECT 1".into();
+        assert!(serde_json::from_value::<Uea1WorkloadManifest>(value).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_or_unbounded_job_sequences() {
+        for jobs in [0, 4097] {
+            let mut manifest = smoke();
+            manifest.mixed.producers[0].jobs = jobs;
+            assert!(manifest.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_unbounded_mixed_windows() {
+        for duration_ms in [0, 300_001, u64::MAX] {
+            let mut manifest = smoke();
+            manifest.mixed.duration_ms = duration_ms;
+            assert!(manifest.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_single_file_optimize_fixture() {
+        let mut manifest = smoke();
+        manifest.mixed.fixture = MixedFixtureRecipe::IcebergRest {
+            rows_per_file: 4,
+            files_per_table: 1,
+            foreground_rows: 8,
+        };
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn shipped_manifests_use_real_typed_jobs() {
+        for json in [
+            include_str!("../../../benchmarks/uea1/workloads.json"),
+            include_str!("../../../benchmarks/uea1/workloads-smoke.json"),
+        ] {
+            let manifest: Uea1WorkloadManifest =
+                serde_json::from_str(json).expect("typed workload manifest");
+            manifest.validate().expect("valid workload manifest");
+            assert_eq!(manifest.mixed.producers.len(), 3);
+            assert!(
+                manifest
+                    .mixed
+                    .producers
+                    .iter()
+                    .all(|producer| producer.jobs > 0)
+            );
+        }
     }
 }

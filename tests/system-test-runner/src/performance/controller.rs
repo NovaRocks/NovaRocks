@@ -15,8 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::manifest::{MixedWorkload, SlowOutputWorkload, Uea1WorkloadManifest, Window};
-use super::metrics::{QuerySample, write_report};
+use super::business::{self, BusinessSample, MixedFixtureBinding};
+use super::manifest::{
+    ManifestPurpose, MixedWorkload, SlowOutputWorkload, Uea1WorkloadManifest, Window,
+};
+use super::metrics::{MeasurementWindow, QuerySample, write_report};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, bail, ensure};
@@ -26,7 +29,7 @@ use novarocks_cluster_harness::process_resources::ProcessResourceMonitor;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -51,17 +54,32 @@ pub fn run(
     scenario: PerformanceScenario,
     context: &mut ScenarioContext,
     manifest: &Uea1WorkloadManifest,
+    mixed_fixture: Option<&MixedFixtureBinding>,
 ) -> Result<()> {
     ensure!(
         context.launch_profile() == LaunchProfile::Performance,
         "{} requires --launch-profile performance",
         scenario.name()
     );
+    if matches!(scenario, PerformanceScenario::Mixed) {
+        ensure!(
+            mixed_fixture.is_some(),
+            "mixed performance requires a scenario-owned isolated catalog fixture"
+        );
+    }
     let monitor = ProcessResourceMonitor::start(context.process_ids(), Duration::from_millis(100))?;
-    let samples = match scenario {
-        PerformanceScenario::ShortConcurrent => run_short(context, manifest)?,
-        PerformanceScenario::Mixed => run_mixed(context, &manifest.mixed)?,
-        PerformanceScenario::SlowOutput => run_slow_output(context, &manifest.slow_output)?,
+    let (samples, measurement_windows) = match scenario {
+        PerformanceScenario::ShortConcurrent => run_short(context, manifest, &monitor)?,
+        PerformanceScenario::Mixed => run_mixed(
+            context,
+            &manifest.mixed,
+            mixed_fixture.context("mixed performance fixture is missing")?,
+            manifest.purpose == ManifestPurpose::Formal,
+            &monitor,
+        )?,
+        PerformanceScenario::SlowOutput => {
+            run_slow_output(context, &manifest.slow_output, &monitor)?
+        }
     };
     let resource_path = context.scenario_root().join("process-resources.json");
     let resources = monitor.finish(&resource_path)?;
@@ -80,6 +98,7 @@ pub fn run(
         &manifest.sha256,
         scenario.name(),
         &samples,
+        &measurement_windows,
         &[],
     )?;
     context.action(format!(
@@ -94,7 +113,8 @@ pub fn run(
 fn run_short(
     context: &ScenarioContext,
     manifest: &Uea1WorkloadManifest,
-) -> Result<Vec<QuerySample>> {
+    monitor: &ProcessResourceMonitor,
+) -> Result<(Vec<QuerySample>, Vec<MeasurementWindow>)> {
     let timeout = context.remaining("run short-query performance windows")?;
     let mut connection = mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
     for query in &manifest.short.queries {
@@ -115,93 +135,240 @@ fn run_short(
     drop(connection);
 
     let mut all = Vec::new();
+    let mut measurement_windows = Vec::new();
+    let mut window_index = 0;
     for window in &manifest.short.windows {
-        all.extend(run_query_window(
-            context.mysql_user(),
-            context.mysql_port(),
-            &manifest.short.queries,
-            window,
-            timeout,
-            "short",
-        )?);
+        for _ in 0..window.repetitions {
+            let (samples, measurement_window) = run_query_window(
+                context.mysql_user(),
+                context.mysql_port(),
+                &manifest.short.queries,
+                window,
+                window_index,
+                timeout,
+                "short",
+                monitor,
+            )?;
+            all.extend(samples);
+            measurement_windows.push(measurement_window);
+            window_index += 1;
+        }
     }
-    Ok(all)
+    Ok((all, measurement_windows))
 }
 
-fn run_mixed(context: &ScenarioContext, workload: &MixedWorkload) -> Result<Vec<QuerySample>> {
-    let timeout = context.remaining("run mixed performance window")?;
+fn run_mixed(
+    context: &ScenarioContext,
+    workload: &MixedWorkload,
+    binding: &MixedFixtureBinding,
+    require_sustained_producers: bool,
+    monitor: &ProcessResourceMonitor,
+) -> Result<(Vec<QuerySample>, Vec<MeasurementWindow>)> {
+    let mut all = Vec::new();
+    let mut measurement_windows = Vec::new();
+    let mut business_samples = Vec::new();
+    for window_index in 0..workload.repetitions {
+        let timeout = context.remaining("prepare private mixed performance window")?;
+        let mut setup = mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
+        let prepared = business::prepare_window(&mut setup, binding, workload, window_index)?;
+        let fixture_path = context
+            .scenario_root()
+            .join(format!("mixed-fixture-{window_index}.json"));
+        std::fs::write(fixture_path, serde_json::to_vec_pretty(&prepared)?)?;
+        let result = run_mixed_window(
+            context,
+            workload,
+            &prepared,
+            window_index,
+            require_sustained_producers,
+            monitor,
+        );
+        match result {
+            Ok((queries, completed, measurement_window)) => {
+                all.extend(queries);
+                business_samples.extend(completed);
+                measurement_windows.push(measurement_window);
+                std::fs::write(
+                    context.scenario_root().join("mixed-business.json"),
+                    serde_json::to_vec_pretty(&business_samples)?,
+                )?;
+                prepared.cleanup(&mut setup)?;
+            }
+            Err(error) => {
+                // A failed/unknown job may still own work. The scenario stops
+                // the cluster before destroying its private REST/S3 fixture.
+                return Err(error)
+                    .context("mixed window invalid; retain fixture until cluster shutdown");
+            }
+        }
+    }
+    Ok((all, measurement_windows))
+}
+
+enum MixedSample {
+    Query(QuerySample),
+    Business(BusinessSample),
+}
+
+fn run_mixed_window(
+    context: &ScenarioContext,
+    workload: &MixedWorkload,
+    prepared: &business::PreparedWindow,
+    window_index: usize,
+    require_sustained_producers: bool,
+    monitor: &ProcessResourceMonitor,
+) -> Result<(Vec<QuerySample>, Vec<BusinessSample>, MeasurementWindow)> {
+    let timeout = Duration::from_millis(workload.job_timeout_ms)
+        .min(context.remaining("run mixed performance window")?);
+    let configured_concurrency = workload.foreground_clients + workload.producers.len();
+    // Connect before releasing the start barrier. A failed connection cannot
+    // leave the other clients parked forever on an unreachable barrier count.
+    let mut connections = Vec::with_capacity(configured_concurrency);
+    for _ in 0..configured_concurrency {
+        let mut connection =
+            mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
+        connection.query_drop(format!(
+            "SET query_timeout = {}",
+            timeout.as_millis().div_ceil(1000).max(1)
+        ))?;
+        connections.push(connection);
+    }
     let stop = Arc::new(AtomicBool::new(false));
-    let deadline = Instant::now() + Duration::from_millis(workload.duration_ms);
-    let (sender, receiver) = mpsc::channel();
+    let start = Arc::new(Barrier::new(configured_concurrency + 1));
+    let window_deadline = Arc::new(OnceLock::new());
+    let (sender, receiver) = mpsc::sync_channel(1024);
     let mut workers = Vec::new();
     for client in 0..workload.foreground_clients {
         let stop = Arc::clone(&stop);
+        let start = Arc::clone(&start);
+        let window_deadline = Arc::clone(&window_deadline);
         let sender = sender.clone();
-        let user = context.mysql_user().to_string();
-        let sql = workload.foreground_sql.clone();
-        let port = context.mysql_port();
+        let mut connection = connections.pop().context("mixed foreground connection")?;
+        let table = prepared.foreground.clone();
+        let expected_rows = prepared.foreground_rows;
         workers.push(thread::spawn(move || -> Result<()> {
-            let mut connection = mysql_actor::connect(&user, port, timeout)?;
-            while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
-                sender.send(measure_query(
-                    &mut connection,
-                    "mixed-foreground",
-                    client,
-                    &sql,
-                )?)?;
+            start.wait();
+            let deadline = *window_deadline
+                .get()
+                .expect("coordinator set window deadline");
+            let result = (|| {
+                while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                    let started = Instant::now();
+                    business::assert_rows(
+                        &mut connection,
+                        &table,
+                        expected_rows,
+                        business::sequence_sum(expected_rows)?,
+                    )?;
+                    let elapsed = started.elapsed().as_micros();
+                    sender.send(MixedSample::Query(QuerySample {
+                        workload: "mixed-foreground".into(),
+                        window_index,
+                        configured_concurrency,
+                        client,
+                        first_row_micros: elapsed,
+                        total_micros: elapsed,
+                        rows: expected_rows,
+                        bytes_read: None,
+                        outcome: if Instant::now() <= deadline {
+                            "success"
+                        } else {
+                            "drained-after-window"
+                        }
+                        .into(),
+                    }))?;
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                stop.store(true, Ordering::Release);
             }
-            Ok(())
+            result
         }));
     }
-    for (index, producer) in workload.producers.iter().cloned().enumerate() {
+    for producer in workload.producers.iter().cloned() {
         let stop = Arc::clone(&stop);
+        let start = Arc::clone(&start);
+        let window_deadline = Arc::clone(&window_deadline);
         let sender = sender.clone();
-        let user = context.mysql_user().to_string();
-        let port = context.mysql_port();
+        let mut connection = connections.pop().context("mixed business connection")?;
+        let jobs = prepared
+            .jobs
+            .get(&producer.kind)
+            .context("prepared producer jobs are missing")?
+            .clone();
+        let poll_interval = Duration::from_millis(workload.poll_interval_ms);
         workers.push(thread::spawn(move || -> Result<()> {
-            let mut connection = mysql_actor::connect(&user, port, timeout)?;
-            let mut completed = 0_u64;
-            while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
-                for statement in &producer.statements {
-                    connection
-                        .query_drop(statement)
-                        .with_context(|| format!("run {} producer statement", producer.kind))?;
+            start.wait();
+            let deadline = *window_deadline.get().expect("coordinator set window deadline");
+            let result = (|| {
+                let mut completed = 0_u64;
+                let mut consumed = 0;
+                for job in jobs {
+                    if stop.load(Ordering::Acquire) || Instant::now() >= deadline { break; }
+                    let sample = business::execute_job(&mut connection, &job, window_index, deadline, timeout, poll_interval)?;
+                    completed += u64::from(sample.completed_in_window);
+                    consumed += 1;
+                    sender.send(MixedSample::Business(sample))?;
                 }
-                let sample = measure_query(
-                    &mut connection,
-                    &format!("mixed-{}", producer.kind),
-                    index,
-                    &producer.completion_query,
-                )?;
-                if sample.rows > 0 {
-                    completed += 1;
-                }
-                sender.send(sample)?;
-            }
-            ensure!(
-                completed >= producer.minimum_completions,
-                "{} producer completed {completed} non-empty jobs, expected at least {}",
-                producer.kind,
-                producer.minimum_completions
-            );
-            Ok(())
+                ensure!(!require_sustained_producers || consumed < producer.jobs || Instant::now() >= deadline,
+                    "{} producer exhausted its finite fixture before the formal window ended", producer.kind.name());
+                ensure!(completed >= producer.minimum_completions,
+                    "{} producer completed {completed} proven jobs inside the window, expected at least {}",
+                    producer.kind.name(), producer.minimum_completions);
+                Ok(())
+            })();
+            if result.is_err() { stop.store(true, Ordering::Release); }
+            result
         }));
     }
     drop(sender);
-    while Instant::now() < deadline {
-        thread::sleep(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(10)),
-        );
+    let started_elapsed_millis = monitor.elapsed_millis();
+    window_deadline
+        .set(Instant::now() + Duration::from_millis(workload.duration_ms))
+        .map_err(|_| anyhow::anyhow!("mixed window deadline was initialized twice"))?;
+    start.wait();
+    let mut queries = Vec::new();
+    let mut business = Vec::new();
+    for sample in receiver {
+        match sample {
+            MixedSample::Query(sample) => queries.push(sample),
+            MixedSample::Business(sample) => business.push(sample),
+        }
     }
     stop.store(true, Ordering::Release);
+    let mut failure = None;
     for worker in workers {
-        worker
+        if let Err(error) = worker
             .join()
-            .map_err(|_| anyhow::anyhow!("mixed performance worker panicked"))??;
+            .map_err(|_| anyhow::anyhow!("mixed performance worker panicked"))
+            .and_then(|result| result)
+        {
+            failure.get_or_insert(error);
+        }
     }
-    Ok(receiver.into_iter().collect())
+    std::fs::write(
+        context
+            .scenario_root()
+            .join(format!("mixed-business-{window_index}.json")),
+        serde_json::to_vec_pretty(&business)?,
+    )?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    ensure!(!queries.is_empty(), "mixed window has no foreground work");
+    Ok((
+        queries,
+        business,
+        MeasurementWindow {
+            workload: "mixed".into(),
+            window_index,
+            configured_concurrency,
+            started_elapsed_millis,
+            ended_elapsed_millis: started_elapsed_millis + u128::from(workload.duration_ms),
+            drain_ended_elapsed_millis: monitor.elapsed_millis(),
+        },
+    ))
 }
 
 fn run_query_window(
@@ -209,39 +376,73 @@ fn run_query_window(
     port: u16,
     queries: &[String],
     window: &Window,
+    window_index: usize,
     timeout: Duration,
     workload: &str,
-) -> Result<Vec<QuerySample>> {
-    let start = Arc::new(Barrier::new(window.concurrency));
-    let (sender, receiver) = mpsc::channel();
-    let mut workers = Vec::new();
+    monitor: &ProcessResourceMonitor,
+) -> Result<(Vec<QuerySample>, MeasurementWindow)> {
+    let concurrency = window.concurrency;
     let warmup_ms = window.warmup_ms;
     let duration_ms = window.duration_ms;
-    for client in 0..window.concurrency {
-        let user = user.to_string();
+
+    // Complete connection and warmup as a separate phase. A failure here is
+    // joined normally and cannot strand measured workers on their start gate.
+    let mut warmup_workers = Vec::with_capacity(concurrency);
+    for client in 0..concurrency {
+        let connection = mysql_actor::connect(user, port, timeout)?;
+        let queries = queries.to_vec();
+        let workload = workload.to_string();
+        warmup_workers.push(thread::spawn(
+            move || -> Result<(usize, mysql::Conn, usize)> {
+                let mut connection = connection;
+                let warmup_deadline = Instant::now() + Duration::from_millis(warmup_ms);
+                let mut index = 0;
+                while Instant::now() < warmup_deadline {
+                    let _ = measure_query(
+                        &mut connection,
+                        &format!("{workload}-warmup"),
+                        window_index,
+                        concurrency,
+                        client,
+                        &queries[index % queries.len()],
+                    )?;
+                    index += 1;
+                }
+                Ok((client, connection, index))
+            },
+        ));
+    }
+    let mut warmed = Vec::with_capacity(concurrency);
+    for worker in warmup_workers {
+        warmed.push(
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("short warmup worker panicked"))??,
+        );
+    }
+    warmed.sort_by_key(|(client, _, _)| *client);
+
+    let start = Arc::new(Barrier::new(concurrency + 1));
+    let window_deadline = Arc::new(OnceLock::new());
+    let (sender, receiver) = mpsc::channel();
+    let mut workers = Vec::with_capacity(concurrency);
+    for (client, mut connection, mut index) in warmed {
         let queries = queries.to_vec();
         let start = Arc::clone(&start);
+        let window_deadline = Arc::clone(&window_deadline);
         let sender = sender.clone();
         let workload = workload.to_string();
         workers.push(thread::spawn(move || -> Result<()> {
-            let mut connection = mysql_actor::connect(&user, port, timeout)?;
-            let warmup_deadline = Instant::now() + Duration::from_millis(warmup_ms);
-            let mut index = 0;
-            while Instant::now() < warmup_deadline {
-                let _ = measure_query(
-                    &mut connection,
-                    &format!("{workload}-warmup"),
-                    client,
-                    &queries[index % queries.len()],
-                )?;
-                index += 1;
-            }
             start.wait();
-            let deadline = Instant::now() + Duration::from_millis(duration_ms);
+            let deadline = *window_deadline
+                .get()
+                .expect("coordinator set short window deadline");
             while Instant::now() < deadline {
                 let sample = measure_query(
                     &mut connection,
                     &workload,
+                    window_index,
+                    concurrency,
                     client,
                     &queries[index % queries.len()],
                 )?;
@@ -252,17 +453,34 @@ fn run_query_window(
         }));
     }
     drop(sender);
+    let started_elapsed_millis = monitor.elapsed_millis();
+    window_deadline
+        .set(Instant::now() + Duration::from_millis(duration_ms))
+        .map_err(|_| anyhow::anyhow!("short window deadline was initialized twice"))?;
+    start.wait();
     for worker in workers {
         worker
             .join()
             .map_err(|_| anyhow::anyhow!("short performance worker panicked"))??;
     }
-    Ok(receiver.into_iter().collect())
+    Ok((
+        receiver.into_iter().collect(),
+        MeasurementWindow {
+            workload: workload.to_string(),
+            window_index,
+            configured_concurrency: concurrency,
+            started_elapsed_millis,
+            ended_elapsed_millis: started_elapsed_millis + u128::from(duration_ms),
+            drain_ended_elapsed_millis: monitor.elapsed_millis(),
+        },
+    ))
 }
 
 fn measure_query(
     connection: &mut mysql::Conn,
     workload: &str,
+    window_index: usize,
+    configured_concurrency: usize,
     client: usize,
     sql: &str,
 ) -> Result<QuerySample> {
@@ -280,10 +498,13 @@ fn measure_query(
     ensure!(rows > 0, "performance query {workload} returned no rows");
     Ok(QuerySample {
         workload: workload.to_string(),
+        window_index,
+        configured_concurrency,
         client,
         first_row_micros: first_row.expect("row count is positive").as_micros(),
         total_micros: started.elapsed().as_micros(),
         rows,
+        bytes_read: None,
         outcome: "success".to_string(),
     })
 }
@@ -291,13 +512,15 @@ fn measure_query(
 fn run_slow_output(
     context: &ScenarioContext,
     workload: &SlowOutputWorkload,
-) -> Result<Vec<QuerySample>> {
+    monitor: &ProcessResourceMonitor,
+) -> Result<(Vec<QuerySample>, Vec<MeasurementWindow>)> {
     let timeout = context.remaining("run slow-output performance window")?;
     let mut slow = connect_raw_mysql(context.mysql_user(), context.mysql_port(), timeout)?;
     send_query(&mut slow, &workload.query)?;
     let mut unread = connect_raw_mysql(context.mysql_user(), context.mysql_port(), timeout)?;
     send_query(&mut unread, &workload.query)?;
 
+    let started_elapsed_millis = monitor.elapsed_millis();
     let started = Instant::now();
     let deadline = started + Duration::from_millis(workload.duration_ms);
     let interval = Duration::from_millis(workload.interval_ms);
@@ -334,16 +557,30 @@ fn run_slow_output(
         "control query made no progress while slow readers were active"
     );
     ensure!(bytes > 0, "slow-output client read no bytes");
-    Ok(vec![QuerySample {
-        workload: "slow-output".to_string(),
-        client: 0,
-        first_row_micros: first_byte
-            .context("slow-output client read no first byte")?
-            .as_micros(),
-        total_micros: started.elapsed().as_micros(),
-        rows: bytes,
-        outcome: "success".to_string(),
-    }])
+    let drain_ended_elapsed_millis = monitor.elapsed_millis();
+    Ok((
+        vec![QuerySample {
+            workload: "slow-output".to_string(),
+            window_index: 0,
+            configured_concurrency: 2,
+            client: 0,
+            first_row_micros: first_byte
+                .context("slow-output client read no first byte")?
+                .as_micros(),
+            total_micros: started.elapsed().as_micros(),
+            rows: bytes,
+            bytes_read: Some(bytes),
+            outcome: "success".to_string(),
+        }],
+        vec![MeasurementWindow {
+            workload: "slow-output".to_string(),
+            window_index: 0,
+            configured_concurrency: 2,
+            started_elapsed_millis,
+            ended_elapsed_millis: started_elapsed_millis + u128::from(workload.duration_ms),
+            drain_ended_elapsed_millis,
+        }],
+    ))
 }
 
 fn connect_raw_mysql(user: &str, port: u16, timeout: Duration) -> Result<TcpStream> {

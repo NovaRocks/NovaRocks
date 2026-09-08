@@ -26,6 +26,16 @@ pub struct ScenarioBinaryLayout {
 pub trait Scenario: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Validates runner-wide inputs before any selected scenario launches a
+    /// process. Scenarios with special profiles or manifests fail here.
+    fn validate_runner_inputs(
+        &self,
+        _launch_profile: LaunchProfile,
+        _uea1_workload_manifest: Option<&Path>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// External-fixture scenarios remain discoverable and runnable by exact
     /// selector, but do not turn the normal no-Docker system baseline into a
     /// Docker requirement.

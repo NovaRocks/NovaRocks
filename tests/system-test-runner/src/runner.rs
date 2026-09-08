@@ -19,6 +19,12 @@ pub fn run(cli: Cli) -> Result<()> {
     if selected.is_empty() {
         bail!("no system scenarios are registered");
     }
+    for scenario in &selected {
+        scenario.validate_runner_inputs(
+            config.launch_profile,
+            config.uea1_workload_manifest.as_deref(),
+        )?;
+    }
     for scenario in selected {
         run_one(scenario, &config)?;
     }
@@ -126,14 +132,25 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             context.runtime_dir().display(),
             context.diagnostics()
         );
+        let launch_profile = match config.launch_profile {
+            novarocks_cluster_harness::LaunchProfile::FaultScenario => "fault-scenario",
+            novarocks_cluster_harness::LaunchProfile::Performance => "performance",
+        };
+        let manifest = config
+            .uea1_workload_manifest
+            .as_ref()
+            .map(|path| format!(" --uea1-workload-manifest {}", path.display()))
+            .unwrap_or_default();
         eprintln!(
-            "rerun: novarocks-system-tests --only {} --binary {} --config {} --artifact-root {} --cluster-size {} --timeout-secs {}",
+            "rerun: novarocks-system-tests --only {} --binary {} --config {} --artifact-root {} --cluster-size {} --timeout-secs {} --launch-profile {}{}",
             context.name(),
             config.binary.display(),
             config.base_config_path.display(),
             config.artifact_root.display(),
             config.cluster_size,
             config.timeout.as_secs(),
+            launch_profile,
+            manifest,
         );
         let cluster_cleanup = context.shutdown();
         let fixture_cleanup = scenario.teardown();
@@ -202,6 +219,30 @@ mod tests {
             .expect("select explicit blue/green scenario")
             .iter()
             .any(|scenario| scenario.name() == "frontend-lifecycle/blue-green-session-cutover")
+        );
+    }
+
+    #[test]
+    fn performance_preflight_rejects_missing_profile_and_manifest() {
+        let scenarios = crate::scenarios::all();
+        let selected = select(
+            &scenarios,
+            &["performance/uea1-short-concurrent".to_string()],
+        )
+        .expect("select performance scenario");
+        let scenario = selected[0];
+        assert!(
+            scenario
+                .validate_runner_inputs(
+                    novarocks_cluster_harness::LaunchProfile::FaultScenario,
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            scenario
+                .validate_runner_inputs(novarocks_cluster_harness::LaunchProfile::Performance, None)
+                .is_err()
         );
     }
 }

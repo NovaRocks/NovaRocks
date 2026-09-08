@@ -248,6 +248,13 @@ impl IsolatedIcebergRestFixture {
         &self.workspace_root
     }
 
+    /// Returns the static object-store identity owned by this isolated
+    /// fixture. Test scenarios use it to install the same explicit credential
+    /// generation in every process before creating a REST catalog.
+    pub fn static_s3_identity(&self) -> IsolatedS3Identity {
+        self.minio_root_identity.clone()
+    }
+
     /// Creates two distinct, valid MinIO STS identities. The fixture first
     /// provisions ordinary users and then signs AssumeRole requests as those
     /// users, yielding the access key, secret, and session token that MinIO

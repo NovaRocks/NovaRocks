@@ -23,11 +23,24 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize)]
 pub struct QuerySample {
     pub workload: String,
+    pub window_index: usize,
+    pub configured_concurrency: usize,
     pub client: usize,
     pub first_row_micros: u128,
     pub total_micros: u128,
     pub rows: u64,
+    pub bytes_read: Option<u64>,
     pub outcome: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MeasurementWindow {
+    pub workload: String,
+    pub window_index: usize,
+    pub configured_concurrency: usize,
+    pub started_elapsed_millis: u128,
+    pub ended_elapsed_millis: u128,
+    pub drain_ended_elapsed_millis: u128,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct PreparationEvent {
@@ -50,6 +63,7 @@ pub struct PerformanceReport<'a> {
     pub manifest_sha256: &'a str,
     pub scenario: &'a str,
     pub query_samples: &'a [QuerySample],
+    pub measurement_windows: &'a [MeasurementWindow],
     pub preparation_events: &'a [PreparationEvent],
 }
 
@@ -58,13 +72,15 @@ pub fn write_report(
     manifest_sha256: &str,
     scenario: &str,
     samples: &[QuerySample],
+    measurement_windows: &[MeasurementWindow],
     preparation_events: &[PreparationEvent],
 ) -> Result<()> {
     let report = PerformanceReport {
-        schema_version: 1,
+        schema_version: 2,
         manifest_sha256,
         scenario,
         query_samples: samples,
+        measurement_windows,
         preparation_events,
     };
     let bytes = serde_json::to_vec_pretty(&report).context("serialize performance report")?;

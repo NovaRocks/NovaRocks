@@ -37,8 +37,9 @@ pub struct ProcessResourceSample {
     pub elapsed_millis: u128,
     pub role: String,
     pub pid: u32,
-    pub rss_bytes: u64,
+    pub rss_bytes: Option<u64>,
     pub threads: Option<u64>,
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
@@ -57,6 +58,7 @@ pub struct ProcessResourceSampler {
 }
 
 pub struct ProcessResourceMonitor {
+    started: Instant,
     stopped: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<ProcessResourceSampler>>>,
 }
@@ -66,12 +68,14 @@ impl ProcessResourceMonitor {
         if interval.is_zero() {
             bail!("process resource sampling interval must be positive");
         }
+        let started = Instant::now();
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = Arc::clone(&stopped);
+        let worker_started = started;
         let worker = thread::Builder::new()
             .name("process-resource-monitor".to_string())
             .spawn(move || {
-                let mut sampler = ProcessResourceSampler::new();
+                let mut sampler = ProcessResourceSampler::new_at(worker_started);
                 while !worker_stopped.load(Ordering::Acquire) {
                     sampler.sample_cluster(&ids)?;
                     thread::sleep(interval);
@@ -80,9 +84,15 @@ impl ProcessResourceMonitor {
             })
             .context("spawn process resource monitor")?;
         Ok(Self {
+            started,
             stopped,
             worker: Some(worker),
         })
+    }
+
+    /// Returns a timestamp in the same monotonic time domain as every sample.
+    pub fn elapsed_millis(&self) -> u128 {
+        self.started.elapsed().as_millis()
     }
 
     pub fn finish(mut self, path: &Path) -> Result<ProcessResourceSampler> {
@@ -115,8 +125,12 @@ impl Default for ProcessResourceSampler {
 
 impl ProcessResourceSampler {
     pub fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(started: Instant) -> Self {
         Self {
-            started: Instant::now(),
+            started,
             samples: Vec::new(),
         }
     }
@@ -130,14 +144,25 @@ impl ProcessResourceSampler {
     }
 
     pub fn sample(&mut self, role: impl Into<String>, pid: u32) -> Result<()> {
-        let (rss_bytes, threads) = read_process_resources(pid)?;
-        self.samples.push(ProcessResourceSample {
-            elapsed_millis: self.started.elapsed().as_millis(),
-            role: role.into(),
-            pid,
-            rss_bytes,
-            threads,
-        });
+        let role = role.into();
+        match read_process_resources(pid) {
+            Ok((rss_bytes, threads)) => self.samples.push(ProcessResourceSample {
+                elapsed_millis: self.started.elapsed().as_millis(),
+                role,
+                pid,
+                rss_bytes: Some(rss_bytes),
+                threads,
+                unavailable_reason: None,
+            }),
+            Err(error) => self.samples.push(ProcessResourceSample {
+                elapsed_millis: self.started.elapsed().as_millis(),
+                role,
+                pid,
+                rss_bytes: None,
+                threads: None,
+                unavailable_reason: Some(format!("{error:#}")),
+            }),
+        }
         Ok(())
     }
 
@@ -146,12 +171,16 @@ impl ProcessResourceSampler {
     }
 
     pub fn high_water(&self, role: &str) -> Option<ProcessResourceHighWater> {
-        let matching = self.samples.iter().filter(|sample| sample.role == role);
+        let matching = self
+            .samples
+            .iter()
+            .filter(|sample| sample.role == role)
+            .filter_map(|sample| sample.rss_bytes.map(|rss| (sample, rss)));
         let mut high = ProcessResourceHighWater::default();
         let mut found = false;
-        for sample in matching {
+        for (sample, rss_bytes) in matching {
             found = true;
-            high.rss_bytes = high.rss_bytes.max(sample.rss_bytes);
+            high.rss_bytes = high.rss_bytes.max(rss_bytes);
             high.threads = match (high.threads, sample.threads) {
                 (Some(current), Some(next)) => Some(current.max(next)),
                 (None, Some(next)) => Some(next),
@@ -244,6 +273,7 @@ mod tests {
         let high = sampler.high_water("test").expect("high water exists");
         assert!(high.rss_bytes > 0);
         assert_eq!(sampler.samples().len(), 1);
+        assert!(sampler.samples()[0].unavailable_reason.is_none());
     }
 
     #[test]
@@ -272,5 +302,17 @@ mod tests {
         assert!(!sampler.samples().is_empty());
         assert!(root.join("samples.json").is_file());
         fs::remove_dir_all(root).expect("remove sample directory");
+    }
+
+    #[test]
+    fn missing_process_is_recorded_without_a_zero_measurement() {
+        let mut sampler = ProcessResourceSampler::new();
+        sampler
+            .sample("missing", u32::MAX)
+            .expect("record unavailable process");
+        let sample = &sampler.samples()[0];
+        assert_eq!(sample.rss_bytes, None);
+        assert!(sample.unavailable_reason.is_some());
+        assert!(sampler.high_water("missing").is_none());
     }
 }

@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod business;
 mod controller;
 mod manifest;
 mod metrics;
 
+pub use business::MixedFixtureBinding;
 pub use controller::{PerformanceScenario, run};
 pub use manifest::Uea1WorkloadManifest;

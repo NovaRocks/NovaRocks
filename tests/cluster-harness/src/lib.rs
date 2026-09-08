@@ -24,6 +24,7 @@ pub mod vended_rest_catalog;
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
+use native_fault_proxy::{NativeFaultProxy, NativeFaultProxyControl};
 use novarocks_failpoint::{
     QueryLifecycleFaultKind, arm_path as lifecycle_arm_path, cleanup_trigger_path,
     mv_known_committed_before_projector_cas_marker_path,
@@ -708,6 +709,75 @@ pub struct CrossProcessClusterOptions {
     /// Harness-owned Native trust profile. `Default` is authenticated h2c on
     /// the loopback IP reference, never an unauthenticated transport.
     pub native_trust_fixture: NativeTrustFixture,
+}
+
+/// Opt-in Native TCP proxies. An empty map leaves every BE endpoint unchanged.
+/// Each value bounds the forwarding buffers retained by that BE's proxy.
+#[derive(Debug, Clone, Default)]
+pub struct CrossProcessNativeFaultProxyConfig {
+    pub backend_retained_byte_limits: BTreeMap<usize, u64>,
+}
+
+#[derive(Default)]
+struct BackendNativeFaultProxies {
+    proxies: BTreeMap<usize, NativeFaultProxy>,
+}
+
+impl BackendNativeFaultProxies {
+    fn start(
+        runtime: &CrossProcessRuntime,
+        config: CrossProcessNativeFaultProxyConfig,
+    ) -> Result<Self> {
+        for (&index, &limit) in &config.backend_retained_byte_limits {
+            ensure!(
+                index < runtime.be.len(),
+                "native fault proxy BE index {index} is out of bounds"
+            );
+            ensure!(
+                limit > 0,
+                "native fault proxy BE[{index}] retained-byte limit must be positive"
+            );
+        }
+        let mut result = Self::default();
+        for (index, limit) in config.backend_retained_byte_limits {
+            let upstream = ([127, 0, 0, 1], runtime.be[index].grpc).into();
+            let proxy = NativeFaultProxy::start(upstream, limit)
+                .with_context(|| format!("start Native fault proxy for BE[{index}]"))?;
+            result.proxies.insert(index, proxy);
+        }
+        Ok(result)
+    }
+
+    fn advertised_port(&self, index: usize) -> Option<u16> {
+        self.proxies.get(&index).map(|proxy| proxy.address().port())
+    }
+
+    fn advertised_ports(&self, runtime: &CrossProcessRuntime) -> Vec<u16> {
+        runtime
+            .be
+            .iter()
+            .enumerate()
+            .map(|(index, ports)| self.advertised_port(index).unwrap_or(ports.grpc))
+            .collect()
+    }
+
+    fn disconnect_backend(&self, index: usize) {
+        if let Some(proxy) = self.proxies.get(&index) {
+            proxy.control().disconnect_all();
+        }
+    }
+
+    fn disconnect_all(&self) {
+        for proxy in self.proxies.values() {
+            proxy.control().disconnect_all();
+        }
+    }
+
+    fn stop(&mut self) {
+        for proxy in self.proxies.values_mut() {
+            proxy.stop();
+        }
+    }
 }
 
 /// Lifecycle boundaries accepted by the distributed fault controls.
@@ -2453,6 +2523,7 @@ struct CrossProcessLaunchConfig<'a> {
     role: ClusterProcessRole,
     be_index: usize,
     runtime: &'a CrossProcessRuntime,
+    be_advertised_grpc_port: Option<u16>,
     runtime_dir: &'a Path,
     query_lifecycle_faults_enabled: bool,
     cleanup_faults_enabled: bool,
@@ -2467,6 +2538,7 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         role,
         be_index,
         runtime,
+        be_advertised_grpc_port,
         runtime_dir,
         query_lifecycle_faults_enabled,
         cleanup_faults_enabled,
@@ -2490,6 +2562,16 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         "advertise_host".to_string(),
         Value::String(native_trust_fixture.fixture.advertise_host().to_string()),
     );
+    if let Some(port) = be_advertised_grpc_port {
+        ensure!(
+            role == ClusterProcessRole::Be && port != 0,
+            "a Native proxy advertised port requires a BE and a nonzero port"
+        );
+        cluster.insert(
+            "advertise_port".to_string(),
+            Value::Integer(i64::from(port)),
+        );
+    }
     if role == ClusterProcessRole::Be {
         let frontend_endpoint = NativeEndpoint::from_host_port(
             native_trust_fixture.fixture.advertise_host(),
@@ -2816,7 +2898,9 @@ pub struct CrossProcessServerHandle {
     target_host: String,
     target_port: u16,
     mysql_user: String,
+    // FE-visible endpoints; runtime.be retains the real process listen ports.
     be_grpc_ports: Vec<u16>,
+    native_fault_proxies: BackendNativeFaultProxies,
     fragment_failure_trigger_paths: Vec<PathBuf>,
     fragment_failure_tokens: Vec<Option<String>>,
     query_lifecycle_fault_files: QueryLifecycleFaultFiles,
@@ -2875,6 +2959,18 @@ impl Drop for RuntimeDirGuard {
 impl CrossProcessServerHandle {
     /// Launch one normal ephemeral cross-process cluster from resolved inputs.
     pub fn launch(options: CrossProcessClusterOptions) -> Result<Self> {
+        Self::launch_with_native_fault_proxies(
+            options,
+            CrossProcessNativeFaultProxyConfig::default(),
+        )
+    }
+
+    /// Launch the same normal cluster with explicitly selected BE TCP proxies.
+    /// Proxies are listening before any BE announces its advertised endpoint.
+    pub fn launch_with_native_fault_proxies(
+        options: CrossProcessClusterOptions,
+        proxy_config: CrossProcessNativeFaultProxyConfig,
+    ) -> Result<Self> {
         let CrossProcessClusterOptions {
             binary: novarocks_bin,
             fe_binary,
@@ -2954,6 +3050,8 @@ impl CrossProcessServerHandle {
             fe_grpc_port: reserved.fe_grpc_port.port(),
             fe_mysql_port: reserved.fe_mysql_port.port(),
         };
+        let native_fault_proxies = BackendNativeFaultProxies::start(&runtime, proxy_config)?;
+        let be_grpc_ports = native_fault_proxies.advertised_ports(&runtime);
 
         validate_be_config_overrides(&config_overlay.be_by_index, cluster_size)?;
 
@@ -2982,6 +3080,9 @@ impl CrossProcessServerHandle {
                 role,
                 be_index,
                 runtime: &runtime,
+                be_advertised_grpc_port: (role == ClusterProcessRole::Be)
+                    .then(|| native_fault_proxies.advertised_port(be_index))
+                    .flatten(),
                 runtime_dir: runtime_dir.path(),
                 query_lifecycle_faults_enabled,
                 cleanup_faults_enabled,
@@ -3088,7 +3189,7 @@ impl CrossProcessServerHandle {
             LiveBackendTopologyWait {
                 mysql_user: &mysql_user,
                 runtime: &runtime,
-                expected_ports: &runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>(),
+                expected_ports: &be_grpc_ports,
                 expected_eligible_backend_count,
                 fe_config_path: &fe_config_path,
                 be_config_paths: &be_config_paths,
@@ -3105,7 +3206,8 @@ impl CrossProcessServerHandle {
             target_host: "127.0.0.1".to_string(),
             target_port: runtime.fe_mysql_port,
             mysql_user,
-            be_grpc_ports: runtime.be.iter().map(|be| be.grpc).collect(),
+            be_grpc_ports,
+            native_fault_proxies,
             fragment_failure_trigger_paths,
             fragment_failure_tokens: vec![None; cluster_size],
             query_lifecycle_fault_files,
@@ -3168,14 +3270,25 @@ impl CrossProcessServerHandle {
     /// the FE topology and TLS verifier used for this BE.
     pub fn native_be_endpoint(&self, index: usize) -> Result<NativeEndpoint> {
         let port = self
-            .runtime
-            .be
+            .be_grpc_ports
             .get(index)
-            .ok_or_else(|| anyhow::anyhow!("native BE index {index} is out of bounds"))?
-            .grpc;
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("native BE index {index} is out of bounds"))?;
         NativeEndpoint::from_host_port(self.native_trust_fixture.fixture.advertise_host(), port)
             .map_err(anyhow::Error::msg)
             .context("construct harness Native BE endpoint")
+    }
+
+    /// Control a selected BE's proxy without transferring its lifecycle owner.
+    /// The control remains valid across BE/FE restarts; resume paused directions
+    /// before using restart methods that wait for a live topology barrier.
+    pub fn native_fault_proxy(&self, index: usize) -> Result<NativeFaultProxyControl> {
+        self.ensure_be_index(index)?;
+        self.native_fault_proxies
+            .proxies
+            .get(&index)
+            .map(NativeFaultProxy::control)
+            .ok_or_else(|| anyhow::anyhow!("Native fault proxy is not enabled for BE[{index}]"))
     }
 
     /// Construct an authenticated test caller with the same deployment key as
@@ -3425,6 +3538,7 @@ impl CrossProcessServerHandle {
                 failures.push(format!("stop cross-process BE[{index}]: {error:#}"));
             }
         }
+        self.native_fault_proxies.stop();
         if !self.retain_runtime_artifacts
             && let Err(error) = fs::remove_dir_all(&self.runtime_dir)
             && error.kind() != std::io::ErrorKind::NotFound
@@ -3974,6 +4088,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 .kill_now()
                 .with_context(|| format!("stop old cross-process BE[{index}] before restart"))?;
         }
+        self.native_fault_proxies.disconnect_backend(index);
 
         let config_path = self
             .be_config_paths
@@ -4025,12 +4140,11 @@ impl ServerHandle for CrossProcessServerHandle {
             be_process.pid(),
             config_path.display()
         );
-        let expected_ports = self.runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>();
         wait_for_live_backend_topology(
             LiveBackendTopologyWait {
                 mysql_user: &self.mysql_user,
                 runtime: &self.runtime,
-                expected_ports: &expected_ports,
+                expected_ports: &self.be_grpc_ports,
                 expected_eligible_backend_count: self.expected_eligible_backend_count,
                 fe_config_path: &self.fe_config_path,
                 be_config_paths: &self.be_config_paths,
@@ -4178,12 +4292,12 @@ impl ServerHandle for CrossProcessServerHandle {
             self.fe_process.pid(),
             self.fe_config_path.display()
         );
-        let expected_ports = self.runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>();
+        self.native_fault_proxies.disconnect_all();
         wait_for_live_backend_topology(
             LiveBackendTopologyWait {
                 mysql_user: &self.mysql_user,
                 runtime: &self.runtime,
-                expected_ports: &expected_ports,
+                expected_ports: &self.be_grpc_ports,
                 expected_eligible_backend_count: self.expected_eligible_backend_count,
                 fe_config_path: &self.fe_config_path,
                 be_config_paths: &self.be_config_paths,
@@ -5752,6 +5866,211 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_proxy_default_preserves_listen_and_advertised_endpoints() {
+        let runtime = make_runtime_2be();
+        let proxies = BackendNativeFaultProxies::start(
+            &runtime,
+            CrossProcessNativeFaultProxyConfig::default(),
+        )
+        .unwrap();
+        assert!(proxies.proxies.is_empty());
+        assert_eq!(proxies.advertised_ports(&runtime), vec![19070, 19071]);
+        assert_eq!(proxies.advertised_port(0), None);
+        let fixture = rendered_native_trust_fixture();
+        let rendered = render_cross_process_launch_config(CrossProcessLaunchConfig {
+            base_config: BASE_CONFIG,
+            source_config_dir: Path::new("/tmp"),
+            role: ClusterProcessRole::Be,
+            be_index: 0,
+            runtime: &runtime,
+            be_advertised_grpc_port: proxies.advertised_port(0),
+            runtime_dir: Path::new("/tmp/novarocks-no-native-proxy"),
+            query_lifecycle_faults_enabled: false,
+            cleanup_faults_enabled: false,
+            overlays: Vec::new(),
+            native_trust_fixture: &fixture,
+        })
+        .unwrap();
+        let config: Value = rendered.parse().unwrap();
+        assert_eq!(config["server"]["grpc_port"].as_integer(), Some(19070));
+        assert!(config["cluster"].get("advertise_port").is_none());
+    }
+
+    #[test]
+    fn native_proxy_renders_only_selected_be_advertisement_and_topology() {
+        let runtime = make_runtime_2be();
+        let mut proxies = BackendNativeFaultProxies::start(
+            &runtime,
+            CrossProcessNativeFaultProxyConfig {
+                backend_retained_byte_limits: BTreeMap::from([(1, 1024)]),
+            },
+        )
+        .unwrap();
+        let advertised = proxies.advertised_ports(&runtime);
+        assert_eq!(advertised[0], runtime.be[0].grpc);
+        assert_ne!(advertised[1], runtime.be[1].grpc);
+        let mut fixture = rendered_native_trust_fixture();
+        fixture.fixture = NativeTrustFixture::automatic_dns();
+        let rendered = render_cross_process_launch_config(CrossProcessLaunchConfig {
+            base_config: BASE_CONFIG,
+            source_config_dir: Path::new("/tmp"),
+            role: ClusterProcessRole::Be,
+            be_index: 1,
+            runtime: &runtime,
+            be_advertised_grpc_port: proxies.advertised_port(1),
+            runtime_dir: Path::new("/tmp/novarocks-native-proxy-config"),
+            query_lifecycle_faults_enabled: false,
+            cleanup_faults_enabled: false,
+            overlays: Vec::new(),
+            native_trust_fixture: &fixture,
+        })
+        .unwrap();
+        let config: Value = rendered.parse().unwrap();
+        assert_eq!(config["server"]["grpc_port"].as_integer(), Some(19071));
+        assert_eq!(
+            config["cluster"]["advertise_port"].as_integer(),
+            Some(i64::from(advertised[1]))
+        );
+        assert_eq!(
+            config["cluster"]["advertise_host"].as_str(),
+            Some("localhost")
+        );
+        assert_eq!(
+            config["cluster"]["frontend_endpoint"].as_str(),
+            Some("localhost:29070")
+        );
+        let rows = vec![
+            backend_row(advertised[0], "Live", true),
+            backend_row(advertised[1], "Live", true),
+        ];
+        validate_live_backend_topology(&advertised, 2, &rows).unwrap();
+        assert!(validate_live_backend_topology(&[19070, 19071], 2, &rows).is_err());
+        let control = proxies.proxies[&1].control();
+        proxies.stop();
+        assert!(control.is_stopped());
+        let listener =
+            std::net::TcpListener::bind(control.address()).expect("release advertised port");
+        drop(listener);
+    }
+
+    #[test]
+    fn native_proxy_rejects_invalid_backend_configuration() {
+        let runtime = make_runtime_1be();
+        for (index, limit) in [(1, 1024), (0, 0)] {
+            let result = BackendNativeFaultProxies::start(
+                &runtime,
+                CrossProcessNativeFaultProxyConfig {
+                    backend_retained_byte_limits: BTreeMap::from([(index, limit)]),
+                },
+            );
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires NOVAROCKS_BIN pointing to a built native server"]
+    fn native_proxy_cluster_keeps_advertisement_across_process_restarts() -> Result<()> {
+        use native_fault_proxy::{ProxyDirection, ProxyMode};
+
+        let binary = std::env::var_os("NOVAROCKS_BIN")
+            .map(PathBuf::from)
+            .context("native proxy integration test requires NOVAROCKS_BIN")?;
+        let runtime_root = RuntimeDirGuard::new(create_runtime_dir(&std::env::temp_dir())?);
+        let log_overlay = |role: &str| {
+            toml::to_string(&BTreeMap::from([(
+                "sys_log_dir",
+                runtime_root
+                    .path()
+                    .join(role)
+                    .to_string_lossy()
+                    .into_owned(),
+            )]))
+        };
+        let config_overlay = CrossProcessConfigOverlay {
+            fe: Some(log_overlay("fe-logs")?),
+            be: None,
+            be_by_index: (0..3)
+                .map(|index| Ok((index, log_overlay(&format!("be-{index}-logs"))?)))
+                .collect::<Result<_>>()?,
+        };
+        let options = CrossProcessClusterOptions {
+            binary,
+            fe_binary: None,
+            be_binaries: Vec::new(),
+            expected_eligible_backend_count: None,
+            base_config_path: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tools/ci/fixtures/system-scenarios-base.toml"),
+            runtime_root: runtime_root.path().to_path_buf(),
+            cluster_size: 3,
+            launch_profile: LaunchProfile::FaultScenario,
+            startup_timeout: Duration::from_secs(60),
+            child_environment: CrossProcessChildEnvironment::default(),
+            config_overlay,
+            native_trust_fixture: NativeTrustFixture::default(),
+        };
+        let mut cluster = CrossProcessServerHandle::launch_with_native_fault_proxies(
+            options,
+            CrossProcessNativeFaultProxyConfig {
+                backend_retained_byte_limits: BTreeMap::from([(1, 64 * 1024)]),
+            },
+        )?;
+        let control = cluster.native_fault_proxy(1)?;
+        let endpoint = cluster.native_be_endpoint(1)?;
+        assert_eq!(endpoint.port(), control.address().port());
+        assert_ne!(endpoint.port(), cluster.runtime().be[1].grpc);
+        assert_eq!(
+            cluster.native_be_endpoint(0)?.port(),
+            cluster.runtime().be[0].grpc
+        );
+        assert!(cluster.native_fault_proxy(0).is_err());
+        let rows = cluster.frontend_backend_topology()?;
+        assert!(
+            rows.iter()
+                .any(|row| row.grpc_port == endpoint.port() && row.is_eligible_live())
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.grpc_port == cluster.runtime().be[1].grpc)
+        );
+
+        // Fault controls do not replace or kill the actual BE process.
+        let before = cluster.process_ids();
+        control.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Paused);
+        control.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Paused);
+        assert!(cluster.be_processes[1].is_running()?);
+        assert_eq!(cluster.process_ids().backends, before.backends);
+        control.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Forward);
+        control.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Forward);
+        ServerHandle::restart_be(&mut cluster, 1)?;
+        assert_ne!(cluster.process_ids().backends[1], before.backends[1]);
+        assert_eq!(cluster.native_be_endpoint(1)?, endpoint);
+        ServerHandle::restart_fe(&mut cluster)?;
+        assert_ne!(cluster.process_ids().frontend, before.frontend);
+        assert_eq!(cluster.native_be_endpoint(1)?, endpoint);
+        let mut connection = MysqlConn::new(
+            OptsBuilder::new()
+                .ip_or_hostname(Some("127.0.0.1"))
+                .tcp_port(cluster.runtime().fe_mysql_port)
+                .prefer_socket(false)
+                .user(Some(cluster.mysql_user.clone()))
+                .tcp_connect_timeout(Some(Duration::from_secs(5)))
+                .read_timeout(Some(Duration::from_secs(5)))
+                .write_timeout(Some(Duration::from_secs(5))),
+        )?;
+        assert_eq!(connection.query_first::<u64, _>("SELECT 1")?, Some(1));
+        drop(connection);
+        cluster.shutdown()?;
+        assert!(control.is_stopped());
+        assert_eq!(control.active_connections(), 0);
+        assert_eq!(control.retained_bytes(), 0);
+        let listener = std::net::TcpListener::bind(control.address())
+            .context("Native proxy must release its advertised listener on cluster shutdown")?;
+        drop(listener);
+        Ok(())
+    }
+
     fn rendered_native_trust_fixture() -> PreparedNativeTrustFixture {
         PreparedNativeTrustFixture {
             fixture: NativeTrustFixture::plaintext_ip(),
@@ -5935,6 +6254,7 @@ access_key_secret = "admin123"
             role: ClusterProcessRole::Be,
             be_index: 0,
             runtime: &runtime,
+            be_advertised_grpc_port: None,
             runtime_dir: Path::new("/tmp/novarocks-native-trust-reference"),
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6015,6 +6335,7 @@ access_key_secret = "admin123"
             role: ClusterProcessRole::Fe,
             be_index: 0,
             runtime: &runtime,
+            be_advertised_grpc_port: None,
             runtime_dir: first_runtime,
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6030,6 +6351,7 @@ access_key_secret = "admin123"
             role: ClusterProcessRole::Fe,
             be_index: 0,
             runtime: &runtime,
+            be_advertised_grpc_port: None,
             runtime_dir: second_runtime,
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6095,6 +6417,7 @@ static_file_path = "catalogs.toml"
             role: ClusterProcessRole::Fe,
             be_index: 0,
             runtime: &runtime,
+            be_advertised_grpc_port: None,
             runtime_dir: &output,
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6555,6 +6878,7 @@ static_file_path = "catalogs.toml"
             role: ClusterProcessRole::Be,
             be_index: 0,
             runtime: &runtime,
+            be_advertised_grpc_port: None,
             runtime_dir: Path::new("/tmp/novarocks-be-config-overlay"),
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
@@ -6582,6 +6906,7 @@ static_file_path = "catalogs.toml"
             role: ClusterProcessRole::Be,
             be_index: 0,
             runtime: &runtime,
+            be_advertised_grpc_port: None,
             runtime_dir: Path::new("/tmp/novarocks-be-config-overlay-guard"),
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
