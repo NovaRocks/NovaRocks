@@ -1462,6 +1462,15 @@ impl FrontendDistributedQueryCoordinator {
                             break Ok(());
                         }
                     }
+                    None if intent == DistributedQueryIntent::Statistics
+                        && !statistics_tasks_are_terminal(&round) =>
+                    {
+                        // Root EOF proves the statistics artifact stream is
+                        // complete, but an upstream stand-down can still be
+                        // converging through CANCELING. Wait for the frozen
+                        // task set to reach terminals before classifying those
+                        // terminals as success-compatible or failed.
+                    }
                     None => break Ok(()),
                 }
             }
@@ -2198,6 +2207,15 @@ struct StatisticsTaskCompletionFact {
     failure_cause: Option<TerminationDetail>,
 }
 
+fn statistics_tasks_are_terminal(round: &TaskRound) -> bool {
+    round.execution().graph().tasks().all(|task| {
+        round
+            .execution()
+            .task(task.task_id())
+            .is_some_and(|remote| remote.is_terminal())
+    })
+}
+
 fn statistics_all_success_error(round: &TaskRound) -> Option<DistributedQueryError> {
     let facts = round
         .execution()
@@ -2627,6 +2645,33 @@ mod tests {
             statistics_all_success_failure_message(&[finished_root, aborted_producer], None)
                 .expect("query cancellation is not a success-compatible stand-down");
         assert!(message.contains("ABORTED(cause=QUERY_FAILED)"));
+    }
+
+    #[test]
+    fn statistics_does_not_classify_a_cancel_until_it_reaches_terminal() {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(19, 23),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("nonzero execution identity");
+        let canceling = StatisticsTaskCompletionFact {
+            identity: TaskIdentity::new(
+                execution_id,
+                StageId::new(2).expect("nonzero stage"),
+                TaskId::new(1).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            ),
+            terminal: false,
+            success_compatible_terminal: false,
+            state: Some(TaskState::Canceling),
+            failure_cause: Some(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            )),
+        };
+        let message = statistics_all_success_failure_message(&[canceling], None)
+            .expect("a canceling task is not yet classifiable as success");
+        assert!(message.contains("terminal=false"));
+        assert!(message.contains("state=CANCELING"));
     }
 
     #[test]
