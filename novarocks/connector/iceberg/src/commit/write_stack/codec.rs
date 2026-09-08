@@ -1554,6 +1554,15 @@ mod tests {
         }
     }
 
+    fn assert_public_provider_error_path(error: &ConnectorWriteCodecError, private_path: &str) {
+        assert_eq!(error.protocol().path().to_string(), "provider_payload");
+        assert!(
+            error.protocol().detail().contains(private_path),
+            "public provider_payload error must retain private path `{private_path}` in its detail: {}",
+            error.protocol().detail()
+        );
+    }
+
     /// Encode, validate, decode, and prove the recovered value is the original.
     ///
     /// The re-encoding check is the backstop: the field-by-field comparison can
@@ -1942,7 +1951,7 @@ mod tests {
             .encode_writer_handle(&handle)
             .expect_err("a foreign generation's handle");
         assert_eq!(error.owner(), "catalog.iceberg");
-        assert_eq!(error.protocol().path().to_string(), "writer_handle");
+        assert_public_provider_error_path(&error, "writer_handle");
         assert!(
             error
                 .protocol()
@@ -1955,7 +1964,7 @@ mod tests {
             .fragment_encoder
             .encode_commit_fragment(&fragment)
             .expect_err("a foreign generation's fragment");
-        assert_eq!(error.protocol().path().to_string(), "commit_fragment");
+        assert_public_provider_error_path(&error, "commit_fragment");
     }
 
     #[test]
@@ -1974,7 +1983,7 @@ mod tests {
             error.protocol().kind(),
             ProtocolErrorKind::InconsistentFields
         );
-        assert_eq!(error.protocol().path().to_string(), "header.catalog");
+        assert_public_provider_error_path(&error, "header.catalog");
         assert!(error.protocol().detail().contains("catalog"));
     }
 
@@ -2005,10 +2014,7 @@ mod tests {
             .decode_writer_handle(&parse_handle(raw))
             .expect_err("a Puffin writer with a Parquet row group size");
         assert_eq!(error.protocol().kind(), ProtocolErrorKind::InvalidValue);
-        assert_eq!(
-            error.protocol().path().to_string(),
-            "writer_handle.iceberg.output"
-        );
+        assert_public_provider_error_path(&error, "writer_handle.iceberg.output");
         assert!(
             error
                 .protocol()
@@ -2036,7 +2042,7 @@ mod tests {
             .handle_decoder
             .decode_writer_handle(&parse_handle(raw))
             .expect_err("a target frozen against another snapshot");
-        assert_eq!(error.protocol().path().to_string(), "writer_handle.iceberg");
+        assert_public_provider_error_path(&error, "writer_handle.iceberg");
         assert!(
             error
                 .protocol()
@@ -2065,11 +2071,11 @@ mod tests {
             .fragment_decoder
             .decode_commit_fragment(&parse_fragment(raw))
             .expect_err("a deletion vector that disagrees with itself");
-        assert_eq!(error.protocol().kind(), ProtocolErrorKind::Conflict);
         assert_eq!(
-            error.protocol().path().to_string(),
-            "commit_fragment.iceberg.deletion_vector"
+            error.protocol().kind(),
+            ProtocolErrorKind::InconsistentFields
         );
+        assert_public_provider_error_path(&error, "commit_fragment.iceberg.deletion_vector");
         assert!(
             error
                 .protocol()
@@ -2097,10 +2103,7 @@ mod tests {
             .handle_encoder
             .encode_writer_handle(&facets.adapter.wrap_writer_handle(handle))
             .expect_err("a non-default gzip level");
-        assert_eq!(
-            error.protocol().path().to_string(),
-            "writer_handle.iceberg.output.compression"
-        );
+        assert_public_provider_error_path(&error, "writer_handle.iceberg.output.compression");
         assert!(error.protocol().detail().contains("cannot express"));
     }
 
@@ -2124,7 +2127,7 @@ mod tests {
             .encode_writer_handle(&neutral)
             .expect_err("an oversized writer handle");
         assert_eq!(error.protocol().kind(), ProtocolErrorKind::Capacity);
-        assert_eq!(error.protocol().path().to_string(), "writer_handle.iceberg");
+        assert_public_provider_error_path(&error, "writer_handle.iceberg");
 
         // One path past the 1 MiB commit-fragment bound.
         let huge = format!("/wh/db/t/data/{}.parquet", "x".repeat(1024 * 1024 + 16));
@@ -2144,10 +2147,7 @@ mod tests {
             .encode_commit_fragment(&neutral)
             .expect_err("an oversized commit fragment");
         assert_eq!(error.protocol().kind(), ProtocolErrorKind::Capacity);
-        assert_eq!(
-            error.protocol().path().to_string(),
-            "commit_fragment.iceberg"
-        );
+        assert_public_provider_error_path(&error, "commit_fragment.iceberg");
     }
     fn unpartitioned() -> IcebergArtifactPartition {
         IcebergArtifactPartition::try_new(
