@@ -57,6 +57,9 @@ use novarocks_execution::task_execution::operation::{
 use novarocks_execution::task_execution::status::{SafeDetail, TaskFailureCategory};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
+use novarocks_task_codec::domain::{
+    ConfidentialTransport, refuse_confidential_material_in_the_clear,
+};
 use novarocks_task_codec::operation::{
     DecodedOperation, DecodedUpdateQueryContext, decode_fetch_dynamic_filters,
     decode_get_final_task_info, decode_operation_batch, decode_subscribe_task_status,
@@ -82,16 +85,19 @@ type ReceiptAck = proto::task_operation_receipt::Ack;
 pub(crate) struct RegistryTaskExecutionIngress {
     registry: Arc<TaskExecutionRegistry>,
     native_compatibility_id: NativeCompatibilityId,
+    native_transport_confidentiality: ConfidentialTransport,
 }
 
 impl RegistryTaskExecutionIngress {
     pub(crate) fn new(
         registry: Arc<TaskExecutionRegistry>,
         native_compatibility_id: NativeCompatibilityId,
+        native_transport_confidentiality: ConfidentialTransport,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry,
             native_compatibility_id,
+            native_transport_confidentiality,
         })
     }
 
@@ -289,6 +295,16 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         &self,
         request: proto::ApplyTaskOperationsRequest,
     ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
+        // Confidential bytes are refused on the raw request, before any
+        // domain decoder can project or retain them and before any registry
+        // operation can take effect. The fact comes from the same
+        // Server-resolved transport mode that configured this BE listener.
+        refuse_confidential_material_in_the_clear(
+            &request,
+            self.native_transport_confidentiality,
+            FieldPath::root("apply_task_operations"),
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         // The transport budget is checked over the whole batch before any
         // item is decoded, so an oversized batch never reaches the owner.
         let operations = decode_operation_batch(
@@ -626,6 +642,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_transport(ConfidentialTransport::Plaintext)
+        }
+
+        fn with_transport(native_transport_confidentiality: ConfidentialTransport) -> Self {
             let backend = BackendProcessId::new_v7();
             let mut config = TaskExecutionRegistryConfig::for_process(backend);
             // Nothing here waits on a gate, and no case may depend on
@@ -643,6 +663,7 @@ mod tests {
                 ingress: RegistryTaskExecutionIngress::new(
                     Arc::clone(&registry),
                     native_compatibility_id,
+                    native_transport_confidentiality,
                 ),
                 registry,
                 task_host,
@@ -1088,6 +1109,61 @@ mod tests {
             error.message().contains("requires a command"),
             "unexpected message: {}",
             error.message()
+        );
+    }
+
+    #[test]
+    fn confidential_material_is_gated_before_domain_decode_or_apply() {
+        let request = || proto::ApplyTaskOperationsRequest {
+            operations: vec![proto::TaskOperation {
+                // This is intentionally malformed. A confidential transport
+                // reaches this later structural check; plaintext must stop at
+                // the raw confidentiality gate first.
+                envelope: None,
+                operation: Some(proto::task_operation::Operation::UpdateQueryContext(
+                    proto::UpdateQueryContextRequest {
+                        command: Some(proto::update_query_context_request::Command::Establish(
+                            proto::EstablishQueryContextRequest {
+                                initial_credential: Some(proto::QueryContextCredentialDomain {
+                                    lease_id: 1,
+                                    epoch: 1,
+                                    descriptors: Vec::new(),
+                                    envelopes: vec![proto::CredentialLeaseSecretEnvelope::default()],
+                                }),
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                )),
+            }],
+        };
+
+        let plaintext = Fixture::with_transport(ConfidentialTransport::Plaintext);
+        let plaintext_error = plaintext
+            .ingress
+            .apply_task_operations(request())
+            .expect_err("plaintext must reject confidential bytes at raw ingress");
+        assert_eq!(plaintext_error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            plaintext_error
+                .message()
+                .contains("credential material requires a confidential native transport"),
+            "unexpected plaintext rejection: {}",
+            plaintext_error.message()
+        );
+
+        let confidential = Fixture::with_transport(ConfidentialTransport::Confidential);
+        let confidential_error = confidential
+            .ingress
+            .apply_task_operations(request())
+            .expect_err("the intentionally malformed request must reach structural decode");
+        assert_eq!(confidential_error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            confidential_error
+                .message()
+                .contains("requires an envelope"),
+            "TLS admission did not reach structural decode: {}",
+            confidential_error.message()
         );
     }
 

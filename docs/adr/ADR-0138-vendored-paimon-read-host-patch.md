@@ -23,6 +23,8 @@ NovaRocks 首期读取 Paimon 时，为什么维护 `paimon` 0.3.0 的可追溯 
 
 首期产品边界是 Filesystem Catalog、共享 S3/MinIO、追加表与 `deduplicate` 主键表的当前快照读取。NovaRocks 的 Server 拥有 role-local secret、authorized object-store access、request deadline、cancellation 与 fragment/query/process memory ledger；provider 和 SDK 不得从环境变量、catalog secret 或默认 storage feature 构造第二条 I/O 路径。
 
+冻结 snapshot 只是读取一致性事实，不是外部保留权。只读 host patch 不写 tag、consumer state 或 retention lease；Paimon 外部 GC/expiration 必须保证 snapshot、schema、manifest 与数据文件至少存活到最长 NovaRocks 查询结束。若外部系统提前清理必要对象，reader 必须保留对象缺失错误并终止，不能切换到 latest、返回部分关系或把缺失解释为空表。
+
 crates.io 的 `paimon` 0.3.0 能读取目标文件格式，但其公开 API 缺少 NovaRocks 需要的四类接缝：注入 storage-client-neutral 的只读 FileIO；在 metadata、Parquet 和 PK merge 内部执行 request cancellation/checkpoint；对 retained bytes 使用随 owner 生命周期移动的 reservation；在 merge 前严格验证历史物理 schema 与 KV system columns。其 `BinaryTableStats` 也未公开，provider 无法从私有 wire 无损重建完整 `DataFileMeta`。
 
 只在 SDK 调用前后检查请求无法约束调用内部的 listing collection、whole/range bytes、Avro 解压、Parquet decode、同 key history、cursor batch 和输出构造。只包装 SDK 返回的 Arrow batch则会漏计还未 yield 的内部状态，并在长时间无输出的 delete/merge 路径中无法及时取消。让 SDK 通过自己的 OpenDAL storage feature 访问 S3，又会绕开 NovaRocks 的 access domain、credential generation 和审计边界。
@@ -50,6 +52,8 @@ Patch 增加 storage-neutral `ReadOnlyFileIO` 和 `ReadControl`。Paimon provide
 合法历史 schema 中不存在的 nullable field 可以按 Paimon 规则补 NULL；历史 schema 声明存在却在物理 batch 缺失或类型不符的 field 必须报损坏。主键读取的 `_SEQUENCE_NUMBER` 与 `_VALUE_KIND` 必须具有准确非空类型和值域，并在 merge 前验证。`BinaryTableStats` 只提升必要 visibility，让 provider 私有 codec 无损重建 SDK `DataFileMeta`；它不成为 SPI 或公共 Native 类型。
 
 NovaRocks 只承诺该补丁覆盖首期只读路径。外部 DDL、DML、maintenance、statistics publication、SDK cache/prefetch 和其它 merge engine 不因 vendoring 获得支持；对应 capability 保持缺席或明确 `Unsupported`。
+
+部署文档必须把外部 retention 前提作为 Paimon 可用性条件，并说明 NovaRocks 没有写侧保留协议。任何需要在外部 GC 并发下保证长查询存活的方案，都必须先为 Paimon 定义可验证的 retention/lease owner，不能通过 reader fallback 放宽冻结快照语义。
 
 ## 接受的妥协（诚实记录）
 

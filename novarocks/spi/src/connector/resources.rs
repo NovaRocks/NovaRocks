@@ -160,6 +160,12 @@ impl ConnectorOutputMemoryToken {
         self.reservation.bytes()
     }
 
+    /// Release bytes that no longer back Arrow buffers while retaining the
+    /// same output owner for the remaining buffers.
+    pub fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+        self.reservation.shrink_to(bytes)
+    }
+
     pub fn into_reservation(self) -> ConnectorResourceReservation {
         self.reservation
     }

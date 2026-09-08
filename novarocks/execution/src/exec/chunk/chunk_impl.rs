@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Schema, SchemaRef};
 
 use crate::runtime::mem_tracker::MemTracker;
+use novarocks_spi::connector::ConnectorOutputMemoryToken;
 use novarocks_types::SlotId;
 
 use super::memory::{ChunkAccounting, ChunkMemoryLease, chunk_bytes_i64, record_batch_bytes};
@@ -36,6 +37,14 @@ pub struct Chunk {
     pub batch: RecordBatch,
     chunk_schema: ChunkSchemaRef,
     accounting: Option<Arc<ChunkAccounting>>,
+    /// A provider reservation that already charges the Arrow buffers in this
+    /// chunk to the admitted fragment hierarchy.
+    ///
+    /// The mutex makes the opaque SPI lease shareable with zero-copy `Chunk`
+    /// clones. While it is present, `transfer_to` must not create a second
+    /// charge for the same buffers. The last chunk owner releases the original
+    /// provider charge.
+    connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
 }
 
 impl Chunk {
@@ -51,6 +60,7 @@ impl Chunk {
             batch,
             chunk_schema,
             accounting: None,
+            connector_output_memory: None,
         })
     }
 
@@ -75,6 +85,7 @@ impl Chunk {
                 batch,
                 chunk_schema,
                 accounting: None,
+                connector_output_memory: None,
             });
         }
         let row_count = batch.num_rows();
@@ -85,6 +96,7 @@ impl Chunk {
             batch,
             chunk_schema,
             accounting: None,
+            connector_output_memory: None,
         })
     }
 
@@ -141,6 +153,7 @@ impl Chunk {
             batch: self.batch.slice(offset, length),
             chunk_schema: Arc::clone(&self.chunk_schema),
             accounting: None,
+            connector_output_memory: self.connector_output_memory.clone(),
         };
         if let Some(accounting) = self.accounting.as_ref() {
             let tracker = accounting.tracker();
@@ -170,6 +183,9 @@ impl Chunk {
             accounting.transfer_to(tracker);
             return;
         }
+        if self.connector_output_memory.is_some() {
+            return;
+        }
         let bytes = chunk_bytes_i64(&self.batch);
         if bytes <= 0 {
             return;
@@ -185,6 +201,9 @@ impl Chunk {
         if let Some(accounting) = self.accounting.as_ref() {
             return accounting.try_transfer_to(tracker);
         }
+        if self.connector_output_memory.is_some() {
+            return Ok(());
+        }
         let bytes = chunk_bytes_i64(&self.batch);
         if bytes <= 0 {
             return Ok(());
@@ -196,18 +215,40 @@ impl Chunk {
 
     #[cfg(test)]
     pub(crate) fn memory_lease(&self) -> Option<ChunkMemoryLease> {
-        self.accounting.as_ref().map(|accounting| ChunkMemoryLease {
-            accounting: Arc::clone(accounting),
-        })
+        self.accounting
+            .as_ref()
+            .map(|accounting| ChunkMemoryLease::native(Arc::clone(accounting)))
     }
 
     /// Moves this chunk's accounting owner without cloning it. Consumers that
     /// retain only a zero-copy projection can then split the projected bytes
     /// from the unprojected remainder exactly.
     pub(crate) fn take_memory_lease(&mut self) -> Option<ChunkMemoryLease> {
-        self.accounting
-            .take()
-            .map(|accounting| ChunkMemoryLease { accounting })
+        if let Some(accounting) = self.accounting.take() {
+            return Some(ChunkMemoryLease::native(accounting));
+        }
+        let output_memory = self.connector_output_memory.take()?;
+        if Arc::strong_count(&output_memory) == 1 {
+            return Some(ChunkMemoryLease::connector(output_memory));
+        }
+        // A clone or slice still owns the same provider reservation. Keep this
+        // chunk attached as well so the shared charge cannot disappear while
+        // either Arrow view remains live.
+        self.connector_output_memory = Some(output_memory);
+        None
+    }
+
+    /// Move an existing connector output reservation onto this chunk without
+    /// charging its Arrow buffers again.
+    pub(crate) fn attach_connector_output_memory(
+        &mut self,
+        output_memory: ConnectorOutputMemoryToken,
+    ) -> Result<(), String> {
+        if self.accounting.is_some() || self.connector_output_memory.is_some() {
+            return Err("chunk output memory already has an accounting owner".to_string());
+        }
+        self.connector_output_memory = Some(Arc::new(Mutex::new(output_memory)));
+        Ok(())
     }
 }
 
@@ -252,6 +293,7 @@ impl Default for Chunk {
             batch: RecordBatch::new_empty(Arc::new(Schema::empty())),
             chunk_schema: Arc::new(ChunkSchema::empty()),
             accounting: None,
+            connector_output_memory: None,
         }
     }
 }

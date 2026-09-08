@@ -3779,7 +3779,6 @@ dependencies = [
  "novarocks-connector-iceberg",
  "novarocks-connector-iceberg-functions",
  "novarocks-connector-paimon",
- "novarocks-connector-starrocks",
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-frontend",

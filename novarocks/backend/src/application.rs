@@ -16,6 +16,7 @@ use novarocks_proto_codec::membership::{
     BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
 };
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
+use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 
 use crate::BackendDataRuntime;
@@ -502,6 +503,7 @@ fn compose_backend_application_services(
     data_runtime: BackendDataRuntime,
     execution: BackendExecutionRuntimeInput,
     native_compatibility_id: NativeCompatibilityId,
+    native_transport_confidentiality: ConfidentialTransport,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
@@ -583,6 +585,7 @@ fn compose_backend_application_services(
     let task_execution_ingress: Arc<dyn TaskExecutionIngress> = RegistryTaskExecutionIngress::new(
         Arc::clone(&task_execution_registry),
         native_compatibility_id,
+        native_transport_confidentiality,
     );
     Ok(BackendApplicationServices {
         backend_process_id,
@@ -710,6 +713,7 @@ impl BackendApplicationHost {
             data_runtime,
             BackendExecutionRuntimeInput::new(execution_runtime_config, function_set),
             native_compatibility_id,
+            native_transport.confidentiality(),
             write_commit_evidence_limits,
             catalog_manager_config,
             &execution_role_binding_factories,
@@ -997,9 +1001,10 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendExecutionRuntimeInput, BackendServerConfig, QueryContextRef, TaskDeadlineTickTask,
-        TaskExecutionRegistryConfig, UnroutedQueryContextHost, UnroutedTaskExecutionHost,
-        combine_primary_and_shutdown, compose_backend_application_services,
+        BackendExecutionRuntimeInput, BackendServerConfig, ConfidentialTransport, QueryContextRef,
+        TaskDeadlineTickTask, TaskExecutionRegistryConfig, UnroutedQueryContextHost,
+        UnroutedTaskExecutionHost, combine_primary_and_shutdown,
+        compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
     use crate::rpc::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
@@ -1211,6 +1216,7 @@ mod tests {
                 test_execution_function_set(),
             ),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            ConfidentialTransport::Plaintext,
             WriteCommitEvidenceLimits::default(),
             crate::connector::catalog_manager::CatalogManagerConfig::default(),
             &[],

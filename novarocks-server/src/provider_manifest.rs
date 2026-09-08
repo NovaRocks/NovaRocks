@@ -60,6 +60,7 @@ struct SealedProviderBuilder {
     execution: ExecutionFactoryBuilder,
 }
 
+// Design: ADR-0139 (docs/adr/ADR-0139-sealed-active-provider-manifest.md)
 const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
     ProviderBuilderDefinition {
         contract: novarocks_connector_iceberg::iceberg_contract_definition,

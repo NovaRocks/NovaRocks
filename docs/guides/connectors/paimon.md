@@ -44,6 +44,18 @@ PROPERTIES (
   删除后的历史文件读取。
 - 数据文件必须是 Parquet。首期支持 uncompressed、Snappy、Zstd 和 LZ4 Raw。
 
+## 外部保留前提
+
+NovaRocks 冻结读取视图，但不会向 Paimon 写入 tag、consumer 状态或任何保留租约，
+因此它不拥有 snapshot、manifest、schema 与数据文件的 GC/expiration 决策。外部
+Paimon writer/maintenance 的保留窗口必须覆盖 NovaRocks 最长查询时长，并留出任务
+排队、重试及运维时钟偏差的余量。在途查询所引用的对象若被外部清理，查询会明确
+失败；它不会切换到 latest snapshot、返回部分结果，或把缺失对象当成空表。
+
+调整 snapshot expiration 或 orphan cleanup 前，运维方必须确认没有仍可能读取目标
+snapshot 的 NovaRocks 查询。需要跨系统保证长查询不受 GC 影响时，应由外部 Paimon
+治理建立可验证的保留策略；PAI-1 不提供此类写侧租约。
+
 ## 明确不支持的能力
 
 Paimon Catalog 是只读的。`INSERT`、Paimon 表 DDL、`ALTER TABLE ... OPTIMIZE` 和

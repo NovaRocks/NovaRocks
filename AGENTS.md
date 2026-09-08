@@ -44,10 +44,13 @@ Its production runtime is the native NovaRocks FE/BE role model:
     config and one normal BE config. It preserves the FE/BE application
     boundary and is not an application role or separate production topology.
 
-- **StarRocks external Connector**
-  - StarRocks is read-only external data, never an inbound server protocol.
-  - RPC reads support every topology; direct reads permanently require
-    shared-data.
+- **Sealed external Connector providers**
+  - The active Server provider manifest contains exactly Iceberg and Paimon.
+  - Paimon is read-only for append-only and `deduplicate` primary-key snapshot
+    reads. Iceberg retains its existing read/write capabilities.
+  - StarRocks is retired: its source remains for reference, but it has no active
+    read capability and `[connector.starrocks]` is rejected at configuration
+    parsing.
 
 Columnar processing is centered on Arrow `RecordBatch` / `Chunk`.
 
@@ -274,12 +277,15 @@ SQL client
   Connector admission and local-catalog snapshots remain application-owned.
 
 - `novarocks/connector/starrocks/**`
-  Read-only StarRocks external Connector. It owns RPC remote reads for every
-  topology and shared-data-only direct reads; it does not depend on Core,
-  Frontend, Backend, Compat, or an Iceberg provider.
+  Retired reference implementation. It is not registered by the Server
+  provider manifest and provides no active product read capability.
 
 - `novarocks/connector/iceberg/**`
   Iceberg control/execution contracts, catalog integrations, and storage facts.
+
+- `novarocks/connector/paimon/**`
+  Read-only Paimon Filesystem Catalog, private wire codec, snapshot planning,
+  and append-only / `deduplicate` primary-key table reads.
 
 - `novarocks/fs/**`
   Connector-neutral authorized object-store access.
@@ -295,7 +301,8 @@ SQL client
 2. The frontend owns session admission, catalog resolution, planning, and
    coordinator lifecycle assembly.
 3. Persistent tables belong to external providers. Iceberg owns its catalog and
-   mutation truth; StarRocks is a read-only external Connector.
+   mutation truth; Paimon owns its external snapshots and exposes only its
+   supported read capability.
 4. The frontend freezes native fragment and Connector facts, then sends them to
    one or more `role=be` processes through native gRPC.
 5. BE hosts bind installed Connector execution instances and run Arrow batches
@@ -425,8 +432,8 @@ SQL client
   `mysql_port`, `user`, MV scheduler settings, and Iceberg maintenance settings.
 
 - `[connector.object_store]`
-  Process-local object-store credentials for connector execution; this does
-  not define a native internal table store.
+  Process-local object-store credentials for Iceberg and Paimon connector
+  execution; this does not define a native internal table store.
 
 - `[debug]`
   `exec_node_output`, `exec_batch_plan_json`
@@ -709,8 +716,9 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   Conflict verdict; do not add a protocol shim, a standalone direct-call path,
   or a no-runtime-filter retry inside an attempt. See ADR-0135.
 - **Connector behavior**: inspect `novarocks/connector/**` and
-  `novarocks/fs/**`. StarRocks is a read-only external Connector, not a native
-  internal-table catalog or a server protocol.
+  `novarocks/fs/**`. The active sealed providers are Iceberg and Paimon;
+  StarRocks is retired and must not be restored through a local-binding config
+  or runtime fallback.
 - **FE/BE interface behavior**: inspect `novarocks/frontend/src/**`,
   `novarocks/backend/src/**`, and the neutral contracts under `novarocks/spi/**`.
 - **Optimizer observability / plan-shape regression**: see

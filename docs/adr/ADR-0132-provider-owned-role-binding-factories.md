@@ -2,9 +2,9 @@
 id: ADR-0132
 title: "Providers own role-binding factories while Server composes local resources"
 domain: [provider-spi, runtime-role]
-status: active
+status: superseded
 supersedes: [ADR-0131]
-superseded-by: null
+superseded-by: ADR-0139
 date: 2026-09-01
 provenance:
   - "discussion: 2026-09-01 StarRocks provider-owned role-binding symmetry"

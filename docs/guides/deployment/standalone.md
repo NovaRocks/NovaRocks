@@ -48,7 +48,8 @@ FE 配置必须包括：
 - BE 会向 FE Native gRPC endpoint 自注册；`[cluster].backends` 不是 deployment 配置。
 
 BE 配置必须包括自身不同的 Native gRPC 与 management HTTP 端口，以及本地
-connector object-store binding。两份配置在同一进程共享 logging 与 data-runtime
+connector object-store binding。Paimon 查询要求 FE 与 BE 的 binding 指向同一
+warehouse 访问域。两份配置在同一进程共享 logging 与 data-runtime
 sizing，其他 role-local 字段各自生效。
 
 `all-in-one` 不共享或绕过 Native trust：Server 仍分别为 FE 与 BE 构造 role-scoped
@@ -108,6 +109,10 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
 
 该 fixture 为当前工作区生成一对正常 FE/BE 配置和四个不冲突 listener port；不要
 猜测端口或重用旧的 standalone config 环境变量。
+
+Paimon 本地 fixture 和支持矩阵见 [Paimon 只读 Connector](../connectors/paimon.md)。
+当前 Server 的封闭 provider 集合只有 Iceberg 与 Paimon；旧
+`[connector.starrocks]` 配置会在解析阶段明确失败。
 
 ## 停止与排障
 

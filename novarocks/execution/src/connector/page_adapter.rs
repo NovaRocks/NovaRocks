@@ -294,16 +294,18 @@ fn convert_page(
         ));
     }
 
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(slot_ids.len());
-    for index in 0..slot_ids.len() {
-        // Materialization happens here and only here: a lazy channel the output
-        // does not bind is never loaded, and a bound one is loaded once.
-        let column = page
-            .block(index)
-            .map_err(|error| {
-                PageAdapterError::from_connector(error, "connector page channel materialization")
-            })?
-            .clone();
+    // Discard provider working channels before extracting the page so an
+    // unbound lazy channel is never materialized. The accounted extraction
+    // moves the provider reservation together with the visible Arrow buffers.
+    page.truncate_channels(slot_ids.len()).map_err(|error| {
+        PageAdapterError::from_connector(error, "connector page channel projection")
+    })?;
+    let (extracted_positions, columns, output_memory) =
+        page.into_accounted_columns().map_err(|error| {
+            PageAdapterError::from_connector(error, "connector page channel materialization")
+        })?;
+    debug_assert_eq!(positions, extracted_positions);
+    for (index, column) in columns.iter().enumerate() {
         if column.len() != positions {
             return Err(PageAdapterError::new(
                 PageAdapterErrorKind::PositionMismatch,
@@ -313,7 +315,6 @@ fn convert_page(
                 ),
             ));
         }
-        columns.push(column);
     }
 
     let schema = chunk_schema_for(slot_ids, &columns, schema_cache)?;
@@ -333,8 +334,14 @@ fn convert_page(
         )
     })?;
 
-    Chunk::try_new_with_chunk_schema(batch, schema)
-        .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))
+    let mut chunk = Chunk::try_new_with_chunk_schema(batch, schema)
+        .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
+    if let Some(output_memory) = output_memory {
+        chunk
+            .attach_connector_output_memory(output_memory)
+            .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
+    }
+    Ok(chunk)
 }
 
 fn chunk_schema_for(
@@ -375,11 +382,14 @@ fn chunk_schema_for(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use arrow::array::{Array, Int64Array};
     use novarocks_spi::connector::read_stack::LazyBlockLoader;
-    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorRequestResources, ConnectorResourceCheckpoint,
+        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    };
 
     use super::*;
 
@@ -387,6 +397,60 @@ mod tests {
     struct CountingLoader {
         loads: Arc<AtomicUsize>,
         values: Vec<i64>,
+    }
+
+    struct OutputLedger {
+        retained: Arc<AtomicU64>,
+    }
+
+    impl ConnectorResourceLedger for OutputLedger {
+        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+            Ok(ConnectorResourceCheckpoint::new(0))
+        }
+
+        fn try_reserve(
+            &self,
+            class: ConnectorResourceClass,
+            bytes: u64,
+        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+            assert_eq!(class, ConnectorResourceClass::ReaderOutput);
+            self.retained.fetch_add(bytes, Ordering::AcqRel);
+            Ok(Box::new(OutputLease {
+                retained: Arc::clone(&self.retained),
+                bytes,
+            }))
+        }
+    }
+
+    struct OutputLease {
+        retained: Arc<AtomicU64>,
+        bytes: u64,
+    }
+
+    impl ConnectorResourceLease for OutputLease {
+        fn bytes(&self) -> u64 {
+            self.bytes
+        }
+
+        fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+            self.retained.fetch_add(additional, Ordering::AcqRel);
+            self.bytes += additional;
+            Ok(())
+        }
+
+        fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+            assert!(bytes <= self.bytes);
+            self.retained
+                .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+            self.bytes = bytes;
+            Ok(())
+        }
+    }
+
+    impl Drop for OutputLease {
+        fn drop(&mut self) {
+            self.retained.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
     }
 
     impl LazyBlockLoader for CountingLoader {
@@ -499,6 +563,40 @@ mod tests {
         assert_eq!(chunk.columns().len(), 0);
         // It is a real result, never end of stream.
         assert!(!chunk.is_empty());
+    }
+
+    #[test]
+    fn accounted_page_moves_one_existing_charge_to_the_chunk() {
+        let retained = Arc::new(AtomicU64::new(0));
+        let resources = ConnectorRequestResources::new(Arc::new(OutputLedger {
+            retained: Arc::clone(&retained),
+        }));
+        let column: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
+        let bytes = column.get_array_memory_size() as u64;
+        let output_memory = resources
+            .try_reserve(ConnectorResourceClass::ReaderOutput, bytes)
+            .expect("reserve provider output")
+            .into_output(bytes)
+            .expect("freeze provider output charge");
+        let page = SourcePage::try_new_accounted(3, vec![column], output_memory)
+            .expect("accounted source page");
+        let (mut adapter, _) = adapter(vec![SlotId::new(1)], vec![Some(page)]);
+        let tracker = MemTracker::new_root("converted connector chunk");
+        adapter.attach_mem_tracker(Arc::clone(&tracker));
+
+        let chunk = match adapter.pull().expect("convert accounted page") {
+            PageConversion::Chunk(chunk) => chunk,
+            PageConversion::Idle | PageConversion::Finished => panic!("expected a chunk"),
+        };
+        assert_eq!(retained.load(Ordering::Acquire), bytes);
+        assert_eq!(tracker.current(), 0, "the page must not be charged twice");
+
+        let shared = chunk.clone();
+        drop(chunk);
+        assert_eq!(retained.load(Ordering::Acquire), bytes);
+        drop(shared);
+        assert_eq!(retained.load(Ordering::Acquire), 0);
+        assert_eq!(tracker.current(), 0);
     }
 
     #[test]

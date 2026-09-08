@@ -608,13 +608,20 @@ impl ProcessorOperator for TableWriterOperator {
             let batch = projected.batch.clone();
             let retained_bytes = record_batch_bytes(&batch);
             let additional_bytes = record_batch_additional_bytes(&batch, &chunk.batch);
+            let connector_retained_bytes =
+                crate::exec::chunk::record_batch_shared_owner_bytes(&batch, &chunk.batch);
             let accounting = chunk.take_memory_lease();
             let reservation = self.writer.try_reserve_input(
                 batch.num_rows(),
                 retained_bytes,
                 accounting,
+                connector_retained_bytes,
                 additional_bytes,
             )?;
+            // The writer reservation now owns every retained input charge.
+            // Drop the source view before it releases any unshared connector
+            // bytes, so accounting never leaves live source buffers ownerless.
+            drop(chunk);
             if let Some(partial) = self.partial_aggregate.as_mut() {
                 #[cfg(debug_assertions)]
                 self.aggregate_guard
@@ -627,7 +634,7 @@ impl ProcessorOperator for TableWriterOperator {
                     .push_chunk(state, projected)
                     .map_err(|error| format!("update writer partial aggregate: {error}"))?;
             }
-            reservation.send(batch);
+            reservation.send(batch)?;
             self.logical_rows = next_rows;
             Ok(())
         })();

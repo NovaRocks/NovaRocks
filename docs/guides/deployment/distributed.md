@@ -21,7 +21,7 @@ under the License.
 
 分布式部署使用 NovaRocks native 角色能力，将协调节点和计算节点拆分为不同进程。FE 角色提供 MySQL 入口、SQL 解析、优化和 fragment 调度；BE 角色提供 NovaRocks gRPC 后端服务并执行 fragment。
 
-该模式不依赖 StarRocks FE。StarRocks 数据只通过只读 external Connector 接入：RPC 支持所有拓扑，direct 永久只支持 shared-data。
+该模式不依赖 StarRocks FE。当前 Server 只封装 Iceberg 与 Paimon provider；StarRocks 已废弃，没有 active read capability，旧 `[connector.starrocks]` 配置会在启动解析阶段明确失败。
 
 ## 部署拓扑
 
@@ -61,7 +61,7 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 
 ## 编译 NovaRocks
 
-分布式部署使用 NovaRocks native runtime，不依赖 StarRocks FE。FE 角色和 BE 角色使用同一个 NovaRocks 二进制文件，建议构建 release 二进制后分发到所有节点。
+分布式部署使用 NovaRocks native runtime。FE 角色和 BE 角色使用同一个 NovaRocks 二进制文件，且必须包含一致的 Iceberg/Paimon 私有 descriptor 与 revision；建议构建同一 release 二进制后分发到所有节点。
 
 推荐构建命令：
 
@@ -128,8 +128,9 @@ NOVAROCKS_READY role=be grpc_port=9080 advertise_host=10.0.0.11 pid=<pid>
 
 `role=be` 不提供 MySQL 端口，`--port` 参数对 BE 无效。
 
-`[connector.object_store]` 是 native connector 读取 Iceberg/S3 数据时使用的
-BE 本地启动配置。所有参与同一集群的 BE 必须使用同一组值；native fragment
+`[connector.object_store]` 是 native connector 读取 Iceberg 或 Paimon/S3 数据时使用的
+role-local 启动配置。所有参与同一集群的 FE/BE 必须把同一 credential binding
+解析到相同访问域；native fragment
 只携带文件、split 和 catalog 标识，不会携带 endpoint 或凭据。运行期通过 SQL
 创建但只存在于 FE 内存中的 catalog 配置不能作为 distributed native read 的
 凭据来源。
@@ -191,8 +192,8 @@ backend_announce_lease_ttl_ms = 5000
 使 `[state_store]` 成为该 authority 的 durable carrier；StaticFile deployment 仍可配置 SQLite
 作为可重建 Accelerator carrier，但必须只从 static snapshot 读取 catalog truth。membership 只是
 可重建的内存投影：FE 重启后由仍在运行的 BE renew announce 重建。不得添加第二套 metadata store、seed
-或内存 fallback。持久用户表属于 external Iceberg catalog；`[connector.object_store]` 只提供
-connector execution 的进程本地凭据。
+或内存 fallback。持久用户表属于 external Iceberg 或 Paimon catalog；只有 Iceberg 当前支持
+native 写入。`[connector.object_store]` 只提供 connector execution 的进程本地凭据。
 
 启动 FE：
 
@@ -247,7 +248,7 @@ SHOW BACKENDS;
 SELECT 1;
 ```
 
-如果集群连接了 external Iceberg catalog，再执行一条真实表查询，确认 FE 调度、BE 执行和外部存储访问均可用。
+如果集群连接了 external Iceberg 或 Paimon catalog，再执行一条真实表查询，确认 FE 调度、BE 执行和外部存储访问均可用。Paimon 查询还要求外部 GC/expiration 的保留窗口覆盖最长查询时长，详见 [Paimon 只读 Connector](../connectors/paimon.md)。
 
 ## 配置与管理 BE
 
