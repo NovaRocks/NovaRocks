@@ -4190,7 +4190,9 @@ dependencies = [
  "novarocks-types",
  "novarocks-version",
  "prost 0.13.5",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tonic",
 ]

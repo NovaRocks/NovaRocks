@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "purpose": "smoke",
+  "short": {
+    "queries": ["SELECT SUM(i) FROM TABLE(generate_series(1, 100)) AS t(i)"],
+    "plan_contains": [],
+    "windows": [
+      {"concurrency": 1, "duration_ms": 250, "warmup_ms": 25},
+      {"concurrency": 2, "duration_ms": 250, "warmup_ms": 25}
+    ]
+  },
+  "mixed": {
+    "foreground_sql": "SELECT COUNT(*) FROM TABLE(generate_series(1, 100)) AS t(i)",
+    "foreground_clients": 2,
+    "duration_ms": 300,
+    "producers": [
+      {
+        "kind": "mv-refresh",
+        "statements": ["SELECT 1"],
+        "completion_query": "SELECT 1",
+        "minimum_completions": 1
+      },
+      {
+        "kind": "statistics",
+        "statements": ["SELECT 1"],
+        "completion_query": "SELECT 1",
+        "minimum_completions": 1
+      },
+      {
+        "kind": "maintenance",
+        "statements": ["SELECT 1"],
+        "completion_query": "SELECT 1",
+        "minimum_completions": 1
+      }
+    ]
+  },
+  "slow_output": {
+    "query": "SELECT i, repeat('x', 1024) FROM TABLE(generate_series(1, 10000)) AS t(i)",
+    "bytes_per_interval": 4096,
+    "interval_ms": 20,
+    "duration_ms": 300
+  }
+}

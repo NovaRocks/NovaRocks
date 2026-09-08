@@ -25,6 +25,7 @@ use crate::config::{
 use crate::{Cli, Mode, RecordFrom, run_cli};
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser};
+use novarocks_cluster_harness::LaunchProfile;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -327,8 +328,7 @@ fn run_workload_protocol(
         benchmark.backend_count,
         base_dir,
         runner_config,
-        false,
-        false,
+        LaunchProfile::Performance,
     )?;
     let target = BenchmarkClusterTarget {
         host: server.target_host().unwrap_or("127.0.0.1").to_owned(),

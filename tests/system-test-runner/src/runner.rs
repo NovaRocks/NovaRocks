@@ -84,8 +84,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         base_config_path: config.base_config_path.clone(),
         runtime_root: scenario_root.clone(),
         cluster_size: config.cluster_size,
-        query_lifecycle_faults_enabled: true,
-        cleanup_faults_enabled: true,
+        launch_profile: config.launch_profile,
         startup_timeout: config.timeout,
         child_environment: launch_config.child_environment,
         config_overlay: launch_config.config_overlay,
@@ -113,6 +112,8 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         config.other_island_binary.clone(),
         config.base_config_path.clone(),
         config.cluster_size,
+        config.launch_profile,
+        config.uea1_workload_manifest.clone(),
     );
     context.action("cluster launched and topology barrier passed");
     let result = scenario.run(&mut context);

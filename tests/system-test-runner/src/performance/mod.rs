@@ -15,17 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod actors;
-mod cli;
-mod config;
-mod performance;
-mod runner;
-pub mod scenario;
-mod scenarios;
+mod controller;
+mod manifest;
+mod metrics;
 
-fn main() {
-    if let Err(error) = cli::Cli::parse_env().and_then(runner::run) {
-        eprintln!("system scenario runner failed: {error:#}");
-        std::process::exit(1);
-    }
-}
+pub use controller::{PerformanceScenario, run};
+pub use manifest::Uea1WorkloadManifest;

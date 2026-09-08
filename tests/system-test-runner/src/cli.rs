@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use novarocks_cluster_harness::LaunchProfile;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,8 +13,9 @@ pub struct Cli {
     pub artifact_root: Option<PathBuf>,
     pub cluster_size: usize,
     pub timeout_secs: u64,
+    pub launch_profile: LaunchProfile,
+    pub uea1_workload_manifest: Option<PathBuf>,
 }
-
 impl Cli {
     pub fn parse_env() -> Result<Self> {
         Self::parse(std::env::args().skip(1))
@@ -30,6 +32,8 @@ impl Cli {
             artifact_root: None,
             cluster_size: 3,
             timeout_secs: 300,
+            launch_profile: LaunchProfile::FaultScenario,
+            uea1_workload_manifest: None,
         };
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -62,6 +66,15 @@ impl Cli {
                         anyhow::anyhow!("--timeout-secs must be a positive integer")
                     })?;
                 }
+                "--launch-profile" => {
+                    cli.launch_profile = value("--launch-profile")?
+                        .parse()
+                        .map_err(anyhow::Error::msg)?;
+                }
+                "--uea1-workload-manifest" => {
+                    cli.uea1_workload_manifest =
+                        Some(PathBuf::from(value("--uea1-workload-manifest")?));
+                }
                 "--help" | "-h" => bail!(Self::usage()),
                 _ => bail!("unknown option {argument}\n{}", Self::usage()),
             }
@@ -76,7 +89,14 @@ impl Cli {
     }
 
     pub const fn usage() -> &'static str {
-        "usage: novarocks-system-tests [--list] [--only <exact-name>]... \\\n+         [--binary <path> [--compatible-binary <path>] [--other-island-binary <path>] \\\n+          --config <path> --artifact-root <path>] \\\n+         [--cluster-size <N>] [--timeout-secs <N>]"
+        concat!(
+            "usage: novarocks-system-tests [--list] [--only <exact-name>]... ",
+            "[--binary <path> [--compatible-binary <path>] ",
+            "[--other-island-binary <path>] --config <path> ",
+            "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] ",
+            "[--launch-profile <fault-scenario|performance>] ",
+            "[--uea1-workload-manifest <path>]"
+        )
     }
 }
 
@@ -89,6 +109,7 @@ mod tests {
         let cli = Cli::parse(Vec::new()).expect("parse defaults");
         assert_eq!(cli.cluster_size, 3);
         assert_eq!(cli.timeout_secs, 300);
+        assert_eq!(cli.launch_profile, LaunchProfile::FaultScenario);
     }
 
     #[test]
@@ -119,6 +140,22 @@ mod tests {
         assert_eq!(
             cli.other_island_binary,
             Some(PathBuf::from("/tmp/other-island"))
+        );
+    }
+
+    #[test]
+    fn parses_performance_profile_and_manifest() {
+        let cli = Cli::parse(vec![
+            "--launch-profile".to_string(),
+            "performance".to_string(),
+            "--uea1-workload-manifest".to_string(),
+            "/tmp/workloads.json".to_string(),
+        ])
+        .expect("parse performance inputs");
+        assert_eq!(cli.launch_profile, LaunchProfile::Performance);
+        assert_eq!(
+            cli.uea1_workload_manifest,
+            Some(PathBuf::from("/tmp/workloads.json"))
         );
     }
 }

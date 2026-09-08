@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessServerHandle,
-    NativeTrustFixture, ServerHandle,
+    LaunchProfile, NativeTrustFixture, ServerHandle,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -79,6 +79,8 @@ pub struct ScenarioContext {
     base_config_path: PathBuf,
     cluster_size: usize,
     startup_timeout: Duration,
+    launch_profile: LaunchProfile,
+    uea1_workload_manifest: Option<PathBuf>,
 }
 
 impl ScenarioContext {
@@ -92,6 +94,8 @@ impl ScenarioContext {
         other_island_binary: Option<PathBuf>,
         base_config_path: PathBuf,
         cluster_size: usize,
+        launch_profile: LaunchProfile,
+        uea1_workload_manifest: Option<PathBuf>,
     ) -> Self {
         Self {
             name,
@@ -105,6 +109,8 @@ impl ScenarioContext {
             base_config_path,
             cluster_size,
             startup_timeout: timeout,
+            launch_profile,
+            uea1_workload_manifest,
         }
     }
 
@@ -114,6 +120,10 @@ impl ScenarioContext {
 
     pub fn handle(&mut self) -> &mut CrossProcessServerHandle {
         &mut self.handle
+    }
+
+    pub fn process_ids(&self) -> novarocks_cluster_harness::process_resources::ClusterProcessIds {
+        self.handle.process_ids()
     }
 
     pub fn mysql_port(&self) -> u16 {
@@ -150,6 +160,14 @@ impl ScenarioContext {
 
     pub fn scenario_root(&self) -> &Path {
         &self.scenario_root
+    }
+
+    pub fn launch_profile(&self) -> LaunchProfile {
+        self.launch_profile
+    }
+
+    pub fn uea1_workload_manifest(&self) -> Option<&Path> {
+        self.uea1_workload_manifest.as_deref()
     }
 
     pub fn diagnostics(&self) -> String {
@@ -197,8 +215,7 @@ impl ScenarioContext {
             base_config_path: self.base_config_path.clone(),
             runtime_root,
             cluster_size: self.cluster_size,
-            query_lifecycle_faults_enabled: true,
-            cleanup_faults_enabled: true,
+            launch_profile: self.launch_profile,
             startup_timeout: self.startup_timeout,
             child_environment: launch_config.child_environment,
             config_overlay: launch_config.config_overlay,

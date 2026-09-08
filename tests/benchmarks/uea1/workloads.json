@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "purpose": "formal",
+  "short": {
+    "queries": [
+      "SELECT SUM(i) FROM TABLE(generate_series(1, 1000)) AS t(i)",
+      "SELECT COUNT(*) FROM TABLE(generate_series(1, 1000)) AS t(i) WHERE i % 7 = 0"
+    ],
+    "plan_contains": ["Physical"],
+    "windows": [
+      {"concurrency": 1, "duration_ms": 120000, "warmup_ms": 5000},
+      {"concurrency": 8, "duration_ms": 120000, "warmup_ms": 5000},
+      {"concurrency": 32, "duration_ms": 120000, "warmup_ms": 5000}
+    ]
+  },
+  "mixed": {
+    "foreground_sql": "SELECT COUNT(*) FROM uea1_perf.default.foreground",
+    "foreground_clients": 8,
+    "duration_ms": 120000,
+    "producers": [
+      {
+        "kind": "mv-refresh",
+        "statements": ["REFRESH MATERIALIZED VIEW uea1_perf.default.foreground_mv WITH SYNC MODE"],
+        "completion_query": "SELECT COUNT(*) FROM uea1_perf.default.foreground_mv",
+        "minimum_completions": 1
+      },
+      {
+        "kind": "statistics",
+        "statements": ["ANALYZE TABLE uea1_perf.default.foreground"],
+        "completion_query": "SELECT COUNT(*) FROM uea1_perf.default.foreground",
+        "minimum_completions": 1
+      },
+      {
+        "kind": "maintenance",
+        "statements": ["OPTIMIZE TABLE uea1_perf.default.foreground"],
+        "completion_query": "SELECT COUNT(*) FROM uea1_perf.default.foreground",
+        "minimum_completions": 1
+      }
+    ]
+  },
+  "slow_output": {
+    "query": "SELECT i, repeat('x', 1024) FROM TABLE(generate_series(1, 1000000)) AS t(i)",
+    "bytes_per_interval": 65536,
+    "interval_ms": 100,
+    "duration_ms": 120000
+  }
+}

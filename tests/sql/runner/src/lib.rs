@@ -4481,6 +4481,14 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         )?;
     let cleanup_faults_enabled = !cli.dry_run
         && selected_cases_require_cleanup_faults(&cli, &suite_names, &suite_configs, &base_dir)?;
+    let launch_profile = if lane == TestLane::Benchmark
+        && !query_lifecycle_faults_enabled
+        && !cleanup_faults_enabled
+    {
+        novarocks_cluster_harness::LaunchProfile::Performance
+    } else {
+        novarocks_cluster_harness::LaunchProfile::FaultScenario
+    };
 
     let launch_cluster_mode = if cli.dry_run {
         ClusterMode::AllInOne
@@ -4503,8 +4511,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
             1,
             &base_dir,
             &runner_config,
-            false,
-            false,
+            launch_profile,
         )?
     } else {
         launch_server(
@@ -4512,8 +4519,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
             launch_cluster_size,
             &base_dir,
             &runner_config,
-            query_lifecycle_faults_enabled,
-            cleanup_faults_enabled,
+            launch_profile,
         )?
     };
     let launched_target_port = server_handle.target_port();

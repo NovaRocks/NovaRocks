@@ -17,6 +17,8 @@
 
 pub mod isolated_iceberg_rest;
 pub mod loopback_s3;
+pub mod native_fault_proxy;
+pub mod process_resources;
 pub mod vended_rest_catalog;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -658,6 +660,33 @@ pub struct CrossProcessConfigOverlay {
 ///
 /// Consumers resolve environment and runner-specific configuration before
 /// constructing this value. The harness owns only the distributed runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LaunchProfile {
+    #[default]
+    FaultScenario,
+    Performance,
+}
+
+impl LaunchProfile {
+    fn enables_faults(self) -> bool {
+        matches!(self, Self::FaultScenario)
+    }
+}
+
+impl std::str::FromStr for LaunchProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "fault-scenario" => Ok(Self::FaultScenario),
+            "performance" => Ok(Self::Performance),
+            _ => Err(format!(
+                "invalid launch profile {value}; expected fault-scenario or performance"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CrossProcessClusterOptions {
     pub binary: PathBuf,
@@ -672,8 +701,7 @@ pub struct CrossProcessClusterOptions {
     pub base_config_path: PathBuf,
     pub runtime_root: PathBuf,
     pub cluster_size: usize,
-    pub query_lifecycle_faults_enabled: bool,
-    pub cleanup_faults_enabled: bool,
+    pub launch_profile: LaunchProfile,
     pub startup_timeout: Duration,
     pub child_environment: CrossProcessChildEnvironment,
     pub config_overlay: CrossProcessConfigOverlay,
@@ -2796,6 +2824,7 @@ pub struct CrossProcessServerHandle {
     query_lifecycle_faults_enabled: bool,
     cleanup_fault_files: Option<CleanupFaultFiles>,
     cleanup_faults_enabled: bool,
+    launch_profile: LaunchProfile,
     runtime_dir: PathBuf,
     runtime: CrossProcessRuntime,
     native_trust_fixture: PreparedNativeTrustFixture,
@@ -2854,13 +2883,14 @@ impl CrossProcessServerHandle {
             base_config_path,
             runtime_root,
             cluster_size,
-            query_lifecycle_faults_enabled,
-            cleanup_faults_enabled,
+            launch_profile,
             startup_timeout,
             child_environment,
             config_overlay,
             native_trust_fixture,
         } = options;
+        let query_lifecycle_faults_enabled = launch_profile.enables_faults();
+        let cleanup_faults_enabled = launch_profile.enables_faults();
         let fe_binary = fe_binary.unwrap_or_else(|| novarocks_bin.clone());
         let be_binaries = if be_binaries.is_empty() {
             vec![novarocks_bin; cluster_size]
@@ -3011,6 +3041,7 @@ impl CrossProcessServerHandle {
                 .then_some((query_lifecycle_fault_files.root(), None)),
             cleanup_fault_dir: cleanup_fault_files.as_ref().map(CleanupFaultFiles::root),
             child_environment: &fe_environment,
+            launch_profile,
         })?;
         println!(
             "started cross-process FE pid={} mysql_port={} config={}",
@@ -3042,6 +3073,7 @@ impl CrossProcessServerHandle {
                     .then_some((query_lifecycle_fault_files.root(), Some(i))),
                 cleanup_fault_dir: None,
                 child_environment: &be_environments[i],
+                launch_profile,
             })?;
             println!(
                 "started cross-process BE[{i}] pid={} grpc_port={} config={}",
@@ -3081,6 +3113,7 @@ impl CrossProcessServerHandle {
             query_lifecycle_faults_enabled,
             cleanup_fault_files,
             cleanup_faults_enabled,
+            launch_profile,
             runtime_dir: runtime_dir.into_path(),
             runtime,
             native_trust_fixture,
@@ -3104,6 +3137,14 @@ impl CrossProcessServerHandle {
     /// Frozen runtime ports and endpoints for this launched cluster.
     pub fn runtime(&self) -> &CrossProcessRuntime {
         &self.runtime
+    }
+
+    /// Operating-system process identifiers owned by this ephemeral cluster.
+    pub fn process_ids(&self) -> process_resources::ClusterProcessIds {
+        process_resources::ClusterProcessIds {
+            frontend: self.fe_process.pid(),
+            backends: self.be_processes.iter().map(ManagedProcess::pid).collect(),
+        }
     }
 
     /// Read the frontend's current `SHOW BACKENDS` projection without changing
@@ -3946,7 +3987,8 @@ impl ServerHandle for CrossProcessServerHandle {
             .be_binaries
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("missing binary for cross-process BE[{index}]"))?;
-        let mut command = build_novarocks_command(binary, "be", &config_path);
+        let mut command =
+            build_novarocks_command_with_profile(binary, "be", &config_path, self.launch_profile);
         command.env(
             "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
             &self.fragment_failure_trigger_paths[index],
@@ -3963,6 +4005,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 );
         }
         apply_child_environment(&mut command, &self.be_environments[index]);
+        apply_launch_profile(&mut command, self.launch_profile);
         let log_path = self.runtime_dir.join(format!("be_{index}.log"));
         let be_process = self
             .be_processes
@@ -4100,7 +4143,12 @@ impl ServerHandle for CrossProcessServerHandle {
             .context("preserve cross-process FE log before restart")?;
         self.fe_log_history.push_str(&prior_log);
         let marker = "NOVAROCKS_READY mysql_port=";
-        let mut command = build_novarocks_command(&self.fe_binary, "fe", &self.fe_config_path);
+        let mut command = build_novarocks_command_with_profile(
+            &self.fe_binary,
+            "fe",
+            &self.fe_config_path,
+            self.launch_profile,
+        );
         if self.query_lifecycle_faults_enabled {
             command.env(
                 novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
@@ -4115,6 +4163,7 @@ impl ServerHandle for CrossProcessServerHandle {
             command.env(novarocks_failpoint::CLEANUP_FAULT_DIR_ENV, files.root());
         }
         apply_child_environment(&mut command, &self.fe_environment);
+        apply_launch_profile(&mut command, self.launch_profile);
         self.fe_process
             .restart(
                 command,
@@ -4263,6 +4312,15 @@ fn process_runtime_diagnostics_with_drained_backends(
 }
 
 pub fn build_novarocks_command(binary: &Path, role: &str, config_path: &Path) -> Command {
+    build_novarocks_command_with_profile(binary, role, config_path, LaunchProfile::FaultScenario)
+}
+
+fn build_novarocks_command_with_profile(
+    binary: &Path,
+    role: &str,
+    config_path: &Path,
+    launch_profile: LaunchProfile,
+) -> Command {
     let mut command = Command::new(binary);
     command
         .arg("standalone")
@@ -4271,18 +4329,37 @@ pub fn build_novarocks_command(binary: &Path, role: &str, config_path: &Path) ->
         .arg("--config")
         .arg(config_path)
         .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Cross-process SQL fixtures own both process logs, so debug harnesses
     // enable the bounded connector scan and write lifecycle markers used for
     // structural evidence. Release servers reject these debug-only environment
     // variables.
-    if cfg!(debug_assertions) {
+    if cfg!(debug_assertions) && launch_profile == LaunchProfile::FaultScenario {
         command.env("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1");
         command.env("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER", "1");
     }
+    apply_launch_profile(&mut command, launch_profile);
     command
+}
+
+fn apply_launch_profile(command: &mut Command, launch_profile: LaunchProfile) {
+    const TEST_ENVIRONMENT: &[&str] = &[
+        "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD",
+        "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER",
+        "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER",
+        "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
+        "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
+    ];
+    if launch_profile == LaunchProfile::FaultScenario {
+        command.env("NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD", "1");
+        return;
+    }
+    for name in TEST_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    command.env_remove(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV);
+    command.env_remove(novarocks_failpoint::CLEANUP_FAULT_DIR_ENV);
 }
 
 struct ProcessLaunch<'a> {
@@ -4296,6 +4373,7 @@ struct ProcessLaunch<'a> {
     query_lifecycle_fault_scope: Option<(&'a Path, Option<usize>)>,
     cleanup_fault_dir: Option<&'a Path>,
     child_environment: &'a BTreeMap<String, String>,
+    launch_profile: LaunchProfile,
 }
 
 fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> {
@@ -4310,8 +4388,10 @@ fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> 
         query_lifecycle_fault_scope,
         cleanup_fault_dir,
         child_environment,
+        launch_profile,
     } = launch;
-    let mut command = build_novarocks_command(binary, role, config_path);
+    let mut command =
+        build_novarocks_command_with_profile(binary, role, config_path, launch_profile);
     if let Some(trigger_path) = fragment_failure_trigger {
         command.env(
             "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
@@ -4334,6 +4414,7 @@ fn spawn_novarocks_process(launch: ProcessLaunch<'_>) -> Result<ManagedProcess> 
         command.env(novarocks_failpoint::CLEANUP_FAULT_DIR_ENV, fault_dir);
     }
     apply_child_environment(&mut command, child_environment);
+    apply_launch_profile(&mut command, launch_profile);
     let result = ManagedProcess::spawn(
         "novarocks".to_string(),
         command,
@@ -4865,6 +4946,56 @@ mod tests {
 
             assert_eq!(marker_is_set, cfg!(debug_assertions), "{marker}");
         }
+    }
+
+    #[test]
+    fn performance_command_removes_every_fault_and_test_environment() {
+        let mut command = build_novarocks_command_with_profile(
+            Path::new("/tmp/novarocks"),
+            "fe",
+            Path::new("/tmp/novarocks-fe.toml"),
+            LaunchProfile::Performance,
+        );
+        for name in [
+            "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD",
+            "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER",
+            "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER",
+            "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
+            novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
+            novarocks_failpoint::CLEANUP_FAULT_DIR_ENV,
+        ] {
+            command.env(name, "must-be-removed");
+        }
+        apply_launch_profile(&mut command, LaunchProfile::Performance);
+
+        for name in [
+            "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD",
+            "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER",
+            "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER",
+            "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX",
+            novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
+            novarocks_failpoint::CLEANUP_FAULT_DIR_ENV,
+        ] {
+            let value = command
+                .get_envs()
+                .find_map(|(candidate, value)| (candidate == OsStr::new(name)).then_some(value));
+            assert_eq!(value, Some(None), "{name}");
+        }
+    }
+
+    #[test]
+    fn launch_profile_parser_is_closed() {
+        assert_eq!(
+            "fault-scenario".parse::<LaunchProfile>(),
+            Ok(LaunchProfile::FaultScenario)
+        );
+        assert_eq!(
+            "performance".parse::<LaunchProfile>(),
+            Ok(LaunchProfile::Performance)
+        );
+        assert!("benchmark".parse::<LaunchProfile>().is_err());
     }
 
     fn lifecycle_debug_json(execution_id: &str) -> serde_json::Value {
