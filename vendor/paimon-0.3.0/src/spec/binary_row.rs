@@ -1,0 +1,2092 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! BinaryRow: an implementation of InternalRow backed by raw binary bytes,
+//! and BinaryRowBuilder for constructing BinaryRow instances.
+
+use crate::spec::murmur_hash::hash_by_words;
+use crate::spec::{DataType, Datum, VariantType};
+use arrow_array::RecordBatch;
+use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+
+pub const EMPTY_BINARY_ROW: BinaryRow = BinaryRow::new(0);
+
+pub static EMPTY_SERIALIZED_ROW: LazyLock<Vec<u8>> =
+    LazyLock::new(|| BinaryRowBuilder::new(0).build_serialized());
+
+/// Highest bit mask for detecting inline vs variable-length encoding.
+const HIGHEST_FIRST_BIT: u64 = 0x80 << 56;
+
+/// Mask to extract the 7-bit length from an inline-encoded value.
+const HIGHEST_SECOND_TO_EIGHTH_BIT: u64 = 0x7F << 56;
+
+/// An implementation of InternalRow backed by raw binary bytes.
+///
+/// Binary layout (little-endian):
+/// ```text
+/// | header (8 bytes) | null bit set (8-byte aligned) | fixed-length (8B per field) | variable-length |
+/// ```
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/data/BinaryRow.java>
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinaryRow {
+    arity: i32,
+    null_bits_size_in_bytes: i32,
+
+    #[serde(with = "serde_bytes")]
+    data: Vec<u8>,
+}
+
+impl BinaryRow {
+    pub const HEADER_SIZE_IN_BYTES: i32 = 8;
+
+    pub const fn cal_bit_set_width_in_bytes(arity: i32) -> i32 {
+        ((arity + 63 + Self::HEADER_SIZE_IN_BYTES) / 64) * 8
+    }
+
+    pub const fn cal_fix_part_size_in_bytes(arity: i32) -> i32 {
+        Self::cal_bit_set_width_in_bytes(arity) + 8 * arity
+    }
+
+    pub const fn new(arity: i32) -> Self {
+        Self {
+            arity,
+            null_bits_size_in_bytes: Self::cal_bit_set_width_in_bytes(arity),
+            data: Vec::new(),
+        }
+    }
+
+    pub fn from_bytes(arity: i32, data: Vec<u8>) -> Self {
+        let null_bits_size_in_bytes = Self::cal_bit_set_width_in_bytes(arity);
+        Self {
+            arity,
+            null_bits_size_in_bytes,
+            data,
+        }
+    }
+
+    pub fn from_serialized_bytes(data: &[u8]) -> crate::Result<Self> {
+        if data.len() < 4 {
+            return Err(crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: serialized data too short for arity prefix: {} bytes",
+                    data.len()
+                ),
+                source: None,
+            });
+        }
+        let arity = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        if arity < 0 {
+            return Err(crate::Error::UnexpectedError {
+                message: format!("BinaryRow: serialized data has negative arity: {arity}"),
+                source: None,
+            });
+        }
+        let body = &data[4..];
+        // The body must hold at least the null bitmap and the fixed part
+        // (8 bytes per field); reject truncated input rather than panicking
+        // later when reading the null bitmap or a field. The size is computed
+        // in i64 so an absurd arity in malformed input cannot overflow.
+        let bit_set_width = ((arity as i64 + 63 + Self::HEADER_SIZE_IN_BYTES as i64) / 64) * 8;
+        let fix_part_size = bit_set_width + 8 * arity as i64;
+        if (body.len() as i64) < fix_part_size {
+            return Err(crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: serialized body too short for arity {arity}: {} bytes, need at least {fix_part_size}",
+                    body.len()
+                ),
+                source: None,
+            });
+        }
+        Ok(Self::from_bytes(arity, body.to_vec()))
+    }
+
+    /// Serialize this BinaryRow to bytes (arity prefix + data), the inverse of `from_serialized_bytes`.
+    pub fn to_serialized_bytes(&self) -> Vec<u8> {
+        // Java's BinaryRow.EMPTY_ROW points to its 8-byte fixed part, so the
+        // schemaless wire representation is 4 bytes of arity plus that body.
+        // BinaryRow::new(0) is an in-memory stub without backing data; normalize
+        // it here instead of emitting a truncated row that the strict decoder
+        // correctly rejects.
+        if self.arity == 0 && self.data.is_empty() {
+            return EMPTY_SERIALIZED_ROW.clone();
+        }
+        let mut buf = Vec::with_capacity(4 + self.data.len());
+        buf.extend_from_slice(&self.arity.to_be_bytes());
+        buf.extend_from_slice(&self.data);
+        buf
+    }
+
+    pub fn arity(&self) -> i32 {
+        self.arity
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn is_null_at(&self, pos: usize) -> bool {
+        let bit_index = pos + Self::HEADER_SIZE_IN_BYTES as usize;
+        let byte_index = bit_index / 8;
+        let bit_offset = bit_index % 8;
+        // Index defensively: a truncated buffer that lacks the null bitmap
+        // byte is reported as not-null so the typed field readers can return
+        // a graceful error instead of this method panicking.
+        match self.data.get(byte_index) {
+            Some(byte) => (byte & (1 << bit_offset)) != 0,
+            None => false,
+        }
+    }
+
+    fn field_offset(&self, pos: usize) -> usize {
+        self.null_bits_size_in_bytes as usize + pos * 8
+    }
+
+    fn read_slice<const N: usize>(&self, offset: usize) -> crate::Result<[u8; N]> {
+        self.data
+            .get(offset..offset + N)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: read {N} bytes at offset {offset} exceeds data length {}",
+                    self.data.len()
+                ),
+                source: None,
+            })
+    }
+
+    fn read_byte_at(&self, offset: usize) -> crate::Result<u8> {
+        self.data
+            .get(offset)
+            .copied()
+            .ok_or_else(|| crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: read 1 byte at offset {offset} exceeds data length {}",
+                    self.data.len()
+                ),
+                source: None,
+            })
+    }
+
+    fn read_i64_at(&self, offset: usize) -> crate::Result<i64> {
+        self.read_slice::<8>(offset).map(i64::from_le_bytes)
+    }
+
+    fn read_i32_at(&self, offset: usize) -> crate::Result<i32> {
+        self.read_slice::<4>(offset).map(i32::from_le_bytes)
+    }
+
+    pub fn get_boolean(&self, pos: usize) -> crate::Result<bool> {
+        self.read_byte_at(self.field_offset(pos)).map(|b| b != 0)
+    }
+
+    pub fn get_byte(&self, pos: usize) -> crate::Result<i8> {
+        self.read_byte_at(self.field_offset(pos)).map(|b| b as i8)
+    }
+
+    pub fn get_short(&self, pos: usize) -> crate::Result<i16> {
+        self.read_slice::<2>(self.field_offset(pos))
+            .map(i16::from_le_bytes)
+    }
+
+    pub fn get_int(&self, pos: usize) -> crate::Result<i32> {
+        self.read_i32_at(self.field_offset(pos))
+    }
+
+    pub fn get_long(&self, pos: usize) -> crate::Result<i64> {
+        self.read_i64_at(self.field_offset(pos))
+    }
+
+    pub fn get_float(&self, pos: usize) -> crate::Result<f32> {
+        self.read_slice::<4>(self.field_offset(pos))
+            .map(f32::from_le_bytes)
+    }
+
+    pub fn get_double(&self, pos: usize) -> crate::Result<f64> {
+        self.read_slice::<8>(self.field_offset(pos))
+            .map(f64::from_le_bytes)
+    }
+
+    fn resolve_var_length_field(&self, pos: usize) -> crate::Result<(usize, usize)> {
+        let field_off = self.field_offset(pos);
+        let raw = self.read_i64_at(field_off)? as u64;
+
+        let (start, len) = if raw & HIGHEST_FIRST_BIT == 0 {
+            let offset = (raw >> 32) as usize;
+            let len = (raw & 0xFFFF_FFFF) as usize;
+            (offset, len)
+        } else {
+            let len = ((raw & HIGHEST_SECOND_TO_EIGHTH_BIT) >> 56) as usize;
+            (field_off, len)
+        };
+
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: var-len field at pos {pos}: offset {start} + len {len} overflows"
+                ),
+                source: None,
+            })?;
+        if end > self.data.len() {
+            return Err(crate::Error::UnexpectedError {
+                message: format!(
+                    "BinaryRow: var-len field at pos {pos}: range [{start}..{end}) exceeds data length {}",
+                    self.data.len()
+                ),
+                source: None,
+            });
+        }
+        Ok((start, len))
+    }
+
+    pub fn get_binary(&self, pos: usize) -> crate::Result<&[u8]> {
+        let (start, len) = self.resolve_var_length_field(pos)?;
+        Ok(&self.data[start..start + len])
+    }
+
+    pub fn get_string(&self, pos: usize) -> crate::Result<&str> {
+        let bytes = self.get_binary(pos)?;
+        std::str::from_utf8(bytes).map_err(|e| crate::Error::UnexpectedError {
+            message: format!("BinaryRow: invalid UTF-8 in string field at pos {pos}: {e}"),
+            source: Some(Box::new(e)),
+        })
+    }
+
+    pub(crate) fn get_decimal_unscaled(&self, pos: usize, precision: u32) -> crate::Result<i128> {
+        if precision <= 18 {
+            Ok(self.get_long(pos)? as i128)
+        } else {
+            let bytes = self.get_binary(pos)?;
+            if bytes.is_empty() {
+                return Err(crate::Error::UnexpectedError {
+                    message: format!("BinaryRow: empty bytes for non-compact Decimal at pos {pos}"),
+                    source: None,
+                });
+            }
+            let negative = bytes[0] & 0x80 != 0;
+            let mut val: i128 = if negative { -1 } else { 0 };
+            for &b in bytes {
+                val = (val << 8) | (b as i128);
+            }
+            Ok(val)
+        }
+    }
+
+    pub(crate) fn get_timestamp_raw(
+        &self,
+        pos: usize,
+        precision: u32,
+    ) -> crate::Result<(i64, i32)> {
+        if precision <= 3 {
+            Ok((self.get_long(pos)?, 0))
+        } else {
+            let field_off = self.field_offset(pos);
+            let offset_and_nano = self.read_i64_at(field_off)? as u64;
+            let offset = (offset_and_nano >> 32) as usize;
+            let nano_of_milli = offset_and_nano as i32;
+
+            if offset + 8 > self.data.len() {
+                return Err(crate::Error::UnexpectedError {
+                    message: format!(
+                        "BinaryRow: non-compact Timestamp at pos {pos}: offset {offset} + 8 exceeds data length {}",
+                        self.data.len()
+                    ),
+                    source: None,
+                });
+            }
+            let millis = i64::from_le_bytes(self.read_slice::<8>(offset)?);
+            Ok((millis, nano_of_milli))
+        }
+    }
+
+    pub fn hash_code(&self) -> i32 {
+        hash_by_words(&self.data)
+    }
+
+    /// Read a Datum from the given position based on the DataType.
+    /// Returns `None` if the field is null.
+    pub fn get_datum(
+        &self,
+        pos: usize,
+        data_type: &crate::spec::DataType,
+    ) -> crate::Result<Option<crate::spec::Datum>> {
+        if self.is_null_at(pos) {
+            return Ok(None);
+        }
+        use crate::spec::{DataType, Datum};
+        let datum = match data_type {
+            DataType::Boolean(_) => Datum::Bool(self.get_boolean(pos)?),
+            DataType::TinyInt(_) => Datum::TinyInt(self.get_byte(pos)?),
+            DataType::SmallInt(_) => Datum::SmallInt(self.get_short(pos)?),
+            DataType::Int(_) => Datum::Int(self.get_int(pos)?),
+            DataType::BigInt(_) => Datum::Long(self.get_long(pos)?),
+            DataType::Float(_) => Datum::Float(self.get_float(pos)?),
+            DataType::Double(_) => Datum::Double(self.get_double(pos)?),
+            DataType::Date(_) => Datum::Date(self.get_int(pos)?),
+            DataType::Time(_) => Datum::Time(self.get_int(pos)?),
+            DataType::VarChar(_) | DataType::Char(_) => {
+                Datum::String(self.get_string(pos)?.to_string())
+            }
+            DataType::Binary(_) | DataType::VarBinary(_) => {
+                Datum::Bytes(self.get_binary(pos)?.to_vec())
+            }
+            DataType::Variant(_) => {
+                let (value, metadata) = decode_variant_bytes(self.get_binary(pos)?)?;
+                Datum::Variant { value, metadata }
+            }
+            DataType::Decimal(dt) => {
+                let unscaled = self.get_decimal_unscaled(pos, dt.precision())?;
+                Datum::Decimal {
+                    unscaled,
+                    precision: dt.precision(),
+                    scale: dt.scale(),
+                }
+            }
+            DataType::Timestamp(ts) => {
+                let (millis, nanos) = self.get_timestamp_raw(pos, ts.precision())?;
+                Datum::Timestamp { millis, nanos }
+            }
+            DataType::LocalZonedTimestamp(ts) => {
+                let (millis, nanos) = self.get_timestamp_raw(pos, ts.precision())?;
+                Datum::LocalZonedTimestamp { millis, nanos }
+            }
+            _ => {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "BinaryRow::get_datum: unsupported data type {:?} at pos {pos}",
+                        data_type
+                    ),
+                });
+            }
+        };
+        Ok(Some(datum))
+    }
+
+    /// Build a BinaryRow from selected columns of an Arrow RecordBatch at a given row.
+    ///
+    /// `field_indices` maps each position in the output BinaryRow to a column index
+    /// in the batch; `fields` provides the Paimon DataField metadata for every column
+    /// in the schema (indexed by the same column indices).
+    pub fn from_arrow(
+        batch: &RecordBatch,
+        row_idx: usize,
+        field_indices: &[usize],
+        fields: &[crate::spec::DataField],
+    ) -> crate::Result<Self> {
+        let arity = field_indices.len() as i32;
+        let mut builder = BinaryRowBuilder::new(arity);
+        for (pos, &field_idx) in field_indices.iter().enumerate() {
+            let field = &fields[field_idx];
+            match extract_datum_from_arrow(batch, row_idx, field_idx, field.data_type())? {
+                Some(datum) => builder.write_datum(pos, &datum, field.data_type()),
+                None => builder.set_null_at(pos),
+            }
+        }
+        Ok(builder.build())
+    }
+
+    /// Build a BinaryRow from typed Datum values using `BinaryRowBuilder`.
+    /// `None` entries are written as null fields.
+    pub fn from_datums(datums: &[(Option<&crate::spec::Datum>, &crate::spec::DataType)]) -> Self {
+        let arity = datums.len() as i32;
+        let mut builder = BinaryRowBuilder::new(arity);
+
+        for (pos, (datum_opt, data_type)) in datums.iter().enumerate() {
+            match datum_opt {
+                Some(datum) => builder.write_datum(pos, datum, data_type),
+                None => builder.set_null_at(pos),
+            }
+        }
+
+        builder.build()
+    }
+
+    pub fn compute_bucket_from_datums(
+        datums: &[(Option<&crate::spec::Datum>, &crate::spec::DataType)],
+        total_buckets: i32,
+    ) -> i32 {
+        let row = Self::from_datums(datums);
+        let hash = row.hash_code();
+        (hash % total_buckets).wrapping_abs()
+    }
+}
+
+/// Builder for constructing BinaryRow instances matching Java's BinaryRowWriter layout.
+///
+/// Layout: header (8 bytes) | null bit set (aligned) | fixed-length (8B per field) | var-length
+pub(crate) struct BinaryRowBuilder {
+    arity: i32,
+    null_bits_size: usize,
+    data: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl BinaryRowBuilder {
+    pub fn new(arity: i32) -> Self {
+        let null_bits_size = BinaryRow::cal_bit_set_width_in_bytes(arity) as usize;
+        let fixed_part_size = null_bits_size + (arity as usize) * 8;
+        Self {
+            arity,
+            null_bits_size,
+            data: vec![0u8; fixed_part_size],
+        }
+    }
+
+    fn field_offset(&self, pos: usize) -> usize {
+        self.null_bits_size + pos * 8
+    }
+
+    pub fn set_null_at(&mut self, pos: usize) {
+        let bit_index = pos + BinaryRow::HEADER_SIZE_IN_BYTES as usize;
+        let byte_index = bit_index / 8;
+        let bit_offset = bit_index % 8;
+        self.data[byte_index] |= 1 << bit_offset;
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 8].fill(0);
+    }
+
+    pub fn write_boolean(&mut self, pos: usize, value: bool) {
+        let offset = self.field_offset(pos);
+        self.data[offset] = u8::from(value);
+    }
+
+    pub fn write_byte(&mut self, pos: usize, value: i8) {
+        let offset = self.field_offset(pos);
+        self.data[offset] = value as u8;
+    }
+
+    pub fn write_short(&mut self, pos: usize, value: i16) {
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    pub fn write_int(&mut self, pos: usize, value: i32) {
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    pub fn write_long(&mut self, pos: usize, value: i64) {
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    pub fn write_float(&mut self, pos: usize, value: f32) {
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    pub fn write_double(&mut self, pos: usize, value: f64) {
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Write a string to the variable-length part and store offset+length in the fixed part.
+    pub fn write_string(&mut self, pos: usize, value: &str) {
+        self.write_binary(pos, value.as_bytes());
+    }
+
+    /// Write a short string (len <= 7) inline into the fixed part.
+    pub fn write_string_inline(&mut self, pos: usize, value: &str) {
+        assert!(
+            value.len() <= 7,
+            "inline string must be <= 7 bytes, got {}",
+            value.len()
+        );
+        self.write_binary_inline(pos, value.as_bytes());
+    }
+
+    /// Write binary data to the variable-length part (8-byte aligned, matching Java BinaryRowWriter).
+    pub fn write_binary(&mut self, pos: usize, value: &[u8]) {
+        let var_offset = self.data.len();
+        self.data.extend_from_slice(value);
+        // Pad to 8-byte word boundary (Java: roundNumberOfBytesToNearestWord)
+        let padding = (8 - (value.len() % 8)) % 8;
+        self.data.extend(std::iter::repeat_n(0u8, padding));
+        let encoded = ((var_offset as u64) << 32) | (value.len() as u64);
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
+    }
+
+    /// Write short binary data (len <= 7) inline into the fixed part.
+    pub fn write_binary_inline(&mut self, pos: usize, value: &[u8]) {
+        assert!(
+            value.len() <= 7,
+            "inline binary must be <= 7 bytes, got {}",
+            value.len()
+        );
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 8].fill(0);
+        self.data[offset..offset + value.len()].copy_from_slice(value);
+        self.data[offset + 7] = 0x80 | (value.len() as u8);
+    }
+
+    /// Inline (len <= 7) or var-length, matching Java `BinaryRowWriter`. Also correct for
+    /// nested rows / arrays: always > 7 bytes, so they land in the var part like `writeRow`.
+    pub fn write_bytes(&mut self, pos: usize, value: &[u8]) {
+        if value.len() <= 7 {
+            self.write_binary_inline(pos, value);
+        } else {
+            self.write_binary(pos, value);
+        }
+    }
+
+    /// Write a compact Decimal (precision <= 18) as its unscaled i64 value.
+    pub fn write_decimal_compact(&mut self, pos: usize, unscaled: i64) {
+        self.write_long(pos, unscaled);
+    }
+
+    /// Write a non-compact Decimal (precision > 18) as big-endian two's complement bytes (8-byte aligned).
+    pub fn write_decimal_var_len(&mut self, pos: usize, unscaled: i128) {
+        let be_bytes = unscaled.to_be_bytes();
+        let mut start = 0;
+        while start < 15 {
+            let b = be_bytes[start];
+            let next = be_bytes[start + 1];
+            if (b == 0x00 && next & 0x80 == 0) || (b == 0xFF && next & 0x80 != 0) {
+                start += 1;
+            } else {
+                break;
+            }
+        }
+        let minimal = &be_bytes[start..];
+
+        let var_offset = self.data.len();
+        self.data.extend_from_slice(minimal);
+        let padding = (8 - (minimal.len() % 8)) % 8;
+        self.data.extend(std::iter::repeat_n(0u8, padding));
+        let len = minimal.len();
+        let encoded = ((var_offset as u64) << 32) | (len as u64);
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
+    }
+
+    /// Write a compact Timestamp (precision <= 3) as epoch millis.
+    pub fn write_timestamp_compact(&mut self, pos: usize, epoch_millis: i64) {
+        self.write_long(pos, epoch_millis);
+    }
+
+    /// Write a non-compact Timestamp (precision > 3).
+    pub fn write_timestamp_non_compact(
+        &mut self,
+        pos: usize,
+        epoch_millis: i64,
+        nano_of_milli: i32,
+    ) {
+        let var_offset = self.data.len();
+        self.data.extend_from_slice(&epoch_millis.to_le_bytes());
+        let encoded = ((var_offset as u64) << 32) | (nano_of_milli as u32 as u64);
+        let offset = self.field_offset(pos);
+        self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
+    }
+
+    pub fn build(self) -> BinaryRow {
+        BinaryRow::from_bytes(self.arity, self.data)
+    }
+
+    /// Build as Paimon's serialized format: 4-byte BE arity prefix + raw data.
+    pub fn build_serialized(self) -> Vec<u8> {
+        let mut serialized = Vec::with_capacity(4 + self.data.len());
+        serialized.extend_from_slice(&self.arity.to_be_bytes());
+        serialized.extend_from_slice(&self.data);
+        serialized
+    }
+
+    /// Raw row data without the arity prefix, for embedding in a parent serializer that writes
+    /// its own length (e.g. `writeInt(size) + rowData`).
+    pub fn build_row_data(self) -> Vec<u8> {
+        self.data
+    }
+
+    /// Write a Datum value at the given position, dispatching by type.
+    pub fn write_datum(&mut self, pos: usize, datum: &Datum, data_type: &DataType) {
+        match datum {
+            Datum::Bool(v) => self.write_boolean(pos, *v),
+            Datum::TinyInt(v) => self.write_byte(pos, *v),
+            Datum::SmallInt(v) => self.write_short(pos, *v),
+            Datum::Int(v) | Datum::Date(v) | Datum::Time(v) => self.write_int(pos, *v),
+            Datum::Long(v) => self.write_long(pos, *v),
+            Datum::Float(v) => self.write_float(pos, *v),
+            Datum::Double(v) => self.write_double(pos, *v),
+            Datum::Timestamp { millis, nanos } => {
+                let precision = match data_type {
+                    DataType::Timestamp(ts) => ts.precision(),
+                    _ => 3,
+                };
+                if precision <= 3 {
+                    self.write_timestamp_compact(pos, *millis);
+                } else {
+                    self.write_timestamp_non_compact(pos, *millis, *nanos);
+                }
+            }
+            Datum::LocalZonedTimestamp { millis, nanos } => {
+                let precision = match data_type {
+                    DataType::LocalZonedTimestamp(ts) => ts.precision(),
+                    _ => 3,
+                };
+                if precision <= 3 {
+                    self.write_timestamp_compact(pos, *millis);
+                } else {
+                    self.write_timestamp_non_compact(pos, *millis, *nanos);
+                }
+            }
+            Datum::Decimal {
+                unscaled,
+                precision,
+                ..
+            } => {
+                if *precision <= 18 {
+                    self.write_decimal_compact(pos, *unscaled as i64);
+                } else {
+                    self.write_decimal_var_len(pos, *unscaled);
+                }
+            }
+            Datum::String(s) => {
+                if s.len() <= 7 {
+                    self.write_string_inline(pos, s);
+                } else {
+                    self.write_string(pos, s);
+                }
+            }
+            Datum::Bytes(b) => {
+                if b.len() <= 7 {
+                    self.write_binary_inline(pos, b);
+                } else {
+                    self.write_binary(pos, b);
+                }
+            }
+            Datum::Variant { value, metadata } => {
+                let bytes = encode_variant_bytes(value, metadata)
+                    .expect("invalid Variant payload for BinaryRow");
+                self.write_binary(pos, &bytes);
+            }
+        }
+    }
+}
+
+/// Build a serialized BinaryRow from optional Datum values.
+/// Returns empty vec if all values are None.
+pub fn datums_to_binary_row(datums: &[(&Option<Datum>, &DataType)]) -> Vec<u8> {
+    if datums.iter().all(|(d, _)| d.is_none()) {
+        return vec![];
+    }
+    let arity = datums.len() as i32;
+    let mut builder = BinaryRowBuilder::new(arity);
+    for (pos, (datum_opt, data_type)) in datums.iter().enumerate() {
+        match datum_opt {
+            Some(datum) => {
+                builder.write_datum(pos, datum, data_type);
+            }
+            None => {
+                builder.set_null_at(pos);
+            }
+        }
+    }
+    builder.build_serialized()
+}
+
+/// Round up to the nearest 8-byte word (Java `roundNumberOfBytesToNearestWord`).
+fn round_to_word(n: usize) -> usize {
+    let r = n & 7;
+    if r == 0 {
+        n
+    } else {
+        n + (8 - r)
+    }
+}
+
+/// `BinaryArray` header size: 4-byte element count + null bitset (4-byte aligned).
+fn binary_array_header(n: usize) -> usize {
+    4 + n.div_ceil(32) * 4
+}
+
+/// Serialize a `BinaryArray` of non-null UTF-8 strings, matching Java's `BinaryArray`
+/// layout: `[count(int)] [null bits] [8B element slots] [var-length part]`. Each element
+/// is inline (len <= 7) or an offset+length pointer, like `BinaryRowWriter`.
+pub fn serialize_binary_array_str(values: &[String]) -> Vec<u8> {
+    let n = values.len();
+    let header = binary_array_header(n);
+    let mut data = vec![0u8; round_to_word(header + n * 8)];
+    data[0..4].copy_from_slice(&(n as i32).to_le_bytes());
+    for (k, s) in values.iter().enumerate() {
+        let eo = header + k * 8;
+        let b = s.as_bytes();
+        if b.len() <= 7 {
+            data[eo..eo + b.len()].copy_from_slice(b);
+            data[eo + 7] = 0x80 | (b.len() as u8);
+        } else {
+            let var_off = data.len();
+            data.extend_from_slice(b);
+            let pad = (8 - (b.len() % 8)) % 8;
+            data.extend(std::iter::repeat_n(0u8, pad));
+            let encoded = ((var_off as u64) << 32) | (b.len() as u64);
+            data[eo..eo + 8].copy_from_slice(&encoded.to_le_bytes());
+        }
+    }
+    data
+}
+
+/// Serialize a `BinaryArray` of nullable i64 (Java `array<bigint>`): fixed 8-byte
+/// element slots, a set null bit for `None` elements.
+pub fn serialize_binary_array_long(values: &[Option<i64>]) -> Vec<u8> {
+    let n = values.len();
+    let header = binary_array_header(n);
+    let mut data = vec![0u8; round_to_word(header + n * 8)];
+    data[0..4].copy_from_slice(&(n as i32).to_le_bytes());
+    for (k, v) in values.iter().enumerate() {
+        match v {
+            None => data[4 + k / 8] |= 1 << (k % 8),
+            Some(x) => {
+                let eo = header + k * 8;
+                data[eo..eo + 8].copy_from_slice(&x.to_le_bytes());
+            }
+        }
+    }
+    data
+}
+
+/// Reverse of [`serialize_binary_array_str`].
+pub fn deserialize_binary_array_str(data: &[u8]) -> crate::Result<Vec<String>> {
+    let n = read_binary_array_len(data)?;
+    let header = binary_array_header(n);
+    // The fixed element region is `n * 8` bytes after the header; reject any
+    // count whose slots cannot fit in the buffer up front. This bounds both the
+    // reservation and the loop, so a forged large count (with or without
+    // element slots) cannot amplify memory before per-element validation.
+    check_binary_array_fits(n, header, data.len())?;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let eo = header + k * 8;
+        let slot = data
+            .get(eo..eo + 8)
+            .ok_or_else(|| bin_arr_err("string element slot out of range"))?;
+        let marker = slot[7];
+        let bytes = if marker & 0x80 != 0 {
+            let len = (marker & 0x7F) as usize;
+            slot.get(..len)
+                .ok_or_else(|| bin_arr_err("inline string length out of range"))?
+        } else {
+            let encoded = u64::from_le_bytes(slot.try_into().unwrap());
+            let var_off = (encoded >> 32) as usize;
+            let len = (encoded & 0xFFFF_FFFF) as usize;
+            let end = var_off
+                .checked_add(len)
+                .ok_or_else(|| bin_arr_err("variable string bytes out of range"))?;
+            data.get(var_off..end)
+                .ok_or_else(|| bin_arr_err("variable string bytes out of range"))?
+        };
+        out.push(
+            std::str::from_utf8(bytes)
+                .map_err(|_| bin_arr_err("string element is not valid UTF-8"))?
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+/// Reverse of [`serialize_binary_array_long`].
+pub fn deserialize_binary_array_long(data: &[u8]) -> crate::Result<Vec<Option<i64>>> {
+    let n = read_binary_array_len(data)?;
+    let header = binary_array_header(n);
+    // See `deserialize_binary_array_str`: reject a count whose fixed element
+    // region overflows the buffer before allocating. Null elements skip the
+    // per-slot read, so this up-front check is what prevents a forged
+    // "large count + all-null bitmap + no slots" input from amplifying memory.
+    check_binary_array_fits(n, header, data.len())?;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let null = data
+            .get(4 + k / 8)
+            .map(|b| b & (1 << (k % 8)) != 0)
+            .unwrap_or(false);
+        if null {
+            out.push(None);
+        } else {
+            let eo = header + k * 8;
+            let slot = data
+                .get(eo..eo + 8)
+                .ok_or_else(|| bin_arr_err("long element slot out of range"))?;
+            out.push(Some(i64::from_le_bytes(slot.try_into().unwrap())));
+        }
+    }
+    Ok(out)
+}
+
+fn read_binary_array_len(data: &[u8]) -> crate::Result<usize> {
+    let raw = data
+        .get(0..4)
+        .ok_or_else(|| bin_arr_err("binary array too short for length prefix"))?;
+    let n = i32::from_le_bytes(raw.try_into().unwrap());
+    if n < 0 {
+        return Err(bin_arr_err("binary array has negative length"));
+    }
+    Ok(n as usize)
+}
+
+/// Reject a binary array whose `n` fixed 8-byte element slots cannot fit in the
+/// buffer after its `header`. Computed without overflow so a forged count
+/// cannot wrap; guards allocation and iteration for both decoders (`None`
+/// elements otherwise skip the per-slot bounds check).
+fn check_binary_array_fits(n: usize, header: usize, data_len: usize) -> crate::Result<()> {
+    if n > data_len.saturating_sub(header) / 8 {
+        return Err(bin_arr_err(
+            "binary array element region exceeds buffer length",
+        ));
+    }
+    Ok(())
+}
+
+fn bin_arr_err(msg: &str) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: msg.to_string(),
+        source: None,
+    }
+}
+
+/// Extract a Datum from an Arrow RecordBatch column at the given row index.
+pub fn extract_datum_from_arrow(
+    batch: &RecordBatch,
+    row_idx: usize,
+    col_idx: usize,
+    data_type: &DataType,
+) -> crate::Result<Option<Datum>> {
+    use arrow_array::Array;
+
+    let col = batch.column(col_idx);
+    if col.is_null(row_idx) {
+        return Ok(None);
+    }
+
+    let datum = match data_type {
+        DataType::Boolean(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::BooleanArray>()
+                .ok_or_else(|| type_mismatch_err("Boolean", col_idx))?;
+            Datum::Bool(arr.value(row_idx))
+        }
+        DataType::TinyInt(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int8Array>()
+                .ok_or_else(|| type_mismatch_err("TinyInt", col_idx))?;
+            Datum::TinyInt(arr.value(row_idx))
+        }
+        DataType::SmallInt(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int16Array>()
+                .ok_or_else(|| type_mismatch_err("SmallInt", col_idx))?;
+            Datum::SmallInt(arr.value(row_idx))
+        }
+        DataType::Int(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .ok_or_else(|| type_mismatch_err("Int", col_idx))?;
+            Datum::Int(arr.value(row_idx))
+        }
+        DataType::BigInt(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .ok_or_else(|| type_mismatch_err("BigInt", col_idx))?;
+            Datum::Long(arr.value(row_idx))
+        }
+        DataType::Float(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| type_mismatch_err("Float", col_idx))?;
+            Datum::Float(arr.value(row_idx))
+        }
+        DataType::Double(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Float64Array>()
+                .ok_or_else(|| type_mismatch_err("Double", col_idx))?;
+            Datum::Double(arr.value(row_idx))
+        }
+        DataType::Char(_) | DataType::VarChar(_) => {
+            if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                Datum::String(arr.value(row_idx).to_string())
+            } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringViewArray>() {
+                Datum::String(arr.value(row_idx).to_string())
+            } else if let Some(arr) = col.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+                Datum::String(arr.value(row_idx).to_string())
+            } else {
+                return Err(type_mismatch_err("String", col_idx));
+            }
+        }
+        DataType::Date(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Date32Array>()
+                .ok_or_else(|| type_mismatch_err("Date", col_idx))?;
+            Datum::Date(arr.value(row_idx))
+        }
+        DataType::Decimal(d) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Decimal128Array>()
+                .ok_or_else(|| type_mismatch_err("Decimal", col_idx))?;
+            Datum::Decimal {
+                unscaled: arr.value(row_idx),
+                precision: d.precision(),
+                scale: d.scale(),
+            }
+        }
+        DataType::Binary(_) | DataType::VarBinary(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .ok_or_else(|| type_mismatch_err("Binary", col_idx))?;
+            Datum::Bytes(arr.value(row_idx).to_vec())
+        }
+        DataType::Variant(_) => extract_variant_datum_from_arrow(col, row_idx, col_idx)?,
+        DataType::Timestamp(ts) => {
+            let (millis, nanos) = extract_timestamp_parts_from_arrow(
+                col,
+                row_idx,
+                col_idx,
+                ts.precision(),
+                "Timestamp",
+            )?;
+            Datum::Timestamp { millis, nanos }
+        }
+        DataType::LocalZonedTimestamp(ts) => {
+            let (millis, nanos) = extract_timestamp_parts_from_arrow(
+                col,
+                row_idx,
+                col_idx,
+                ts.precision(),
+                "LocalZonedTimestamp",
+            )?;
+            Datum::LocalZonedTimestamp { millis, nanos }
+        }
+        _ => {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "Unsupported data type {:?} for Arrow extraction at column {}",
+                    data_type, col_idx
+                ),
+            });
+        }
+    };
+
+    Ok(Some(datum))
+}
+
+fn extract_timestamp_parts_from_arrow(
+    col: &std::sync::Arc<dyn arrow_array::Array>,
+    row_idx: usize,
+    col_idx: usize,
+    precision: u32,
+    expected: &str,
+) -> crate::Result<(i64, i32)> {
+    match precision {
+        0..=3 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                .ok_or_else(|| type_mismatch_err(&format!("{expected}(ms)"), col_idx))?;
+            Ok((arr.value(row_idx), 0))
+        }
+        4..=6 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                .ok_or_else(|| type_mismatch_err(&format!("{expected}(us)"), col_idx))?;
+            Ok(timestamp_parts_from_micros(arr.value(row_idx)))
+        }
+        7..=9 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                .ok_or_else(|| type_mismatch_err(&format!("{expected}(ns)"), col_idx))?;
+            Ok(timestamp_parts_from_nanos(arr.value(row_idx)))
+        }
+        _ => Err(crate::Error::Unsupported {
+            message: format!("Unsupported {expected} precision {precision}"),
+        }),
+    }
+}
+
+fn timestamp_parts_from_micros(micros: i64) -> (i64, i32) {
+    (
+        micros.div_euclid(1_000),
+        (micros.rem_euclid(1_000) * 1_000) as i32,
+    )
+}
+
+fn timestamp_parts_from_nanos(nanos: i64) -> (i64, i32) {
+    (
+        nanos.div_euclid(1_000_000),
+        nanos.rem_euclid(1_000_000) as i32,
+    )
+}
+
+fn encode_variant_bytes(value: &[u8], metadata: &[u8]) -> crate::Result<Vec<u8>> {
+    VariantType::validate_payload(value, metadata)?;
+    let mut bytes = Vec::with_capacity(4 + value.len() + metadata.len());
+    bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(value);
+    bytes.extend_from_slice(metadata);
+    Ok(bytes)
+}
+
+fn decode_variant_bytes(bytes: &[u8]) -> crate::Result<(Vec<u8>, Vec<u8>)> {
+    if bytes.len() < 4 {
+        return Err(crate::Error::DataInvalid {
+            message: format!("Variant bytes too short: {} bytes", bytes.len()),
+            source: None,
+        });
+    }
+    let value_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let value_end = 4usize
+        .checked_add(value_len)
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Variant value length overflows".to_string(),
+            source: None,
+        })?;
+    if value_end > bytes.len() {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Variant value length {value_len} exceeds payload length {}",
+                bytes.len()
+            ),
+            source: None,
+        });
+    }
+    let value = bytes[4..value_end].to_vec();
+    let metadata = bytes[value_end..].to_vec();
+    VariantType::validate_payload(&value, &metadata)?;
+    Ok((value, metadata))
+}
+
+fn extract_variant_datum_from_arrow(
+    col: &std::sync::Arc<dyn arrow_array::Array>,
+    row_idx: usize,
+    col_idx: usize,
+) -> crate::Result<Datum> {
+    use arrow_array::Array;
+
+    let arr = col
+        .as_any()
+        .downcast_ref::<arrow_array::StructArray>()
+        .ok_or_else(|| type_mismatch_err("Variant", col_idx))?;
+    validate_variant_struct_array(arr, col_idx)?;
+    let value = arr.column(0);
+    let metadata = arr.column(1);
+    if value.is_null(row_idx) || metadata.is_null(row_idx) {
+        return Err(crate::Error::DataInvalid {
+            message: format!("Variant Arrow struct at column {col_idx} has null child value"),
+            source: None,
+        });
+    }
+    let value = value
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .ok_or_else(|| type_mismatch_err("Variant.value", col_idx))?
+        .value(row_idx)
+        .to_vec();
+    let metadata = metadata
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .ok_or_else(|| type_mismatch_err("Variant.metadata", col_idx))?
+        .value(row_idx)
+        .to_vec();
+    VariantType::validate_payload(&value, &metadata)?;
+    Ok(Datum::Variant { value, metadata })
+}
+
+fn validate_variant_struct_array(
+    arr: &arrow_array::StructArray,
+    col_idx: usize,
+) -> crate::Result<()> {
+    if arr.num_columns() != 2 {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Variant Arrow struct at column {col_idx} must have 2 fields, got {}",
+                arr.num_columns()
+            ),
+            source: None,
+        });
+    }
+    arr.column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .ok_or_else(|| type_mismatch_err("Variant.value", col_idx))?;
+    arr.column(1)
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .ok_or_else(|| type_mismatch_err("Variant.metadata", col_idx))?;
+    Ok(())
+}
+
+fn type_mismatch_err(expected: &str, col_idx: usize) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: format!(
+            "Arrow column {} type mismatch: expected {} compatible array",
+            col_idx, expected
+        ),
+        source: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch-level BinaryRow utilities
+// ---------------------------------------------------------------------------
+
+/// Pre-downcast column reference to avoid per-row dynamic dispatch.
+enum TypedColumn<'a> {
+    Boolean(&'a arrow_array::BooleanArray),
+    Int8(&'a arrow_array::Int8Array),
+    Int16(&'a arrow_array::Int16Array),
+    Int32(&'a arrow_array::Int32Array),
+    Int64(&'a arrow_array::Int64Array),
+    Float32(&'a arrow_array::Float32Array),
+    Float64(&'a arrow_array::Float64Array),
+    Utf8(&'a arrow_array::StringArray),
+    Utf8View(&'a arrow_array::StringViewArray),
+    LargeUtf8(&'a arrow_array::LargeStringArray),
+    Date32(&'a arrow_array::Date32Array),
+    Decimal128(&'a arrow_array::Decimal128Array, u32, u32), // (array, precision, scale)
+    Binary(&'a arrow_array::BinaryArray),
+    Variant(&'a arrow_array::StructArray),
+    TimestampMs(&'a arrow_array::TimestampMillisecondArray),
+    TimestampUs(&'a arrow_array::TimestampMicrosecondArray),
+    TimestampNs(&'a arrow_array::TimestampNanosecondArray),
+}
+
+/// Downcast Arrow columns once, returning typed references paired with their DataType.
+fn downcast_columns<'a>(
+    batch: &'a RecordBatch,
+    field_indices: &[usize],
+    fields: &'a [crate::spec::DataField],
+) -> crate::Result<Vec<(TypedColumn<'a>, &'a crate::spec::DataField)>> {
+    use arrow_array::Array;
+    field_indices
+        .iter()
+        .map(|&col_idx| {
+            let field = &fields[col_idx];
+            let col = batch.column(col_idx);
+            let typed = match field.data_type() {
+                DataType::Boolean(_) => TypedColumn::Boolean(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Boolean", col_idx))?,
+                ),
+                DataType::TinyInt(_) => TypedColumn::Int8(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("TinyInt", col_idx))?,
+                ),
+                DataType::SmallInt(_) => TypedColumn::Int16(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("SmallInt", col_idx))?,
+                ),
+                DataType::Int(_) => TypedColumn::Int32(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Int", col_idx))?,
+                ),
+                DataType::BigInt(_) => TypedColumn::Int64(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("BigInt", col_idx))?,
+                ),
+                DataType::Float(_) => TypedColumn::Float32(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Float", col_idx))?,
+                ),
+                DataType::Double(_) => TypedColumn::Float64(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Double", col_idx))?,
+                ),
+                DataType::Char(_) | DataType::VarChar(_) => {
+                    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::StringArray>() {
+                        TypedColumn::Utf8(arr)
+                    } else if let Some(arr) =
+                        col.as_any().downcast_ref::<arrow_array::StringViewArray>()
+                    {
+                        TypedColumn::Utf8View(arr)
+                    } else if let Some(arr) =
+                        col.as_any().downcast_ref::<arrow_array::LargeStringArray>()
+                    {
+                        TypedColumn::LargeUtf8(arr)
+                    } else {
+                        return Err(type_mismatch_err("String", col_idx));
+                    }
+                }
+                DataType::Date(_) => TypedColumn::Date32(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Date", col_idx))?,
+                ),
+                DataType::Decimal(d) => TypedColumn::Decimal128(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Decimal", col_idx))?,
+                    d.precision(),
+                    d.scale(),
+                ),
+                DataType::Binary(_) | DataType::VarBinary(_) => TypedColumn::Binary(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Binary", col_idx))?,
+                ),
+                DataType::Variant(_) => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Variant", col_idx))?;
+                    validate_variant_struct_array(arr, col_idx)?;
+                    TypedColumn::Variant(arr)
+                }
+                DataType::Timestamp(ts) => match ts.precision() {
+                    0..=3 => TypedColumn::TimestampMs(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Timestamp(ms)", col_idx))?,
+                    ),
+                    4..=6 => TypedColumn::TimestampUs(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Timestamp(us)", col_idx))?,
+                    ),
+                    7..=9 => TypedColumn::TimestampNs(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Timestamp(ns)", col_idx))?,
+                    ),
+                    _ => {
+                        return Err(crate::Error::Unsupported {
+                            message: format!("Unsupported Timestamp precision {}", ts.precision()),
+                        });
+                    }
+                },
+                DataType::LocalZonedTimestamp(ts) => {
+                    match ts.precision() {
+                        0..=3 => TypedColumn::TimestampMs(col.as_any().downcast_ref().ok_or_else(
+                            || type_mismatch_err("LocalZonedTimestamp(ms)", col_idx),
+                        )?),
+                        4..=6 => TypedColumn::TimestampUs(col.as_any().downcast_ref().ok_or_else(
+                            || type_mismatch_err("LocalZonedTimestamp(us)", col_idx),
+                        )?),
+                        7..=9 => TypedColumn::TimestampNs(col.as_any().downcast_ref().ok_or_else(
+                            || type_mismatch_err("LocalZonedTimestamp(ns)", col_idx),
+                        )?),
+                        _ => {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Unsupported LocalZonedTimestamp precision {}",
+                                    ts.precision()
+                                ),
+                            });
+                        }
+                    }
+                }
+                other => {
+                    return Err(crate::Error::Unsupported {
+                        message: format!(
+                            "Unsupported data type {:?} for batch column downcast at column {}",
+                            other, col_idx
+                        ),
+                    });
+                }
+            };
+            Ok((typed, field))
+        })
+        .collect()
+}
+
+/// Write a value from a pre-downcast column into a BinaryRowBuilder at the given position.
+fn write_typed_value(
+    builder: &mut BinaryRowBuilder,
+    pos: usize,
+    row_idx: usize,
+    typed_col: &TypedColumn,
+    _data_type: &DataType,
+) -> crate::Result<()> {
+    use arrow_array::Array;
+    match typed_col {
+        TypedColumn::Boolean(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_boolean(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Int8(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_byte(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Int16(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_short(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Int32(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_int(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Int64(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_long(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Float32(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_float(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Float64(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_double(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Utf8(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let s = arr.value(row_idx);
+                if s.len() <= 7 {
+                    builder.write_string_inline(pos, s);
+                } else {
+                    builder.write_string(pos, s);
+                }
+            }
+        }
+        TypedColumn::Utf8View(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let s = arr.value(row_idx);
+                if s.len() <= 7 {
+                    builder.write_string_inline(pos, s);
+                } else {
+                    builder.write_string(pos, s);
+                }
+            }
+        }
+        TypedColumn::LargeUtf8(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let s = arr.value(row_idx);
+                if s.len() <= 7 {
+                    builder.write_string_inline(pos, s);
+                } else {
+                    builder.write_string(pos, s);
+                }
+            }
+        }
+        TypedColumn::Date32(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_int(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::Decimal128(arr, precision, _scale) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let unscaled = arr.value(row_idx);
+                if *precision <= 18 {
+                    builder.write_decimal_compact(pos, unscaled as i64);
+                } else {
+                    builder.write_decimal_var_len(pos, unscaled);
+                }
+            }
+        }
+        TypedColumn::Binary(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let b = arr.value(row_idx);
+                if b.len() <= 7 {
+                    builder.write_binary_inline(pos, b);
+                } else {
+                    builder.write_binary(pos, b);
+                }
+            }
+        }
+        TypedColumn::Variant(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let value = arr.column(0);
+                let metadata = arr.column(1);
+                if value.is_null(row_idx) || metadata.is_null(row_idx) {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Variant Arrow struct has null child value".to_string(),
+                        source: None,
+                    });
+                } else if let (Some(value), Some(metadata)) = (
+                    value.as_any().downcast_ref::<arrow_array::BinaryArray>(),
+                    metadata.as_any().downcast_ref::<arrow_array::BinaryArray>(),
+                ) {
+                    let bytes =
+                        encode_variant_bytes(value.value(row_idx), metadata.value(row_idx))?;
+                    builder.write_binary(pos, &bytes);
+                } else {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Variant Arrow struct children must be BinaryArray".to_string(),
+                        source: None,
+                    });
+                }
+            }
+        }
+        TypedColumn::TimestampMs(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_timestamp_compact(pos, arr.value(row_idx));
+            }
+        }
+        TypedColumn::TimestampUs(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let (millis, nanos) = timestamp_parts_from_micros(arr.value(row_idx));
+                builder.write_timestamp_non_compact(pos, millis, nanos);
+            }
+        }
+        TypedColumn::TimestampNs(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let (millis, nanos) = timestamp_parts_from_nanos(arr.value(row_idx));
+                builder.write_timestamp_non_compact(pos, millis, nanos);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build BinaryRows for all rows in the batch for the given field indices.
+/// Downcasts columns once, then iterates rows — O(F) downcasts instead of O(N*F).
+pub(crate) fn batch_build_binary_rows(
+    batch: &RecordBatch,
+    field_indices: &[usize],
+    fields: &[crate::spec::DataField],
+) -> crate::Result<Vec<BinaryRow>> {
+    let typed_columns = downcast_columns(batch, field_indices, fields)?;
+    let arity = field_indices.len() as i32;
+    let num_rows = batch.num_rows();
+    let mut rows = Vec::with_capacity(num_rows);
+
+    for row_idx in 0..num_rows {
+        let mut builder = BinaryRowBuilder::new(arity);
+        for (pos, (typed_col, field)) in typed_columns.iter().enumerate() {
+            write_typed_value(&mut builder, pos, row_idx, typed_col, field.data_type())?;
+        }
+        rows.push(builder.build());
+    }
+    Ok(rows)
+}
+
+/// Batch-compute serialized partition bytes for all rows.
+/// Returns one `Vec<u8>` per row, identical to calling
+/// `BinaryRow::from_arrow(batch, row_idx, field_indices, fields).to_serialized_bytes()`
+/// for each row, but with O(F) column downcasts instead of O(N*F).
+pub fn batch_to_serialized_bytes(
+    batch: &RecordBatch,
+    field_indices: &[usize],
+    fields: &[crate::spec::DataField],
+) -> crate::Result<Vec<Vec<u8>>> {
+    let rows = batch_build_binary_rows(batch, field_indices, fields)?;
+    Ok(rows.into_iter().map(|r| r.to_serialized_bytes()).collect())
+}
+
+/// Batch-compute Murmur3 hash codes for all rows.
+/// Returns one `i32` per row, identical to calling
+/// `BinaryRow::from_arrow(batch, row_idx, field_indices, fields).hash_code()`
+/// for each row, but with O(F) column downcasts instead of O(N*F).
+pub fn batch_hash_codes(
+    batch: &RecordBatch,
+    field_indices: &[usize],
+    fields: &[crate::spec::DataField],
+) -> crate::Result<Vec<i32>> {
+    let rows = batch_build_binary_rows(batch, field_indices, fields)?;
+    Ok(rows.into_iter().map(|r| r.hash_code()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::variant::GenericVariant;
+
+    #[test]
+    fn test_empty_binary_row() {
+        let row = BinaryRow::new(0);
+        assert_eq!(row.arity(), 0);
+        assert!(row.is_empty());
+        assert_eq!(row.data(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn test_empty_binary_row_serializes_to_java_wire_format() {
+        let serialized = BinaryRow::new(0).to_serialized_bytes();
+        assert_eq!(serialized, *EMPTY_SERIALIZED_ROW);
+        assert_eq!(serialized.len(), 12);
+        assert_eq!(
+            BinaryRow::from_serialized_bytes(&serialized).unwrap(),
+            BinaryRow::from_bytes(0, vec![0; 8])
+        );
+    }
+
+    #[test]
+    fn test_binary_row_constants() {
+        assert_eq!(BinaryRow::cal_bit_set_width_in_bytes(0), 8);
+        assert_eq!(BinaryRow::cal_bit_set_width_in_bytes(1), 8);
+        assert_eq!(BinaryRow::cal_bit_set_width_in_bytes(56), 8);
+        assert_eq!(BinaryRow::cal_bit_set_width_in_bytes(57), 16);
+    }
+
+    #[test]
+    fn test_from_serialized_bytes() {
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_int(0, 42);
+        let serialized = builder.build_serialized();
+
+        let row = BinaryRow::from_serialized_bytes(&serialized).unwrap();
+        assert_eq!(row.arity(), 1);
+        assert!(!row.is_null_at(0));
+        assert_eq!(row.get_int(0).unwrap(), 42);
+    }
+
+    #[test]
+    fn test_from_serialized_bytes_too_short() {
+        assert!(BinaryRow::from_serialized_bytes(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn test_from_serialized_bytes_truncated_body() {
+        // Valid 4-byte arity prefix (arity = 1) but the body is empty, so it
+        // cannot hold the null bitmap. This must be rejected gracefully rather
+        // than panicking when the null bitmap is later read.
+        let truncated = [0u8, 0, 0, 1];
+        assert!(BinaryRow::from_serialized_bytes(&truncated).is_err());
+
+        // Body present but still shorter than the fixed part (null bitmap of 8
+        // bytes + one 8-byte field = 16 bytes for arity 1).
+        let mut short_body = vec![0u8, 0, 0, 1];
+        short_body.extend_from_slice(&[0u8; 4]);
+        assert!(BinaryRow::from_serialized_bytes(&short_body).is_err());
+    }
+
+    #[test]
+    fn test_from_serialized_bytes_negative_arity() {
+        // arity = -1 (0xFFFFFFFF) must be rejected, not used in size math.
+        let data = [0xFFu8, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+        assert!(BinaryRow::from_serialized_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn test_from_serialized_bytes_well_formed_decodes() {
+        // Negative control: a correctly sized body decodes and reads back fine.
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_int(0, 7);
+        let serialized = builder.build_serialized();
+        let row = BinaryRow::from_serialized_bytes(&serialized).unwrap();
+        assert_eq!(row.arity(), 1);
+        assert!(!row.is_null_at(0));
+        assert_eq!(row.get_int(0).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_is_null_at_short_buffer_does_not_panic() {
+        // A row whose backing buffer lacks the null bitmap byte must not panic
+        // in is_null_at; the position is reported as not-null and the typed
+        // reader then returns a graceful error.
+        let row = BinaryRow::from_bytes(1, Vec::new());
+        assert!(!row.is_null_at(0));
+        assert!(row.get_int(0).is_err());
+    }
+
+    #[test]
+    fn test_get_int() {
+        let mut builder = BinaryRowBuilder::new(2);
+        builder.write_int(0, 42);
+        builder.write_int(1, -100);
+        let row = builder.build();
+
+        assert!(!row.is_empty());
+        assert_eq!(row.arity(), 2);
+        assert_eq!(row.get_int(0).unwrap(), 42);
+        assert_eq!(row.get_int(1).unwrap(), -100);
+    }
+
+    #[test]
+    fn test_get_long() {
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_long(0, i64::MAX);
+        let row = builder.build();
+        assert_eq!(row.get_long(0).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn test_get_short_byte_boolean() {
+        let mut builder = BinaryRowBuilder::new(3);
+        builder.write_short(0, -32768);
+        builder.write_byte(1, -1);
+        builder.write_boolean(2, true);
+        let row = builder.build();
+
+        assert_eq!(row.get_short(0).unwrap(), -32768);
+        assert_eq!(row.get_byte(1).unwrap(), -1);
+        assert!(row.get_boolean(2).unwrap());
+    }
+
+    #[test]
+    fn test_get_float_double() {
+        let mut builder = BinaryRowBuilder::new(2);
+        builder.write_float(0, 1.5_f32);
+        builder.write_double(1, std::f64::consts::PI);
+        let row = builder.build();
+
+        assert!((row.get_float(0).unwrap() - 1.5_f32).abs() < f32::EPSILON);
+        assert!((row.get_double(1).unwrap() - std::f64::consts::PI).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_null_handling() {
+        let mut builder = BinaryRowBuilder::new(3);
+        builder.write_int(0, 42);
+        builder.set_null_at(1);
+        builder.write_int(2, 99);
+        let row = builder.build();
+
+        assert!(!row.is_null_at(0));
+        assert!(row.is_null_at(1));
+        assert!(!row.is_null_at(2));
+        assert_eq!(row.get_int(0).unwrap(), 42);
+        assert_eq!(row.get_int(2).unwrap(), 99);
+    }
+
+    #[test]
+    fn test_get_string_variable_length() {
+        let mut builder = BinaryRowBuilder::new(2);
+        builder.write_string(0, "hello");
+        builder.write_string(1, "world!");
+        let row = builder.build();
+
+        assert_eq!(row.get_string(0).unwrap(), "hello");
+        assert_eq!(row.get_string(1).unwrap(), "world!");
+    }
+
+    #[test]
+    fn test_get_binary_variable_length() {
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_binary(0, b"\x00\x01\x02\x03");
+        let row = builder.build();
+
+        assert_eq!(row.get_binary(0).unwrap(), &[0x00, 0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_variant_datum_roundtrip() {
+        let data_type = DataType::Variant(crate::spec::VariantType::new());
+        let variant = GenericVariant::parse_json(r#"{"a":1}"#).unwrap();
+        let datum = Datum::Variant {
+            value: variant.value().to_vec(),
+            metadata: variant.metadata().to_vec(),
+        };
+        let row = BinaryRow::from_datums(&[(Some(&datum), &data_type)]);
+
+        assert_eq!(row.get_datum(0, &data_type).unwrap(), Some(datum));
+    }
+
+    #[test]
+    fn test_mixed_types_partition_row() {
+        let mut builder = BinaryRowBuilder::new(2);
+        builder.write_string(0, "2024-01-01");
+        builder.write_int(1, 12);
+        let row = builder.build();
+
+        assert_eq!(row.get_string(0).unwrap(), "2024-01-01");
+        assert_eq!(row.get_int(1).unwrap(), 12);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_empty() {
+        let row = BinaryRow::new(0);
+        let json = serde_json::to_string(&row).unwrap();
+        let deserialized: BinaryRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.arity(), 0);
+        assert!(deserialized.is_empty());
+    }
+
+    #[test]
+    fn test_serde_roundtrip_populated() {
+        let mut builder = BinaryRowBuilder::new(2);
+        builder.write_int(0, 42);
+        builder.write_string(1, "hello");
+        let row = builder.build();
+
+        let json = serde_json::to_string(&row).unwrap();
+        let deserialized: BinaryRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.arity(), row.arity());
+        assert_eq!(deserialized.data(), row.data());
+        assert_eq!(deserialized.get_int(0).unwrap(), 42);
+        assert_eq!(deserialized.get_string(1).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_from_bytes_arity_zero() {
+        let data = vec![0u8; 8];
+        let row = BinaryRow::from_bytes(0, data);
+        assert_eq!(row.arity(), 0);
+        assert!(!row.is_empty());
+    }
+
+    #[test]
+    fn test_new_and_from_bytes_null_bits_size_consistent() {
+        for arity in [0, 1, 2, 10, 56, 57, 100] {
+            let stub = BinaryRow::new(arity);
+            let data = vec![0u8; BinaryRow::cal_fix_part_size_in_bytes(arity) as usize];
+            let real = BinaryRow::from_bytes(arity, data);
+            assert_eq!(
+                stub.null_bits_size_in_bytes, real.null_bits_size_in_bytes,
+                "null_bits_size_in_bytes mismatch for arity={arity}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_string_inline() {
+        let mut builder = BinaryRowBuilder::new(2);
+        builder.write_string_inline(0, "hi");
+        builder.write_string_inline(1, "7_bytes");
+        let row = builder.build();
+
+        assert_eq!(row.get_string(0).unwrap(), "hi");
+        assert_eq!(row.get_string(1).unwrap(), "7_bytes");
+    }
+
+    #[test]
+    fn test_get_binary_inline() {
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_binary_inline(0, &[0xDE, 0xAD]);
+        let row = builder.build();
+
+        assert_eq!(row.get_binary(0).unwrap(), &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn test_get_decimal_compact() {
+        let mut builder = BinaryRowBuilder::new(3);
+        builder.write_decimal_compact(0, 12345);
+        builder.write_decimal_compact(1, -100);
+        builder.write_decimal_compact(2, 0);
+        let row = builder.build();
+
+        assert_eq!(row.get_decimal_unscaled(0, 10).unwrap(), 12345);
+        assert_eq!(row.get_decimal_unscaled(1, 10).unwrap(), -100);
+        assert_eq!(row.get_decimal_unscaled(2, 10).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_get_decimal_var_len() {
+        let mut builder = BinaryRowBuilder::new(2);
+        let large_pos: i128 = 10_000_000_000_000_000_000;
+        builder.write_decimal_var_len(0, large_pos);
+        let large_neg: i128 = -10_000_000_000_000_000_000;
+        builder.write_decimal_var_len(1, large_neg);
+        let row = builder.build();
+
+        assert_eq!(row.get_decimal_unscaled(0, 20).unwrap(), large_pos);
+        assert_eq!(row.get_decimal_unscaled(1, 20).unwrap(), large_neg);
+    }
+
+    #[test]
+    fn test_get_timestamp_compact() {
+        let epoch_millis: i64 = 1_704_067_200_000;
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_timestamp_compact(0, epoch_millis);
+        let row = builder.build();
+
+        let (millis, nano) = row.get_timestamp_raw(0, 3).unwrap();
+        assert_eq!(millis, epoch_millis);
+        assert_eq!(nano, 0);
+    }
+
+    #[test]
+    fn test_write_datum_int_and_string() {
+        let mut builder = BinaryRowBuilder::new(2);
+        builder.write_datum(
+            0,
+            &Datum::Int(42),
+            &DataType::Int(crate::spec::IntType::new()),
+        );
+        builder.write_datum(
+            1,
+            &Datum::String("hello".to_string()),
+            &DataType::VarChar(crate::spec::VarCharType::string_type()),
+        );
+        let row = builder.build();
+        assert_eq!(row.get_int(0).unwrap(), 42);
+        assert_eq!(row.get_string(1).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_write_datum_long_string() {
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_datum(
+            0,
+            &Datum::String("long_string_value".to_string()),
+            &DataType::VarChar(crate::spec::VarCharType::string_type()),
+        );
+        let row = builder.build();
+        assert_eq!(row.get_string(0).unwrap(), "long_string_value");
+    }
+
+    #[test]
+    fn test_datums_to_binary_row_roundtrip() {
+        let d1 = Some(Datum::Int(100));
+        let d2 = Some(Datum::String("abc".to_string()));
+        let dt1 = DataType::Int(crate::spec::IntType::new());
+        let dt2 = DataType::VarChar(crate::spec::VarCharType::string_type());
+        let datums = vec![(&d1, &dt1), (&d2, &dt2)];
+        let bytes = datums_to_binary_row(&datums);
+        assert!(!bytes.is_empty());
+        let row = BinaryRow::from_serialized_bytes(&bytes).unwrap();
+        assert_eq!(row.get_int(0).unwrap(), 100);
+        assert_eq!(row.get_string(1).unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_datums_to_binary_row_all_none() {
+        let d1: Option<Datum> = None;
+        let dt1 = DataType::Int(crate::spec::IntType::new());
+        let datums = vec![(&d1, &dt1)];
+        let bytes = datums_to_binary_row(&datums);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn test_datums_to_binary_row_mixed_null() {
+        let d1 = Some(Datum::Int(7));
+        let d2: Option<Datum> = None;
+        let dt1 = DataType::Int(crate::spec::IntType::new());
+        let dt2 = DataType::Int(crate::spec::IntType::new());
+        let datums = vec![(&d1, &dt1), (&d2, &dt2)];
+        let bytes = datums_to_binary_row(&datums);
+        assert!(!bytes.is_empty());
+        let row = BinaryRow::from_serialized_bytes(&bytes).unwrap();
+        assert_eq!(row.get_int(0).unwrap(), 7);
+        assert!(row.is_null_at(1));
+    }
+
+    #[test]
+    fn test_get_timestamp_non_compact() {
+        let epoch_millis: i64 = 1_704_067_200_123;
+        let nano_of_milli: i32 = 456_000;
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_timestamp_non_compact(0, epoch_millis, nano_of_milli);
+        let row = builder.build();
+
+        let (millis, nano) = row.get_timestamp_raw(0, 6).unwrap();
+        assert_eq!(millis, epoch_millis);
+        assert_eq!(nano, nano_of_milli);
+    }
+
+    #[test]
+    fn test_batch_vs_per_row_equivalence() {
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType as ArrowDT, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDT::Int32, true),
+            Field::new("name", ArrowDT::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+                Arc::new(StringArray::from(vec![Some("hello"), Some("world"), None])),
+            ],
+        )
+        .unwrap();
+
+        let fields = vec![
+            crate::spec::DataField::new(0, "id".into(), DataType::Int(crate::spec::IntType::new())),
+            crate::spec::DataField::new(
+                1,
+                "name".into(),
+                DataType::VarChar(crate::spec::VarCharType::string_type()),
+            ),
+        ];
+        let indices = vec![0, 1];
+
+        // Batch results
+        let batch_bytes = batch_to_serialized_bytes(&batch, &indices, &fields).unwrap();
+        let batch_hashes = batch_hash_codes(&batch, &indices, &fields).unwrap();
+
+        // Per-row results
+        for row_idx in 0..batch.num_rows() {
+            let row = BinaryRow::from_arrow(&batch, row_idx, &indices, &fields).unwrap();
+            assert_eq!(
+                batch_bytes[row_idx],
+                row.to_serialized_bytes(),
+                "serialized bytes mismatch at row {row_idx}"
+            );
+            assert_eq!(
+                batch_hashes[row_idx],
+                row.hash_code(),
+                "hash code mismatch at row {row_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_negative_sub_millisecond_timestamp_uses_euclidean_parts() {
+        use arrow_array::TimestampMicrosecondArray;
+        use arrow_schema::{DataType as ArrowDT, Field, Schema, TimeUnit};
+        use std::sync::Arc;
+
+        // 1 microsecond before the epoch: 1969-12-31 23:59:59.999999.
+        // Truncating division would store (millis=0, nanos=-1000), which is
+        // inconsistent with the DataFusion literal pushdown path that uses
+        // euclidean division and produces (millis=-1, nanos=999_000). The
+        // mismatch made pushed predicates on pre-epoch fractional timestamps
+        // false-negative, so the write path must normalize the same way.
+        let micros: i64 = -1;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            ArrowDT::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![Some(
+                micros,
+            )]))],
+        )
+        .unwrap();
+
+        let ts_type = DataType::Timestamp(crate::spec::TimestampType::new(6).unwrap());
+        let fields = vec![crate::spec::DataField::new(0, "ts".into(), ts_type.clone())];
+        let indices = vec![0];
+
+        // Single-row extraction path (`extract_datum_from_arrow`).
+        let datum = extract_datum_from_arrow(&batch, 0, 0, &ts_type)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            datum,
+            Datum::Timestamp {
+                millis: -1,
+                nanos: 999_000,
+            },
+            "extract_datum_from_arrow should normalize negative sub-millisecond timestamps"
+        );
+
+        // Batch write path must persist the same euclidean parts so that a
+        // pushed-down literal compares equal to the stored value.
+        let row = BinaryRow::from_arrow(&batch, 0, &indices, &fields).unwrap();
+        let (millis, nanos) = row.get_timestamp_raw(0, 6).unwrap();
+        assert_eq!(
+            (millis, nanos),
+            (-1, 999_000),
+            "binary-row write path must store euclidean timestamp parts"
+        );
+    }
+
+    #[test]
+    fn binary_array_str_round_trips() {
+        for v in [
+            vec![],
+            vec!["a".to_string()],
+            vec!["".to_string(), "short".to_string(), "x".repeat(20)],
+            vec!["1234567".to_string(), "12345678".to_string()], // 7-byte inline vs 8-byte pointer
+        ] {
+            let bytes = serialize_binary_array_str(&v);
+            assert_eq!(deserialize_binary_array_str(&bytes).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn binary_array_long_round_trips() {
+        for v in [
+            vec![],
+            vec![Some(1i64), None, Some(-5), Some(i64::MAX)],
+            vec![None, None],
+        ] {
+            let bytes = serialize_binary_array_long(&v);
+            assert_eq!(deserialize_binary_array_long(&bytes).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn binary_array_str_rejects_truncated() {
+        assert!(deserialize_binary_array_str(&[1, 0]).is_err()); // < 4 header bytes
+    }
+
+    #[test]
+    fn binary_array_rejects_huge_length_prefix() {
+        // A 4-byte buffer whose length prefix decodes to i32::MAX must return an
+        // Err rather than eagerly reserving a huge Vec (capacity-overflow / OOM).
+        let huge = [0xFF, 0xFF, 0xFF, 0x7F];
+        assert!(deserialize_binary_array_str(&huge).is_err());
+        assert!(deserialize_binary_array_long(&huge).is_err());
+    }
+
+    #[test]
+    fn binary_array_long_rejects_all_null_amplification() {
+        // Forged input: a large element count with an all-ones null bitmap and
+        // NO element slots. Null elements skip the per-slot bounds check, so
+        // without an up-front `count * 8 <= remaining` guard the loop would
+        // push `count` `None`s from a tiny buffer (~128x memory amplification),
+        // reachable through the C entry point (OOM risk). Must error, not
+        // allocate.
+        let count: i32 = 8000;
+        let bitmap_len = (count as usize).div_ceil(8); // 1000 bytes
+        let mut buf = Vec::with_capacity(4 + bitmap_len);
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend(std::iter::repeat_n(0xFFu8, bitmap_len)); // every element null
+        assert!(deserialize_binary_array_long(&buf).is_err());
+    }
+}

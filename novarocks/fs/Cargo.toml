@@ -27,6 +27,7 @@ doctest = false
 arrow = "58.2.0"
 bytes = "1"
 crc32c = "0.6"
+futures = "0.3"
 libc = "0.2"
 opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
 orc-rust = { version = "0.8.0", default-features = false }

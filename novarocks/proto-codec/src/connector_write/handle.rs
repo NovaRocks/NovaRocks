@@ -15,955 +15,131 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Structural validation of the logical writer handle carrier.
+//! Validation of the provider-neutral writer-handle carrier.
 
 use novarocks_proto_models::connector_write as dto;
+use novarocks_spi::connector::{ConnectorCodecCategory, ConnectorEncodedPayload};
 use prost::Message;
 
-use super::shared::{
-    validate_artifact_partition, validate_content_range, validate_file_content,
-    validate_file_format,
-};
-use super::{
-    MAX_EQUALITY_DELETE_COLUMNS, MAX_NAME_BYTES, MAX_OLD_DELETE_MERGE_TARGETS,
-    MAX_OLD_DELETE_REFERENCES, MAX_PARTITION_COLUMNS, MAX_PATH_BYTES, MAX_SCHEMA_JSON_BYTES,
-    MAX_TRANSFORM_EXPR_BYTES, MAX_TRANSFORM_EXPRS, MAX_WRITER_HANDLE_ENCODED_BYTES, bounded_count,
-    bounded_text, inconsistent, invalid_enum, missing, nonnegative_i64, out_of_range,
-};
-use crate::{FieldPath, ProtocolError};
+use super::MAX_WRITER_HANDLE_ENCODED_BYTES;
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 
-/// A writer handle whose carrier is canonical, in bounds, and structurally an
-/// Iceberg write recipe.
+/// A writer handle whose public envelope is structurally valid and bounded.
 ///
-/// Being validated says nothing about whether the recipe describes a legal
-/// Iceberg write: that judgement needs the table, and belongs to the provider's
-/// own constructors. What it does guarantee is that no unbounded, unnamed, or
-/// self-contradictory field reaches them.
-#[derive(Clone, Debug, PartialEq)]
+/// The public codec deliberately retains only the provider-neutral envelope.
+/// The installed provider binding validates provider, catalog generation and
+/// codec revision before interpreting the private bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedWriterHandle {
-    raw: dto::ConnectorWriterHandle,
+    provider_payload: ConnectorEncodedPayload,
 }
 
 impl ValidatedWriterHandle {
     pub fn parse(raw: dto::ConnectorWriterHandle, path: FieldPath) -> Result<Self, ProtocolError> {
-        // Size is checked first: an oversized carrier is rejected before it is
-        // walked, not after the walk happens to allocate.
         let encoded_len = raw.encoded_len();
         if encoded_len > MAX_WRITER_HANDLE_ENCODED_BYTES {
-            return Err(out_of_range(
+            return Err(ProtocolError::new(
                 path,
+                ProtocolErrorKind::OutOfRange,
                 format!(
                     "writer handle encodes to {encoded_len} bytes, over the hard limit {MAX_WRITER_HANDLE_ENCODED_BYTES}"
                 ),
             ));
         }
-        let handle = raw.handle.as_ref().ok_or_else(|| {
-            missing(
-                path.clone(),
-                "a writer handle requires one provider variant",
-            )
-        })?;
-        match handle {
-            dto::connector_writer_handle::Handle::Iceberg(iceberg) => {
-                validate_iceberg_writer_handle(iceberg, path.field("iceberg"))?;
-            }
-        }
-        Ok(Self { raw })
+        let provider_payload = crate::connector_common::decode_embedded_connector_payload(
+            raw.provider_payload.as_ref(),
+            ConnectorCodecCategory::WriteHandle,
+            MAX_WRITER_HANDLE_ENCODED_BYTES,
+            path.field("provider_payload"),
+        )?;
+        Ok(Self { provider_payload })
     }
 
-    pub const fn as_proto(&self) -> &dto::ConnectorWriterHandle {
-        &self.raw
+    pub const fn provider_payload(&self) -> &ConnectorEncodedPayload {
+        &self.provider_payload
+    }
+
+    pub fn into_provider_payload(self) -> ConnectorEncodedPayload {
+        self.provider_payload
+    }
+
+    /// Rebuild the canonical public protobuf without retaining a second copy.
+    pub fn as_proto(&self) -> dto::ConnectorWriterHandle {
+        dto::ConnectorWriterHandle {
+            provider_payload: Some(crate::connector_common::encode_connector_payload_message(
+                &self.provider_payload,
+            )),
+        }
     }
 
     pub fn into_proto(self) -> dto::ConnectorWriterHandle {
-        self.raw
-    }
-
-    pub fn iceberg(&self) -> &dto::IcebergWriterHandle {
-        match self.raw.handle.as_ref() {
-            Some(dto::connector_writer_handle::Handle::Iceberg(iceberg)) => iceberg,
-            None => unreachable!("a validated writer handle always carries a variant"),
+        dto::ConnectorWriterHandle {
+            provider_payload: Some(crate::connector_common::encode_connector_payload_message(
+                &self.provider_payload,
+            )),
         }
     }
-}
-
-fn validate_write_branch(
-    value: i32,
-    path: FieldPath,
-) -> Result<dto::IcebergWriteBranch, ProtocolError> {
-    match dto::IcebergWriteBranch::try_from(value) {
-        Ok(dto::IcebergWriteBranch::Unspecified) | Err(_) => Err(invalid_enum(
-            path,
-            "write branch must be a named Iceberg write branch",
-        )),
-        Ok(branch) => Ok(branch),
-    }
-}
-
-fn validate_table_facts(
-    table: Option<&dto::IcebergWriteTableFacts>,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    let table =
-        table.ok_or_else(|| missing(path.clone(), "a writer handle requires its table facts"))?;
-    bounded_text(
-        &table.table_uuid,
-        MAX_NAME_BYTES,
-        path.clone().field("table_uuid"),
-        false,
-    )?;
-    bounded_text(
-        &table.namespace,
-        MAX_NAME_BYTES,
-        path.clone().field("namespace"),
-        false,
-    )?;
-    bounded_text(
-        &table.table_name,
-        MAX_NAME_BYTES,
-        path.clone().field("table_name"),
-        false,
-    )?;
-    bounded_text(
-        &table.table_location,
-        MAX_PATH_BYTES,
-        path.clone().field("table_location"),
-        false,
-    )?;
-    bounded_text(
-        &table.data_location,
-        MAX_PATH_BYTES,
-        path.clone().field("data_location"),
-        false,
-    )?;
-    bounded_text(
-        &table.target_ref,
-        MAX_NAME_BYTES,
-        path.clone().field("target_ref"),
-        false,
-    )?;
-    nonnegative_i64(
-        table.base_sequence_number,
-        path.clone().field("base_sequence_number"),
-        "base sequence number",
-    )?;
-    if table.schema_id < 0 {
-        return Err(out_of_range(
-            path.clone().field("schema_id"),
-            "schema id must be nonnegative",
-        ));
-    }
-    if table.default_partition_spec_id < 0 {
-        return Err(out_of_range(
-            path.clone().field("default_partition_spec_id"),
-            "default partition spec id must be nonnegative",
-        ));
-    }
-    // Iceberg has exactly three table format versions today. An unnamed one is
-    // a rejection rather than an optimistic "probably compatible".
-    if !(1..=3).contains(&table.format_version) {
-        return Err(out_of_range(
-            path.field("format_version"),
-            format!(
-                "table format version {} is outside the supported range 1..=3",
-                table.format_version
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_data_recipe(
-    recipe: &dto::IcebergDataBranchRecipe,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    if let Some(schema_json) = recipe.input_schema_json.as_ref() {
-        bounded_text(
-            schema_json,
-            MAX_SCHEMA_JSON_BYTES,
-            path.clone().field("input_schema_json"),
-            false,
-        )?;
-    }
-    for (field, label) in [
-        (
-            &recipe.partition_source_column_names,
-            "partition_source_column_names",
-        ),
-        (&recipe.partition_column_names, "partition_column_names"),
-    ] {
-        bounded_count(
-            field.len(),
-            MAX_PARTITION_COLUMNS,
-            path.clone().field(label),
-            "partition column",
-        )?;
-        for (index, name) in field.iter().enumerate() {
-            bounded_text(
-                name,
-                MAX_NAME_BYTES,
-                path.clone().field(label).index(index),
-                false,
-            )?;
-        }
-    }
-    bounded_count(
-        recipe.transform_exprs.len(),
-        MAX_TRANSFORM_EXPRS,
-        path.clone().field("transform_exprs"),
-        "transform expression",
-    )?;
-    for (index, expr) in recipe.transform_exprs.iter().enumerate() {
-        bounded_text(
-            expr,
-            MAX_TRANSFORM_EXPR_BYTES,
-            path.clone().field("transform_exprs").index(index),
-            false,
-        )?;
-    }
-    // A partition column with no transform, or the reverse, would leave the
-    // writer guessing which pairing was meant.
-    if recipe.partition_column_names.len() != recipe.transform_exprs.len() {
-        return Err(inconsistent(
-            path,
-            "each partition column requires exactly one transform expression",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_equality_recipe(
-    recipe: &dto::IcebergEqualityDeleteRecipe,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    bounded_count(
-        recipe.columns.len(),
-        MAX_EQUALITY_DELETE_COLUMNS,
-        path.clone().field("columns"),
-        "equality delete column",
-    )?;
-    // A file that matches on nothing would delete every row it is applied to.
-    if recipe.columns.is_empty() {
-        return Err(inconsistent(
-            path.clone().field("columns"),
-            "an equality delete matches on at least one column",
-        ));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for (index, column) in recipe.columns.iter().enumerate() {
-        let column_path = path.clone().field("columns").index(index);
-        bounded_text(
-            &column.name,
-            MAX_NAME_BYTES,
-            column_path.clone().field("name"),
-            false,
-        )?;
-        bounded_text(
-            &column.data_type,
-            MAX_NAME_BYTES,
-            column_path.clone().field("data_type"),
-            false,
-        )?;
-        if column.field_id < 0 {
-            return Err(out_of_range(
-                column_path.clone().field("field_id"),
-                "an equality delete column field id must be nonnegative",
-            ));
-        }
-        // A repeated field id would make the same column part of the match key
-        // twice, and Iceberg reads the ids back as a set.
-        if !seen.insert(column.field_id) {
-            return Err(inconsistent(
-                column_path.field("field_id"),
-                "equality delete columns must name distinct field ids",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_old_delete_reference(
-    reference: &dto::IcebergOldDeleteArtifactRef,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    bounded_text(
-        &reference.path,
-        MAX_PATH_BYTES,
-        path.clone().field("path"),
-        false,
-    )?;
-    let content = validate_file_content(reference.content, path.clone().field("content"))?;
-    if content != dto::IcebergFileContent::PositionDeletes {
-        return Err(inconsistent(
-            path.field("content"),
-            "an old delete reference must name position deletes",
-        ));
-    }
-    let format = validate_file_format(reference.file_format, path.clone().field("file_format"))?;
-    if reference.file_size_in_bytes == 0 {
-        return Err(out_of_range(
-            path.clone().field("file_size_in_bytes"),
-            "an old delete artifact cannot be empty",
-        ));
-    }
-    if reference.partition_spec_id < 0 {
-        return Err(out_of_range(
-            path.clone().field("partition_spec_id"),
-            "partition spec id must be nonnegative",
-        ));
-    }
-    if let Some(range) = reference.content_range.as_ref() {
-        validate_content_range(range, path.clone().field("content_range"))?;
-    }
-    // A Puffin blob is one of several in its container, so it is only
-    // addressable with a range and only meaningful against a named data file.
-    // A Parquet delete file is the whole file, so a range would contradict it.
-    match format {
-        dto::IcebergFileFormat::Puffin => {
-            if reference.content_range.is_none() {
-                return Err(inconsistent(
-                    path.clone().field("content_range"),
-                    "a Puffin deletion vector requires its blob range",
-                ));
-            }
-            if reference.referenced_data_file.is_none() {
-                return Err(inconsistent(
-                    path.clone().field("referenced_data_file"),
-                    "a Puffin deletion vector requires its referenced data file",
-                ));
-            }
-        }
-        dto::IcebergFileFormat::Parquet => {
-            if reference.content_range.is_some() {
-                return Err(inconsistent(
-                    path.clone().field("content_range"),
-                    "a Parquet delete file has no blob range",
-                ));
-            }
-        }
-        dto::IcebergFileFormat::Unspecified => unreachable!("validated above"),
-    }
-    if let Some(referenced) = reference.referenced_data_file.as_ref() {
-        bounded_text(
-            referenced,
-            MAX_PATH_BYTES,
-            path.clone().field("referenced_data_file"),
-            false,
-        )?;
-    }
-    let route = reference.storage_route.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("storage_route"),
-            "an old delete reference requires its storage route",
-        )
-    })?;
-    bounded_text(
-        &route.access_binding,
-        MAX_NAME_BYTES,
-        path.field("storage_route").field("access_binding"),
-        false,
-    )
-}
-
-fn validate_old_delete_target(
-    target: &dto::IcebergOldDeleteMergeTarget,
-    key: &str,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    bounded_text(
-        &target.data_file_path,
-        MAX_PATH_BYTES,
-        path.clone().field("data_file_path"),
-        false,
-    )?;
-    // The map key and the target must name the same file, or a lookup and the
-    // merge it drives would disagree about which data file is being rewritten.
-    if target.data_file_path != key {
-        return Err(inconsistent(
-            path.clone().field("data_file_path"),
-            "an old delete target must be keyed by its own data file path",
-        ));
-    }
-    nonnegative_i64(
-        target.base_snapshot_id,
-        path.clone().field("base_snapshot_id"),
-        "base snapshot id",
-    )?;
-    validate_artifact_partition(target.partition.as_ref(), path.clone().field("partition"))?;
-    bounded_count(
-        target.references.len(),
-        MAX_OLD_DELETE_REFERENCES,
-        path.clone().field("references"),
-        "old delete reference",
-    )?;
-    let mut previous: Option<&str> = None;
-    for (index, reference) in target.references.iter().enumerate() {
-        let reference_path = path.clone().field("references").index(index);
-        validate_old_delete_reference(reference, reference_path.clone())?;
-        // Sorted and unique rather than repaired: two spellings of one artifact
-        // would be merged twice, and an order that depends on who built the
-        // handle would make the same write two different writes.
-        if let Some(previous) = previous
-            && previous >= reference.path.as_str()
-        {
-            return Err(inconsistent(
-                reference_path.field("path"),
-                "old delete references must be sorted and unique by path",
-            ));
-        }
-        previous = Some(reference.path.as_str());
-    }
-    Ok(())
-}
-
-fn validate_iceberg_writer_handle(
-    handle: &dto::IcebergWriterHandle,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    let branch = validate_write_branch(handle.branch, path.clone().field("branch"))?;
-    validate_table_facts(handle.table.as_ref(), path.clone().field("table"))?;
-    let output = handle.output.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("output"),
-            "a writer handle requires its output settings",
-        )
-    })?;
-    validate_file_format(
-        output.file_format,
-        path.clone().field("output").field("file_format"),
-    )?;
-    if let Some(size) = output.parquet_row_group_size_bytes
-        && size == 0
-    {
-        return Err(out_of_range(
-            path.clone()
-                .field("output")
-                .field("parquet_row_group_size_bytes"),
-            "a parquet row group must hold at least one byte",
-        ));
-    }
-
-    // The branch decides which of the two optional recipes must be present.
-    // Accepting both, or neither, would let a writer pick.
-    match branch {
-        dto::IcebergWriteBranch::Data => {
-            let recipe = handle.data.as_ref().ok_or_else(|| {
-                inconsistent(
-                    path.clone().field("data"),
-                    "a data branch requires its data recipe",
-                )
-            })?;
-            validate_data_recipe(recipe, path.clone().field("data"))?;
-            if !handle.old_deletes.is_empty() {
-                return Err(inconsistent(
-                    path.clone().field("old_deletes"),
-                    "a data branch never merges old delete artifacts",
-                ));
-            }
-            if handle.equality.is_some() {
-                return Err(inconsistent(
-                    path.field("equality"),
-                    "a data branch has no equality recipe",
-                ));
-            }
-        }
-        dto::IcebergWriteBranch::PositionDelete | dto::IcebergWriteBranch::DeletionVector => {
-            if handle.data.is_some() {
-                return Err(inconsistent(
-                    path.clone().field("data"),
-                    "a delete branch has no data recipe",
-                ));
-            }
-            if handle.equality.is_some() {
-                return Err(inconsistent(
-                    path.clone().field("equality"),
-                    "a position-delete branch has no equality recipe",
-                ));
-            }
-            bounded_count(
-                handle.old_deletes.len(),
-                MAX_OLD_DELETE_MERGE_TARGETS,
-                path.clone().field("old_deletes"),
-                "old delete merge target",
-            )?;
-            for (key, target) in &handle.old_deletes {
-                let target_path = path.clone().field("old_deletes").map_key(key.clone());
-                validate_old_delete_target(target, key, target_path)?;
-            }
-        }
-        dto::IcebergWriteBranch::EqualityDelete => {
-            if handle.data.is_some() {
-                return Err(inconsistent(
-                    path.clone().field("data"),
-                    "an equality-delete branch has no data recipe",
-                ));
-            }
-            // An equality delete supersedes no existing artifact, so a frozen
-            // old-delete target here would name a merge it never performs.
-            if !handle.old_deletes.is_empty() {
-                return Err(inconsistent(
-                    path.clone().field("old_deletes"),
-                    "an equality-delete branch never merges old delete artifacts",
-                ));
-            }
-            let recipe = handle.equality.as_ref().ok_or_else(|| {
-                inconsistent(
-                    path.clone().field("equality"),
-                    "an equality-delete branch requires its equality recipe",
-                )
-            })?;
-            validate_equality_recipe(recipe, path.field("equality"))?;
-        }
-        dto::IcebergWriteBranch::Unspecified => unreachable!("validated above"),
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorCodecRevision, ConnectorEnvelopeHeader,
+        ConnectorInstanceId, ConnectorProviderId,
+    };
+
     use super::*;
-    use crate::ProtocolErrorKind;
 
-    fn table() -> dto::IcebergWriteTableFacts {
-        dto::IcebergWriteTableFacts {
-            table_uuid: "9c2f1f66-1f0f-4c9a-9a1a-3f1d2c0b7a11".to_string(),
-            namespace: "db".to_string(),
-            table_name: "t".to_string(),
-            table_location: "s3://bucket/db/t".to_string(),
-            data_location: "s3://bucket/db/t/data".to_string(),
-            target_ref: "main".to_string(),
-            base_snapshot_id: Some(7),
-            base_sequence_number: 3,
-            schema_id: 0,
-            default_partition_spec_id: 0,
-            format_version: 2,
-        }
-    }
-
-    fn output() -> dto::IcebergWriterOutput {
-        dto::IcebergWriterOutput {
-            file_format: dto::IcebergFileFormat::Parquet as i32,
-            compression: dto::IcebergCompression::Zstd as i32,
-            parquet_row_group_size_bytes: Some(1024),
-        }
-    }
-
-    fn partition() -> dto::IcebergArtifactPartition {
-        dto::IcebergArtifactPartition {
-            partition_path: String::new(),
-            null_fingerprint: String::new(),
-            partition_spec_id: 0,
-            descriptor: Some(dto::IcebergPartitionDescriptor { values: Vec::new() }),
-        }
-    }
-
-    fn data_handle() -> dto::ConnectorWriterHandle {
+    fn raw(category: ConnectorCodecCategory) -> dto::ConnectorWriterHandle {
+        let catalog = ConnectorInstanceId::try_from_canonical("lake").unwrap();
+        let payload = ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                ConnectorProviderId::parse("test").unwrap(),
+                CatalogHandle::new(catalog, CatalogVersion::from_bytes([7; 32])),
+                category,
+                ConnectorCodecRevision::try_new(1).unwrap(),
+            ),
+            Bytes::from_static(b"private"),
+        );
         dto::ConnectorWriterHandle {
-            handle: Some(dto::connector_writer_handle::Handle::Iceberg(
-                dto::IcebergWriterHandle {
-                    branch: dto::IcebergWriteBranch::Data as i32,
-                    table: Some(table()),
-                    output: Some(output()),
-                    data: Some(dto::IcebergDataBranchRecipe {
-                        input_schema_json: None,
-                        partition_source_column_names: vec!["d".to_string()],
-                        partition_column_names: vec!["d_day".to_string()],
-                        transform_exprs: vec!["day(d)".to_string()],
-                        row_lineage: false,
-                    }),
-                    old_deletes: std::collections::BTreeMap::new(),
-                    equality: None,
-                },
+            provider_payload: Some(crate::connector_common::encode_connector_payload_message(
+                &payload,
             )),
         }
     }
 
-    fn puffin_reference(path: &str) -> dto::IcebergOldDeleteArtifactRef {
-        dto::IcebergOldDeleteArtifactRef {
-            path: path.to_string(),
-            content: dto::IcebergFileContent::PositionDeletes as i32,
-            file_format: dto::IcebergFileFormat::Puffin as i32,
-            file_size_in_bytes: 128,
-            record_count: 4,
-            content_range: Some(dto::IcebergContentRange {
-                offset: 4,
-                size_in_bytes: 64,
-            }),
-            referenced_data_file: Some("s3://bucket/db/t/data/a.parquet".to_string()),
-            data_sequence_number: Some(2),
-            added_snapshot_id: Some(9),
-            partition_spec_id: 0,
-            storage_route: Some(dto::IcebergStorageRoute {
-                access_binding: "s3://bucket/db/t".to_string(),
-            }),
-        }
+    #[test]
+    fn retains_only_the_validated_provider_payload() {
+        let raw = raw(ConnectorCodecCategory::WriteHandle);
+        let validated =
+            ValidatedWriterHandle::parse(raw.clone(), FieldPath::root("writer_handle")).unwrap();
+        assert_eq!(validated.provider_payload().payload().as_ref(), b"private");
+        assert_eq!(validated.as_proto(), raw);
     }
 
-    fn delete_handle(
-        references: Vec<dto::IcebergOldDeleteArtifactRef>,
-    ) -> dto::ConnectorWriterHandle {
-        let data_file = "s3://bucket/db/t/data/a.parquet".to_string();
-        let mut old_deletes = std::collections::BTreeMap::new();
-        old_deletes.insert(
-            data_file.clone(),
-            dto::IcebergOldDeleteMergeTarget {
-                data_file_path: data_file,
-                data_file_record_count: 100,
-                data_file_sequence_number: Some(2),
-                partition: Some(partition()),
-                base_snapshot_id: 9,
-                references,
+    #[test]
+    fn rejects_a_missing_payload() {
+        let error = ValidatedWriterHandle::parse(
+            dto::ConnectorWriterHandle {
+                provider_payload: None,
             },
-        );
-        dto::ConnectorWriterHandle {
-            handle: Some(dto::connector_writer_handle::Handle::Iceberg(
-                dto::IcebergWriterHandle {
-                    branch: dto::IcebergWriteBranch::DeletionVector as i32,
-                    table: Some(table()),
-                    output: Some(dto::IcebergWriterOutput {
-                        file_format: dto::IcebergFileFormat::Puffin as i32,
-                        compression: dto::IcebergCompression::None as i32,
-                        parquet_row_group_size_bytes: None,
-                    }),
-                    data: None,
-                    old_deletes,
-                    equality: None,
-                },
-            )),
-        }
-    }
-
-    fn equality_handle(
-        columns: Vec<dto::IcebergEqualityDeleteColumn>,
-    ) -> dto::ConnectorWriterHandle {
-        dto::ConnectorWriterHandle {
-            handle: Some(dto::connector_writer_handle::Handle::Iceberg(
-                dto::IcebergWriterHandle {
-                    branch: dto::IcebergWriteBranch::EqualityDelete as i32,
-                    table: Some(table()),
-                    output: Some(output()),
-                    data: None,
-                    old_deletes: std::collections::BTreeMap::new(),
-                    equality: Some(dto::IcebergEqualityDeleteRecipe { columns }),
-                },
-            )),
-        }
-    }
-
-    fn equality_column(name: &str, field_id: i32) -> dto::IcebergEqualityDeleteColumn {
-        dto::IcebergEqualityDeleteColumn {
-            name: name.to_string(),
-            field_id,
-            data_type: "Int64".to_string(),
-            nullable: true,
-        }
-    }
-
-    fn parse(raw: dto::ConnectorWriterHandle) -> Result<ValidatedWriterHandle, ProtocolError> {
-        ValidatedWriterHandle::parse(raw, FieldPath::root("writer_handle"))
+            FieldPath::root("writer_handle"),
+        )
+        .unwrap_err();
+        assert_eq!(error.path().to_string(), "writer_handle.provider_payload");
     }
 
     #[test]
-    fn a_well_formed_handle_round_trips_through_its_carrier() {
-        let raw = data_handle();
-        let validated = parse(raw.clone()).expect("valid data handle");
-        assert_eq!(validated.as_proto(), &raw);
-        assert_eq!(validated.into_proto(), raw);
-
-        let raw = delete_handle(vec![
-            puffin_reference("s3://bucket/db/t/data/a-dv-1.puffin"),
-            puffin_reference("s3://bucket/db/t/data/a-dv-2.puffin"),
-        ]);
-        let validated = parse(raw.clone()).expect("valid delete handle");
-        assert_eq!(validated.iceberg().old_deletes.len(), 1);
-        assert_eq!(validated.as_proto(), &raw);
-    }
-
-    /// Grow a valid data-branch handle until it encodes to exactly `target`
-    /// bytes.
-    ///
-    /// Transform expressions are the only field with room to reach sixteen
-    /// megabytes, and each one is separately capped, so the padding is spread
-    /// over full-size expressions plus a final one whose length is solved for.
-    /// Every added expression needs its paired partition column, or the recipe
-    /// would be rejected for a reason that has nothing to do with size. Kept
-    /// inside the 16 KiB..64 KiB band the final length keeps a three-byte
-    /// protobuf length prefix, so one added byte is one added encoded byte and
-    /// the solve settles in a single correction.
-    fn handle_encoding_exactly(target: usize) -> dto::ConnectorWriterHandle {
-        let full = target / MAX_TRANSFORM_EXPR_BYTES - 1;
-        let build = |last: usize| {
-            let mut raw = data_handle();
-            let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-                raw.handle.as_mut().expect("variant");
-            let data = iceberg.data.as_mut().expect("data recipe");
-            for index in 0..=full {
-                let bytes = if index == full {
-                    last
-                } else {
-                    MAX_TRANSFORM_EXPR_BYTES
-                };
-                data.partition_column_names.push(format!("pad_{index}"));
-                data.transform_exprs.push("e".repeat(bytes));
-            }
-            raw
-        };
-
-        let mut last = 32 * 1024;
-        for _ in 0..4 {
-            let candidate = build(last);
-            let encoded_len = candidate.encoded_len();
-            if encoded_len == target {
-                return candidate;
-            }
-            let correction = isize::try_from(target).expect("bounded")
-                - isize::try_from(encoded_len).expect("bounded");
-            last = last
-                .checked_add_signed(correction)
-                .expect("the correction stays positive");
-            assert!(
-                (16 * 1024..=MAX_TRANSFORM_EXPR_BYTES).contains(&last),
-                "the tuning expression left the constant-width band at {last} bytes"
-            );
-        }
-        panic!("could not pad a writer handle to exactly {target} bytes");
-    }
-
-    /// Reaching the frozen single-handle budget is legal; the gate rejects only
-    /// what exceeds it.
-    #[test]
-    fn a_handle_at_exactly_the_frozen_budget_is_accepted() {
-        let raw = handle_encoding_exactly(MAX_WRITER_HANDLE_ENCODED_BYTES);
-        assert_eq!(raw.encoded_len(), MAX_WRITER_HANDLE_ENCODED_BYTES);
-        parse(raw).expect("the exact single-handle budget is legal");
-    }
-
-    /// One byte over the same budget, with every other field still valid, so
-    /// the size gate is the only thing that can reject it -- and it names the
-    /// carrier rather than a field, because it fires before the walk.
-    #[test]
-    fn a_handle_one_byte_over_the_frozen_budget_is_rejected() {
-        let raw = handle_encoding_exactly(MAX_WRITER_HANDLE_ENCODED_BYTES + 1);
-        assert_eq!(raw.encoded_len(), MAX_WRITER_HANDLE_ENCODED_BYTES + 1);
-        let error = parse(raw).expect_err("one byte over the single-handle budget");
-        assert_eq!(error.kind(), ProtocolErrorKind::OutOfRange);
-        assert_eq!(error.path().to_string(), "writer_handle");
-    }
-
-    #[test]
-    fn a_handle_without_a_provider_variant_is_a_missing_field() {
-        let error = parse(dto::ConnectorWriterHandle { handle: None }).expect_err("no variant");
-        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
-        assert_eq!(error.path().to_string(), "writer_handle");
-    }
-
-    #[test]
-    fn an_unnamed_enum_value_is_rejected_rather_than_defaulted() {
-        let mut raw = data_handle();
-        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-            raw.handle.as_mut().expect("variant");
-        iceberg.branch = dto::IcebergWriteBranch::Unspecified as i32;
-        let error = parse(raw).expect_err("unspecified branch");
-        assert_eq!(error.kind(), ProtocolErrorKind::InvalidEnum);
-        assert_eq!(error.path().to_string(), "writer_handle.iceberg.branch");
-    }
-
-    #[test]
-    fn the_branch_decides_which_recipe_must_be_present() {
-        // A data branch that also claims old deletes.
-        let mut raw = data_handle();
-        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-            raw.handle.as_mut().expect("variant");
-        iceberg.old_deletes.insert(
-            "s3://bucket/db/t/data/a.parquet".to_string(),
-            dto::IcebergOldDeleteMergeTarget {
-                data_file_path: "s3://bucket/db/t/data/a.parquet".to_string(),
-                data_file_record_count: 1,
-                data_file_sequence_number: None,
-                partition: Some(partition()),
-                base_snapshot_id: 1,
-                references: Vec::new(),
-            },
-        );
-        let error = parse(raw).expect_err("data branch with old deletes");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
+    fn rejects_a_payload_for_another_category() {
+        let error = ValidatedWriterHandle::parse(
+            raw(ConnectorCodecCategory::CommitFragment),
+            FieldPath::root("writer_handle"),
+        )
+        .unwrap_err();
         assert_eq!(
             error.path().to_string(),
-            "writer_handle.iceberg.old_deletes"
+            "writer_handle.provider_payload.header"
         );
-
-        // A delete branch that also claims a data recipe.
-        let mut raw = delete_handle(Vec::new());
-        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-            raw.handle.as_mut().expect("variant");
-        iceberg.data = Some(dto::IcebergDataBranchRecipe {
-            input_schema_json: None,
-            partition_source_column_names: Vec::new(),
-            partition_column_names: Vec::new(),
-            transform_exprs: Vec::new(),
-            row_lineage: false,
-        });
-        let error = parse(raw).expect_err("delete branch with a data recipe");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-        assert_eq!(error.path().to_string(), "writer_handle.iceberg.data");
-    }
-
-    #[test]
-    fn a_puffin_reference_needs_its_blob_range_and_a_parquet_one_must_not_have_it() {
-        let mut reference = puffin_reference("s3://bucket/db/t/data/a-dv.puffin");
-        reference.content_range = None;
-        let error = parse(delete_handle(vec![reference])).expect_err("puffin without a range");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-        assert_eq!(
-            error.path().to_string(),
-            "writer_handle.iceberg.old_deletes[\"s3://bucket/db/t/data/a.parquet\"].references[0].content_range"
-        );
-
-        let mut reference = puffin_reference("s3://bucket/db/t/data/a-pos.parquet");
-        reference.file_format = dto::IcebergFileFormat::Parquet as i32;
-        let error = parse(delete_handle(vec![reference])).expect_err("parquet with a range");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-    }
-
-    #[test]
-    fn old_delete_references_must_be_sorted_and_unique() {
-        let duplicated = vec![
-            puffin_reference("s3://bucket/db/t/data/a-dv-1.puffin"),
-            puffin_reference("s3://bucket/db/t/data/a-dv-1.puffin"),
-        ];
-        let error = parse(delete_handle(duplicated)).expect_err("duplicate reference");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-
-        let unsorted = vec![
-            puffin_reference("s3://bucket/db/t/data/a-dv-2.puffin"),
-            puffin_reference("s3://bucket/db/t/data/a-dv-1.puffin"),
-        ];
-        let error = parse(delete_handle(unsorted)).expect_err("unsorted references");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-    }
-
-    #[test]
-    fn an_old_delete_target_must_be_keyed_by_its_own_data_file() {
-        let mut raw = delete_handle(Vec::new());
-        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-            raw.handle.as_mut().expect("variant");
-        let target = iceberg
-            .old_deletes
-            .get_mut("s3://bucket/db/t/data/a.parquet")
-            .expect("target");
-        target.data_file_path = "s3://bucket/db/t/data/b.parquet".to_string();
-        let error = parse(raw).expect_err("key and target disagree");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-    }
-
-    #[test]
-    fn a_partition_value_carries_a_datum_exactly_when_it_is_not_null() {
-        for (is_null, datum) in [(true, Some(vec![1_u8])), (false, None)] {
-            let mut raw = delete_handle(Vec::new());
-            let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-                raw.handle.as_mut().expect("variant");
-            let target = iceberg
-                .old_deletes
-                .get_mut("s3://bucket/db/t/data/a.parquet")
-                .expect("target");
-            target
-                .partition
-                .as_mut()
-                .expect("partition")
-                .descriptor
-                .as_mut()
-                .expect("descriptor")
-                .values
-                .push(dto::IcebergPartitionValueDescriptor {
-                    is_null,
-                    datum_bytes: datum,
-                });
-            let error = parse(raw).expect_err("partition value disagreement");
-            assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-        }
-    }
-
-    #[test]
-    fn an_unsupported_table_format_version_is_out_of_range() {
-        for version in [0_u32, 4, 99] {
-            let mut raw = data_handle();
-            let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-                raw.handle.as_mut().expect("variant");
-            iceberg.table.as_mut().expect("table").format_version = version;
-            let error = parse(raw).expect_err("unsupported format version");
-            assert_eq!(error.kind(), ProtocolErrorKind::OutOfRange);
-            assert_eq!(
-                error.path().to_string(),
-                "writer_handle.iceberg.table.format_version"
-            );
-        }
-    }
-
-    #[test]
-    fn an_equality_delete_branch_carries_its_own_recipe_and_nothing_else() {
-        let raw = equality_handle(vec![equality_column("id", 1), equality_column("k", 2)]);
-        let validated = parse(raw.clone()).expect("valid equality handle");
-        assert_eq!(validated.as_proto(), &raw);
-
-        // No recipe at all: the writer would have no match key.
-        let mut raw = equality_handle(vec![equality_column("id", 1)]);
-        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-            raw.handle.as_mut().expect("variant");
-        iceberg.equality = None;
-        let error = parse(raw).expect_err("equality branch without a recipe");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-        assert_eq!(error.path().to_string(), "writer_handle.iceberg.equality");
-
-        // An equality delete supersedes nothing, so it never freezes an old
-        // delete merge target.
-        let mut raw = equality_handle(vec![equality_column("id", 1)]);
-        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-            raw.handle.as_mut().expect("variant");
-        iceberg.old_deletes.insert(
-            "s3://bucket/db/t/data/a.parquet".to_string(),
-            dto::IcebergOldDeleteMergeTarget {
-                data_file_path: "s3://bucket/db/t/data/a.parquet".to_string(),
-                data_file_record_count: 1,
-                data_file_sequence_number: None,
-                partition: Some(partition()),
-                base_snapshot_id: 1,
-                references: Vec::new(),
-            },
-        );
-        let error = parse(raw).expect_err("equality branch with old deletes");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-        assert_eq!(
-            error.path().to_string(),
-            "writer_handle.iceberg.old_deletes"
-        );
-    }
-
-    #[test]
-    fn an_equality_recipe_needs_at_least_one_distinct_column() {
-        let error = parse(equality_handle(Vec::new())).expect_err("no equality column");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-
-        let error = parse(equality_handle(vec![
-            equality_column("id", 1),
-            equality_column("also_id", 1),
-        ]))
-        .expect_err("repeated field id");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-    }
-
-    #[test]
-    fn every_partition_column_needs_exactly_one_transform() {
-        let mut raw = data_handle();
-        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-            raw.handle.as_mut().expect("variant");
-        iceberg
-            .data
-            .as_mut()
-            .expect("recipe")
-            .transform_exprs
-            .clear();
-        let error = parse(raw).expect_err("column without a transform");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-        assert_eq!(error.path().to_string(), "writer_handle.iceberg.data");
     }
 }

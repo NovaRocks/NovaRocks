@@ -28,6 +28,7 @@ const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 const MAX_FORMAT_NAME_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Design: ADR-0137 (docs/adr/ADR-0137-provider-owned-private-connector-wire.md)
 pub struct ConnectorCodecDeclaration {
     provider_id: ConnectorProviderId,
     category: ConnectorCodecCategory,

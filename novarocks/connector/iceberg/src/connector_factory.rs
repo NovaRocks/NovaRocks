@@ -38,7 +38,6 @@ use crate::metadata_context::IcebergMetadataContext;
 use crate::provider_binding::IcebergInstanceDistribution;
 use crate::resources::IcebergMetadataResources;
 use crate::typed_boundary::{IcebergTypedBoundary, IcebergTypedRequestControlFactory};
-use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadMetadata, ConnectorReadRegistrationLease, ConnectorReadRequestControlFactory,
     ConnectorReadSplitManager,
@@ -47,7 +46,7 @@ use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle, ConnectorControlBinding,
     ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorProviderBindingKey,
-    ConnectorProviderId, ProviderBindingEpoch,
+    ConnectorProviderId, ConnectorReadWireEncoder, ProviderBindingEpoch,
 };
 use std::sync::Arc;
 
@@ -65,7 +64,7 @@ pub type IcebergReadControlInstaller = Arc<
             CatalogHandle,
             Arc<dyn ConnectorReadMetadata>,
             Arc<dyn ConnectorReadSplitManager>,
-            Arc<dyn ConnectorReadEncoder>,
+            Arc<dyn ConnectorReadWireEncoder>,
             Arc<dyn ConnectorReadRequestControlFactory>,
         ) -> Result<Arc<dyn ConnectorReadRegistrationLease>, ConnectorError>
         + Send
@@ -118,9 +117,7 @@ impl IcebergConnectorFactory {
                 "Iceberg control factory requires typed catalog properties before construction",
             )
         })?;
-        if catalog_properties.provider_kind()
-            != novarocks_spi::connector::CatalogProviderKind::Iceberg
-        {
+        if catalog_properties.provider_id().as_str() != "iceberg" {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Iceberg control factory received catalog properties for another provider",
@@ -304,7 +301,7 @@ impl IcebergConnectorFactory {
                     Arc::clone(&runtime),
                 ));
                 let adapter = Arc::new(Arc::clone(&boundary).read_runtime_adapter());
-                let encoder: Arc<dyn ConnectorReadEncoder> =
+                let encoder: Arc<dyn ConnectorReadWireEncoder> =
                     Arc::new(crate::typed_read::IcebergConnectorReadWireAdapter::new(
                         adapter.as_ref().clone(),
                     ));
@@ -423,8 +420,8 @@ mod tests {
     use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
-        ConnectorInstanceId, CredentialConsumerRole, StaticCredentialReference,
+        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
+        ConnectorProviderId, CredentialConsumerRole, StaticCredentialReference,
     };
 
     use super::*;
@@ -452,7 +449,7 @@ mod tests {
     ) -> CatalogProperties {
         CatalogProperties::new(
             CatalogHandle::new(instance_id, CatalogVersion::from_bytes([0; 32])),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             properties
                 .iter()
@@ -890,7 +887,7 @@ mod tests {
             .with_catalog_properties(
                 CatalogProperties::new(
                     expected_handle.clone(),
-                    CatalogProviderKind::Iceberg,
+                    ConnectorProviderId::parse("iceberg").expect("static provider ID"),
                     1,
                     Vec::new(),
                     Vec::new(),
@@ -953,7 +950,7 @@ mod tests {
                     ConnectorInstanceId::parse("ice").expect("instance ID"),
                     CatalogVersion::from_bytes([8; 32]),
                 ),
-                CatalogProviderKind::Iceberg,
+                ConnectorProviderId::parse("iceberg").expect("static provider ID"),
                 1,
                 Vec::new(),
                 Vec::new(),

@@ -150,14 +150,14 @@ for lower_layer in \
   grep -Fq "novarocks-proto-models" "$lower_layer_wire.stderr"
 done
 
-starrocks_missing_binding="$tmpdir/starrocks-missing-binding.json"
+starrocks_missing_spi="$tmpdir/starrocks-missing-spi.json"
 jq '
   (.packages[] | select(.name == "novarocks-connector-starrocks") | .dependencies) |= map(
-    select(.name != "novarocks-connector-binding")
+    select(.name != "novarocks-spi")
   )
-' "$base_metadata" >"$starrocks_missing_binding"
-assert_rejected "$starrocks_missing_binding" \
-  "novarocks-connector-starrocks must directly declare normal dependency on novarocks-connector-binding"
+' "$base_metadata" >"$starrocks_missing_spi"
+assert_rejected "$starrocks_missing_spi" \
+  "novarocks-connector-starrocks must directly declare normal dependency on novarocks-spi"
 
 starrocks_direct_wire="$tmpdir/starrocks-direct-wire.json"
 jq '
@@ -166,7 +166,7 @@ jq '
   }]
 ' "$base_metadata" >"$starrocks_direct_wire"
 assert_rejected "$starrocks_direct_wire" \
-  "novarocks-connector-starrocks must obtain wire packages only through novarocks-connector-binding"
+  "novarocks-connector-starrocks must not directly depend on wire packages"
 
 starrocks_optional_direct_wire="$tmpdir/starrocks-optional-direct-wire.json"
 jq '
@@ -175,7 +175,7 @@ jq '
   }]
 ' "$base_metadata" >"$starrocks_optional_direct_wire"
 assert_rejected "$starrocks_optional_direct_wire" \
-  "novarocks-connector-starrocks must obtain wire packages only through novarocks-connector-binding"
+  "novarocks-connector-starrocks must not directly depend on wire packages"
 
 starrocks_server="$tmpdir/starrocks-server.json"
 add_normal_resolve_edge novarocks-connector-starrocks novarocks-server "$starrocks_server"

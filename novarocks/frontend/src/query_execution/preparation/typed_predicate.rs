@@ -99,6 +99,7 @@ pub(crate) fn connector_value_type(data_type: &DataType) -> Option<ConnectorValu
         // Eight-bit columns exist in the engine and nowhere in Iceberg, so a
         // column of this type is always one the engine derived.
         DataType::Int8 => Some(ConnectorValueType::TinyInt),
+        DataType::Int16 => Some(ConnectorValueType::SmallInt),
         DataType::Int32 => Some(ConnectorValueType::Integer),
         DataType::Int64 => Some(ConnectorValueType::BigInt),
         DataType::Float32 => Some(ConnectorValueType::Real),
@@ -122,6 +123,9 @@ pub(crate) fn connector_value_type(data_type: &DataType) -> Option<ConnectorValu
         DataType::Time64(TimeUnit::Microsecond) => Some(ConnectorValueType::TimeMicros),
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
             Some(ConnectorValueType::TimestampMicros)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, None) => {
+            Some(ConnectorValueType::TimestampMillis)
         }
         DataType::Timestamp(TimeUnit::Nanosecond, None) => Some(ConnectorValueType::TimestampNanos),
         // A zoned timestamp is exact only when the engine already states UTC.
@@ -363,6 +367,10 @@ fn lower_literal(expr: &TypedExpr, expected: ConnectorValueType) -> Option<Conne
             LiteralValue::Int(value) => ConnectorValue::TinyInt(i8::try_from(*value).ok()?),
             _ => return None,
         },
+        ConnectorValueType::SmallInt => match literal {
+            LiteralValue::Int(value) => ConnectorValue::SmallInt(i16::try_from(*value).ok()?),
+            _ => return None,
+        },
         ConnectorValueType::Integer => match literal {
             LiteralValue::Int(value) => ConnectorValue::Integer(i32::try_from(*value).ok()?),
             _ => return None,
@@ -392,6 +400,10 @@ fn lower_literal(expr: &TypedExpr, expected: ConnectorValueType) -> Option<Conne
         },
         ConnectorValueType::TimestampMicros => match literal {
             LiteralValue::Int(value) => ConnectorValue::TimestampMicros(*value),
+            _ => return None,
+        },
+        ConnectorValueType::TimestampMillis => match literal {
+            LiteralValue::Int(value) => ConnectorValue::TimestampMillis(*value),
             _ => return None,
         },
         ConnectorValueType::TimestampTzMicros => match literal {
@@ -465,8 +477,13 @@ fn unnest(mut expr: &TypedExpr) -> &TypedExpr {
 #[cfg(test)]
 pub(super) mod test_support {
     use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_proto_codec::connector_read::ValidatedColumnHandle;
     use novarocks_proto_models::connector_read as dto;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+        ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceId, ConnectorProviderId,
+    };
     use novarocks_sql::plan_read::{
         BinOp, DistributedNodeKind, ExprKind, LiteralValue, OutputColumn, PlanScanNode, TypedExpr,
     };
@@ -576,26 +593,24 @@ pub(super) mod test_support {
         }
     }
 
-    /// A validated Iceberg column handle. Which provider owns the variant is
-    /// never read by the engine; only its canonical bytes are.
+    /// A validated provider-neutral column envelope. The lowering under test
+    /// reads only its canonical bytes.
     pub(crate) fn column_handle(field_id: i32, name: &str) -> ValidatedColumnHandle {
+        let payload = ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                ConnectorProviderId::parse("fixture").expect("provider id"),
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("typed_predicate_fixture").expect("instance id"),
+                    CatalogVersion::from_bytes([1; 32]),
+                ),
+                ConnectorCodecCategory::ReadColumn,
+                ConnectorCodecRevision::try_new(1).expect("codec revision"),
+            ),
+            bytes::Bytes::from(format!("{field_id}:{name}")),
+        );
         ValidatedColumnHandle::parse(
             dto::ColumnHandle {
-                handle: Some(dto::column_handle::Handle::Iceberg(
-                    dto::IcebergColumnHandle {
-                        base_column_identity: Some(dto::ColumnIdentity {
-                            field_id,
-                            name: name.to_owned(),
-                            category: dto::ColumnIdentityCategory::Primitive as i32,
-                            children: Vec::new(),
-                        }),
-                        base_type_json: "\"long\"".to_owned(),
-                        field_id_path: Vec::new(),
-                        type_json: "\"long\"".to_owned(),
-                        nullable: true,
-                        comment: None,
-                    },
-                )),
+                provider_payload: Some(encode_connector_payload_message(&payload)),
             },
             FieldPath::root("column_handle"),
         )
@@ -605,7 +620,7 @@ pub(super) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, TimeUnit};
 
     use super::*;
 
@@ -615,7 +630,14 @@ mod tests {
             connector_value_type(&DataType::Int64),
             Some(ConnectorValueType::BigInt)
         );
-        assert_eq!(connector_value_type(&DataType::Int16), None);
+        assert_eq!(
+            connector_value_type(&DataType::Int16),
+            Some(ConnectorValueType::SmallInt)
+        );
+        assert_eq!(
+            connector_value_type(&DataType::Timestamp(TimeUnit::Millisecond, None)),
+            Some(ConnectorValueType::TimestampMillis)
+        );
         assert_eq!(
             scan_output_value_type(&DataType::LargeBinary),
             Some(ConnectorValueType::NonComparable)

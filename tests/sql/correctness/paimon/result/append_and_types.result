@@ -1,0 +1,25 @@
+-- query 1
+id	value
+1	none-a
+2	none-b
+3	none-c
+10	snappy
+20	zstd
+30	lz4-raw
+
+-- query 2
+part	id	value
+east	1	e1
+east	2	e2
+east	4	e4
+north	5	n5
+west	3	w3
+
+-- query 3
+id	c_decimal	c_binary_hex	c_date	c_timestamp
+1	12345678901234567890123456789.123456789	00FF10	2024-02-29	2024-02-29 12:34:56.123456
+2	NULL	NULL	NULL	NULL
+
+-- query 4
+row_count
+0

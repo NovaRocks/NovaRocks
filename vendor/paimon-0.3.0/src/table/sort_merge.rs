@@ -1,0 +1,3783 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Sort-merge reader with LoserTree for primary-key table reads.
+//!
+//! Merges multiple sorted `ArrowRecordBatchStream`s by primary key using a
+//! tournament tree (LoserTree), applying a [`MergeFunction`] to deduplicate
+//! rows sharing the same key.
+//!
+//! Reference:
+//! - Java Paimon: `SortMergeReaderWithMinHeap`
+//! - DataFusion: `SortPreservingMergeStream` (LoserTree layout)
+//! - Arrow-row: `RowConverter` for efficient key comparison
+
+use crate::io::{ReadControl, ReadReservation};
+use crate::spec::{AggregationConfig, CoreOptions, DataField, PartialUpdateConfig, RowKind};
+use crate::table::aggregator::{new_aggregator, FieldAggregator};
+use crate::table::ArrowRecordBatchStream;
+use crate::Error;
+use arrow_array::{new_null_array, Array, ArrayRef, Int64Array, Int8Array, RecordBatch};
+use arrow_ord::ord::make_comparator;
+use arrow_row::{RowConverter, Rows, SortField};
+use arrow_schema::{SchemaRef, SortOptions};
+use arrow_select::interleave::interleave;
+use async_stream::try_stream;
+use futures::StreamExt;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+// ---------------------------------------------------------------------------
+// MergeFunction
+// ---------------------------------------------------------------------------
+
+/// Buffered batches used by the merge reader.
+///
+/// Source batches keep the internal read schema, while materialized batches
+/// already match the merge output schema.
+#[derive(Clone)]
+pub(crate) enum BufferedBatch {
+    Source(RecordBatch),
+    Materialized(RecordBatch),
+}
+
+impl BufferedBatch {
+    fn column_for_output<'a>(
+        &'a self,
+        output_col_idx: usize,
+        source_output_col_indices: &[usize],
+    ) -> &'a dyn arrow_array::Array {
+        match self {
+            Self::Source(batch) => batch
+                .column(source_output_col_indices[output_col_idx])
+                .as_ref(),
+            Self::Materialized(batch) => batch.column(output_col_idx).as_ref(),
+        }
+    }
+}
+
+/// A row reference as an index into the batch buffer.
+pub(crate) struct MergeRow {
+    /// Index into the shared batch buffer.
+    pub batch_idx: usize,
+    pub row_idx: usize,
+    pub sequence_number: i64,
+    pub value_kind: i8,
+    /// User-defined sequence values from `sequence.field` (empty if not configured).
+    pub user_sequences: Vec<Option<i128>>,
+}
+
+#[cfg(test)]
+impl MergeRow {
+    fn source_batch<'a>(
+        &self,
+        batch_buffer: &'a [BufferedBatch],
+    ) -> crate::Result<&'a RecordBatch> {
+        match batch_buffer.get(self.batch_idx) {
+            Some(BufferedBatch::Source(batch)) => Ok(batch),
+            Some(BufferedBatch::Materialized(_)) => Err(Error::UnexpectedError {
+                message: format!(
+                    "Merge row unexpectedly referenced a materialized batch at index {}",
+                    self.batch_idx
+                ),
+                source: None,
+            }),
+            None => Err(Error::UnexpectedError {
+                message: format!(
+                    "Merge row referenced batch index {} outside the current buffer",
+                    self.batch_idx
+                ),
+                source: None,
+            }),
+        }
+    }
+}
+
+/// Merge result for rows sharing the same primary key.
+pub(crate) enum MergeResult {
+    /// Reuse an existing source row from the batch buffer.
+    SourceRow { batch_idx: usize, row_idx: usize },
+    /// Emit a synthesized one-row batch matching the merge output schema.
+    MaterializedRow(RecordBatch),
+    /// Omit this key from the output.
+    Omit,
+}
+
+/// Merge function applied to rows sharing the same primary key.
+///
+/// Deduplicate-style engines can keep returning a source row. Future
+/// field-wise engines may instead materialize a new output row.
+pub(crate) trait MergeFunction: Send + Sync {
+    /// Merge all rows sharing the same key into a final output result.
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult>;
+}
+
+/// Deduplicate merge: keeps the row with the highest sequence.
+/// When `sequence.field` is configured (one or more fields), compares user
+/// sequences lexicographically first, then falls back to system
+/// `_SEQUENCE_NUMBER` as tie-breaker.
+/// When sequence numbers are equal, keeps the last-added row (last-writer-wins).
+/// Filters out DELETE and UPDATE_BEFORE rows.
+pub(crate) struct DeduplicateMergeFunction;
+
+fn compare_sequence_order(lhs: &MergeRow, rhs: &MergeRow) -> Ordering {
+    match (lhs.user_sequences.is_empty(), rhs.user_sequences.is_empty()) {
+        (false, false) => lhs
+            .user_sequences
+            .cmp(&rhs.user_sequences)
+            .then_with(|| lhs.sequence_number.cmp(&rhs.sequence_number)),
+        _ => lhs.sequence_number.cmp(&rhs.sequence_number),
+    }
+}
+
+impl MergeFunction for DeduplicateMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        _batch_buffer: &[BufferedBatch],
+        _source_output_col_indices: &[usize],
+        _output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        let winner = rows
+            .iter()
+            .reduce(|best, r| {
+                let ord = compare_sequence_order(r, best);
+                // >= semantics: last-writer-wins for equal values.
+                if ord.is_ge() {
+                    r
+                } else {
+                    best
+                }
+            })
+            .expect("merge called with empty rows");
+        if RowKind::from_value(winner.value_kind)?.is_add() {
+            Ok(MergeResult::SourceRow {
+                batch_idx: winner.batch_idx,
+                row_idx: winner.row_idx,
+            })
+        } else {
+            Ok(MergeResult::Omit)
+        }
+    }
+}
+
+/// Partial-update merge: for each non-key column, keep the latest non-null
+/// value or apply its configured field aggregator.
+///
+/// Sequence-group aggregators use forward accumulation when the incoming
+/// group sequence is newer or equal and reversed accumulation when it is
+/// older, matching Java `PartialUpdateMergeFunction`.
+///
+/// DELETE / UPDATE_BEFORE rows are ignored when `ignore-delete=true` and
+/// treated as unsupported otherwise.
+#[derive(Debug)]
+pub(crate) struct PartialUpdateMergeFunction {
+    ignore_delete: bool,
+    sequence_groups: Vec<RuntimeSequenceGroup>,
+    grouped_fields: HashSet<usize>,
+    aggregators: Option<Mutex<FieldAggregatorSlots>>,
+}
+
+type FieldAggregatorSlots = Vec<Option<Box<dyn FieldAggregator>>>;
+
+#[derive(Debug, Clone)]
+struct RuntimeSequenceGroup {
+    sequence_indices: Vec<usize>,
+    protected_indices: Vec<usize>,
+}
+
+impl PartialUpdateMergeFunction {
+    #[cfg(test)]
+    pub(crate) fn new(
+        table_options: &HashMap<String, String>,
+        table_name: &str,
+    ) -> crate::Result<Self> {
+        PartialUpdateConfig::new(table_options).validate_write_mode(true, table_name)?;
+        Ok(Self {
+            ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            sequence_groups: Vec::new(),
+            grouped_fields: HashSet::new(),
+            aggregators: None,
+        })
+    }
+
+    pub(crate) fn new_with_schema(
+        table_options: &HashMap<String, String>,
+        table_name: &str,
+        table_fields: &[DataField],
+        output_fields: &[DataField],
+        primary_keys: &[String],
+    ) -> crate::Result<Self> {
+        let config = PartialUpdateConfig::new(table_options);
+        config.validate_read_mode(true, table_name)?;
+        let groups = config.validated_sequence_groups(table_fields, primary_keys)?;
+        let aggregate_functions =
+            config.validated_aggregate_functions(table_fields, primary_keys)?;
+        let field_indices: HashMap<&str, usize> = output_fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| (field.name(), index))
+            .collect();
+        let sequence_groups = groups
+            .into_iter()
+            .filter(|group| {
+                group
+                    .sequence_fields
+                    .iter()
+                    .chain(group.protected_fields.iter())
+                    .any(|field| field_indices.contains_key(field.as_str()))
+            })
+            .map(|group| {
+                let sequence_indices = group
+                    .sequence_fields
+                    .iter()
+                    .map(|field| {
+                        field_indices.get(field.as_str()).copied().ok_or_else(|| {
+                            Error::UnexpectedError {
+                                message: format!(
+                                    "Projected partial-update sequence group is missing \
+                                     sequence field '{field}'"
+                                ),
+                                source: None,
+                            }
+                        })
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?;
+                let protected_indices = group
+                    .protected_fields
+                    .iter()
+                    .filter_map(|field| field_indices.get(field.as_str()).copied())
+                    .collect();
+                Ok(RuntimeSequenceGroup {
+                    sequence_indices,
+                    protected_indices,
+                })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let grouped_fields = sequence_groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .sequence_indices
+                    .iter()
+                    .chain(group.protected_indices.iter())
+            })
+            .copied()
+            .collect();
+        let aggregators = output_fields
+            .iter()
+            .map(|field| -> crate::Result<Option<Box<dyn FieldAggregator>>> {
+                let Some(function) = aggregate_functions.get(field.name()) else {
+                    return Ok(None);
+                };
+                Ok(Some(new_aggregator(
+                    function,
+                    field.name(),
+                    field.data_type(),
+                    table_options,
+                )?))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        Ok(Self {
+            ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            sequence_groups,
+            grouped_fields,
+            aggregators: aggregators
+                .iter()
+                .any(Option::is_some)
+                .then(|| Mutex::new(aggregators)),
+        })
+    }
+}
+
+impl MergeFunction for PartialUpdateMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        if rows.is_empty() {
+            return Err(Error::UnexpectedError {
+                message: "merge called with empty rows".to_string(),
+                source: None,
+            });
+        }
+
+        let mut ordered_row_indices: Vec<usize> = (0..rows.len()).collect();
+        ordered_row_indices.sort_by(|&lhs_idx, &rhs_idx| {
+            compare_sequence_order(&rows[lhs_idx], &rows[rhs_idx])
+                .then_with(|| lhs_idx.cmp(&rhs_idx))
+        });
+
+        let mut selected_by_col: Vec<Option<(usize, usize)>> =
+            vec![None; output_schema.fields().len()];
+        let mut group_sequence_rows: Vec<Option<(usize, usize)>> =
+            vec![None; self.sequence_groups.len()];
+        let mut aggregators = match &self.aggregators {
+            Some(aggregators) => Some(aggregators.lock().map_err(|e| Error::UnexpectedError {
+                message: format!("PartialUpdateMergeFunction aggregator mutex poisoned: {e}"),
+                source: None,
+            })?),
+            None => None,
+        };
+        if let Some(aggregators) = aggregators.as_mut() {
+            for aggregator in aggregators.iter_mut().flatten() {
+                aggregator.reset();
+            }
+        }
+        let mut saw_add = false;
+
+        for row_idx in ordered_row_indices {
+            let row = &rows[row_idx];
+            if !RowKind::from_value(row.value_kind)?.is_add() {
+                if self.ignore_delete {
+                    continue;
+                }
+                return Err(crate::Error::Unsupported {
+                    message: "merge-engine=partial-update basic mode does not support DELETE or UPDATE_BEFORE rows".to_string(),
+                });
+            }
+            saw_add = true;
+
+            for (output_col_idx, selected) in selected_by_col.iter_mut().enumerate() {
+                if self.grouped_fields.contains(&output_col_idx) {
+                    continue;
+                }
+                let source_array = batch_buffer[row.batch_idx]
+                    .column_for_output(output_col_idx, source_output_col_indices);
+                if let Some(aggregator) = aggregators
+                    .as_mut()
+                    .and_then(|aggregators| aggregators.get_mut(output_col_idx))
+                    .and_then(Option::as_mut)
+                {
+                    aggregator.agg(source_array, row.row_idx)?;
+                } else if !source_array.is_null(row.row_idx) {
+                    *selected = Some((row.batch_idx, row.row_idx));
+                }
+            }
+
+            for (group_idx, group) in self.sequence_groups.iter().enumerate() {
+                let sequence_is_empty = group.sequence_indices.iter().all(|&output_col_idx| {
+                    batch_buffer[row.batch_idx]
+                        .column_for_output(output_col_idx, source_output_col_indices)
+                        .is_null(row.row_idx)
+                });
+                if sequence_is_empty {
+                    continue;
+                }
+
+                let sequence_ordering = match group_sequence_rows[group_idx] {
+                    None => Ordering::Greater,
+                    Some((current_batch_idx, current_row_idx)) => compare_sequence_group_rows(
+                        row.batch_idx,
+                        row.row_idx,
+                        current_batch_idx,
+                        current_row_idx,
+                        &group.sequence_indices,
+                        batch_buffer,
+                        source_output_col_indices,
+                    )?,
+                };
+                let should_advance = sequence_ordering.is_ge();
+
+                for &output_col_idx in &group.protected_indices {
+                    if let Some(aggregator) = aggregators
+                        .as_mut()
+                        .and_then(|aggregators| aggregators.get_mut(output_col_idx))
+                        .and_then(Option::as_mut)
+                    {
+                        let source_array = batch_buffer[row.batch_idx]
+                            .column_for_output(output_col_idx, source_output_col_indices);
+                        if should_advance {
+                            aggregator.agg(source_array, row.row_idx)?;
+                        } else {
+                            aggregator.agg_reversed(source_array, row.row_idx)?;
+                        }
+                    } else if should_advance {
+                        selected_by_col[output_col_idx] = Some((row.batch_idx, row.row_idx));
+                    }
+                }
+
+                if !should_advance {
+                    continue;
+                }
+
+                group_sequence_rows[group_idx] = Some((row.batch_idx, row.row_idx));
+                for &output_col_idx in &group.sequence_indices {
+                    selected_by_col[output_col_idx] = Some((row.batch_idx, row.row_idx));
+                }
+            }
+        }
+
+        if !saw_add {
+            return Ok(MergeResult::Omit);
+        }
+
+        let output_columns: Vec<ArrayRef> = output_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(output_col_idx, field)| {
+                let column = match aggregators
+                    .as_ref()
+                    .and_then(|aggregators| aggregators.get(output_col_idx))
+                    .and_then(Option::as_ref)
+                {
+                    Some(aggregator) => aggregator.result()?,
+                    None => match selected_by_col[output_col_idx] {
+                        Some((batch_idx, row_idx)) => batch_buffer[batch_idx]
+                            .column_for_output(output_col_idx, source_output_col_indices)
+                            .slice(row_idx, 1),
+                        None => new_null_array(field.data_type(), 1),
+                    },
+                };
+                if !field.is_nullable() && column.is_null(0) {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "merge-engine=partial-update produced NULL for non-nullable field '{}'",
+                            field.name()
+                        ),
+                        source: None,
+                    });
+                }
+                Ok(column)
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        let batch = RecordBatch::try_new(output_schema.clone(), output_columns).map_err(|e| {
+            Error::UnexpectedError {
+                message: format!("Failed to build partial-update materialized row: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })?;
+
+        Ok(MergeResult::MaterializedRow(batch))
+    }
+}
+
+fn compare_sequence_group_rows(
+    incoming_batch_idx: usize,
+    incoming_row_idx: usize,
+    current_batch_idx: usize,
+    current_row_idx: usize,
+    sequence_indices: &[usize],
+    batch_buffer: &[BufferedBatch],
+    source_output_col_indices: &[usize],
+) -> crate::Result<Ordering> {
+    for &output_col_idx in sequence_indices {
+        let incoming = batch_buffer[incoming_batch_idx]
+            .column_for_output(output_col_idx, source_output_col_indices);
+        let current = batch_buffer[current_batch_idx]
+            .column_for_output(output_col_idx, source_output_col_indices);
+        let comparator = make_comparator(
+            incoming,
+            current,
+            SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        )
+        .map_err(|e| Error::DataInvalid {
+            message: format!("Failed to compare partial-update sequence-group fields: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+        let ordering = comparator(incoming_row_idx, current_row_idx);
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+// ---------------------------------------------------------------------------
+// AggregateMergeFunction
+// ---------------------------------------------------------------------------
+
+/// Basic aggregation merge: apply a per-field aggregator across all rows
+/// sharing the same primary key.
+///
+/// For each output column, the aggregator is selected by the following
+/// priority (matching Java `AggregateMergeFunction#getAggFuncName`):
+///
+/// 1. Columns listed in the `sequence_fields` constructor argument (which
+///    the reader populates from the `sequence.field` table option) are
+///    forced to `last_value`, regardless of any per-field configuration.
+/// 2. Primary-key columns get no aggregator; their value is copied through
+///    from a representative row (Paimon guarantees same-PK rows share the
+///    same key).
+/// 3. `fields.<col>.aggregate-function`, if set.
+/// 4. `fields.default-aggregate-function`, if set.
+/// 5. Fall back to `last_non_null_value`.
+///
+/// Sequence is checked before primary key so a column that is both a PK
+/// and a sequence field still gets `last_value`.
+///
+/// DELETE / UPDATE_BEFORE rows are rejected at runtime; retract handling
+/// is left to a follow-up commit.
+///
+/// `aggregators` is held behind a `Mutex` so the implementation can mutate
+/// per-key accumulators inside `MergeFunction::merge(&self, ...)` without
+/// changing the trait signature shared with the other merge functions.  The
+/// merge function is invoked sequentially by `sort_merge_stream`, so the
+/// lock is effectively uncontended.
+///
+/// Reference: Java `org.apache.paimon.mergetree.compact.aggregate.AggregateMergeFunction`.
+#[derive(Debug)]
+pub(crate) struct AggregateMergeFunction {
+    /// One slot per output column.  `None` marks primary-key columns that are
+    /// copied through; `Some` holds the aggregator that owns the column.
+    aggregators: Mutex<Vec<Option<Box<dyn FieldAggregator>>>>,
+}
+
+impl AggregateMergeFunction {
+    pub(crate) fn new(
+        table_options: &HashMap<String, String>,
+        table_name: &str,
+        output_fields: &[DataField],
+        primary_keys: &[String],
+        sequence_fields: &[String],
+    ) -> crate::Result<Self> {
+        let config = AggregationConfig::new(table_options);
+        config.validate_runtime_mode(true, table_name)?;
+
+        let pk_set: HashSet<&str> = primary_keys.iter().map(String::as_str).collect();
+        let seq_set: HashSet<&str> = sequence_fields.iter().map(String::as_str).collect();
+
+        // Per Java AggregateMergeFunction#createFieldAggregators, the priority
+        // order is:
+        //   1. sequence fields  → `last_value`
+        //   2. primary keys     → no aggregator (PK columns are copied through)
+        //   3. per-field `fields.<col>.aggregate-function`
+        //   4. table-level `fields.default-aggregate-function`
+        //   5. fall back to `last_non_null_value`
+        // Sequence is checked before PK so a column that is both PK and sequence
+        // field still gets `last_value` (matching Java).
+        let aggregators: Vec<Option<Box<dyn FieldAggregator>>> = output_fields
+            .iter()
+            .map(|field| -> crate::Result<Option<Box<dyn FieldAggregator>>> {
+                let name = field.name();
+                let agg_name: &str = if seq_set.contains(name) {
+                    "last_value"
+                } else if pk_set.contains(name) {
+                    return Ok(None);
+                } else if let Some(per_field) = config.agg_function_for_field(name) {
+                    per_field
+                } else if let Some(default) = config.default_agg_function() {
+                    default
+                } else {
+                    "last_non_null_value"
+                };
+                Ok(Some(new_aggregator(
+                    agg_name,
+                    name,
+                    field.data_type(),
+                    table_options,
+                )?))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        Ok(Self {
+            aggregators: Mutex::new(aggregators),
+        })
+    }
+}
+
+impl MergeFunction for AggregateMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        if rows.is_empty() {
+            return Err(Error::UnexpectedError {
+                message: "merge called with empty rows".to_string(),
+                source: None,
+            });
+        }
+
+        // Reject retract rows up-front so partial accumulation cannot leak
+        // into the output if a DELETE shows up mid-group.
+        for row in rows {
+            if !RowKind::from_value(row.value_kind)?.is_add() {
+                return Err(crate::Error::Unsupported {
+                    message: "merge-engine=aggregation basic mode does not support DELETE or UPDATE_BEFORE rows".to_string(),
+                });
+            }
+        }
+
+        // Sort row indices by user sequence (if configured), then system
+        // sequence, so per-field aggregators see the canonical "ascending
+        // sequence" order documented in their contracts.
+        let mut ordered_row_indices: Vec<usize> = (0..rows.len()).collect();
+        ordered_row_indices.sort_by(|&lhs_idx, &rhs_idx| {
+            compare_sequence_order(&rows[lhs_idx], &rows[rhs_idx])
+                .then_with(|| lhs_idx.cmp(&rhs_idx))
+        });
+
+        let mut aggregators = self
+            .aggregators
+            .lock()
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("AggregateMergeFunction aggregator mutex poisoned: {e}"),
+                source: None,
+            })?;
+        for slot in aggregators.iter_mut() {
+            if let Some(agg) = slot.as_mut() {
+                agg.reset();
+            }
+        }
+
+        for &row_idx in &ordered_row_indices {
+            let row = &rows[row_idx];
+            for (col_idx, slot) in aggregators.iter_mut().enumerate() {
+                if let Some(agg) = slot.as_mut() {
+                    let source_array = batch_buffer[row.batch_idx]
+                        .column_for_output(col_idx, source_output_col_indices);
+                    agg.agg(source_array, row.row_idx)?;
+                }
+            }
+        }
+
+        // Use the last sorted row to source primary-key column values: every
+        // row in the group shares the same PK by construction, so any row
+        // works; picking the last one keeps the slice cheap to compute.
+        let pk_source = &rows[*ordered_row_indices.last().unwrap()];
+
+        let output_columns: Vec<ArrayRef> = aggregators
+            .iter()
+            .enumerate()
+            .map(|(col_idx, slot)| -> crate::Result<ArrayRef> {
+                match slot {
+                    Some(agg) => agg.result(),
+                    None => Ok(batch_buffer[pk_source.batch_idx]
+                        .column_for_output(col_idx, source_output_col_indices)
+                        .slice(pk_source.row_idx, 1)),
+                }
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        // Defensive check: non-nullable fields must not contain NULL on the
+        // merged output (e.g. `min` on an all-NULL value group, or a NULL
+        // primary-key cell on the source row).  Split the message so the
+        // operator knows whether to look at the aggregator config or at the
+        // upstream data.
+        for (col_idx, field) in output_schema.fields().iter().enumerate() {
+            if !field.is_nullable() && output_columns[col_idx].is_null(0) {
+                let message = match aggregators[col_idx].as_ref() {
+                    Some(agg) => format!(
+                        "merge-engine=aggregation: aggregator '{}' produced NULL for \
+                         non-nullable field '{}'",
+                        agg.name(),
+                        field.name()
+                    ),
+                    None => format!(
+                        "merge-engine=aggregation: primary-key column '{}' contains NULL on a \
+                         source row; declare the column nullable or fix the upstream data",
+                        field.name()
+                    ),
+                };
+                return Err(Error::DataInvalid {
+                    message,
+                    source: None,
+                });
+            }
+        }
+
+        let batch = RecordBatch::try_new(output_schema.clone(), output_columns).map_err(|e| {
+            Error::UnexpectedError {
+                message: format!("Failed to build aggregation materialized row: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })?;
+
+        Ok(MergeResult::MaterializedRow(batch))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SortMergeCursor
+// ---------------------------------------------------------------------------
+
+/// Cursor tracking position within a single stream's current RecordBatch.
+struct SortMergeCursor {
+    batch: RecordBatch,
+    /// Row-encoded keys for the current batch (via arrow-row).
+    rows: Rows,
+    offset: usize,
+    /// The batch token moves to `batch_buffer` as soon as this cursor is
+    /// registered. Keeping it here during construction closes the gap between
+    /// polling the input stream and registering the batch.
+    batch_reservation: Option<Box<dyn ReadReservation>>,
+    _rows_reservations: Vec<Box<dyn ReadReservation>>,
+}
+
+impl SortMergeCursor {
+    fn is_finished(&self) -> bool {
+        self.offset >= self.rows.num_rows()
+    }
+
+    fn current_row(&self) -> arrow_row::Row<'_> {
+        self.rows.row(self.offset)
+    }
+
+    fn advance(&mut self) {
+        self.offset += 1;
+    }
+
+    fn sequence_number(&self, seq_index: usize) -> crate::Result<i64> {
+        let col = self.batch.column(seq_index);
+        let arr = col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| Error::DataInvalid {
+                message: "_SEQUENCE_NUMBER must be an Int64 column".to_string(),
+                source: None,
+            })?;
+        if arr.is_null(self.offset) {
+            return Err(Error::DataInvalid {
+                message: "_SEQUENCE_NUMBER contains NULL".to_string(),
+                source: None,
+            });
+        }
+        Ok(arr.value(self.offset))
+    }
+
+    fn value_kind(&self, value_kind_index: usize) -> crate::Result<i8> {
+        let col = self.batch.column(value_kind_index);
+        let arr = col
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .ok_or_else(|| Error::DataInvalid {
+                message: "_VALUE_KIND must be an Int8 column".to_string(),
+                source: None,
+            })?;
+        if arr.is_null(self.offset) {
+            return Err(Error::DataInvalid {
+                message: "_VALUE_KIND contains NULL".to_string(),
+                source: None,
+            });
+        }
+        let value = arr.value(self.offset);
+        RowKind::from_value(value)?;
+        Ok(value)
+    }
+
+    /// Read the user-defined sequence field value (cast to i64 for ordering).
+    /// Returns None if the column is NULL at this row.
+    ///
+    /// Supports the same types as Java Paimon's `UserDefinedSeqComparator`:
+    /// TinyInt, SmallInt, Int, BigInt, Timestamp, Date, Decimal.
+    fn user_sequence(&self, user_seq_index: usize) -> Option<i128> {
+        let col = self.batch.column(user_seq_index);
+        if col.is_null(self.offset) {
+            return None;
+        }
+        use arrow_array::*;
+        let any = col.as_any();
+        if let Some(arr) = any.downcast_ref::<Int64Array>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        if let Some(arr) = any.downcast_ref::<Int32Array>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        if let Some(arr) = any.downcast_ref::<Int16Array>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        if let Some(arr) = any.downcast_ref::<Int8Array>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        // Timestamps are stored as i64 internally (micros, millis, seconds, nanos).
+        if let Some(arr) = any.downcast_ref::<TimestampMicrosecondArray>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        if let Some(arr) = any.downcast_ref::<TimestampMillisecondArray>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        if let Some(arr) = any.downcast_ref::<TimestampNanosecondArray>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        if let Some(arr) = any.downcast_ref::<TimestampSecondArray>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        if let Some(arr) = any.downcast_ref::<Date32Array>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        if let Some(arr) = any.downcast_ref::<Date64Array>() {
+            return Some(arr.value(self.offset) as i128);
+        }
+        // Decimal128: use raw i128 value for ordering (same precision/scale within a column).
+        if let Some(arr) = any.downcast_ref::<Decimal128Array>() {
+            return Some(arr.value(self.offset));
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LoserTree
+// ---------------------------------------------------------------------------
+
+/// A LoserTree (tournament tree) for k-way merge.
+///
+/// Layout follows DataFusion's `SortPreservingMergeStream`:
+/// - `nodes[0]` = overall winner index
+/// - `nodes[1..k]` = loser at each internal node
+///
+/// Reference: <https://en.wikipedia.org/wiki/K-way_merge_algorithm#Tournament_Tree>
+struct LoserTree {
+    /// nodes[0] = winner, nodes[1..] = losers
+    nodes: Vec<usize>,
+    num_streams: usize,
+}
+
+impl LoserTree {
+    fn new(num_streams: usize) -> Self {
+        Self {
+            nodes: vec![usize::MAX; num_streams],
+            num_streams,
+        }
+    }
+
+    fn winner(&self) -> usize {
+        self.nodes[0]
+    }
+
+    /// Leaf node index for a given stream index.
+    fn leaf_index(&self, stream_idx: usize) -> usize {
+        (self.num_streams + stream_idx) / 2
+    }
+
+    fn parent_index(node_idx: usize) -> usize {
+        node_idx / 2
+    }
+
+    /// Build the tree from scratch given a comparison function.
+    /// `is_gt(a, b)` returns true if stream `a` > stream `b`.
+    fn init(&mut self, is_gt: impl Fn(usize, usize) -> bool) {
+        self.nodes.fill(usize::MAX);
+        for i in 0..self.num_streams {
+            let mut winner = i;
+            let mut cmp_node = self.leaf_index(i);
+            while cmp_node != 0 && self.nodes[cmp_node] != usize::MAX {
+                let challenger = self.nodes[cmp_node];
+                if is_gt(winner, challenger) {
+                    self.nodes[cmp_node] = winner;
+                    winner = challenger;
+                }
+                cmp_node = Self::parent_index(cmp_node);
+            }
+            self.nodes[cmp_node] = winner;
+        }
+    }
+
+    /// Update the tree after the winner has been consumed/advanced.
+    fn update(&mut self, is_gt: impl Fn(usize, usize) -> bool) {
+        let mut winner = self.nodes[0];
+        let mut cmp_node = self.leaf_index(winner);
+        while cmp_node != 0 {
+            let challenger = self.nodes[cmp_node];
+            if is_gt(winner, challenger) {
+                self.nodes[cmp_node] = winner;
+                winner = challenger;
+            }
+            cmp_node = Self::parent_index(cmp_node);
+        }
+        self.nodes[0] = winner;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SortMergeReader
+// ---------------------------------------------------------------------------
+
+/// Configuration for building a [`SortMergeReader`].
+pub(crate) struct SortMergeReaderBuilder {
+    streams: Vec<ArrowRecordBatchStream>,
+    /// Full schema of the input streams (key + seq + value_kind + value columns).
+    input_schema: SchemaRef,
+    /// Indices of primary key columns in input_schema.
+    key_indices: Vec<usize>,
+    /// Index of _SEQUENCE_NUMBER column in input_schema.
+    seq_index: usize,
+    /// Index of _VALUE_KIND column in input_schema.
+    value_kind_index: usize,
+    /// Indices of user-defined sequence field columns in input_schema (if configured).
+    user_sequence_indices: Vec<usize>,
+    /// Indices of user value columns in input_schema (output columns).
+    value_indices: Vec<usize>,
+    /// Output schema (key + value columns, no system columns).
+    output_schema: SchemaRef,
+    merge_function: Box<dyn MergeFunction>,
+    batch_size: usize,
+    read_control: Option<Arc<dyn ReadControl>>,
+}
+
+impl SortMergeReaderBuilder {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        streams: Vec<ArrowRecordBatchStream>,
+        input_schema: SchemaRef,
+        key_indices: Vec<usize>,
+        seq_index: usize,
+        value_kind_index: usize,
+        user_sequence_indices: Vec<usize>,
+        value_indices: Vec<usize>,
+        output_schema: SchemaRef,
+        merge_function: Box<dyn MergeFunction>,
+    ) -> Self {
+        Self {
+            streams,
+            input_schema,
+            key_indices,
+            seq_index,
+            value_kind_index,
+            user_sequence_indices,
+            value_indices,
+            output_schema,
+            merge_function,
+            batch_size: 1024,
+            read_control: None,
+        }
+    }
+
+    pub(crate) fn with_read_control(mut self, control: Option<Arc<dyn ReadControl>>) -> Self {
+        self.read_control = control;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    /// Build the sort-merge stream.
+    pub(crate) fn build(self) -> crate::Result<ArrowRecordBatchStream> {
+        let sort_fields: Vec<SortField> = self
+            .key_indices
+            .iter()
+            .map(|&idx| SortField::new(self.input_schema.field(idx).data_type().clone()))
+            .collect();
+
+        let row_converter = RowConverter::new(sort_fields).map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to create RowConverter: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+
+        sort_merge_stream(
+            self.streams,
+            row_converter,
+            self.key_indices,
+            self.seq_index,
+            self.value_kind_index,
+            self.user_sequence_indices,
+            self.value_indices,
+            self.output_schema,
+            self.merge_function,
+            self.batch_size,
+            self.read_control,
+        )
+    }
+}
+
+fn checkpoint(control: &Option<Arc<dyn ReadControl>>) -> crate::Result<()> {
+    if let Some(control) = control {
+        control.checkpoint()?;
+    }
+    Ok(())
+}
+
+fn reserve(
+    control: &Option<Arc<dyn ReadControl>>,
+    bytes: usize,
+) -> crate::Result<Option<Box<dyn ReadReservation>>> {
+    control
+        .as_ref()
+        .map(|control| control.try_reserve(u64::try_from(bytes).unwrap_or(u64::MAX).max(1)))
+        .transpose()
+}
+
+fn make_cursor(
+    batch: RecordBatch,
+    key_indices: &[usize],
+    seq_index: usize,
+    value_kind_index: usize,
+    converter: &mut RowConverter,
+    control: &Option<Arc<dyn ReadControl>>,
+) -> crate::Result<SortMergeCursor> {
+    checkpoint(control)?;
+    validate_kv_system_columns(&batch, seq_index, value_kind_index)?;
+    let batch_reservation = reserve(
+        control,
+        batch
+            .get_array_memory_size()
+            .saturating_add(std::mem::size_of::<BufferedBatch>())
+            .saturating_add(std::mem::size_of::<Option<Box<dyn ReadReservation>>>()),
+    )?;
+    // Reserve conservatively before arrow-row allocates. The exact size is
+    // checked afterwards and any excess receives a second reservation.
+    let key_bytes = key_indices.iter().fold(0usize, |total, &idx| {
+        total.saturating_add(batch.column(idx).get_array_memory_size())
+    });
+    let estimate = std::mem::size_of::<Rows>()
+        .saturating_add(key_bytes.saturating_mul(2))
+        .saturating_add(
+            batch
+                .num_rows()
+                .saturating_add(1)
+                .saturating_mul(std::mem::size_of::<usize>()),
+        )
+        .saturating_add(batch.num_rows().saturating_mul(16));
+    let mut rows_reservations = Vec::new();
+    if let Some(token) = reserve(control, estimate)? {
+        rows_reservations.push(token);
+    }
+    let rows = convert_batch_keys(&batch, key_indices, converter)?;
+    if rows.size() > estimate {
+        if let Some(token) = reserve(control, rows.size() - estimate)? {
+            rows_reservations.push(token);
+        }
+    }
+    checkpoint(control)?;
+    Ok(SortMergeCursor {
+        batch,
+        rows,
+        offset: 0,
+        batch_reservation,
+        _rows_reservations: rows_reservations,
+    })
+}
+
+fn validate_kv_system_columns(
+    batch: &RecordBatch,
+    seq_index: usize,
+    value_kind_index: usize,
+) -> crate::Result<()> {
+    let schema = batch.schema();
+    let seq_field = schema
+        .fields()
+        .get(seq_index)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "_SEQUENCE_NUMBER column is missing from the decoded KV batch".to_string(),
+            source: None,
+        })?;
+    let seq = batch
+        .columns()
+        .get(seq_index)
+        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| Error::DataInvalid {
+            message: "_SEQUENCE_NUMBER must be an Int64 column".to_string(),
+            source: None,
+        })?;
+    if seq_field.is_nullable() || seq.null_count() != 0 {
+        return Err(Error::DataInvalid {
+            message: "_SEQUENCE_NUMBER must be declared non-null and contain no NULLs".to_string(),
+            source: None,
+        });
+    }
+
+    let kind_field = schema
+        .fields()
+        .get(value_kind_index)
+        .ok_or_else(|| Error::DataInvalid {
+            message: "_VALUE_KIND column is missing from the decoded KV batch".to_string(),
+            source: None,
+        })?;
+    let kinds = batch
+        .columns()
+        .get(value_kind_index)
+        .and_then(|column| column.as_any().downcast_ref::<Int8Array>())
+        .ok_or_else(|| Error::DataInvalid {
+            message: "_VALUE_KIND must be an Int8 column".to_string(),
+            source: None,
+        })?;
+    if kind_field.is_nullable() || kinds.null_count() != 0 {
+        return Err(Error::DataInvalid {
+            message: "_VALUE_KIND must be declared non-null and contain no NULLs".to_string(),
+            source: None,
+        });
+    }
+    if let Some(value) = kinds
+        .values()
+        .iter()
+        .copied()
+        .find(|value| !(0..=3).contains(value))
+    {
+        return Err(Error::DataInvalid {
+            message: format!("_VALUE_KIND contains invalid value {value}; expected 0..=3"),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+/// Convert a RecordBatch's key columns into arrow-row `Rows`.
+fn convert_batch_keys(
+    batch: &RecordBatch,
+    key_indices: &[usize],
+    converter: &mut RowConverter,
+) -> crate::Result<Rows> {
+    let key_columns: Vec<ArrayRef> = key_indices
+        .iter()
+        .map(|&idx| batch.column(idx).clone())
+        .collect();
+    converter
+        .convert_columns(&key_columns)
+        .map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to convert key columns to Rows: {e}"),
+            source: Some(Box::new(e)),
+        })
+}
+
+/// Compare two cursors by their current key. `None` cursors are treated as
+/// greater than any value (exhausted streams sink to the bottom).
+fn compare_cursors(cursors: &[Option<SortMergeCursor>], a: usize, b: usize) -> Ordering {
+    match (&cursors[a], &cursors[b]) {
+        (None, None) => Ordering::Equal,
+        (None, _) => Ordering::Greater,
+        (_, None) => Ordering::Less,
+        (Some(ca), Some(cb)) => ca.current_row().cmp(&cb.current_row()),
+    }
+}
+
+/// The main sort-merge stream implementation.
+///
+/// Uses an interleave-based output strategy (like DataFusion's BatchBuilder):
+/// instead of slicing individual rows and concatenating, we record
+/// `(batch_idx, row_idx)` indices and use `arrow_select::interleave` to
+/// gather all output rows in one pass per column.
+#[allow(clippy::too_many_arguments)]
+fn sort_merge_stream(
+    mut streams: Vec<ArrowRecordBatchStream>,
+    mut row_converter: RowConverter,
+    key_indices: Vec<usize>,
+    seq_index: usize,
+    value_kind_index: usize,
+    user_sequence_indices: Vec<usize>,
+    value_indices: Vec<usize>,
+    output_schema: SchemaRef,
+    merge_function: Box<dyn MergeFunction>,
+    batch_size: usize,
+    read_control: Option<Arc<dyn ReadControl>>,
+) -> crate::Result<ArrowRecordBatchStream> {
+    let num_streams = streams.len();
+    if num_streams == 0 {
+        return Ok(futures::stream::empty().boxed());
+    }
+
+    // Output column indices for source batches: key columns + value columns
+    // (skip system columns like _SEQUENCE_NUMBER).
+    let source_output_col_indices: Vec<usize> = key_indices
+        .iter()
+        .chain(value_indices.iter())
+        .copied()
+        .collect();
+
+    Ok(try_stream! {
+        checkpoint(&read_control)?;
+        let _cursor_state_reservation = reserve(
+            &read_control,
+            num_streams.saturating_mul(
+                std::mem::size_of::<Option<SortMergeCursor>>()
+                    .saturating_add(std::mem::size_of::<Option<usize>>()),
+            ),
+        )?;
+        // Initialize cursors: read first non-empty batch from each stream.
+        // Loop to skip empty batches (e.g. from predicate filtering).
+        let mut cursors: Vec<Option<SortMergeCursor>> = Vec::with_capacity(num_streams);
+        for stream in &mut streams {
+            let mut found = false;
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result?;
+                if batch.num_rows() > 0 {
+                    cursors.push(Some(make_cursor(
+                        batch,
+                        &key_indices,
+                        seq_index,
+                        value_kind_index,
+                        &mut row_converter,
+                        &read_control,
+                    )?));
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                cursors.push(None);
+            }
+        }
+
+        // Build loser tree.
+        let mut tree = LoserTree::new(num_streams);
+        tree.init(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
+
+        // Batch buffer: stores RecordBatches referenced by output indices.
+        // Each cursor's current batch gets an entry; when a cursor advances
+        // to a new batch, the old one stays in the buffer until the output
+        // batch is flushed.
+        let mut batch_buffer: Vec<BufferedBatch> = Vec::new();
+        let mut batch_reservations: Vec<Option<Box<dyn ReadReservation>>> = Vec::new();
+        // Map from stream_idx -> current batch_buffer index.
+        let mut stream_batch_idx: Vec<Option<usize>> = vec![None; num_streams];
+
+        // Register initial batches.
+        for (i, cursor) in cursors.iter_mut().enumerate() {
+            if let Some(c) = cursor {
+                let idx = batch_buffer.len();
+                batch_buffer.push(BufferedBatch::Source(c.batch.clone()));
+                batch_reservations.push(c.batch_reservation.take());
+                stream_batch_idx[i] = Some(idx);
+            }
+        }
+
+        // Output indices: (batch_buffer_idx, row_idx) for interleave.
+        let _output_index_reservation = reserve(
+            &read_control,
+            batch_size.saturating_mul(std::mem::size_of::<(usize, usize)>()),
+        )?;
+        let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
+
+        loop {
+            checkpoint(&read_control)?;
+            let winner_idx = tree.winner();
+            // Check if all streams are exhausted.
+            if cursors[winner_idx].is_none() {
+                break;
+            }
+
+            // Capture the winner's key for grouping same-key rows.
+            let (winner_key, _winner_key_reservation) = {
+                let cursor = cursors[winner_idx].as_ref().unwrap();
+                let token = reserve(
+                    &read_control,
+                    cursor.current_row().data().len().saturating_add(std::mem::size_of::<arrow_row::OwnedRow>()),
+                )?;
+                (cursor.current_row().owned(), token)
+            };
+
+            // Collect all rows with the same key across all streams.
+            let mut same_key_rows: Vec<MergeRow> = Vec::new();
+            let mut same_key_reservations: Vec<Option<Box<dyn ReadReservation>>> = Vec::new();
+
+            loop {
+                checkpoint(&read_control)?;
+                let current_winner = tree.winner();
+                let matches = match &cursors[current_winner] {
+                    None => false,
+                    Some(c) => c.current_row().cmp(&winner_key.row()) == Ordering::Equal,
+                };
+                if !matches {
+                    break;
+                }
+
+                // Record this row.
+                {
+                    let cursor = cursors[current_winner].as_ref().unwrap();
+                    let buf_idx = stream_batch_idx[current_winner].unwrap();
+                    let retained = std::mem::size_of::<MergeRow>().saturating_add(
+                        user_sequence_indices
+                            .len()
+                            .saturating_mul(std::mem::size_of::<Option<i128>>()),
+                    );
+                    let reservation = reserve(&read_control, retained)?;
+                    // Avoid geometric spare capacity escaping the per-row charge.
+                    same_key_rows.reserve_exact(1);
+                    same_key_rows.push(MergeRow {
+                        batch_idx: buf_idx,
+                        row_idx: cursor.offset,
+                        sequence_number: cursor.sequence_number(seq_index)?,
+                        value_kind: cursor.value_kind(value_kind_index)?,
+                        user_sequences: user_sequence_indices.iter().map(|&idx| cursor.user_sequence(idx)).collect(),
+                    });
+                    same_key_reservations.push(reservation);
+                }
+
+                // Advance the cursor.
+                {
+                    let cursor = cursors[current_winner].as_mut().unwrap();
+                    cursor.advance();
+                    if cursor.is_finished() {
+                        // Try to get next non-empty batch from this stream.
+                        // Loop to skip empty batches.
+                        cursors[current_winner] = None;
+                        while let Some(batch_result) = streams[current_winner].next().await {
+                            let batch = batch_result?;
+                            if batch.num_rows() > 0 {
+                                let mut cursor = make_cursor(
+                                    batch,
+                                    &key_indices,
+                                    seq_index,
+                                    value_kind_index,
+                                    &mut row_converter,
+                                    &read_control,
+                                )?;
+                                let buf_idx = batch_buffer.len();
+                                batch_buffer.push(BufferedBatch::Source(cursor.batch.clone()));
+                                batch_reservations.push(cursor.batch_reservation.take());
+                                stream_batch_idx[current_winner] = Some(buf_idx);
+                                cursors[current_winner] = Some(cursor);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Update loser tree after advancing.
+                tree.update(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
+            }
+
+            match merge_function.merge(
+                &same_key_rows,
+                &batch_buffer,
+                &source_output_col_indices,
+                &output_schema,
+            )? {
+                MergeResult::SourceRow { batch_idx, row_idx } => {
+                    output_indices.push((batch_idx, row_idx));
+                }
+                MergeResult::MaterializedRow(batch) => {
+                    if batch.num_rows() != 1 {
+                        Err(Error::UnexpectedError {
+                            message: format!(
+                                "Materialized merge result must contain exactly one row, got {}",
+                                batch.num_rows()
+                            ),
+                            source: None,
+                        })?;
+                    }
+                    if batch.schema().as_ref() != output_schema.as_ref() {
+                        Err(Error::UnexpectedError {
+                            message: "Materialized merge result schema does not match merge output schema".to_string(),
+                            source: None,
+                        })?;
+                    }
+                    let batch_idx = batch_buffer.len();
+                    let reservation = reserve(
+                        &read_control,
+                        batch.get_array_memory_size().saturating_add(std::mem::size_of::<BufferedBatch>()),
+                    )?;
+                    batch_buffer.push(BufferedBatch::Materialized(batch));
+                    batch_reservations.push(reservation);
+                    output_indices.push((batch_idx, 0));
+                }
+                MergeResult::Omit => {
+                    // An all-delete history can produce no output for an
+                    // arbitrarily long time, so omission is a cancellation
+                    // boundary rather than a no-op.
+                    checkpoint(&read_control)?;
+                }
+            }
+            drop(same_key_reservations);
+
+            // Yield a batch when we've accumulated enough rows.
+            if output_indices.len() >= batch_size {
+                let construction_bytes = batch_buffer.iter().fold(0usize, |total, batch| {
+                    let batch = match batch {
+                        BufferedBatch::Source(batch) | BufferedBatch::Materialized(batch) => batch,
+                    };
+                    total.saturating_add(batch.get_array_memory_size())
+                });
+                let construction_reservation = reserve(&read_control, construction_bytes)?;
+                let batch = build_output_interleave(
+                    &output_schema,
+                    &batch_buffer,
+                    &source_output_col_indices,
+                    &output_indices,
+                )?;
+                let output_reservation = reserve(&read_control, batch.get_array_memory_size())?;
+                drop(construction_reservation);
+                output_indices.clear();
+                // Compact batch buffer after the pending output rows have been
+                // materialized. Source batches still referenced by cursors stay
+                // alive; materialized batches can be dropped here because they
+                // are referenced only by the flushed output_indices above.
+                compact_batch_buffer(
+                    &mut batch_buffer,
+                    &mut stream_batch_idx,
+                    &cursors,
+                    &mut batch_reservations,
+                );
+                checkpoint(&read_control)?;
+                yield batch;
+                drop(output_reservation);
+            }
+        }
+
+        // Yield remaining rows.
+        if !output_indices.is_empty() {
+            let construction_bytes = batch_buffer.iter().fold(0usize, |total, batch| {
+                let batch = match batch {
+                    BufferedBatch::Source(batch) | BufferedBatch::Materialized(batch) => batch,
+                };
+                total.saturating_add(batch.get_array_memory_size())
+            });
+            let construction_reservation = reserve(&read_control, construction_bytes)?;
+            let batch = build_output_interleave(
+                &output_schema,
+                &batch_buffer,
+                &source_output_col_indices,
+                &output_indices,
+            )?;
+            let output_reservation = reserve(&read_control, batch.get_array_memory_size())?;
+            drop(construction_reservation);
+            checkpoint(&read_control)?;
+            yield batch;
+            drop(output_reservation);
+        }
+        checkpoint(&read_control)?;
+    }
+    .boxed())
+}
+
+/// Build an output RecordBatch using `interleave` to gather rows from the
+/// batch buffer in one pass per column.
+fn build_output_interleave(
+    schema: &SchemaRef,
+    batch_buffer: &[BufferedBatch],
+    source_output_col_indices: &[usize],
+    indices: &[(usize, usize)],
+) -> crate::Result<RecordBatch> {
+    let columns: Vec<ArrayRef> = (0..schema.fields().len())
+        .map(|output_col_idx| {
+            let arrays: Vec<&dyn arrow_array::Array> = batch_buffer
+                .iter()
+                .map(|batch| batch.column_for_output(output_col_idx, source_output_col_indices))
+                .collect();
+            interleave(&arrays, indices).map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to interleave output column {output_col_idx}: {e}"),
+                source: Some(Box::new(e)),
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build interleaved RecordBatch: {e}"),
+        source: Some(Box::new(e)),
+    })
+}
+
+/// Compact the batch buffer by removing batches no longer referenced by any
+/// cursor, and updating indices accordingly.
+fn compact_batch_buffer(
+    batch_buffer: &mut Vec<BufferedBatch>,
+    stream_batch_idx: &mut [Option<usize>],
+    cursors: &[Option<SortMergeCursor>],
+    batch_reservations: &mut Vec<Option<Box<dyn ReadReservation>>>,
+) {
+    // Collect which buffer indices are still alive (referenced by a cursor).
+    let mut alive: Vec<bool> = vec![false; batch_buffer.len()];
+    for (i, cursor) in cursors.iter().enumerate() {
+        if cursor.is_some() {
+            if let Some(idx) = stream_batch_idx[i] {
+                alive[idx] = true;
+            }
+        }
+    }
+
+    // Build old->new index mapping.
+    let mut new_indices: Vec<Option<usize>> = vec![None; batch_buffer.len()];
+    let mut new_buffer: Vec<BufferedBatch> = Vec::new();
+    let mut new_reservations: Vec<Option<Box<dyn ReadReservation>>> = Vec::new();
+    let mut old_reservations = std::mem::take(batch_reservations).into_iter();
+    for (old_idx, is_alive) in alive.iter().enumerate() {
+        let reservation = old_reservations
+            .next()
+            .expect("batch reservation must align with batch buffer");
+        if *is_alive {
+            new_indices[old_idx] = Some(new_buffer.len());
+            new_buffer.push(batch_buffer[old_idx].clone());
+            new_reservations.push(reservation);
+        }
+    }
+
+    *batch_buffer = new_buffer;
+    *batch_reservations = new_reservations;
+
+    // Remap stream_batch_idx.
+    for (i, cursor) in cursors.iter().enumerate() {
+        if cursor.is_some() {
+            if let Some(old_idx) = stream_batch_idx[i] {
+                stream_batch_idx[i] = new_indices[old_idx];
+            }
+        } else {
+            stream_batch_idx[i] = None;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, Int32Array, Int64Array, Int8Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::TryStreamExt;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    #[derive(Debug, Default)]
+    struct ObservedReadState {
+        retained: AtomicU64,
+        peak: AtomicU64,
+        checkpoints: AtomicUsize,
+        cancel_after: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct ObservedReadControl {
+        state: Arc<ObservedReadState>,
+    }
+
+    impl ReadControl for ObservedReadControl {
+        fn check_active(&self) -> crate::Result<()> {
+            self.fail_if_cancelled()
+        }
+
+        fn checkpoint(&self) -> crate::Result<()> {
+            self.state.checkpoints.fetch_add(1, AtomicOrdering::SeqCst);
+            self.fail_if_cancelled()
+        }
+
+        fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
+            self.fail_if_cancelled()?;
+            let retained = self.state.retained.fetch_add(bytes, AtomicOrdering::SeqCst) + bytes;
+            self.state.peak.fetch_max(retained, AtomicOrdering::SeqCst);
+            Ok(Box::new(ObservedReservation {
+                state: self.state.clone(),
+                bytes,
+            }))
+        }
+    }
+
+    impl ObservedReadControl {
+        fn fail_if_cancelled(&self) -> crate::Result<()> {
+            let cancel_after = self.state.cancel_after.load(AtomicOrdering::SeqCst);
+            if cancel_after != 0
+                && self.state.checkpoints.load(AtomicOrdering::SeqCst) >= cancel_after
+            {
+                return Err(Error::UnexpectedError {
+                    message: "test read cancelled".to_string(),
+                    source: None,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ObservedReservation {
+        state: Arc<ObservedReadState>,
+        bytes: u64,
+    }
+
+    impl ReadReservation for ObservedReservation {
+        fn bytes(&self) -> u64 {
+            self.bytes
+        }
+    }
+
+    impl Drop for ObservedReservation {
+        fn drop(&mut self) {
+            self.state
+                .retained
+                .fetch_sub(self.bytes, AtomicOrdering::SeqCst);
+        }
+    }
+
+    fn make_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]))
+    }
+
+    fn make_output_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]))
+    }
+
+    fn make_batch(
+        schema: &SchemaRef,
+        pks: Vec<i32>,
+        seqs: Vec<i64>,
+        values: Vec<Option<&str>>,
+    ) -> RecordBatch {
+        let len = pks.len();
+        make_batch_with_kind(schema, pks, seqs, vec![0i8; len], values)
+    }
+
+    fn make_batch_with_kind(
+        schema: &SchemaRef,
+        pks: Vec<i32>,
+        seqs: Vec<i64>,
+        kinds: Vec<i8>,
+        values: Vec<Option<&str>>,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(pks)),
+                Arc::new(Int64Array::from(seqs)),
+                Arc::new(Int8Array::from(kinds)),
+                Arc::new(StringArray::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn stream_from_batches(batches: Vec<RecordBatch>) -> ArrowRecordBatchStream {
+        futures::stream::iter(batches.into_iter().map(Ok)).boxed()
+    }
+
+    struct NeverMerge;
+
+    impl MergeFunction for NeverMerge {
+        fn merge(
+            &self,
+            _rows: &[MergeRow],
+            _batch_buffer: &[BufferedBatch],
+            _source_output_col_indices: &[usize],
+            _output_schema: &SchemaRef,
+        ) -> crate::Result<MergeResult> {
+            panic!("invalid KV system columns must fail before merge")
+        }
+    }
+
+    async fn assert_kv_system_column_error(batch: RecordBatch, expected: &str) {
+        let schema = batch.schema();
+        let error = SortMergeReaderBuilder::new(
+            vec![stream_from_batches(vec![batch])],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(NeverMerge),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[tokio::test]
+    async fn kv_sequence_number_rejects_wrong_type_before_merge() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int32, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        assert_kv_system_column_error(batch, "_SEQUENCE_NUMBER must be an Int64").await;
+    }
+
+    #[tokio::test]
+    async fn kv_sequence_number_rejects_null_before_merge() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, true),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        assert_kv_system_column_error(batch, "_SEQUENCE_NUMBER must be declared non-null").await;
+    }
+
+    #[tokio::test]
+    async fn kv_value_kind_rejects_wrong_type_before_merge() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        assert_kv_system_column_error(batch, "_VALUE_KIND must be an Int8").await;
+    }
+
+    #[tokio::test]
+    async fn kv_value_kind_rejects_null_before_merge() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int8Array::from(vec![None])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        assert_kv_system_column_error(batch, "_VALUE_KIND must be declared non-null").await;
+    }
+
+    #[tokio::test]
+    async fn kv_value_kind_rejects_out_of_range_before_merge() {
+        let schema = make_schema();
+        let batch = make_batch_with_kind(&schema, vec![1], vec![1], vec![9], vec![Some("a")]);
+        assert_kv_system_column_error(batch, "_VALUE_KIND contains invalid value 9").await;
+    }
+
+    fn observed_control(cancel_after: usize) -> (Arc<ObservedReadState>, Arc<dyn ReadControl>) {
+        let state = Arc::new(ObservedReadState::default());
+        state
+            .cancel_after
+            .store(cancel_after, AtomicOrdering::SeqCst);
+        let control: Arc<dyn ReadControl> = Arc::new(ObservedReadControl {
+            state: state.clone(),
+        });
+        (state, control)
+    }
+
+    #[tokio::test]
+    async fn all_delete_history_is_checkpointed_charged_and_released() {
+        let schema = make_schema();
+        let row_count = 512usize;
+        let stream = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![7; row_count],
+            (0..row_count as i64).collect(),
+            vec![RowKind::Delete.to_value(); row_count],
+            vec![Some("deleted"); row_count],
+        )]);
+        let (state, control) = observed_control(0);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(DeduplicateMergeFunction),
+        )
+        .with_read_control(Some(control))
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert!(result.is_empty());
+        assert!(state.checkpoints.load(AtomicOrdering::SeqCst) > row_count);
+        assert!(state.peak.load(AtomicOrdering::SeqCst) > 0);
+        assert_eq!(state.retained.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn all_delete_history_observes_cancellation_without_output() {
+        let schema = make_schema();
+        let row_count = 512usize;
+        let stream = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![7; row_count],
+            (0..row_count as i64).collect(),
+            vec![RowKind::Delete.to_value(); row_count],
+            vec![Some("deleted"); row_count],
+        )]);
+        let (state, control) = observed_control(40);
+
+        let error = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(DeduplicateMergeFunction),
+        )
+        .with_read_control(Some(control))
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test read cancelled"));
+        assert_eq!(state.retained.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    struct MaterializingMergeFunction;
+
+    impl MergeFunction for MaterializingMergeFunction {
+        fn merge(
+            &self,
+            rows: &[MergeRow],
+            batch_buffer: &[BufferedBatch],
+            source_output_col_indices: &[usize],
+            output_schema: &SchemaRef,
+        ) -> crate::Result<MergeResult> {
+            let first = rows.first().expect("merge called with empty rows");
+            let source_batch = first.source_batch(batch_buffer)?;
+            let pk = source_batch
+                .column(source_output_col_indices[0])
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("pk column must be Int32")
+                .value(first.row_idx);
+
+            let batch = RecordBatch::try_new(
+                output_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![pk])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![Some("merged")])) as ArrayRef,
+                ],
+            )
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to build materialized merge batch: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+
+            Ok(MergeResult::MaterializedRow(batch))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_loser_tree_basic() {
+        // 3 streams, verify init produces correct winner
+        let schema = make_schema();
+        let s0 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 3],
+            vec![1, 1],
+            vec![Some("a"), Some("c")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![2, 4],
+            vec![1, 1],
+            vec![Some("b"), Some("d")],
+        )]);
+        let s2 = stream_from_batches(vec![make_batch(&schema, vec![5], vec![1], vec![Some("e")])]);
+
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1, s2],
+            schema,
+            vec![0], // key: pk
+            1,       // seq index
+            2,       // value_kind index
+            vec![],  // no user sequence fields
+            vec![3], // value index
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(pks, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_deduplicate_merge() {
+        // Two streams with overlapping keys, different sequence numbers
+        let schema = make_schema();
+        let s0 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 2, 3],
+            vec![1, 1, 1],
+            vec![Some("old_a"), Some("old_b"), Some("old_c")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 2, 4],
+            vec![2, 2, 2],
+            vec![Some("new_a"), Some("new_b"), Some("new_d")],
+        )]);
+
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,       // value_kind index
+            vec![],  // no user sequence fields
+            vec![3], // value index
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let values: Vec<String> = result
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(pks, vec![1, 2, 3, 4]);
+        // key 1,2: newer seq wins; key 3: only in s0; key 4: only in s1
+        assert_eq!(values, vec!["new_a", "new_b", "old_c", "new_d"]);
+    }
+
+    #[tokio::test]
+    async fn test_empty_streams() {
+        let schema = make_schema();
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![],
+            schema,
+            vec![0],
+            1,
+            2,       // value_kind index
+            vec![],  // no user sequence fields
+            vec![3], // value index
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_single_stream_no_duplicates() {
+        let schema = make_schema();
+        let s0 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 2, 3],
+            vec![1, 1, 1],
+            vec![Some("a"), Some("b"), Some("c")],
+        )]);
+
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![s0],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(pks, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_multi_batch_per_stream() {
+        let schema = make_schema();
+        // Stream 0: two batches
+        let s0 = stream_from_batches(vec![
+            make_batch(&schema, vec![1, 3], vec![1, 1], vec![Some("a"), Some("c")]),
+            make_batch(&schema, vec![5, 7], vec![1, 1], vec![Some("e"), Some("g")]),
+        ]);
+        // Stream 1: two batches
+        let s1 = stream_from_batches(vec![
+            make_batch(&schema, vec![2, 4], vec![1, 1], vec![Some("b"), Some("d")]),
+            make_batch(&schema, vec![6], vec![1], vec![Some("f")]),
+        ]);
+
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(pks, vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[tokio::test]
+    async fn test_batch_size_boundary() {
+        let schema = make_schema();
+        let s0 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 2, 3, 4, 5],
+            vec![1, 1, 1, 1, 1],
+            vec![Some("a"), Some("b"), Some("c"), Some("d"), Some("e")],
+        )]);
+
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![s0],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .with_batch_size(2)
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        // Should produce 3 batches: [2, 2, 1] rows
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].num_rows(), 2);
+        assert_eq!(result[1].num_rows(), 2);
+        assert_eq!(result[2].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_multi_sequence_fields() {
+        // Schema: pk, _SEQUENCE_NUMBER, _VALUE_KIND, seq1, seq2, value
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("seq1", DataType::Int64, false),
+            Field::new("seq2", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+
+        // pk=1: s0 has (seq1=10, seq2=1), s1 has (seq1=10, seq2=2) → s1 wins (second field higher)
+        // pk=2: s0 has (seq1=20, seq2=1), s1 has (seq1=10, seq2=99) → s0 wins (first field higher)
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(StringArray::from(vec!["old_a", "winner_b"])),
+            ],
+        )
+        .unwrap()]);
+        let s1 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![2, 2])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+                Arc::new(Int64Array::from(vec![10, 10])),
+                Arc::new(Int64Array::from(vec![2, 99])),
+                Arc::new(StringArray::from(vec!["winner_a", "loser_b"])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],    // key: pk
+            1,          // seq index
+            2,          // value_kind index
+            vec![3, 4], // user sequence fields: seq1, seq2
+            vec![5],    // value index
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let values: Vec<String> = result
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, vec!["winner_a", "winner_b"]);
+    }
+
+    #[tokio::test]
+    async fn test_delete_row_filtered() {
+        let schema = make_schema();
+        // Stream 0: pk=1 INSERT (seq=1), pk=2 INSERT (seq=1)
+        let s0 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1, 2],
+            vec![1, 1],
+            vec![0, 0],
+            vec![Some("a"), Some("b")],
+        )]);
+        // Stream 1: pk=1 DELETE (seq=2) — should win and be filtered out
+        let s1 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![2],
+            vec![3], // DELETE
+            vec![Some("a")],
+        )]);
+
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        // pk=1 deleted, only pk=2 remains
+        assert_eq!(pks, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn test_single_stream_duplicate_keys() {
+        let schema = make_schema();
+        // Single stream with duplicate pk=1 (seq 1 and 2), unique pk=2
+        let s0 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 1, 2],
+            vec![1, 2, 1],
+            vec![Some("old"), Some("new"), Some("only")],
+        )]);
+
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![s0],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let values: Vec<String> = result
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(pks, vec![1, 2]);
+        assert_eq!(values, vec!["new", "only"]);
+    }
+
+    #[tokio::test]
+    async fn test_single_row_per_stream() {
+        let schema = make_schema();
+        let s0 = stream_from_batches(vec![make_batch(&schema, vec![3], vec![1], vec![Some("c")])]);
+        let s1 = stream_from_batches(vec![make_batch(&schema, vec![1], vec![1], vec![Some("a")])]);
+        let s2 = stream_from_batches(vec![make_batch(&schema, vec![2], vec![1], vec![Some("b")])]);
+
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1, s2],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let values: Vec<String> = result
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(pks, vec![1, 2, 3]);
+        assert_eq!(values, vec!["a", "b", "c"]);
+    }
+
+    /// Helper to create an empty batch with the test schema.
+    fn make_empty_batch(schema: &SchemaRef) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(Vec::<i32>::new())),
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+                Arc::new(Int8Array::from(Vec::<i8>::new())),
+                Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_empty_batches_skipped() {
+        // Regression: empty batches (e.g. from predicate filtering) must be
+        // skipped, not treated as stream exhaustion.
+        let schema = make_schema();
+
+        // Stream 0: empty batch at start, then real data
+        let s0 = stream_from_batches(vec![
+            make_empty_batch(&schema),
+            make_batch(&schema, vec![1, 3], vec![1, 1], vec![Some("a"), Some("c")]),
+        ]);
+        // Stream 1: data, empty batch in the middle, then more data
+        let s1 = stream_from_batches(vec![
+            make_batch(&schema, vec![2], vec![1], vec![Some("b")]),
+            make_empty_batch(&schema),
+            make_empty_batch(&schema),
+            make_batch(&schema, vec![4], vec![1], vec![Some("d")]),
+        ]);
+
+        let output_schema = make_output_schema();
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let values: Vec<String> = result
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(pks, vec![1, 2, 3, 4]);
+        assert_eq!(values, vec!["a", "b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn test_materialized_merge_result_path() {
+        let schema = make_schema();
+        let s0 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 2],
+            vec![1, 1],
+            vec![Some("old_a"), Some("old_b")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch(
+            &schema,
+            vec![1, 3],
+            vec![2, 1],
+            vec![Some("new_a"), Some("c")],
+        )]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(MaterializingMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let pks: Vec<i32> = result
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let values: Vec<String> = result
+            .iter()
+            .flat_map(|b| {
+                let arr = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+                (0..arr.len())
+                    .map(|i| arr.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(pks, vec![1, 2, 3]);
+        assert_eq!(values, vec!["merged", "merged", "merged"]);
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_keeps_latest_non_null_values() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("v_int", DataType::Int32, true),
+            Field::new("v_str", DataType::Utf8, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("v_int", DataType::Int32, true),
+            Field::new("v_str", DataType::Utf8, true),
+        ]));
+
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(StringArray::from(vec![Some("old-1"), Some("old-2")])),
+            ],
+        )
+        .unwrap()]);
+        let s1 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![2, 2, 1])),
+                Arc::new(Int8Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![None, Some(200), Some(30)])),
+                Arc::new(StringArray::from(vec![Some("new-1"), None, None])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction::new(&HashMap::new(), "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let mut rows: Vec<(i32, Option<i32>, Option<String>)> = Vec::new();
+        for batch in &result {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let ints = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let strs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    ids.value(i),
+                    if ints.is_null(i) {
+                        None
+                    } else {
+                        Some(ints.value(i))
+                    },
+                    if strs.is_null(i) {
+                        None
+                    } else {
+                        Some(strs.value(i).to_string())
+                    },
+                ));
+            }
+        }
+        rows.sort_by_key(|row| row.0);
+
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some(10), Some("new-1".to_string())),
+                (2, Some(200), Some("old-2".to_string())),
+                (3, Some(30), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_sequence_groups_advance_independently() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("seq_a", DataType::Int32, true),
+            Field::new("value_a", DataType::Int32, true),
+            Field::new("seq_b", DataType::Int32, true),
+            Field::new("value_b", DataType::Int32, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("seq_a", DataType::Int32, true),
+            Field::new("value_a", DataType::Int32, true),
+            Field::new("seq_b", DataType::Int32, true),
+            Field::new("value_b", DataType::Int32, true),
+        ]));
+        let output_fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "seq_a".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "value_a".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                3,
+                "seq_b".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                4,
+                "value_b".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.seq_a.sequence-group".to_string(),
+                "value_a".to_string(),
+            ),
+            (
+                "fields.seq_b.sequence-group".to_string(),
+                "value_b".to_string(),
+            ),
+        ]);
+        let old = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![100])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![1000])),
+            ],
+        )
+        .unwrap()]);
+        let mixed = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![9])),
+                Arc::new(Int32Array::from(vec![200])),
+                Arc::new(Int32Array::from(vec![11])),
+                Arc::new(Int32Array::from(vec![2000])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![old, mixed],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4, 5, 6],
+            output_schema,
+            Box::new(
+                PartialUpdateMergeFunction::new_with_schema(
+                    &options,
+                    "test_table",
+                    &output_fields,
+                    &output_fields,
+                    &["pk".to_string()],
+                )
+                .unwrap(),
+            ),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let batch = &result[0];
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            100
+        );
+        assert_eq!(
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            11
+        );
+        assert_eq!(
+            batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            2000
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_composite_sequence_group_skips_empty_sequence() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("seq_major", DataType::Int32, true),
+            Field::new("seq_minor", DataType::Int32, true),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("seq_major", DataType::Int32, true),
+            Field::new("seq_minor", DataType::Int32, true),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let output_fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "seq_major".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "seq_minor".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                3,
+                "value".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.seq_major,seq_minor.sequence-group".to_string(),
+                "value".to_string(),
+            ),
+        ]);
+        let stream = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int8Array::from(vec![0, 0, 0, 0, 0])),
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    None,
+                    Some(2),
+                    Some(3),
+                ])),
+                Arc::new(Int32Array::from(vec![
+                    Some(2),
+                    Some(1),
+                    None,
+                    None,
+                    Some(0),
+                ])),
+                Arc::new(Int32Array::from(vec![
+                    Some(100),
+                    Some(200),
+                    Some(300),
+                    Some(400),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4, 5],
+            output_schema,
+            Box::new(
+                PartialUpdateMergeFunction::new_with_schema(
+                    &options,
+                    "test_table",
+                    &output_fields,
+                    &output_fields,
+                    &["pk".to_string()],
+                )
+                .unwrap(),
+            ),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let batch = &result[0];
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            0
+        );
+        assert!(batch.column(3).is_null(0));
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_aggregation_composite_sequence_accepts_partial_null_tuple() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("seq_major", DataType::Int32, true),
+            Field::new("seq_minor", DataType::Int32, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("seq_major", DataType::Int32, true),
+            Field::new("seq_minor", DataType::Int32, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "seq_major".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "seq_minor".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                3,
+                "value".into(),
+                crate::spec::DataType::VarChar(VarCharType::string_type()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.seq_major,seq_minor.sequence-group".to_string(),
+                "value".to_string(),
+            ),
+            (
+                "fields.value.aggregate-function".to_string(),
+                "listagg".to_string(),
+            ),
+        ]);
+        let stream = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int8Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(11), None])),
+                Arc::new(Int32Array::from(vec![Some(1), None, None])),
+                Arc::new(StringArray::from(vec![
+                    Some("base"),
+                    Some("partial"),
+                    Some("ignored"),
+                ])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4, 5],
+            output_schema,
+            Box::new(
+                PartialUpdateMergeFunction::new_with_schema(
+                    &options,
+                    "test_table",
+                    &output_fields,
+                    &output_fields,
+                    &["pk".to_string()],
+                )
+                .unwrap(),
+            ),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let batch = &result[0];
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            11
+        );
+        assert!(batch.column(2).is_null(0));
+        assert_eq!(
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "base,partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_last_non_null_aggregation_without_sequence_group() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let output_fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "value".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.value.aggregate-function".to_string(),
+                "last_non_null_value".to_string(),
+            ),
+        ]);
+        let stream = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int8Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(30), None])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(
+                PartialUpdateMergeFunction::new_with_schema(
+                    &options,
+                    "test_table",
+                    &output_fields,
+                    &output_fields,
+                    &["pk".to_string()],
+                )
+                .unwrap(),
+            ),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            30
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_sequence_group_listagg_preserves_group_sequence_order() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("version", DataType::Int32, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("version", DataType::Int32, true),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let output_fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "version".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "value".into(),
+                crate::spec::DataType::VarChar(VarCharType::string_type()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.version.sequence-group".to_string(),
+                "value".to_string(),
+            ),
+            (
+                "fields.value.aggregate-function".to_string(),
+                "listagg".to_string(),
+            ),
+        ]);
+        let stream = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(Int8Array::from(vec![0, 0, 0, 0, 0])),
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    Some(12),
+                    Some(11),
+                    Some(12),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("b"),
+                    Some("d"),
+                    Some("c"),
+                    Some("e"),
+                    Some("ignored"),
+                ])),
+            ],
+        )
+        .unwrap()]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            output_schema,
+            Box::new(
+                PartialUpdateMergeFunction::new_with_schema(
+                    &options,
+                    "test_table",
+                    &output_fields,
+                    &output_fields,
+                    &["pk".to_string()],
+                )
+                .unwrap(),
+            ),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let batch = &result[0];
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            12
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "c,b,d,e"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_rejects_delete_like_rows() {
+        let schema = make_schema();
+        let output_schema = make_output_schema();
+        let s0 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![1],
+            vec![0],
+            vec![Some("old")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![2],
+            vec![3],
+            vec![Some("delete")],
+        )]);
+
+        let err = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction::new(&HashMap::new(), "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Unsupported { message }
+            if message.contains("partial-update basic mode does not support DELETE or UPDATE_BEFORE")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_ignores_delete_when_configured() {
+        let schema = make_schema();
+        let output_schema = make_output_schema();
+        let s0 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![1],
+            vec![0],
+            vec![Some("old")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![2],
+            vec![3],
+            vec![Some("delete")],
+        )]);
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            ("ignore-delete".to_string(), "true".to_string()),
+        ]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction::new(&options, "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        assert_eq!(
+            result[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "old"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_alias_ignores_update_before() {
+        let schema = make_schema();
+        let output_schema = make_output_schema();
+        let s0 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![1],
+            vec![0],
+            vec![Some("old")],
+        )]);
+        let s1 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![2],
+            vec![1],
+            vec![Some("before")],
+        )]);
+        let s2 = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![3],
+            vec![2],
+            vec![Some("new")],
+        )]);
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "partial-update.ignore-delete".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![s0, s1, s2],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction::new(&options, "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        assert_eq!(
+            result[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_merge_omits_retract_only_key_when_configured() {
+        let schema = make_schema();
+        let output_schema = make_output_schema();
+        let stream = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1],
+            vec![1],
+            vec![3],
+            vec![Some("delete")],
+        )]);
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            ("ignore-delete".to_string(), "true".to_string()),
+        ]);
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            output_schema,
+            Box::new(PartialUpdateMergeFunction::new(&options, "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn test_partial_update_merge_function_new_rejects_unsupported_options() {
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.price.aggregate-function".to_string(),
+                "last_non_null".to_string(),
+            ),
+        ]);
+
+        let err = PartialUpdateMergeFunction::new(&options, "default.t").unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Unsupported { message }
+            if message.contains("fields.price.aggregate-function")
+        ));
+    }
+
+    #[test]
+    fn test_partial_update_new_with_schema_validates_aggregate_functions() {
+        let fields = vec![
+            DataField::new(0, "pk".into(), crate::spec::DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "version".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+            DataField::new(
+                2,
+                "value".into(),
+                crate::spec::DataType::Int(IntType::new()),
+            ),
+        ];
+        let options = HashMap::from([
+            ("merge-engine".to_string(), "partial-update".to_string()),
+            (
+                "fields.version.sequence-group".to_string(),
+                "value".to_string(),
+            ),
+            (
+                "fields.value.aggregate-function".to_string(),
+                "sume".to_string(),
+            ),
+        ]);
+
+        let err = PartialUpdateMergeFunction::new_with_schema(
+            &options,
+            "default.t",
+            &fields,
+            &fields,
+            &["pk".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, Error::ConfigInvalid { ref message }
+                if message.contains("sume") && message.contains("value")),
+            "expected schema-aware aggregate validation, got {err:?}"
+        );
+    }
+
+    // ---------- AggregateMergeFunction ----------
+
+    use crate::spec::{DataType as PaimonDataType, IntType, VarCharType};
+
+    fn aggregation_output_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(0, "pk".into(), PaimonDataType::Int(IntType::new())),
+            DataField::new(1, "amount".into(), PaimonDataType::Int(IntType::new())),
+            DataField::new(
+                2,
+                "tag".into(),
+                // listagg requires unbounded VARCHAR (STRING), matching Java.
+                PaimonDataType::VarChar(VarCharType::string_type()),
+            ),
+        ]
+    }
+
+    fn aggregation_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("amount", DataType::Int32, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]))
+    }
+
+    fn aggregation_output_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("amount", DataType::Int32, true),
+            Field::new("tag", DataType::Utf8, true),
+        ]))
+    }
+
+    fn agg_options(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut opts = HashMap::from([("merge-engine".to_string(), "aggregation".to_string())]);
+        for (k, v) in pairs {
+            opts.insert((*k).to_string(), (*v).to_string());
+        }
+        opts
+    }
+
+    fn build_agg_function(options: HashMap<String, String>) -> Box<dyn MergeFunction> {
+        Box::new(
+            AggregateMergeFunction::new(
+                &options,
+                "test_table",
+                &aggregation_output_fields(),
+                &["pk".to_string()],
+                &[],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_merge_sum_and_listagg() {
+        let schema = aggregation_schema();
+        let output_schema = aggregation_output_schema();
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("x")])),
+            ],
+        )
+        .unwrap()]);
+        let s1 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![2, 2, 1])),
+                Arc::new(Int8Array::from(vec![0, 0, 0])),
+                Arc::new(Int32Array::from(vec![Some(5), Some(7), Some(99)])),
+                Arc::new(StringArray::from(vec![Some("b"), None, Some("solo")])),
+            ],
+        )
+        .unwrap()]);
+
+        let options = agg_options(&[
+            ("fields.amount.aggregate-function", "sum"),
+            ("fields.tag.aggregate-function", "listagg"),
+            ("fields.tag.list-agg-delimiter", "|"),
+        ]);
+
+        let batches = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            output_schema,
+            build_agg_function(options),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let mut rows: Vec<(i32, Option<i32>, Option<String>)> = Vec::new();
+        for batch in &batches {
+            let pks = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let amounts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let tags = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push((
+                    pks.value(i),
+                    if amounts.is_null(i) {
+                        None
+                    } else {
+                        Some(amounts.value(i))
+                    },
+                    if tags.is_null(i) {
+                        None
+                    } else {
+                        Some(tags.value(i).to_string())
+                    },
+                ));
+            }
+        }
+        rows.sort_by_key(|row| row.0);
+
+        assert_eq!(
+            rows,
+            vec![
+                (1, Some(15), Some("a|b".to_string())),
+                (2, Some(27), Some("x".to_string())),
+                (3, Some(99), Some("solo".to_string())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_merge_rejects_delete_rows() {
+        let schema = aggregation_schema();
+        let output_schema = aggregation_output_schema();
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![Some(10)])),
+                Arc::new(StringArray::from(vec![Some("a")])),
+            ],
+        )
+        .unwrap()]);
+        // Row kind 3 = DELETE
+        let s1 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int8Array::from(vec![3])),
+                Arc::new(Int32Array::from(vec![Some(99)])),
+                Arc::new(StringArray::from(vec![Some("b")])),
+            ],
+        )
+        .unwrap()]);
+
+        let options = agg_options(&[
+            ("fields.amount.aggregate-function", "sum"),
+            ("fields.tag.aggregate-function", "last_value"),
+        ]);
+
+        let err = SortMergeReaderBuilder::new(
+            vec![s0, s1],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            output_schema,
+            build_agg_function(options),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Unsupported { ref message }
+            if message.contains("aggregation basic mode does not support DELETE")
+        ));
+    }
+
+    #[test]
+    fn test_aggregate_merge_function_falls_back_to_last_non_null_value() {
+        // With no per-field nor default aggregate-function configured, each
+        // value column should fall back to last_non_null_value (matching Java
+        // AggregateMergeFunction#getAggFuncName).
+        let options = HashMap::from([("merge-engine".to_string(), "aggregation".to_string())]);
+        let mf = AggregateMergeFunction::new(
+            &options,
+            "test_table",
+            &aggregation_output_fields(),
+            &["pk".to_string()],
+            &[],
+        )
+        .expect("aggregation engine must accept tables without explicit per-field config");
+        // Smoke check: construction succeeds.
+        let _ = mf;
+    }
+
+    #[test]
+    fn test_aggregate_merge_function_sequence_field_forced_last_value() {
+        // 'tag' is the sequence field; even though the table-level default is
+        // listagg, it should be forced to last_value (so the latest tag survives).
+        let schema = aggregation_schema();
+        let output_schema = aggregation_output_schema();
+        let options = agg_options(&[
+            ("fields.amount.aggregate-function", "sum"),
+            ("fields.default-aggregate-function", "listagg"),
+            ("sequence.field", "tag"),
+        ]);
+        let mf = AggregateMergeFunction::new(
+            &options,
+            "test_table",
+            &aggregation_output_fields(),
+            &["pk".to_string()],
+            &["tag".to_string()],
+        )
+        .unwrap();
+
+        let s0 = stream_from_batches(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+                Arc::new(Int32Array::from(vec![Some(3), Some(4)])),
+                Arc::new(StringArray::from(vec![Some("first"), Some("second")])),
+            ],
+        )
+        .unwrap()]);
+
+        // Use the merge function via builder.
+        let batches = futures::executor::block_on(async {
+            SortMergeReaderBuilder::new(
+                vec![s0],
+                schema,
+                vec![0],
+                1,
+                2,
+                vec![],
+                vec![3, 4],
+                output_schema,
+                Box::new(mf),
+            )
+            .build()
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap()
+        });
+
+        let batch = &batches[0];
+        let tags = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let amounts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(tags.value(0), "second"); // last_value, not listagg.
+        assert_eq!(amounts.value(0), 7); // sum of 3 + 4.
+    }
+
+    #[test]
+    fn test_aggregate_merge_function_default_function_applies_when_per_field_absent() {
+        let options = agg_options(&[("fields.default-aggregate-function", "last_non_null_value")]);
+        let mf = AggregateMergeFunction::new(
+            &options,
+            "test_table",
+            &aggregation_output_fields(),
+            &["pk".to_string()],
+            &[],
+        )
+        .unwrap();
+        // Construction must succeed: amount and tag fall back to the default.
+        // Tag is VarChar — last_non_null_value supports any type.
+        let _ = mf;
+    }
+
+    #[test]
+    fn test_aggregate_merge_function_rejects_unsupported_options() {
+        let options = agg_options(&[("fields.amount.ignore-retract", "true")]);
+        let err = AggregateMergeFunction::new(
+            &options,
+            "test_table",
+            &aggregation_output_fields(),
+            &["pk".to_string()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported { message } if message.contains("ignore-retract"))
+        );
+    }
+}

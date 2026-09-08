@@ -1,0 +1,2711 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::error::*;
+use crate::spec::DataField;
+use bitflags::bitflags;
+use serde::{Deserialize, Serialize};
+use serde_utils::DataTypeName;
+use serde_with::{serde_as, DeserializeFromStr, FromInto, SerializeDisplay};
+use std::{
+    fmt::{Debug, Display, Formatter},
+    str::FromStr,
+};
+
+bitflags! {
+/// An enumeration of Data type families for clustering {@link DataTypeRoot}s into categories.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataTypeFamily.java>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DataTypeFamily: u32 {
+        const PREDEFINED = 1 << 0;
+        const CONSTRUCTED = 1 << 1;
+        const CHARACTER_STRING = 1 << 2;
+        const BINARY_STRING = 1 << 3;
+        const NUMERIC = 1 << 4;
+        const INTEGER_NUMERIC = 1 << 5;
+        const EXACT_NUMERIC = 1 << 6;
+        const APPROXIMATE_NUMERIC = 1 << 7;
+        const DATETIME = 1 << 8;
+        const TIME = 1 << 9;
+        const TIMESTAMP = 1 << 10;
+        const COLLECTION = 1 << 11;
+        const EXTENSION = 1 << 12;
+    }
+}
+
+/// Data type for paimon table.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DataType {
+    /// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
+    Boolean(BooleanType),
+
+    /// Data type of a 1-byte (2^8) signed integer with values from -128 to 127.
+    TinyInt(TinyIntType),
+    /// Data type of a 2-byte (2^16) signed integer with values from -32,768 to 32,767.
+    SmallInt(SmallIntType),
+    /// Data type of a 4-byte (2^32) signed integer with values from -2,147,483,648 to 2,147,483,647.
+    Int(IntType),
+    /// Data type of an 8-byte (2^64) signed integer with values from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
+    BigInt(BigIntType),
+    /// Data type of a decimal number with fixed precision and scale.
+    Decimal(DecimalType),
+    /// Data type of an 8-byte double precision floating point number.
+    Double(DoubleType),
+    /// Data type of a 4-byte single precision floating point number.
+    Float(FloatType),
+
+    /// Data type of a fixed-length binary string (=a sequence of bytes).
+    Binary(BinaryType),
+    /// Data type of a variable-length binary string (=a sequence of bytes).
+    VarBinary(VarBinaryType),
+    /// Data type of semi-structured values encoded as Variant value + metadata.
+    Variant(VariantType),
+    /// Data type of binary large object.
+    Blob(BlobType),
+    /// Data type of a fixed-length character string.
+    Char(CharType),
+    /// Data type of a variable-length character string.
+    VarChar(VarCharType),
+
+    /// Data type of a date consisting of `year-month-day` with values ranging from `0000-01-01` to `9999-12-31`
+    Date(DateType),
+    /// Data type of a timestamp WITH LOCAL time zone consisting of `year-month-day hour:minute:second[.fractional] zone`.
+    LocalZonedTimestamp(LocalZonedTimestampType),
+    /// Data type of a time WITHOUT time zone consisting of `hour:minute:second[.fractional]` with
+    /// up to nanosecond precision and values ranging from `00:00:00.000000000` to `23:59:59.999999999`.
+    Time(TimeType),
+    /// Data type of a timestamp WITHOUT time zone consisting of `year-month-day hour:minute:second[.fractional]` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000` to `9999-12-31 23:59:59.999999999`.
+    Timestamp(TimestampType),
+
+    /// Data type of an array of elements with same subtype.
+    Array(ArrayType),
+    /// Data type of an associative array that maps keys `NULL` to values (including `NULL`).
+    Map(MapType),
+    /// Data type of a multiset (=bag). Unlike a set, it allows for multiple instances for each of its
+    /// elements with a common subtype.
+    Multiset(MultisetType),
+    /// Data type of a sequence of fields. A field consists of a field name, field type, and an optional
+    /// description.
+    Row(RowType),
+    /// Data type of a fixed-size dense vector `VECTOR<element, length>`.
+    Vector(VectorType),
+}
+
+impl DataType {
+    /// Returns whether this type is or contains (recursively) a [`RowType`].
+    /// Used to reject schema columns that would require field ID assignment for nested row fields,
+    /// which is not yet implemented (see <https://github.com/apache/paimon/pull/1547>).
+    pub fn contains_row_type(&self) -> bool {
+        match self {
+            DataType::Row(_) => true,
+            DataType::Array(v) => v.element_type.contains_row_type(),
+            DataType::Map(v) => v.key_type.contains_row_type() || v.value_type.contains_row_type(),
+            DataType::Multiset(v) => v.element_type.contains_row_type(),
+            DataType::Vector(v) => v.element_type.contains_row_type(),
+            _ => false,
+        }
+    }
+
+    pub fn is_blob_type(&self) -> bool {
+        matches!(self, DataType::Blob(_))
+    }
+
+    /// Returns whether this field is stored in a dedicated `.blob` file.
+    pub(crate) fn is_blob_file_field(&self) -> bool {
+        match self {
+            DataType::Blob(_) => true,
+            DataType::Array(array) => array.element_type().is_blob_type(),
+            _ => false,
+        }
+    }
+
+    /// Returns whether this type is nullable.
+    pub fn is_nullable(&self) -> bool {
+        match self {
+            DataType::Boolean(v) => v.nullable,
+            DataType::TinyInt(v) => v.nullable,
+            DataType::SmallInt(v) => v.nullable,
+            DataType::Int(v) => v.nullable,
+            DataType::BigInt(v) => v.nullable,
+            DataType::Decimal(v) => v.nullable,
+            DataType::Double(v) => v.nullable,
+            DataType::Float(v) => v.nullable,
+            DataType::Binary(v) => v.nullable,
+            DataType::VarBinary(v) => v.nullable,
+            DataType::Variant(v) => v.nullable,
+            DataType::Blob(v) => v.nullable,
+            DataType::Char(v) => v.nullable,
+            DataType::VarChar(v) => v.nullable,
+            DataType::Date(v) => v.nullable,
+            DataType::LocalZonedTimestamp(v) => v.nullable,
+            DataType::Time(v) => v.nullable,
+            DataType::Timestamp(v) => v.nullable,
+            DataType::Array(v) => v.nullable,
+            DataType::Map(v) => v.nullable,
+            DataType::Multiset(v) => v.nullable,
+            DataType::Row(v) => v.nullable,
+            DataType::Vector(v) => v.nullable,
+        }
+    }
+
+    /// Returns a copy of this type with the given nullability (top-level only).
+    /// Corresponds to Java `DataType.copy(boolean nullable)`.
+    pub fn copy_with_nullable(&self, nullable: bool) -> Result<Self> {
+        Ok(match self {
+            DataType::Boolean(_) => DataType::Boolean(BooleanType::with_nullable(nullable)),
+            DataType::TinyInt(_) => DataType::TinyInt(TinyIntType::with_nullable(nullable)),
+            DataType::SmallInt(_) => DataType::SmallInt(SmallIntType::with_nullable(nullable)),
+            DataType::Int(_) => DataType::Int(IntType::with_nullable(nullable)),
+            DataType::BigInt(_) => DataType::BigInt(BigIntType::with_nullable(nullable)),
+            DataType::Decimal(v) => DataType::Decimal(DecimalType::with_nullable(
+                nullable,
+                v.precision(),
+                v.scale(),
+            )?),
+            DataType::Double(_) => DataType::Double(DoubleType::with_nullable(nullable)),
+            DataType::Float(_) => DataType::Float(FloatType::with_nullable(nullable)),
+            DataType::Binary(v) => {
+                DataType::Binary(BinaryType::with_nullable(nullable, v.length())?)
+            }
+            DataType::VarBinary(v) => {
+                DataType::VarBinary(VarBinaryType::try_new(nullable, v.length())?)
+            }
+            DataType::Variant(_) => DataType::Variant(VariantType::with_nullable(nullable)),
+            DataType::Blob(_) => DataType::Blob(BlobType::with_nullable(nullable)),
+            DataType::Char(v) => DataType::Char(CharType::with_nullable(nullable, v.length())?),
+            DataType::VarChar(v) => {
+                DataType::VarChar(VarCharType::with_nullable(nullable, v.length())?)
+            }
+            DataType::Date(_) => DataType::Date(DateType::with_nullable(nullable)),
+            DataType::LocalZonedTimestamp(v) => DataType::LocalZonedTimestamp(
+                LocalZonedTimestampType::with_nullable(nullable, v.precision())?,
+            ),
+            DataType::Time(v) => DataType::Time(TimeType::with_nullable(nullable, v.precision())?),
+            DataType::Timestamp(v) => {
+                DataType::Timestamp(TimestampType::with_nullable(nullable, v.precision())?)
+            }
+            DataType::Array(v) => DataType::Array(ArrayType::with_nullable(
+                nullable,
+                v.element_type.as_ref().clone(),
+            )),
+            DataType::Map(v) => DataType::Map(MapType::with_nullable(
+                nullable,
+                v.key_type.as_ref().clone(),
+                v.value_type.as_ref().clone(),
+            )),
+            DataType::Multiset(v) => DataType::Multiset(MultisetType::with_nullable(
+                nullable,
+                v.element_type.as_ref().clone(),
+            )),
+            DataType::Row(v) => {
+                DataType::Row(RowType::with_nullable(nullable, v.fields().to_vec()))
+            }
+            DataType::Vector(v) => DataType::Vector(VectorType::try_new(
+                nullable,
+                v.length(),
+                v.element_type().clone(),
+            )?),
+        })
+    }
+}
+
+/// ArrayType for paimon.
+///
+/// Data type of an array of elements with same subtype.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/ArrayType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ArrayType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::ARRAY>>")]
+    nullable: bool,
+    #[serde(rename = "element")]
+    element_type: Box<DataType>,
+}
+
+impl ArrayType {
+    pub fn new(element_type: DataType) -> Self {
+        Self::with_nullable(true, element_type)
+    }
+
+    pub fn with_nullable(nullable: bool, element_type: DataType) -> Self {
+        Self {
+            nullable,
+            element_type: Box::new(element_type),
+        }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
+    }
+
+    pub fn element_type(&self) -> &DataType {
+        &self.element_type
+    }
+}
+
+/// VectorType for paimon.
+///
+/// Data type of a fixed-size dense vector `VECTOR<element, length>`. Elements are densely
+/// stored. The element type must be one of BOOLEAN, TINYINT, SMALLINT, INT, BIGINT, FLOAT,
+/// DOUBLE, and `length` must be between 1 and `i32::MAX` (both inclusive).
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/types/VectorType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct VectorType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::VECTOR>>")]
+    nullable: bool,
+    #[serde(rename = "element")]
+    element_type: Box<DataType>,
+    length: u32,
+}
+
+impl VectorType {
+    /// Maximum vector length, matching Java `Integer.MAX_VALUE`.
+    pub const MAX_LENGTH: u32 = i32::MAX as u32;
+    /// Minimum vector length.
+    pub const MIN_LENGTH: u32 = 1;
+
+    pub fn new(length: u32, element_type: DataType) -> Result<Self> {
+        Self::try_new(true, length, element_type)
+    }
+
+    pub fn with_nullable(nullable: bool, length: u32, element_type: DataType) -> Result<Self> {
+        Self::try_new(nullable, length, element_type)
+    }
+
+    pub fn try_new(nullable: bool, length: u32, element_type: DataType) -> Result<Self> {
+        if !Self::is_valid_element_type(&element_type) {
+            return Err(Error::DataTypeInvalid {
+                message: format!("Invalid element type for vector: {element_type:?}"),
+            });
+        }
+        if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
+            return Err(Error::DataTypeInvalid {
+                message: format!(
+                    "Vector length must be between {} and {} (both inclusive), got {length}.",
+                    Self::MIN_LENGTH,
+                    Self::MAX_LENGTH
+                ),
+            });
+        }
+        Ok(Self {
+            nullable,
+            element_type: Box::new(element_type),
+            length,
+        })
+    }
+
+    fn is_valid_element_type(dt: &DataType) -> bool {
+        matches!(
+            dt,
+            DataType::Boolean(_)
+                | DataType::TinyInt(_)
+                | DataType::SmallInt(_)
+                | DataType::Int(_)
+                | DataType::BigInt(_)
+                | DataType::Float(_)
+                | DataType::Double(_)
+        )
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
+    }
+
+    pub fn element_type(&self) -> &DataType {
+        &self.element_type
+    }
+
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+
+    /// SQL name of a valid vector element type.
+    fn element_sql_name(&self) -> &'static str {
+        match self.element_type.as_ref() {
+            DataType::Boolean(_) => "BOOLEAN",
+            DataType::TinyInt(_) => "TINYINT",
+            DataType::SmallInt(_) => "SMALLINT",
+            DataType::Int(_) => "INT",
+            DataType::BigInt(_) => "BIGINT",
+            DataType::Float(_) => "FLOAT",
+            DataType::Double(_) => "DOUBLE",
+            other => {
+                unreachable!("vector element type validated at construction: {other:?}")
+            }
+        }
+    }
+}
+
+impl Display for VectorType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // Match Java VectorType.asSQLString: the element is rendered with its own
+        // SQL string, which includes the element's nullability suffix.
+        write!(f, "VECTOR<{}", self.element_sql_name())?;
+        if !self.element_type.is_nullable() {
+            write!(f, " NOT NULL")?;
+        }
+        write!(f, ", {}>", self.length)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+// Hand-written `Deserialize` (rather than `#[derive(Deserialize)]` with
+// `#[serde(try_from = ...)]`): the derive-based `try_from` path does not compose
+// with the untagged `DataType` enum for a struct carrying a numeric (`length`)
+// field — under `#[serde(untagged)]` serde buffers input into a `Content` value
+// and replays it through a `ContentDeserializer`, which mis-handles the
+// `serde_with` layering. This visitor parses the Java JSON shape directly and
+// routes through `VectorType::try_new` so validation still runs on deserialize.
+impl<'de> Deserialize<'de> for VectorType {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Field {
+            #[serde(rename = "type")]
+            Type,
+            Element,
+            Length,
+        }
+
+        struct VectorTypeVisitor;
+
+        impl<'de> Visitor<'de> for VectorTypeVisitor {
+            type Value = VectorType;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a VECTOR data type object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<VectorType, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut nullable: Option<bool> = None;
+                let mut element_type: Option<Box<DataType>> = None;
+                let mut length: Option<u32> = None;
+
+                while let Some(key) = map.next_key::<Field>()? {
+                    match key {
+                        Field::Type => {
+                            if nullable.is_some() {
+                                return Err(de::Error::duplicate_field("type"));
+                            }
+                            // Reuse the shared `VECTOR`/`VECTOR NOT NULL` parsing.
+                            let raw: serde_utils::NullableType<serde_utils::VECTOR> =
+                                map.next_value()?;
+                            nullable = Some(raw.into());
+                        }
+                        Field::Element => {
+                            if element_type.is_some() {
+                                return Err(de::Error::duplicate_field("element"));
+                            }
+                            element_type = Some(map.next_value()?);
+                        }
+                        Field::Length => {
+                            if length.is_some() {
+                                return Err(de::Error::duplicate_field("length"));
+                            }
+                            length = Some(map.next_value()?);
+                        }
+                    }
+                }
+
+                let nullable = nullable.ok_or_else(|| de::Error::missing_field("type"))?;
+                let element_type =
+                    element_type.ok_or_else(|| de::Error::missing_field("element"))?;
+                let length = length.ok_or_else(|| de::Error::missing_field("length"))?;
+
+                VectorType::try_new(nullable, length, *element_type).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "VectorType",
+            &["type", "element", "length"],
+            VectorTypeVisitor,
+        )
+    }
+}
+
+/// BigIntType for paimon.
+///
+/// Data type of an 8-byte (2^64) signed integer with values from -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BigIntType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
+pub struct BigIntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::BIGINT>>")]
+    nullable: bool,
+}
+
+impl Default for BigIntType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BigIntType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::NUMERIC
+            | DataTypeFamily::INTEGER_NUMERIC
+            | DataTypeFamily::EXACT_NUMERIC
+    }
+}
+
+/// BinaryType for paimon.
+///
+/// Data type of a fixed-length binary string (=a sequence of bytes).
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/BinaryType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, SerializeDisplay, DeserializeFromStr, Hash)]
+pub struct BinaryType {
+    nullable: bool,
+    length: usize,
+}
+
+impl Display for BinaryType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BINARY({})", self.length)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for BinaryType {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for BinaryType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::BINARY::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid BINARY type. Expected string to start with 'BINARY'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "BinaryType")?;
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid BINARY length. Unable to parse length as a usize.".to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(BinaryType { nullable, length })
+    }
+}
+
+impl BinaryType {
+    pub const MIN_LENGTH: usize = 1;
+
+    pub const MAX_LENGTH: usize = usize::MAX;
+
+    pub const DEFAULT_LENGTH: usize = 1;
+
+    pub fn new(length: usize) -> Result<Self, Error> {
+        Self::with_nullable(true, length)
+    }
+
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, Error> {
+        if length < Self::MIN_LENGTH {
+            return DataTypeInvalidSnafu {
+                message: "Binary string length must be at least 1.".to_string(),
+            }
+            .fail();
+        }
+        Ok(Self { nullable, length })
+    }
+
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING
+    }
+}
+
+/// BooleanType for paimon.
+///
+/// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/BooleanType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BooleanType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::BOOLEAN>>")]
+    nullable: bool,
+}
+
+impl Default for BooleanType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BooleanType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+    }
+}
+
+/// BlobType for paimon.
+///
+/// Data type of binary large object.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/types/BlobType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BlobType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::BLOB>>")]
+    nullable: bool,
+}
+
+impl Default for BlobType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlobType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+    }
+}
+
+/// VariantType for paimon.
+///
+/// Data type of semi-structured values encoded as two binary buffers: `value`
+/// and `metadata`.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/types/VariantType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VariantType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::VARIANT>>")]
+    nullable: bool,
+}
+
+impl Default for VariantType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VariantType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+    }
+
+    pub(crate) fn validate_payload(value: &[u8], metadata: &[u8]) -> crate::Result<()> {
+        crate::variant::validate_payload(value, metadata)
+    }
+}
+
+/// CharType for paimon.
+///
+/// Data type of a fixed-length character string.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/CharType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, SerializeDisplay, DeserializeFromStr)]
+pub struct CharType {
+    nullable: bool,
+    length: usize,
+}
+
+impl Display for CharType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CHAR({})", self.length)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for CharType {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for CharType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::CHAR::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid CHAR type. Expected string to start with 'CHAR'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "CharType")?;
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid CHAR length. Unable to parse length as a usize.".to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(CharType { nullable, length })
+    }
+}
+
+impl CharType {
+    pub const DEFAULT_LENGTH: usize = 1;
+
+    pub const MIN_LENGTH: usize = 1;
+
+    pub const MAX_LENGTH: usize = 255;
+
+    pub fn new(length: usize) -> Result<Self, Error> {
+        Self::with_nullable(true, length)
+    }
+
+    pub fn with_nullable(nullable: bool, length: usize) -> Result<Self, Error> {
+        if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
+            return DataTypeInvalidSnafu {
+                message: "Char string length must be between 1 and 255.".to_string(),
+            }
+            .fail();
+        }
+        Ok(CharType { nullable, length })
+    }
+
+    pub fn length(&self) -> usize {
+        self.length
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING
+    }
+}
+
+/// DateType for paimon.
+///
+/// Data type of a date consisting of `year-month-day` with values ranging from `0000-01-01` to `9999-12-31`
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DateType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DateType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::DATE>>")]
+    nullable: bool,
+}
+
+impl Default for DateType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DateType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::DATETIME
+    }
+}
+
+/// DecimalType for paimon.
+///
+/// Data type of a decimal number with fixed precision and scale.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DecimalType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
+pub struct DecimalType {
+    nullable: bool,
+
+    precision: u32,
+    scale: u32,
+}
+
+impl Display for DecimalType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DECIMAL({}, {})", self.precision, self.scale)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for DecimalType {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE).unwrap()
+    }
+}
+
+impl FromStr for DecimalType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::DECIMAL::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid DECIMAL type. Expected string to start with 'DECIMAL'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "DecimalType")?;
+        let precision_scale_str = &s[open_bracket + 1..close_bracket];
+        let (precision, scale) = match precision_scale_str
+            .split(',')
+            .collect::<Vec<&str>>()
+            .as_slice()
+        {
+            [precision_str, scale_str] => {
+                let precision =
+                    precision_str
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| Error::DataTypeInvalid {
+                            message:
+                                "Invalid DECIMAL precision. Unable to parse precision as a u32."
+                                    .to_string(),
+                        })?;
+                let scale =
+                    scale_str
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|_| Error::DataTypeInvalid {
+                            message: "Invalid DECIMAL scale. Unable to parse scale as a u32."
+                                .to_string(),
+                        })?;
+                (precision, scale)
+            }
+            _ => {
+                let precision = precision_scale_str.trim().parse::<u32>().map_err(|_| {
+                    Error::DataTypeInvalid {
+                        message: "Invalid DECIMAL precision. Unable to parse precision as a u32."
+                            .to_string(),
+                    }
+                })?;
+                (precision, DecimalType::DEFAULT_SCALE)
+            }
+        };
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(DecimalType {
+            nullable,
+            precision,
+            scale,
+        })
+    }
+}
+
+impl DecimalType {
+    pub const MIN_PRECISION: u32 = 1;
+
+    pub const MAX_PRECISION: u32 = 38;
+
+    pub const DEFAULT_PRECISION: u32 = 10;
+
+    pub const MIN_SCALE: u32 = 0;
+
+    pub const DEFAULT_SCALE: u32 = 0;
+
+    pub fn new(precision: u32, scale: u32) -> Result<Self, Error> {
+        Self::with_nullable(true, precision, scale)
+    }
+
+    pub fn with_nullable(nullable: bool, precision: u32, scale: u32) -> Result<Self, Error> {
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "Decimal precision must be between {} and {} (both inclusive).",
+                    Self::MIN_PRECISION,
+                    Self::MAX_PRECISION
+                ),
+            }
+            .fail();
+        }
+
+        if !(Self::MIN_SCALE..=precision).contains(&scale) {
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "Decimal scale must be between {} and {} (both inclusive).",
+                    Self::MIN_SCALE,
+                    precision
+                ),
+            }
+            .fail();
+        }
+
+        Ok(DecimalType {
+            nullable,
+            precision,
+            scale,
+        })
+    }
+
+    pub fn precision(&self) -> u32 {
+        self.precision
+    }
+
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::EXACT_NUMERIC
+    }
+}
+
+/// DoubleType for paimon.
+///
+/// Data type of an 8-byte double precision floating point number.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DoubleType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
+pub struct DoubleType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::DOUBLE>>")]
+    nullable: bool,
+}
+
+impl Display for DoubleType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DOUBLE")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for DoubleType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DoubleType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::APPROXIMATE_NUMERIC
+    }
+}
+
+/// FloatType for paimon.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/FloatType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
+pub struct FloatType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::FLOAT>>")]
+    nullable: bool,
+}
+
+impl Default for FloatType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FloatType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::NUMERIC | DataTypeFamily::APPROXIMATE_NUMERIC
+    }
+}
+
+/// IntType for paimon.
+///
+/// Data type of a 4-byte (2^32) signed integer with values from -2,147,483,648 to 2,147,483,647.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/IntType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::INT>>")]
+    nullable: bool,
+}
+
+impl Default for IntType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IntType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::NUMERIC
+            | DataTypeFamily::INTEGER_NUMERIC
+            | DataTypeFamily::EXACT_NUMERIC
+    }
+}
+
+/// LocalZonedTimestampType for paimon.
+///
+/// Data type of a timestamp WITH LOCAL time zone consisting of `year-month-day hour:minute:second[.fractional] zone` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000 +14:59` to `9999-12-31 23:59:59.999999999 -14:59`. Leap seconds (23:59:60 and 23:59:61) are not supported as the semantics are closer to a point in time than a wall-clock time.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
+pub struct LocalZonedTimestampType {
+    nullable: bool,
+    precision: u32,
+}
+
+impl Display for LocalZonedTimestampType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TIMESTAMP({}) WITH LOCAL TIME ZONE", self.precision)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for LocalZonedTimestampType {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_PRECISION).unwrap()
+    }
+}
+
+impl FromStr for LocalZonedTimestampType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::LocalZonedTimestamp::NAME) || !s.contains("WITH") {
+            return DataTypeInvalidSnafu {
+                message:
+                    "Invalid LocalZonedTimestamp type. Expected string to start with 'TIMESTAMP'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) =
+            serde_utils::extract_brackets_pos(s, "LocalZonedTimestampType")?;
+        let precision_str = &s[open_bracket + 1..close_bracket];
+        let precision =
+            precision_str
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid LocalZonedTimestamp length. Unable to parse length as a u32."
+                        .to_string(),
+                })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(LocalZonedTimestampType {
+            nullable,
+            precision,
+        })
+    }
+}
+
+impl LocalZonedTimestampType {
+    pub const MIN_PRECISION: u32 = TimestampType::MIN_PRECISION;
+
+    pub const MAX_PRECISION: u32 = TimestampType::MAX_PRECISION;
+
+    pub const DEFAULT_PRECISION: u32 = TimestampType::DEFAULT_PRECISION;
+
+    pub fn new(precision: u32) -> Result<Self, Error> {
+        Self::with_nullable(true, precision)
+    }
+
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, Error> {
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "LocalZonedTimestamp precision must be between {} and {} (both inclusive).",
+                    Self::MIN_PRECISION,
+                    Self::MAX_PRECISION
+                ),
+            }
+            .fail();
+        }
+
+        Ok(LocalZonedTimestampType {
+            nullable,
+            precision,
+        })
+    }
+
+    pub fn precision(&self) -> u32 {
+        self.precision
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::DATETIME
+            | DataTypeFamily::TIMESTAMP
+            | DataTypeFamily::EXTENSION
+    }
+}
+
+/// SmallIntType for paimon.
+///
+/// Data type of a 2-byte (2^16) signed integer with values from -32,768 to 32,767.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/SmallIntType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
+pub struct SmallIntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::SMALLINT>>")]
+    nullable: bool,
+}
+
+impl Default for SmallIntType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SmallIntType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::NUMERIC
+            | DataTypeFamily::INTEGER_NUMERIC
+            | DataTypeFamily::EXACT_NUMERIC
+    }
+}
+
+/// TimeType for paimon.
+///
+/// Data type of a time WITHOUT time zone consisting of `hour:minute:second[.fractional]` with
+/// up to nanosecond precision and values ranging from `00:00:00.000000000` to `23:59:59.999999999`.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimeType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
+pub struct TimeType {
+    nullable: bool,
+    precision: u32,
+}
+
+impl Display for TimeType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TIME({})", self.precision)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for TimeType {
+    fn default() -> Self {
+        Self::new(TimeType::DEFAULT_PRECISION).unwrap()
+    }
+}
+
+impl FromStr for TimeType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::TIME::NAME) || s.contains("STAMP") {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIME type. Expected string to start with 'TIME'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "TimeType")?;
+        let precision_str = &s[open_bracket + 1..close_bracket];
+        let precision =
+            precision_str
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid TIME length. Unable to parse length as a u32.".to_string(),
+                })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(TimeType {
+            nullable,
+            precision,
+        })
+    }
+}
+
+impl TimeType {
+    pub const MIN_PRECISION: u32 = 0;
+
+    pub const MAX_PRECISION: u32 = 9;
+
+    pub const DEFAULT_PRECISION: u32 = 0;
+
+    pub fn new(precision: u32) -> Result<Self, Error> {
+        Self::with_nullable(true, precision)
+    }
+
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, Error> {
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "Time precision must be between {} and {} (both inclusive).",
+                    Self::MIN_PRECISION,
+                    Self::MAX_PRECISION
+                ),
+            }
+            .fail();
+        }
+
+        Ok(TimeType {
+            nullable,
+            precision,
+        })
+    }
+
+    pub fn precision(&self) -> u32 {
+        self.precision
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::DATETIME | DataTypeFamily::TIME
+    }
+}
+
+/// TimestampType for paimon.
+///
+/// Data type of a timestamp WITHOUT time zone consisting of `year-month-day hour:minute:second[.fractional]` with up to nanosecond precision and values ranging from `0000-01-01 00:00:00.000000000` to `9999-12-31 23:59:59.999999999`.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/TimestampType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
+pub struct TimestampType {
+    nullable: bool,
+    precision: u32,
+}
+
+impl Display for TimestampType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TIMESTAMP({})", self.precision)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for TimestampType {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_PRECISION).unwrap()
+    }
+}
+
+impl FromStr for TimestampType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.starts_with(serde_utils::TIMESTAMP::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid TIMESTAMP type. Expected string to start with 'TIMESTAMP'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "TimestampType")?;
+        let precision_str = &s[open_bracket + 1..close_bracket];
+        let precision =
+            precision_str
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| Error::DataTypeInvalid {
+                    message: "Invalid TIMESTAMP precision. Unable to parse precision as a u32."
+                        .to_string(),
+                })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(TimestampType {
+            nullable,
+            precision,
+        })
+    }
+}
+
+impl TimestampType {
+    pub const MIN_PRECISION: u32 = 0;
+
+    pub const MAX_PRECISION: u32 = 9;
+
+    pub const DEFAULT_PRECISION: u32 = 6;
+
+    pub fn new(precision: u32) -> Result<Self, Error> {
+        Self::with_nullable(true, precision)
+    }
+
+    pub fn with_nullable(nullable: bool, precision: u32) -> Result<Self, Error> {
+        if !(Self::MIN_PRECISION..=Self::MAX_PRECISION).contains(&precision) {
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "Timestamp precision must be between {} and {} (both inclusive).",
+                    Self::MIN_PRECISION,
+                    Self::MAX_PRECISION
+                ),
+            }
+            .fail();
+        }
+
+        Ok(TimestampType {
+            nullable,
+            precision,
+        })
+    }
+
+    pub fn precision(&self) -> u32 {
+        self.precision
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::DATETIME | DataTypeFamily::TIMESTAMP
+    }
+}
+
+/// TinyIntType for paimon.
+///
+/// Data type of a 1-byte signed integer with values from -128 to 127.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/master/paimon-common/src/release-0.8.2/java/org/apache/paimon/types/TinyIntType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(transparent)]
+pub struct TinyIntType {
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::TINYINT>>")]
+    nullable: bool,
+}
+
+impl Default for TinyIntType {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TinyIntType {
+    pub fn new() -> Self {
+        Self::with_nullable(true)
+    }
+
+    pub fn with_nullable(nullable: bool) -> Self {
+        Self { nullable }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED
+            | DataTypeFamily::NUMERIC
+            | DataTypeFamily::INTEGER_NUMERIC
+            | DataTypeFamily::EXACT_NUMERIC
+    }
+}
+
+/// VarBinaryType for paimon.
+///
+/// Data type of a variable-length binary string (=a sequence of bytes).
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarBinaryType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
+pub struct VarBinaryType {
+    nullable: bool,
+    length: u32,
+}
+
+impl Display for VarBinaryType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VARBINARY({})", self.length)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for VarBinaryType {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+impl FromStr for VarBinaryType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // "BYTES" is an alias for VARBINARY(MAX_LENGTH) in Paimon Java.
+        if s == "BYTES" || s == "BYTES NOT NULL" {
+            let nullable = !s.contains("NOT NULL");
+            return Ok(VarBinaryType {
+                nullable,
+                length: Self::MAX_LENGTH,
+            });
+        }
+
+        if !s.starts_with(serde_utils::VARBINARY::NAME) {
+            return DataTypeInvalidSnafu {
+                message: "Invalid VARBINARY type. Expected string to start with 'VARBINARY'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "VarBinaryType")?;
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid VARBINARY length. Unable to parse length as a u32.".to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(VarBinaryType { nullable, length })
+    }
+}
+
+impl VarBinaryType {
+    pub const MIN_LENGTH: u32 = 1;
+
+    // Aligned with Java `VarBinaryType.MAX_LENGTH = Integer.MAX_VALUE`; see
+    // `VarCharType::MAX_LENGTH` for the parser overflow this avoids.
+    pub const MAX_LENGTH: u32 = i32::MAX as u32;
+
+    pub const DEFAULT_LENGTH: u32 = 1;
+
+    pub fn new(length: u32) -> Result<Self, Error> {
+        Self::try_new(true, length)
+    }
+
+    pub fn try_new(nullable: bool, length: u32) -> Result<Self, Error> {
+        if length < Self::MIN_LENGTH {
+            return DataTypeInvalidSnafu {
+                message: "VarBinary string length must be at least 1.".to_string(),
+            }
+            .fail();
+        }
+
+        Ok(VarBinaryType { nullable, length })
+    }
+
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::BINARY_STRING
+    }
+}
+
+/// VarCharType for paimon.
+///
+/// Data type of a variable-length character string.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/VarCharType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, DeserializeFromStr, SerializeDisplay, Hash)]
+pub struct VarCharType {
+    nullable: bool,
+    length: u32,
+}
+
+impl Display for VarCharType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VARCHAR({})", self.length)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for VarCharType {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_LENGTH).unwrap()
+    }
+}
+
+/// Alias for variable-length string used in schema JSON (Java: VarCharType.STRING_TYPE).
+const STRING_TYPE_NAME: &str = "STRING";
+
+impl FromStr for VarCharType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.starts_with(STRING_TYPE_NAME) {
+            let nullable = !s.contains("NOT NULL");
+            return VarCharType::with_nullable(nullable, Self::MAX_LENGTH);
+        }
+        if !s.starts_with(serde_utils::VARCHAR::NAME) {
+            return DataTypeInvalidSnafu {
+                message:
+                    "Invalid VARCHAR type. Expected string to start with 'VARCHAR' or 'STRING'.",
+            }
+            .fail();
+        }
+
+        let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "VarCharType")?;
+        let length_str = &s[open_bracket + 1..close_bracket];
+        let length = length_str
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| Error::DataTypeInvalid {
+                message: "Invalid VARCHAR length. Unable to parse length as a u32.".to_string(),
+            })?;
+
+        let nullable = !s[close_bracket..].contains("NOT NULL");
+
+        Ok(VarCharType { nullable, length })
+    }
+}
+
+impl VarCharType {
+    pub const MIN_LENGTH: u32 = 1;
+
+    // Aligned with Java `VarCharType.MAX_LENGTH = Integer.MAX_VALUE`. Casting
+    // `isize::MAX` here overflows on 64-bit targets and produces `u32::MAX`
+    // (4294967295), which Java's `DataTypeJsonParser` then fails to parse via
+    // `Integer.parseInt` when reading a `CreateTableRequest`.
+    pub const MAX_LENGTH: u32 = i32::MAX as u32;
+
+    pub const DEFAULT_LENGTH: u32 = 1;
+
+    /// Variable-length string type with maximum length (Java: `VarCharType.STRING_TYPE`).
+    ///
+    /// Reference: [VarCharType.STRING_TYPE](https://github.com/apache/paimon/blob/release-1.3/paimon-api/src/main/java/org/apache/paimon/types/VarCharType.java).
+    #[inline]
+    pub fn string_type() -> Self {
+        Self::with_nullable(true, Self::MAX_LENGTH).unwrap()
+    }
+
+    pub fn new(length: u32) -> Result<Self, Error> {
+        Self::with_nullable(true, length)
+    }
+
+    pub fn with_nullable(nullable: bool, length: u32) -> Result<Self, Error> {
+        if !(Self::MIN_LENGTH..=Self::MAX_LENGTH).contains(&length) {
+            return DataTypeInvalidSnafu {
+                message: format!(
+                    "VarChar string length must be between {} and {} (both inclusive).",
+                    Self::MIN_LENGTH,
+                    Self::MAX_LENGTH
+                ),
+            }
+            .fail();
+        }
+
+        Ok(VarCharType { nullable, length })
+    }
+
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::PREDEFINED | DataTypeFamily::CHARACTER_STRING
+    }
+}
+
+/// MapType for paimon.
+///
+/// Data type of an associative array that maps keys `NULL` to values (including `NULL`).
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MapType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+pub struct MapType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::MAP>>")]
+    nullable: bool,
+    #[serde(rename = "key")]
+    key_type: Box<DataType>,
+    #[serde(rename = "value")]
+    value_type: Box<DataType>,
+}
+
+impl MapType {
+    pub fn new(key_type: DataType, value_type: DataType) -> Self {
+        Self::with_nullable(true, key_type, value_type)
+    }
+
+    pub fn with_nullable(nullable: bool, key_type: DataType, value_type: DataType) -> Self {
+        Self {
+            nullable,
+            key_type: Box::new(key_type),
+            value_type: Box::new(value_type),
+        }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
+    }
+
+    pub fn key_type(&self) -> &DataType {
+        &self.key_type
+    }
+
+    pub fn value_type(&self) -> &DataType {
+        &self.value_type
+    }
+}
+
+/// MultisetType for paimon.
+///
+/// Data type of a multiset (=bag). Unlike a set, it allows for multiple instances for each of its
+/// elements with a common subtype.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/MultisetType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+pub struct MultisetType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::MULTISET>>")]
+    nullable: bool,
+    #[serde(rename = "element")]
+    element_type: Box<DataType>,
+}
+
+impl MultisetType {
+    pub fn new(element_type: DataType) -> Self {
+        Self::with_nullable(true, element_type)
+    }
+
+    pub fn with_nullable(nullable: bool, element_type: DataType) -> Self {
+        Self {
+            nullable,
+            element_type: Box::new(element_type),
+        }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED | DataTypeFamily::COLLECTION
+    }
+
+    pub fn element_type(&self) -> &DataType {
+        &self.element_type
+    }
+}
+
+/// RowType for paimon.
+///
+/// Data type of a sequence of fields. A field consists of a field name, field type, and an optional
+/// description. The most specific type of a row of a table is a row type. In this case, each column
+/// of the row corresponds to the field of the row type that has the same ordinal position as the
+/// column.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/RowType.java>.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Hash)]
+pub struct RowType {
+    #[serde(rename = "type")]
+    #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::ROW>>")]
+    nullable: bool,
+    fields: Vec<DataField>,
+}
+
+impl RowType {
+    pub const fn new(fields: Vec<DataField>) -> Self {
+        Self::with_nullable(true, fields)
+    }
+
+    pub const fn with_nullable(nullable: bool, fields: Vec<DataField>) -> Self {
+        Self { nullable, fields }
+    }
+
+    pub fn family(&self) -> DataTypeFamily {
+        DataTypeFamily::CONSTRUCTED
+    }
+
+    pub fn fields(&self) -> &[DataField] {
+        &self.fields
+    }
+}
+
+mod serde_utils {
+    // We use name like `BOOLEAN` by design to avoid conflict.
+    #![allow(clippy::upper_case_acronyms)]
+
+    use crate::Error;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::marker::PhantomData;
+
+    pub trait DataTypeName {
+        const NAME: &'static str;
+    }
+
+    pub struct ARRAY;
+    impl DataTypeName for ARRAY {
+        const NAME: &'static str = "ARRAY";
+    }
+
+    pub struct VECTOR;
+    impl DataTypeName for VECTOR {
+        const NAME: &'static str = "VECTOR";
+    }
+
+    pub struct BIGINT;
+    impl DataTypeName for BIGINT {
+        const NAME: &'static str = "BIGINT";
+    }
+
+    pub struct BOOLEAN;
+    impl DataTypeName for BOOLEAN {
+        const NAME: &'static str = "BOOLEAN";
+    }
+
+    pub struct BLOB;
+    impl DataTypeName for BLOB {
+        const NAME: &'static str = "BLOB";
+    }
+
+    pub struct VARIANT;
+    impl DataTypeName for VARIANT {
+        const NAME: &'static str = "VARIANT";
+    }
+
+    pub struct BINARY;
+    impl DataTypeName for BINARY {
+        const NAME: &'static str = "BINARY";
+    }
+
+    pub struct VARBINARY;
+    impl DataTypeName for VARBINARY {
+        const NAME: &'static str = "VARBINARY";
+    }
+
+    pub struct CHAR;
+    impl DataTypeName for CHAR {
+        const NAME: &'static str = "CHAR";
+    }
+
+    pub struct VARCHAR;
+    impl DataTypeName for VARCHAR {
+        const NAME: &'static str = "VARCHAR";
+    }
+
+    pub struct DECIMAL;
+    impl DataTypeName for DECIMAL {
+        const NAME: &'static str = "DECIMAL";
+    }
+
+    pub struct DATE;
+    impl DataTypeName for DATE {
+        const NAME: &'static str = "DATE";
+    }
+
+    pub struct DOUBLE;
+    impl DataTypeName for DOUBLE {
+        const NAME: &'static str = "DOUBLE";
+    }
+
+    pub struct FLOAT;
+    impl DataTypeName for FLOAT {
+        const NAME: &'static str = "FLOAT";
+    }
+
+    pub struct INT;
+    impl DataTypeName for INT {
+        const NAME: &'static str = "INT";
+    }
+
+    pub struct SMALLINT;
+    impl DataTypeName for SMALLINT {
+        const NAME: &'static str = "SMALLINT";
+    }
+
+    pub struct TIME;
+    impl DataTypeName for TIME {
+        const NAME: &'static str = "TIME";
+    }
+
+    pub struct TIMESTAMP;
+    impl DataTypeName for TIMESTAMP {
+        const NAME: &'static str = "TIMESTAMP";
+    }
+
+    pub struct LocalZonedTimestamp;
+    impl DataTypeName for LocalZonedTimestamp {
+        const NAME: &'static str = "TIMESTAMP";
+    }
+
+    pub struct TINYINT;
+    impl DataTypeName for TINYINT {
+        const NAME: &'static str = "TINYINT";
+    }
+
+    pub struct MAP;
+    impl DataTypeName for MAP {
+        const NAME: &'static str = "MAP";
+    }
+
+    pub struct MULTISET;
+    impl DataTypeName for MULTISET {
+        const NAME: &'static str = "MULTISET";
+    }
+
+    pub struct ROW;
+    impl DataTypeName for ROW {
+        const NAME: &'static str = "ROW";
+    }
+
+    pub struct NullableType<T: DataTypeName> {
+        nullable: bool,
+        value: PhantomData<T>,
+    }
+
+    impl<T: DataTypeName> From<bool> for NullableType<T> {
+        fn from(value: bool) -> Self {
+            Self {
+                nullable: value,
+                value: PhantomData,
+            }
+        }
+    }
+    impl<T: DataTypeName> From<NullableType<T>> for bool {
+        fn from(value: NullableType<T>) -> Self {
+            value.nullable
+        }
+    }
+
+    impl<T: DataTypeName> Serialize for NullableType<T> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            if self.nullable {
+                serializer.serialize_str(T::NAME)
+            } else {
+                serializer.serialize_str(&format!("{} NOT NULL", T::NAME))
+            }
+        }
+    }
+
+    /// TODO: we should support more edge cases.
+    impl<'de, T: DataTypeName> Deserialize<'de> for NullableType<T> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let s = String::deserialize(deserializer)?;
+
+            let (name, nullable) = s.split_once(' ').unwrap_or((s.as_str(), ""));
+
+            if name == T::NAME && nullable.is_empty() {
+                Ok(NullableType::from(true))
+            } else if name == T::NAME && nullable.contains("NOT NULL") {
+                Ok(NullableType::from(false))
+            } else {
+                let expect = format!("{} or {} NOT NULL", T::NAME, T::NAME);
+
+                Err(serde::de::Error::invalid_value(
+                    serde::de::Unexpected::Str(s.as_str()),
+                    &expect.as_str(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn extract_brackets_pos(
+        s: &str,
+        type_name: &str,
+    ) -> crate::Result<(usize, usize), Error> {
+        let Some(open_bracket) = s.find('(') else {
+            return Err(Error::DataTypeInvalid {
+                message: format!("Invalid {type_name} specification. Missing opening bracket.")
+                    .to_string(),
+            });
+        };
+        let Some(close_bracket) = s.find(')') else {
+            return Err(Error::DataTypeInvalid {
+                message: format!("Invalid {type_name} specification. Missing closing bracket.")
+                    .to_string(),
+            });
+        };
+
+        if open_bracket >= close_bracket {
+            return Err(Error::DataTypeInvalid {
+                message: format!(
+                    "Invalid {type_name} specification. Opening bracket \
+                appears after or at the same position as closing bracket."
+                )
+                .to_string(),
+            });
+        }
+
+        Ok((open_bracket, close_bracket))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_blob_file_field_classification() {
+        let blob = DataType::Blob(BlobType::new());
+        let array_blob = DataType::Array(ArrayType::new(blob.clone()));
+        let nested_array_blob = DataType::Array(ArrayType::new(array_blob.clone()));
+
+        assert!(blob.is_blob_file_field());
+        assert!(array_blob.is_blob_file_field());
+        assert!(!nested_array_blob.is_blob_file_field());
+        assert!(!DataType::Int(IntType::new()).is_blob_file_field());
+    }
+
+    fn load_fixture(name: &str) -> String {
+        let workdir =
+            std::env::current_dir().unwrap_or_else(|err| panic!("current_dir must exist: {err}"));
+        let path = workdir.join(format!("tests/fixtures/{name}.json"));
+
+        let content = std::fs::read(&path)
+            .unwrap_or_else(|err| panic!("fixtures {path:?} load failed: {err}"));
+        String::from_utf8(content)
+            .expect("fixtures content must be valid utf8")
+            .trim_end_matches(['\n', '\r'])
+            .to_string()
+    }
+
+    fn test_cases() -> Vec<(&'static str, DataType)> {
+        vec![
+            (
+                "array_type",
+                DataType::Array(ArrayType {
+                    nullable: false,
+                    element_type: DataType::Int(IntType::with_nullable(false)).into(),
+                }),
+            ),
+            (
+                "array_type_nullable",
+                DataType::Array(ArrayType {
+                    nullable: true,
+                    element_type: DataType::Int(IntType::with_nullable(true)).into(),
+                }),
+            ),
+            (
+                "bigint_type",
+                DataType::BigInt(BigIntType { nullable: false }),
+            ),
+            (
+                "bigint_type_nullable",
+                DataType::BigInt(BigIntType { nullable: true }),
+            ),
+            (
+                "binary_type",
+                DataType::Binary(BinaryType {
+                    nullable: false,
+                    length: 22,
+                }),
+            ),
+            (
+                "binary_type_nullable",
+                DataType::Binary(BinaryType {
+                    nullable: true,
+                    length: 22,
+                }),
+            ),
+            ("blob_type", DataType::Blob(BlobType { nullable: false })),
+            (
+                "blob_type_nullable",
+                DataType::Blob(BlobType { nullable: true }),
+            ),
+            (
+                "boolean_type",
+                DataType::Boolean(BooleanType { nullable: false }),
+            ),
+            (
+                "boolean_type_nullable",
+                DataType::Boolean(BooleanType { nullable: true }),
+            ),
+            (
+                "char_type",
+                DataType::Char(CharType {
+                    nullable: false,
+                    length: 33,
+                }),
+            ),
+            (
+                "char_type_nullable",
+                DataType::Char(CharType {
+                    nullable: true,
+                    length: 33,
+                }),
+            ),
+            ("date_type", DataType::Date(DateType { nullable: false })),
+            (
+                "date_type_nullable",
+                DataType::Date(DateType { nullable: true }),
+            ),
+            (
+                "decimal_type",
+                DataType::Decimal(DecimalType {
+                    nullable: false,
+                    precision: 10,
+                    scale: 2,
+                }),
+            ),
+            (
+                "decimal_type_nullable",
+                DataType::Decimal(DecimalType {
+                    nullable: true,
+                    precision: 10,
+                    scale: 2,
+                }),
+            ),
+            (
+                "double_type",
+                DataType::Double(DoubleType { nullable: false }),
+            ),
+            (
+                "double_type_nullable",
+                DataType::Double(DoubleType { nullable: true }),
+            ),
+            ("float_type", DataType::Float(FloatType { nullable: false })),
+            (
+                "float_type_nullable",
+                DataType::Float(FloatType { nullable: true }),
+            ),
+            ("int_type", DataType::Int(IntType { nullable: false })),
+            (
+                "int_type_nullable",
+                DataType::Int(IntType { nullable: true }),
+            ),
+            (
+                "local_zoned_timestamp_type",
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType {
+                    nullable: false,
+                    precision: 3,
+                }),
+            ),
+            (
+                "local_zoned_timestamp_type_nullable",
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType {
+                    nullable: true,
+                    precision: 6,
+                }),
+            ),
+            (
+                "map_type",
+                DataType::Map(MapType {
+                    nullable: false,
+                    key_type: DataType::VarChar(VarCharType {
+                        nullable: true,
+                        length: 20,
+                    })
+                    .into(),
+                    value_type: DataType::Int(IntType { nullable: false }).into(),
+                }),
+            ),
+            (
+                "map_type_nullable",
+                DataType::Map(MapType {
+                    nullable: true,
+                    key_type: DataType::VarChar(VarCharType {
+                        nullable: true,
+                        length: 20,
+                    })
+                    .into(),
+                    value_type: DataType::Int(IntType { nullable: true }).into(),
+                }),
+            ),
+            (
+                "multiset_type",
+                DataType::Multiset(MultisetType {
+                    nullable: false,
+                    element_type: DataType::Int(IntType { nullable: false }).into(),
+                }),
+            ),
+            (
+                "multiset_type_nullable",
+                DataType::Multiset(MultisetType {
+                    nullable: true,
+                    element_type: DataType::Int(IntType { nullable: true }).into(),
+                }),
+            ),
+            (
+                "row_type",
+                DataType::Row(RowType {
+                    nullable: false,
+                    fields: vec![
+                        DataField::new(0, "a".into(), DataType::Int(IntType { nullable: false })),
+                        DataField::new(
+                            1,
+                            "b".into(),
+                            DataType::VarChar(VarCharType {
+                                nullable: false,
+                                length: 20,
+                            }),
+                        ),
+                    ],
+                }),
+            ),
+            (
+                "row_type_nullable",
+                DataType::Row(RowType {
+                    nullable: true,
+                    fields: vec![
+                        DataField::new(0, "a".into(), DataType::Int(IntType { nullable: true })),
+                        DataField::new(
+                            1,
+                            "b".into(),
+                            DataType::VarChar(VarCharType {
+                                nullable: true,
+                                length: 20,
+                            }),
+                        ),
+                    ],
+                }),
+            ),
+            (
+                "smallint_type",
+                DataType::SmallInt(SmallIntType { nullable: false }),
+            ),
+            (
+                "smallint_type_nullable",
+                DataType::SmallInt(SmallIntType { nullable: true }),
+            ),
+            (
+                "time_type",
+                DataType::Time(TimeType {
+                    nullable: false,
+                    precision: 9,
+                }),
+            ),
+            (
+                "time_type_nullable",
+                DataType::Time(TimeType {
+                    nullable: true,
+                    precision: 0,
+                }),
+            ),
+            (
+                "timestamp_type",
+                DataType::Timestamp(TimestampType {
+                    nullable: false,
+                    precision: 6,
+                }),
+            ),
+            (
+                "timestamp_type_nullable",
+                DataType::Timestamp(TimestampType {
+                    nullable: true,
+                    precision: 6,
+                }),
+            ),
+            (
+                "tinyint_type",
+                DataType::TinyInt(TinyIntType { nullable: false }),
+            ),
+            (
+                "tinyint_type_nullable",
+                DataType::TinyInt(TinyIntType { nullable: true }),
+            ),
+            (
+                "varbinary_type",
+                DataType::VarBinary(VarBinaryType {
+                    nullable: false,
+                    length: 233,
+                }),
+            ),
+            (
+                "varbinary_type_nullable",
+                DataType::VarBinary(VarBinaryType {
+                    nullable: true,
+                    length: 233,
+                }),
+            ),
+            (
+                "variant_type",
+                DataType::Variant(VariantType { nullable: false }),
+            ),
+            (
+                "variant_type_nullable",
+                DataType::Variant(VariantType { nullable: true }),
+            ),
+            (
+                "varchar_type",
+                DataType::VarChar(VarCharType {
+                    nullable: false,
+                    length: 33,
+                }),
+            ),
+            (
+                "varchar_type_nullable",
+                DataType::VarChar(VarCharType {
+                    nullable: true,
+                    length: 33,
+                }),
+            ),
+            (
+                "highly_complex_nested_row_type",
+                DataType::Row(RowType::new(vec![
+                    DataField::new(
+                        0,
+                        "outer_row1".to_string(),
+                        DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "middle1_decimal".to_string(),
+                                DataType::Decimal(DecimalType::with_nullable(true, 12, 3).unwrap()),
+                            ),
+                            DataField::new(
+                                1,
+                                "middle1_inner_row1".to_string(),
+                                DataType::Row(RowType::new(vec![
+                                    DataField::new(
+                                        0,
+                                        "inner1_boolean".to_string(),
+                                        DataType::Boolean(BooleanType::new()),
+                                    ),
+                                    DataField::new(
+                                        1,
+                                        "inner1_int".to_string(),
+                                        DataType::Int(IntType::new()),
+                                    ),
+                                    DataField::new(
+                                        2,
+                                        "inner1_varchar".to_string(),
+                                        DataType::VarChar(
+                                            VarCharType::with_nullable(true, 100).unwrap(),
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                            DataField::new(
+                                2,
+                                "middle1_array".to_string(),
+                                DataType::Array(ArrayType::new(DataType::Map(MapType::new(
+                                    DataType::VarChar(
+                                        VarCharType::with_nullable(true, 50).unwrap(),
+                                    ),
+                                    DataType::Int(IntType::new()),
+                                )))),
+                            ),
+                        ])),
+                    ),
+                    DataField::new(
+                        1,
+                        "outer_row2".to_string(),
+                        DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "middle2_multiset".to_string(),
+                                DataType::Multiset(MultisetType::new(DataType::Timestamp(
+                                    TimestampType::with_nullable(true, 6).unwrap(),
+                                ))),
+                            ),
+                            DataField::new(
+                                1,
+                                "middle2_inner_row2".to_string(),
+                                DataType::Row(RowType::new(vec![
+                                    DataField::new(
+                                        0,
+                                        "inner2_char".to_string(),
+                                        DataType::Char(CharType::with_nullable(true, 50).unwrap()),
+                                    ),
+                                    DataField::new(
+                                        1,
+                                        "inner2_float".to_string(),
+                                        DataType::Float(FloatType::new()),
+                                    ),
+                                    DataField::new(
+                                        2,
+                                        "inner2_binary".to_string(),
+                                        DataType::Binary(
+                                            BinaryType::with_nullable(true, 256).unwrap(),
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                            DataField::new(
+                                2,
+                                "middle2_map".to_string(),
+                                DataType::Map(MapType::new(
+                                    DataType::Char(CharType::with_nullable(true, 10).unwrap()),
+                                    DataType::Row(RowType::new(vec![
+                                        DataField::new(
+                                            0,
+                                            "inner1_boolean".to_string(),
+                                            DataType::Boolean(BooleanType::new()),
+                                        ),
+                                        DataField::new(
+                                            1,
+                                            "inner1_int".to_string(),
+                                            DataType::Int(IntType::new()),
+                                        ),
+                                        DataField::new(
+                                            2,
+                                            "inner1_varchar".to_string(),
+                                            DataType::VarChar(
+                                                VarCharType::with_nullable(true, 100).unwrap(),
+                                            ),
+                                        ),
+                                    ])),
+                                )),
+                            ),
+                        ])),
+                    ),
+                    DataField::new(
+                        2,
+                        "outer_map".to_string(),
+                        DataType::Map(MapType::new(
+                            DataType::VarChar(VarCharType::with_nullable(true, 30).unwrap()),
+                            DataType::Row(RowType::new(vec![
+                                DataField::new(
+                                    0,
+                                    "middle1_decimal".to_string(),
+                                    DataType::Decimal(
+                                        DecimalType::with_nullable(true, 12, 3).unwrap(),
+                                    ),
+                                ),
+                                DataField::new(
+                                    1,
+                                    "middle1_inner_row1".to_string(),
+                                    DataType::Row(RowType::new(vec![
+                                        DataField::new(
+                                            0,
+                                            "inner1_boolean".to_string(),
+                                            DataType::Boolean(BooleanType::new()),
+                                        ),
+                                        DataField::new(
+                                            1,
+                                            "inner1_int".to_string(),
+                                            DataType::Int(IntType::new()),
+                                        ),
+                                        DataField::new(
+                                            2,
+                                            "inner1_varchar".to_string(),
+                                            DataType::VarChar(
+                                                VarCharType::with_nullable(true, 100).unwrap(),
+                                            ),
+                                        ),
+                                    ])),
+                                ),
+                                DataField::new(
+                                    2,
+                                    "middle1_array".to_string(),
+                                    DataType::Array(ArrayType::new(DataType::Map(MapType::new(
+                                        DataType::VarChar(
+                                            VarCharType::with_nullable(true, 50).unwrap(),
+                                        ),
+                                        DataType::Int(IntType::new()),
+                                    )))),
+                                ),
+                            ])),
+                        )),
+                    ),
+                    DataField::new(
+                        3,
+                        "outer_array".to_string(),
+                        DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "middle2_multiset".to_string(),
+                                DataType::Multiset(MultisetType::new(DataType::Timestamp(
+                                    TimestampType::with_nullable(true, 6).unwrap(),
+                                ))),
+                            ),
+                            DataField::new(
+                                1,
+                                "middle2_inner_row2".to_string(),
+                                DataType::Row(RowType::new(vec![
+                                    DataField::new(
+                                        0,
+                                        "inner2_char".to_string(),
+                                        DataType::Char(CharType::with_nullable(true, 50).unwrap()),
+                                    ),
+                                    DataField::new(
+                                        1,
+                                        "inner2_float".to_string(),
+                                        DataType::Float(FloatType::new()),
+                                    ),
+                                    DataField::new(
+                                        2,
+                                        "inner2_binary".to_string(),
+                                        DataType::Binary(
+                                            BinaryType::with_nullable(true, 256).unwrap(),
+                                        ),
+                                    ),
+                                ])),
+                            ),
+                            DataField::new(
+                                2,
+                                "middle2_map".to_string(),
+                                DataType::Map(MapType::new(
+                                    DataType::Char(CharType::with_nullable(true, 10).unwrap()),
+                                    DataType::Row(RowType::new(vec![
+                                        DataField::new(
+                                            0,
+                                            "inner1_boolean".to_string(),
+                                            DataType::Boolean(BooleanType::new()),
+                                        ),
+                                        DataField::new(
+                                            1,
+                                            "inner1_int".to_string(),
+                                            DataType::Int(IntType::new()),
+                                        ),
+                                        DataField::new(
+                                            2,
+                                            "inner1_varchar".to_string(),
+                                            DataType::VarChar(
+                                                VarCharType::with_nullable(true, 100).unwrap(),
+                                            ),
+                                        ),
+                                    ])),
+                                )),
+                            ),
+                        ])))),
+                    ),
+                    DataField::new(
+                        4,
+                        "outer_multiset".to_string(),
+                        DataType::Multiset(MultisetType::new(DataType::Row(RowType::new(vec![
+                            DataField::new(
+                                0,
+                                "deep_inner_decimal".to_string(),
+                                DataType::Decimal(DecimalType::with_nullable(true, 10, 2).unwrap()),
+                            ),
+                            DataField::new(
+                                1,
+                                "deep_inner_varbinary".to_string(),
+                                DataType::VarBinary(VarBinaryType::try_new(true, 128).unwrap()),
+                            ),
+                        ])))),
+                    ),
+                ])),
+            ),
+        ]
+    }
+
+    /// Test data type serialize against with test fixtures.
+    ///
+    /// The name is the test fixtures file name.
+    #[test]
+    fn test_data_type_serialize() {
+        for (name, input) in test_cases() {
+            let actual = serde_json::to_string(&input)
+                .unwrap_or_else(|err| panic!("serialize failed for {name}: {err}"));
+
+            assert_eq!(
+                actual,
+                load_fixture(name),
+                "test data type serialize for {name}"
+            )
+        }
+    }
+
+    /// Test data type serialize against with test fixtures.
+    ///
+    /// The name is the test fixtures file name.
+    #[test]
+    fn test_data_type_deserialize() {
+        for (name, expect) in test_cases() {
+            let actual = serde_json::from_str::<DataType>(&load_fixture(name))
+                .unwrap_or_else(|err| panic!("deserialize failed for {name}: {err}"));
+
+            assert_eq!(actual, expect, "test data type deserialize for {name}")
+        }
+    }
+
+    /// Regression: `MAX_LENGTH` for `VarCharType`/`VarBinaryType` must fit in a
+    /// Java `int`, otherwise `DataTypeJsonParser` rejects the `CreateTableRequest`
+    /// REST payload with `NumberFormatException` on `Integer.parseInt`.
+    #[test]
+    fn test_max_length_fits_java_integer() {
+        const JAVA_INTEGER_MAX_VALUE: u32 = i32::MAX as u32;
+
+        assert_eq!(VarCharType::MAX_LENGTH, JAVA_INTEGER_MAX_VALUE);
+        assert_eq!(VarBinaryType::MAX_LENGTH, JAVA_INTEGER_MAX_VALUE);
+
+        let varchar = VarCharType::string_type().to_string();
+        let length_token = varchar
+            .strip_prefix("VARCHAR(")
+            .and_then(|s| s.split(')').next())
+            .expect("VARCHAR display format");
+        length_token
+            .parse::<i32>()
+            .expect("VARCHAR length must parse as Java int");
+
+        let varbinary = VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH)
+            .unwrap()
+            .to_string();
+        let length_token = varbinary
+            .strip_prefix("VARBINARY(")
+            .and_then(|s| s.split(')').next())
+            .expect("VARBINARY display format");
+        length_token
+            .parse::<i32>()
+            .expect("VARBINARY length must parse as Java int");
+    }
+
+    #[test]
+    fn test_vector_type_construction_valid_elements() {
+        for elem in [
+            DataType::Boolean(BooleanType::new()),
+            DataType::TinyInt(TinyIntType::new()),
+            DataType::SmallInt(SmallIntType::new()),
+            DataType::Int(IntType::new()),
+            DataType::BigInt(BigIntType::new()),
+            DataType::Float(FloatType::new()),
+            DataType::Double(DoubleType::new()),
+        ] {
+            let v = VectorType::try_new(true, 8, elem.clone()).unwrap();
+            assert_eq!(v.length(), 8);
+            assert_eq!(v.element_type(), &elem);
+        }
+    }
+
+    #[test]
+    fn test_vector_type_rejects_invalid_element() {
+        let err = VectorType::try_new(true, 4, DataType::VarChar(VarCharType::new(10).unwrap()));
+        assert!(matches!(err, Err(Error::DataTypeInvalid { .. })));
+        let err = VectorType::try_new(
+            true,
+            4,
+            DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+        );
+        assert!(matches!(err, Err(Error::DataTypeInvalid { .. })));
+    }
+
+    #[test]
+    fn test_vector_type_rejects_bad_length() {
+        assert!(matches!(
+            VectorType::try_new(true, 0, DataType::Float(FloatType::new())),
+            Err(Error::DataTypeInvalid { .. })
+        ));
+        assert!(VectorType::try_new(true, 1, DataType::Float(FloatType::new())).is_ok());
+        let too_big = i32::MAX as u32 + 1;
+        assert!(matches!(
+            VectorType::try_new(true, too_big, DataType::Float(FloatType::new())),
+            Err(Error::DataTypeInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn test_vector_type_display() {
+        let v = VectorType::try_new(true, 128, DataType::Float(FloatType::new())).unwrap();
+        assert_eq!(v.to_string(), "VECTOR<FLOAT, 128>");
+        let v = VectorType::try_new(false, 128, DataType::Float(FloatType::new())).unwrap();
+        assert_eq!(v.to_string(), "VECTOR<FLOAT, 128> NOT NULL");
+
+        // The element's own nullability is rendered too (matches Java asSQLString and
+        // is consistent with serde, which preserves the element's "FLOAT NOT NULL").
+        let v =
+            VectorType::try_new(true, 4, DataType::Float(FloatType::with_nullable(false))).unwrap();
+        assert_eq!(v.to_string(), "VECTOR<FLOAT NOT NULL, 4>");
+        let v = VectorType::try_new(false, 4, DataType::Float(FloatType::with_nullable(false)))
+            .unwrap();
+        assert_eq!(v.to_string(), "VECTOR<FLOAT NOT NULL, 4> NOT NULL");
+    }
+
+    #[test]
+    fn test_vector_type_serde_roundtrip() {
+        // Atomic element types serialize as bare strings (e.g. "FLOAT"), matching
+        // the existing ARRAY wire form (see tests/fixtures/array_type.json), not as
+        // nested objects. Pin the exact JSON so the wire shape cannot drift.
+        let v = VectorType::try_new(true, 3, DataType::Float(FloatType::new())).unwrap();
+        let json = serde_json::to_string(&v).unwrap();
+        assert_eq!(json, r#"{"type":"VECTOR","element":"FLOAT","length":3}"#);
+        let back: VectorType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+
+        let nn = VectorType::try_new(false, 2, DataType::Double(DoubleType::new())).unwrap();
+        let json = serde_json::to_string(&nn).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"VECTOR NOT NULL","element":"DOUBLE","length":2}"#
+        );
+        let back: VectorType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, nn);
+    }
+
+    #[test]
+    fn test_vector_type_deserialize_rejects_invalid() {
+        // Use the real string-form element so the failure is the vector's own
+        // validation (invalid element type / bad length), not a failure to parse
+        // the element itself.
+        let bad_elem = r#"{"type":"VECTOR","element":"VARCHAR(10)","length":4}"#;
+        let err = serde_json::from_str::<VectorType>(bad_elem).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid element type for vector"),
+            "expected element-type validation error, got: {err}"
+        );
+
+        let bad_len = r#"{"type":"VECTOR","element":"FLOAT","length":0}"#;
+        let err = serde_json::from_str::<VectorType>(bad_len).unwrap_err();
+        assert!(
+            err.to_string().contains("Vector length must be between"),
+            "expected length validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_datatype_vector_untagged_roundtrip() {
+        let dt = DataType::Vector(
+            VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap(),
+        );
+        let json = serde_json::to_string(&dt).unwrap();
+        let back: DataType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, dt);
+        assert!(matches!(back, DataType::Vector(_)));
+
+        // ARRAY must still parse as Array, not Vector. Atomic element types are
+        // serialized as bare strings (e.g. "FLOAT") in this codebase, not objects.
+        let arr_json = r#"{"type":"ARRAY","element":"FLOAT"}"#;
+        let arr: DataType = serde_json::from_str(arr_json).unwrap();
+        assert!(matches!(arr, DataType::Array(_)));
+    }
+
+    #[test]
+    fn test_datatype_vector_nullable_and_copy() {
+        let dt = DataType::Vector(
+            VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap(),
+        );
+        assert!(dt.is_nullable());
+        let nn = dt.copy_with_nullable(false).unwrap();
+        assert!(!nn.is_nullable());
+        if let DataType::Vector(v) = &nn {
+            assert_eq!(v.length(), 4);
+            assert_eq!(v.element_type(), &DataType::Float(FloatType::new()));
+        } else {
+            panic!("expected Vector");
+        }
+        assert!(!dt.contains_row_type());
+    }
+
+    #[test]
+    fn test_datatype_vector_arrow_conversion() {
+        // PR 2 lifted the PR 1 boundary: Vector now converts to an Arrow
+        // FixedSizeList (see arrow/mod.rs for the full conversion test matrix).
+        let dt = DataType::Vector(
+            VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap(),
+        );
+        let arrow = crate::arrow::paimon_type_to_arrow(&dt).unwrap();
+        assert!(matches!(arrow, arrow_schema::DataType::FixedSizeList(_, 4)));
+    }
+}

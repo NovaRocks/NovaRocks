@@ -23,6 +23,7 @@ use novarocks_spi::connector::provider::{
 use novarocks_spi::connector::{
     ConnectorCodecCategory, ConnectorCodecErrorKind, ConnectorCodecRevision, ConnectorProviderId,
 };
+use sha2::{Digest, Sha256};
 
 fn declaration(provider: &str, category: ConnectorCodecCategory) -> ConnectorCodecDeclaration {
     ConnectorCodecDeclaration::try_new(
@@ -142,4 +143,110 @@ fn definitions_reject_cross_provider_capability_groups() {
     )
     .unwrap_err();
     assert_eq!(error.kind(), ConnectorCodecErrorKind::InconsistentFields);
+}
+
+#[test]
+fn codec_declarations_are_bounded_and_digest_the_exact_registered_descriptor() {
+    let descriptor = b"provider-private-schema-v1";
+    let value = ConnectorCodecDeclaration::try_new(
+        ConnectorProviderId::parse("iceberg").unwrap(),
+        ConnectorCodecCategory::ReadSplit,
+        ConnectorCodecRevision::try_new(7).unwrap(),
+        "iceberg.read-split.v7",
+        descriptor,
+    )
+    .unwrap();
+    assert_eq!(value.revision().get(), 7);
+    assert_eq!(value.descriptor(), descriptor);
+    assert_eq!(
+        value.descriptor_sha256(),
+        &<[u8; 32]>::from(Sha256::digest(descriptor))
+    );
+
+    for (format_name, descriptor) in [
+        ("", b"schema".as_slice()),
+        ("iceberg.读取", b"schema".as_slice()),
+        ("iceberg.read", b"".as_slice()),
+    ] {
+        assert_eq!(
+            ConnectorCodecDeclaration::try_new(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                ConnectorCodecCategory::ReadSplit,
+                ConnectorCodecRevision::try_new(1).unwrap(),
+                format_name,
+                descriptor,
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorCodecErrorKind::InvalidValue
+        );
+    }
+    assert_eq!(
+        ConnectorCodecDeclaration::try_new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorCodecCategory::ReadSplit,
+            ConnectorCodecRevision::try_new(1).unwrap(),
+            "x".repeat(129),
+            b"schema",
+        )
+        .unwrap_err()
+        .kind(),
+        ConnectorCodecErrorKind::InvalidValue
+    );
+    assert_eq!(
+        ConnectorCodecDeclaration::try_new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorCodecCategory::ReadSplit,
+            ConnectorCodecRevision::try_new(1).unwrap(),
+            "iceberg.read",
+            vec![0; 1024 * 1024 + 1],
+        )
+        .unwrap_err()
+        .kind(),
+        ConnectorCodecErrorKind::InvalidValue
+    );
+}
+
+#[test]
+fn sealing_static_definitions_does_not_reopen_or_interpret_provider_material() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DescriptorProbe<'a> {
+        reads: &'a AtomicUsize,
+    }
+
+    impl AsRef<[u8]> for DescriptorProbe<'_> {
+        fn as_ref(&self) -> &[u8] {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            b"provider-private-schema"
+        }
+    }
+
+    let reads = AtomicUsize::new(0);
+    let split = ConnectorCodecDeclaration::try_new(
+        ConnectorProviderId::parse("probe").unwrap(),
+        ConnectorCodecCategory::ReadSplit,
+        ConnectorCodecRevision::try_new(1).unwrap(),
+        "probe.read-split.v1",
+        DescriptorProbe { reads: &reads },
+    )
+    .unwrap();
+    let reads_after_definition = reads.load(Ordering::SeqCst);
+    let definition = ProviderContractDefinition::read_only(
+        ConnectorProviderId::parse("probe").unwrap(),
+        ProviderReadContractDefinition::new(
+            ProviderReadCodecDefinitions::try_new(
+                declaration("probe", ConnectorCodecCategory::ReadTable),
+                declaration("probe", ConnectorCodecCategory::ReadView),
+                declaration("probe", ConnectorCodecCategory::ReadColumn),
+                split,
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let registry = SealedProviderRegistry::seal([definition]).unwrap();
+    assert_eq!(registry.definitions().len(), 1);
+    assert_eq!(reads.load(Ordering::SeqCst), reads_after_definition);
 }

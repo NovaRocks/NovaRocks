@@ -1,0 +1,206 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::io::FileIO;
+use crate::spec::avro::SchemaCache;
+use crate::spec::manifest_entry::ManifestEntry;
+use crate::spec::manifest_entry::MANIFEST_ENTRY_SCHEMA;
+use crate::spec::FileKind;
+
+use crate::Result;
+
+/// Manifest file reader and writer.
+///
+/// A manifest file contains a list of ManifestEntry records in Avro format.
+/// Each entry represents an addition or deletion of a data file.
+///
+/// Impl Reference: <https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/manifest/ManifestFile.java>
+pub struct Manifest;
+
+impl Manifest {
+    /// Read manifest entries from a file.
+    pub async fn read(file_io: &FileIO, path: &str) -> Result<Vec<ManifestEntry>> {
+        let input_file = file_io.new_input(path)?;
+        let content = input_file.read().await?;
+        crate::spec::avro::from_avro_bytes_fast_with_control(&content, file_io.read_control())
+            .map(crate::spec::avro::RetainedDecode::into_value)
+    }
+
+    /// Read manifest entries from bytes.
+    #[allow(dead_code)]
+    fn read_from_bytes(bytes: &[u8]) -> Result<Vec<ManifestEntry>> {
+        crate::spec::avro::from_avro_bytes_fast(bytes)
+    }
+
+    /// Read manifest entries with a lightweight filter on (kind, partition, bucket, total_buckets).
+    /// Entries that fail the filter skip DataFileMeta decoding entirely.
+    pub async fn read_filtered<F>(
+        file_io: &FileIO,
+        path: &str,
+        cache: &mut SchemaCache,
+        filter: &mut F,
+    ) -> Result<Vec<ManifestEntry>>
+    where
+        F: FnMut(FileKind, &[u8], i32, i32) -> bool,
+    {
+        let input_file = file_io.new_input(path)?;
+        let content = input_file.read().await?;
+        let control = file_io.read_control();
+        let (header, mut block_iter) =
+            crate::spec::avro::ocf::parse_ocf_streaming_with_control(&content, control.clone())?;
+        let writer_schema =
+            cache.get_or_parse_with_control(&header.schema_json, control.as_ref())?;
+        crate::spec::avro::decode_manifest_streaming(
+            &mut block_iter,
+            &writer_schema,
+            control,
+            filter,
+        )
+        .map(crate::spec::avro::RetainedDecode::into_value)
+    }
+
+    /// Write manifest entries to a file.
+    pub async fn write(file_io: &FileIO, path: &str, entries: &[ManifestEntry]) -> Result<()> {
+        Self::write_with_compression(
+            file_io,
+            path,
+            entries,
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .await
+    }
+
+    /// Write manifest entries to a file with the configured Avro compression.
+    pub async fn write_with_compression(
+        file_io: &FileIO,
+        path: &str,
+        entries: &[ManifestEntry],
+        compression: &str,
+    ) -> Result<()> {
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            MANIFEST_ENTRY_SCHEMA,
+            entries,
+            compression,
+        )?;
+        let output = file_io.new_output(path)?;
+        output.write(bytes::Bytes::from(bytes)).await
+    }
+}
+
+/// Merge ADD/DELETE entries by file identifier, returning only the active ADD set.
+/// Mirrors Java [FileEntry.mergeEntries](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/manifest/FileEntry.java).
+/// Return order is unspecified.
+pub(crate) fn merge_active_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
+    use std::collections::HashMap;
+
+    use crate::spec::manifest_entry::Identifier;
+    let mut map: HashMap<Identifier, ManifestEntry> = HashMap::new();
+    for entry in entries {
+        match entry.kind() {
+            FileKind::Add => {
+                map.insert(entry.identifier(), entry);
+            }
+            FileKind::Delete => {
+                map.remove(&entry.identifier());
+            }
+        }
+    }
+    map.into_values().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIO;
+    use crate::spec::manifest_common::FileKind;
+    use std::env::current_dir;
+
+    #[tokio::test]
+    async fn test_read_manifest_from_file() {
+        let workdir = current_dir().unwrap();
+        let path =
+            workdir.join("tests/fixtures/manifest/manifest-8ded1f09-fcda-489e-9167-582ac0f9f846-0");
+
+        let file_io = FileIO::from_url("file://").unwrap().build().unwrap();
+        let entries = Manifest::read(&file_io, path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        // verify manifest entry
+        let t1 = &entries[0];
+        assert_eq!(t1.kind(), &FileKind::Delete);
+        assert_eq!(t1.bucket(), 1);
+
+        let t2 = &entries[1];
+        assert_eq!(t2.kind(), &FileKind::Add);
+        assert_eq!(t2.bucket(), 2);
+    }
+
+    #[test]
+    fn test_merge_active_entries_cancels_add_then_delete() {
+        use crate::spec::data_file::DataFileMeta;
+        use crate::spec::stats::BinaryTableStats;
+        use crate::spec::ManifestEntry;
+
+        fn entry(kind: FileKind, file_name: &str, level: i32) -> ManifestEntry {
+            let stats = BinaryTableStats::empty();
+            let file = DataFileMeta {
+                file_name: file_name.to_string(),
+                file_size: 100,
+                row_count: 10,
+                min_key: vec![],
+                max_key: vec![],
+                key_stats: stats.clone(),
+                value_stats: stats,
+                min_sequence_number: 0,
+                max_sequence_number: 0,
+                schema_id: 0,
+                level,
+                extra_files: vec![],
+                creation_time: None,
+                delete_row_count: None,
+                embedded_index: None,
+                file_source: None,
+                value_stats_cols: None,
+                external_path: None,
+                first_row_id: None,
+                write_cols: None,
+            };
+            ManifestEntry::new(kind, vec![], 0, 1, file, 2)
+        }
+
+        let cancelled = merge_active_entries(vec![
+            entry(FileKind::Add, "f.parquet", 0),
+            entry(FileKind::Delete, "f.parquet", 0),
+        ]);
+        assert!(cancelled.is_empty());
+
+        let two_levels = merge_active_entries(vec![
+            entry(FileKind::Add, "f.parquet", 0),
+            entry(FileKind::Add, "f.parquet", 1),
+        ]);
+        assert_eq!(two_levels.len(), 2);
+
+        let compacted = merge_active_entries(vec![
+            entry(FileKind::Add, "f.parquet", 0),
+            entry(FileKind::Delete, "f.parquet", 0),
+            entry(FileKind::Add, "f.parquet", 1),
+        ]);
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(compacted[0].file().level, 1);
+    }
+}

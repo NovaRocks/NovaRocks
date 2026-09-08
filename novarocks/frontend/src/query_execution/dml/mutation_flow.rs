@@ -935,10 +935,10 @@ pub(crate) fn prepare_update_mutation(
         current_catalog,
         current_database,
     )?;
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         return Err(format!(
             "UPDATE only supports iceberg backends, got `{}`",
-            target.backend_name
+            target.provider_id.as_str()
         ));
     }
 
@@ -1089,10 +1089,10 @@ pub(crate) fn prepare_merge_mutation(
         current_catalog,
         current_database,
     )?;
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         return Err(format!(
             "MERGE only supports iceberg backends, got `{}`",
-            target.backend_name
+            target.provider_id.as_str()
         ));
     }
     // See the UPDATE path for why this rejection cannot live in row-mutation
@@ -4598,7 +4598,8 @@ mod tests {
 
     fn iceberg_target() -> crate::catalog_application::resolver::TargetBackend {
         crate::catalog_application::resolver::TargetBackend {
-            backend_name: "iceberg",
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static Iceberg provider ID"),
             catalog: "ice".to_string(),
             namespace: "db1".to_string(),
             table: "t".to_string(),
@@ -5463,10 +5464,27 @@ mod tests {
         )
     }
 
+    fn row_mutation_payload(
+        category: novarocks_spi::connector::ConnectorCodecCategory,
+        payload: impl Into<bytes::Bytes>,
+    ) -> novarocks_spi::connector::ConnectorEncodedPayload {
+        novarocks_spi::connector::ConnectorEncodedPayload::new(
+            novarocks_spi::connector::ConnectorEnvelopeHeader::new(
+                novarocks_spi::connector::ConnectorProviderId::parse("fake").expect("provider id"),
+                row_mutation_catalog_handle(),
+                category,
+                novarocks_spi::connector::ConnectorCodecRevision::try_new(1)
+                    .expect("codec revision"),
+            ),
+            payload.into(),
+        )
+    }
+
     fn row_mutation_catalog_properties() -> novarocks_spi::connector::CatalogProperties {
         novarocks_spi::connector::CatalogProperties::new(
             row_mutation_catalog_handle(),
-            novarocks_spi::connector::CatalogProviderKind::Iceberg,
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static provider ID"),
             1,
             Vec::new(),
             Vec::new(),
@@ -5668,35 +5686,22 @@ mod tests {
 
     struct FakeRowMutationEncoder;
 
-    impl novarocks_proto_codec::connector_write::ConnectorWriteHandleEncoder
-        for FakeRowMutationEncoder
-    {
+    impl novarocks_spi::connector::ConnectorWriteHandleWireEncoder for FakeRowMutationEncoder {
         fn owner(&self) -> &str {
             "fake"
         }
 
-        fn encode_writer_handle(
+        fn encode_writer_handle_payload(
             &self,
             _handle: &novarocks_spi::connector::write_stack::ConnectorWriterHandle,
         ) -> Result<
-            novarocks_proto_models::connector_write::ConnectorWriterHandle,
-            novarocks_proto_codec::connector_write::ConnectorWriteCodecError,
+            novarocks_spi::connector::ConnectorEncodedPayload,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
-            Ok(novarocks_proto_models::connector_write::ConnectorWriterHandle {
-                handle: Some(
-                    novarocks_proto_models::connector_write::connector_writer_handle::Handle::Iceberg(
-                        novarocks_proto_models::connector_write::IcebergWriterHandle {
-                            branch: novarocks_proto_models::connector_write::IcebergWriteBranch::Data
-                                as i32,
-                            table: Some(Default::default()),
-                            output: None,
-                            data: None,
-                            old_deletes: std::collections::BTreeMap::new(),
-                        equality: None,
-                        },
-                    ),
-                ),
-            })
+            Ok(row_mutation_payload(
+                novarocks_spi::connector::ConnectorCodecCategory::WriteHandle,
+                bytes::Bytes::from_static(b"row-mutation-handle"),
+            ))
         }
     }
 
@@ -5705,19 +5710,17 @@ mod tests {
             novarocks_spi::connector::write_stack::WriteRuntimeAdapter<FakeRowMutationProvider>,
     }
 
-    impl novarocks_proto_codec::connector_write::ConnectorWriteFragmentDecoder
-        for FakeRowMutationDecoder
-    {
+    impl novarocks_spi::connector::ConnectorWriteFragmentWireDecoder for FakeRowMutationDecoder {
         fn owner(&self) -> &str {
             "fake"
         }
 
-        fn decode_commit_fragment(
+        fn decode_commit_fragment_payload(
             &self,
-            _fragment: &novarocks_proto_codec::connector_write::ValidatedCommitFragment,
+            _fragment: &novarocks_spi::connector::ConnectorEncodedPayload,
         ) -> Result<
             novarocks_spi::connector::write_stack::ConnectorCommitFragment,
-            novarocks_proto_codec::connector_write::ConnectorWriteCodecError,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
             Ok(self.adapter.wrap_commit_fragment(FakeRowMutationFragment))
         }
@@ -5756,7 +5759,7 @@ mod tests {
         });
         let lease = crate::connector::control_host::ConnectorWriteStackLease::new(
             novarocks_spi::connector::ConnectorControlRuntimeId::new(),
-            novarocks_connector_binding::ConnectorControlWriteBinding::new(
+            novarocks_spi::connector::ConnectorControlWriteBinding::new(
                 Arc::new(UnusedLegacyWriteControl),
                 control,
                 Arc::new(FakeRowMutationEncoder),

@@ -32,10 +32,10 @@
 
 use std::sync::Arc;
 
+use crate::wire::dto;
 use novarocks_proto_codec::connector_read::{
     MAX_DELETES_PER_SPLIT, MAX_JSON_BYTES, MAX_PATH_BYTES,
 };
-use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     ConnectorSplit, ConnectorTableExecuteHandle as ConnectorTableExecuteHandleMarker, HostAddress,
     SchemaTableName, SplitWeight,
@@ -460,14 +460,6 @@ impl IcebergTableExecuteHandle {
         }
     }
 
-    pub fn to_table_execute_handle_proto(&self) -> dto::ConnectorTableExecuteHandle {
-        dto::ConnectorTableExecuteHandle {
-            handle: Some(dto::connector_table_execute_handle::Handle::Iceberg(
-                self.to_proto(),
-            )),
-        }
-    }
-
     pub fn from_proto(raw: &dto::IcebergTableExecuteHandle) -> Result<Self, ConnectorError> {
         let schema_table_name = raw
             .schema_table_name
@@ -499,20 +491,6 @@ impl IcebergTableExecuteHandle {
             table_location: raw.table_location.clone(),
             procedure_handle,
         })
-    }
-
-    pub fn from_table_execute_handle_proto(
-        raw: &dto::ConnectorTableExecuteHandle,
-    ) -> Result<Self, ConnectorError> {
-        let handle = raw
-            .handle
-            .as_ref()
-            .ok_or_else(|| invalid("connector table execute handle variant must be present"))?;
-        match handle {
-            dto::connector_table_execute_handle::Handle::Iceberg(iceberg) => {
-                Self::from_proto(iceberg)
-            }
-        }
     }
 }
 
@@ -666,28 +644,6 @@ impl IcebergRewritePositionDeleteFilesSplit {
         }
     }
 
-    pub fn to_connector_split_proto(&self) -> dto::ConnectorSplit {
-        dto::ConnectorSplit {
-            split_weight_raw: self.split_weight.raw_value(),
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            // Every selected vector belongs to this one data file, so
-            // co-locating splits of the same file lets one worker reuse the
-            // Puffin container it already opened.
-            affinity_key: Some(self.data_file_path.to_string()),
-            retained_size_in_bytes: self.retained_size_in_bytes,
-            category: Some(dto::connector_split::Category::RewritePositionDeleteFiles(
-                dto::RewritePositionDeleteFilesSplitCategory {
-                    provider: Some(
-                        dto::rewrite_position_delete_files_split_category::Provider::Iceberg(
-                            self.to_proto(),
-                        ),
-                    ),
-                },
-            )),
-        }
-    }
-
     pub fn from_proto(
         raw: &dto::IcebergRewritePositionDeleteFilesSplit,
         split_weight: SplitWeight,
@@ -704,49 +660,6 @@ impl IcebergRewritePositionDeleteFilesSplit {
             selected_position_deletes,
             split_weight,
         })
-    }
-
-    pub fn from_connector_split_proto(raw: &dto::ConnectorSplit) -> Result<Self, ConnectorError> {
-        if !raw.remotely_accessible {
-            return Err(invalid(
-                "an iceberg rewrite position delete split is always remotely accessible",
-            ));
-        }
-        if !raw.addresses.is_empty() {
-            return Err(invalid(
-                "an iceberg rewrite position delete split names no host addresses",
-            ));
-        }
-        let split_weight = SplitWeight::try_from_raw(raw.split_weight_raw)?;
-        let category = raw
-            .category
-            .as_ref()
-            .ok_or_else(|| invalid("connector split category must be present"))?;
-        let rewrite = match category {
-            dto::connector_split::Category::RewritePositionDeleteFiles(rewrite) => rewrite,
-            dto::connector_split::Category::Data(_)
-            | dto::connector_split::Category::TableChanges(_)
-            | dto::connector_split::Category::ChangeWindow(_)
-            | dto::connector_split::Category::SystemFiles(_) => {
-                return Err(invalid(
-                    "connector split is not an iceberg rewrite position delete split",
-                ));
-            }
-        };
-        let provider = rewrite.provider.as_ref().ok_or_else(|| {
-            invalid("rewrite position delete files split provider variant must be present")
-        })?;
-        match provider {
-            dto::rewrite_position_delete_files_split_category::Provider::Iceberg(iceberg) => {
-                let split = Self::from_proto(iceberg, split_weight)?;
-                if raw.affinity_key.as_deref() != Some(split.data_file_path()) {
-                    return Err(invalid(
-                        "an iceberg rewrite position delete split is keyed by its data file path",
-                    ));
-                }
-                Ok(split)
-            }
-        }
     }
 }
 
@@ -983,12 +896,10 @@ mod tests {
     }
 
     #[test]
-    fn table_execute_handles_round_trip_through_the_closed_wire_variant() {
+    fn table_execute_handles_round_trip_through_the_private_wire_value() {
         for handle in [optimize_handle(), rewrite_handle()] {
-            let decoded = IcebergTableExecuteHandle::from_table_execute_handle_proto(
-                &handle.to_table_execute_handle_proto(),
-            )
-            .expect("decoded handle");
+            let decoded =
+                IcebergTableExecuteHandle::from_proto(&handle.to_proto()).expect("decoded handle");
             assert_eq!(decoded, handle);
         }
 
@@ -999,10 +910,8 @@ mod tests {
             procedure_handle: None,
         })
         .expect("coordinator handle");
-        let decoded = IcebergTableExecuteHandle::from_table_execute_handle_proto(
-            &coordinator.to_table_execute_handle_proto(),
-        )
-        .expect("decoded handle");
+        let decoded =
+            IcebergTableExecuteHandle::from_proto(&coordinator.to_proto()).expect("decoded handle");
         assert_eq!(decoded, coordinator);
         assert!(decoded.procedure_handle().is_none());
     }
@@ -1101,19 +1010,14 @@ mod tests {
         );
         assert!(ConnectorSplit::retained_size_in_bytes(&split) > 0);
 
-        let raw = split.to_connector_split_proto();
-        let decoded = IcebergRewritePositionDeleteFilesSplit::from_connector_split_proto(&raw)
-            .expect("decoded split");
+        let raw = split.to_proto();
+        let decoded = IcebergRewritePositionDeleteFilesSplit::from_proto(
+            &raw,
+            ConnectorSplit::split_weight(&split),
+        )
+        .expect("decoded split");
         assert_eq!(decoded.to_proto(), split.to_proto());
         assert_eq!(decoded.data_file_path(), split.data_file_path());
-
-        let mut foreign = split.to_connector_split_proto();
-        foreign.category = Some(dto::connector_split::Category::Data(dto::DataSplit {
-            provider: None,
-        }));
-        assert!(
-            IcebergRewritePositionDeleteFilesSplit::from_connector_split_proto(&foreign).is_err()
-        );
     }
 
     #[test]

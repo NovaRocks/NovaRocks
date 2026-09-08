@@ -1,0 +1,212 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.connector.iceberg;
+
+import "common.proto";
+
+// Iceberg-private write recipes and staged artifacts. The public connector
+// envelope owns provider, catalog generation, category, and codec revision;
+// execution and writer identities remain in their existing public carriers.
+
+enum IcebergWriteFileFormat {
+  ICEBERG_WRITE_FILE_FORMAT_UNSPECIFIED = 0;
+  ICEBERG_WRITE_FILE_FORMAT_PARQUET = 1;
+  ICEBERG_WRITE_FILE_FORMAT_PUFFIN = 2;
+}
+
+enum IcebergFileContent {
+  ICEBERG_FILE_CONTENT_UNSPECIFIED = 0;
+  ICEBERG_FILE_CONTENT_DATA = 1;
+  ICEBERG_FILE_CONTENT_POSITION_DELETES = 2;
+  ICEBERG_FILE_CONTENT_EQUALITY_DELETES = 3;
+}
+
+enum IcebergWriteBranch {
+  ICEBERG_WRITE_BRANCH_UNSPECIFIED = 0;
+  ICEBERG_WRITE_BRANCH_DATA = 1;
+  ICEBERG_WRITE_BRANCH_POSITION_DELETE = 2;
+  ICEBERG_WRITE_BRANCH_DELETION_VECTOR = 3;
+  ICEBERG_WRITE_BRANCH_EQUALITY_DELETE = 4;
+}
+
+enum IcebergCompression {
+  ICEBERG_COMPRESSION_UNSPECIFIED = 0;
+  ICEBERG_COMPRESSION_NONE = 1;
+  ICEBERG_COMPRESSION_SNAPPY = 2;
+  ICEBERG_COMPRESSION_GZIP = 3;
+  ICEBERG_COMPRESSION_LZ4 = 4;
+  ICEBERG_COMPRESSION_ZSTD = 5;
+}
+
+message IcebergPartitionValueDescriptor {
+  bool is_null = 1;
+  optional bytes datum_bytes = 2;
+}
+
+message IcebergPartitionDescriptor {
+  repeated IcebergPartitionValueDescriptor values = 1;
+}
+
+message IcebergArtifactPartition {
+  string partition_path = 1;
+  string null_fingerprint = 2;
+  int32 partition_spec_id = 3;
+  IcebergPartitionDescriptor descriptor = 4;
+}
+
+message IcebergColumnStats {
+  map<int32, int64> column_sizes = 1;
+  map<int32, int64> value_counts = 2;
+  map<int32, int64> null_value_counts = 3;
+  map<int32, int64> nan_value_counts = 4;
+  map<int32, bytes> lower_bounds = 5;
+  map<int32, bytes> upper_bounds = 6;
+}
+
+message IcebergArtifactMetrics {
+  uint64 record_count = 1;
+  uint64 file_size_in_bytes = 2;
+  repeated int64 split_offsets = 3;
+  optional IcebergColumnStats column_stats = 4;
+}
+
+message IcebergContentRange {
+  int64 offset = 1;
+  int64 size_in_bytes = 2;
+}
+
+// FE -> BE: one immutable logical writer recipe.
+message IcebergWriteTableFacts {
+  string table_uuid = 1;
+  string namespace = 2;
+  string table_name = 3;
+  string table_location = 4;
+  string data_location = 5;
+  string target_ref = 6;
+  optional int64 base_snapshot_id = 7;
+  int64 base_sequence_number = 8;
+  int32 schema_id = 9;
+  int32 default_partition_spec_id = 10;
+  uint32 format_version = 11;
+}
+
+message IcebergWriterOutput {
+  IcebergWriteFileFormat file_format = 1;
+  IcebergCompression compression = 2;
+  optional uint64 parquet_row_group_size_bytes = 3;
+}
+
+message IcebergDataBranchRecipe {
+  optional string input_schema_json = 1;
+  repeated string partition_source_column_names = 2;
+  repeated string partition_column_names = 3;
+  repeated string transform_exprs = 4;
+  bool row_lineage = 5;
+}
+
+message IcebergOldDeleteArtifactRef {
+  string path = 1;
+  IcebergFileContent content = 2;
+  IcebergWriteFileFormat file_format = 3;
+  uint64 file_size_in_bytes = 4;
+  optional uint64 record_count = 5;
+  optional IcebergContentRange content_range = 6;
+  optional string referenced_data_file = 7;
+  optional int64 data_sequence_number = 8;
+  optional int64 added_snapshot_id = 9;
+  int32 partition_spec_id = 10;
+  IcebergStorageRoute storage_route = 11;
+}
+
+message IcebergEqualityDeleteColumn {
+  string name = 1;
+  int32 field_id = 2;
+  string data_type = 3;
+  bool nullable = 4;
+}
+
+message IcebergEqualityDeleteRecipe {
+  repeated IcebergEqualityDeleteColumn columns = 1;
+}
+
+message IcebergOldDeleteMergeTarget {
+  string data_file_path = 1;
+  uint64 data_file_record_count = 2;
+  optional int64 data_file_sequence_number = 3;
+  IcebergArtifactPartition partition = 4;
+  int64 base_snapshot_id = 5;
+  repeated IcebergOldDeleteArtifactRef references = 6;
+}
+
+// The recipe intentionally carries no operation, cohort, query, attempt,
+// backend, driver, or sink identity and no credential material.
+message IcebergWriterHandle {
+  IcebergWriteBranch branch = 1;
+  IcebergWriteTableFacts table = 2;
+  IcebergWriterOutput output = 3;
+  optional IcebergDataBranchRecipe data = 4;
+  map<string, IcebergOldDeleteMergeTarget> old_deletes = 5;
+  optional IcebergEqualityDeleteRecipe equality = 6;
+}
+
+// BE -> FE: one staged provider artifact.
+message IcebergDataFileArtifact {
+  string path = 1;
+  IcebergWriteFileFormat file_format = 2;
+  IcebergArtifactPartition partition = 3;
+  IcebergArtifactMetrics metrics = 4;
+  optional int64 first_row_id = 5;
+}
+
+message IcebergPositionDeleteFileArtifact {
+  string path = 1;
+  IcebergArtifactPartition partition = 2;
+  IcebergArtifactMetrics metrics = 3;
+  string referenced_data_file = 4;
+  repeated string merged_old_references = 5;
+}
+
+message IcebergDeletionVectorArtifact {
+  string path = 1;
+  IcebergArtifactPartition partition = 2;
+  IcebergArtifactMetrics metrics = 3;
+  string referenced_data_file = 4;
+  IcebergContentRange content_range = 5;
+  uint64 cardinality = 6;
+  repeated string merged_old_references = 7;
+}
+
+message IcebergEqualityDeleteFileArtifact {
+  string path = 1;
+  IcebergArtifactPartition partition = 2;
+  IcebergArtifactMetrics metrics = 3;
+  repeated int32 equality_field_ids = 4;
+}
+
+// The fragment intentionally carries no writer, attempt, or aggregate result
+// identity. Those relationships stay in the existing public result carrier.
+message IcebergCommitFragment {
+  oneof artifact {
+    IcebergDataFileArtifact data_file = 1;
+    IcebergPositionDeleteFileArtifact position_delete_file = 2;
+    IcebergDeletionVectorArtifact deletion_vector = 3;
+    IcebergEqualityDeleteFileArtifact equality_delete_file = 4;
+  }
+}

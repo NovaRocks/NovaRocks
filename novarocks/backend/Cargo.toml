@@ -10,7 +10,6 @@ doctest = false
 [dependencies]
 novarocks-execution = { path = "../execution" }
 novarocks-functions = { path = "../functions" }
-novarocks-connector-binding = { path = "../connector-binding" }
 novarocks-failpoint = { path = "../failpoint" }
 novarocks-native-trust = { path = "../native-trust" }
 novarocks-proto-codec = { path = "../proto-codec" }

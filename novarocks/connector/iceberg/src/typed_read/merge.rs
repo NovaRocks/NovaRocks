@@ -33,8 +33,8 @@
 
 use std::sync::Arc;
 
+use crate::wire::dto;
 use novarocks_proto_codec::connector_read::{MAX_JSON_BYTES, MAX_PATH_BYTES, MAX_SCAN_ASSIGNMENTS};
-use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     ConnectorMergeTableHandle as ConnectorMergeTableHandleMarker, ConnectorTableHandle,
     SchemaTableName, TupleDomain,
@@ -211,14 +211,6 @@ impl IcebergMergeTableHandle {
         }
     }
 
-    pub fn to_merge_table_handle_proto(&self) -> dto::ConnectorMergeTableHandle {
-        dto::ConnectorMergeTableHandle {
-            handle: Some(dto::connector_merge_table_handle::Handle::Iceberg(
-                self.to_proto(),
-            )),
-        }
-    }
-
     pub fn from_proto(raw: &dto::IcebergMergeTableHandle) -> Result<Self, ConnectorError> {
         let table_handle = raw
             .table_handle
@@ -232,20 +224,6 @@ impl IcebergMergeTableHandle {
             IcebergTableHandle::from_proto(table_handle)?,
             IcebergInsertTableHandle::from_proto(insert_table_handle)?,
         )
-    }
-
-    pub fn from_merge_table_handle_proto(
-        raw: &dto::ConnectorMergeTableHandle,
-    ) -> Result<Self, ConnectorError> {
-        let handle = raw
-            .handle
-            .as_ref()
-            .ok_or_else(|| invalid("connector merge table handle variant must be present"))?;
-        match handle {
-            dto::connector_merge_table_handle::Handle::Iceberg(iceberg) => {
-                Self::from_proto(iceberg)
-            }
-        }
     }
 }
 
@@ -432,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_handles_round_trip_through_the_closed_wire_variant() {
+    fn merge_handles_round_trip_through_the_private_wire_value() {
         let handle = IcebergMergeTableHandle::try_new(partitioned_handle(), insert_handle())
             .expect("merge handle");
         // The exhaustive struct literal in `to_proto` is the proof that the
@@ -444,10 +422,8 @@ mod tests {
         };
         assert_eq!(handle.to_proto(), expected);
 
-        let decoded = IcebergMergeTableHandle::from_merge_table_handle_proto(
-            &handle.to_merge_table_handle_proto(),
-        )
-        .expect("decoded merge handle");
+        let decoded =
+            IcebergMergeTableHandle::from_proto(&handle.to_proto()).expect("decoded merge handle");
         assert_eq!(decoded, handle);
     }
 

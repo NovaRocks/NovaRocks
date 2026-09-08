@@ -32,7 +32,7 @@ use novarocks_execution::task_execution::OperationOutcome;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::UniqueId;
 
-use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
+use novarocks_spi::connector::ConnectorReadWireEncoder;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadDynamicFilterSnapshot, ConnectorReadSplitSource,
 };
@@ -307,7 +307,7 @@ pub(crate) struct SplitAssignmentDriver {
     /// Splits the backends reported as still queued, above which the driver
     /// stops pulling new batches.
     max_queued_splits_per_task: u64,
-    encoders: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadEncoder>>,
+    encoders: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadWireEncoder>>,
     retry_policy: TaskUpdateRetryPolicy,
     stop: SplitAssignmentStop,
 }
@@ -318,7 +318,7 @@ impl SplitAssignmentDriver {
         transport: std::sync::Arc<dyn TaskUpdateTransport>,
         tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
-        encoders: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadEncoder>>,
+        encoders: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadWireEncoder>>,
         retry_policy: TaskUpdateRetryPolicy,
         stop: SplitAssignmentStop,
     ) -> Self {

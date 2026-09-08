@@ -17,6 +17,7 @@
 
 mod definition;
 mod registry;
+mod role;
 mod types;
 
 pub use definition::{
@@ -24,4 +25,8 @@ pub use definition::{
     ProviderReadContractDefinition, ProviderWriteCodecDefinitions, ProviderWriteContractDefinition,
 };
 pub use registry::SealedProviderRegistry;
+pub use role::{
+    ProviderControlRoleFactory, ProviderExecutionRoleFactory, ProviderRoleDefinition,
+    SealedProviderRoleRegistry,
+};
 pub use types::{ProviderReadTypes, ProviderWriteTypes};

@@ -8,7 +8,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::drain::BackendDrainState;
-use novarocks_connector_binding::ConnectorExecutionRoleBindingFactory;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
 use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
@@ -16,6 +15,7 @@ use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_proto_codec::membership::{
     BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
 };
+use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 
 use crate::BackendDataRuntime;

@@ -72,7 +72,7 @@ pub(crate) fn reject_if_iceberg_mv_properties(
     props: &HashMap<String, String>,
     mutation: IcebergMvUserMutation,
 ) -> Result<(), String> {
-    if target.backend_name == "iceberg" && is_iceberg_mv_table_properties(props) {
+    if target.provider_id.as_str() == "iceberg" && is_iceberg_mv_table_properties(props) {
         return Err(format!(
             "table {}.{}.{} is a materialized view; {}",
             target.catalog,
@@ -96,7 +96,7 @@ pub fn reject_if_iceberg_mv_table_with_ports(
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,
 ) -> Result<(), String> {
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         return Ok(());
     }
 
@@ -126,7 +126,7 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
     mutation: IcebergMvUserMutation,
     context: ConnectorRequestContext,
 ) -> Result<(), String> {
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         return Ok(());
     }
 
@@ -398,7 +398,8 @@ mod tests {
 
     fn iceberg_target() -> TargetBackend {
         TargetBackend {
-            backend_name: "iceberg",
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static Iceberg provider ID"),
             catalog: "ice".to_string(),
             namespace: "analytics".to_string(),
             table: "mv_orders".to_string(),

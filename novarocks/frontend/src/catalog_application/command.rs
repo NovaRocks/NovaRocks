@@ -319,7 +319,7 @@ fn execute_alter_iceberg_properties(
         &target,
         crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
     )?;
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         return Err(
             "ALTER TABLE TBLPROPERTIES only supports standalone iceberg catalogs".to_string(),
         );
@@ -497,10 +497,10 @@ fn execute_alter_partition_spec(
         current_catalog,
         current_database,
     )?;
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         return Err(format!(
             "ALTER TABLE ADD/DROP PARTITION COLUMN only supports iceberg backends, got `{}`",
-            target.backend_name
+            target.provider_id.as_str()
         ));
     }
     crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
@@ -615,10 +615,10 @@ fn execute_show_create_table(
         current_catalog,
         current_database,
     )?;
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         return Err(format!(
             "SHOW CREATE TABLE only supports Iceberg tables, got `{}` backend",
-            target.backend_name
+            target.provider_id.as_str()
         ));
     }
     let instance_id =

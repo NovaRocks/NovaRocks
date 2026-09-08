@@ -110,6 +110,8 @@ code-anchors:
 - ADR-0129 — vended credential 为何必须在 metadata materialization 前按 attempt 收集（active）
 - ADR-0130 — Connector role binding 为何每个进程角色只发布一个 complete generation（active）
 - ADR-0132 — provider 为何拥有 role-binding factory、而 Server 只组装 role-local resource（active）
+- ADR-0137 — 多 provider 的私有 Connector wire 为何归 provider 自有、Native 只承载 opaque envelope（active）
+- ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active）
 - ADR-0125 — Backend catalog runtime、Frontend effect owner 与 provider-private proof 为何使用三种不互换 identity（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
@@ -377,6 +379,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
 - ADR-0134 — 概率结构为何精确依赖 registry DataSketches 预发布包、由上游唯一拥有标准格式与集合运算（active）
+- ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）

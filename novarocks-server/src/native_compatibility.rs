@@ -19,29 +19,56 @@
 //! Server-owned static manifest for the Native compatibility contract.
 
 use anyhow::Context;
-use novarocks_spi::connector::ConnectorProviderBindingKind;
+use novarocks_spi::connector::provider::ProviderContractDefinition;
 use novarocks_version::{
     NativeCarrierDeclaration, NativeCompatibilityMaterial,
     derive_repository_native_compatibility_material,
 };
 
-// Iceberg revision 2 adds `CatalogHandle` to the provider-private distributed
-// rewrite attempt artifact. This cannot be inferred from the native IDL.
-const NATIVE_CARRIER_MANIFEST: [(&str, u64); 2] = [("iceberg", 2), ("starrocks", 1)];
-
 /// Builds the one closed carrier manifest for this server binary.
 ///
 /// This is intentionally independent of config and runtime connector state.
 pub fn native_carrier_declarations() -> anyhow::Result<Vec<NativeCarrierDeclaration>> {
-    let declarations = NATIVE_CARRIER_MANIFEST
-        .into_iter()
-        .map(|(provider_id, contract_revision)| {
-            NativeCarrierDeclaration::try_new(provider_id, contract_revision)
-                .with_context(|| "validate server native carrier declaration")
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    validate_declared_provider_kinds(&declarations)?;
-    Ok(declarations)
+    [
+        novarocks_connector_iceberg::iceberg_contract_definition()
+            .context("build Iceberg provider contract")
+            .and_then(|contract| native_carrier_from_contract(&contract)),
+        novarocks_connector_paimon::definition::paimon_contract_definition()
+            .context("build Paimon provider contract")
+            .and_then(|contract| native_carrier_from_contract(&contract)),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn native_carrier_from_contract(
+    contract: &ProviderContractDefinition,
+) -> anyhow::Result<NativeCarrierDeclaration> {
+    let declarations = contract.declarations();
+    let first = declarations
+        .first()
+        .copied()
+        .context("provider contract has no private codec declaration")?;
+    for declaration in declarations.iter().copied() {
+        anyhow::ensure!(
+            declaration.provider_id() == contract.provider_id(),
+            "provider contract contains a declaration for another provider"
+        );
+        anyhow::ensure!(
+            declaration.revision() == first.revision(),
+            "provider contract declarations disagree on private codec revision"
+        );
+        anyhow::ensure!(
+            declaration.descriptor_sha256() == first.descriptor_sha256(),
+            "provider contract declarations disagree on private descriptor digest"
+        );
+    }
+    NativeCarrierDeclaration::try_new_with_private_descriptor(
+        contract.provider_id().as_str(),
+        u64::from(first.revision().get()),
+        first.descriptor(),
+    )
+    .with_context(|| "validate server native carrier declaration")
 }
 
 /// Resolves the immutable compatibility material for this binary before role
@@ -59,61 +86,39 @@ pub fn resolve_native_compatibility_material(
     .with_context(|| "derive native compatibility material")
 }
 
-fn validate_declared_provider_kinds(
-    declarations: &[NativeCarrierDeclaration],
-) -> anyhow::Result<()> {
-    let expected = ConnectorProviderBindingKind::ALL
-        .map(|kind| kind.provider_id())
-        .to_vec();
-    let actual = declarations
-        .iter()
-        .map(NativeCarrierDeclaration::provider_id)
-        .collect::<Vec<_>>();
-    if actual != expected {
-        anyhow::bail!(
-            "server native carrier manifest does not match ConnectorProviderBindingKind::ALL: actual={actual:?}, expected={expected:?}"
-        );
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{native_carrier_declarations, resolve_native_compatibility_material};
-    use crate::composition::compose_backend_execution_role_binding_factories;
-    use novarocks_spi::connector::{CatalogProviderKind, ConnectorProviderBindingKind};
+    use novarocks_spi::connector::provider::{
+        ConnectorCodecDeclaration, ProviderContractDefinition, ProviderReadCodecDefinitions,
+        ProviderReadContractDefinition,
+    };
+    use novarocks_spi::connector::{
+        ConnectorCodecCategory, ConnectorCodecRevision, ConnectorProviderId,
+    };
 
+    use super::{
+        native_carrier_declarations, native_carrier_from_contract,
+        resolve_native_compatibility_material,
+    };
     #[test]
-    fn static_manifest_matches_the_closed_provider_enum_and_backend_installers() {
+    fn static_manifest_contains_exact_private_provider_descriptors() {
         let declarations = native_carrier_declarations().expect("server carrier declarations");
         let declared = declarations
             .iter()
             .map(|declaration| declaration.provider_id())
             .collect::<Vec<_>>();
-        let expected = ConnectorProviderBindingKind::ALL
-            .map(|kind| kind.provider_id())
-            .to_vec();
-        assert_eq!(declared, expected);
+        assert_eq!(declared, vec!["iceberg", "paimon"]);
         assert_eq!(
             declarations
                 .iter()
                 .map(|declaration| (declaration.provider_id(), declaration.contract_revision()))
                 .collect::<Vec<_>>(),
-            vec![("iceberg", 2), ("starrocks", 1)]
+            vec![("iceberg", 1), ("paimon", 1)]
         );
-
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let config = crate::app_config::NovaRocksConfig::default();
-        let factories =
-            compose_backend_execution_role_binding_factories(&config, runtime.handle().clone())
-                .expect("backend factories");
-        let factory_kinds = factories
-            .iter()
-            .map(|factory| factory.provider_kind())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            factory_kinds,
-            CatalogProviderKind::ALL.into_iter().collect()
+        assert!(
+            declarations
+                .iter()
+                .all(|declaration| { declaration.private_descriptor_digest() != [0; 32] })
         );
     }
 
@@ -128,5 +133,77 @@ mod tests {
         assert_eq!(material.carriers(), native_carrier_declarations().unwrap());
         assert_eq!(material.id().to_string().len(), 64);
         assert_ne!(material.id(), implementation_only_change.id());
+    }
+
+    #[test]
+    fn native_carrier_rejects_provider_declarations_with_different_revisions() {
+        let provider = ConnectorProviderId::parse("fixture").expect("provider");
+        let declaration = |category, revision| {
+            ConnectorCodecDeclaration::try_new(
+                provider.clone(),
+                category,
+                ConnectorCodecRevision::try_new(revision).expect("revision"),
+                format!("fixture.{category:?}.{revision}"),
+                b"same descriptor".as_slice(),
+            )
+            .expect("declaration")
+        };
+        let contract = ProviderContractDefinition::read_only(
+            provider.clone(),
+            ProviderReadContractDefinition::new(
+                ProviderReadCodecDefinitions::try_new(
+                    declaration(ConnectorCodecCategory::ReadTable, 1),
+                    declaration(ConnectorCodecCategory::ReadView, 2),
+                    declaration(ConnectorCodecCategory::ReadColumn, 1),
+                    declaration(ConnectorCodecCategory::ReadSplit, 1),
+                )
+                .expect("codec categories"),
+            ),
+        )
+        .expect("provider contract");
+
+        let error = native_carrier_from_contract(&contract)
+            .expect_err("mixed revisions must not enter global compatibility material");
+        assert!(
+            error
+                .to_string()
+                .contains("disagree on private codec revision")
+        );
+    }
+
+    #[test]
+    fn native_carrier_rejects_provider_declarations_with_different_descriptors() {
+        let provider = ConnectorProviderId::parse("fixture").expect("provider");
+        let declaration = |category, descriptor: &'static [u8]| {
+            ConnectorCodecDeclaration::try_new(
+                provider.clone(),
+                category,
+                ConnectorCodecRevision::try_new(1).expect("revision"),
+                format!("fixture.{category:?}"),
+                descriptor,
+            )
+            .expect("declaration")
+        };
+        let contract = ProviderContractDefinition::read_only(
+            provider.clone(),
+            ProviderReadContractDefinition::new(
+                ProviderReadCodecDefinitions::try_new(
+                    declaration(ConnectorCodecCategory::ReadTable, b"descriptor-a"),
+                    declaration(ConnectorCodecCategory::ReadView, b"descriptor-b"),
+                    declaration(ConnectorCodecCategory::ReadColumn, b"descriptor-a"),
+                    declaration(ConnectorCodecCategory::ReadSplit, b"descriptor-a"),
+                )
+                .expect("codec categories"),
+            ),
+        )
+        .expect("provider contract");
+
+        let error = native_carrier_from_contract(&contract)
+            .expect_err("mixed descriptors must not enter global compatibility material");
+        assert!(
+            error
+                .to_string()
+                .contains("disagree on private descriptor digest")
+        );
     }
 }

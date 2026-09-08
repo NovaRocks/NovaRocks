@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Verify NCP-2R4 connector role-binding ownership boundaries.
+"""Verify connector role-binding ownership boundaries after SPI convergence.
 
 Cargo metadata proves the dependency cut.  Small, named source markers prove
 the final cutover removed the former FE/BE parallel typed registries; this is
@@ -30,28 +30,20 @@ import sys
 from pathlib import Path
 
 
-BINDING = "novarocks-connector-binding"
+RETIRED_BINDING = "novarocks-connector-binding"
 SPI = "novarocks-spi"
-PROTO = "novarocks-proto-codec"
 FRONTEND = "novarocks-frontend"
 BACKEND = "novarocks-backend"
-REQUIRED_BINDING_INTERNAL = {SPI, PROTO}
-FORBIDDEN_BINDING_CLOSURE = {
-    FRONTEND,
-    BACKEND,
-    "novarocks-server",
-    "novarocks-connector-iceberg",
-    "novarocks-connector-starrocks",
-    "novarocks-execution",
-    "novarocks-fs",
-    "novarocks-sql",
-}
 LEGACY_PATHS = (
     "novarocks/frontend/src/connector/typed_control_registry.rs",
     "novarocks/backend/src/connector/typed_registry.rs",
 )
 STARROCKS_PROVIDER_FACTORY = "novarocks/connector/starrocks/src/role_binding.rs"
 SERVER_STARROCKS_FACTORY_ADAPTER = "novarocks-server/src/connector_role_binding.rs"
+SPI_ROLE_CONTRACTS = (
+    "novarocks/spi/src/connector/binding/role.rs",
+    "novarocks/spi/src/connector/provider/role.rs",
+)
 REQUIRED_STARROCKS_FACTORY_MARKERS = (
     "impl ConnectorControlRoleBindingFactory for StarRocksControlRoleBindingFactory",
     "impl ConnectorExecutionRoleBindingFactory for StarRocksExecutionRoleBindingFactory",
@@ -127,29 +119,20 @@ def normal_closure(metadata, root_name):
 
 
 def verify_metadata(metadata):
-    binding = package(metadata, BINDING)
-    internal = {
-        name
-        for name in normal_direct_dependencies(binding)
-        if name.startswith("novarocks-")
-    }
-    if internal != REQUIRED_BINDING_INTERNAL:
-        fail(
-            f"{BINDING} internal normal dependencies must be exactly: "
-            + ", ".join(sorted(REQUIRED_BINDING_INTERNAL))
-        )
-    forbidden = sorted(normal_closure(metadata, BINDING) & FORBIDDEN_BINDING_CLOSURE)
-    if forbidden:
-        fail(
-            f"{BINDING} normal dependency closure contains forbidden packages: "
-            + ", ".join(forbidden)
-        )
+    if any(entry["name"] == RETIRED_BINDING for entry in metadata["packages"]):
+        fail(f"retired package must be absent: {RETIRED_BINDING}")
     for role in (FRONTEND, BACKEND):
-        if BINDING not in normal_direct_dependencies(package(metadata, role)):
-            fail(f"{role} must directly declare a normal dependency on {BINDING}")
+        if SPI not in normal_direct_dependencies(package(metadata, role)):
+            fail(f"{role} must directly declare a normal dependency on {SPI}")
 
 
 def verify_source(source_root):
+    retired_manifest = source_root / "novarocks/connector-binding/Cargo.toml"
+    if retired_manifest.exists():
+        fail("retired connector-binding crate manifest must be removed")
+    for relative in SPI_ROLE_CONTRACTS:
+        if not (source_root / relative).exists():
+            fail(f"SPI role-binding contract is missing: {relative}")
     for relative in LEGACY_PATHS:
         if (source_root / relative).exists():
             fail(f"legacy parallel registry must be removed: {relative}")

@@ -18,15 +18,150 @@
 use super::backend;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorListNamespacesRequest, ConnectorNamespaceIdentity, ConnectorReadReferenceFacts,
-    ConnectorReadReferenceFactsRequest, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableRequest, ConnectorTableResolution,
+    ConnectorReadReferenceFactsRequest, ConnectorRequestContext, ConnectorRequestResources,
+    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
+    ConnectorResourceLedger, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution,
 };
+
+/// Request-local cap for connector metadata and split preparation retained by
+/// the Frontend. Provider-specific object and collection limits remain
+/// narrower; this is the final aggregate guard for one admitted request.
+const FRONTEND_CONNECTOR_REQUEST_BYTES: u64 = 256 * 1024 * 1024;
+
+struct FrontendConnectorResourceState {
+    current: AtomicU64,
+    checkpoint: AtomicU64,
+    limit: u64,
+}
+
+#[derive(Clone)]
+struct FrontendConnectorResourceLedger {
+    state: Arc<FrontendConnectorResourceState>,
+}
+
+impl FrontendConnectorResourceLedger {
+    fn new(limit: u64) -> Self {
+        Self {
+            state: Arc::new(FrontendConnectorResourceState {
+                current: AtomicU64::new(0),
+                checkpoint: AtomicU64::new(0),
+                limit,
+            }),
+        }
+    }
+
+    fn reserve(&self, bytes: u64) -> Result<(), ConnectorError> {
+        let mut current = self.state.current.load(Ordering::Acquire);
+        loop {
+            let next = current.checked_add(bytes).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "frontend connector request resource accounting overflowed",
+                )
+            })?;
+            if next > self.state.limit {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    format!(
+                        "frontend connector request retained {next} bytes, limit is {} bytes",
+                        self.state.limit
+                    ),
+                ));
+            }
+            match self.state.current.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+struct FrontendConnectorResourceLease {
+    ledger: FrontendConnectorResourceLedger,
+    bytes: u64,
+}
+
+impl ConnectorResourceLease for FrontendConnectorResourceLease {
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+        self.ledger.reserve(additional)?;
+        self.bytes = self.bytes.checked_add(additional).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "frontend connector resource lease overflowed",
+            )
+        })?;
+        Ok(())
+    }
+
+    fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+        if bytes > self.bytes {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "frontend connector resource lease cannot grow through shrink_to",
+            ));
+        }
+        let released = self.bytes - bytes;
+        self.ledger
+            .state
+            .current
+            .fetch_sub(released, Ordering::AcqRel);
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+impl Drop for FrontendConnectorResourceLease {
+    fn drop(&mut self) {
+        self.ledger
+            .state
+            .current
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+impl ConnectorResourceLedger for FrontendConnectorResourceLedger {
+    fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+        Ok(ConnectorResourceCheckpoint::new(
+            self.state.checkpoint.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
+    fn try_reserve(
+        &self,
+        _class: ConnectorResourceClass,
+        bytes: u64,
+    ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+        self.reserve(bytes)?;
+        Ok(Box::new(FrontendConnectorResourceLease {
+            ledger: self.clone(),
+            bytes,
+        }))
+    }
+}
+
+fn install_frontend_connector_resources(
+    context: ConnectorRequestContext,
+) -> ConnectorRequestContext {
+    context.with_resources(ConnectorRequestResources::new(Arc::new(
+        FrontendConnectorResourceLedger::new(FRONTEND_CONNECTOR_REQUEST_BYTES),
+    )))
+}
 
 struct RequestConnectorCancellation {
     signal: Arc<AtomicBool>,
@@ -59,6 +194,7 @@ fn build_connector_request_context(
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
+    .map(install_frontend_connector_resources)
     .map_err(|error| error.to_string())
 }
 
@@ -105,6 +241,7 @@ pub fn connector_request_context_for_execution(
             novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
+        .map(install_frontend_connector_resources)
         .map_err(|error| error.to_string()),
         None => build_connector_request_context(query_options, cancellation),
     }
@@ -143,12 +280,19 @@ pub fn test_request_context() -> ConnectorRequestContext {
     reason = "The request-context tests remain adjacent to their test-only factory."
 )]
 mod request_context_tests {
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    use super::{connector_request_context_for_execution, query_expire_duration};
+    use super::{
+        FrontendConnectorResourceLedger, connector_request_context_for_execution,
+        query_expire_duration,
+    };
     use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
     use crate::common::backend_topology::BackendTopologySnapshot;
     use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
+    use novarocks_spi::connector::{
+        ConnectorErrorKind, ConnectorResourceClass, ConnectorResourceLedger,
+    };
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
 
@@ -214,6 +358,49 @@ mod request_context_tests {
             query_expire_duration(Some(&configured)),
             Duration::from_secs(17)
         );
+    }
+
+    #[test]
+    fn frontend_connector_ledger_rejects_over_limit_without_retaining_charge() {
+        let ledger = FrontendConnectorResourceLedger::new(10);
+        let lease = ledger
+            .try_reserve(ConnectorResourceClass::Metadata, 7)
+            .expect("initial reservation fits");
+        assert_eq!(ledger.state.current.load(Ordering::Acquire), 7);
+
+        let error = ledger
+            .try_reserve(ConnectorResourceClass::SplitPlanning, 4)
+            .err()
+            .expect("aggregate reservation must respect the request limit");
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(ledger.state.current.load(Ordering::Acquire), 7);
+
+        drop(lease);
+        assert_eq!(ledger.state.current.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn frontend_connector_lease_grow_shrink_and_drop_release_exact_bytes() {
+        let ledger = FrontendConnectorResourceLedger::new(10);
+        let mut lease = ledger
+            .try_reserve(ConnectorResourceClass::ReaderState, 6)
+            .expect("initial reservation fits");
+
+        lease.try_grow(4).expect("growth reaches exact limit");
+        assert_eq!(lease.bytes(), 10);
+        assert_eq!(ledger.state.current.load(Ordering::Acquire), 10);
+
+        let error = lease
+            .try_grow(1)
+            .expect_err("growth beyond the limit must fail");
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(lease.bytes(), 10);
+        assert_eq!(ledger.state.current.load(Ordering::Acquire), 10);
+
+        lease.shrink_to(3).expect("shrink releases the difference");
+        assert_eq!(ledger.state.current.load(Ordering::Acquire), 3);
+        drop(lease);
+        assert_eq!(ledger.state.current.load(Ordering::Acquire), 0);
     }
 }
 

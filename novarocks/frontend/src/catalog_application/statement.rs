@@ -706,7 +706,7 @@ pub(crate) fn execute_drop_database_statement(
         name,
         current_catalog,
     )?;
-    if target.backend_name == "iceberg" {
+    if target.provider_id.as_str() == "iceberg" {
         ensure_no_iceberg_mv_targets_in_scope(context, &target.catalog, Some(&target.namespace))?;
         ensure_no_external_iceberg_dependents(context, &target.catalog, Some(&target.namespace))?;
     }
@@ -851,7 +851,7 @@ pub(crate) fn execute_drop_table_statement(
         }
         Err(err) => return Err(err),
     };
-    let dependency_ref = if target.backend_name == "iceberg" {
+    let dependency_ref = if target.provider_id.as_str() == "iceberg" {
         crate::mv::domain::dependency::model::iceberg_table_object_ref(
             &target.catalog,
             &target.namespace,
@@ -873,7 +873,7 @@ pub(crate) fn execute_drop_table_statement(
         Ok(()) => {}
         Err(err)
             if if_exists
-                && target.backend_name == "iceberg"
+                && target.provider_id.as_str() == "iceberg"
                 && is_missing_table_guard_error(&err) =>
         {
             cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
@@ -905,7 +905,7 @@ pub(crate) fn execute_drop_table_statement(
         connector_context.clone(),
     ) {
         Ok(_) => {
-            if target.backend_name == "iceberg" {
+            if target.provider_id.as_str() == "iceberg" {
                 context.catalog_service().invalidate_table(
                     &target.catalog,
                     &target.namespace,
@@ -916,7 +916,7 @@ pub(crate) fn execute_drop_table_statement(
             Ok(StatementResult::Ok)
         }
         Err(err) if if_exists && err.contains("NotFound") => {
-            if target.backend_name == "iceberg" {
+            if target.provider_id.as_str() == "iceberg" {
                 cleanup_iceberg_drop_table_registration_if_exists(context, &target)?;
             }
             Ok(StatementResult::Ok)
@@ -924,7 +924,7 @@ pub(crate) fn execute_drop_table_statement(
         Err(err) => {
             // A DROP TABLE aimed at a view must say so instead of "unknown
             // table" — views and tables are separate REST resources.
-            if target.backend_name == "iceberg"
+            if target.provider_id.as_str() == "iceberg"
                 && external_view_exists(
                     context,
                     &target.catalog,

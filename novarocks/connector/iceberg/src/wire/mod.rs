@@ -25,3 +25,6 @@ pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
 pub(crate) mod dto {
     include!(concat!(env!("OUT_DIR"), "/novarocks.connector.iceberg.rs"));
 }
+
+pub(crate) mod read;
+pub(crate) mod write;

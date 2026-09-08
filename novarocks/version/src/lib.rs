@@ -27,7 +27,7 @@ const NATIVE_BUILD_IDENTITY: &str = env!("NOVAROCKS_NATIVE_BUILD_IDENTITY");
 
 // Design: ADR-0121 (docs/adr/ADR-0121-native-compatibility-islands-and-ingress-admission.md)
 /// Domain separator for the immutable Native compatibility identity encoding.
-pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v3\0";
+pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v4\0";
 
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
@@ -46,6 +46,7 @@ compile_error!("native-compatibility-test-fixture is only supported by debug and
 pub struct NativeCarrierDeclaration {
     provider_id: Box<str>,
     contract_revision: u64,
+    private_descriptor_digest: [u8; 32],
 }
 
 impl NativeCarrierDeclaration {
@@ -70,7 +71,27 @@ impl NativeCarrierDeclaration {
         Ok(Self {
             provider_id: provider_id.into(),
             contract_revision,
+            private_descriptor_digest: [0; 32],
         })
+    }
+
+    /// Declare the exact provider-private descriptor compiled into the
+    /// process. This keeps private protobuf evolution inside Native
+    /// compatibility admission without exposing provider messages in the
+    /// repository-wide descriptor set.
+    pub fn try_new_with_private_descriptor(
+        provider_id: impl AsRef<str>,
+        contract_revision: u64,
+        private_descriptor: &[u8],
+    ) -> Result<Self, NativeCompatibilityError> {
+        if private_descriptor.is_empty() {
+            return Err(NativeCompatibilityError::EmptyPrivateDescriptor {
+                provider_id: provider_id.as_ref().into(),
+            });
+        }
+        let mut declaration = Self::try_new(provider_id, contract_revision)?;
+        declaration.private_descriptor_digest = Sha256::digest(private_descriptor).into();
+        Ok(declaration)
     }
 
     pub fn provider_id(&self) -> &str {
@@ -79,6 +100,10 @@ impl NativeCarrierDeclaration {
 
     pub const fn contract_revision(&self) -> u64 {
         self.contract_revision
+    }
+
+    pub const fn private_descriptor_digest(&self) -> [u8; 32] {
+        self.private_descriptor_digest
     }
 }
 
@@ -134,6 +159,9 @@ pub enum NativeCompatibilityError {
     ZeroCarrierRevision {
         provider_id: Box<str>,
     },
+    EmptyPrivateDescriptor {
+        provider_id: Box<str>,
+    },
     CarrierManifestNotStrictlySorted {
         previous: Box<str>,
         current: Box<str>,
@@ -170,6 +198,10 @@ impl fmt::Display for NativeCompatibilityError {
                     "native compatibility carrier {provider_id} has zero revision"
                 )
             }
+            Self::EmptyPrivateDescriptor { provider_id } => write!(
+                formatter,
+                "native compatibility carrier {provider_id} has an empty private descriptor"
+            ),
             Self::CarrierManifestNotStrictlySorted { previous, current } => write!(
                 formatter,
                 "native compatibility carrier manifest is not strictly sorted: {previous} then {current}"
@@ -231,6 +263,7 @@ pub fn derive_native_compatibility_material(
         );
         hasher.update(provider_id);
         hasher.update(carrier.contract_revision().to_be_bytes());
+        hasher.update(carrier.private_descriptor_digest());
     }
     hasher.update(epoch.to_be_bytes());
 
@@ -318,7 +351,7 @@ mod tests {
 
         assert_eq!(
             material.id().to_string(),
-            "1cfda438a3098656c9db5560d2864f20c9be7077806e1057b85c39fef97c01fd"
+            "9df578f237b2a71e63bbc6ec4a064aca0afdb695f1389c17cbc77356e97dff34"
         );
         assert_eq!(material.function_catalog_digest(), [0x31; 32]);
         assert_eq!(
@@ -358,6 +391,22 @@ mod tests {
             1,
         )
         .expect("provider revision material");
+        let private_descriptor = derive_native_compatibility_material(
+            b"descriptor-v1",
+            [
+                NativeCarrierDeclaration::try_new_with_private_descriptor(
+                    "iceberg",
+                    1,
+                    b"iceberg-private-v2",
+                )
+                .expect("iceberg private declaration"),
+                NativeCarrierDeclaration::try_new("starrocks", 1).expect("starrocks declaration"),
+            ],
+            [0x31; 32],
+            [0x41; 32],
+            1,
+        )
+        .expect("private descriptor material");
         let catalog_only = derive_native_compatibility_material(
             b"descriptor-v1",
             carriers(),
@@ -385,6 +434,7 @@ mod tests {
 
         assert_ne!(original.id(), descriptor.id());
         assert_ne!(original.id(), provider_revision.id());
+        assert_ne!(original.id(), private_descriptor.id());
         assert_ne!(original.id(), catalog_only.id());
         assert_ne!(original.id(), implementation_only.id());
         assert_ne!(original.id(), epoch.id());

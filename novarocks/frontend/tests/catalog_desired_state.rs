@@ -56,9 +56,9 @@ use novarocks_native_trust::{
 };
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{
-    CatalogProviderKind, ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+    ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
     ConnectorProviderBinding, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
     ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableHandle,
     ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
@@ -223,34 +223,34 @@ impl SelectivelyFailingFactory {
     }
 }
 
-impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for SelectivelyFailingFactory {
-    fn provider_kind(&self) -> CatalogProviderKind {
-        CatalogProviderKind::Iceberg
+impl novarocks_spi::connector::ConnectorControlRoleBindingFactory for SelectivelyFailingFactory {
+    fn provider_id(&self) -> ConnectorProviderId {
+        ConnectorProviderId::parse("iceberg").expect("static provider ID")
     }
 
     fn normalize_and_validate(
         &self,
         properties: novarocks_spi::connector::CatalogProperties,
     ) -> Result<
-        novarocks_connector_binding::NormalizedCatalogProperties,
-        novarocks_connector_binding::ConnectorMaterializationError,
+        novarocks_spi::connector::NormalizedCatalogProperties,
+        novarocks_spi::connector::ConnectorMaterializationError,
     > {
-        novarocks_connector_binding::NormalizedCatalogProperties::try_new(properties).map_err(|detail| novarocks_connector_binding::ConnectorMaterializationError::new(
-            novarocks_connector_binding::ConnectorMaterializationErrorClass::InvalidDefinition,
-            novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+        novarocks_spi::connector::NormalizedCatalogProperties::try_new(properties).map_err(|detail| novarocks_spi::connector::ConnectorMaterializationError::new(
+            novarocks_spi::connector::ConnectorMaterializationErrorClass::InvalidDefinition,
+            novarocks_spi::connector::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
             detail,
         ))
     }
 
     fn materialize(
         &self,
-        properties: novarocks_connector_binding::NormalizedCatalogProperties,
-        _context: novarocks_connector_binding::MaterializationContext,
+        properties: novarocks_spi::connector::NormalizedCatalogProperties,
+        _context: novarocks_spi::connector::MaterializationContext,
     ) -> futures::future::BoxFuture<
         'static,
         Result<
-            novarocks_connector_binding::ConnectorControlRoleBinding,
-            novarocks_connector_binding::ConnectorMaterializationError,
+            novarocks_spi::connector::ConnectorControlRoleBinding,
+            novarocks_spi::connector::ConnectorMaterializationError,
         >,
     > {
         use futures::FutureExt;
@@ -267,16 +267,16 @@ impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for Selecti
             if let Some((entered, release)) = hanging {
                 entered.notify_one();
                 release.notified().await;
-                return Err(novarocks_connector_binding::ConnectorMaterializationError::new(
-                    novarocks_connector_binding::ConnectorMaterializationErrorClass::Unavailable,
-                    novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                return Err(novarocks_spi::connector::ConnectorMaterializationError::new(
+                    novarocks_spi::connector::ConnectorMaterializationErrorClass::Unavailable,
+                    novarocks_spi::connector::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
                     "injected hanging provider materialization",
                 ));
             }
             if poisoned == Some(properties.handle().catalog_name().as_str()) {
-                return Err(novarocks_connector_binding::ConnectorMaterializationError::new(
-                    novarocks_connector_binding::ConnectorMaterializationErrorClass::Unavailable,
-                    novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                return Err(novarocks_spi::connector::ConnectorMaterializationError::new(
+                    novarocks_spi::connector::ConnectorMaterializationErrorClass::Unavailable,
+                    novarocks_spi::connector::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
                     "injected provider materialization failure",
                 ));
             }
@@ -285,14 +285,14 @@ impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for Selecti
                 ProviderBindingEpoch::from_bytes(incarnation),
             )
                 .with_catalog_properties(properties.as_catalog_properties().clone())
-                .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)?;
-            novarocks_connector_binding::ConnectorControlRoleBinding::try_new(
+                .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
+            novarocks_spi::connector::ConnectorControlRoleBinding::try_new(
                 properties,
                 Arc::new(binding),
                 None,
                 None,
             )
-            .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)
+            .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)
         }
         .boxed()
     }

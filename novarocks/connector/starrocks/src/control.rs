@@ -291,10 +291,9 @@ mod tests {
     use std::time::Duration;
 
     use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorCancellation, ConnectorProviderBindingKind,
-        ConnectorReadSelector, ConnectorScanSelection, ConnectorTableObjectCaptureRequest,
-        ConnectorTableObjectId, ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector,
-        ConnectorTableResolution,
+        ConnectorBatchBudget, ConnectorCancellation, ConnectorReadSelector, ConnectorScanSelection,
+        ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
+        ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
     };
 
     use super::*;
@@ -380,10 +379,7 @@ mod tests {
             .provider_binding(&context())
             .expect("typed declaration");
 
-        assert_eq!(
-            declaration.provider_kind(),
-            ConnectorProviderBindingKind::StarRocks
-        );
+        assert_eq!(declaration.provider_id().as_str(), "starrocks");
         assert_eq!(declaration.starrocks_local_binding(), Some("default"));
     }
 

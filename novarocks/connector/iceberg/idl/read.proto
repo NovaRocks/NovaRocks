@@ -1,0 +1,433 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.connector.iceberg;
+
+// Iceberg owns this complete private read format. The public connector
+// envelope carries provider, catalog generation, category and revision. Split
+// scheduling facts (weight, reachability, addresses, affinity and retained
+// estimate) stay in the public split carrier and are deliberately absent here.
+
+enum ValueTypeKind {
+  VALUE_TYPE_KIND_UNSPECIFIED = 0;
+  VALUE_TYPE_KIND_BOOLEAN = 1;
+  VALUE_TYPE_KIND_INTEGER = 2;
+  VALUE_TYPE_KIND_BIG_INT = 3;
+  VALUE_TYPE_KIND_REAL = 4;
+  VALUE_TYPE_KIND_DOUBLE = 5;
+  VALUE_TYPE_KIND_DECIMAL = 6;
+  VALUE_TYPE_KIND_DATE = 7;
+  VALUE_TYPE_KIND_TIME_MICROS = 8;
+  VALUE_TYPE_KIND_TIMESTAMP_MICROS = 9;
+  VALUE_TYPE_KIND_TIMESTAMP_TZ_MICROS = 10;
+  VALUE_TYPE_KIND_TIMESTAMP_NANOS = 11;
+  VALUE_TYPE_KIND_TIMESTAMP_TZ_NANOS = 12;
+  VALUE_TYPE_KIND_VARCHAR = 13;
+  VALUE_TYPE_KIND_VARBINARY = 14;
+  VALUE_TYPE_KIND_UUID = 15;
+  VALUE_TYPE_KIND_FIXED = 16;
+  VALUE_TYPE_KIND_NON_COMPARABLE = 17;
+  VALUE_TYPE_KIND_TINY_INT = 18;
+  VALUE_TYPE_KIND_SMALL_INT = 19;
+  VALUE_TYPE_KIND_TIMESTAMP_MILLIS = 20;
+}
+
+message ValueType {
+  ValueTypeKind kind = 1;
+  optional uint32 decimal_precision = 2;
+  optional int32 decimal_scale = 3;
+  optional uint32 fixed_length = 4;
+}
+
+message DecimalValue {
+  bytes unscaled = 1;
+  uint32 precision = 2;
+  int32 scale = 3;
+}
+
+message Value {
+  oneof value {
+    bool boolean = 1;
+    int32 integer = 2;
+    int64 big_int = 3;
+    float real = 4;
+    double double_value = 5;
+    DecimalValue decimal = 6;
+    int32 date = 7;
+    int64 time_micros = 8;
+    int64 timestamp_micros = 9;
+    int64 timestamp_tz_micros = 10;
+    int64 timestamp_nanos = 11;
+    int64 timestamp_tz_nanos = 12;
+    string varchar = 13;
+    bytes varbinary = 14;
+    bytes uuid = 15;
+    bytes fixed = 16;
+    int32 tiny_int = 17;
+    int32 small_int = 18;
+    int64 timestamp_millis = 19;
+  }
+}
+
+enum BoundKind {
+  BOUND_KIND_UNSPECIFIED = 0;
+  BOUND_KIND_UNBOUNDED = 1;
+  BOUND_KIND_INCLUSIVE = 2;
+  BOUND_KIND_EXCLUSIVE = 3;
+}
+
+message Bound {
+  BoundKind kind = 1;
+  optional Value value = 2;
+}
+
+message Range {
+  Bound low = 1;
+  Bound high = 2;
+}
+
+message ValueSet {
+  ValueType value_type = 1;
+  repeated Range ranges = 2;
+}
+
+message Domain {
+  ValueSet values = 1;
+  bool null_allowed = 2;
+}
+
+message ColumnDomain {
+  IcebergColumnHandle column = 1;
+  Domain domain = 2;
+}
+
+message TupleDomain {
+  bool none = 1;
+  repeated ColumnDomain column_domains = 2;
+}
+
+message SchemaTableName {
+  string schema_name = 1;
+  string table_name = 2;
+}
+
+enum ColumnIdentityCategory {
+  COLUMN_IDENTITY_CATEGORY_UNSPECIFIED = 0;
+  COLUMN_IDENTITY_CATEGORY_PRIMITIVE = 1;
+  COLUMN_IDENTITY_CATEGORY_STRUCT = 2;
+  COLUMN_IDENTITY_CATEGORY_ARRAY = 3;
+  COLUMN_IDENTITY_CATEGORY_MAP = 4;
+}
+
+message ColumnIdentity {
+  int32 field_id = 1;
+  string name = 2;
+  ColumnIdentityCategory category = 3;
+  repeated ColumnIdentity children = 4;
+}
+
+message IcebergColumnHandle {
+  ColumnIdentity base_column_identity = 1;
+  string base_type_json = 2;
+  repeated int32 field_id_path = 3;
+  string type_json = 4;
+  bool nullable = 5;
+  optional string comment = 6;
+}
+
+message HiveTransactionHandle {
+  bool auto_commit = 1;
+  bytes uuid = 2;
+}
+
+message IcebergReadViewPayload {
+  HiveTransactionHandle transaction = 1;
+}
+
+message IcebergPinnedDataFileSet {
+  repeated string paths = 1;
+}
+
+message IcebergTableHandle {
+  SchemaTableName schema_table_name = 1;
+  optional int64 snapshot_id = 2;
+  string table_schema_json = 3;
+  optional int32 spec_id = 4;
+  map<int32, string> partition_spec_jsons = 5;
+  int32 format_version = 6;
+  TupleDomain unenforced_predicate = 7;
+  TupleDomain enforced_predicate = 8;
+  optional uint64 limit = 9;
+  repeated IcebergColumnHandle projected_columns = 10;
+  optional string name_mapping_json = 11;
+  string table_location = 12;
+  map<string, string> storage_properties = 13;
+  IcebergPinnedDataFileSet pinned_data_files = 14;
+}
+
+message TableChangesFunctionHandle {
+  SchemaTableName schema_table_name = 1;
+  string table_schema_json = 2;
+  repeated IcebergColumnHandle columns = 3;
+  optional string name_mapping_json = 4;
+  int64 start_snapshot_id = 5;
+  int64 end_snapshot_id = 6;
+}
+
+message IcebergChangeWindowHandle {
+  SchemaTableName schema_table_name = 1;
+  string table_schema_json = 2;
+  repeated IcebergColumnHandle columns = 3;
+  optional string name_mapping_json = 4;
+  int64 from_snapshot_id_exclusive = 5;
+  int64 to_snapshot_id_inclusive = 6;
+  map<int32, string> partition_spec_jsons = 7;
+}
+
+enum IcebergSystemTableType {
+  ICEBERG_SYSTEM_TABLE_TYPE_UNSPECIFIED = 0;
+  ICEBERG_SYSTEM_TABLE_TYPE_FILES = 1;
+  ICEBERG_SYSTEM_TABLE_TYPE_ENTRIES = 2;
+  ICEBERG_SYSTEM_TABLE_TYPE_SNAPSHOTS = 3;
+  ICEBERG_SYSTEM_TABLE_TYPE_HISTORY = 4;
+  ICEBERG_SYSTEM_TABLE_TYPE_REFS = 5;
+  ICEBERG_SYSTEM_TABLE_TYPE_MANIFESTS = 6;
+  ICEBERG_SYSTEM_TABLE_TYPE_PARTITIONS = 7;
+}
+
+message IcebergSystemTableReference {
+  SchemaTableName schema_table_name = 1;
+  IcebergSystemTableType system_table_type = 2;
+  string metadata_file_location = 3;
+  string table_uuid = 4;
+  optional int64 snapshot_id = 5;
+}
+
+enum IcebergProcedureId {
+  ICEBERG_PROCEDURE_ID_UNSPECIFIED = 0;
+  ICEBERG_PROCEDURE_ID_OPTIMIZE = 1;
+  ICEBERG_PROCEDURE_ID_OPTIMIZE_MANIFESTS = 2;
+  ICEBERG_PROCEDURE_ID_DROP_EXTENDED_STATS = 3;
+  ICEBERG_PROCEDURE_ID_ROLLBACK_TO_SNAPSHOT = 4;
+  ICEBERG_PROCEDURE_ID_EXPIRE_SNAPSHOTS = 5;
+  ICEBERG_PROCEDURE_ID_REMOVE_ORPHAN_FILES = 6;
+  ICEBERG_PROCEDURE_ID_ADD_FILES = 7;
+  ICEBERG_PROCEDURE_ID_ADD_FILES_FROM_TABLE = 8;
+  ICEBERG_PROCEDURE_ID_REWRITE_POSITION_DELETE_FILES = 9;
+}
+
+message IcebergOptimizeHandle {
+  IcebergTableHandle table_handle = 1;
+  uint64 min_file_size_bytes = 2;
+}
+
+message IcebergRewriteArtifactContentId {
+  string artifact_location = 1;
+  string artifact_digest_hex = 2;
+}
+
+message IcebergRewritePositionDeleteFilesHandle {
+  IcebergTableHandle table_handle = 1;
+  IcebergRewriteArtifactContentId artifact = 2;
+  string group_digest_hex = 3;
+}
+
+message IcebergTableExecuteHandle {
+  SchemaTableName schema_table_name = 1;
+  IcebergProcedureId procedure_id = 2;
+  string table_location = 3;
+  oneof procedure_handle {
+    IcebergOptimizeHandle optimize = 10;
+    IcebergRewritePositionDeleteFilesHandle rewrite_position_delete_files = 11;
+  }
+}
+
+message IcebergInsertTableHandle {
+  SchemaTableName schema_table_name = 1;
+  string table_schema_json = 2;
+  string table_location = 3;
+  int32 format_version = 4;
+  optional int32 spec_id = 5;
+}
+
+message IcebergMergeTableHandle {
+  IcebergTableHandle table_handle = 1;
+  IcebergInsertTableHandle insert_table_handle = 2;
+}
+
+message IcebergReadTablePayload {
+  oneof relation {
+    IcebergTableHandle table = 10;
+    TableChangesFunctionHandle table_function = 11;
+    IcebergChangeWindowHandle change_window = 12;
+    IcebergSystemTableReference system_table = 13;
+    IcebergTableExecuteHandle table_execute = 14;
+    IcebergMergeTableHandle merge_table = 15;
+  }
+}
+
+enum IcebergFileFormat {
+  ICEBERG_FILE_FORMAT_UNSPECIFIED = 0;
+  ICEBERG_FILE_FORMAT_ORC = 1;
+  ICEBERG_FILE_FORMAT_PARQUET = 2;
+  ICEBERG_FILE_FORMAT_AVRO = 3;
+  ICEBERG_FILE_FORMAT_PUFFIN = 4;
+}
+
+enum IcebergDeleteFileContent {
+  ICEBERG_DELETE_FILE_CONTENT_UNSPECIFIED = 0;
+  ICEBERG_DELETE_FILE_CONTENT_POSITION_DELETES = 1;
+  ICEBERG_DELETE_FILE_CONTENT_EQUALITY_DELETES = 2;
+}
+
+message ParquetFileDecryptionData {
+  bytes key_metadata = 1;
+  bytes aad_prefix = 2;
+}
+
+message IcebergDeleteFile {
+  IcebergDeleteFileContent content = 1;
+  string path = 2;
+  IcebergFileFormat format = 3;
+  int64 record_count = 4;
+  int64 file_size_in_bytes = 5;
+  repeated int32 equality_field_ids = 6;
+  optional int64 row_position_lower_bound = 7;
+  optional int64 row_position_upper_bound = 8;
+  int64 data_sequence_number = 9;
+  optional int64 content_offset = 10;
+  optional int64 content_size_in_bytes = 11;
+  optional ParquetFileDecryptionData decryption_data = 12;
+  optional string referenced_data_file = 13;
+}
+
+message IcebergSplit {
+  string path = 1;
+  int64 start = 2;
+  int64 length = 3;
+  int64 file_size = 4;
+  int64 file_record_count = 5;
+  IcebergFileFormat file_format = 6;
+  int32 partition_spec_id = 7;
+  string partition_data_json = 8;
+  repeated IcebergDeleteFile deletes = 9;
+  TupleDomain file_statistics_domain = 10;
+  optional int64 data_sequence_number = 11;
+  optional int64 file_first_row_id = 12;
+  optional ParquetFileDecryptionData decryption_data = 13;
+}
+
+enum TableChangesChangeType {
+  TABLE_CHANGES_CHANGE_TYPE_UNSPECIFIED = 0;
+  TABLE_CHANGES_CHANGE_TYPE_ADDED_FILE = 1;
+  TABLE_CHANGES_CHANGE_TYPE_DELETED_FILE = 2;
+}
+
+message TableChangesSplit {
+  TableChangesChangeType change_type = 1;
+  int64 snapshot_id = 2;
+  int64 snapshot_timestamp_millis = 3;
+  int64 change_ordinal = 4;
+  string path = 5;
+  int64 start = 6;
+  int64 length = 7;
+  int64 file_size = 8;
+  int64 file_record_count = 9;
+  IcebergFileFormat file_format = 10;
+  int32 partition_spec_id = 11;
+  string partition_data_json = 12;
+  optional ParquetFileDecryptionData decryption_data = 13;
+}
+
+message IcebergAddedRows {
+  IcebergSplit data = 1;
+  repeated int64 restricted_row_ids = 2;
+}
+
+message IcebergPositionDeletedRows {
+  IcebergSplit data = 1;
+  repeated IcebergDeleteFile newly_applied_deletes = 2;
+  repeated IcebergDeleteFile previously_applied_deletes = 3;
+}
+
+message IcebergEqualityDeletedRows {
+  IcebergSplit data = 1;
+  repeated IcebergDeleteFile newly_applied_equality_deletes = 2;
+  repeated IcebergDeleteFile previously_applied_deletes = 3;
+}
+
+message IcebergDeletedDataFileRows {
+  IcebergSplit data = 1;
+  repeated IcebergDeleteFile previously_applied_deletes = 2;
+}
+
+message IcebergChangeSplit {
+  oneof rows {
+    IcebergAddedRows added_rows = 10;
+    IcebergPositionDeletedRows position_deleted_rows = 11;
+    IcebergEqualityDeletedRows equality_deleted_rows = 12;
+    IcebergDeletedDataFileRows deleted_data_file_rows = 13;
+  }
+}
+
+message TrinoManifestFile {
+  string path = 1;
+  int64 length = 2;
+  int32 partition_spec_id = 3;
+  int32 content = 4;
+  int64 sequence_number = 5;
+  int64 min_sequence_number = 6;
+  int64 added_snapshot_id = 7;
+  optional int32 added_files_count = 8;
+  optional int32 existing_files_count = 9;
+  optional int32 deleted_files_count = 10;
+  optional int64 added_rows_count = 11;
+  optional int64 existing_rows_count = 12;
+  optional int64 deleted_rows_count = 13;
+  optional int64 first_row_id = 14;
+  bytes key_metadata = 15;
+}
+
+message FilesTableSplit {
+  TrinoManifestFile manifest = 1;
+  string table_schema_json = 2;
+  string metadata_table_schema_json = 3;
+  map<int32, string> partition_spec_jsons = 4;
+  optional string partition_column_type_json = 5;
+  optional string bounds_column_type_json = 6;
+  optional string encryption_key_id = 7;
+}
+
+message IcebergRewritePositionDeleteFilesSplit {
+  string data_file_path = 1;
+  int64 data_file_size = 2;
+  int32 partition_spec_id = 3;
+  string partition_data_json = 4;
+  repeated IcebergDeleteFile selected_position_deletes = 5;
+}
+
+message IcebergReadSplitPayload {
+  oneof split {
+    IcebergSplit data = 10;
+    TableChangesSplit table_changes = 11;
+    IcebergChangeSplit change_window = 12;
+    FilesTableSplit system_files = 13;
+    IcebergRewritePositionDeleteFilesSplit rewrite_position_delete_files = 14;
+  }
+}

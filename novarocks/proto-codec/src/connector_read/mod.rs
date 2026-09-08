@@ -83,10 +83,6 @@ pub(crate) fn invalid_enum(path: FieldPath, detail: impl Into<String>) -> Protoc
     ProtocolError::new(path, ProtocolErrorKind::InvalidEnum, detail)
 }
 
-pub(crate) fn unsupported(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
-    ProtocolError::new(path, ProtocolErrorKind::Unsupported, detail)
-}
-
 pub(crate) fn bounded_text(
     value: &str,
     max_bytes: usize,
@@ -131,17 +127,6 @@ pub(crate) fn exact_bytes(
         ));
     }
     Ok(())
-}
-
-pub(crate) fn nonnegative_i64(
-    value: i64,
-    path: FieldPath,
-    label: &'static str,
-) -> Result<i64, ProtocolError> {
-    if value < 0 {
-        return Err(out_of_range(path, format!("{label} must be nonnegative")));
-    }
-    Ok(value)
 }
 
 /// Re-root a nested error under this message's path without rebuilding it.

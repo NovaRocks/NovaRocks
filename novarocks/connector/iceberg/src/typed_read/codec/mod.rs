@@ -15,34 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Iceberg's concrete implementation of the closed connector-read codec.
-//!
-//! This is the only Iceberg module that turns central-IDL read carriers into
-//! the Connector-owned runtime enums.  Ordinary metadata, split enumeration,
-//! and reader calls use those enums directly.
+//! Iceberg's adapter between public read carriers and its private wire codec.
 
 use std::sync::Arc;
 
-use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::catalog::encode_catalog_handle;
-use novarocks_proto_codec::connector_read::{
-    CatalogTableHandle, ConnectorReadCodecError, ConnectorReadDecoder, ConnectorReadEncoder,
-    ConnectorRelation, ValidatedColumnHandle, ValidatedConnectorSplit, ValidatedTransactionHandle,
-};
-use novarocks_proto_models::connector_read as dto;
-use novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime;
-use novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter;
+use bytes::Bytes;
+use novarocks_spi::connector::read_stack::adapter::{ProviderReadRuntime, ReadRuntimeAdapter};
 use novarocks_spi::connector::read_stack::{
-    ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadSplit,
+    ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadSplit, ConnectorReadSplitFacts,
     ConnectorReadTransactionHandle,
 };
-
-use super::{
-    FilesTableSplit, HiveTransactionHandle, IcebergChangeSplit, IcebergChangeWindowHandle,
-    IcebergColumnHandle, IcebergMergeTableHandle, IcebergReadSplit,
-    IcebergRewritePositionDeleteFilesSplit, IcebergRuntimeRelation, IcebergSystemTableReference,
-    IcebergTableExecuteHandle, IcebergTableHandle, TableChangesFunctionHandle, TableChangesSplit,
+use novarocks_spi::connector::{
+    ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
+    ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload,
+    ConnectorEnvelopeHeader, ConnectorFieldPath, ConnectorReadRelationPayload,
+    ConnectorReadSplitCategory, ConnectorReadSplitPayload, ConnectorReadWireDecoder,
+    ConnectorReadWireEncoder,
 };
+
+use crate::provider_types::{IcebergReadTypes, IcebergReadView};
+
+use super::{HiveTransactionHandle, IcebergColumnHandle, IcebergReadSplit, IcebergRuntimeRelation};
+
+pub(crate) const ICEBERG_READ_CODEC_REVISION: u32 = 1;
+const MAX_PRIVATE_READ_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PRIVATE_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct IcebergConnectorReadWireAdapter<P>
@@ -74,56 +71,84 @@ where
         }
     }
 
-    fn invalid(&self, path: FieldPath, error: impl std::fmt::Display) -> ConnectorReadCodecError {
-        ConnectorReadCodecError::invalid(&self.owner, path, error.to_string())
+    fn invalid(&self, path: ConnectorFieldPath, detail: impl AsRef<str>) -> ConnectorCodecError {
+        ConnectorCodecError::new(path, ConnectorCodecErrorKind::InvalidValue, detail)
     }
 
-    fn ensure_outer_relation(
+    fn inconsistent(
         &self,
-        relation: &CatalogTableHandle,
-    ) -> Result<(), ConnectorReadCodecError> {
+        path: ConnectorFieldPath,
+        detail: impl AsRef<str>,
+    ) -> ConnectorCodecError {
+        ConnectorCodecError::new(path, ConnectorCodecErrorKind::InconsistentFields, detail)
+    }
+
+    fn private_rejection(&self, error: ConnectorCodecError) -> ConnectorCodecError {
+        ConnectorCodecError::new(
+            ConnectorFieldPath::root("provider_payload"),
+            error.kind(),
+            format!("{}: {}", error.path(), error.detail()),
+        )
+    }
+
+    fn revision() -> ConnectorCodecRevision {
+        ConnectorCodecRevision::try_new(ICEBERG_READ_CODEC_REVISION)
+            .expect("Iceberg read codec revision is non-zero")
+    }
+
+    fn header(&self, category: ConnectorCodecCategory) -> ConnectorEnvelopeHeader {
         let binding = self.adapter.binding();
-        if relation.catalog_handle().catalog_name() != binding.catalog_handle().catalog_name() {
-            return Err(self.invalid(
-                FieldPath::root("catalog_table_handle")
-                    .field("catalog_handle")
-                    .field("catalog_name"),
-                "iceberg catalog table handle names another catalog",
-            ));
-        }
-        if relation.catalog_handle() != binding.catalog_handle() {
-            return Err(self.invalid(
-                FieldPath::root("catalog_table_handle").field("catalog_handle"),
-                "iceberg catalog table handle names another catalog version",
-            ));
-        }
-        Ok(())
+        ConnectorEnvelopeHeader::new(
+            binding.descriptor().provider_id.clone(),
+            binding.catalog_handle().clone(),
+            category,
+            Self::revision(),
+        )
     }
 
-    fn decode_transaction_value(
+    fn envelope(
         &self,
-        transaction: &dto::ConnectorTransactionHandle,
-    ) -> Result<HiveTransactionHandle, ConnectorReadCodecError> {
-        HiveTransactionHandle::from_transaction_handle_proto(transaction)
-            .map_err(|error| self.invalid(FieldPath::root("transaction"), error))
+        category: ConnectorCodecCategory,
+        payload: Bytes,
+    ) -> ConnectorEncodedPayload {
+        ConnectorEncodedPayload::new(self.header(category), payload)
     }
 
-    fn encode_outer_relation(
+    fn decode_limits() -> ConnectorDecodeLimits {
+        ConnectorDecodeLimits::try_new(
+            MAX_PRIVATE_READ_BYTES,
+            MAX_PRIVATE_RETAINED_BYTES,
+            MAX_PRIVATE_READ_BYTES,
+            1_000_000,
+            64,
+        )
+        .expect("Iceberg read decode limits are finite and non-zero")
+    }
+
+    fn decode_private<T>(
         &self,
-        transaction: &HiveTransactionHandle,
-        relation: dto::catalog_table_handle::Relation,
-    ) -> dto::CatalogTableHandle {
-        dto::CatalogTableHandle {
-            catalog_handle: Some(encode_catalog_handle(
-                self.adapter.binding().catalog_handle(),
-            )),
-            transaction: Some(transaction.to_transaction_handle_proto()),
-            relation: Some(relation),
-        }
+        payload: &ConnectorEncodedPayload,
+        category: ConnectorCodecCategory,
+        decode: impl FnOnce(&[u8], &mut ConnectorDecodeContext<'_>) -> Result<T, ConnectorCodecError>,
+    ) -> Result<T, ConnectorCodecError> {
+        let header = self.header(category);
+        payload
+            .header()
+            .validate_expected(
+                header.provider_id(),
+                header.catalog(),
+                header.category(),
+                header.codec_revision(),
+            )
+            .map_err(|error| self.private_rejection(error))?;
+        let mut ledger = ConnectorDecodeLedger::new(Self::decode_limits());
+        let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+        decode(payload.payload().as_ref(), &mut context)
+            .map_err(|error| self.private_rejection(error))
     }
 }
 
-impl<P> ConnectorReadDecoder for IcebergConnectorReadWireAdapter<P>
+impl<P> ConnectorReadWireDecoder for IcebergConnectorReadWireAdapter<P>
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
@@ -136,111 +161,81 @@ where
         &self.owner
     }
 
-    fn decode_relation(
+    fn decode_relation_payload(
         &self,
-        relation: &CatalogTableHandle,
-    ) -> Result<ConnectorReadRelation, ConnectorReadCodecError> {
-        self.ensure_outer_relation(relation)?;
-        let transaction = relation.transaction();
-        let _transaction = self.decode_transaction_value(transaction)?;
-        let table = match relation.relation() {
-            ConnectorRelation::Table(value) => IcebergRuntimeRelation::Table(
-                IcebergTableHandle::from_table_handle_proto(value).map_err(|error| {
-                    self.invalid(FieldPath::root("catalog_table_handle"), error)
-                })?,
-            ),
-            ConnectorRelation::TableFunction(value) => IcebergRuntimeRelation::TableFunction(
-                TableChangesFunctionHandle::from_table_function_handle_proto(value).map_err(
-                    |error| self.invalid(FieldPath::root("catalog_table_handle"), error),
-                )?,
-            ),
-            ConnectorRelation::ChangeWindow(value) => IcebergRuntimeRelation::ChangeWindow(
-                IcebergChangeWindowHandle::from_change_window_handle_proto(value).map_err(
-                    |error| self.invalid(FieldPath::root("catalog_table_handle"), error),
-                )?,
-            ),
-            ConnectorRelation::SystemTable(value) => IcebergRuntimeRelation::SystemTable(
-                IcebergSystemTableReference::from_system_table_reference_proto(value).map_err(
-                    |error| self.invalid(FieldPath::root("catalog_table_handle"), error),
-                )?,
-            ),
-            ConnectorRelation::TableExecute(value) => IcebergRuntimeRelation::TableExecute(
-                IcebergTableExecuteHandle::from_table_execute_handle_proto(value).map_err(
-                    |error| self.invalid(FieldPath::root("catalog_table_handle"), error),
-                )?,
-            ),
-            ConnectorRelation::MergeTable(value) => IcebergRuntimeRelation::MergeTable(
-                IcebergMergeTableHandle::from_merge_table_handle_proto(value).map_err(|error| {
-                    self.invalid(FieldPath::root("catalog_table_handle"), error)
-                })?,
-            ),
-        };
-        let kind = table.kind();
-        let wrapped = self.adapter.wrap_table(table);
-        self.adapter
-            .relation(kind, wrapped)
-            .map_err(|error| self.invalid(FieldPath::root("catalog_table_handle"), error))
+        relation: &ConnectorReadRelationPayload,
+    ) -> Result<ConnectorReadRelation, ConnectorCodecError> {
+        let view = self.decode_private(
+            relation.view(),
+            ConnectorCodecCategory::ReadView,
+            |payload, context| IcebergReadTypes::wire_codecs().decode_read_view(payload, context),
+        )?;
+        let table = self.decode_private(
+            relation.table(),
+            ConnectorCodecCategory::ReadTable,
+            |payload, context| IcebergReadTypes::wire_codecs().decode_table(payload, context),
+        )?;
+        let public_kind = relation.kind();
+        if table.kind() != public_kind {
+            return Err(self.inconsistent(
+                ConnectorFieldPath::root("catalog_table_handle").field("relation"),
+                "public relation category does not match the Iceberg private table payload",
+            ));
+        }
+        Ok(ConnectorReadRelation::new(
+            public_kind,
+            self.adapter.wrap_table(table),
+            self.adapter.wrap_transaction(view.transaction().clone()),
+        ))
     }
 
-    fn decode_column(
+    fn decode_column_payload(
         &self,
-        column: &ValidatedColumnHandle,
-    ) -> Result<ConnectorReadColumnHandle, ConnectorReadCodecError> {
-        let column = IcebergColumnHandle::from_column_handle_proto(column.as_proto())
-            .map_err(|error| self.invalid(FieldPath::root("column_handle"), error))?;
+        column: &ConnectorEncodedPayload,
+    ) -> Result<ConnectorReadColumnHandle, ConnectorCodecError> {
+        let column = self.decode_private(
+            column,
+            ConnectorCodecCategory::ReadColumn,
+            |payload, context| IcebergReadTypes::wire_codecs().decode_column(payload, context),
+        )?;
         Ok(self.adapter.wrap_column(column))
     }
 
-    fn decode_transaction(
+    fn decode_transaction_payload(
         &self,
-        transaction: &ValidatedTransactionHandle,
-    ) -> Result<ConnectorReadTransactionHandle, ConnectorReadCodecError> {
-        Ok(self
-            .adapter
-            .wrap_transaction(self.decode_transaction_value(transaction.as_proto())?))
+        transaction: &ConnectorEncodedPayload,
+    ) -> Result<ConnectorReadTransactionHandle, ConnectorCodecError> {
+        let view = self.decode_private(
+            transaction,
+            ConnectorCodecCategory::ReadView,
+            |payload, context| IcebergReadTypes::wire_codecs().decode_read_view(payload, context),
+        )?;
+        Ok(self.adapter.wrap_transaction(view.transaction().clone()))
     }
 
-    fn decode_split(
+    fn decode_split_payload(
         &self,
-        split: &ValidatedConnectorSplit,
-    ) -> Result<ConnectorReadSplit, ConnectorReadCodecError> {
-        let split = match split.category() {
-            novarocks_proto_codec::connector_read::SplitCategory::Data => IcebergReadSplit::Data(
-                IcebergTableHandleSplit::from_connector_split_proto(split.as_proto())
-                    .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-            ),
-            novarocks_proto_codec::connector_read::SplitCategory::TableChanges => {
-                IcebergReadSplit::TableChanges(
-                    TableChangesSplit::from_connector_split_proto(split.as_proto())
-                        .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-                )
-            }
-            novarocks_proto_codec::connector_read::SplitCategory::ChangeWindow => {
-                IcebergReadSplit::ChangeWindow(
-                    IcebergChangeSplit::from_connector_split_proto(split.as_proto())
-                        .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-                )
-            }
-            novarocks_proto_codec::connector_read::SplitCategory::SystemFiles => {
-                IcebergReadSplit::SystemFiles(
-                    FilesTableSplit::from_connector_split_proto(split.as_proto())
-                        .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-                )
-            }
-            novarocks_proto_codec::connector_read::SplitCategory::RewritePositionDeleteFiles => {
-                IcebergReadSplit::RewritePositionDeleteFiles(
-                    IcebergRewritePositionDeleteFilesSplit::from_connector_split_proto(
-                        split.as_proto(),
-                    )
-                    .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-                )
-            }
-        };
-        Ok(self.adapter.wrap_split(split))
+        split: &ConnectorReadSplitPayload,
+        facts: &ConnectorReadSplitFacts,
+    ) -> Result<ConnectorReadSplit, ConnectorCodecError> {
+        let decoded = self.decode_private(
+            split.provider_payload(),
+            ConnectorCodecCategory::ReadSplit,
+            |payload, context| {
+                IcebergReadTypes::wire_codecs().decode_split(payload, facts, context)
+            },
+        )?;
+        if split_category(&decoded) != split.category() {
+            return Err(self.inconsistent(
+                ConnectorFieldPath::root("connector_split").field("category"),
+                "public split category does not match the Iceberg private split payload",
+            ));
+        }
+        Ok(self.adapter.wrap_split(decoded))
     }
 }
 
-impl<P> ConnectorReadEncoder for IcebergConnectorReadWireAdapter<P>
+impl<P> ConnectorReadWireEncoder for IcebergConnectorReadWireAdapter<P>
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
@@ -253,89 +248,103 @@ where
         &self.owner
     }
 
-    fn encode_relation(
+    fn encode_relation_payload(
         &self,
         relation: &ConnectorReadRelation,
-    ) -> Result<dto::CatalogTableHandle, ConnectorReadCodecError> {
-        let table = self
-            .adapter
-            .table(relation.table())
-            .map_err(|error| self.invalid(FieldPath::root("relation").field("table"), error))?;
+    ) -> Result<ConnectorReadRelationPayload, ConnectorCodecError> {
+        let table = self.adapter.table(relation.table()).map_err(|error| {
+            self.invalid(
+                ConnectorFieldPath::root("relation").field("table"),
+                error.to_string(),
+            )
+        })?;
         let transaction = self
             .adapter
             .transaction(relation.transaction())
             .map_err(|error| {
-                self.invalid(FieldPath::root("relation").field("transaction"), error)
+                self.invalid(
+                    ConnectorFieldPath::root("relation").field("transaction"),
+                    error.to_string(),
+                )
             })?;
-        let raw = match table {
-            IcebergRuntimeRelation::Table(value) => {
-                dto::catalog_table_handle::Relation::Table(value.to_table_handle_proto())
-            }
-            IcebergRuntimeRelation::TableFunction(value) => {
-                dto::catalog_table_handle::Relation::TableFunction(
-                    value.to_table_function_handle_proto(),
-                )
-            }
-            IcebergRuntimeRelation::ChangeWindow(value) => {
-                dto::catalog_table_handle::Relation::ChangeWindow(
-                    value.to_change_window_handle_proto(),
-                )
-            }
-            IcebergRuntimeRelation::SystemTable(value) => {
-                dto::catalog_table_handle::Relation::SystemTable(
-                    value.to_system_table_reference_proto(),
-                )
-            }
-            IcebergRuntimeRelation::TableExecute(value) => {
-                dto::catalog_table_handle::Relation::TableExecute(
-                    value.to_table_execute_handle_proto(),
-                )
-            }
-            IcebergRuntimeRelation::MergeTable(value) => {
-                dto::catalog_table_handle::Relation::MergeTable(value.to_merge_table_handle_proto())
-            }
-        };
-        Ok(self.encode_outer_relation(transaction, raw))
+        if table.kind() != relation.kind() {
+            return Err(self.inconsistent(
+                ConnectorFieldPath::root("relation").field("kind"),
+                "relation category does not match the Iceberg table handle",
+            ));
+        }
+
+        let table_bytes = IcebergReadTypes::wire_codecs()
+            .encode_table(table)
+            .map_err(|error| self.private_rejection(error))?;
+        let table_payload = self.envelope(ConnectorCodecCategory::ReadTable, table_bytes);
+        let view_bytes = IcebergReadTypes::wire_codecs()
+            .encode_read_view(&IcebergReadView::new(transaction.clone()))
+            .map_err(|error| self.private_rejection(error))?;
+        Ok(ConnectorReadRelationPayload::new(
+            relation.kind(),
+            table_payload,
+            self.envelope(ConnectorCodecCategory::ReadView, view_bytes),
+        ))
     }
 
-    fn encode_column(
+    fn encode_column_payload(
         &self,
         column: &ConnectorReadColumnHandle,
-    ) -> Result<dto::ColumnHandle, ConnectorReadCodecError> {
-        let column = self
-            .adapter
-            .column(column)
-            .map_err(|error| self.invalid(FieldPath::root("column_handle"), error))?;
-        Ok(column.to_column_handle_proto())
+    ) -> Result<ConnectorEncodedPayload, ConnectorCodecError> {
+        let column = self.adapter.column(column).map_err(|error| {
+            self.invalid(ConnectorFieldPath::root("column_handle"), error.to_string())
+        })?;
+        let bytes = IcebergReadTypes::wire_codecs()
+            .encode_column(column)
+            .map_err(|error| self.private_rejection(error))?;
+        Ok(self.envelope(ConnectorCodecCategory::ReadColumn, bytes))
     }
 
-    fn encode_transaction(
+    fn encode_transaction_payload(
         &self,
         transaction: &ConnectorReadTransactionHandle,
-    ) -> Result<dto::ConnectorTransactionHandle, ConnectorReadCodecError> {
-        let transaction = self
-            .adapter
-            .transaction(transaction)
-            .map_err(|error| self.invalid(FieldPath::root("transaction"), error))?;
-        Ok(transaction.to_transaction_handle_proto())
+    ) -> Result<ConnectorEncodedPayload, ConnectorCodecError> {
+        let transaction = self.adapter.transaction(transaction).map_err(|error| {
+            self.invalid(
+                ConnectorFieldPath::root("transaction_handle"),
+                error.to_string(),
+            )
+        })?;
+        let bytes = IcebergReadTypes::wire_codecs()
+            .encode_read_view(&IcebergReadView::new(transaction.clone()))
+            .map_err(|error| self.private_rejection(error))?;
+        Ok(self.envelope(ConnectorCodecCategory::ReadView, bytes))
     }
 
-    fn encode_split(
+    fn encode_split_payload(
         &self,
         split: &ConnectorReadSplit,
-    ) -> Result<dto::ConnectorSplit, ConnectorReadCodecError> {
-        let split = self
-            .adapter
-            .split(split)
-            .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?;
-        Ok(match split {
-            IcebergReadSplit::Data(value) => value.to_connector_split_proto(),
-            IcebergReadSplit::TableChanges(value) => value.to_connector_split_proto(),
-            IcebergReadSplit::ChangeWindow(value) => value.to_connector_split_proto(),
-            IcebergReadSplit::SystemFiles(value) => value.to_connector_split_proto(),
-            IcebergReadSplit::RewritePositionDeleteFiles(value) => value.to_connector_split_proto(),
-        })
+    ) -> Result<ConnectorReadSplitPayload, ConnectorCodecError> {
+        let value = self.adapter.split(split).map_err(|error| {
+            self.invalid(
+                ConnectorFieldPath::root("connector_split"),
+                error.to_string(),
+            )
+        })?;
+        let bytes = IcebergReadTypes::wire_codecs()
+            .encode_split(value)
+            .map_err(|error| self.private_rejection(error))?;
+        Ok(ConnectorReadSplitPayload::new(
+            split_category(value),
+            self.envelope(ConnectorCodecCategory::ReadSplit, bytes),
+        ))
     }
 }
 
-type IcebergTableHandleSplit = super::IcebergSplit;
+const fn split_category(split: &IcebergReadSplit) -> ConnectorReadSplitCategory {
+    match split {
+        IcebergReadSplit::Data(_) => ConnectorReadSplitCategory::Data,
+        IcebergReadSplit::TableChanges(_) => ConnectorReadSplitCategory::TableChanges,
+        IcebergReadSplit::ChangeWindow(_) => ConnectorReadSplitCategory::ChangeWindow,
+        IcebergReadSplit::SystemFiles(_) => ConnectorReadSplitCategory::SystemFiles,
+        IcebergReadSplit::RewritePositionDeleteFiles(_) => {
+            ConnectorReadSplitCategory::RewritePositionDeleteFiles
+        }
+    }
+}

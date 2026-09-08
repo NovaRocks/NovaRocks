@@ -39,9 +39,12 @@ SKIP_CARGO_TEST="false"
 SKIP_SYSTEM_SCENARIOS="false"
 SYSTEM_SCENARIO_BASE_CONFIG="$SCRIPT_DIR/fixtures/system-scenarios-base.toml"
 SYSTEM_SCENARIO_CLUSTER_SIZE="${NOVA_CI_SYSTEM_CLUSTER_SIZE:-3}"
-SYSTEM_SCENARIO_TIMEOUT_SECS="${NOVA_CI_SYSTEM_TIMEOUT_SECS:-300}"
+SYSTEM_SCENARIO_TIMEOUT_SECS="${NOVA_CI_SYSTEM_TIMEOUT_SECS:-900}"
 REQUESTED_SUITES=()
 CI_RUNTIME_PREPARED="false"
+PAIMON_FIXTURE_PREPARED="false"
+PAIMON_FIXTURE_DIR=""
+PAIMON_FIXTURE_RUN_ID=""
 NOVA_CI_CARGO_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}"
 SQL_CLUSTER_MODE="${SQL_CLUSTER_MODE:-cross-process}"
 if [ -n "${SQL_CLUSTER_SIZE:-}" ]; then
@@ -286,6 +289,16 @@ cleanup() {
   local status=$?
   ci_stop_all_in_one_server || true
 
+  if [ "$PAIMON_FIXTURE_PREPARED" = "true" ] && [ -n "$PAIMON_FIXTURE_DIR" ]; then
+    {
+      echo "+ docker/paimon-read/cleanup.sh --output-dir <ci-run>/paimon-fixture --env-file <runtime-env> --run-id $PAIMON_FIXTURE_RUN_ID"
+      docker/paimon-read/cleanup.sh \
+        --output-dir "$PAIMON_FIXTURE_DIR" \
+        --env-file "$NOVA_ENV_REST_ENV_FILE" \
+        --run-id "$PAIMON_FIXTURE_RUN_ID"
+    } >>"$CI_RUN_DIR/env.log" 2>&1 || true
+  fi
+
   if [ "$CI_RUNTIME_PREPARED" = "true" ] && [ "$KEEP_RUNTIME" != "true" ]; then
     {
       echo "+ docker/iceberg-rest/down.sh --runtime-only --purge"
@@ -325,12 +338,25 @@ prepare_runtime() {
     require_runtime_var NOVA_ENV_RUNTIME_DIR
     require_runtime_var NOVA_ENV_MYSQL_PORT
     require_runtime_var NOVAROCKS_ICEBERG_REST_URI
+    require_runtime_var NOVA_ENV_REST_ENV_FILE
+    PAIMON_FIXTURE_DIR="$CI_RUN_DIR/paimon-fixture"
+    PAIMON_FIXTURE_RUN_ID="ci-${CI_COMMIT_SHA:0:12}-$(basename "$CI_RUN_DIR")"
+    echo "+ docker/paimon-read/prepare.sh --env-file <runtime-env> --run-id $PAIMON_FIXTURE_RUN_ID --output-dir <ci-run>/paimon-fixture"
+    docker/paimon-read/prepare.sh \
+      --env-file "$NOVA_ENV_REST_ENV_FILE" \
+      --run-id "$PAIMON_FIXTURE_RUN_ID" \
+      --output-dir "$PAIMON_FIXTURE_DIR"
+    export NOVAROCKS_PAIMON_FIXTURE_MANIFEST="$PAIMON_FIXTURE_DIR/manifest.json"
+    export SYSTEM_SCENARIO_BASE_CONFIG="$PAIMON_FIXTURE_DIR/base-server.toml"
+    export NOVAROCKS_SQL_TEST_CONFIG="$PAIMON_FIXTURE_DIR/sql-runner.toml"
+    PAIMON_FIXTURE_PREPARED="true"
     echo "NOVAROCKS_FE_CONFIG=$NOVAROCKS_FE_CONFIG"
     echo "NOVAROCKS_BE_CONFIG=$NOVAROCKS_BE_CONFIG"
     echo "NOVAROCKS_SQL_TEST_CONFIG=$NOVAROCKS_SQL_TEST_CONFIG"
     echo "NOVA_ENV_RUNTIME_DIR=$NOVA_ENV_RUNTIME_DIR"
     echo "NOVA_ENV_MYSQL_PORT=$NOVA_ENV_MYSQL_PORT"
     echo "NOVAROCKS_ICEBERG_REST_URI=$NOVAROCKS_ICEBERG_REST_URI"
+    echo "NOVAROCKS_PAIMON_FIXTURE_MANIFEST=$NOVAROCKS_PAIMON_FIXTURE_MANIFEST"
     echo "NOVAROCKS_SPARK_DEFAULTS=${NOVAROCKS_SPARK_DEFAULTS:-}"
     echo "NOVA_CI_CARGO_PROFILE=$NOVA_CI_CARGO_PROFILE"
     echo "SQL_CLUSTER_MODE=$SQL_CLUSTER_MODE"

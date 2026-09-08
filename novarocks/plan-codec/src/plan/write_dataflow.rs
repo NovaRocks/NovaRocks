@@ -271,6 +271,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Fields};
+    use novarocks_proto_models::connector_common as common_dto;
     use novarocks_spi::connector::write_stack::{WriterAuxiliaryChannel, WriterMultiplexSchema};
     use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId};
     use novarocks_sql::plan_read::DistributedNodeKind;
@@ -291,19 +292,17 @@ mod tests {
     /// verbatim; interpreting it is the provider's job, not the encoder's.
     fn handle_for(ordinal: u32) -> write_dto::ConnectorWriterHandle {
         write_dto::ConnectorWriterHandle {
-            handle: Some(write_dto::connector_writer_handle::Handle::Iceberg(
-                write_dto::IcebergWriterHandle {
-                    branch: write_dto::IcebergWriteBranch::Data as i32,
-                    table: Some(write_dto::IcebergWriteTableFacts {
-                        table_uuid: format!("target-{ordinal}"),
-                        ..Default::default()
-                    }),
-                    output: None,
-                    data: None,
-                    old_deletes: std::collections::BTreeMap::new(),
-                    equality: None,
-                },
-            )),
+            provider_payload: Some(common_dto::ConnectorEncodedPayload {
+                header: Some(common_dto::ConnectorEnvelopeHeader {
+                    provider_id: "test-provider".to_string(),
+                    catalog: Some(novarocks_proto_codec::catalog::encode_catalog_handle(
+                        &catalog_handle(),
+                    )),
+                    category: common_dto::ConnectorPayloadCategory::WriteHandle as i32,
+                    codec_revision: 1,
+                }),
+                payload: format!("target-{ordinal}").into_bytes(),
+            }),
         }
     }
 

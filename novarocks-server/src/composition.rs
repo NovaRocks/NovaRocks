@@ -23,9 +23,6 @@ use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
 use novarocks_backend::BackendServerConfig;
-use novarocks_connector_binding::{
-    ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBindingFactory,
-};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::resources::{IcebergExecutionResources, IcebergMetadataResources};
 use novarocks_connector_iceberg::storage_inspector::{
@@ -36,8 +33,8 @@ use novarocks_connector_iceberg::storage_inspector::{
 use novarocks_connector_iceberg::{
     IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory,
 };
-use novarocks_connector_starrocks::{
-    StarRocksControlRoleBindingFactory, StarRocksExecutionRoleBindingFactory,
+use novarocks_connector_paimon::role_binding::{
+    PaimonControlRoleBindingFactory, PaimonExecutionRoleBindingFactory,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -68,9 +65,14 @@ use novarocks_spi::connector::{
     MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
     WriteCommitEvidenceLimits,
 };
+use novarocks_spi::connector::{
+    ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBindingFactory,
+};
 use novarocks_spi::state_store::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
 use novarocks_types::{ClusterRole, NativeCompatibilityId};
+
+use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergMvStorageObservationAdapter {
@@ -384,13 +386,21 @@ pub fn compose_backend_execution_role_binding_factories(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorExecutionRoleBindingFactory>>> {
-    let iceberg_resources = compose_iceberg_execution_resources(config, runtime)?;
+    // FE and BE configs own different role-local secret registries, so one
+    // deployable role cannot construct the opposite role merely to seal a
+    // combined ProviderRoleDefinition. The test below cross-validates both
+    // projections against the provider contracts used by Native admission.
+    let iceberg_resources = compose_iceberg_execution_resources(config, runtime.clone())?;
+    let paimon_access = compose_paimon_access_factory(config, runtime.clone(), ClusterRole::Be)?;
     Ok(vec![
         std::sync::Arc::new(IcebergExecutionRoleBindingFactory::new(
             iceberg_resources,
             novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget(),
         )),
-        std::sync::Arc::new(StarRocksExecutionRoleBindingFactory::new()),
+        std::sync::Arc::new(PaimonExecutionRoleBindingFactory::new(
+            paimon_access,
+            runtime,
+        )),
     ])
 }
 
@@ -755,23 +765,19 @@ pub fn compose_frontend_control_role_factories(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlRoleBindingFactory>>> {
     // Design: ADR-0132 (docs/adr/ADR-0132-provider-owned-role-binding-factories.md)
-    // Server owns FE-local resource construction; the StarRocks provider owns
-    // the role-binding factory and catalog definitions retain only an exact
-    // local-binding reference, never endpoints or credentials.
-    let starrocks_resources = config
-        .connector
-        .starrocks_role_binding_resources(ClusterRole::Fe)
-        .map_err(|error| anyhow::anyhow!("construct StarRocks FE-local bindings: {error}"))?;
+    // Server owns role-local resources and credential resolution. Providers
+    // own the complete binding factories and receive no root configuration.
     let iceberg_binding =
         compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Fe)?;
+    let paimon_access = compose_paimon_access_factory(config, runtime.clone(), ClusterRole::Fe)?;
     Ok(vec![
         std::sync::Arc::new(IcebergControlRoleBindingFactory::new(
-            IcebergMetadataResources::new(iceberg_binding, runtime),
+            IcebergMetadataResources::new(iceberg_binding, runtime.clone()),
             NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight).ok_or_else(
                 || anyhow::anyhow!("catalog materialization max inflight must be nonzero"),
             )?,
         )),
-        std::sync::Arc::new(StarRocksControlRoleBindingFactory::new(starrocks_resources)),
+        std::sync::Arc::new(PaimonControlRoleBindingFactory::new(paimon_access, runtime)),
     ])
 }
 
@@ -803,6 +809,22 @@ fn compose_iceberg_access_template(
     Ok(IcebergReadBinding::with_static_credential_resolver(
         resources, resolver,
     ))
+}
+
+fn compose_paimon_access_factory(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+    role: ClusterRole,
+) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
+    let credentials = config
+        .connector
+        .credential_registry(role)
+        .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?;
+    let resources = compose_connector_file_planning_resources(config, runtime)?;
+    Ok(std::sync::Arc::new(ServerPaimonRoleFileIoFactory::new(
+        resources,
+        credentials,
+    )))
 }
 
 pub fn compose_connector_file_planning_resources(
@@ -860,7 +882,7 @@ mod tests {
         compose_task_execution_budgets, mv_lake_target_snapshot_observation,
     };
     use novarocks_execution::task_execution::{DispatchBudget, LeaseBounds, TransportBudget};
-    use novarocks_spi::connector::CatalogProviderKind;
+    use novarocks_spi::connector::ConnectorProviderId;
     use std::time::Duration;
 
     #[test]
@@ -888,11 +910,24 @@ mod tests {
             compose_backend_execution_role_binding_factories(&config, runtime.handle().clone())
                 .expect("backend factories");
 
-        for provider in [CatalogProviderKind::Iceberg, CatalogProviderKind::StarRocks] {
+        assert_eq!(factories.len(), 2);
+        assert_eq!(factories_on_backend.len(), 2);
+
+        let native_provider_ids = crate::native_compatibility::native_carrier_declarations()
+            .expect("native provider contracts")
+            .into_iter()
+            .map(|declaration| declaration.provider_id().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(native_provider_ids, vec!["iceberg", "paimon"]);
+
+        for provider in [
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
+            ConnectorProviderId::parse("paimon").expect("static provider ID"),
+        ] {
             assert_eq!(
                 factories
                     .iter()
-                    .filter(|factory| factory.provider_kind() == provider)
+                    .filter(|factory| factory.provider_id() == provider)
                     .count(),
                 1,
                 "frontend must compose {provider:?} exactly once"
@@ -900,10 +935,16 @@ mod tests {
             assert_eq!(
                 factories_on_backend
                     .iter()
-                    .filter(|factory| factory.provider_kind() == provider)
+                    .filter(|factory| factory.provider_id() == provider)
                     .count(),
                 1,
                 "backend must compose {provider:?} exactly once"
+            );
+            assert!(
+                native_provider_ids
+                    .iter()
+                    .any(|declared| declared == provider.as_str()),
+                "role factory must be declared by the Native provider contract"
             );
         }
     }

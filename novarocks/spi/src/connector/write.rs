@@ -2541,7 +2541,7 @@ impl ConnectorWriteLease {
         })?;
         let declaration = distribution.declaration(context)?;
         let key = declaration.binding_key();
-        if declaration.provider_id() != provider_id.as_str() || key != &self.provider_binding_key {
+        if declaration.provider_id() != provider_id || key != &self.provider_binding_key {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector write declaration does not match its retained binding generation",

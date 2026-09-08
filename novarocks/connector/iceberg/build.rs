@@ -2,10 +2,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 const IDL_DIR: &str = "idl";
-const PROTO_FILES: [&str; 1] = ["common.proto"];
+const PROTO_FILES: &[&str] = &["common.proto", "read.proto", "write.proto"];
 
 fn main() {
-    for file in PROTO_FILES {
+    for file in PROTO_FILES.iter().copied() {
         println!(
             "cargo:rerun-if-changed={}",
             Path::new(IDL_DIR).join(file).display()
@@ -23,6 +23,7 @@ fn main() {
         .map(|file| Path::new(IDL_DIR).join(file))
         .collect::<Vec<_>>();
     let mut config = prost_build::Config::new();
+    config.btree_map(["."]);
     config.file_descriptor_set_path(out_dir.join("iceberg_connector_descriptor.bin"));
     config
         .compile_protos(&proto_paths, &[PathBuf::from(IDL_DIR)])

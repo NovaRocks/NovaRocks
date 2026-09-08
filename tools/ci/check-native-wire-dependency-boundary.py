@@ -33,7 +33,6 @@ from pathlib import Path
 
 MODELS = "novarocks-proto-models"
 PROTO = "novarocks-proto-codec"
-BINDING = "novarocks-connector-binding"
 SPI = "novarocks-spi"
 TYPES = "novarocks-types"
 FRONTEND = "novarocks-frontend"
@@ -65,8 +64,8 @@ FORBIDDEN_CODEC_CLOSURE = {
 # transitive closure* cannot acquire wire crates. Server is checked separately
 # for direct dependencies because it intentionally composes the FE and BE,
 # whose closures contain wire crates. StarRocks is excluded deliberately:
-# its provider-owned role-binding factory depends on the generic binding
-# contract, but it still must not gain application ownership.
+# its provider-owned role-binding factory depends on SPI, but it still must not
+# gain application ownership.
 LOWER_LAYER_ROOTS = {
     SPI,
     TYPES,
@@ -234,14 +233,14 @@ def verify_lower_layer_closures(metadata):
 def verify_starrocks_provider_boundary(metadata):
     starrocks = package_by_name(metadata, STARROCKS)
     direct = normal_dependency_names(starrocks, include_optional=False)
-    if BINDING not in direct:
-        fail(f"{STARROCKS} must directly declare normal dependency on {BINDING}")
+    if SPI not in direct:
+        fail(f"{STARROCKS} must directly declare normal dependency on {SPI}")
 
     declared_direct = normal_dependency_names(starrocks, include_optional=True)
     direct_wire = sorted(declared_direct & WIRE_PACKAGES)
     if direct_wire:
         fail(
-            f"{STARROCKS} must obtain wire packages only through {BINDING}: "
+            f"{STARROCKS} must not directly depend on wire packages: "
             + ", ".join(direct_wire)
         )
 

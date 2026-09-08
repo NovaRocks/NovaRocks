@@ -37,6 +37,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use novarocks_proto_codec::connector_write::{
+    ConnectorWriteFragmentDecoder, ConnectorWriteHandleEncoder,
+};
 use novarocks_proto_models::connector_write as write_dto;
 use novarocks_spi::connector::write_stack::{
     ConnectorPreparedWriteSet, ConnectorWriteBeginRequest, ConnectorWriteFinishRequest,
@@ -772,19 +775,18 @@ pub(crate) fn finish_write_session_for_following_terminal_action(
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use novarocks_connector_binding::ConnectorControlWriteBinding;
-    use novarocks_proto_codec::connector_write::{
-        ConnectorWriteCodecError, ConnectorWriteFragmentDecoder, ConnectorWriteHandleEncoder,
-        ValidatedCommitFragment,
-    };
+    use novarocks_proto_codec::connector_common::encode_connector_payload_message;
+    use novarocks_spi::connector::ConnectorControlWriteBinding;
     use novarocks_spi::connector::write_stack::{
         ConnectorCommitFragment, ConnectorWriterHandle, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES,
         ProviderWriteRuntime, WriteRuntimeAdapter, WriteStatisticsArtifact,
     };
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorProviderBindingKey, ConnectorProviderId,
-        ConnectorWriteControl as LegacyWriteControl, CredentialLeaseId, ResolvedVendedS3Access,
+        CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+        ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorProviderId,
+        ConnectorWriteControl as LegacyWriteControl, ConnectorWriteFragmentWireDecoder,
+        ConnectorWriteHandleWireEncoder, CredentialLeaseId, ResolvedVendedS3Access,
         StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsRequiredAggregation,
         StatisticsScanColumn, StorageAccessDomainId, StorageAccessRequest,
         StorageCredentialScopePrefix,
@@ -830,7 +832,8 @@ pub(crate) mod tests {
     fn catalog_properties() -> novarocks_spi::connector::CatalogProperties {
         novarocks_spi::connector::CatalogProperties::new(
             catalog_handle(),
-            novarocks_spi::connector::CatalogProviderKind::Iceberg,
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static provider ID"),
             1,
             Vec::new(),
             Vec::new(),
@@ -847,6 +850,21 @@ pub(crate) mod tests {
             },
             catalog_handle: handle,
         }))
+    }
+
+    fn encoded_payload(
+        category: ConnectorCodecCategory,
+        payload: impl Into<bytes::Bytes>,
+    ) -> ConnectorEncodedPayload {
+        ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                ConnectorProviderId::parse("fake").expect("provider id"),
+                catalog_handle(),
+                category,
+                ConnectorCodecRevision::try_new(1).expect("codec revision"),
+            ),
+            payload.into(),
+        )
     }
 
     // ---- the session control under test ----------------------------------
@@ -978,30 +996,20 @@ pub(crate) mod tests {
         payload_bytes: usize,
     }
 
-    impl ConnectorWriteHandleEncoder for FakeEncoder {
+    impl ConnectorWriteHandleWireEncoder for FakeEncoder {
         fn owner(&self) -> &str {
             "fake"
         }
 
-        fn encode_writer_handle(
+        fn encode_writer_handle_payload(
             &self,
             _handle: &ConnectorWriterHandle,
-        ) -> Result<write_dto::ConnectorWriterHandle, ConnectorWriteCodecError> {
-            Ok(write_dto::ConnectorWriterHandle {
-                handle: Some(write_dto::connector_writer_handle::Handle::Iceberg(
-                    write_dto::IcebergWriterHandle {
-                        branch: write_dto::IcebergWriteBranch::Data as i32,
-                        table: Some(write_dto::IcebergWriteTableFacts {
-                            table_uuid: "u".repeat(self.payload_bytes),
-                            ..Default::default()
-                        }),
-                        output: None,
-                        data: None,
-                        old_deletes: std::collections::BTreeMap::new(),
-                        equality: None,
-                    },
-                )),
-            })
+        ) -> Result<ConnectorEncodedPayload, novarocks_spi::connector::ConnectorCodecError>
+        {
+            Ok(encoded_payload(
+                ConnectorCodecCategory::WriteHandle,
+                bytes::Bytes::from(vec![b'u'; self.payload_bytes]),
+            ))
         }
     }
 
@@ -1009,15 +1017,16 @@ pub(crate) mod tests {
         adapter: WriteRuntimeAdapter<FakeProvider>,
     }
 
-    impl ConnectorWriteFragmentDecoder for FakeDecoder {
+    impl ConnectorWriteFragmentWireDecoder for FakeDecoder {
         fn owner(&self) -> &str {
             "fake"
         }
 
-        fn decode_commit_fragment(
+        fn decode_commit_fragment_payload(
             &self,
-            _fragment: &ValidatedCommitFragment,
-        ) -> Result<ConnectorCommitFragment, ConnectorWriteCodecError> {
+            _fragment: &ConnectorEncodedPayload,
+        ) -> Result<ConnectorCommitFragment, novarocks_spi::connector::ConnectorCodecError>
+        {
             Ok(self.adapter.wrap_commit_fragment(FakeFragment(0)))
         }
     }
@@ -1306,36 +1315,15 @@ pub(crate) mod tests {
         accounting
     }
 
-    /// A real canonical commit fragment. The session decodes what it commits,
-    /// so a test that fed it arbitrary bytes would never reach the connector.
+    /// A canonical provider-neutral commit-fragment envelope. The fake provider
+    /// owns the private payload and the session exercises the real outer codec.
     fn fragment_bytes(path: &str) -> Vec<u8> {
         use prost::Message;
         write_dto::ConnectorCommitFragment {
-            fragment: Some(write_dto::connector_commit_fragment::Fragment::Iceberg(
-                write_dto::IcebergCommitFragment {
-                    artifact: Some(write_dto::iceberg_commit_fragment::Artifact::DataFile(
-                        write_dto::IcebergDataFileArtifact {
-                            path: path.to_string(),
-                            file_format: write_dto::IcebergFileFormat::Parquet as i32,
-                            partition: Some(write_dto::IcebergArtifactPartition {
-                                partition_path: String::new(),
-                                null_fingerprint: String::new(),
-                                partition_spec_id: 0,
-                                descriptor: Some(write_dto::IcebergPartitionDescriptor {
-                                    values: Vec::new(),
-                                }),
-                            }),
-                            metrics: Some(write_dto::IcebergArtifactMetrics {
-                                record_count: 1,
-                                file_size_in_bytes: 16,
-                                split_offsets: Vec::new(),
-                                column_stats: None,
-                            }),
-                            first_row_id: None,
-                        },
-                    )),
-                },
-            )),
+            provider_payload: Some(encode_connector_payload_message(&encoded_payload(
+                ConnectorCodecCategory::CommitFragment,
+                bytes::Bytes::copy_from_slice(path.as_bytes()),
+            ))),
         }
         .encode_to_vec()
     }
@@ -1362,35 +1350,7 @@ pub(crate) mod tests {
     /// Bytes a producer could actually emit, so a test that hands a fragment
     /// to a session exercises the real decode path rather than a stub.
     pub(crate) fn commit_fragment_bytes() -> Vec<u8> {
-        use prost::Message;
-        write_dto::ConnectorCommitFragment {
-            fragment: Some(write_dto::connector_commit_fragment::Fragment::Iceberg(
-                write_dto::IcebergCommitFragment {
-                    artifact: Some(write_dto::iceberg_commit_fragment::Artifact::DataFile(
-                        write_dto::IcebergDataFileArtifact {
-                            path: "s3://bucket/db/t/data/new.parquet".to_string(),
-                            file_format: write_dto::IcebergFileFormat::Parquet as i32,
-                            partition: Some(write_dto::IcebergArtifactPartition {
-                                partition_path: String::new(),
-                                null_fingerprint: String::new(),
-                                partition_spec_id: 0,
-                                descriptor: Some(write_dto::IcebergPartitionDescriptor {
-                                    values: Vec::new(),
-                                }),
-                            }),
-                            metrics: Some(write_dto::IcebergArtifactMetrics {
-                                record_count: 7,
-                                file_size_in_bytes: 128,
-                                split_offsets: Vec::new(),
-                                column_stats: None,
-                            }),
-                            first_row_id: None,
-                        },
-                    )),
-                },
-            )),
-        }
-        .encode_to_vec()
+        fragment_bytes("s3://bucket/db/t/data/new.parquet")
     }
 
     pub(crate) fn known_committed() -> ExternalMutationOutcome<ConnectorWriteReceipt> {
@@ -1541,39 +1501,9 @@ pub(crate) mod tests {
         assert_eq!(sealed.ordinals().collect::<Vec<_>>(), vec![0]);
 
         // 2. The backends report their fragments through the root relation.
-        //    Round-trip a real canonical fragment so the decoder is exercised
-        //    against bytes a producer could actually emit.
-        let fragment_bytes = {
-            use prost::Message;
-            write_dto::ConnectorCommitFragment {
-                fragment: Some(write_dto::connector_commit_fragment::Fragment::Iceberg(
-                    write_dto::IcebergCommitFragment {
-                        artifact: Some(write_dto::iceberg_commit_fragment::Artifact::DataFile(
-                            write_dto::IcebergDataFileArtifact {
-                                path: "s3://bucket/db/t/data/new.parquet".to_string(),
-                                file_format: write_dto::IcebergFileFormat::Parquet as i32,
-                                partition: Some(write_dto::IcebergArtifactPartition {
-                                    partition_path: String::new(),
-                                    null_fingerprint: String::new(),
-                                    partition_spec_id: 0,
-                                    descriptor: Some(write_dto::IcebergPartitionDescriptor {
-                                        values: Vec::new(),
-                                    }),
-                                }),
-                                metrics: Some(write_dto::IcebergArtifactMetrics {
-                                    record_count: 7,
-                                    file_size_in_bytes: 128,
-                                    split_offsets: Vec::new(),
-                                    column_stats: None,
-                                }),
-                                first_row_id: None,
-                            },
-                        )),
-                    },
-                )),
-            }
-            .encode_to_vec()
-        };
+        //    Round-trip a canonical outer fragment envelope so the decoder is
+        //    exercised against bytes a producer could emit.
+        let fragment_bytes = commit_fragment_bytes();
         let prepared = DecodedPreparedWriteSet::for_test(
             7,
             vec![(

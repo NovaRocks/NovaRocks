@@ -1,0 +1,371 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+CREATE NAMESPACE IF NOT EXISTS {{CATALOG}}.{{DATABASE}};
+USE {{CATALOG}}.{{DATABASE}};
+
+CREATE TABLE append_none (id INT, value STRING)
+TBLPROPERTIES (
+  'file.format' = 'parquet',
+  'file.compression' = 'uncompressed',
+  'manifest.format' = 'avro',
+  'manifest.compression' = 'null',
+  'write-only' = 'true'
+);
+INSERT INTO append_none VALUES (1, 'none-a'), (2, 'none-b');
+
+CREATE TABLE append_snappy (id INT, value STRING)
+TBLPROPERTIES (
+  'file.format' = 'parquet',
+  'file.compression' = 'snappy',
+  'manifest.format' = 'avro',
+  'manifest.compression' = 'snappy',
+  'write-only' = 'true'
+);
+INSERT INTO append_snappy VALUES (10, 'snappy');
+
+CREATE TABLE append_zstd (id INT, value STRING)
+TBLPROPERTIES (
+  'file.format' = 'parquet',
+  'file.compression' = 'zstd',
+  'manifest.format' = 'avro',
+  'manifest.compression' = 'zstd',
+  'write-only' = 'true'
+);
+INSERT INTO append_zstd VALUES (20, 'zstd');
+
+CREATE TABLE append_lz4 (id INT, value STRING)
+TBLPROPERTIES (
+  'file.format' = 'parquet',
+  'file.compression' = 'lz4_raw',
+  'manifest.format' = 'avro',
+  'manifest.compression' = 'zstd',
+  'write-only' = 'true'
+);
+INSERT INTO append_lz4 VALUES (30, 'lz4-raw');
+
+CREATE TABLE append_partitioned (part STRING, id INT, value STRING)
+PARTITIONED BY (part)
+TBLPROPERTIES (
+  'bucket' = '2',
+  'bucket-key' = 'id',
+  'file.format' = 'parquet',
+  'file.compression' = 'zstd',
+  'write-only' = 'true'
+);
+INSERT INTO append_partitioned VALUES
+  ('east', 1, 'e1'), ('east', 2, 'e2'), ('west', 3, 'w3');
+
+CREATE TABLE empty_append (id INT, value STRING)
+TBLPROPERTIES ('file.format' = 'parquet');
+
+CREATE TABLE pk_default (id INT, metric INT, note STRING)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'deduplicate',
+  'bucket' = '2',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet',
+  'file.compression' = 'zstd',
+  'write-only' = 'true'
+);
+INSERT INTO pk_default VALUES
+  (1, 20, 'old-a'), (2, 20, 'old-b'), (3, 30, 'delete-me');
+
+CREATE TABLE pk_dynamic (id INT, metric BIGINT, note STRING)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'deduplicate',
+  'bucket' = '-1',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet'
+);
+INSERT INTO pk_dynamic VALUES
+  (101, 1010, 'd101'), (102, 1020, 'd102'),
+  (103, 1030, 'd103'), (104, 1040, 'd104');
+
+CREATE TABLE pk_sequence (id INT, seq BIGINT, value STRING)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'deduplicate',
+  'sequence.field' = 'seq',
+  'bucket' = '2',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet',
+  'write-only' = 'true'
+);
+INSERT INTO pk_sequence VALUES
+  (1, 10, 'seq-10'), (2, 5, 'seq-5'), (4, 7, 'equal-first');
+
+CREATE TABLE pk_all_deleted (id INT, value STRING)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'deduplicate',
+  'bucket' = '1',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet',
+  'write-only' = 'true'
+);
+INSERT INTO pk_all_deleted VALUES (1, 'gone-a'), (2, 'gone-b');
+
+CREATE TABLE pk_composite (
+  region STRING,
+  account_id BIGINT,
+  sub_id INT,
+  balance DECIMAL(18, 2),
+  note STRING
+)
+PARTITIONED BY (region)
+TBLPROPERTIES (
+  'primary-key' = 'region,account_id,sub_id',
+  'merge-engine' = 'deduplicate',
+  'bucket' = '2',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet',
+  'write-only' = 'true'
+);
+INSERT INTO pk_composite VALUES
+  ('east', 1, 1, 10.50, 'e-1-1'),
+  ('east', 1, 2, 11.50, 'e-1-2'),
+  ('west', 2, 1, 20.50, 'w-2-1');
+
+CREATE TABLE pk_date_decimal (
+  business_date DATE,
+  amount DECIMAL(18, 2),
+  id INT,
+  value STRING
+)
+PARTITIONED BY (business_date)
+TBLPROPERTIES (
+  'primary-key' = 'business_date,amount,id',
+  'merge-engine' = 'deduplicate',
+  'bucket' = '2',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet',
+  'write-only' = 'true'
+);
+INSERT INTO pk_date_decimal VALUES
+  (DATE '2024-02-29', 10.25, 1, 'leap'),
+  (DATE '2024-03-01', -20.50, 2, 'march');
+
+CREATE TABLE pk_no_stats (id INT, value STRING)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'deduplicate',
+  'bucket' = '1',
+  'deletion-vectors.enabled' = 'false',
+  'metadata.stats-mode' = 'none',
+  'manifest.delete-file-drop-stats' = 'true',
+  'file.format' = 'parquet',
+  'write-only' = 'true'
+);
+INSERT INTO pk_no_stats VALUES (1, 'legacy-a'), (2, 'legacy-b');
+
+CREATE TABLE schema_evolution (id INT, old_name STRING, retired INT)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'deduplicate',
+  'bucket' = '1',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet',
+  'write-only' = 'true'
+);
+INSERT INTO schema_evolution VALUES (1, 'before-a', 100), (2, 'before-b', 200);
+
+CREATE TABLE type_matrix (
+  id INT,
+  c_bool BOOLEAN,
+  c_tiny TINYINT,
+  c_small SMALLINT,
+  c_int INT,
+  c_big BIGINT,
+  c_float FLOAT,
+  c_double DOUBLE,
+  c_decimal DECIMAL(38, 9),
+  c_char CHAR(4),
+  c_varchar VARCHAR(16),
+  c_binary BINARY,
+  c_date DATE,
+  c_timestamp TIMESTAMP_NTZ
+)
+TBLPROPERTIES (
+  'file.format' = 'parquet',
+  'file.compression' = 'zstd'
+);
+INSERT INTO type_matrix VALUES (
+  1, true, -128, -32768, -2147483648, -9223372036854775808,
+  CAST(1.25 AS FLOAT), CAST(-2.5 AS DOUBLE),
+  CAST(12345678901234567890123456789.123456789 AS DECIMAL(38, 9)),
+  'xy', 'varchar-value', X'00FF10', DATE '2024-02-29',
+  TIMESTAMP '2024-02-29 12:34:56.123456'
+);
+INSERT INTO type_matrix VALUES (
+  2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL, NULL
+);
+
+-- These are valid Paimon tables which exercise NovaRocks' explicit first-
+-- release rejection paths. They are never counted as supported data tables.
+CREATE TABLE unsupported_orc (id INT, value STRING)
+TBLPROPERTIES ('file.format' = 'orc');
+INSERT INTO unsupported_orc VALUES (1, 'orc');
+
+CREATE TABLE unsupported_avro_data (id INT, value STRING)
+TBLPROPERTIES ('file.format' = 'avro');
+INSERT INTO unsupported_avro_data VALUES (1, 'avro');
+
+CREATE TABLE unsupported_dv (id INT, value STRING)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'deduplicate',
+  'bucket' = '1',
+  'deletion-vectors.enabled' = 'true',
+  'file.format' = 'parquet'
+);
+INSERT INTO unsupported_dv VALUES (1, 'dv');
+
+CREATE TABLE unsupported_aggregation (id INT, metric BIGINT)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'aggregation',
+  'fields.metric.aggregate-function' = 'sum',
+  'bucket' = '1',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet'
+);
+INSERT INTO unsupported_aggregation VALUES (1, 1);
+
+CREATE TABLE unsupported_nested (id INT, values ARRAY<INT>)
+TBLPROPERTIES ('file.format' = 'parquet');
+INSERT INTO unsupported_nested VALUES (1, array(1, 2));
+
+CREATE TABLE unsupported_timestamp_ltz (id INT, ts TIMESTAMP_LTZ)
+TBLPROPERTIES ('file.format' = 'parquet');
+INSERT INTO unsupported_timestamp_ltz VALUES
+  (1, TIMESTAMP '2024-02-29 12:34:56.123456');
+
+CREATE TABLE unsupported_postpone (id INT, value STRING)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'deduplicate',
+  'bucket' = '-2',
+  'postpone.batch-write-fixed-bucket' = 'false',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet'
+);
+INSERT INTO unsupported_postpone VALUES (1, 'postpone');
+
+CREATE TABLE unsupported_multi_sequence (
+  id INT,
+  seq1 BIGINT,
+  seq2 BIGINT,
+  value STRING
+)
+TBLPROPERTIES (
+  'primary-key' = 'id',
+  'merge-engine' = 'deduplicate',
+  'sequence.field' = 'seq1,seq2',
+  'bucket' = '1',
+  'deletion-vectors.enabled' = 'false',
+  'file.format' = 'parquet'
+);
+INSERT INTO unsupported_multi_sequence VALUES (1, 1, 1, 'multi-sequence');
+
+SELECT concat('NR_ORACLE|s1|append_none|', to_json(named_struct('id', id, 'value', value)))
+FROM append_none ORDER BY id;
+SELECT concat('NR_ORACLE|s1|append_snappy|', to_json(named_struct('id', id, 'value', value)))
+FROM append_snappy ORDER BY id;
+SELECT concat('NR_ORACLE|s1|append_zstd|', to_json(named_struct('id', id, 'value', value)))
+FROM append_zstd ORDER BY id;
+SELECT concat('NR_ORACLE|s1|append_lz4|', to_json(named_struct('id', id, 'value', value)))
+FROM append_lz4 ORDER BY id;
+SELECT concat('NR_ORACLE|s1|append_partitioned|', to_json(named_struct('part', part, 'id', id, 'value', value)))
+FROM append_partitioned ORDER BY part, id;
+SELECT concat('NR_ORACLE|s1|empty_append|', to_json(named_struct('count', count(*))))
+FROM empty_append;
+SELECT concat('NR_ORACLE|s1|pk_default|', to_json(named_struct('id', id, 'metric', metric, 'note', note)))
+FROM pk_default ORDER BY id;
+SELECT concat('NR_ORACLE|s1|pk_dynamic|', to_json(named_struct('id', id, 'metric', metric, 'note', note)))
+FROM pk_dynamic ORDER BY id;
+SELECT concat('NR_ORACLE|s1|pk_sequence|', to_json(named_struct('id', id, 'seq', seq, 'value', value)))
+FROM pk_sequence ORDER BY id;
+SELECT concat('NR_ORACLE|s1|pk_composite|', to_json(named_struct('region', region, 'account_id', account_id, 'sub_id', sub_id, 'balance', balance, 'note', note)))
+FROM pk_composite ORDER BY region, account_id, sub_id;
+SELECT concat('NR_ORACLE|s1|pk_date_decimal|', to_json(named_struct('business_date', CAST(business_date AS STRING), 'amount', CAST(amount AS STRING), 'id', id, 'value', value)))
+FROM pk_date_decimal ORDER BY business_date, amount, id;
+SELECT concat('NR_ORACLE|s1|pk_all_deleted|', to_json(named_struct('id', id, 'value', value)))
+FROM pk_all_deleted ORDER BY id;
+SELECT concat('NR_ORACLE|s1|pk_no_stats|', to_json(named_struct('id', id, 'value', value)))
+FROM pk_no_stats ORDER BY id;
+SELECT concat('NR_ORACLE|s1|schema_evolution|', to_json(named_struct('id', id, 'old_name', old_name, 'retired', retired)))
+FROM schema_evolution ORDER BY id;
+SELECT concat('NR_ORACLE|s1|type_matrix|', to_json(named_struct(
+  'id', id, 'c_bool', c_bool, 'c_tiny', c_tiny, 'c_small', c_small,
+  'c_int', c_int, 'c_big', c_big,
+  'c_float', CAST(c_float AS DOUBLE), 'c_double', c_double,
+  'c_decimal', CAST(c_decimal AS STRING), 'c_char', CAST(c_char AS STRING),
+  'c_varchar', CAST(c_varchar AS STRING), 'c_binary_hex', hex(c_binary),
+  'c_date', CAST(c_date AS STRING),
+  'c_timestamp', date_format(c_timestamp, 'yyyy-MM-dd HH:mm:ss.SSSSSS')
+))) FROM type_matrix ORDER BY id;
+SELECT concat('NR_ORACLE|s1|unsupported_orc|', to_json(named_struct('id', id, 'value', value)))
+FROM unsupported_orc ORDER BY id;
+SELECT concat('NR_ORACLE|s1|unsupported_avro_data|', to_json(named_struct('id', id, 'value', value)))
+FROM unsupported_avro_data ORDER BY id;
+SELECT concat('NR_ORACLE|s1|unsupported_dv|', to_json(named_struct('id', id, 'value', value)))
+FROM unsupported_dv ORDER BY id;
+SELECT concat('NR_ORACLE|s1|unsupported_aggregation|', to_json(named_struct('id', id, 'metric', metric)))
+FROM unsupported_aggregation ORDER BY id;
+SELECT concat('NR_ORACLE|s1|unsupported_nested|', to_json(named_struct('id', id, 'values', values)))
+FROM unsupported_nested ORDER BY id;
+SELECT concat('NR_ORACLE|s1|unsupported_timestamp_ltz|', to_json(named_struct('id', id, 'ts', date_format(ts, 'yyyy-MM-dd HH:mm:ss.SSSSSS'))))
+FROM unsupported_timestamp_ltz ORDER BY id;
+SELECT concat('NR_ORACLE|s1|unsupported_postpone|', to_json(named_struct('count', count(*))))
+FROM unsupported_postpone;
+SELECT concat('NR_ORACLE|s1|unsupported_multi_sequence|', to_json(named_struct('id', id, 'seq1', seq1, 'seq2', seq2, 'value', value)))
+FROM unsupported_multi_sequence ORDER BY id;
+
+SELECT concat('NR_SNAPSHOT|s1|pk_default|', to_json(named_struct(
+  'snapshot_id', snapshot_id, 'schema_id', schema_id, 'commit_kind', commit_kind,
+  'total_record_count', total_record_count)))
+FROM `pk_default$snapshots` ORDER BY snapshot_id;
+SELECT concat('NR_SNAPSHOT|s1|pk_sequence|', to_json(named_struct(
+  'snapshot_id', snapshot_id, 'schema_id', schema_id, 'commit_kind', commit_kind,
+  'total_record_count', total_record_count)))
+FROM `pk_sequence$snapshots` ORDER BY snapshot_id;
+SELECT concat('NR_SCHEMA|s1|schema_evolution|', to_json(named_struct(
+  'schema_id', schema_id, 'fields', fields, 'partition_keys', partition_keys,
+  'primary_keys', primary_keys, 'options', options)))
+FROM `schema_evolution$schemas` ORDER BY schema_id;
+SELECT concat('NR_FILE|s1|pk_default|', to_json(named_struct(
+  'partition', CAST(partition AS STRING), 'bucket', bucket, 'file_path', file_path,
+  'file_format', file_format, 'schema_id', schema_id, 'level', level,
+  'record_count', record_count, 'file_size_in_bytes', file_size_in_bytes,
+  'min_sequence_number', min_sequence_number, 'max_sequence_number', max_sequence_number)))
+FROM `pk_default$files` ORDER BY file_path;
+SELECT concat('NR_MANIFEST|s1|append_snappy|', to_json(named_struct(
+  'file_name', file_name, 'file_size', file_size, 'num_added_files', num_added_files,
+  'num_deleted_files', num_deleted_files, 'schema_id', schema_id)))
+FROM `append_snappy$manifests` ORDER BY file_name;
+SELECT concat('NR_MANIFEST|s1|append_none|', to_json(named_struct(
+  'file_name', file_name, 'file_size', file_size, 'num_added_files', num_added_files,
+  'num_deleted_files', num_deleted_files, 'schema_id', schema_id)))
+FROM `append_none$manifests` ORDER BY file_name;
+SELECT concat('NR_MANIFEST|s1|append_zstd|', to_json(named_struct(
+  'file_name', file_name, 'file_size', file_size, 'num_added_files', num_added_files,
+  'num_deleted_files', num_deleted_files, 'schema_id', schema_id)))
+FROM `append_zstd$manifests` ORDER BY file_name;

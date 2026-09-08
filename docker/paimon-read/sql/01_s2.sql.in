@@ -1,0 +1,92 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+USE {{CATALOG}}.{{DATABASE}};
+
+INSERT INTO append_none VALUES (3, 'none-c');
+INSERT INTO append_partitioned VALUES ('east', 4, 'e4'), ('north', 5, 'n5');
+
+-- Separate commits keep the old and new values in distinct L0 files.
+INSERT INTO pk_default VALUES (1, 21, 'new-a'), (4, 40, 'new-d');
+UPDATE pk_default SET metric = 22, note = 'new-b' WHERE id = 2;
+DELETE FROM pk_default WHERE id = 3;
+
+INSERT INTO pk_dynamic VALUES (101, 1111, 'd101-new'), (105, 1050, 'd105');
+
+-- The seq=9 arrival is newer in commit order but must lose to seq=10. A
+-- later seq=11 record then becomes the visible winner.
+INSERT INTO pk_sequence VALUES
+  (1, 9, 'late-lower'), (3, 1, 'seq-1'), (4, 7, 'equal-second');
+INSERT INTO pk_sequence VALUES (1, 11, 'seq-11');
+DELETE FROM pk_sequence WHERE id = 2;
+
+DELETE FROM pk_all_deleted WHERE id IN (1, 2);
+
+INSERT INTO pk_composite VALUES
+  ('east', 1, 1, 99.75, 'e-1-1-new'),
+  ('west', 2, 2, 22.25, 'w-2-2');
+DELETE FROM pk_composite
+WHERE region = 'east' AND account_id = 1 AND sub_id = 2;
+
+INSERT INTO pk_date_decimal VALUES
+  (DATE '2024-02-29', 10.25, 1, 'leap-new'),
+  (DATE '2024-03-02', 30.75, 3, 'weekend');
+
+INSERT INTO pk_no_stats VALUES (1, 'legacy-a-new'), (3, 'legacy-c');
+DELETE FROM pk_no_stats WHERE id = 2;
+
+SELECT concat('NR_ORACLE|s2|append_none|', to_json(named_struct('id', id, 'value', value)))
+FROM append_none ORDER BY id;
+SELECT concat('NR_ORACLE|s2|append_partitioned|', to_json(named_struct('part', part, 'id', id, 'value', value)))
+FROM append_partitioned ORDER BY part, id;
+SELECT concat('NR_ORACLE|s2|pk_default|', to_json(named_struct('id', id, 'metric', metric, 'note', note)))
+FROM pk_default ORDER BY id;
+SELECT concat('NR_ORACLE|s2|pk_dynamic|', to_json(named_struct('id', id, 'metric', metric, 'note', note)))
+FROM pk_dynamic ORDER BY id;
+SELECT concat('NR_ORACLE|s2|pk_sequence|', to_json(named_struct('id', id, 'seq', seq, 'value', value)))
+FROM pk_sequence ORDER BY id;
+SELECT concat('NR_ORACLE|s2|pk_composite|', to_json(named_struct('region', region, 'account_id', account_id, 'sub_id', sub_id, 'balance', balance, 'note', note)))
+FROM pk_composite ORDER BY region, account_id, sub_id;
+SELECT concat('NR_ORACLE|s2|pk_date_decimal|', to_json(named_struct('business_date', CAST(business_date AS STRING), 'amount', CAST(amount AS STRING), 'id', id, 'value', value)))
+FROM pk_date_decimal ORDER BY business_date, amount, id;
+SELECT concat('NR_ORACLE|s2|pk_all_deleted|', to_json(named_struct('count', count(*))))
+FROM pk_all_deleted;
+SELECT concat('NR_ORACLE|s2|pk_no_stats|', to_json(named_struct('id', id, 'value', value)))
+FROM pk_no_stats ORDER BY id;
+SELECT concat('NR_ORACLE|s2|pk_default_old_value_count|', to_json(named_struct('count', count(*))))
+FROM pk_default WHERE metric = 20;
+
+SELECT concat('NR_SNAPSHOT|s2|pk_default|', to_json(named_struct(
+  'snapshot_id', snapshot_id, 'schema_id', schema_id, 'commit_kind', commit_kind,
+  'total_record_count', total_record_count)))
+FROM `pk_default$snapshots` ORDER BY snapshot_id;
+SELECT concat('NR_SNAPSHOT|s2|pk_sequence|', to_json(named_struct(
+  'snapshot_id', snapshot_id, 'schema_id', schema_id, 'commit_kind', commit_kind,
+  'total_record_count', total_record_count)))
+FROM `pk_sequence$snapshots` ORDER BY snapshot_id;
+SELECT concat('NR_FILE|s2|pk_default|', to_json(named_struct(
+  'partition', CAST(partition AS STRING), 'bucket', bucket, 'file_path', file_path,
+  'file_format', file_format, 'schema_id', schema_id, 'level', level,
+  'record_count', record_count, 'file_size_in_bytes', file_size_in_bytes,
+  'min_sequence_number', min_sequence_number, 'max_sequence_number', max_sequence_number)))
+FROM `pk_default$files` ORDER BY file_path;
+SELECT concat('NR_FILE|s2|pk_sequence|', to_json(named_struct(
+  'partition', CAST(partition AS STRING), 'bucket', bucket, 'file_path', file_path,
+  'file_format', file_format, 'schema_id', schema_id, 'level', level,
+  'record_count', record_count, 'file_size_in_bytes', file_size_in_bytes,
+  'min_sequence_number', min_sequence_number, 'max_sequence_number', max_sequence_number)))
+FROM `pk_sequence$files` ORDER BY file_path;

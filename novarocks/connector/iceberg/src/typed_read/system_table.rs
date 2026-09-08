@@ -30,10 +30,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use crate::wire::dto;
 use novarocks_proto_codec::connector_read::{
     MAX_JSON_BYTES, MAX_PATH_BYTES, MAX_SPLITS_PER_ASSIGNMENT,
 };
-use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     ConnectorSplit, ConnectorSplitBatch, ConnectorSplitSource, DynamicFilterSnapshot, HostAddress,
     SchemaTableName, SplitWeight, SystemTableDistribution,
@@ -344,14 +344,6 @@ impl IcebergSystemTableReference {
         }
     }
 
-    pub fn to_system_table_reference_proto(&self) -> dto::ConnectorSystemTableReference {
-        dto::ConnectorSystemTableReference {
-            reference: Some(dto::connector_system_table_reference::Reference::Iceberg(
-                self.to_proto(),
-            )),
-        }
-    }
-
     pub fn from_proto(raw: &dto::IcebergSystemTableReference) -> Result<Self, ConnectorError> {
         let schema_table_name = raw.schema_table_name.as_ref().ok_or_else(|| {
             invalid("iceberg system table reference requires a schema table name")
@@ -366,20 +358,6 @@ impl IcebergSystemTableReference {
             table_uuid: raw.table_uuid.clone(),
             snapshot_id: raw.snapshot_id,
         })
-    }
-
-    pub fn from_system_table_reference_proto(
-        raw: &dto::ConnectorSystemTableReference,
-    ) -> Result<Self, ConnectorError> {
-        let reference = raw
-            .reference
-            .as_ref()
-            .ok_or_else(|| invalid("connector system table reference variant must be present"))?;
-        match reference {
-            dto::connector_system_table_reference::Reference::Iceberg(iceberg) => {
-                Self::from_proto(iceberg)
-            }
-        }
     }
 }
 /// What one manifest tracks.
@@ -864,25 +842,6 @@ impl FilesTableSplit {
         }
     }
 
-    pub fn to_connector_split_proto(&self) -> dto::ConnectorSplit {
-        dto::ConnectorSplit {
-            split_weight_raw: SplitWeight::STANDARD.raw_value(),
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            // Manifests of one snapshot share no reader state, so there is
-            // nothing to co-locate.
-            affinity_key: None,
-            retained_size_in_bytes: self.retained_size_in_bytes,
-            category: Some(dto::connector_split::Category::SystemFiles(
-                dto::SystemFilesSplitCategory {
-                    provider: Some(dto::system_files_split_category::Provider::Iceberg(
-                        self.to_proto(),
-                    )),
-                },
-            )),
-        }
-    }
-
     pub fn from_proto(raw: &dto::FilesTableSplit) -> Result<Self, ConnectorError> {
         let manifest = raw
             .manifest
@@ -897,42 +856,6 @@ impl FilesTableSplit {
             bounds_column_type_json: raw.bounds_column_type_json.clone(),
             encryption_key_id: raw.encryption_key_id.clone(),
         })
-    }
-
-    pub fn from_connector_split_proto(raw: &dto::ConnectorSplit) -> Result<Self, ConnectorError> {
-        if !raw.remotely_accessible {
-            return Err(invalid(
-                "an iceberg $files split is always remotely accessible",
-            ));
-        }
-        if !raw.addresses.is_empty() {
-            return Err(invalid("an iceberg $files split names no host addresses"));
-        }
-        if raw.affinity_key.is_some() {
-            return Err(invalid("an iceberg $files split carries no affinity key"));
-        }
-        let category = raw
-            .category
-            .as_ref()
-            .ok_or_else(|| invalid("connector split category must be present"))?;
-        let system_files = match category {
-            dto::connector_split::Category::SystemFiles(system_files) => system_files,
-            dto::connector_split::Category::Data(_)
-            | dto::connector_split::Category::TableChanges(_)
-            | dto::connector_split::Category::ChangeWindow(_)
-            | dto::connector_split::Category::RewritePositionDeleteFiles(_) => {
-                return Err(invalid("connector split is not an iceberg $files split"));
-            }
-        };
-        let provider = system_files
-            .provider
-            .as_ref()
-            .ok_or_else(|| invalid("system files split provider variant must be present"))?;
-        match provider {
-            dto::system_files_split_category::Provider::Iceberg(iceberg) => {
-                Self::from_proto(iceberg)
-            }
-        }
     }
 }
 
@@ -1492,10 +1415,8 @@ mod tests {
             IcebergSystemTableType::Manifests,
         ] {
             let frozen = reference(relation);
-            let decoded = IcebergSystemTableReference::from_system_table_reference_proto(
-                &frozen.to_system_table_reference_proto(),
-            )
-            .expect("decoded reference");
+            let decoded = IcebergSystemTableReference::from_proto(&frozen.to_proto())
+                .expect("decoded reference");
             assert_eq!(decoded, frozen);
         }
 
@@ -1505,9 +1426,7 @@ mod tests {
         ]))
         .expect("source");
         for split in drain(&mut source) {
-            let decoded =
-                FilesTableSplit::from_connector_split_proto(&split.to_connector_split_proto())
-                    .expect("decoded split");
+            let decoded = FilesTableSplit::from_proto(&split.to_proto()).expect("decoded split");
             assert_eq!(decoded.manifest(), split.manifest());
             assert_eq!(decoded.table_schema_json(), split.table_schema_json());
             assert_eq!(
@@ -1521,26 +1440,6 @@ mod tests {
             );
             assert!(decoded.encryption_key_id().is_none());
         }
-    }
-
-    #[test]
-    fn a_files_split_rejects_a_foreign_split_category() {
-        let mut source =
-            FilesTableSplitSource::try_new(split_source_params(vec![manifest("m0.avro")]))
-                .expect("source");
-        let split = drain(&mut source).remove(0);
-        let mut raw = split.to_connector_split_proto();
-        raw.category = Some(dto::connector_split::Category::Data(dto::DataSplit {
-            provider: None,
-        }));
-        assert!(FilesTableSplit::from_connector_split_proto(&raw).is_err());
-
-        let mut raw = split.to_connector_split_proto();
-        raw.addresses = vec![dto::HostAddress {
-            host: "h".to_string(),
-            port: 1,
-        }];
-        assert!(FilesTableSplit::from_connector_split_proto(&raw).is_err());
     }
 
     #[test]

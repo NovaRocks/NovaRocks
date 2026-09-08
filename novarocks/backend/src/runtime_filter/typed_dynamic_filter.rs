@@ -418,11 +418,15 @@ const fn query(result: Result<bool, RuntimeFilterArtifactQueryError>) -> Option<
 fn artifact_scalar(value: &ConnectorValue) -> Option<ConnectorScalarValue> {
     match value {
         ConnectorValue::Boolean(value) => Some(ConnectorScalarValue::Boolean(*value)),
+        ConnectorValue::SmallInt(value) => Some(ConnectorScalarValue::Int16(*value)),
         ConnectorValue::Integer(value) => Some(ConnectorScalarValue::Int32(*value)),
         ConnectorValue::BigInt(value) => Some(ConnectorScalarValue::Int64(*value)),
         ConnectorValue::Date(value) => Some(ConnectorScalarValue::Date32(*value)),
         ConnectorValue::TimestampMicros(value) => {
             Some(ConnectorScalarValue::TimestampMicros(*value))
+        }
+        ConnectorValue::TimestampMillis(value) => {
+            Some(ConnectorScalarValue::TimestampMillis(*value))
         }
         ConnectorValue::TimestampNanos(value) => Some(ConnectorScalarValue::TimestampNanos(*value)),
         ConnectorValue::Varchar(value) => Some(ConnectorScalarValue::Utf8(value.to_string())),
@@ -450,6 +454,7 @@ fn artifact_arrow_type(value: &ConnectorScalarValue) -> Option<&'static DataType
     const INT32: DataType = DataType::Int32;
     const INT64: DataType = DataType::Int64;
     const DATE32: DataType = DataType::Date32;
+    const TIMESTAMP_MILLIS: DataType = DataType::Timestamp(TimeUnit::Millisecond, None);
     const TIMESTAMP_MICROS: DataType = DataType::Timestamp(TimeUnit::Microsecond, None);
     const TIMESTAMP_NANOS: DataType = DataType::Timestamp(TimeUnit::Nanosecond, None);
     const UTF8: DataType = DataType::Utf8;
@@ -460,6 +465,7 @@ fn artifact_arrow_type(value: &ConnectorScalarValue) -> Option<&'static DataType
         ConnectorScalarValue::Int32(_) => Some(&INT32),
         ConnectorScalarValue::Int64(_) => Some(&INT64),
         ConnectorScalarValue::Date32(_) => Some(&DATE32),
+        ConnectorScalarValue::TimestampMillis(_) => Some(&TIMESTAMP_MILLIS),
         ConnectorScalarValue::TimestampMicros(_) => Some(&TIMESTAMP_MICROS),
         ConnectorScalarValue::TimestampNanos(_) => Some(&TIMESTAMP_NANOS),
         ConnectorScalarValue::Utf8(_) => Some(&UTF8),
@@ -964,5 +970,23 @@ mod tests {
             subscription: RuntimeFilterSubscriptionHandle::Live(Arc::new(Live(None))),
         }
         .binding_id();
+    }
+
+    #[test]
+    fn narrow_and_millisecond_bounds_keep_their_exact_artifact_types() {
+        let small = artifact_scalar(&ConnectorValue::SmallInt(-123)).expect("smallint scalar");
+        assert_eq!(small, ConnectorScalarValue::Int16(-123));
+        assert_eq!(artifact_arrow_type(&small), Some(&DataType::Int16));
+
+        let millis = artifact_scalar(&ConnectorValue::TimestampMillis(1_704_067_200_123))
+            .expect("millisecond scalar");
+        assert_eq!(
+            millis,
+            ConnectorScalarValue::TimestampMillis(1_704_067_200_123)
+        );
+        assert_eq!(
+            artifact_arrow_type(&millis),
+            Some(&DataType::Timestamp(TimeUnit::Millisecond, None))
+        );
     }
 }

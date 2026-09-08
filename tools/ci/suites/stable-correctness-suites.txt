@@ -28,6 +28,7 @@ iceberg-ivm
 iceberg-mv-apply
 iceberg-rest
 distributed-resilience
+paimon
 materialized-view
 session
 

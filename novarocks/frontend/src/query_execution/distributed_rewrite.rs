@@ -446,8 +446,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
-        ConnectorCancellation, ConnectorControlBinding, ConnectorDistributedRewrite,
+        CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCancellation,
+        ConnectorControlBinding, ConnectorDistributedRewrite,
         ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewritePlanSummary,
         ConnectorDistributedRewritePlanningRequest, ConnectorExecutionDistribution,
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
@@ -481,7 +481,7 @@ mod tests {
     fn catalog_properties(instance: ConnectorInstanceId) -> CatalogProperties {
         CatalogProperties::new(
             CatalogHandle::new(instance, CatalogVersion::from_bytes([3; 32])),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             vec![
                 CatalogProperty::new("warehouse", "s3://rewrite-session").expect("valid warehouse"),

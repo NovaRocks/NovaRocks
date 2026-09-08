@@ -27,7 +27,18 @@ use novarocks_spi::connector::{
 };
 use prost::Message;
 
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
+
 pub fn encode_connector_payload(value: &ConnectorEncodedPayload) -> Vec<u8> {
+    encode_connector_payload_message(value).encode_to_vec()
+}
+
+/// Materialize the public protobuf envelope around provider-private bytes.
+/// Purpose-specific carriers use this helper so they never know a provider's
+/// private message type.
+pub fn encode_connector_payload_message(
+    value: &ConnectorEncodedPayload,
+) -> dto::ConnectorEncodedPayload {
     let header = value.header();
     dto::ConnectorEncodedPayload {
         header: Some(dto::ConnectorEnvelopeHeader {
@@ -41,7 +52,6 @@ pub fn encode_connector_payload(value: &ConnectorEncodedPayload) -> Vec<u8> {
         }),
         payload: value.payload().to_vec(),
     }
-    .encode_to_vec()
 }
 
 pub fn decode_connector_payload(
@@ -111,6 +121,73 @@ pub fn decode_connector_payload(
         ),
         Bytes::from(raw.payload),
     ))
+}
+
+/// Validate an envelope that has already been decoded as part of a larger
+/// protobuf carrier. Provider payload semantics remain untouched here.
+pub fn decode_connector_payload_message(
+    raw: dto::ConnectorEncodedPayload,
+    limits: ConnectorDecodeLimits,
+) -> Result<ConnectorEncodedPayload, ConnectorCodecError> {
+    let encoded = raw.encode_to_vec();
+    decode_connector_payload(&encoded, limits)
+}
+
+/// Decode one envelope embedded in a purpose-specific carrier and prove that
+/// it belongs to the category selected by that carrier. The installed binding
+/// performs the later provider/catalog/revision comparison.
+pub fn decode_embedded_connector_payload(
+    raw: Option<&dto::ConnectorEncodedPayload>,
+    expected_category: ConnectorCodecCategory,
+    max_encoded_bytes: usize,
+    path: FieldPath,
+) -> Result<ConnectorEncodedPayload, ProtocolError> {
+    let raw = raw.ok_or_else(|| {
+        ProtocolError::new(
+            path.clone(),
+            ProtocolErrorKind::MissingField,
+            "provider payload must be present",
+        )
+    })?;
+    let encoded_len = raw.encoded_len();
+    if encoded_len > max_encoded_bytes {
+        return Err(ProtocolError::new(
+            path.clone(),
+            ProtocolErrorKind::OutOfRange,
+            format!("provider payload exceeds {max_encoded_bytes} encoded bytes"),
+        ));
+    }
+    let envelope_slack = 4096usize;
+    let limit = max_encoded_bytes.max(1);
+    let limits =
+        ConnectorDecodeLimits::try_new(limit, limit.saturating_add(envelope_slack), limit, 16, 8)
+            .expect("finite embedded connector limits are valid");
+    let decoded = decode_connector_payload_message(raw.clone(), limits)
+        .map_err(|error| connector_error(path.clone(), error))?;
+    if decoded.header().category() != expected_category {
+        return Err(ProtocolError::new(
+            path.field("header"),
+            ProtocolErrorKind::InconsistentFields,
+            "connector payload category does not match its public carrier",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn connector_error(path: FieldPath, error: ConnectorCodecError) -> ProtocolError {
+    let kind = match error.kind() {
+        ConnectorCodecErrorKind::MissingField => ProtocolErrorKind::MissingField,
+        ConnectorCodecErrorKind::InvalidEnum => ProtocolErrorKind::InvalidEnum,
+        ConnectorCodecErrorKind::InvalidValue | ConnectorCodecErrorKind::UnknownField => {
+            ProtocolErrorKind::InvalidValue
+        }
+        ConnectorCodecErrorKind::DuplicateField => ProtocolErrorKind::DuplicateField,
+        ConnectorCodecErrorKind::InconsistentFields => ProtocolErrorKind::InconsistentFields,
+        ConnectorCodecErrorKind::Unsupported => ProtocolErrorKind::Unsupported,
+        ConnectorCodecErrorKind::Capacity => ProtocolErrorKind::Capacity,
+        ConnectorCodecErrorKind::VersionMismatch => ProtocolErrorKind::VersionMismatch,
+    };
+    ProtocolError::new(path, kind, error.to_string())
 }
 
 fn encode_category(category: ConnectorCodecCategory) -> i32 {

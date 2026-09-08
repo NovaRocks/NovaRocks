@@ -24,7 +24,6 @@
 
 use std::sync::Arc;
 
-use novarocks_proto_codec::connector_read::ConnectorReadDecoder;
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadFactory, ProviderReadFactoryAdapter, ProviderReadPageSourceProvider,
     ProviderReadRuntime, ProviderReadSystemTableProvider, ReadRuntimeAdapter,
@@ -34,10 +33,11 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorInstanceDescriptor,
-    ConnectorProviderId, ConnectorRequestContext,
+    ConnectorProviderId, ConnectorReadWireDecoder, ConnectorRequestContext,
 };
 
 use crate::access_binding::IcebergReadBinding;
+use crate::provider_types::IcebergReadCodecs;
 use crate::typed_read::page_source_provider::{
     IcebergPageSourceProvider, IcebergPageSourceProviderOptions,
 };
@@ -104,7 +104,7 @@ impl IcebergTypedProviderFactory {
         );
 
         let adapter = ReadRuntimeAdapter::new(Arc::new(runtime));
-        let decoder: Arc<dyn ConnectorReadDecoder> =
+        let decoder: Arc<dyn ConnectorReadWireDecoder> =
             Arc::new(IcebergConnectorReadWireAdapter::new(adapter.clone()));
         let provider_factory = Arc::new(ProviderReadFactoryAdapter::new(
             adapter,
@@ -116,6 +116,7 @@ impl IcebergTypedProviderFactory {
         Ok(IcebergExecutionReadBinding {
             provider_factory,
             decoder,
+            private_read_codecs: crate::provider_types::IcebergReadTypes::wire_codecs(),
         })
     }
 }
@@ -202,8 +203,8 @@ mod tests {
     };
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
-        ConnectorCancellation, ConnectorErrorKind, ConnectorInstanceId, ConnectorStorageResolver,
+        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCancellation,
+        ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderId, ConnectorStorageResolver,
         CredentialConsumerRole, ResolvedVendedS3Access, StorageAccessRequest,
     };
 
@@ -266,7 +267,7 @@ mod tests {
                 ConnectorInstanceId::parse("typed-vended-test").expect("catalog"),
                 CatalogVersion::from_bytes([0x27; 32]),
             ),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             vec![
                 CatalogProperty::new("aws.s3.endpoint", "http://minio:9000")
@@ -386,7 +387,8 @@ mod tests {
 
 pub struct IcebergExecutionReadBinding {
     provider_factory: Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadProviderFactory>,
-    decoder: Arc<dyn ConnectorReadDecoder>,
+    decoder: Arc<dyn ConnectorReadWireDecoder>,
+    private_read_codecs: IcebergReadCodecs,
 }
 
 impl IcebergExecutionReadBinding {
@@ -396,8 +398,14 @@ impl IcebergExecutionReadBinding {
         Arc::clone(&self.provider_factory)
     }
 
-    pub fn decoder(&self) -> Arc<dyn ConnectorReadDecoder> {
+    pub fn decoder(&self) -> Arc<dyn ConnectorReadWireDecoder> {
         Arc::clone(&self.decoder)
+    }
+
+    /// Provider-owned codec facet consumed by the UEA role adapters after the
+    /// atomic public-envelope cutover.
+    pub const fn private_read_codecs(&self) -> IcebergReadCodecs {
+        self.private_read_codecs
     }
 }
 

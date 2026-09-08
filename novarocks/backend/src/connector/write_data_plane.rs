@@ -57,6 +57,7 @@ use novarocks_proto_codec::connector_write::{
 };
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::connector_write as dto;
+use novarocks_spi::connector::ConnectorWriteFragmentWireEncoder;
 use novarocks_spi::connector::write_stack::{
     ConnectorBatchWriter, ConnectorCommitFragment, ConnectorOpenWriterRequest,
     ConnectorWriteExecution, ConnectorWriterPhysicalContext, WriteTargetOrdinal,
@@ -74,14 +75,14 @@ const WRITE_EVENT_TARGET: &str = "novarocks::connector_write";
 /// bytes. It holds no decoder, so it cannot read a carrier that came from
 /// anywhere else.
 pub(crate) struct RoleBoundCommitFragmentEncoder {
-    encoder: Arc<dyn ConnectorWriteFragmentEncoder>,
+    encoder: Arc<dyn ConnectorWriteFragmentWireEncoder>,
     execution_id: QueryExecutionId,
     node_id: i32,
 }
 
 impl RoleBoundCommitFragmentEncoder {
     pub(crate) fn new(
-        encoder: Arc<dyn ConnectorWriteFragmentEncoder>,
+        encoder: Arc<dyn ConnectorWriteFragmentWireEncoder>,
         execution_id: QueryExecutionId,
         node_id: i32,
     ) -> Self {
@@ -633,7 +634,7 @@ mod tests {
     impl ProviderWriteRuntime for StubWriteRuntime {
         type CommitHandle = ();
         type WriterHandle = String;
-        type CommitFragment = dto::ConnectorCommitFragment;
+        type CommitFragment = String;
 
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
@@ -654,62 +655,60 @@ mod tests {
         adapter: WriteRuntimeAdapter<StubWriteRuntime>,
     }
 
-    impl ConnectorWriteFragmentEncoder for StubFragmentEncoder {
+    impl ConnectorWriteFragmentWireEncoder for StubFragmentEncoder {
         fn owner(&self) -> &str {
             "write_test"
         }
 
-        fn encode_commit_fragment(
+        fn encode_commit_fragment_payload(
             &self,
             fragment: &ConnectorCommitFragment,
         ) -> Result<
-            dto::ConnectorCommitFragment,
-            novarocks_proto_codec::connector_write::ConnectorWriteCodecError,
+            novarocks_spi::connector::ConnectorEncodedPayload,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
-            self.adapter
+            let value = self
+                .adapter
                 .commit_fragment(fragment)
                 .cloned()
                 .map_err(|error| {
-                    novarocks_proto_codec::connector_write::ConnectorWriteCodecError::invalid(
-                        "write_test",
-                        FieldPath::root("commit_fragment"),
+                    novarocks_spi::connector::ConnectorCodecError::new(
+                        novarocks_spi::connector::ConnectorFieldPath::root("commit_fragment"),
+                        novarocks_spi::connector::ConnectorCodecErrorKind::InvalidValue,
                         error.to_string(),
                     )
-                })
+                })?;
+            Ok(novarocks_spi::connector::ConnectorEncodedPayload::new(
+                novarocks_spi::connector::ConnectorEnvelopeHeader::new(
+                    ConnectorProviderId::parse("iceberg").expect("provider id"),
+                    catalog_handle(),
+                    novarocks_spi::connector::ConnectorCodecCategory::CommitFragment,
+                    novarocks_spi::connector::ConnectorCodecRevision::try_new(1)
+                        .expect("codec revision"),
+                ),
+                bytes::Bytes::from(value),
+            ))
         }
     }
 
-    fn stub_fragment_encoder() -> Arc<dyn ConnectorWriteFragmentEncoder> {
+    fn stub_fragment_encoder() -> Arc<dyn ConnectorWriteFragmentWireEncoder> {
         Arc::new(StubFragmentEncoder { adapter: adapter() })
     }
 
     fn data_file_fragment(path: &str) -> dto::ConnectorCommitFragment {
+        use novarocks_proto_codec::connector_common::encode_connector_payload_message;
+        let payload = novarocks_spi::connector::ConnectorEncodedPayload::new(
+            novarocks_spi::connector::ConnectorEnvelopeHeader::new(
+                ConnectorProviderId::parse("iceberg").expect("provider id"),
+                catalog_handle(),
+                novarocks_spi::connector::ConnectorCodecCategory::CommitFragment,
+                novarocks_spi::connector::ConnectorCodecRevision::try_new(1)
+                    .expect("codec revision"),
+            ),
+            bytes::Bytes::copy_from_slice(path.as_bytes()),
+        );
         dto::ConnectorCommitFragment {
-            fragment: Some(dto::connector_commit_fragment::Fragment::Iceberg(
-                dto::IcebergCommitFragment {
-                    artifact: Some(dto::iceberg_commit_fragment::Artifact::DataFile(
-                        dto::IcebergDataFileArtifact {
-                            path: path.to_string(),
-                            file_format: dto::IcebergFileFormat::Parquet as i32,
-                            partition: Some(dto::IcebergArtifactPartition {
-                                partition_path: String::new(),
-                                null_fingerprint: String::new(),
-                                partition_spec_id: 0,
-                                descriptor: Some(dto::IcebergPartitionDescriptor {
-                                    values: Vec::new(),
-                                }),
-                            }),
-                            metrics: Some(dto::IcebergArtifactMetrics {
-                                record_count: 3,
-                                file_size_in_bytes: 512,
-                                split_offsets: vec![0],
-                                column_stats: None,
-                            }),
-                            first_row_id: None,
-                        },
-                    )),
-                },
-            )),
+            provider_payload: Some(encode_connector_payload_message(&payload)),
         }
     }
 
@@ -721,7 +720,7 @@ mod tests {
     fn the_encoder_produces_the_canonical_carrier_its_validator_accepts() {
         let encoder =
             RoleBoundCommitFragmentEncoder::new(stub_fragment_encoder(), execution_id(), 11);
-        let fragment = adapter().wrap_commit_fragment(data_file_fragment("s3://b/t/a.parquet"));
+        let fragment = adapter().wrap_commit_fragment("s3://b/t/a.parquet".to_owned());
         let bytes = encoder
             .encode(target(0), &fragment)
             .expect("encode commit fragment");
@@ -757,7 +756,10 @@ mod tests {
     #[test]
     fn the_validator_rejects_a_carrier_without_a_provider_variant() {
         let validator = RootCommitFragmentCarrierValidator::new(execution_id(), 12);
-        let empty = dto::ConnectorCommitFragment { fragment: None }.encode_to_vec();
+        let empty = dto::ConnectorCommitFragment {
+            provider_payload: None,
+        }
+        .encode_to_vec();
         let error = validator
             .validate(target(0), &empty)
             .expect_err("a variantless carrier is refused");
@@ -824,9 +826,9 @@ mod tests {
         }
 
         async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
-            Ok(vec![adapter().wrap_commit_fragment(data_file_fragment(
-                "s3://b/t/a.parquet",
-            ))])
+            Ok(vec![
+                adapter().wrap_commit_fragment("s3://b/t/a.parquet".to_owned()),
+            ])
         }
 
         async fn abort(&mut self) -> Result<(), ConnectorError> {

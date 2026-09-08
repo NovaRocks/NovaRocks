@@ -51,7 +51,7 @@ use std::collections::btree_map::Entry;
 
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogHandle, CatalogNonSecretProperty, CatalogProperties,
-    CatalogProperty, CatalogProviderKind, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
+    CatalogProperty, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
     MAX_CATALOG_NON_SECRET_PROPERTIES, canonical_catalog_credential_binding_bytes,
     canonicalize_catalog_credential_bindings,
 };
@@ -363,7 +363,7 @@ impl CatalogDesiredStateEntry {
         }
 
         let config = self.config();
-        let provider_kind = catalog_provider_kind(config.provider_id())?;
+        let provider_id = config.provider_id().clone();
         let mut execution_properties = config
             .durable_properties()
             .iter()
@@ -378,14 +378,14 @@ impl CatalogDesiredStateEntry {
 
         let version = CatalogVersion::from_bytes(self.execution_definition_digest(
             mode,
-            provider_kind,
+            &provider_id,
             &execution_properties,
             &binding_bytes,
         ));
         let handle = CatalogHandle::new(config.instance_id().clone(), version);
         CatalogProperties::new(
             handle,
-            provider_kind,
+            provider_id,
             u32::from(config.config_format_version()),
             execution_properties,
             config.credential_bindings().to_vec(),
@@ -396,7 +396,7 @@ impl CatalogDesiredStateEntry {
     fn execution_definition_digest(
         &self,
         mode: CatalogDesiredStateSourceMode,
-        provider_kind: CatalogProviderKind,
+        provider_id: &ConnectorProviderId,
         execution_properties: &[CatalogProperty],
         binding_bytes: &[u8],
     ) -> [u8; 32] {
@@ -405,7 +405,7 @@ impl CatalogDesiredStateEntry {
         hasher.update(CATALOG_VERSION_DOMAIN);
         update_framed(&mut hasher, mode.as_str().as_bytes());
         update_framed(&mut hasher, config.instance_id().as_str().as_bytes());
-        update_framed(&mut hasher, provider_kind.provider_id().as_bytes());
+        update_framed(&mut hasher, provider_id.as_str().as_bytes());
         hasher.update(u32::from(config.config_format_version()).to_be_bytes());
         hasher.update((execution_properties.len() as u64).to_be_bytes());
         for property in execution_properties {
@@ -842,21 +842,6 @@ fn untrustworthy_enumeration(
 fn update_framed(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
-}
-
-fn catalog_provider_kind(
-    provider_id: &ConnectorProviderId,
-) -> Result<CatalogProviderKind, CatalogApplicationError> {
-    match provider_id.as_str() {
-        "iceberg" => Ok(CatalogProviderKind::Iceberg),
-        "starrocks" => Ok(CatalogProviderKind::StarRocks),
-        provider => Err(CatalogApplicationError::new(
-            CatalogApplicationErrorKind::InvalidRequest,
-            format!(
-                "catalog provider `{provider}` has no supported distributed catalog materialization kind"
-            ),
-        )),
-    }
 }
 
 fn projection_error(

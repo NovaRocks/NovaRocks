@@ -1058,11 +1058,31 @@ impl Drop for RegisteredPageSource {
 /// decoder tests assert what the decoder does with exactly that carrier.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::collections::BTreeMap;
-
+    use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_proto_codec::connector_read::{ConnectorReadDecoder, encode_value_type};
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::ConnectorValueType;
+
+    pub(crate) fn encoded_payload(
+        category: novarocks_spi::connector::ConnectorCodecCategory,
+        value: impl Into<bytes::Bytes>,
+    ) -> novarocks_proto_models::connector_common::ConnectorEncodedPayload {
+        encode_connector_payload_message(&novarocks_spi::connector::ConnectorEncodedPayload::new(
+            novarocks_spi::connector::ConnectorEnvelopeHeader::new(
+                novarocks_spi::connector::ConnectorProviderId::parse("fixture")
+                    .expect("provider id"),
+                novarocks_spi::connector::CatalogHandle::new(
+                    novarocks_spi::connector::ConnectorInstanceId::try_from_canonical("test.typed")
+                        .expect("instance id"),
+                    novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
+                ),
+                category,
+                novarocks_spi::connector::ConnectorCodecRevision::try_new(1)
+                    .expect("codec revision"),
+            ),
+            value.into(),
+        ))
+    }
 
     pub(crate) fn unconstrained() -> dto::TupleDomain {
         dto::TupleDomain {
@@ -1071,53 +1091,12 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn iceberg_column_handle(field_id: i32) -> dto::IcebergColumnHandle {
-        dto::IcebergColumnHandle {
-            base_column_identity: Some(dto::ColumnIdentity {
-                field_id,
-                name: format!("c{field_id}"),
-                category: dto::ColumnIdentityCategory::Primitive as i32,
-                children: Vec::new(),
-            }),
-            base_type_json: "\"long\"".to_owned(),
-            field_id_path: Vec::new(),
-            type_json: "\"long\"".to_owned(),
-            nullable: true,
-            comment: None,
-        }
-    }
-
     pub(crate) fn column_handle(field_id: i32) -> dto::ColumnHandle {
         dto::ColumnHandle {
-            handle: Some(dto::column_handle::Handle::Iceberg(iceberg_column_handle(
-                field_id,
-            ))),
-        }
-    }
-
-    pub(crate) fn schema_table_name() -> dto::SchemaTableName {
-        dto::SchemaTableName {
-            schema_name: "db".to_owned(),
-            table_name: "t".to_owned(),
-        }
-    }
-
-    pub(crate) fn iceberg_table_handle() -> dto::IcebergTableHandle {
-        dto::IcebergTableHandle {
-            schema_table_name: Some(schema_table_name()),
-            snapshot_id: Some(11),
-            table_schema_json: "{\"type\":\"struct\"}".to_owned(),
-            spec_id: Some(0),
-            partition_spec_jsons: BTreeMap::from([(0, "{\"spec-id\":0}".to_owned())]),
-            format_version: 2,
-            unenforced_predicate: Some(unconstrained()),
-            enforced_predicate: Some(unconstrained()),
-            limit: None,
-            projected_columns: vec![iceberg_column_handle(1)],
-            name_mapping_json: None,
-            pinned_data_files: None,
-            table_location: "s3://bucket/warehouse/db/t".to_owned(),
-            storage_properties: BTreeMap::new(),
+            provider_payload: Some(encoded_payload(
+                novarocks_spi::connector::ConnectorCodecCategory::ReadColumn,
+                bytes::Bytes::from(format!("column-{field_id}")),
+            )),
         }
     }
 
@@ -1128,17 +1107,16 @@ pub(crate) mod test_support {
                 version: vec![1; 32],
             }),
             transaction: Some(dto::ConnectorTransactionHandle {
-                handle: Some(dto::connector_transaction_handle::Handle::Iceberg(
-                    dto::HiveTransactionHandle {
-                        auto_commit: true,
-                        uuid: vec![2; 16],
-                    },
+                provider_payload: Some(encoded_payload(
+                    novarocks_spi::connector::ConnectorCodecCategory::ReadView,
+                    bytes::Bytes::from_static(b"transaction"),
                 )),
             }),
             relation: Some(dto::catalog_table_handle::Relation::Table(
                 dto::ConnectorTableHandle {
-                    handle: Some(dto::connector_table_handle::Handle::Iceberg(
-                        iceberg_table_handle(),
+                    provider_payload: Some(encoded_payload(
+                        novarocks_spi::connector::ConnectorCodecCategory::ReadTable,
+                        bytes::Bytes::from_static(b"table"),
                     )),
                 },
             )),
@@ -1219,16 +1197,16 @@ pub(crate) mod test_support {
         )
     }
 
-    impl ConnectorReadDecoder for FixtureCodec {
+    impl novarocks_spi::connector::ConnectorReadWireDecoder for FixtureCodec {
         fn owner(&self) -> &str {
             "fixture"
         }
-        fn decode_relation(
+        fn decode_relation_payload(
             &self,
-            _relation: &novarocks_proto_codec::connector_read::CatalogTableHandle,
+            _relation: &novarocks_spi::connector::ConnectorReadRelationPayload,
         ) -> Result<
             novarocks_spi::connector::read_stack::ConnectorReadRelation,
-            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
             let table = self.adapter.wrap_table(FixtureTable);
             self.adapter
@@ -1237,37 +1215,38 @@ pub(crate) mod test_support {
                     table,
                 )
                 .map_err(|error| {
-                    novarocks_proto_codec::connector_read::ConnectorReadCodecError::invalid(
-                        self.owner(),
-                        novarocks_proto_codec::FieldPath::root("table"),
+                    novarocks_spi::connector::ConnectorCodecError::new(
+                        novarocks_spi::connector::ConnectorFieldPath::root("table"),
+                        novarocks_spi::connector::ConnectorCodecErrorKind::InvalidValue,
                         error.to_string(),
                     )
                 })
         }
-        fn decode_column(
+        fn decode_column_payload(
             &self,
-            _: &novarocks_proto_codec::connector_read::ValidatedColumnHandle,
+            _: &novarocks_spi::connector::ConnectorEncodedPayload,
         ) -> Result<
             novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
             Ok(self.adapter.wrap_column(FixtureColumn(1)))
         }
-        fn decode_transaction(
+        fn decode_transaction_payload(
             &self,
-            _: &novarocks_proto_codec::connector_read::ValidatedTransactionHandle,
+            _: &novarocks_spi::connector::ConnectorEncodedPayload,
         ) -> Result<
             novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
-            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
             Ok(self.adapter.wrap_transaction(()))
         }
-        fn decode_split(
+        fn decode_split_payload(
             &self,
-            _: &novarocks_proto_codec::connector_read::ValidatedConnectorSplit,
+            _: &novarocks_spi::connector::ConnectorReadSplitPayload,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadSplitFacts,
         ) -> Result<
             novarocks_spi::connector::read_stack::ConnectorReadSplit,
-            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
             Ok(self.adapter.wrap_split(FixtureSplit))
         }
@@ -1465,21 +1444,10 @@ pub(crate) mod test_support {
                 affinity_key: None,
                 retained_size_in_bytes: 64,
                 category: Some(dto::connector_split::Category::Data(dto::DataSplit {
-                    provider: Some(dto::data_split::Provider::Iceberg(dto::IcebergSplit {
-                        path: format!("s3://bucket/warehouse/db/t/data-{sequence_id}.parquet"),
-                        start: 0,
-                        length: 128,
-                        file_size: 128,
-                        file_record_count: 4,
-                        file_format: dto::IcebergFileFormat::Parquet as i32,
-                        partition_spec_id: 0,
-                        partition_data_json: "{\"partitionValues\":[]}".to_owned(),
-                        deletes: Vec::new(),
-                        file_statistics_domain: Some(unconstrained()),
-                        data_sequence_number: Some(1),
-                        file_first_row_id: Some(0),
-                        decryption_data: None,
-                    })),
+                    provider_payload: Some(encoded_payload(
+                        novarocks_spi::connector::ConnectorCodecCategory::ReadSplit,
+                        bytes::Bytes::from(format!("split-{sequence_id}")),
+                    )),
                 })),
             }),
         }

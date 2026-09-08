@@ -1,0 +1,734 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::data_evolution_reader::DataEvolutionReader;
+use super::data_file_reader::DataFileReader;
+use super::format_table_read::FormatTableRead;
+use super::incremental_scan::{IncrementalPlan, IncrementalScanMode, IncrementalSplit};
+use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
+use super::read_builder::split_scan_predicates;
+use super::{ArrowRecordBatchStream, Table};
+use crate::arrow::build_target_arrow_schema;
+use crate::spec::{
+    BigIntType, CoreOptions, DataField, DataType, MergeEngine, Predicate, TinyIntType,
+    ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
+    VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
+};
+use crate::DataSplit;
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow_schema::Schema as ArrowSchema;
+use futures::StreamExt;
+use std::sync::Arc;
+
+/// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
+///
+/// Reference: [pypaimon.read.table_read.TableRead](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_read.py)
+#[derive(Debug, Clone)]
+pub struct TableRead<'a>(TableReadKind<'a>);
+
+#[derive(Debug, Clone)]
+enum TableReadKind<'a> {
+    Paimon(PaimonTableRead<'a>),
+    Format(FormatTableRead<'a>),
+}
+
+impl<'a> TableRead<'a> {
+    /// Create a new TableRead with a specific read type (projected fields).
+    pub fn new(
+        table: &'a Table,
+        read_type: Vec<DataField>,
+        data_predicates: Vec<Predicate>,
+    ) -> Self {
+        if table.is_format_table() {
+            Self::new_format(table, read_type, data_predicates, None)
+        } else {
+            Self(TableReadKind::Paimon(PaimonTableRead::new(
+                table,
+                read_type,
+                data_predicates,
+            )))
+        }
+    }
+
+    pub(crate) fn new_format(
+        table: &'a Table,
+        read_type: Vec<DataField>,
+        data_predicates: Vec<Predicate>,
+        limit: Option<usize>,
+    ) -> Self {
+        Self(TableReadKind::Format(FormatTableRead::new(
+            table,
+            read_type,
+            data_predicates,
+            limit,
+        )))
+    }
+
+    /// Schema (fields) that this read will produce.
+    pub fn read_type(&self) -> &[DataField] {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.read_type(),
+            TableReadKind::Format(read) => read.read_type(),
+        }
+    }
+
+    /// Data predicates for read-side pruning.
+    pub fn data_predicates(&self) -> &[Predicate] {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.data_predicates(),
+            TableReadKind::Format(read) => read.data_predicates(),
+        }
+    }
+
+    /// Table for this read.
+    pub fn table(&self) -> &Table {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.table(),
+            TableReadKind::Format(read) => read.table(),
+        }
+    }
+
+    /// Set a filter predicate.
+    pub fn with_filter(self, filter: Predicate) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(read.with_filter(filter))),
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read.with_filter(filter))),
+        }
+    }
+
+    /// Attach an engine-specific Parquet decoder-filter factory.
+    ///
+    /// The hook is used only by schema-identical raw reads. Callers must still
+    /// enforce the expression after the scan because an individual file may not
+    /// be able to build a decoder filter.
+    pub fn with_row_filter_factory(self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => {
+                Self(TableReadKind::Paimon(read.with_row_filter_factory(factory)))
+            }
+            TableReadKind::Format(read) => {
+                Self(TableReadKind::Format(read.with_row_filter_factory(factory)))
+            }
+        }
+    }
+
+    /// Returns an [`ArrowRecordBatchStream`].
+    pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_arrow(data_splits),
+            TableReadKind::Format(read) => read.to_arrow(data_splits),
+        }
+    }
+
+    /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
+    ///
+    /// Only [`IncrementalSplit::Data`] is supported in this release. Diff
+    /// planning/read remains unimplemented.
+    pub fn to_incremental_arrow(
+        &self,
+        plan: &IncrementalPlan,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_incremental_arrow(plan),
+            TableReadKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support incremental batch read".to_string(),
+            }),
+        }
+    }
+
+    /// Returns an audit-log [`ArrowRecordBatchStream`] for an incremental plan.
+    ///
+    /// Output schema is `rowkind` (+ optional `_SEQUENCE_NUMBER`) followed by
+    /// the projected user columns. Primary-key Delta and Changelog rows take
+    /// kinds from `_VALUE_KIND`; append-only Delta rows are `+I`. Diff remains
+    /// unsupported.
+    pub fn to_audit_log_arrow(
+        &self,
+        plan: &IncrementalPlan,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_audit_log_arrow(plan),
+            TableReadKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support audit log batch read".to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PaimonTableRead<'a> {
+    table: &'a Table,
+    read_type: Vec<DataField>,
+    data_predicates: Vec<Predicate>,
+    row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
+}
+
+impl<'a> PaimonTableRead<'a> {
+    /// Create a new TableRead with a specific read type (projected fields).
+    pub fn new(
+        table: &'a Table,
+        read_type: Vec<DataField>,
+        data_predicates: Vec<Predicate>,
+    ) -> Self {
+        Self {
+            table,
+            read_type,
+            data_predicates,
+            row_filter_factory: None,
+        }
+    }
+
+    /// Schema (fields) that this read will produce.
+    pub fn read_type(&self) -> &[DataField] {
+        &self.read_type
+    }
+
+    /// Data predicates for read-side pruning.
+    pub fn data_predicates(&self) -> &[Predicate] {
+        &self.data_predicates
+    }
+
+    /// Table for this read.
+    pub fn table(&self) -> &Table {
+        self.table
+    }
+
+    /// Set a filter predicate. Used conservatively for read-side pruning and
+    /// enforced exactly by residual filtering on append, data-evolution, and
+    /// primary-key merge read paths (see
+    /// [`ReadBuilder::with_filter`](crate::table::ReadBuilder::with_filter)
+    /// for per-format exceptions).
+    pub fn with_filter(mut self, filter: Predicate) -> Self {
+        let (_, data_predicates) = split_scan_predicates(self.table, filter);
+        // Keep the FULL data predicate (including `And`/`Or`/`Not`). Native
+        // pushdown / stats pruning skip compound nodes they cannot use, and the
+        // residual pass applies the full predicate exactly. Pruning here would
+        // drop compound predicates before the residual could enforce them.
+        self.data_predicates = data_predicates;
+        self
+    }
+
+    fn with_row_filter_factory(mut self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
+        self.row_filter_factory = Some(factory);
+        self
+    }
+
+    /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
+    pub fn to_incremental_arrow(
+        &self,
+        plan: &IncrementalPlan,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        if plan.mode() == IncrementalScanMode::Diff {
+            return Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff read not yet implemented".to_string(),
+            });
+        }
+
+        let mut data_splits = Vec::new();
+        for split in plan.splits() {
+            match split {
+                IncrementalSplit::Data(data) => data_splits.push(data.clone()),
+                IncrementalSplit::DiffPair { .. } => {
+                    return Err(crate::Error::UnexpectedError {
+                        message: "DiffPair appeared in non-Diff incremental plan".to_string(),
+                        source: None,
+                    });
+                }
+            }
+        }
+        // Delta / Changelog rows are read as-is from planned files (no full-table
+        // merge against historical base versions).
+        self.new_data_file_reader()?.read(&data_splits)
+    }
+
+    /// Returns an audit-log stream for a planned incremental scan.
+    pub fn to_audit_log_arrow(
+        &self,
+        plan: &IncrementalPlan,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        match plan.mode() {
+            IncrementalScanMode::Diff => Err(crate::Error::Unsupported {
+                message: "Batch incremental Diff audit read not yet implemented".to_string(),
+            }),
+            IncrementalScanMode::Delta => {
+                self.audit_raw_stream(plan, !self.table.schema().primary_keys().is_empty())
+            }
+            IncrementalScanMode::Changelog => self.audit_raw_stream(plan, true),
+            IncrementalScanMode::Auto => unreachable!("Auto resolved during plan()"),
+        }
+    }
+
+    fn audit_raw_stream(
+        &self,
+        plan: &IncrementalPlan,
+        has_value_kind: bool,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let data_splits = plan.data_splits();
+        let user_read_type = self.read_type.clone();
+        let include_sequence = audit_sequence_number_enabled(self.table);
+        let audit_schema = audit_schema_for_read_type(&user_read_type, include_sequence)?;
+
+        let mut read_type = user_read_type.clone();
+        if include_sequence {
+            read_type.insert(
+                0,
+                DataField::new(
+                    SEQUENCE_NUMBER_FIELD_ID,
+                    SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+                    DataType::BigInt(BigIntType::new()),
+                ),
+            );
+        }
+        if has_value_kind {
+            read_type.push(DataField::new(
+                VALUE_KIND_FIELD_ID,
+                VALUE_KIND_FIELD_NAME.to_string(),
+                DataType::TinyInt(TinyIntType::new()),
+            ));
+        }
+
+        let reader = DataFileReader::new(
+            self.table.file_io.clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema.fields().to_vec(),
+            read_type,
+            self.data_predicates.clone(),
+        )
+        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
+        let raw_stream = reader.read(&data_splits)?;
+
+        Ok(Box::pin(async_stream::try_stream! {
+            futures::pin_mut!(raw_stream);
+            while let Some(batch) = raw_stream.next().await {
+                let batch = batch?;
+                let rowkind_col: ArrayRef = if has_value_kind {
+                    let col = batch
+                        .column_by_name(VALUE_KIND_FIELD_NAME)
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: "Changelog audit read missing _VALUE_KIND column".to_string(),
+                            source: None,
+                        })?;
+                    Arc::new(rowkind_array_from_column(col)?)
+                } else {
+                    let inserts: Vec<&'static str> = (0..batch.num_rows()).map(|_| "+I").collect();
+                    Arc::new(StringArray::from(inserts))
+                };
+
+                let mut columns: Vec<ArrayRef> = vec![rowkind_col];
+                if include_sequence {
+                    let seq_col = batch
+                        .column_by_name(SEQUENCE_NUMBER_FIELD_NAME)
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: "Audit read missing _SEQUENCE_NUMBER column".to_string(),
+                            source: None,
+                        })?;
+                    columns.push(seq_col.clone());
+                }
+                for field in &user_read_type {
+                    let col = batch
+                        .column_by_name(field.name())
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!(
+                                "Audit read missing column '{}'",
+                                field.name()
+                            ),
+                            source: None,
+                        })?;
+                    columns.push(col.clone());
+                }
+                yield RecordBatch::try_new(audit_schema.clone(), columns).map_err(|e| {
+                    crate::Error::UnexpectedError {
+                        message: format!("Failed to build audit log batch: {e}"),
+                        source: Some(Box::new(e)),
+                    }
+                })?;
+            }
+        }))
+    }
+
+    /// Returns an [`ArrowRecordBatchStream`].
+    pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
+        let core_options = self.table.schema.core_options();
+        // Fail closed for a direct `TableRead` (bypassing `ReadBuilder::new_read`).
+        core_options.ensure_read_authorized()?;
+        let merge_engine = core_options.merge_engine()?;
+
+        // Route supported PK merge engines through the split-aware reader.
+        // Deduplicate may mix raw and KV splits. Partial-update and aggregation
+        // use KV reads normally, but fully materialized DV plans can read raw.
+        if has_primary_keys
+            && matches!(
+                merge_engine,
+                MergeEngine::Deduplicate | MergeEngine::PartialUpdate | MergeEngine::Aggregation
+            )
+        {
+            return self.read_pk(data_splits, &core_options);
+        }
+
+        if core_options.data_evolution_enabled() {
+            self.read_with_evolution(data_splits, &core_options)
+        } else {
+            self.read_raw(data_splits)
+        }
+    }
+
+    /// Read PK table. For `Deduplicate`, splits marked raw convertible by scan
+    /// planning (mirrors Java `DataSplit#convertToRawFiles`) use the faster
+    /// DataFileReader; the rest go through KeyValueFileReader for sort-merge
+    /// dedup. A fully materialized deletion-vector plan for `PartialUpdate` or
+    /// `Aggregation` can also be read raw because DVs already mask stale rows.
+    /// Plans that still need any per-key merge fail closed because mixing raw
+    /// and merged outputs would produce incorrect results.
+    fn read_pk(
+        &self,
+        data_splits: &[DataSplit],
+        core_options: &CoreOptions,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let merge_engine = core_options.merge_engine()?;
+        let dv_enabled = core_options.deletion_vectors_enabled();
+        if matches!(
+            merge_engine,
+            MergeEngine::PartialUpdate | MergeEngine::Aggregation
+        ) && !dv_enabled
+        {
+            return self.read_kv(data_splits, core_options);
+        }
+
+        if matches!(
+            merge_engine,
+            MergeEngine::PartialUpdate | MergeEngine::Aggregation
+        ) {
+            let merge_engine_name = match merge_engine {
+                MergeEngine::PartialUpdate => "partial-update",
+                MergeEngine::Aggregation => "aggregation",
+                _ => unreachable!("guarded by partial-update/aggregation match"),
+            };
+            if core_options.deletion_vectors_merge_on_read() {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "merge-engine={merge_engine_name} with deletion-vectors.merge-on-read=true is not supported"
+                    ),
+                });
+            }
+            if !data_splits
+                .iter()
+                .all(DataSplit::is_fully_materialized_pk_dv)
+            {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "merge-engine={merge_engine_name} with deletion vectors can only read fully materialized compacted splits"
+                    ),
+                });
+            }
+            return self.read_raw(data_splits);
+        }
+
+        // Deletion-vector tables read raw by design: stale versions of a key
+        // are masked by DVs, not merged, and KeyValueFileReader does not
+        // support DVs. Keep the plain level-0 dispatch for them.
+        let mut kv_splits = Vec::new();
+        let mut raw_splits = Vec::new();
+        for split in data_splits {
+            if pk_split_needs_merge(split, dv_enabled) {
+                kv_splits.push(split.clone());
+            } else {
+                raw_splits.push(split.clone());
+            }
+        }
+
+        if raw_splits.is_empty() {
+            return self.read_kv(&kv_splits, core_options);
+        }
+        if kv_splits.is_empty() {
+            return self.read_raw(&raw_splits);
+        }
+
+        let kv_stream = self.read_kv(&kv_splits, core_options)?;
+        let raw_stream = self.read_raw(&raw_splits)?;
+        Ok(Box::pin(futures::stream::select_all([
+            kv_stream, raw_stream,
+        ])))
+    }
+
+    /// Read splits via KeyValueFileReader (sort-merge dedup).
+    fn read_kv(
+        &self,
+        splits: &[DataSplit],
+        core_options: &CoreOptions,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let reader = KeyValueFileReader::new(
+            self.table.file_io.clone(),
+            KeyValueReadConfig {
+                table_name: self.table.identifier().full_name(),
+                table_options: self.table.schema().options().clone(),
+                schema_manager: self.table.schema_manager().clone(),
+                table_schema_id: self.table.schema().id(),
+                table_fields: self.table.schema.fields().to_vec(),
+                read_type: self.read_type().to_vec(),
+                predicates: self.data_predicates.clone(),
+                primary_keys: self.table.schema.trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine()?,
+                sequence_fields: core_options
+                    .sequence_fields()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                read_batch_size: core_options.read_batch_size()?,
+            },
+        );
+        reader.read(splits)
+    }
+
+    /// Read with data-evolution support.
+    fn read_with_evolution(
+        &self,
+        data_splits: &[DataSplit],
+        core_options: &CoreOptions,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let reader = DataEvolutionReader::new(
+            self.table.file_io.clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema.fields().to_vec(),
+            self.read_type().to_vec(),
+            self.data_predicates.clone(),
+            core_options.blob_as_descriptor(),
+            core_options.blob_descriptor_fields(),
+            core_options.blob_view_fields(),
+            core_options.blob_view_resolve_enabled(),
+            self.table.rest_env().cloned(),
+        )?
+        .with_batch_size(Some(core_options.read_batch_size()?));
+        reader.read(data_splits)
+    }
+
+    /// Read raw data files without dedup or evolution.
+    fn read_raw(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        self.new_data_file_reader()?.read(data_splits)
+    }
+
+    fn new_data_file_reader(&self) -> crate::Result<DataFileReader> {
+        let mut reader = DataFileReader::new(
+            self.table.file_io.clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema.fields().to_vec(),
+            self.read_type().to_vec(),
+            self.data_predicates.clone(),
+        )
+        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?));
+        // The engine decoder filter is safe only on the plain append/raw path.
+        // This constructor is also used by raw-convertible primary-key splits,
+        // where positional merge semantics must remain untouched.
+        if self.table.schema().primary_keys().is_empty() {
+            if let Some(factory) = &self.row_filter_factory {
+                reader = reader.with_row_filter_factory(Arc::clone(factory));
+            }
+        }
+        Ok(reader)
+    }
+}
+
+fn audit_schema_for_read_type(
+    read_type: &[DataField],
+    include_sequence: bool,
+) -> crate::Result<Arc<ArrowSchema>> {
+    let mut fields = Vec::with_capacity(read_type.len() + 2);
+    fields.push(DataField::new(
+        ROW_KIND_FIELD_ID,
+        ROW_KIND_FIELD_NAME.to_string(),
+        DataType::VarChar(crate::spec::VarCharType::string_type()),
+    ));
+    if include_sequence {
+        fields.push(DataField::new(
+            SEQUENCE_NUMBER_FIELD_ID,
+            SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+            DataType::BigInt(BigIntType::new()),
+        ));
+    }
+    fields.extend(read_type.iter().cloned());
+    build_target_arrow_schema(&fields)
+}
+
+fn audit_sequence_number_enabled(table: &Table) -> bool {
+    table
+        .schema()
+        .options()
+        .get("table-read.sequence-number.enabled")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+fn rowkind_array_from_column(column: &dyn arrow_array::Array) -> crate::Result<StringArray> {
+    let values = column
+        .as_any()
+        .downcast_ref::<arrow_array::Int8Array>()
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "AuditLogTable _VALUE_KIND column must be Int8".to_string(),
+            source: None,
+        })?;
+    let mut strings = Vec::with_capacity(values.len());
+    for idx in 0..values.len() {
+        if values.is_null(idx) {
+            return Err(crate::Error::DataInvalid {
+                message: format!("AuditLogTable _VALUE_KIND is null at row {idx}"),
+                source: None,
+            });
+        }
+        let rowkind = match values.value(idx) {
+            0 => "+I",
+            1 => "-U",
+            2 => "+U",
+            3 => "-D",
+            value => {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "AuditLogTable _VALUE_KIND has invalid value {value} at row {idx}"
+                    ),
+                    source: None,
+                });
+            }
+        };
+        strings.push(rowkind);
+    }
+    Ok(StringArray::from(strings))
+}
+
+/// Whether a primary-key split must go through the sort-merge reader.
+///
+/// Mirrors Java `PrimaryKeyTableRawFileSplitReadProvider#match`: a raw read
+/// needs the split marked raw convertible AND a known `delete_row_count` on
+/// every file. Legacy files without the stat may hide delete rows — scan
+/// planning treats the missing stat as "no deletes" for compatibility, so the
+/// read side must fall back to the merge reader, which drops them.
+///
+/// Deletion-vector tables keep the plain level-0 dispatch: stale versions are
+/// masked by DVs and KeyValueFileReader does not support DVs.
+fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
+    if dv_enabled {
+        return split.data_files().iter().any(|f| f.level == 0);
+    }
+    !split.raw_convertible()
+        || split
+            .data_files()
+            .iter()
+            .any(|f| f.delete_row_count.is_none())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{BinaryRow, DataFileMeta};
+    use crate::table::query_auth_table;
+    use crate::table::source::DataSplitBuilder;
+
+    fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size: 128,
+            row_count: 10,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count,
+            embedded_index: None,
+            first_row_id: None,
+            write_cols: None,
+            external_path: None,
+            file_source: None,
+            value_stats_cols: None,
+        }
+    }
+
+    fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
+        DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .with_raw_convertible(raw_convertible)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_pk_split_needs_merge_routing() {
+        // Raw convertible with known delete counts: raw read.
+        let raw = split(vec![file("a", 5, Some(0))], true);
+        assert!(!pk_split_needs_merge(&raw, false));
+
+        // Not raw convertible: merge read.
+        let merge = split(vec![file("a", 5, Some(0))], false);
+        assert!(pk_split_needs_merge(&merge, false));
+
+        // Raw convertible but a legacy file lacks delete_row_count: the file
+        // may hide delete rows, so it must go through the merge reader.
+        let legacy = split(vec![file("a", 5, None)], true);
+        assert!(pk_split_needs_merge(&legacy, false));
+
+        // Deletion-vector tables dispatch on level 0 only.
+        let dv_l0 = split(vec![file("a", 0, None)], false);
+        assert!(pk_split_needs_merge(&dv_l0, true));
+        let dv_compacted = split(vec![file("a", 5, None)], false);
+        assert!(!pk_split_needs_merge(&dv_compacted, true));
+    }
+
+    #[test]
+    fn test_rowkind_rejects_null_value_kind() {
+        let values = arrow_array::Int8Array::from(vec![Some(0), None]);
+        assert!(matches!(
+            rowkind_array_from_column(&values),
+            Err(crate::Error::DataInvalid { ref message, .. }) if message.contains("null at row 1")
+        ));
+    }
+
+    #[test]
+    fn test_rowkind_rejects_invalid_value_kind() {
+        let values = arrow_array::Int8Array::from(vec![4]);
+        assert!(matches!(
+            rowkind_array_from_column(&values),
+            Err(crate::Error::DataInvalid { ref message, .. })
+                if message.contains("invalid value 4 at row 0")
+        ));
+    }
+
+    #[test]
+    fn test_direct_table_read_fails_closed_when_query_auth_enabled() {
+        let table = query_auth_table();
+        // Bypass `ReadBuilder` by constructing `TableRead` directly; the `to_arrow` guard
+        // still fails closed.
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        assert!(
+            matches!(
+                read.to_arrow(&[]),
+                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
+            ),
+            "directly-constructed read of a query-auth.enabled table must fail closed"
+        );
+    }
+}

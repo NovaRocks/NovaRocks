@@ -75,7 +75,9 @@ use novarocks_execution::task_execution::operation::TaskDomainUpdate;
 use novarocks_execution::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
 };
-use novarocks_proto_codec::connector_read::{MAX_ASSIGNMENT_RETAINED_BYTES, SplitAssignment};
+use novarocks_proto_codec::connector_read::{
+    ConnectorReadDecoder, MAX_ASSIGNMENT_RETAINED_BYTES, SplitAssignment,
+};
 use novarocks_proto_models::connector_read as connector_dto;
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorStorageResolver, read_stack::ConnectorSession,
@@ -831,7 +833,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             context_options.runtime().as_ref().clone(),
             self.queries.connector_cancellation_for_execution(execution),
             Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
-            Some(typed_runtime),
+            Some(typed_runtime.clone()),
             Arc::clone(self.execution_runtime.function_catalog()),
         )
         .map_err(|error| protocol(format!("task {identity} plan is not decodable: {error}")))?;
@@ -907,6 +909,13 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             )
             .map_err(|error| {
                 resource_exhausted(format!("task {identity} could not be admitted: {error}"))
+            })?;
+        typed_runtime
+            .install_connector_resource_tracker(admission.fragment_mem_tracker())
+            .map_err(|error| {
+                internal(format!(
+                    "task {identity} could not install connector resource accounting: {error}"
+                ))
             })?;
         let context = admission
             .into_prepare_context(

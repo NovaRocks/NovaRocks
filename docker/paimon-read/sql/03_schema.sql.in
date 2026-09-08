@@ -1,0 +1,43 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+USE {{CATALOG}}.{{DATABASE}};
+ALTER TABLE schema_evolution RENAME COLUMN old_name TO name;
+ALTER TABLE schema_evolution ADD COLUMN added STRING AFTER id;
+ALTER TABLE schema_evolution ALTER COLUMN name FIRST;
+ALTER TABLE schema_evolution DROP COLUMN retired;
+INSERT INTO schema_evolution (id, name, added) VALUES
+  (1, 'after-a', 'added-a'), (3, 'after-c', 'added-c');
+
+SELECT concat('NR_ORACLE|schema|schema_evolution|', to_json(named_struct(
+  'name', name, 'id', id, 'added', added)))
+FROM schema_evolution ORDER BY id;
+
+SELECT concat('NR_SNAPSHOT|schema|schema_evolution|', to_json(named_struct(
+  'snapshot_id', snapshot_id, 'schema_id', schema_id, 'commit_kind', commit_kind,
+  'total_record_count', total_record_count)))
+FROM `schema_evolution$snapshots` ORDER BY snapshot_id;
+SELECT concat('NR_SCHEMA|schema|schema_evolution|', to_json(named_struct(
+  'schema_id', schema_id, 'fields', fields, 'partition_keys', partition_keys,
+  'primary_keys', primary_keys, 'options', options)))
+FROM `schema_evolution$schemas` ORDER BY schema_id;
+SELECT concat('NR_FILE|schema|schema_evolution|', to_json(named_struct(
+  'partition', CAST(partition AS STRING), 'bucket', bucket, 'file_path', file_path,
+  'file_format', file_format, 'schema_id', schema_id, 'level', level,
+  'record_count', record_count, 'file_size_in_bytes', file_size_in_bytes,
+  'min_sequence_number', min_sequence_number, 'max_sequence_number', max_sequence_number)))
+FROM `schema_evolution$files` ORDER BY file_path;

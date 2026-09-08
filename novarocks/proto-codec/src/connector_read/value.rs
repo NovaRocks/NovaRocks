@@ -110,6 +110,7 @@ pub fn decode_value_type(
             match simple {
                 dto::ValueTypeKind::Boolean => ConnectorValueType::Boolean,
                 dto::ValueTypeKind::TinyInt => ConnectorValueType::TinyInt,
+                dto::ValueTypeKind::SmallInt => ConnectorValueType::SmallInt,
                 dto::ValueTypeKind::Integer => ConnectorValueType::Integer,
                 dto::ValueTypeKind::BigInt => ConnectorValueType::BigInt,
                 dto::ValueTypeKind::Real => ConnectorValueType::Real,
@@ -117,6 +118,7 @@ pub fn decode_value_type(
                 dto::ValueTypeKind::Date => ConnectorValueType::Date,
                 dto::ValueTypeKind::TimeMicros => ConnectorValueType::TimeMicros,
                 dto::ValueTypeKind::TimestampMicros => ConnectorValueType::TimestampMicros,
+                dto::ValueTypeKind::TimestampMillis => ConnectorValueType::TimestampMillis,
                 dto::ValueTypeKind::TimestampTzMicros => ConnectorValueType::TimestampTzMicros,
                 dto::ValueTypeKind::TimestampNanos => ConnectorValueType::TimestampNanos,
                 dto::ValueTypeKind::TimestampTzNanos => ConnectorValueType::TimestampTzNanos,
@@ -145,6 +147,7 @@ pub fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
         ConnectorValueType::NonComparable => dto::ValueTypeKind::NonComparable,
         ConnectorValueType::Boolean => dto::ValueTypeKind::Boolean,
         ConnectorValueType::TinyInt => dto::ValueTypeKind::TinyInt,
+        ConnectorValueType::SmallInt => dto::ValueTypeKind::SmallInt,
         ConnectorValueType::Integer => dto::ValueTypeKind::Integer,
         ConnectorValueType::BigInt => dto::ValueTypeKind::BigInt,
         ConnectorValueType::Real => dto::ValueTypeKind::Real,
@@ -157,6 +160,7 @@ pub fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
         ConnectorValueType::Date => dto::ValueTypeKind::Date,
         ConnectorValueType::TimeMicros => dto::ValueTypeKind::TimeMicros,
         ConnectorValueType::TimestampMicros => dto::ValueTypeKind::TimestampMicros,
+        ConnectorValueType::TimestampMillis => dto::ValueTypeKind::TimestampMillis,
         ConnectorValueType::TimestampTzMicros => dto::ValueTypeKind::TimestampTzMicros,
         ConnectorValueType::TimestampNanos => dto::ValueTypeKind::TimestampNanos,
         ConnectorValueType::TimestampTzNanos => dto::ValueTypeKind::TimestampTzNanos,
@@ -194,6 +198,14 @@ pub fn decode_value(
                 )
             })?)
         }
+        dto::value::Value::SmallInt(value) => {
+            ConnectorValue::SmallInt(i16::try_from(*value).map_err(|_| {
+                out_of_range(
+                    path.clone().field("small_int"),
+                    "small int value must be within -32768..=32767",
+                )
+            })?)
+        }
         dto::value::Value::Integer(value) => ConnectorValue::Integer(*value),
         dto::value::Value::BigInt(value) => ConnectorValue::BigInt(*value),
         dto::value::Value::Real(value) => ConnectorValue::Real(*value),
@@ -223,6 +235,7 @@ pub fn decode_value(
         dto::value::Value::Date(value) => ConnectorValue::Date(*value),
         dto::value::Value::TimeMicros(value) => ConnectorValue::TimeMicros(*value),
         dto::value::Value::TimestampMicros(value) => ConnectorValue::TimestampMicros(*value),
+        dto::value::Value::TimestampMillis(value) => ConnectorValue::TimestampMillis(*value),
         dto::value::Value::TimestampTzMicros(value) => ConnectorValue::TimestampTzMicros(*value),
         dto::value::Value::TimestampNanos(value) => ConnectorValue::TimestampNanos(*value),
         dto::value::Value::TimestampTzNanos(value) => ConnectorValue::TimestampTzNanos(*value),
@@ -259,6 +272,7 @@ pub fn encode_value(value: &ConnectorValue) -> dto::Value {
     let encoded = match value {
         ConnectorValue::Boolean(value) => dto::value::Value::Boolean(*value),
         ConnectorValue::TinyInt(value) => dto::value::Value::TinyInt(i32::from(*value)),
+        ConnectorValue::SmallInt(value) => dto::value::Value::SmallInt(i32::from(*value)),
         ConnectorValue::Integer(value) => dto::value::Value::Integer(*value),
         ConnectorValue::BigInt(value) => dto::value::Value::BigInt(*value),
         ConnectorValue::Real(value) => dto::value::Value::Real(*value),
@@ -275,6 +289,7 @@ pub fn encode_value(value: &ConnectorValue) -> dto::Value {
         ConnectorValue::Date(value) => dto::value::Value::Date(*value),
         ConnectorValue::TimeMicros(value) => dto::value::Value::TimeMicros(*value),
         ConnectorValue::TimestampMicros(value) => dto::value::Value::TimestampMicros(*value),
+        ConnectorValue::TimestampMillis(value) => dto::value::Value::TimestampMillis(*value),
         ConnectorValue::TimestampTzMicros(value) => dto::value::Value::TimestampTzMicros(*value),
         ConnectorValue::TimestampNanos(value) => dto::value::Value::TimestampNanos(*value),
         ConnectorValue::TimestampTzNanos(value) => dto::value::Value::TimestampTzNanos(*value),
@@ -300,6 +315,8 @@ mod tests {
     fn every_value_type_round_trips() {
         for value_type in [
             ConnectorValueType::Boolean,
+            ConnectorValueType::TinyInt,
+            ConnectorValueType::SmallInt,
             ConnectorValueType::Integer,
             ConnectorValueType::BigInt,
             ConnectorValueType::Real,
@@ -311,6 +328,7 @@ mod tests {
             ConnectorValueType::Date,
             ConnectorValueType::TimeMicros,
             ConnectorValueType::TimestampMicros,
+            ConnectorValueType::TimestampMillis,
             ConnectorValueType::TimestampTzMicros,
             ConnectorValueType::TimestampNanos,
             ConnectorValueType::TimestampTzNanos,
@@ -392,17 +410,36 @@ mod tests {
 
     #[test]
     fn values_round_trip_and_reject_a_type_mismatch() {
+        for value in [
+            ConnectorValue::SmallInt(i16::MIN),
+            ConnectorValue::SmallInt(i16::MAX),
+            ConnectorValue::TimestampMillis(-1_704_067_200_123),
+            ConnectorValue::TimestampMillis(1_704_067_200_123),
+        ] {
+            let encoded = encode_value(&value);
+            assert_eq!(
+                decode_value(&encoded, value.value_type(), root()).expect("valid"),
+                value
+            );
+        }
+
         let value = ConnectorValue::BigInt(42);
         let encoded = encode_value(&value);
-        assert_eq!(
-            decode_value(&encoded, ConnectorValueType::BigInt, root()).expect("valid"),
-            value
-        );
         assert_eq!(
             decode_value(&encoded, ConnectorValueType::Integer, root())
                 .expect_err("mismatch")
                 .kind(),
             crate::ProtocolErrorKind::InvalidValue
+        );
+
+        let out_of_range = dto::Value {
+            value: Some(dto::value::Value::SmallInt(i32::from(i16::MAX) + 1)),
+        };
+        assert_eq!(
+            decode_value(&out_of_range, ConnectorValueType::SmallInt, root())
+                .expect_err("out of range")
+                .kind(),
+            crate::ProtocolErrorKind::OutOfRange
         );
     }
 

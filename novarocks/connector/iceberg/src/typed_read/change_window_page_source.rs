@@ -919,17 +919,12 @@ mod tests {
     #[test]
     fn the_sign_column_the_frontend_binds_is_the_one_this_reader_recognizes() {
         // The frontend appends `change_op_column_handle()` to a change
-        // window's bindings, and the provider decodes each scan assignment back
-        // through the wire. A lossy round trip would make the sign look like an
-        // impostor claiming its reserved field id.
+        // window's bindings, and the provider decodes each scan assignment from
+        // its private wire value. A lossy round trip would make the sign look
+        // like an impostor claiming its reserved field id.
         let column = change_op_column_handle().expect("change op");
-        let validated = novarocks_proto_codec::connector_read::ValidatedColumnHandle::parse(
-            column.to_column_handle_proto(),
-            novarocks_proto_codec::FieldPath::root("column"),
-        )
-        .expect("a well-formed wire column handle");
-        let decoded = IcebergColumnHandle::from_column_handle_proto(validated.as_proto())
-            .expect("decode the sign column");
+        let decoded =
+            IcebergColumnHandle::from_proto(&column.to_proto()).expect("decode the sign column");
 
         assert_eq!(decoded, column);
         let projection = ChangeOpProjection::of(&[decoded]).expect("the sign is recognized");

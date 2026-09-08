@@ -41,6 +41,7 @@ pub enum ConnectorValueType {
     /// An eight-bit signed integer. Only an engine-derived column has this
     /// type; no Iceberg field does.
     TinyInt,
+    SmallInt,
     Integer,
     BigInt,
     Real,
@@ -52,6 +53,7 @@ pub enum ConnectorValueType {
     Date,
     TimeMicros,
     TimestampMicros,
+    TimestampMillis,
     TimestampTzMicros,
     TimestampNanos,
     TimestampTzNanos,
@@ -93,6 +95,7 @@ impl ConnectorValueType {
 pub enum ConnectorValue {
     Boolean(bool),
     TinyInt(i8),
+    SmallInt(i16),
     Integer(i32),
     BigInt(i64),
     Real(f32),
@@ -108,6 +111,7 @@ pub enum ConnectorValue {
     TimeMicros(i64),
     /// Microseconds since the Unix epoch, without a time zone.
     TimestampMicros(i64),
+    TimestampMillis(i64),
     /// Microseconds since the Unix epoch, in UTC.
     TimestampTzMicros(i64),
     /// Nanoseconds since the Unix epoch, without a time zone.
@@ -125,6 +129,7 @@ impl ConnectorValue {
         match self {
             Self::Boolean(_) => ConnectorValueType::Boolean,
             Self::TinyInt(_) => ConnectorValueType::TinyInt,
+            Self::SmallInt(_) => ConnectorValueType::SmallInt,
             Self::Integer(_) => ConnectorValueType::Integer,
             Self::BigInt(_) => ConnectorValueType::BigInt,
             Self::Real(_) => ConnectorValueType::Real,
@@ -138,6 +143,7 @@ impl ConnectorValue {
             Self::Date(_) => ConnectorValueType::Date,
             Self::TimeMicros(_) => ConnectorValueType::TimeMicros,
             Self::TimestampMicros(_) => ConnectorValueType::TimestampMicros,
+            Self::TimestampMillis(_) => ConnectorValueType::TimestampMillis,
             Self::TimestampTzMicros(_) => ConnectorValueType::TimestampTzMicros,
             Self::TimestampNanos(_) => ConnectorValueType::TimestampNanos,
             Self::TimestampTzNanos(_) => ConnectorValueType::TimestampTzNanos,
@@ -154,10 +160,12 @@ impl ConnectorValue {
     pub fn payload_bytes(&self) -> usize {
         match self {
             Self::Boolean(_) | Self::TinyInt(_) => 1,
+            Self::SmallInt(_) => 2,
             Self::Integer(_) | Self::Date(_) | Self::Real(_) => 4,
             Self::BigInt(_)
             | Self::Double(_)
             | Self::TimeMicros(_)
+            | Self::TimestampMillis(_)
             | Self::TimestampMicros(_)
             | Self::TimestampTzMicros(_)
             | Self::TimestampNanos(_)
@@ -197,6 +205,8 @@ impl ConnectorValue {
     pub fn try_compare_same_type(&self, other: &Self) -> Option<Ordering> {
         match (self, other) {
             (Self::Boolean(left), Self::Boolean(right)) => Some(left.cmp(right)),
+            (Self::TinyInt(left), Self::TinyInt(right)) => Some(left.cmp(right)),
+            (Self::SmallInt(left), Self::SmallInt(right)) => Some(left.cmp(right)),
             (Self::Integer(left), Self::Integer(right)) => Some(left.cmp(right)),
             (Self::BigInt(left), Self::BigInt(right)) => Some(left.cmp(right)),
             (Self::Real(left), Self::Real(right)) => {
@@ -230,6 +240,7 @@ impl ConnectorValue {
             }
             (Self::Date(left), Self::Date(right)) => Some(left.cmp(right)),
             (Self::TimeMicros(left), Self::TimeMicros(right))
+            | (Self::TimestampMillis(left), Self::TimestampMillis(right))
             | (Self::TimestampMicros(left), Self::TimestampMicros(right))
             | (Self::TimestampTzMicros(left), Self::TimestampTzMicros(right))
             | (Self::TimestampNanos(left), Self::TimestampNanos(right))

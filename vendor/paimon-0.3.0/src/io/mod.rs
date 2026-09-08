@@ -1,0 +1,97 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+pub(crate) mod cache;
+mod file_io;
+pub(crate) use file_io::retain_bytes;
+pub use file_io::*;
+
+mod read_only;
+pub use read_only::*;
+
+mod storage;
+pub use storage::*;
+
+#[cfg(any(
+    feature = "storage-azdls",
+    feature = "storage-cos",
+    feature = "storage-gcs",
+    feature = "storage-obs",
+    feature = "storage-oss",
+    feature = "storage-s3"
+))]
+fn with_http_transport(op: opendal::Operator) -> opendal::Operator {
+    use opendal::{HttpTransporter, OperationContext};
+    use opendal_http_transport_reqwest::ReqwestTransport;
+
+    let transport = HttpTransporter::new(ReqwestTransport::default());
+    op.with_context(OperationContext::new().with_http_transport(transport))
+}
+
+#[cfg(any(
+    feature = "storage-s3",
+    feature = "storage-cos",
+    feature = "storage-azdls",
+    feature = "storage-obs",
+    feature = "storage-gcs"
+))]
+mod storage_config;
+
+#[cfg(feature = "storage-fs")]
+mod storage_fs;
+#[cfg(feature = "storage-fs")]
+use storage_fs::*;
+
+#[cfg(feature = "storage-memory")]
+mod storage_memory;
+#[cfg(feature = "storage-memory")]
+use storage_memory::*;
+
+#[cfg(feature = "storage-oss")]
+pub(crate) mod storage_oss;
+#[cfg(feature = "storage-oss")]
+use storage_oss::*;
+
+#[cfg(feature = "storage-s3")]
+mod storage_s3;
+#[cfg(feature = "storage-s3")]
+use storage_s3::*;
+
+#[cfg(feature = "storage-cos")]
+mod storage_cos;
+#[cfg(feature = "storage-cos")]
+use storage_cos::*;
+
+#[cfg(feature = "storage-azdls")]
+mod storage_azdls;
+#[cfg(feature = "storage-azdls")]
+use storage_azdls::*;
+
+#[cfg(feature = "storage-obs")]
+mod storage_obs;
+#[cfg(feature = "storage-obs")]
+use storage_obs::*;
+
+#[cfg(feature = "storage-gcs")]
+mod storage_gcs;
+#[cfg(feature = "storage-gcs")]
+use storage_gcs::*;
+
+#[cfg(feature = "storage-hdfs")]
+mod storage_hdfs;
+#[cfg(feature = "storage-hdfs")]
+use storage_hdfs::*;

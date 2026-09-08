@@ -18,27 +18,12 @@
 // Design: ADR-0125 (docs/adr/ADR-0125-query-leased-catalog-runtime-and-provider-binding-evidence.md)
 use std::sync::Arc;
 
-use super::{ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ProviderBindingEpoch};
+use super::{
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderId,
+    ProviderBindingEpoch,
+};
 
 const MAX_LOCAL_BINDING_BYTES: usize = 256;
-
-/// The closed provider variant carried by a provider-private binding.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ConnectorProviderBindingKind {
-    Iceberg,
-    StarRocks,
-}
-
-impl ConnectorProviderBindingKind {
-    pub const ALL: [Self; 2] = [Self::Iceberg, Self::StarRocks];
-
-    pub const fn provider_id(self) -> &'static str {
-        match self {
-            Self::Iceberg => "iceberg",
-            Self::StarRocks => "starrocks",
-        }
-    }
-}
 
 /// Immutable provider-private identity used to fence FE effects and late
 /// materialization. It is not a BE execution identity and never crosses the
@@ -59,62 +44,43 @@ impl ConnectorProviderBindingKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ConnectorProviderBindingSource {
-    Iceberg { access_binding: Arc<str> },
-    StarRocks { local_binding: Arc<str> },
-}
-
-/// Borrowed, transport-neutral provider facts from a validated provider
-/// binding. Consumers must match this closed enum rather than infer a
-/// provider from an identifier string.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorProviderBindingProvider<'a> {
-    Iceberg { access_binding: &'a str },
-    StarRocks { local_binding: &'a str },
-}
-
-impl ConnectorProviderBindingProvider<'_> {
-    pub const fn kind(self) -> ConnectorProviderBindingKind {
-        match self {
-            Self::Iceberg { .. } => ConnectorProviderBindingKind::Iceberg,
-            Self::StarRocks { .. } => ConnectorProviderBindingKind::StarRocks,
-        }
-    }
-}
-
-impl ConnectorProviderBindingSource {
-    const fn kind(&self) -> ConnectorProviderBindingKind {
-        match self {
-            Self::Iceberg { .. } => ConnectorProviderBindingKind::Iceberg,
-            Self::StarRocks { .. } => ConnectorProviderBindingKind::StarRocks,
-        }
-    }
-}
-
-/// Transport-neutral, validated provider binding admitted by connector control.
-///
-/// Its fields remain private so a provider binding can only be constructed
-/// through the bounded constructors below.  Protocol adapters are owned by
-/// the FE and BE applications, not by SPI.
+/// A validated provider binding admitted by connector control. The provider
+/// identity is open; only its installed provider may interpret `local_binding`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorProviderBinding {
     binding_key: ConnectorProviderBindingKey,
-    provider: ConnectorProviderBindingSource,
+    provider_id: ConnectorProviderId,
+    local_binding: Arc<str>,
 }
 
 impl ConnectorProviderBinding {
+    pub fn try_new(
+        provider_id: ConnectorProviderId,
+        instance_id: impl AsRef<str>,
+        incarnation: [u8; 16],
+        local_binding: impl AsRef<str>,
+    ) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            binding_key: ConnectorProviderBindingKey {
+                instance_id: ConnectorInstanceId::try_from_canonical(instance_id.as_ref())?,
+                incarnation: ProviderBindingEpoch::from_bytes(incarnation),
+            },
+            provider_id,
+            local_binding: bounded_binding(local_binding.as_ref())?,
+        })
+    }
+
     pub fn iceberg(
         instance_id: impl AsRef<str>,
         incarnation: [u8; 16],
         access_binding: impl AsRef<str>,
     ) -> Result<Self, ConnectorError> {
         Self::try_new(
-            instance_id.as_ref(),
+            ConnectorProviderId::parse("iceberg")
+                .expect("the static Iceberg provider identity is valid"),
+            instance_id,
             incarnation,
-            ConnectorProviderBindingSource::Iceberg {
-                access_binding: bounded_binding(access_binding.as_ref())?,
-            },
+            access_binding,
         )
     }
 
@@ -124,63 +90,32 @@ impl ConnectorProviderBinding {
         local_binding: impl AsRef<str>,
     ) -> Result<Self, ConnectorError> {
         Self::try_new(
-            instance_id.as_ref(),
+            ConnectorProviderId::parse("starrocks")
+                .expect("the static StarRocks provider identity is valid"),
+            instance_id,
             incarnation,
-            ConnectorProviderBindingSource::StarRocks {
-                local_binding: bounded_binding(local_binding.as_ref())?,
-            },
+            local_binding,
         )
-    }
-
-    fn try_new(
-        instance_id: &str,
-        incarnation: [u8; 16],
-        provider: ConnectorProviderBindingSource,
-    ) -> Result<Self, ConnectorError> {
-        Ok(Self {
-            binding_key: ConnectorProviderBindingKey {
-                instance_id: ConnectorInstanceId::try_from_canonical(instance_id)?,
-                incarnation: ProviderBindingEpoch::from_bytes(incarnation),
-            },
-            provider,
-        })
     }
 
     pub fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.binding_key
     }
 
-    pub fn provider(&self) -> ConnectorProviderBindingProvider<'_> {
-        match &self.provider {
-            ConnectorProviderBindingSource::Iceberg { access_binding } => {
-                ConnectorProviderBindingProvider::Iceberg { access_binding }
-            }
-            ConnectorProviderBindingSource::StarRocks { local_binding } => {
-                ConnectorProviderBindingProvider::StarRocks { local_binding }
-            }
-        }
+    pub const fn provider_id(&self) -> &ConnectorProviderId {
+        &self.provider_id
     }
 
-    pub const fn provider_kind(&self) -> ConnectorProviderBindingKind {
-        self.provider.kind()
-    }
-
-    pub const fn provider_id(&self) -> &'static str {
-        self.provider_kind().provider_id()
+    pub fn local_binding(&self) -> &str {
+        &self.local_binding
     }
 
     pub fn iceberg_access_binding(&self) -> Option<&str> {
-        match &self.provider {
-            ConnectorProviderBindingSource::Iceberg { access_binding } => Some(access_binding),
-            ConnectorProviderBindingSource::StarRocks { .. } => None,
-        }
+        (self.provider_id.as_str() == "iceberg").then_some(&self.local_binding)
     }
 
     pub fn starrocks_local_binding(&self) -> Option<&str> {
-        match &self.provider {
-            ConnectorProviderBindingSource::Iceberg { .. } => None,
-            ConnectorProviderBindingSource::StarRocks { local_binding } => Some(local_binding),
-        }
+        (self.provider_id.as_str() == "starrocks").then_some(&self.local_binding)
     }
 }
 
@@ -202,26 +137,20 @@ fn bounded_binding(value: &str) -> Result<Arc<str>, ConnectorError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ConnectorProviderBinding, ConnectorProviderBindingKind, ConnectorProviderBindingProvider,
-    };
+    use super::ConnectorProviderBinding;
+    use crate::connector::ConnectorProviderId;
 
     #[test]
-    fn constructors_validate_canonical_identity_and_local_binding() {
-        assert!(ConnectorProviderBinding::iceberg("MyCatalog", [1; 16], "local").is_err());
-        assert!(ConnectorProviderBinding::iceberg("catalog", [1; 16], "").is_err());
-        assert!(ConnectorProviderBinding::starrocks("catalog", [1; 16], "x".repeat(257)).is_err());
-        let binding = ConnectorProviderBinding::iceberg("catalog", [1; 16], "local").unwrap();
-        assert_eq!(
-            binding.provider_kind(),
-            ConnectorProviderBindingKind::Iceberg
-        );
-        assert_eq!(binding.provider_id(), "iceberg");
-        assert!(matches!(
-            binding.provider(),
-            ConnectorProviderBindingProvider::Iceberg {
-                access_binding: "local"
-            }
-        ));
+    fn an_open_provider_identity_owns_one_bounded_local_binding() {
+        let binding = ConnectorProviderBinding::try_new(
+            ConnectorProviderId::parse("paimon").unwrap(),
+            "catalog",
+            [1; 16],
+            "filesystem",
+        )
+        .unwrap();
+        assert_eq!(binding.provider_id().as_str(), "paimon");
+        assert_eq!(binding.local_binding(), "filesystem");
+        assert!(binding.iceberg_access_binding().is_none());
     }
 }

@@ -23,10 +23,10 @@ use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::catalog as wire;
 use novarocks_spi::connector::{
     CATALOG_VERSION_BYTES, CatalogCredentialBinding, CatalogCredentialMode,
-    CatalogCredentialPurpose, CatalogHandle, CatalogProperties, CatalogProperty,
-    CatalogProviderKind, CatalogVersion, ConnectorInstanceId, CredentialConsumerRole,
-    MAX_CATALOG_SET_BYTES, MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES,
-    MAX_REACHABLE_CATALOGS_PER_PRUNE, StaticCredentialReference,
+    CatalogCredentialPurpose, CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion,
+    ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole, MAX_CATALOG_SET_BYTES,
+    MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES, MAX_REACHABLE_CATALOGS_PER_PRUNE,
+    StaticCredentialReference,
 };
 
 /// One exact, validated query-wide catalog contribution.
@@ -298,7 +298,7 @@ pub fn decode_catalog_handle(
 pub fn encode_catalog_properties(properties: CatalogProperties) -> wire::CatalogProperties {
     wire::CatalogProperties {
         handle: Some(encode_catalog_handle(properties.handle())),
-        provider_kind: encode_provider_kind(properties.provider_kind()) as i32,
+        provider_id: properties.provider_id().as_str().to_owned(),
         config_format_version: properties.config_format_version(),
         execution_properties: properties
             .execution_properties()
@@ -325,8 +325,8 @@ pub fn decode_catalog_properties(
         .handle
         .ok_or_else(|| missing(root.clone().field("handle"), "catalog handle is required"))
         .and_then(|handle| decode_catalog_handle(handle, root.clone().field("handle")))?;
-    let provider_kind =
-        decode_provider_kind(raw.provider_kind, root.clone().field("provider_kind"))?;
+    let provider_id = ConnectorProviderId::parse(&raw.provider_id)
+        .map_err(|error| invalid(root.clone().field("provider_id"), error.to_string()))?;
     let mut properties = Vec::with_capacity(raw.execution_properties.len());
     for (index, property) in raw.execution_properties.into_iter().enumerate() {
         let decoded = CatalogProperty::new(&property.key, &property.value).map_err(|error| {
@@ -360,7 +360,7 @@ pub fn decode_catalog_properties(
     }
     CatalogProperties::new(
         handle,
-        provider_kind,
+        provider_id,
         raw.config_format_version,
         properties,
         bindings,
@@ -466,24 +466,6 @@ fn decode_consumer_role(
     }
 }
 
-fn encode_provider_kind(value: CatalogProviderKind) -> wire::CatalogProviderKind {
-    match value {
-        CatalogProviderKind::Iceberg => wire::CatalogProviderKind::Iceberg,
-        CatalogProviderKind::StarRocks => wire::CatalogProviderKind::Starrocks,
-    }
-}
-
-fn decode_provider_kind(value: i32, root: FieldPath) -> Result<CatalogProviderKind, ProtocolError> {
-    match wire::CatalogProviderKind::try_from(value) {
-        Ok(wire::CatalogProviderKind::Iceberg) => Ok(CatalogProviderKind::Iceberg),
-        Ok(wire::CatalogProviderKind::Starrocks) => Ok(CatalogProviderKind::StarRocks),
-        _ => Err(invalid(
-            root,
-            "catalog provider kind is required and must be known",
-        )),
-    }
-}
-
 fn invalid(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
     ProtocolError::new(path, ProtocolErrorKind::InvalidValue, detail)
 }
@@ -519,7 +501,7 @@ mod tests {
                 ConnectorInstanceId::try_from_canonical(name).unwrap(),
                 CatalogVersion::from_bytes([version; CATALOG_VERSION_BYTES]),
             ),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").unwrap(),
             1,
             vec![CatalogProperty::new("warehouse", "s3://warehouse").unwrap()],
             vec![

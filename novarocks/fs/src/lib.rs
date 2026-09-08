@@ -35,7 +35,7 @@ mod runtime;
 
 pub use access::{
     BoundFile, ConditionalCreateOutcome, FileIdentity, FsAccessHandle, FsAccessResolver,
-    FsLocation, FsScheme, ObjectStoreAccessContext, ObjectStoreConfig,
+    FsListEntry, FsListStream, FsLocation, FsScheme, ObjectStoreAccessContext, ObjectStoreConfig,
     ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig, ObjectStoreProviderPool,
     ObjectStoreProviderPoolMetrics, ObjectStoreProviderPoolOptions, ObjectStoreSecretMaterial,
     ResolvedFsPath, is_object_store_location_parse_only, parse_object_store_path_parse_only,
@@ -52,6 +52,7 @@ pub use catalog_properties::{
     AWS_S3_CATALOG_PROPERTY_KEYS, normalize_aws_s3_catalog_properties,
     object_store_config_from_aws_s3_catalog_properties,
     object_store_config_from_aws_s3_catalog_property_pairs,
+    object_store_endpoint_config_from_aws_s3_catalog_property_pairs,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
 pub use novarocks_secret::SecretValue;

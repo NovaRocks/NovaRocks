@@ -33,8 +33,8 @@ use novarocks_proto_codec::lifecycle::{
 };
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
-    CatalogProviderKind, CatalogStorageAccessDomainInput, ConnectorControlPlanningLease,
-    ConnectorError, ConnectorErrorKind, ConnectorProviderId, ConnectorStorageResolver,
+    CatalogStorageAccessDomainInput, ConnectorControlPlanningLease, ConnectorError,
+    ConnectorErrorKind, ConnectorProviderId, ConnectorStorageResolver,
     ConnectorVendedCredentialLeaseSink, ConnectorVendedS3CredentialLeaseRefresher,
     CredentialConsumerRole, CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
     ResolvedVendedS3Access, StorageAccessRequest, StorageCredentialScopePrefix,
@@ -205,7 +205,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             })
             .cloned()
             .ok_or_else(|| collector_error("catalog has no vended object-store data binding"))?;
-        if catalog_properties.provider_kind() != CatalogProviderKind::Iceberg {
+        if catalog_properties.provider_id().as_str() != "iceberg" {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 "vended S3 credential collection currently supports Iceberg catalogs only",
@@ -994,8 +994,8 @@ mod tests {
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorControlPlanningLease,
-        ConnectorInstanceId, ConnectorVendedCredentialLeaseSink, CredentialConsumerRole,
+        CatalogProperties, CatalogVersion, ConnectorControlPlanningLease, ConnectorInstanceId,
+        ConnectorProviderId, ConnectorVendedCredentialLeaseSink, CredentialConsumerRole,
         StorageAccessRequest, StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
         VendedS3CredentialLeaseEntry,
     };
@@ -1019,7 +1019,7 @@ mod tests {
                 ConnectorInstanceId::try_from_canonical("catalog.analytics").expect("catalog name"),
                 CatalogVersion::from_bytes([0x23; 32]),
             ),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             vec![],
             vec![],
@@ -1034,7 +1034,7 @@ mod tests {
                 ConnectorInstanceId::try_from_canonical("catalog.vended").expect("catalog name"),
                 CatalogVersion::from_bytes([0x24; 32]),
             ),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             vec![],
             vec![

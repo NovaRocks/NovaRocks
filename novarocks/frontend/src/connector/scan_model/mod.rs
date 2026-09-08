@@ -54,18 +54,17 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    CONNECTOR_FIELD_HIDDEN_FROM_SQL, CatalogHandle, CatalogProperties, CatalogProviderKind,
-    CatalogVersion, ConnectorBeginScanRequest, ConnectorChangeWindowAdmission,
-    ConnectorControlBinding, ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, CatalogHandle, CatalogProperties, CatalogVersion,
+    ConnectorBeginScanRequest, ConnectorChangeWindowAdmission, ConnectorControlBinding,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorNamespaceRequest, ConnectorPredicateDisposition,
     ConnectorPredicateDispositionKind, ConnectorProviderBinding, ConnectorProviderBindingKey,
-    ConnectorProviderBindingKind, ConnectorProviderId, ConnectorReadPurpose,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableHandle,
-    ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
+    ConnectorProviderId, ConnectorReadPurpose, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateKind,
+    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -798,7 +797,7 @@ pub fn planned_files_fixture_binding_for_provider(
     .with_catalog_properties(
         CatalogProperties::new(
             catalog_handle,
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             Vec::new(),
             Vec::new(),
@@ -1454,10 +1453,7 @@ mod tests {
             .declaration(&crate::connector::test_request_context())
             .expect("fixture provider binding");
 
-        assert_eq!(
-            declaration.provider_kind(),
-            ConnectorProviderBindingKind::Iceberg
-        );
+        assert_eq!(declaration.provider_id().as_str(), FIXTURE_PROVIDER_ID);
         assert_eq!(declaration.binding_key().instance_id(), CATALOG);
     }
 

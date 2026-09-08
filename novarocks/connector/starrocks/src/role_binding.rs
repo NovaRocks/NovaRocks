@@ -27,13 +27,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use novarocks_connector_binding::{
+use novarocks_spi::connector::{CatalogProperties, ConnectorProviderId};
+use novarocks_spi::connector::{
     ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBinding,
     ConnectorExecutionRoleBindingFactory, ConnectorMaterializationError,
     ConnectorMaterializationErrorClass, ConnectorMaterializationRetryDisposition,
     MaterializationContext, NormalizedCatalogProperties,
 };
-use novarocks_spi::connector::{CatalogProperties, CatalogProviderKind};
 
 use crate::{
     STARROCKS_PROVIDER_ID, StarRocksConnectorConfig, StarRocksControlGeneration,
@@ -117,8 +117,8 @@ impl StarRocksControlRoleBindingFactory {
 }
 
 impl ConnectorControlRoleBindingFactory for StarRocksControlRoleBindingFactory {
-    fn provider_kind(&self) -> CatalogProviderKind {
-        CatalogProviderKind::StarRocks
+    fn provider_id(&self) -> ConnectorProviderId {
+        ConnectorProviderId::parse("starrocks").expect("static provider ID")
     }
 
     fn normalize_and_validate(
@@ -177,8 +177,8 @@ impl StarRocksExecutionRoleBindingFactory {
 }
 
 impl ConnectorExecutionRoleBindingFactory for StarRocksExecutionRoleBindingFactory {
-    fn provider_kind(&self) -> CatalogProviderKind {
-        CatalogProviderKind::StarRocks
+    fn provider_id(&self) -> ConnectorProviderId {
+        ConnectorProviderId::parse("starrocks").expect("static provider ID")
     }
 
     fn bind(
@@ -192,7 +192,7 @@ impl ConnectorExecutionRoleBindingFactory for StarRocksExecutionRoleBindingFacto
 }
 
 fn ensure_starrocks(properties: &CatalogProperties) -> Result<(), ConnectorMaterializationError> {
-    if properties.provider_kind() == CatalogProviderKind::StarRocks {
+    if properties.provider_id().as_str() == "starrocks" {
         return Ok(());
     }
     Err(ConnectorMaterializationError::new(
@@ -304,7 +304,7 @@ mod tests {
 
     fn properties(
         instance_id: &str,
-        kind: CatalogProviderKind,
+        kind: ConnectorProviderId,
         local_binding: Option<&str>,
     ) -> CatalogProperties {
         properties_with_local_bindings(instance_id, kind, local_binding.into_iter().collect())
@@ -312,7 +312,7 @@ mod tests {
 
     fn properties_with_local_bindings(
         instance_id: &str,
-        kind: CatalogProviderKind,
+        kind: ConnectorProviderId,
         local_bindings: Vec<&str>,
     ) -> CatalogProperties {
         CatalogProperties::new(
@@ -350,7 +350,7 @@ mod tests {
         let normalized = factory
             .normalize_and_validate(properties(
                 "catalog.starrocks",
-                CatalogProviderKind::StarRocks,
+                ConnectorProviderId::parse("starrocks").expect("static provider ID"),
                 Some("metadata-blue"),
             ))
             .expect("normalize StarRocks properties");
@@ -375,14 +375,14 @@ mod tests {
         let blue = factory
             .normalize_and_validate(properties(
                 "catalog.starrocks-blue",
-                CatalogProviderKind::StarRocks,
+                ConnectorProviderId::parse("starrocks").expect("static provider ID"),
                 Some("metadata-blue"),
             ))
             .expect("normalize blue catalog");
         let green = factory
             .normalize_and_validate(properties(
                 "catalog.starrocks-green",
-                CatalogProviderKind::StarRocks,
+                ConnectorProviderId::parse("starrocks").expect("static provider ID"),
                 Some("metadata-green"),
             ))
             .expect("normalize green catalog");
@@ -423,7 +423,7 @@ mod tests {
         let missing = factory
             .normalize_and_validate(properties(
                 "catalog.starrocks",
-                CatalogProviderKind::StarRocks,
+                ConnectorProviderId::parse("starrocks").expect("static provider ID"),
                 None,
             ))
             .expect_err("local binding is required");
@@ -435,7 +435,7 @@ mod tests {
         let unknown = factory
             .normalize_and_validate(properties(
                 "catalog.starrocks",
-                CatalogProviderKind::StarRocks,
+                ConnectorProviderId::parse("starrocks").expect("static provider ID"),
                 Some("missing"),
             ))
             .expect("the definition is structurally valid");
@@ -464,7 +464,7 @@ mod tests {
         let invalid = factory
             .normalize_and_validate(properties_with_local_bindings(
                 "catalog.starrocks",
-                CatalogProviderKind::StarRocks,
+                ConnectorProviderId::parse("starrocks").expect("static provider ID"),
                 vec!["not-ascii-\u{4e2d}"],
             ))
             .expect_err("invalid local binding definition must fail closed");
@@ -478,7 +478,7 @@ mod tests {
                 ConnectorInstanceId::parse("catalog.starrocks").expect("catalog"),
                 CatalogVersion::from_bytes([7; 32]),
             ),
-            CatalogProviderKind::StarRocks,
+            ConnectorProviderId::parse("starrocks").expect("static provider ID"),
             1,
             vec![
                 CatalogProperty::new("local_binding", "metadata-blue").expect("property"),
@@ -498,7 +498,7 @@ mod tests {
     fn execution_factory_publishes_no_starrocks_capability_until_its_typed_contract_exists() {
         let normalized = NormalizedCatalogProperties::try_new(properties(
             "catalog.starrocks",
-            CatalogProviderKind::StarRocks,
+            ConnectorProviderId::parse("starrocks").expect("static provider ID"),
             None,
         ))
         .expect("normalized StarRocks properties");

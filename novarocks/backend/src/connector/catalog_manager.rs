@@ -28,12 +28,12 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks_connector_binding::{
+use novarocks_spi::connector::{CatalogHandle, CatalogProperties, ConnectorProviderId};
+use novarocks_spi::connector::{
     ConnectorExecutionRoleBinding, ConnectorExecutionRoleBindingFactory,
     ConnectorMaterializationError, ConnectorMaterializationErrorClass,
     ConnectorMaterializationRetryDisposition, NormalizedCatalogProperties,
 };
-use novarocks_spi::connector::{CatalogHandle, CatalogProperties, CatalogProviderKind};
 use novarocks_types::QueryExecutionId;
 
 /// The bounded number of unleased materialized catalogs retained by default.
@@ -48,7 +48,7 @@ const DEFAULT_PROVIDER_MAX_CONCURRENT_BINDS: usize = 4;
 /// in one local, bounded operation.
 #[derive(Clone)]
 pub struct ConnectorExecutionRoleBindingFactorySet {
-    factories: Arc<BTreeMap<CatalogProviderKind, Arc<dyn ConnectorExecutionRoleBindingFactory>>>,
+    factories: Arc<BTreeMap<ConnectorProviderId, Arc<dyn ConnectorExecutionRoleBindingFactory>>>,
 }
 
 impl ConnectorExecutionRoleBindingFactorySet {
@@ -57,8 +57,8 @@ impl ConnectorExecutionRoleBindingFactorySet {
     ) -> Result<Self, CatalogManagerError> {
         let mut sealed = BTreeMap::new();
         for factory in factories {
-            let provider_kind = factory.provider_kind();
-            if sealed.insert(provider_kind, factory).is_some() {
+            let provider_id = factory.provider_id();
+            if sealed.insert(provider_id, factory).is_some() {
                 return Err(CatalogManagerError::InvalidConfiguration(
                     "duplicate connector execution role binding factory provider kind",
                 ));
@@ -81,7 +81,7 @@ impl ConnectorExecutionRoleBindingFactorySet {
                     detail,
                 )
             })?;
-        let Some(factory) = self.factories.get(&normalized.provider_kind()) else {
+        let Some(factory) = self.factories.get(normalized.provider_id()) else {
             return Err(ConnectorMaterializationError::new(
                 ConnectorMaterializationErrorClass::InvalidDefinition,
                 ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
@@ -243,7 +243,7 @@ struct CatalogManagerState<T> {
     entries: BTreeMap<CatalogHandle, Arc<CatalogCell<T>>>,
     query_reachability: BTreeMap<QueryExecutionId, BTreeSet<CatalogHandle>>,
     next_registration_token: u64,
-    provider_binds: BTreeMap<CatalogProviderKind, ProviderBindState>,
+    provider_binds: BTreeMap<ConnectorProviderId, ProviderBindState>,
 }
 
 #[derive(Default)]
@@ -471,8 +471,8 @@ impl<T> CatalogManager<T> {
             return Ok(runtime);
         }
 
-        let provider = cell.properties.provider_kind();
-        let materialized = match self.acquire_provider_bind(provider, &active) {
+        let provider = cell.properties.provider_id().clone();
+        let materialized = match self.acquire_provider_bind(provider.clone(), &active) {
             Ok(()) => {
                 let result = if active() {
                     materialize(&cell.properties)
@@ -691,7 +691,7 @@ impl<T> CatalogManager<T> {
 
     fn acquire_provider_bind(
         &self,
-        provider: CatalogProviderKind,
+        provider: ConnectorProviderId,
         active: &impl Fn() -> bool,
     ) -> Result<(), CatalogManagerError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -699,7 +699,7 @@ impl<T> CatalogManager<T> {
             if !active() {
                 return Err(cancelled_catalog_install_error());
             }
-            let provider_state = state.provider_binds.entry(provider).or_default();
+            let provider_state = state.provider_binds.entry(provider.clone()).or_default();
             let rate_ready = provider_state
                 .last_started
                 .is_none_or(|last| last.elapsed() >= self.config.provider_min_bind_interval);
@@ -716,7 +716,7 @@ impl<T> CatalogManager<T> {
         }
     }
 
-    fn release_provider_bind(&self, provider: CatalogProviderKind) {
+    fn release_provider_bind(&self, provider: ConnectorProviderId) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let provider_state = state
             .provider_binds
@@ -890,13 +890,13 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use novarocks_connector_binding::{
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogProperties, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
+    };
+    use novarocks_spi::connector::{
         ConnectorExecutionRoleBinding, ConnectorExecutionRoleBindingFactory,
         ConnectorMaterializationError, ConnectorMaterializationErrorClass,
         ConnectorMaterializationRetryDisposition, NormalizedCatalogProperties,
-    };
-    use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
     };
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 
@@ -915,17 +915,23 @@ mod tests {
             ConnectorInstanceId::try_from_canonical("catalog.analytics").expect("catalog id"),
             CatalogVersion::from_bytes([version; 32]),
         );
-        CatalogProperties::new(handle, CatalogProviderKind::Iceberg, 1, vec![], vec![])
-            .expect("catalog properties")
+        CatalogProperties::new(
+            handle,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
+            1,
+            vec![],
+            vec![],
+        )
+        .expect("catalog properties")
     }
 
     struct UnsupportedFactory {
-        provider_kind: CatalogProviderKind,
+        provider_id: ConnectorProviderId,
     }
 
     impl ConnectorExecutionRoleBindingFactory for UnsupportedFactory {
-        fn provider_kind(&self) -> CatalogProviderKind {
-            self.provider_kind
+        fn provider_id(&self) -> ConnectorProviderId {
+            self.provider_id.clone()
         }
 
         fn bind(
@@ -938,14 +944,14 @@ mod tests {
     }
 
     #[test]
-    fn execution_role_factory_set_rejects_duplicate_provider_kind_before_admission() {
+    fn execution_role_factory_set_rejects_duplicate_provider_id_before_admission() {
         assert!(matches!(
             ConnectorExecutionRoleBindingFactorySet::try_new([
                 Arc::new(UnsupportedFactory {
-                    provider_kind: CatalogProviderKind::Iceberg,
+                    provider_id: ConnectorProviderId::parse("iceberg").expect("static provider ID"),
                 }) as Arc<dyn ConnectorExecutionRoleBindingFactory>,
                 Arc::new(UnsupportedFactory {
-                    provider_kind: CatalogProviderKind::Iceberg,
+                    provider_id: ConnectorProviderId::parse("iceberg").expect("static provider ID"),
                 }) as Arc<dyn ConnectorExecutionRoleBindingFactory>,
             ]),
             Err(CatalogManagerError::InvalidConfiguration(

@@ -405,6 +405,9 @@ fn connector_scalar_type(data_type: &DataType) -> Option<ConnectorScalarType> {
         DataType::Int32 => Some(ConnectorScalarType::Int32),
         DataType::Int64 => Some(ConnectorScalarType::Int64),
         DataType::Date32 => Some(ConnectorScalarType::Date32),
+        DataType::Timestamp(TimeUnit::Millisecond, None) => {
+            Some(ConnectorScalarType::TimestampMillis)
+        }
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
             Some(ConnectorScalarType::TimestampMicros)
         }
@@ -704,5 +707,24 @@ mod tests {
         } if version == LogicalVersion::new(2))
         );
         assert_eq!(outcome.effect(), None);
+    }
+
+    #[test]
+    fn scan_domain_types_preserve_int16_and_timestamp_milliseconds() {
+        assert_eq!(
+            connector_scalar_type(&DataType::Int16),
+            Some(ConnectorScalarType::Int16)
+        );
+        assert_eq!(
+            connector_scalar_type(&DataType::Timestamp(TimeUnit::Millisecond, None)),
+            Some(ConnectorScalarType::TimestampMillis)
+        );
+        assert_eq!(
+            connector_scalar_type(&DataType::Timestamp(
+                TimeUnit::Millisecond,
+                Some("UTC".into())
+            )),
+            None
+        );
     }
 }

@@ -61,7 +61,8 @@ pub(crate) fn execute_with_ports(
         ConnectorTableResolution::StrictBaseTable,
     )?;
     let target = crate::catalog_application::resolver::TargetBackend {
-        backend_name: "iceberg",
+        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+            .expect("static Iceberg provider ID"),
         catalog: catalog_name.clone(),
         namespace: namespace.clone(),
         table: table_name.clone(),

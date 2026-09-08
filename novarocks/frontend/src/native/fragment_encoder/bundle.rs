@@ -79,42 +79,40 @@ pub(crate) fn encode_native_fragment_bundle_for_input(
 
 #[cfg(test)]
 mod tests {
+    use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_proto_models::plan;
-    use novarocks_spi::connector::{CatalogHandle, CatalogVersion, ConnectorInstanceId};
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+        ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceId, ConnectorProviderId,
+    };
     use novarocks_sql::test_support::{NativeWriteDataflowFixture, native_write_dataflow_plan};
 
     use super::*;
     use crate::query_execution::post_compile::NativeFragmentEncodingInput;
 
     fn sealed_targets(ordinals: &[u32]) -> SealedWriteTargets {
+        let catalog = CatalogHandle::new(
+            ConnectorInstanceId::parse("bundle_write_targets").expect("instance id"),
+            CatalogVersion::from_bytes([9; 32]),
+        );
         SealedWriteTargets::new(
-            CatalogHandle::new(
-                ConnectorInstanceId::parse("bundle_write_targets").expect("instance id"),
-                CatalogVersion::from_bytes([9; 32]),
-            ),
+            catalog.clone(),
             ordinals
                 .iter()
                 .map(|ordinal| {
+                    let payload = ConnectorEncodedPayload::new(
+                        ConnectorEnvelopeHeader::new(
+                            ConnectorProviderId::parse("fixture").expect("provider id"),
+                            catalog.clone(),
+                            ConnectorCodecCategory::WriteHandle,
+                            ConnectorCodecRevision::try_new(1).expect("codec revision"),
+                        ),
+                        bytes::Bytes::from(format!("target-{ordinal}")),
+                    );
                     (
                         *ordinal,
                         novarocks_proto_models::connector_write::ConnectorWriterHandle {
-                            handle: Some(
-                                novarocks_proto_models::connector_write::connector_writer_handle::Handle::Iceberg(
-                                    novarocks_proto_models::connector_write::IcebergWriterHandle {
-                                        branch: novarocks_proto_models::connector_write::IcebergWriteBranch::Data as i32,
-                                        table: Some(
-                                            novarocks_proto_models::connector_write::IcebergWriteTableFacts {
-                                                table_uuid: format!("target-{ordinal}"),
-                                                ..Default::default()
-                                            },
-                                        ),
-                                        output: None,
-                                        data: None,
-                                        old_deletes: std::collections::BTreeMap::new(),
-                        equality: None,
-                                    },
-                                ),
-                            ),
+                            provider_payload: Some(encode_connector_payload_message(&payload)),
                         },
                     )
                 })

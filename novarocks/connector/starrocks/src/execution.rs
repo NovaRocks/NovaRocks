@@ -24,8 +24,8 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
-    CatalogRuntimeMaterializer, ConnectorError, ConnectorErrorKind,
+    CatalogHandle, CatalogProperties, CatalogRuntime, CatalogRuntimeMaterializer, ConnectorError,
+    ConnectorErrorKind, ConnectorProviderId,
 };
 
 /// Startup-composed materializer for the closed StarRocks catalog family.
@@ -41,21 +41,21 @@ impl CatalogRuntime for StarRocksCatalogRuntime {
         &self.handle
     }
 
-    fn provider_kind(&self) -> CatalogProviderKind {
-        CatalogProviderKind::StarRocks
+    fn provider_id(&self) -> ConnectorProviderId {
+        ConnectorProviderId::parse("starrocks").expect("static provider ID")
     }
 }
 
 impl CatalogRuntimeMaterializer for StarRocksCatalogRuntimeMaterializer {
-    fn provider_kind(&self) -> CatalogProviderKind {
-        CatalogProviderKind::StarRocks
+    fn provider_id(&self) -> ConnectorProviderId {
+        ConnectorProviderId::parse("starrocks").expect("static provider ID")
     }
 
     fn materialize(
         &self,
         properties: &CatalogProperties,
     ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError> {
-        if properties.provider_kind() != CatalogProviderKind::StarRocks {
+        if properties.provider_id().as_str() != "starrocks" {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "StarRocks catalog materializer received another provider kind",

@@ -20,8 +20,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use novarocks_frontend::connector::ConnectorControlHost;
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
-    ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
+    CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorBeginScanRequest,
+    ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorCatalogMutationResolver, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
@@ -140,7 +140,7 @@ fn binding(incarnation: u8) -> ConnectorControlBinding {
 fn catalog_properties(instance: ConnectorInstanceId) -> CatalogProperties {
     CatalogProperties::new(
         CatalogHandle::new(instance, CatalogVersion::from_bytes([3; 32])),
-        CatalogProviderKind::Iceberg,
+        ConnectorProviderId::parse("iceberg").expect("static provider ID"),
         1,
         vec![CatalogProperty::new("warehouse", "s3://rewrite-session").expect("valid warehouse")],
         Vec::new(),

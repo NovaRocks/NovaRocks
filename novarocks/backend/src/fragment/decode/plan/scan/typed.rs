@@ -251,7 +251,11 @@ fn typed_scan_runtime_inputs(
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
-    .map(|request| request.with_storage_resolver(runtime.storage_resolver()))
+    .map(|request| {
+        request
+            .with_storage_resolver(runtime.storage_resolver())
+            .with_resources(runtime.connector_resources())
+    })
     .map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidValue,
@@ -690,34 +694,18 @@ mod tests {
     /// The `$files` system relation, whose reference is valid for either lane.
     fn system_table_relation() -> dto::catalog_table_handle::Relation {
         dto::catalog_table_handle::Relation::SystemTable(dto::ConnectorSystemTableReference {
-            reference: Some(dto::connector_system_table_reference::Reference::Iceberg(
-                dto::IcebergSystemTableReference {
-                    schema_table_name: Some(test_support::schema_table_name()),
-                    system_table_type: dto::IcebergSystemTableType::Files as i32,
-                    metadata_file_location: "s3://bucket/warehouse/db/t/metadata/v3.json"
-                        .to_owned(),
-                    table_uuid: "6b1c2f0a-9d4e-4f7b-8a31-0c5d7e9f1234".to_owned(),
-                    snapshot_id: Some(11),
-                },
+            provider_payload: Some(test_support::encoded_payload(
+                novarocks_spi::connector::ConnectorCodecCategory::ReadTable,
+                bytes::Bytes::from_static(b"system-table"),
             )),
         })
     }
 
     fn change_window_relation() -> dto::catalog_table_handle::Relation {
         dto::catalog_table_handle::Relation::ChangeWindow(dto::ConnectorChangeWindowHandle {
-            handle: Some(dto::connector_change_window_handle::Handle::Iceberg(
-                dto::IcebergChangeWindowHandle {
-                    schema_table_name: Some(test_support::schema_table_name()),
-                    table_schema_json: "{\"type\":\"struct\"}".to_owned(),
-                    columns: vec![test_support::iceberg_column_handle(1)],
-                    name_mapping_json: None,
-                    from_snapshot_id_exclusive: 3,
-                    to_snapshot_id_inclusive: 9,
-                    partition_spec_jsons: std::collections::BTreeMap::from([(
-                        0,
-                        "{\"spec-id\":0}".to_owned(),
-                    )]),
-                },
+            provider_payload: Some(test_support::encoded_payload(
+                novarocks_spi::connector::ConnectorCodecCategory::ReadTable,
+                bytes::Bytes::from_static(b"change-window"),
             )),
         })
     }
@@ -1066,35 +1054,19 @@ mod tests {
             (
                 dto::catalog_table_handle::Relation::TableFunction(
                     dto::ConnectorTableFunctionHandle {
-                        handle: Some(
-                            dto::connector_table_function_handle::Handle::IcebergTableChanges(
-                                dto::TableChangesFunctionHandle {
-                                    schema_table_name: Some(test_support::schema_table_name()),
-                                    table_schema_json: "{\"type\":\"struct\"}".to_owned(),
-                                    columns: vec![test_support::iceberg_column_handle(1)],
-                                    name_mapping_json: None,
-                                    start_snapshot_id: 3,
-                                    end_snapshot_id: 9,
-                                },
-                            ),
-                        ),
+                        provider_payload: Some(test_support::encoded_payload(
+                            novarocks_spi::connector::ConnectorCodecCategory::ReadTable,
+                            bytes::Bytes::from_static(b"table-function"),
+                        )),
                     },
                 ),
                 "table_function",
             ),
             (
                 dto::catalog_table_handle::Relation::MergeTable(dto::ConnectorMergeTableHandle {
-                    handle: Some(dto::connector_merge_table_handle::Handle::Iceberg(
-                        dto::IcebergMergeTableHandle {
-                            table_handle: Some(test_support::iceberg_table_handle()),
-                            insert_table_handle: Some(dto::IcebergInsertTableHandle {
-                                schema_table_name: Some(test_support::schema_table_name()),
-                                table_schema_json: "{\"type\":\"struct\"}".to_owned(),
-                                table_location: "s3://bucket/warehouse/db/t".to_owned(),
-                                format_version: 2,
-                                spec_id: Some(0),
-                            }),
-                        },
+                    provider_payload: Some(test_support::encoded_payload(
+                        novarocks_spi::connector::ConnectorCodecCategory::ReadTable,
+                        bytes::Bytes::from_static(b"merge-table"),
                     )),
                 }),
                 "merge_table",

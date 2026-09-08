@@ -22,11 +22,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
-    CatalogRuntimeMaterializer, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
-    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
-    ConnectorProviderBindingKey, ConnectorReadExecution, ConnectorRequestContext,
+    CatalogHandle, CatalogProperties, CatalogRuntime, CatalogRuntimeMaterializer,
+    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
+    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext,
     ConnectorScanUnitDomainFacts, ConnectorSplit,
 };
 
@@ -72,21 +72,21 @@ impl CatalogRuntime for IcebergCatalogRuntime {
         &self.handle
     }
 
-    fn provider_kind(&self) -> CatalogProviderKind {
-        CatalogProviderKind::Iceberg
+    fn provider_id(&self) -> ConnectorProviderId {
+        ConnectorProviderId::parse("iceberg").expect("static provider ID")
     }
 }
 
 impl CatalogRuntimeMaterializer for IcebergCatalogRuntimeMaterializer {
-    fn provider_kind(&self) -> CatalogProviderKind {
-        CatalogProviderKind::Iceberg
+    fn provider_id(&self) -> ConnectorProviderId {
+        ConnectorProviderId::parse("iceberg").expect("static provider ID")
     }
 
     fn materialize(
         &self,
         properties: &CatalogProperties,
     ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError> {
-        if properties.provider_kind() != CatalogProviderKind::Iceberg {
+        if properties.provider_id().as_str() != "iceberg" {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "Iceberg catalog materializer received another provider kind",

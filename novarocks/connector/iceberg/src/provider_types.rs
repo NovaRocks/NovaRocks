@@ -15,11 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bytes::Bytes;
 use novarocks_spi::connector::provider::ProviderReadTypes;
+use novarocks_spi::connector::read_stack::ConnectorReadSplitFacts;
+use novarocks_spi::connector::{
+    ConnectorCodecError, ConnectorDecodeContext, ConnectorPrivateDecoder, ConnectorPrivateEncoder,
+};
 
 use crate::typed_read::{
     HiveTransactionHandle, IcebergColumnHandle, IcebergReadSplit, IcebergRuntimeRelation,
 };
+use crate::wire::read::IcebergReadWireCodec;
 
 /// Frozen provider view carried separately from the table and split.
 ///
@@ -45,6 +51,71 @@ impl IcebergReadView {
 /// The single Iceberg read family shared by control and execution adapters.
 pub struct IcebergReadTypes;
 
+impl IcebergReadTypes {
+    /// The one provider-owned codec shared by both role adapters.
+    pub const fn wire_codecs() -> IcebergReadCodecs {
+        IcebergReadCodecs
+    }
+}
+
+/// Public Iceberg read-family facade over the provider-private protobuf.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IcebergReadCodecs;
+
+impl IcebergReadCodecs {
+    pub fn encode_table(
+        &self,
+        value: &IcebergRuntimeRelation,
+    ) -> Result<Bytes, ConnectorCodecError> {
+        IcebergReadWireCodec.encode_private(value)
+    }
+
+    pub fn decode_table(
+        &self,
+        payload: &[u8],
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<IcebergRuntimeRelation, ConnectorCodecError> {
+        IcebergReadWireCodec.decode_private(payload, context)
+    }
+
+    pub fn encode_column(&self, value: &IcebergColumnHandle) -> Result<Bytes, ConnectorCodecError> {
+        IcebergReadWireCodec.encode_private(value)
+    }
+
+    pub fn decode_column(
+        &self,
+        payload: &[u8],
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<IcebergColumnHandle, ConnectorCodecError> {
+        IcebergReadWireCodec.decode_private(payload, context)
+    }
+
+    pub fn encode_read_view(&self, value: &IcebergReadView) -> Result<Bytes, ConnectorCodecError> {
+        IcebergReadWireCodec.encode_private(value)
+    }
+
+    pub fn decode_read_view(
+        &self,
+        payload: &[u8],
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<IcebergReadView, ConnectorCodecError> {
+        IcebergReadWireCodec.decode_private(payload, context)
+    }
+
+    pub fn encode_split(&self, value: &IcebergReadSplit) -> Result<Bytes, ConnectorCodecError> {
+        IcebergReadWireCodec.encode_private(value)
+    }
+
+    pub fn decode_split(
+        &self,
+        payload: &[u8],
+        facts: &ConnectorReadSplitFacts,
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<IcebergReadSplit, ConnectorCodecError> {
+        IcebergReadWireCodec.decode_split_private(payload, facts, context)
+    }
+}
+
 impl ProviderReadTypes for IcebergReadTypes {
     type Table = IcebergRuntimeRelation;
     type Column = IcebergColumnHandle;
@@ -69,5 +140,6 @@ mod tests {
         {
         }
         assert_family::<IcebergReadTypes>();
+        let _codec = IcebergReadTypes::wire_codecs();
     }
 }

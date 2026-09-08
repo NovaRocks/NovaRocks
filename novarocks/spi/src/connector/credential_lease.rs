@@ -553,8 +553,8 @@ mod tests {
     };
     use crate::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorError,
-        ConnectorInstanceId, CredentialConsumerRole, StorageAccessDomainId,
+        CatalogProperties, CatalogVersion, ConnectorError, ConnectorInstanceId,
+        ConnectorProviderId, CredentialConsumerRole, StorageAccessDomainId,
         StorageCredentialScopePrefix,
     };
     use novarocks_secret::SecretValue;
@@ -674,7 +674,7 @@ mod tests {
     fn vended_catalog_properties() -> CatalogProperties {
         CatalogProperties::new(
             owner(),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             vec![],
             vec![

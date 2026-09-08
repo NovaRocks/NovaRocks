@@ -730,7 +730,7 @@ mod tests {
         DispatchLane, DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer,
         SplitWatermark, TaskIdentity, UpdateTask,
     };
-    use novarocks_proto_codec::connector_read::{ConnectorReadCodecError, ConnectorReadEncoder};
+    use novarocks_spi::connector::ConnectorReadWireEncoder;
     use novarocks_types::identity::{BackendProcessId, StageId};
     use novarocks_types::{AttemptId, QueryId};
 
@@ -746,44 +746,48 @@ mod tests {
     /// methods a terminal marker reaches may be reachable.
     struct TerminalOnlyEncoder;
 
-    impl ConnectorReadEncoder for TerminalOnlyEncoder {
+    impl ConnectorReadWireEncoder for TerminalOnlyEncoder {
         fn owner(&self) -> &str {
             "split-delivery-test"
         }
 
-        fn encode_relation(
+        fn encode_relation_payload(
             &self,
             _relation: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
         ) -> Result<
-            novarocks_proto_models::connector_read::CatalogTableHandle,
-            ConnectorReadCodecError,
+            novarocks_spi::connector::ConnectorReadRelationPayload,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
             unreachable!("split delivery tests never encode a relation")
         }
 
-        fn encode_column(
+        fn encode_column_payload(
             &self,
             _column: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-        ) -> Result<novarocks_proto_models::connector_read::ColumnHandle, ConnectorReadCodecError>
-        {
+        ) -> Result<
+            novarocks_spi::connector::ConnectorEncodedPayload,
+            novarocks_spi::connector::ConnectorCodecError,
+        > {
             unreachable!("split delivery tests never encode a column")
         }
 
-        fn encode_transaction(
+        fn encode_transaction_payload(
             &self,
             _transaction: &novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
         ) -> Result<
-            novarocks_proto_models::connector_read::ConnectorTransactionHandle,
-            ConnectorReadCodecError,
+            novarocks_spi::connector::ConnectorEncodedPayload,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
             unreachable!("split delivery tests never encode a transaction")
         }
 
-        fn encode_split(
+        fn encode_split_payload(
             &self,
             _split: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
-        ) -> Result<novarocks_proto_models::connector_read::ConnectorSplit, ConnectorReadCodecError>
-        {
+        ) -> Result<
+            novarocks_spi::connector::ConnectorReadSplitPayload,
+            novarocks_spi::connector::ConnectorCodecError,
+        > {
             unreachable!("split delivery tests never enumerate a split")
         }
     }

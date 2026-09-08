@@ -1,0 +1,2 @@
+# PAI-1 reads a fixture authored by an external Spark/Paimon process.
+explicit_only = true

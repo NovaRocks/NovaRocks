@@ -1,0 +1,116 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Spec module for paimon.
+//!
+//! All paimon specs types are defined here.
+
+mod binary_row;
+pub use binary_row::*;
+
+mod blob_descriptor;
+pub use blob_descriptor::BlobDescriptor;
+
+mod blob_view_struct;
+pub use blob_view_struct::BlobViewStruct;
+
+mod data_file;
+pub use data_file::*;
+
+mod core_options;
+pub(crate) use core_options::TimeTravelSelector;
+pub use core_options::*;
+
+mod partial_update;
+pub(crate) use partial_update::PartialUpdateConfig;
+
+mod aggregation;
+pub(crate) use aggregation::{
+    remove_field_scoped_options, rename_field_scoped_options, AggregationConfig,
+};
+
+mod data_type_casts;
+pub(crate) use data_type_casts::supports_cast;
+
+mod schema;
+pub use schema::*;
+
+mod schema_change;
+pub use schema_change::*;
+
+mod variant_metadata;
+pub use variant_metadata::*;
+
+mod snapshot;
+pub use snapshot::*;
+
+mod manifest_file_meta;
+pub use manifest_file_meta::*;
+
+mod index_file_meta;
+pub use index_file_meta::*;
+
+mod pk_index_source;
+pub use pk_index_source::*;
+
+mod index_manifest;
+pub use index_manifest::{IndexManifest, IndexManifestEntry};
+mod manifest;
+pub(crate) use manifest::merge_active_entries;
+pub use manifest::Manifest;
+mod manifest_common;
+pub use manifest_common::FileKind;
+mod manifest_entry;
+pub use manifest_entry::Identifier;
+pub use manifest_entry::ManifestEntry;
+pub(crate) use manifest_entry::MANIFEST_ENTRY_SCHEMA;
+mod manifest_list;
+pub use manifest_list::ManifestList;
+mod objects_file;
+pub use objects_file::from_avro_bytes;
+pub use objects_file::to_avro_bytes;
+pub(crate) use objects_file::{
+    new_avro_writer, to_avro_bytes_with_compression, DEFAULT_AVRO_BLOCK_SIZE,
+    DEFAULT_AVRO_COMPRESSION,
+};
+pub(crate) mod avro;
+pub(crate) mod stats;
+pub use stats::BinaryTableStats;
+mod types;
+pub use types::*;
+mod partition;
+pub use partition::Partition;
+mod partition_utils;
+pub(crate) use partition_utils::PartitionComputer;
+mod predicate;
+pub(crate) use predicate::datum_cmp;
+pub(crate) use predicate::eval_row;
+pub(crate) use predicate::extract_datum;
+pub(crate) use predicate::java_bytes_cmp;
+pub(crate) use predicate::like_match;
+pub use predicate::{
+    field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator,
+};
+pub(crate) mod murmur_hash;
+mod partition_statistics;
+pub use partition_statistics::PartitionStatistics;
+
+mod row_kind;
+pub use row_kind::RowKind;
+
+mod row_kind_filter;
+pub(crate) use row_kind_filter::RowKindFilter;

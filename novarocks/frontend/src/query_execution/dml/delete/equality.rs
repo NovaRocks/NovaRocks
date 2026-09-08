@@ -55,10 +55,10 @@ pub(crate) fn prepare_equality_delete_statement(
 ) -> Result<PreparedDelete, String> {
     let table = sql_object_name(&stmt.target);
     let target = resolve_existing_table_target(state, &table, current_catalog, current_database)?;
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         return Err(format!(
             "ADD EQUALITY DELETE only supports iceberg backends, got `{}`",
-            target.backend_name
+            target.provider_id.as_str()
         ));
     }
     let planning_lease = crate::connector::acquire_metadata_planning_lease(

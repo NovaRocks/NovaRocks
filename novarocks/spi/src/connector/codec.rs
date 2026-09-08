@@ -27,6 +27,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use super::read_stack::{
+    ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadRelationKind,
+    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadTransactionHandle,
+};
+use super::write_stack::{ConnectorCommitFragment, ConnectorWriterHandle};
 use super::{CatalogHandle, ConnectorProviderId};
 
 pub const MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH: usize = 64;
@@ -342,6 +347,163 @@ pub trait ConnectorPrivateDecoder<T>: Send + Sync {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<T, ConnectorCodecError>;
+}
+
+/// Provider-neutral relation payloads handed between a provider codec and the
+/// public protobuf adapter. The provider owns the two private payloads; the
+/// public adapter owns the relation discriminant and its generated DTO.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorReadRelationPayload {
+    kind: ConnectorReadRelationKind,
+    table: ConnectorEncodedPayload,
+    view: ConnectorEncodedPayload,
+}
+
+impl ConnectorReadRelationPayload {
+    pub const fn new(
+        kind: ConnectorReadRelationKind,
+        table: ConnectorEncodedPayload,
+        view: ConnectorEncodedPayload,
+    ) -> Self {
+        Self { kind, table, view }
+    }
+
+    pub const fn kind(&self) -> ConnectorReadRelationKind {
+        self.kind
+    }
+
+    pub const fn table(&self) -> &ConnectorEncodedPayload {
+        &self.table
+    }
+
+    pub const fn view(&self) -> &ConnectorEncodedPayload {
+        &self.view
+    }
+}
+
+/// Public scheduling category paired with one provider-private split payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorReadSplitCategory {
+    Data,
+    TableChanges,
+    ChangeWindow,
+    SystemFiles,
+    RewritePositionDeleteFiles,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorReadSplitPayload {
+    category: ConnectorReadSplitCategory,
+    provider_payload: ConnectorEncodedPayload,
+}
+
+impl ConnectorReadSplitPayload {
+    pub const fn new(
+        category: ConnectorReadSplitCategory,
+        provider_payload: ConnectorEncodedPayload,
+    ) -> Self {
+        Self {
+            category,
+            provider_payload,
+        }
+    }
+
+    pub const fn category(&self) -> ConnectorReadSplitCategory {
+        self.category
+    }
+
+    pub const fn provider_payload(&self) -> &ConnectorEncodedPayload {
+        &self.provider_payload
+    }
+}
+
+/// FE-facing provider codec facet. It produces only SPI payloads; generated
+/// public DTOs remain the responsibility of the outer wire adapter.
+pub trait ConnectorReadWireEncoder: Send + Sync {
+    fn owner(&self) -> &str;
+
+    fn encode_relation_payload(
+        &self,
+        relation: &ConnectorReadRelation,
+    ) -> Result<ConnectorReadRelationPayload, ConnectorCodecError>;
+
+    fn encode_column_payload(
+        &self,
+        column: &ConnectorReadColumnHandle,
+    ) -> Result<ConnectorEncodedPayload, ConnectorCodecError>;
+
+    fn encode_transaction_payload(
+        &self,
+        transaction: &ConnectorReadTransactionHandle,
+    ) -> Result<ConnectorEncodedPayload, ConnectorCodecError>;
+
+    fn encode_split_payload(
+        &self,
+        split: &ConnectorReadSplit,
+    ) -> Result<ConnectorReadSplitPayload, ConnectorCodecError>;
+}
+
+/// BE-facing provider codec facet. Public protobuf validation has completed
+/// before these methods receive an SPI payload.
+pub trait ConnectorReadWireDecoder: Send + Sync {
+    fn owner(&self) -> &str;
+
+    fn decode_relation_payload(
+        &self,
+        payload: &ConnectorReadRelationPayload,
+    ) -> Result<ConnectorReadRelation, ConnectorCodecError>;
+
+    fn decode_column_payload(
+        &self,
+        payload: &ConnectorEncodedPayload,
+    ) -> Result<ConnectorReadColumnHandle, ConnectorCodecError>;
+
+    fn decode_transaction_payload(
+        &self,
+        payload: &ConnectorEncodedPayload,
+    ) -> Result<ConnectorReadTransactionHandle, ConnectorCodecError>;
+
+    fn decode_split_payload(
+        &self,
+        payload: &ConnectorReadSplitPayload,
+        facts: &ConnectorReadSplitFacts,
+    ) -> Result<ConnectorReadSplit, ConnectorCodecError>;
+}
+
+pub trait ConnectorWriteHandleWireEncoder: Send + Sync {
+    fn owner(&self) -> &str;
+
+    fn encode_writer_handle_payload(
+        &self,
+        handle: &ConnectorWriterHandle,
+    ) -> Result<ConnectorEncodedPayload, ConnectorCodecError>;
+}
+
+pub trait ConnectorWriteHandleWireDecoder: Send + Sync {
+    fn owner(&self) -> &str;
+
+    fn decode_writer_handle_payload(
+        &self,
+        payload: &ConnectorEncodedPayload,
+    ) -> Result<ConnectorWriterHandle, ConnectorCodecError>;
+}
+
+pub trait ConnectorWriteFragmentWireEncoder: Send + Sync {
+    fn owner(&self) -> &str;
+
+    fn encode_commit_fragment_payload(
+        &self,
+        fragment: &ConnectorCommitFragment,
+    ) -> Result<ConnectorEncodedPayload, ConnectorCodecError>;
+}
+
+pub trait ConnectorWriteFragmentWireDecoder: Send + Sync {
+    fn owner(&self) -> &str;
+
+    fn decode_commit_fragment_payload(
+        &self,
+        payload: &ConnectorEncodedPayload,
+    ) -> Result<ConnectorCommitFragment, ConnectorCodecError>;
 }
 
 impl ConnectorDecodeLedger {
