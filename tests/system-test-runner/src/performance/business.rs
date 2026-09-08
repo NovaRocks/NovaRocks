@@ -605,14 +605,21 @@ pub(super) fn execute_job(
         }
         BusinessKind::Analyze => {
             let mut exact_job_id = None;
+            let mut last_state = None;
             let completed = loop {
-                check_deadline(deadline)?;
+                check_job_deadline(
+                    deadline,
+                    job,
+                    exact_job_id.as_deref(),
+                    last_state.as_deref(),
+                )?;
                 if let Some(observed) =
                     observe_exact_job(analyze_jobs(connection, job)?, &mut exact_job_id)?
                 {
                     if terminal_success(&observed.state, "SUCCEEDED")? {
                         break observed;
                     }
+                    last_state = Some(observed.state);
                 }
                 thread::sleep(
                     poll_interval.min(deadline.saturating_duration_since(Instant::now())),
@@ -634,14 +641,21 @@ pub(super) fn execute_job(
         }
         BusinessKind::Optimize => {
             let mut exact_job_id = None;
+            let mut last_state = None;
             let completed = loop {
-                check_deadline(deadline)?;
+                check_job_deadline(
+                    deadline,
+                    job,
+                    exact_job_id.as_deref(),
+                    last_state.as_deref(),
+                )?;
                 if let Some(observed) =
                     observe_exact_job(optimize_jobs(connection, job)?, &mut exact_job_id)?
                 {
                     if terminal_success(&observed.state, "FINISHED")? {
                         break observed;
                     }
+                    last_state = Some(observed.state);
                 }
                 thread::sleep(
                     poll_interval.min(deadline.saturating_duration_since(Instant::now())),
@@ -691,16 +705,31 @@ pub(super) fn execute_job(
             sample.publication_marker = published.to_string();
         }
     }
-    check_deadline(deadline)?;
+    check_job_deadline(
+        deadline,
+        job,
+        sample.job_id.as_deref(),
+        Some("post-completion-validation"),
+    )?;
     sample.total_micros = started.elapsed().as_micros();
     sample.completed_in_window = Instant::now() <= window_deadline;
     Ok(sample)
 }
 
-fn check_deadline(deadline: Instant) -> Result<()> {
+fn check_job_deadline(
+    deadline: Instant,
+    job: &PreparedJob,
+    job_id: Option<&str>,
+    last_state: Option<&str>,
+) -> Result<()> {
     ensure!(
         Instant::now() < deadline,
-        "mixed business completion deadline exceeded; job outcome is not proven"
+        "mixed {} job {} for {} exceeded its completion deadline; exact_job_id={}; last_state={}; job outcome is not proven",
+        job.kind.name(),
+        job.ordinal,
+        job.target(),
+        job_id.unwrap_or("unobserved"),
+        last_state.unwrap_or("unobserved")
     );
     Ok(())
 }
