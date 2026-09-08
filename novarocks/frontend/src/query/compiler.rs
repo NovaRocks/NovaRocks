@@ -234,24 +234,33 @@ impl PreparedDistributedRoundFactory for FrontendDistributedRoundFactory {
             Vec::new(),
             self.compiler.query.catalog_application().map(Arc::as_ref),
         );
-        let analyzed = SqlCompiler::analyze(
-            self.compiler
-                .analyze_request(
-                    &self.query,
-                    self.current_catalog.as_deref(),
-                    &self.current_database,
-                    execution.execution(),
-                    &materializer,
-                    self.mv_definitions.as_ref(),
-                    self.intent.clone(),
-                )
-                .map_err(|error| {
-                    DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
-                })?,
-        )
-        .map_err(|error| {
-            FrontendDistributedRoundFactory::error(FrontendQueryCompilerError::from_compile(error))
-        })?
+        let analyze_request = self
+            .compiler
+            .analyze_request(
+                &self.query,
+                self.current_catalog.as_deref(),
+                &self.current_database,
+                execution.execution(),
+                &materializer,
+                self.mv_definitions.as_ref(),
+                self.intent.clone(),
+            )
+            .map_err(|error| {
+                DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
+            })?;
+        let analyzed = crate::preparation_diagnostics::observe_result(
+            "compile",
+            "retry_sql_analyze",
+            "not-applicable",
+            None,
+            || {
+                SqlCompiler::analyze(analyze_request).map_err(|error| {
+                    FrontendDistributedRoundFactory::error(
+                        FrontendQueryCompilerError::from_compile(error),
+                    )
+                })
+            },
+        )?
         .into_pending()
         .map_err(|error| {
             FrontendDistributedRoundFactory::error(FrontendQueryCompilerError::from_compile(error))
@@ -261,29 +270,47 @@ impl PreparedDistributedRoundFactory for FrontendDistributedRoundFactory {
                 .map_err(|error| {
                     DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
                 })?;
-        let distributed_plan =
-            SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
+        let distributed_plan = crate::preparation_diagnostics::observe_result(
+            "compile",
+            "retry_sql_optimize",
+            "not-applicable",
+            None,
+            || {
+                SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics)).map_err(
+                    |error| {
+                        FrontendDistributedRoundFactory::error(
+                            FrontendQueryCompilerError::from_compile(error),
+                        )
+                    },
+                )
+            },
+        )?
+        .into_distributed_plan()
+        .map_err(|error| {
+            FrontendDistributedRoundFactory::error(FrontendQueryCompilerError::from_compile(error))
+        })?;
+        let (assembly, completion) = crate::preparation_diagnostics::observe_result(
+            "compile",
+            "retry_prepare_distributed_description",
+            "not-applicable",
+            None,
+            || {
+                prepare_compiled_distributed_query(
+                    distributed_plan,
+                    &self.compiler.query,
+                    &materializer,
+                    &connector_context,
+                    self.query_options.clone(),
+                    execution.execution(),
+                    self.completion.next_round_intent(),
+                )
                 .map_err(|error| {
-                    FrontendDistributedRoundFactory::error(
-                        FrontendQueryCompilerError::from_compile(error),
-                    )
-                })?
-                .into_distributed_plan()
-                .map_err(|error| {
-                    FrontendDistributedRoundFactory::error(
-                        FrontendQueryCompilerError::from_compile(error),
-                    )
-                })?;
-        let (assembly, completion) = prepare_compiled_distributed_query(
-            distributed_plan,
-            &self.compiler.query,
-            &materializer,
-            &connector_context,
-            self.query_options.clone(),
-            execution.execution(),
-            self.completion.next_round_intent(),
-        )
-        .map_err(|error| DistributedQueryError::new(DistributedQueryErrorKind::Failed, error))?;
+                    FrontendDistributedRoundFactory::error(FrontendQueryCompilerError::Engine(
+                        error,
+                    ))
+                })
+            },
+        )?;
         let native_bundle = encode_native_fragment_bundle(assembly.encoding().encoding_view())
             .map_err(|error| {
                 DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
@@ -502,7 +529,7 @@ impl FrontendQueryCompiler {
         } else {
             None
         };
-        let analyzed = SqlCompiler::analyze(self.analyze_request(
+        let analyze_request = self.analyze_request(
             query,
             current_catalog,
             current_database,
@@ -510,27 +537,47 @@ impl FrontendQueryCompiler {
             &materializer,
             mv_definitions.as_ref(),
             intent.clone(),
-        )?)
+        )?;
+        let analyzed = crate::preparation_diagnostics::observe_result(
+            "compile",
+            "sql_analyze",
+            "not-applicable",
+            None,
+            || SqlCompiler::analyze(analyze_request),
+        )
         .map_err(FrontendQueryCompilerError::from_compile)?
         .into_pending()
         .map_err(FrontendQueryCompilerError::from_compile)?;
         reject_quarantined_mv_targets(bindings.as_ref(), self.mv_readiness.as_ref())?;
         let statistics =
             query_statistics_snapshot(&self.query, &materializer, &attempt_connector_context)?;
-        let distributed_plan =
-            SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
-                .map_err(FrontendQueryCompilerError::from_compile)?
-                .into_distributed_plan()
-                .map_err(FrontendQueryCompilerError::from_compile)?;
+        let distributed_plan = crate::preparation_diagnostics::observe_result(
+            "compile",
+            "sql_optimize",
+            "not-applicable",
+            None,
+            || SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics)),
+        )
+        .map_err(FrontendQueryCompilerError::from_compile)?
+        .into_distributed_plan()
+        .map_err(FrontendQueryCompilerError::from_compile)?;
         let retry_completion = RetryCompletionTemplate::from_first_round(&completion_intent);
-        let (assembly, completion) = prepare_compiled_distributed_query(
-            distributed_plan,
-            &self.query,
-            &materializer,
-            &attempt_connector_context,
-            query_options.clone(),
-            execution,
-            completion_intent,
+        let (assembly, completion) = crate::preparation_diagnostics::observe_result(
+            "compile",
+            "prepare_distributed_description",
+            "not-applicable",
+            None,
+            || {
+                prepare_compiled_distributed_query(
+                    distributed_plan,
+                    &self.query,
+                    &materializer,
+                    &attempt_connector_context,
+                    query_options.clone(),
+                    execution,
+                    completion_intent,
+                )
+            },
         )?;
         // Semantic admission is complete before native request construction.
         // Static rounds reuse these exact bindings on a topology retry. A

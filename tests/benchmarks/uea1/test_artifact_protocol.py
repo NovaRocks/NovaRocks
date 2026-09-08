@@ -67,7 +67,7 @@ class ArtifactFixture:
             },
         }
         self.performance = {
-            "schema_version": 3,
+            "schema_version": 4,
             "run_id": self.run_id,
             "run_manifest_sha256": "",
             "manifest_sha256": self.hashes["manifest"],
@@ -93,6 +93,12 @@ class ArtifactFixture:
                 "ended_elapsed_millis": 200,
                 "drain_ended_elapsed_millis": 201,
             }],
+            "preparation_diagnostic": {
+                "schema_version": 1,
+                "run_token": self.run_id,
+                "started_elapsed_micros": 10_000,
+                "ended_elapsed_micros": 90_000,
+            },
             "preparation_events_status": "available",
             "preparation_events": [
                 {
@@ -175,14 +181,26 @@ class ArtifactProtocolTest(unittest.TestCase):
     def tearDown(self):
         self.fixture.close()
 
-    def test_schema_three_and_exact_run_manifest_reference_are_accepted(self):
+    def test_schema_four_and_exact_run_manifest_reference_are_accepted(self):
         document = self.fixture.extract()
         self.assertEqual(document["provenance"]["run_id"], self.fixture.run_id)
         self.assertEqual(document["compatibility"]["build_profile"], "release")
 
-    def test_schema_two_is_rejected(self):
+    def test_old_performance_schema_is_rejected(self):
         self.fixture.performance["schema_version"] = 2
-        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "schema_version 3"):
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "schema_version 4"):
+            self.fixture.extract()
+
+    def test_diagnostic_run_token_must_match_run_manifest(self):
+        self.fixture.performance["preparation_diagnostic"]["run_token"] = "other-run"
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "exact formal run"):
+            self.fixture.extract()
+
+    def test_diagnostic_prelude_must_end_before_timed_windows(self):
+        self.fixture.performance["preparation_diagnostic"][
+            "ended_elapsed_micros"
+        ] = 100_001
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "overlaps"):
             self.fixture.extract()
 
     def test_tampered_run_identity_and_manifest_reference_are_rejected(self):

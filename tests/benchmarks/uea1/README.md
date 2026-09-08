@@ -59,6 +59,14 @@ start/end identity. Formal extraction rejects a missing preparation event,
 any incomplete FE/three-BE resource window, and any artifact that does not
 reference the exact completed run manifest.
 
+Preparation measurements use an authenticated, run-scoped diagnostic prelude.
+The runner arms the otherwise absent collector with the run-manifest identity,
+executes the scenario's real preparation paths, drains and disarms it, and only
+then starts timed work. `uea1-performance.json` records the diagnostic range in
+the same monotonic domain as every timed window. Formal extraction requires the
+exact run token and rejects any overlap. The launch secret is process-local and
+is never written to the artifact.
+
 `workloads-smoke.json` uses the same three real business operations and oracles
 with small fixtures and one job of each kind. Its closed producers may finish
 before the foreground window because it is a facility self-test, not

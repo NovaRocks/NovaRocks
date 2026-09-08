@@ -72,6 +72,11 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             };
         }
     };
+    let uea1_preparation_diagnostic_secret = launch_config
+        .child_environment
+        .fe
+        .get("NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET")
+        .cloned();
     let handle = CrossProcessServerHandle::launch(CrossProcessClusterOptions {
         binary: config.binary.clone(),
         fe_binary: resolve_binary(
@@ -120,6 +125,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         config.cluster_size,
         config.launch_profile,
         config.uea1_workload_manifest.clone(),
+        uea1_preparation_diagnostic_secret,
     );
     context.action("cluster launched and topology barrier passed");
     let result = scenario.run(&mut context);

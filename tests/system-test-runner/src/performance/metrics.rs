@@ -16,7 +16,7 @@
 // under the License.
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
@@ -46,7 +46,7 @@ pub struct MeasurementWindow {
     pub ended_elapsed_millis: u128,
     pub drain_ended_elapsed_millis: u128,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PreparationEvent {
     pub work_id: String,
     pub logical_execution_id: String,
@@ -61,6 +61,21 @@ pub struct PreparationEvent {
     pub outcome: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PerformanceDiagnosticResponse {
+    pub schema_version: u8,
+    pub run_token: String,
+    pub events: Vec<PreparationEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PreparationDiagnosticFrame {
+    pub schema_version: u8,
+    pub run_token: String,
+    pub started_elapsed_micros: u128,
+    pub ended_elapsed_micros: u128,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PerformanceReport<'a> {
     pub schema_version: u32,
@@ -70,6 +85,7 @@ pub struct PerformanceReport<'a> {
     pub scenario: &'a str,
     pub query_samples: &'a [QuerySample],
     pub measurement_windows: &'a [MeasurementWindow],
+    pub preparation_diagnostic: &'a PreparationDiagnosticFrame,
     pub preparation_events_status: &'a str,
     pub preparation_events: &'a [PreparationEvent],
 }
@@ -82,6 +98,7 @@ pub struct PerformanceReportInput<'a> {
     pub scenario: &'a str,
     pub samples: &'a [QuerySample],
     pub measurement_windows: &'a [MeasurementWindow],
+    pub preparation_diagnostic: &'a PreparationDiagnosticFrame,
     pub preparation_events: &'a [PreparationEvent],
 }
 
@@ -94,16 +111,18 @@ pub fn write_report(input: PerformanceReportInput<'_>) -> Result<()> {
         scenario,
         samples,
         measurement_windows,
+        preparation_diagnostic,
         preparation_events,
     } = input;
     let report = PerformanceReport {
-        schema_version: 3,
+        schema_version: 4,
         run_id,
         run_manifest_sha256,
         manifest_sha256,
         scenario,
         query_samples: samples,
         measurement_windows,
+        preparation_diagnostic,
         preparation_events_status: if preparation_events.is_empty() {
             "unsupported-not-wired"
         } else {

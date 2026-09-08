@@ -222,6 +222,47 @@ def _validate_preparation_events(performance: dict[str, Any], scenario: str) -> 
             )
 
 
+def _validate_preparation_diagnostic_frame(
+    performance: dict[str, Any], run_id: str
+) -> None:
+    frame = _expect_object(
+        performance.get("preparation_diagnostic"), "preparation_diagnostic"
+    )
+    _expect_exact_keys(
+        frame,
+        {
+            "schema_version",
+            "run_token",
+            "started_elapsed_micros",
+            "ended_elapsed_micros",
+        },
+        "preparation_diagnostic",
+    )
+    if frame["schema_version"] != 1 or frame["run_token"] != run_id:
+        raise ProtocolError("preparation diagnostic does not identify the exact formal run")
+    started = _nonnegative_number(
+        frame["started_elapsed_micros"],
+        "preparation_diagnostic.started_elapsed_micros",
+    )
+    ended = _positive_number(
+        frame["ended_elapsed_micros"],
+        "preparation_diagnostic.ended_elapsed_micros",
+    )
+    if ended < started:
+        raise ProtocolError("preparation diagnostic has an inverted time range")
+    windows = performance.get("measurement_windows")
+    if not isinstance(windows, list) or not windows:
+        raise ProtocolError("preparation diagnostic requires timed measurement windows")
+    for offset, raw in enumerate(windows):
+        window = _expect_object(raw, f"measurement_windows[{offset}]")
+        window_started = _nonnegative_number(
+            window.get("started_elapsed_millis"),
+            f"measurement_windows[{offset}].started_elapsed_millis",
+        )
+        if window_started * 1000 < ended:
+            raise ProtocolError("timed measurement overlaps preparation diagnostic prelude")
+
+
 def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     descriptor = _expect_object(_load_json(descriptor_path, "descriptor"), "descriptor")
     _expect_exact_keys(
@@ -257,8 +298,8 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     )
     if not isinstance(resources, list):
         raise ProtocolError("resource artifact must be an array")
-    if performance.get("schema_version") != 3:
-        raise ProtocolError("performance artifact must use schema_version 3")
+    if performance.get("schema_version") != 4:
+        raise ProtocolError("performance artifact must use schema_version 4")
     run_manifest_sha256 = _sha256_file(artifact_paths["run_manifest"])
     if (
         run_manifest.get("formal") is not True
@@ -316,6 +357,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     )
     if performance.get("run_id") != run_id or run_manifest.get("run_id") != run_id:
         raise ProtocolError("performance and run manifest identity mismatch")
+    _validate_preparation_diagnostic_frame(performance, run_id)
     if performance.get("run_manifest_sha256") != run_manifest_sha256:
         raise ProtocolError("performance artifact does not reference its exact run manifest")
     if performance.get("manifest_sha256") != input_hashes["manifest"]:

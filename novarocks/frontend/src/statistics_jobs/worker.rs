@@ -237,6 +237,11 @@ async fn run_attempt(
     let execution_cancellation = attempt_cancellation.view();
     let execution_job = running.clone();
     let mut execution = tokio::task::spawn_blocking(move || {
+        let job_id = execution_job.job_id;
+        let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
+            format!("statistics-job:{job_id}"),
+            format!("statistics-job:{job_id}"),
+        );
         executor.execute(&execution_job, execution_cancellation)
     });
     let result = loop {

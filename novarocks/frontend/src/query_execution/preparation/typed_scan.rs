@@ -218,8 +218,9 @@ pub(crate) fn prepare_typed_scan(
     //    task has no split at all.
     let (mut handle, work_source) = match freeze {
         TypedRelationFreeze::Table { version, reference } => {
-            let handle = metadata
-                .get_table_handle(session, relation, version, reference)
+            let handle = observe_provider_negotiation(&relation_name, "get_table_handle", || {
+                metadata.get_table_handle(session, relation, version, reference)
+            })
                 .map_err(|error| {
                     format!("typed scan cannot freeze relation {relation_name}: {error}")
                 })?
@@ -231,8 +232,11 @@ pub(crate) fn prepare_typed_scan(
             (handle, ConnectorReadWorkSource::RuntimeSplits)
         }
         TypedRelationFreeze::PinnedFileSet(pinned) => {
-            let handle = metadata
-                .get_pinned_file_set_handle(session, relation, pinned)
+            let handle = observe_provider_negotiation(
+                &relation_name,
+                "get_pinned_file_set_handle",
+                || metadata.get_pinned_file_set_handle(session, relation, pinned),
+            )
                 .map_err(|error| {
                     format!(
                         "typed scan cannot freeze relation {relation_name} restricted to the {} data files pinned at version {}: {error}",
@@ -248,8 +252,11 @@ pub(crate) fn prepare_typed_scan(
             (handle, ConnectorReadWorkSource::RuntimeSplits)
         }
         TypedRelationFreeze::ChangeWindow(window) => {
-            let handle = metadata
-                .get_change_window_plan(session, relation, window)
+            let handle = observe_provider_negotiation(
+                &relation_name,
+                "get_change_window_plan",
+                || metadata.get_change_window_plan(session, relation, window),
+            )
                 .map_err(|error| {
                     format!(
                         "typed scan cannot freeze the change window of relation {relation_name} from snapshot {} to snapshot {}: {error}",
@@ -267,8 +274,11 @@ pub(crate) fn prepare_typed_scan(
             (handle, ConnectorReadWorkSource::RuntimeSplits)
         }
         TypedRelationFreeze::TableExecute(procedure) => {
-            let handle = metadata
-                .get_table_execute_plan(session, relation, procedure)
+            let handle = observe_provider_negotiation(
+                &relation_name,
+                "get_table_execute_plan",
+                || metadata.get_table_execute_plan(session, relation, procedure),
+            )
                 .map_err(|error| {
                     format!(
                         "typed scan cannot freeze the table-execute relation of {relation_name}: {error}"
@@ -282,18 +292,19 @@ pub(crate) fn prepare_typed_scan(
             (handle, ConnectorReadWorkSource::RuntimeSplits)
         }
         TypedRelationFreeze::SystemTable => {
-            let plan = metadata
-                .get_system_table_plan(session, relation)
-                .map_err(|error| {
-                    format!(
-                        "typed scan cannot freeze system relation {relation_name}: {error}"
-                    )
-                })?
-                .ok_or_else(|| {
-                    format!(
-                        "typed scan relation {relation_name} is not a system relation of this connector"
-                    )
-                })?;
+            let plan = observe_provider_negotiation(
+                &relation_name,
+                "get_system_table_plan",
+                || metadata.get_system_table_plan(session, relation),
+            )
+            .map_err(|error| {
+                format!("typed scan cannot freeze system relation {relation_name}: {error}")
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "typed scan relation {relation_name} is not a system relation of this connector"
+                )
+            })?;
             // `SingleCoordinator` means one backend reads one immutable
             // metadata file with no split; spreading it would duplicate every
             // row. `AllNodes` is real distributable I/O and enumerates.
@@ -308,8 +319,10 @@ pub(crate) fn prepare_typed_scan(
     };
 
     // 2. Resolve the relation's columns.
-    let column_bindings = metadata
-        .get_column_bindings(session, &handle)
+    let column_bindings =
+        observe_provider_negotiation(&relation_name, "get_column_bindings", || {
+            metadata.get_column_bindings(session, &handle)
+        })
         .map_err(|error| {
             format!("typed scan cannot read the columns of relation {relation_name}: {error}")
         })?;
@@ -392,49 +405,51 @@ pub(crate) fn prepare_typed_scan(
     // 5. Offer the filter. Whatever the connector hands back stays the
     //    reader's own work: `unenforced_predicate` is applied by the backend
     //    scan, `enforced_predicate` records only what the connector took.
-    let (enforced_predicate, unenforced_predicate, remaining_expression) = match metadata
-        .apply_filter(session, &handle, &constraint)
+    let (enforced_predicate, unenforced_predicate, remaining_expression) =
+        match observe_provider_negotiation(&relation_name, "apply_filter", || {
+            metadata.apply_filter(session, &handle, &constraint)
+        })
         .map_err(|error| {
             format!("typed scan filter pushdown on relation {relation_name} failed: {error}")
         })? {
-        // Nothing was accepted, so the engine keeps the whole predicate — and
-        // keeping it means evaluating it, not handing it to the reader.
-        //
-        // An unenforced predicate is the reader's own work by contract. A
-        // relation the connector declines outright may have no reader that
-        // applies one: a system relation read whole by a single backend opens
-        // its page source with no constraint at all, so a predicate parked
-        // there is applied by nobody and the query silently returns rows it
-        // must not see.
-        None => {
-            lowered.residual_ordinals = (0..scan.predicates.len()).collect();
-            (TupleDomain::all(), TupleDomain::all(), None)
-        }
-        Some(application) => {
-            let unenforced = application.remaining_constraint().summary().clone();
-            let remaining_expression = application
-                .remaining_expression()
-                .filter(|expression| !expression.is_constant_true())
-                .cloned();
-            // Enforcement is claimed only for a column the connector kept
-            // whole. A column it handed back partially is covered by its own
-            // guarantee for the complement, and by the reader for the rest.
-            let enforced = lowered
-                .summary
-                .filter_columns(|column| unenforced.domain_for(column).is_none());
-            handle = application.into_handle();
-            (enforced, unenforced, remaining_expression)
-        }
-    };
+            // Nothing was accepted, so the engine keeps the whole predicate — and
+            // keeping it means evaluating it, not handing it to the reader.
+            //
+            // An unenforced predicate is the reader's own work by contract. A
+            // relation the connector declines outright may have no reader that
+            // applies one: a system relation read whole by a single backend opens
+            // its page source with no constraint at all, so a predicate parked
+            // there is applied by nobody and the query silently returns rows it
+            // must not see.
+            None => {
+                lowered.residual_ordinals = (0..scan.predicates.len()).collect();
+                (TupleDomain::all(), TupleDomain::all(), None)
+            }
+            Some(application) => {
+                let unenforced = application.remaining_constraint().summary().clone();
+                let remaining_expression = application
+                    .remaining_expression()
+                    .filter(|expression| !expression.is_constant_true())
+                    .cloned();
+                // Enforcement is claimed only for a column the connector kept
+                // whole. A column it handed back partially is covered by its own
+                // guarantee for the complement, and by the reader for the rest.
+                let enforced = lowered
+                    .summary
+                    .filter_columns(|column| unenforced.domain_for(column).is_none());
+                handle = application.into_handle();
+                (enforced, unenforced, remaining_expression)
+            }
+        };
 
     // 6. Offer the projection. A narrowed handle is a pushdown fact; the
     //    ordered assignments above remain the output authority either way.
-    if let Some(narrowed) = metadata
-        .apply_projection(session, &handle, &assignments)
-        .map_err(|error| {
-            format!("typed scan projection pushdown on relation {relation_name} failed: {error}")
-        })?
-    {
+    if let Some(narrowed) = observe_provider_negotiation(&relation_name, "apply_projection", || {
+        metadata.apply_projection(session, &handle, &assignments)
+    })
+    .map_err(|error| {
+        format!("typed scan projection pushdown on relation {relation_name} failed: {error}")
+    })? {
         handle = narrowed;
     }
 
@@ -443,11 +458,12 @@ pub(crate) fn prepare_typed_scan(
     let mut limit_guaranteed = false;
     if let Some(limit) = limit
         && let Some(application) =
-            metadata
-                .apply_limit(session, &handle, limit)
-                .map_err(|error| {
-                    format!("typed scan limit pushdown on relation {relation_name} failed: {error}")
-                })?
+            observe_provider_negotiation(&relation_name, "apply_limit", || {
+                metadata.apply_limit(session, &handle, limit)
+            })
+            .map_err(|error| {
+                format!("typed scan limit pushdown on relation {relation_name} failed: {error}")
+            })?
     {
         limit_guaranteed = application.limit_guaranteed();
         handle = application.into_handle();
@@ -458,9 +474,10 @@ pub(crate) fn prepare_typed_scan(
     // frontend code never sees or constructs the transaction payload.
     let (dynamic_filter_bindings, dynamic_filter_outputs) =
         bind_dynamic_filters(dynamic_filters, &variables_by_name, &relation_name)?;
-    let relation = metadata
-        .relation(relation_kind, handle)
-        .map_err(|error| format!("typed scan cannot freeze relation {relation_name}: {error}"))?;
+    let relation = observe_provider_negotiation(&relation_name, "relation", || {
+        metadata.relation(relation_kind, handle)
+    })
+    .map_err(|error| format!("typed scan cannot freeze relation {relation_name}: {error}"))?;
     let table_scan = TableScanNode::new(
         plan_node_id,
         TableHandle::new(catalog, relation),
@@ -485,6 +502,20 @@ pub(crate) fn prepare_typed_scan(
         limit_guaranteed,
         dynamic_filter_outputs,
     })
+}
+
+fn observe_provider_negotiation<R, E>(
+    relation_name: &str,
+    operation: &str,
+    call: impl FnOnce() -> Result<R, E>,
+) -> Result<R, E> {
+    crate::preparation_diagnostics::observe_result_lazy(
+        "connector_planning_negotiation",
+        || format!("{operation}:{relation_name}"),
+        "not-applicable",
+        None,
+        call,
+    )
 }
 
 /// The one connector column an output column names.

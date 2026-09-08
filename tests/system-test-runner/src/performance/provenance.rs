@@ -158,6 +158,10 @@ pub fn begin_run_manifest(
 }
 
 impl RunManifestHandle {
+    pub fn run_id(&self) -> &str {
+        &self.manifest.run_id
+    }
+
     pub fn finish_success(mut self) -> Result<RunManifestReference> {
         self.manifest.ended_unix_millis = Some(now_unix_millis()?);
         self.manifest.exit_code = Some(0);

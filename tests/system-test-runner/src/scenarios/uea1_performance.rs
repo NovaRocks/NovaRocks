@@ -24,8 +24,12 @@ use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, LaunchProfile,
 };
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Mutex;
+
+const PREPARATION_DIAGNOSTIC_SECRET_ENV: &str = "NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET";
 
 const MIXED_CATALOG: &str = "uea1_performance";
 const MIXED_CREDENTIAL_NAME: &str = "uea1-performance-data";
@@ -82,8 +86,16 @@ impl Scenario for Uea1PerformanceScenario {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let mut child_environment = CrossProcessChildEnvironment::default();
+        child_environment.fe.insert(
+            PREPARATION_DIAGNOSTIC_SECRET_ENV.to_string(),
+            diagnostic_secret()?,
+        );
         if !self.is_mixed() {
-            return Ok(ScenarioLaunchConfig::default());
+            return Ok(ScenarioLaunchConfig {
+                child_environment,
+                ..ScenarioLaunchConfig::default()
+            });
         }
 
         let rest = IsolatedIcebergRestFixture::start(scenario_root)
@@ -117,7 +129,6 @@ impl Scenario for Uea1PerformanceScenario {
             create_catalog_sql,
         });
 
-        let mut child_environment = CrossProcessChildEnvironment::default();
         child_environment
             .fe
             .insert(ACCESS_KEY_ENV.to_string(), identity.access_key_id.clone());
@@ -197,6 +208,15 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
             .shutdown()
             .context("shutdown private UEA-1 mixed Iceberg REST fixture")
     }
+}
+
+fn diagnostic_secret() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    File::open("/dev/urandom")
+        .context("open operating-system random source for diagnostic secret")?
+        .read_exact(&mut bytes)
+        .context("read diagnostic secret from operating-system random source")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {

@@ -19,9 +19,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
-use axum::{Json, Router, routing::get};
+use axum::{
+    Json, Router,
+    routing::{get, post},
+};
 
 use crate::coordinator::QueryLifecycleConvergenceReader;
 use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
@@ -129,7 +132,54 @@ pub(crate) fn frontend_management_router_with_readers(
     } else {
         router
     };
+    let router = if crate::preparation_diagnostics::enabled() {
+        router
+            .route(
+                "/v1/diagnostics/preparation/arm",
+                post(arm_preparation_diagnostics),
+            )
+            .route(
+                "/v1/diagnostics/preparation/drain",
+                post(drain_preparation_diagnostics),
+            )
+    } else {
+        router
+    };
     router.with_state(state)
+}
+
+async fn arm_preparation_diagnostics(
+    headers: HeaderMap,
+    Json(request): Json<crate::preparation_diagnostics::ControlRequest>,
+) -> axum::response::Response {
+    if !preparation_diagnostic_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match crate::preparation_diagnostics::arm(request.run_token) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error).into_response(),
+    }
+}
+
+async fn drain_preparation_diagnostics(
+    headers: HeaderMap,
+    Json(request): Json<crate::preparation_diagnostics::ControlRequest>,
+) -> axum::response::Response {
+    if !preparation_diagnostic_authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match crate::preparation_diagnostics::drain(&request.run_token) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error).into_response(),
+    }
+}
+
+fn preparation_diagnostic_authorized(headers: &HeaderMap) -> bool {
+    crate::preparation_diagnostics::authorize(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+    )
 }
 
 async fn handle_management_metrics(

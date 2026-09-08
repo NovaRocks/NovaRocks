@@ -272,6 +272,10 @@ async fn execute_claimed_job(
     stat2f_record_provider_dispatch(job_id)?;
     let worker_runtime = runtime.clone();
     let execution = tokio::task::spawn_blocking(move || {
+        let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
+            format!("maintenance-job:{job_id}"),
+            format!("maintenance-job:{job_id}"),
+        );
         executor.execute(&worker_runtime, engine.as_ref(), &job)
     })
     .await

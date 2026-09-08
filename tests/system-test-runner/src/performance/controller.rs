@@ -19,7 +19,10 @@ use super::business::{self, BusinessSample, MixedFixtureBinding};
 use super::manifest::{
     ManifestPurpose, MixedWorkload, SlowOutputWorkload, Uea1WorkloadManifest, Window,
 };
-use super::metrics::{MeasurementWindow, PerformanceReportInput, QuerySample, write_report};
+use super::metrics::{
+    MeasurementWindow, PerformanceDiagnosticResponse, PerformanceReportInput,
+    PreparationDiagnosticFrame, PreparationEvent, QuerySample, write_report,
+};
 use super::provenance::begin_run_manifest;
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::ScenarioContext;
@@ -99,6 +102,14 @@ pub fn run(
     )?;
     let monitor = ProcessResourceMonitor::start(context.process_ids(), Duration::from_millis(100))?;
     let timeline = MonotonicTimeline::new(&monitor);
+    let diagnostic = run_diagnostic_prelude(
+        scenario,
+        context,
+        manifest,
+        mixed_fixture,
+        run_manifest.run_id(),
+        timeline,
+    )?;
     let (samples, measurement_windows) = match scenario {
         PerformanceScenario::ShortConcurrent => run_short(context, manifest, &monitor, timeline)?,
         PerformanceScenario::Mixed => run_mixed(
@@ -121,6 +132,14 @@ pub fn run(
         scenario.name()
     );
     ensure!(
+        measurement_windows
+            .iter()
+            .all(|window| window.started_elapsed_millis.saturating_mul(1000)
+                >= diagnostic.frame.ended_elapsed_micros),
+        "{} timed measurement overlapped its diagnostic prelude",
+        scenario.name()
+    );
+    ensure!(
         !samples.is_empty() && samples.iter().any(|sample| sample.rows > 0),
         "{} produced no valid work",
         scenario.name()
@@ -134,7 +153,8 @@ pub fn run(
         scenario: scenario.name(),
         samples: &samples,
         measurement_windows: &measurement_windows,
-        preparation_events: &[],
+        preparation_diagnostic: &diagnostic.frame,
+        preparation_events: &diagnostic.events,
     })?;
     context.action(format!(
         "{} completed {} valid samples using manifest {}",
@@ -166,6 +186,175 @@ impl MonotonicTimeline {
     fn elapsed_millis(self) -> u128 {
         self.elapsed_micros() / 1000
     }
+}
+
+struct CollectedDiagnosticPrelude {
+    frame: PreparationDiagnosticFrame,
+    events: Vec<PreparationEvent>,
+}
+
+fn run_diagnostic_prelude(
+    scenario: PerformanceScenario,
+    context: &ScenarioContext,
+    manifest: &Uea1WorkloadManifest,
+    mixed_fixture: Option<&MixedFixtureBinding>,
+    run_token: &str,
+    timeline: MonotonicTimeline,
+) -> Result<CollectedDiagnosticPrelude> {
+    let secret = context
+        .uea1_preparation_diagnostic_secret()
+        .context("UEA-1 preparation diagnostic control secret is missing")?;
+    post_preparation_diagnostic_control(
+        context,
+        "/v1/diagnostics/preparation/arm",
+        secret,
+        run_token,
+    )?;
+    let started_elapsed_micros = timeline.elapsed_micros();
+    let prelude_result = execute_diagnostic_work(scenario, context, manifest, mixed_fixture);
+    let drained = post_preparation_diagnostic_control(
+        context,
+        "/v1/diagnostics/preparation/drain",
+        secret,
+        run_token,
+    );
+    let ended_elapsed_micros = timeline.elapsed_micros();
+    prelude_result?;
+    let response = drained?.context("preparation diagnostic drain returned no document")?;
+    ensure!(
+        response.schema_version == 1 && response.run_token == run_token,
+        "preparation diagnostic drain did not return the exact armed run"
+    );
+    ensure!(
+        !response.events.is_empty(),
+        "preparation diagnostic prelude produced no events"
+    );
+    Ok(CollectedDiagnosticPrelude {
+        frame: PreparationDiagnosticFrame {
+            schema_version: 1,
+            run_token: response.run_token,
+            started_elapsed_micros,
+            ended_elapsed_micros,
+        },
+        events: response.events,
+    })
+}
+
+fn execute_diagnostic_work(
+    scenario: PerformanceScenario,
+    context: &ScenarioContext,
+    manifest: &Uea1WorkloadManifest,
+    mixed_fixture: Option<&MixedFixtureBinding>,
+) -> Result<()> {
+    let timeout = context.remaining("run UEA-1 preparation diagnostic prelude")?;
+    let mut connection = mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
+    match scenario {
+        PerformanceScenario::ShortConcurrent => {
+            for query in &manifest.short.queries {
+                connection
+                    .query_drop(query)
+                    .context("execute short preparation diagnostic query")?;
+            }
+        }
+        PerformanceScenario::SlowOutput => {
+            connection
+                .query_drop(&manifest.slow_output.control_query)
+                .context("execute slow-output control diagnostic query")?;
+            connection
+                .query_drop(&manifest.slow_output.foreground_query)
+                .context("execute slow-output foreground diagnostic query")?;
+            connection
+                .query_drop(format!(
+                    "SELECT * FROM ({}) AS uea1_slow_diagnostic LIMIT 1",
+                    manifest.slow_output.query
+                ))
+                .context("execute bounded slow-output preparation diagnostic query")?;
+        }
+        PerformanceScenario::Mixed => {
+            let binding = mixed_fixture.context("mixed diagnostic fixture is missing")?;
+            let mut diagnostic_workload = manifest.mixed.clone();
+            for producer in &mut diagnostic_workload.producers {
+                producer.jobs = 1;
+                producer.minimum_completions = 1;
+            }
+            let prepared = business::prepare_window(
+                &mut connection,
+                binding,
+                &diagnostic_workload,
+                diagnostic_workload.repetitions,
+            )?;
+            let result = (|| {
+                business::assert_rows(
+                    &mut connection,
+                    &prepared.foreground,
+                    prepared.foreground_rows,
+                    business::sequence_sum(prepared.foreground_rows)?,
+                )?;
+                for jobs in prepared.jobs.values() {
+                    let job = jobs
+                        .first()
+                        .context("diagnostic producer has no prepared job")?;
+                    business::execute_job(
+                        &mut connection,
+                        job,
+                        diagnostic_workload.repetitions,
+                        Instant::now() + Duration::from_millis(diagnostic_workload.job_timeout_ms),
+                        Duration::from_millis(diagnostic_workload.job_timeout_ms),
+                        Duration::from_millis(diagnostic_workload.poll_interval_ms),
+                    )?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })();
+            if result.is_ok() {
+                prepared.cleanup(&mut connection)?;
+            }
+            result?;
+        }
+    }
+    Ok(())
+}
+
+fn post_preparation_diagnostic_control(
+    context: &ScenarioContext,
+    path: &str,
+    secret: &str,
+    run_token: &str,
+) -> Result<Option<PerformanceDiagnosticResponse>> {
+    let body = serde_json::to_vec(&serde_json::json!({"run_token": run_token}))?;
+    let address = SocketAddr::from(([127, 0, 0, 1], context.fe_http_port()));
+    let timeout = context.remaining("call preparation diagnostic management control")?;
+    let mut stream = TcpStream::connect_timeout(&address, timeout)
+        .context("connect preparation diagnostic management control")?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(&body)?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .context("diagnostic management response has no header terminator")?;
+    let headers = std::str::from_utf8(&response[..split])?;
+    let status = headers
+        .lines()
+        .next()
+        .context("diagnostic management response has no status line")?;
+    ensure!(
+        status.contains(" 204 ") || status.contains(" 200 "),
+        "diagnostic management control failed: {status}"
+    );
+    if status.contains(" 204 ") {
+        return Ok(None);
+    }
+    let payload = &response[split + 4..];
+    serde_json::from_slice(payload)
+        .context("decode preparation diagnostic drain response")
+        .map(Some)
 }
 
 fn run_short(

@@ -91,6 +91,7 @@ pub struct ScenarioContext {
     startup_timeout: Duration,
     launch_profile: LaunchProfile,
     uea1_workload_manifest: Option<PathBuf>,
+    uea1_preparation_diagnostic_secret: Option<String>,
 }
 
 impl ScenarioContext {
@@ -106,6 +107,7 @@ impl ScenarioContext {
         cluster_size: usize,
         launch_profile: LaunchProfile,
         uea1_workload_manifest: Option<PathBuf>,
+        uea1_preparation_diagnostic_secret: Option<String>,
     ) -> Self {
         Self {
             name,
@@ -121,6 +123,7 @@ impl ScenarioContext {
             startup_timeout: timeout,
             launch_profile,
             uea1_workload_manifest,
+            uea1_preparation_diagnostic_secret,
         }
     }
 
@@ -186,6 +189,14 @@ impl ScenarioContext {
 
     pub fn uea1_workload_manifest(&self) -> Option<&Path> {
         self.uea1_workload_manifest.as_deref()
+    }
+
+    pub fn uea1_preparation_diagnostic_secret(&self) -> Option<&str> {
+        self.uea1_preparation_diagnostic_secret.as_deref()
+    }
+
+    pub fn fe_http_port(&self) -> u16 {
+        self.handle.runtime().fe_http_port
     }
 
     pub fn diagnostics(&self) -> String {

@@ -635,9 +635,17 @@ impl FrontendDistributedQueryCoordinator {
         let _query = self
             .registry
             .register(query_id, intent, Arc::clone(&dispatcher))?;
-        let schedule = backend_services
-            .scheduler
-            .schedule(parts.artifacts.scheduling_view(), execution_id)?;
+        let schedule = crate::preparation_diagnostics::observe_result(
+            "attempt_instantiation",
+            "schedule_attempt",
+            "not-applicable",
+            Some(execution_id),
+            || {
+                backend_services
+                    .scheduler
+                    .schedule(parts.artifacts.scheduling_view(), execution_id)
+            },
+        )?;
         let scheduled_backend_ownership = backend_services
             .scheduler
             .scheduled_backend_ownership(&schedule.backend_ids())?;
@@ -1873,9 +1881,9 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         &self,
     ) -> Result<crate::query_execution::completion::QueryAttemptReservation, DistributedQueryError>
     {
-        crate::query_execution::completion::QueryAttemptReservation::first(
-            self.query_ids.next_query_id()?,
-        )
+        let query_id = self.query_ids.next_query_id()?;
+        crate::preparation_diagnostics::bind_logical_query(query_id);
+        crate::query_execution::completion::QueryAttemptReservation::first(query_id)
     }
 
     fn execute(

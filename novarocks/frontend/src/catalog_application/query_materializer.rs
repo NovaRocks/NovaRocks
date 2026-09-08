@@ -393,7 +393,18 @@ impl PlannerTableProvider for CatalogServiceMaterializer<'_> {
         database: &str,
         table: &str,
     ) -> Result<ResolvedAnalyzerTable, String> {
-        self.resolve_table_for_analysis_once(catalog, database, table)
+        crate::preparation_diagnostics::observe_result_lazy(
+            "metadata_observation",
+            || {
+                format!(
+                    "resolve_table:{}.{database}.{table}",
+                    self.effective_catalog(catalog).unwrap_or("default_catalog")
+                )
+            },
+            "static",
+            None,
+            || self.resolve_table_for_analysis_once(catalog, database, table),
+        )
     }
 
     fn iceberg_metadata_provider(&self) -> Option<&dyn IcebergMetadataTableProvider> {
@@ -415,7 +426,18 @@ impl IcebergMetadataTableProvider for CatalogServiceMaterializer<'_> {
         table: &str,
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     ) -> Result<ResolvedAnalyzerTable, String> {
-        self.metadata_table_def(catalog, database, table, metadata_table_type)
+        crate::preparation_diagnostics::observe_result_lazy(
+            "metadata_observation",
+            || {
+                format!(
+                    "resolve_metadata_table:{}.{database}.{table}:{metadata_table_type:?}",
+                    self.effective_catalog(catalog).unwrap_or("default_catalog")
+                )
+            },
+            "static",
+            None,
+            || self.metadata_table_def(catalog, database, table, metadata_table_type),
+        )
     }
 }
 

@@ -1130,7 +1130,10 @@ impl FrontendQuerySession {
                 _ => None,
             },
         );
+        let diagnostic_statement = active.token();
         let mut worker = task::spawn_blocking(move || {
+            let _diagnostic_scope =
+                crate::preparation_diagnostics::enter_statement(diagnostic_statement);
             let result: Result<StatementResult, RoutedExecutionError> = {
                 let statement = parsed_statement;
                 if matches!(
