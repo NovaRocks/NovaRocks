@@ -113,9 +113,12 @@ pub struct MixedWorkload {
 #[serde(deny_unknown_fields)]
 pub struct SlowOutputWorkload {
     pub query: String,
+    pub control_query: String,
+    pub foreground_query: String,
     pub bytes_per_interval: usize,
     pub interval_ms: u64,
     pub duration_ms: u64,
+    pub repetitions: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -209,10 +212,13 @@ impl Uea1WorkloadManifest {
         }
         ensure!(
             !self.slow_output.query.trim().is_empty()
+                && !self.slow_output.control_query.trim().is_empty()
+                && !self.slow_output.foreground_query.trim().is_empty()
                 && self.slow_output.bytes_per_interval > 0
                 && self.slow_output.interval_ms > 0
-                && self.slow_output.duration_ms > 0,
-            "slow-output workload requires SQL and positive byte/time limits"
+                && self.slow_output.duration_ms > 0
+                && (1..=20).contains(&self.slow_output.repetitions),
+            "slow-output workload requires SQL and positive bounded byte/time/window limits"
         );
         if matches!(self.purpose, ManifestPurpose::Formal) {
             let concurrency = self
@@ -237,6 +243,10 @@ impl Uea1WorkloadManifest {
                     && self.mixed.duration_ms >= 120_000
                     && self.mixed.repetitions >= 5,
                 "formal mixed workload requires eight clients and five 120 second windows"
+            );
+            ensure!(
+                self.slow_output.duration_ms >= 120_000 && self.slow_output.repetitions >= 5,
+                "formal slow-output workload requires five windows of at least 120 seconds"
             );
         }
         Ok(())
@@ -299,9 +309,12 @@ mod tests {
             },
             slow_output: SlowOutputWorkload {
                 query: "SELECT 1".to_string(),
+                control_query: "SELECT 1".to_string(),
+                foreground_query: "SELECT 1".to_string(),
                 bytes_per_interval: 1,
                 interval_ms: 1,
                 duration_ms: 1,
+                repetitions: 1,
             },
             sha256: String::new(),
         }

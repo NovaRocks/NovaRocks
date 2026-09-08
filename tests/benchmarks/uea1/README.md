@@ -51,14 +51,42 @@ identities and aggregate counts, never credentials or source rows.
 elapsed-millisecond domain as `process-resources.json`. Resource comparisons
 select samples between `started_elapsed_millis` and `ended_elapsed_millis`;
 setup, warmup, cleanup, and post-window drain samples remain diagnostic only.
+Every performance and startup run also writes `run-manifest.json`. Formal runs
+require a clean checkout and that checkout's exact
+`target/release/novarocks`; the manifest records source, binary, config,
+workload, fixture, tool tree, Cargo.lock, toolchain, platform, power mode, and
+start/end identity. Formal extraction rejects a missing preparation event,
+any incomplete FE/three-BE resource window, and any artifact that does not
+reference the exact completed run manifest.
 
 `workloads-smoke.json` uses the same three real business operations and oracles
 with small fixtures and one job of each kind. Its closed producers may finish
 before the foreground window because it is a facility self-test, not
 performance evidence. `SELECT 1` cannot stand in for a producer or its completion.
-Formal short-query and mixed workloads require at least five fixed windows.
+Formal short-query, mixed, and slow-output workloads require at least five
+fixed 120-second windows. Slow-output records control and foreground queries
+as distinct metric cohorts while the throttled client remains a diagnostic
+delivery observation.
 
 `compare.py` derives the allowed relative noise from two baseline A/A sample
 sets using pooled median and MAD. It rejects zero-valued positive metrics and
-noise above five percent. `build_feedback.py` records command duration and
-peak process-tree RSS for reproducible development-feedback samples.
+noise above five percent. Formal comparison uses four non-overlapping runs in
+the exact order B0-A, candidate-A, B0-B, candidate-B; it verifies both source
+and binary repeats before pooling the two candidate samples. First create one
+descriptor beside each run's artifacts with only `artifacts`, `expected`,
+`metric_resolutions`, and the closed sampled thread gates. Then run:
+
+```bash
+python3 tests/benchmarks/uea1/artifact_protocol.py extract \
+  --descriptor <run>/descriptor.json --output <run>/comparison-input.json
+python3 tests/benchmarks/uea1/compare.py --structured \
+  --baseline-a <b0-a>/comparison-input.json \
+  --candidate-a <candidate-a>/comparison-input.json \
+  --baseline-b <b0-b>/comparison-input.json \
+  --candidate-b <candidate-b>/comparison-input.json
+```
+
+`build_feedback.py` samples one same-tick process snapshot repeatedly and
+records command duration plus peak RSS for the isolated process group and its
+complete visible descendant tree. Missing samples stay unavailable rather
+than becoming zero.

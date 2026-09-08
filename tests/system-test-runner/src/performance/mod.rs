@@ -19,6 +19,7 @@ mod business;
 mod controller;
 mod manifest;
 mod metrics;
+pub(crate) mod provenance;
 
 pub use business::MixedFixtureBinding;
 pub use controller::{PerformanceScenario, run};

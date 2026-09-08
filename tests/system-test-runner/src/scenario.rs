@@ -172,6 +172,14 @@ impl ScenarioContext {
         &self.scenario_root
     }
 
+    pub fn primary_binary(&self) -> &Path {
+        &self.binary
+    }
+
+    pub fn base_config_path(&self) -> &Path {
+        &self.base_config_path
+    }
+
     pub fn launch_profile(&self) -> LaunchProfile {
         self.launch_profile
     }

@@ -7,7 +7,12 @@ import argparse
 import json
 import math
 import statistics
+import sys
 from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).parent))
+from artifact_protocol import ProtocolError, validate_comparison_input  # noqa: E402
 
 
 def derive_epsilon(values: list[float], resolution: float) -> float:
@@ -52,21 +57,181 @@ def load_values(path: Path) -> list[float]:
     return [float(item) for item in value]
 
 
+def _window_signature(document: dict) -> list[tuple[str, int, int, int]]:
+    return [
+        (
+            window["workload"],
+            window["window_index"],
+            window["configured_concurrency"],
+            window["duration_millis"],
+        )
+        for window in document["windows"]
+    ]
+
+
+def _metric_map(document: dict) -> dict[str, dict]:
+    return {metric["id"]: metric for metric in document["metrics"]}
+
+
+def _gate_map(document: dict) -> dict[str, dict]:
+    return {gate["metric"]: gate for gate in document["absolute_gates"]}
+
+
+def compare_protocol_inputs(
+    baseline_a: dict, candidate_a: dict, baseline_b: dict, candidate_b: dict
+) -> dict[str, object]:
+    """Compare the required interleaved B0/A/B and candidate/A/B runs."""
+
+    inputs = [
+        validate_comparison_input(baseline_a),
+        validate_comparison_input(candidate_a),
+        validate_comparison_input(baseline_b),
+        validate_comparison_input(candidate_b),
+    ]
+    baseline_a, candidate_a, baseline_b, candidate_b = inputs
+    run_ids = [document["provenance"]["run_id"] for document in inputs]
+    if len(set(run_ids)) != len(run_ids):
+        raise ProtocolError("all four run identities must be distinct")
+    for previous, following in zip(inputs, inputs[1:]):
+        if previous["provenance"]["ended_unix_millis"] > following["provenance"][
+            "started_unix_millis"
+        ]:
+            raise ProtocolError(
+                "runs must be non-overlapping and ordered B0-A, candidate-A, B0-B, candidate-B"
+            )
+    for field in ("source_sha", "binary_sha256"):
+        if baseline_a["provenance"][field] != baseline_b["provenance"][field]:
+            raise ProtocolError(f"baseline A/A {field} mismatch")
+        if candidate_a["provenance"][field] != candidate_b["provenance"][field]:
+            raise ProtocolError(f"candidate A/A {field} mismatch")
+        if candidate_a["provenance"][field] == baseline_a["provenance"][field]:
+            raise ProtocolError(f"candidate {field} unexpectedly matches the baseline")
+    if any(document["compatibility"] != baseline_a["compatibility"] for document in inputs[1:]):
+        raise ProtocolError(
+            "manifest, fixture, config, tool, lock, toolchain, scenario, or platform mismatch"
+        )
+    signatures = [_window_signature(document) for document in inputs]
+    if any(signature != signatures[0] for signature in signatures[1:]):
+        raise ProtocolError("measurement window count or shape mismatch")
+
+    metric_maps = [_metric_map(document) for document in inputs]
+    if any(set(mapping) != set(metric_maps[0]) for mapping in metric_maps[1:]):
+        raise ProtocolError("relative metric set mismatch")
+    relative_results: list[dict[str, object]] = []
+    all_relative_valid = True
+    all_relative_passed = True
+    for metric_id in sorted(metric_maps[0]):
+        entries = [mapping[metric_id] for mapping in metric_maps]
+        spec = lambda entry: (
+            entry["metric"],
+            entry["unit"],
+            entry["direction"],
+            entry["resolution"],
+            entry["cohort"],
+        )
+        if any(spec(entry) != spec(entries[0]) for entry in entries[1:]):
+            raise ProtocolError(f"metric definition mismatch for {metric_id}")
+        result = compare(
+            entries[0]["values"],
+            entries[2]["values"],
+            entries[1]["values"] + entries[3]["values"],
+            entries[0]["resolution"],
+            entries[0]["direction"] == "higher_is_better",
+        )
+        relative_results.append({"id": metric_id, **result})
+        all_relative_valid = all_relative_valid and bool(result.get("valid"))
+        all_relative_passed = all_relative_passed and bool(result.get("passed"))
+
+    gate_maps = [_gate_map(document) for document in inputs]
+    if any(set(mapping) != set(gate_maps[0]) for mapping in gate_maps[1:]):
+        raise ProtocolError("absolute gate set mismatch")
+    absolute_results: list[dict[str, object]] = []
+    all_absolute_passed = True
+    for metric in sorted(gate_maps[0]):
+        entries = [mapping[metric] for mapping in gate_maps]
+        spec = lambda entry: (entry["unit"], entry["direction"], entry["limit"])
+        if any(spec(entry) != spec(entries[0]) for entry in entries[1:]):
+            raise ProtocolError(f"absolute gate definition mismatch for {metric}")
+        passed = bool(entries[1]["passed"]) and bool(entries[3]["passed"])
+        all_absolute_passed = all_absolute_passed and passed
+        absolute_results.append(
+            {
+                "metric": metric,
+                "unit": entries[2]["unit"],
+                "limit": entries[2]["limit"],
+                "baseline_a_worst": max(entries[0]["values"]),
+                "baseline_b_worst": max(entries[2]["values"]),
+                "candidate_a_worst": max(entries[1]["values"]),
+                "candidate_b_worst": max(entries[3]["values"]),
+                "passed": passed,
+            }
+        )
+    return {
+        "valid": all_relative_valid,
+        "passed": all_relative_valid and all_relative_passed and all_absolute_passed,
+        "runs": {
+            "baseline_a": run_ids[0],
+            "candidate_a": run_ids[1],
+            "baseline_b": run_ids[2],
+            "candidate_b": run_ids[3],
+        },
+        "relative_metrics": relative_results,
+        "absolute_gates": absolute_results,
+    }
+
+
+def load_protocol_input(path: Path) -> dict:
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ProtocolError(f"{path} must contain a structured comparison input")
+    return validate_comparison_input(value)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-a", type=Path, required=True)
     parser.add_argument("--baseline-b", type=Path, required=True)
-    parser.add_argument("--candidate", type=Path, required=True)
-    parser.add_argument("--resolution", type=float, required=True)
+    parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--candidate-a", type=Path)
+    parser.add_argument("--candidate-b", type=Path)
+    parser.add_argument("--resolution", type=float)
     parser.add_argument("--larger-is-better", action="store_true")
-    args = parser.parse_args()
-    result = compare(
-        load_values(args.baseline_a),
-        load_values(args.baseline_b),
-        load_values(args.candidate),
-        args.resolution,
-        args.larger_is_better,
+    parser.add_argument(
+        "--structured",
+        action="store_true",
+        help="validate and compare artifact_protocol.py inputs",
     )
+    args = parser.parse_args()
+    try:
+        if args.structured:
+            if (
+                args.resolution is not None
+                or args.larger_is_better
+                or args.candidate is not None
+                or args.candidate_a is None
+                or args.candidate_b is None
+            ):
+                parser.error(
+                    "structured comparison requires --candidate-a and --candidate-b and carries its own resolution and direction"
+                )
+            result = compare_protocol_inputs(
+                load_protocol_input(args.baseline_a),
+                load_protocol_input(args.candidate_a),
+                load_protocol_input(args.baseline_b),
+                load_protocol_input(args.candidate_b),
+            )
+        else:
+            if args.resolution is None or args.candidate is None:
+                parser.error("--resolution and --candidate are required for legacy array inputs")
+            result = compare(
+                load_values(args.baseline_a),
+                load_values(args.baseline_b),
+                load_values(args.candidate),
+                args.resolution,
+                args.larger_is_better,
+            )
+    except (OSError, json.JSONDecodeError, ProtocolError, ValueError) as error:
+        result = {"valid": False, "passed": False, "reason": str(error)}
     print(json.dumps(result, sort_keys=True))
     return 0 if result.get("valid") and result.get("passed") else 1
 

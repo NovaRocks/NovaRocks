@@ -19,7 +19,8 @@ use super::business::{self, BusinessSample, MixedFixtureBinding};
 use super::manifest::{
     ManifestPurpose, MixedWorkload, SlowOutputWorkload, Uea1WorkloadManifest, Window,
 };
-use super::metrics::{MeasurementWindow, QuerySample, write_report};
+use super::metrics::{MeasurementWindow, PerformanceReportInput, QuerySample, write_report};
+use super::provenance::begin_run_manifest;
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::ScenarioContext;
 use anyhow::{Context, Result, bail, ensure};
@@ -61,24 +62,55 @@ pub fn run(
         "{} requires --launch-profile performance",
         scenario.name()
     );
+    if manifest.purpose == ManifestPurpose::Formal {
+        ensure!(
+            context.process_ids().backends.len() == 3,
+            "formal UEA-1 performance requires native 1FE+3BE"
+        );
+        ensure!(
+            context
+                .primary_binary()
+                .components()
+                .any(|component| component.as_os_str() == "release"),
+            "formal UEA-1 performance requires a checkout-local release binary"
+        );
+    }
     if matches!(scenario, PerformanceScenario::Mixed) {
         ensure!(
             mixed_fixture.is_some(),
             "mixed performance requires a scenario-owned isolated catalog fixture"
         );
     }
+    let fixture_spec = serde_json::to_vec(&(scenario.name(), manifest))
+        .context("serialize UEA-1 fixture specification")?;
+    let workload_manifest_bytes = std::fs::read(
+        context
+            .uea1_workload_manifest()
+            .context("UEA-1 performance workload manifest path is missing")?,
+    )
+    .context("read frozen UEA-1 workload manifest for the run artifact")?;
+    let run_manifest = begin_run_manifest(
+        context,
+        scenario.name(),
+        &manifest.sha256,
+        &workload_manifest_bytes,
+        &fixture_spec,
+        manifest.purpose == ManifestPurpose::Formal,
+    )?;
     let monitor = ProcessResourceMonitor::start(context.process_ids(), Duration::from_millis(100))?;
+    let timeline = MonotonicTimeline::new(&monitor);
     let (samples, measurement_windows) = match scenario {
-        PerformanceScenario::ShortConcurrent => run_short(context, manifest, &monitor)?,
+        PerformanceScenario::ShortConcurrent => run_short(context, manifest, &monitor, timeline)?,
         PerformanceScenario::Mixed => run_mixed(
             context,
             &manifest.mixed,
             mixed_fixture.context("mixed performance fixture is missing")?,
             manifest.purpose == ManifestPurpose::Formal,
             &monitor,
+            timeline,
         )?,
         PerformanceScenario::SlowOutput => {
-            run_slow_output(context, &manifest.slow_output, &monitor)?
+            run_slow_output(context, &manifest.slow_output, &monitor, timeline)?
         }
     };
     let resource_path = context.scenario_root().join("process-resources.json");
@@ -93,14 +125,17 @@ pub fn run(
         "{} produced no valid work",
         scenario.name()
     );
-    write_report(
-        context.scenario_root(),
-        &manifest.sha256,
-        scenario.name(),
-        &samples,
-        &measurement_windows,
-        &[],
-    )?;
+    let run_manifest = run_manifest.finish_success()?;
+    write_report(PerformanceReportInput {
+        root: context.scenario_root(),
+        run_id: &run_manifest.run_id,
+        run_manifest_sha256: &run_manifest.sha256,
+        manifest_sha256: &manifest.sha256,
+        scenario: scenario.name(),
+        samples: &samples,
+        measurement_windows: &measurement_windows,
+        preparation_events: &[],
+    })?;
     context.action(format!(
         "{} completed {} valid samples using manifest {}",
         scenario.name(),
@@ -110,10 +145,34 @@ pub fn run(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct MonotonicTimeline {
+    anchor: Instant,
+    anchor_elapsed_micros: u128,
+}
+
+impl MonotonicTimeline {
+    fn new(monitor: &ProcessResourceMonitor) -> Self {
+        Self {
+            anchor: Instant::now(),
+            anchor_elapsed_micros: monitor.elapsed_millis().saturating_mul(1000),
+        }
+    }
+
+    fn elapsed_micros(self) -> u128 {
+        self.anchor_elapsed_micros + self.anchor.elapsed().as_micros()
+    }
+
+    fn elapsed_millis(self) -> u128 {
+        self.elapsed_micros() / 1000
+    }
+}
+
 fn run_short(
     context: &ScenarioContext,
     manifest: &Uea1WorkloadManifest,
     monitor: &ProcessResourceMonitor,
+    timeline: MonotonicTimeline,
 ) -> Result<(Vec<QuerySample>, Vec<MeasurementWindow>)> {
     let timeout = context.remaining("run short-query performance windows")?;
     let mut connection = mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
@@ -140,14 +199,17 @@ fn run_short(
     for window in &manifest.short.windows {
         for _ in 0..window.repetitions {
             let (samples, measurement_window) = run_query_window(
-                context.mysql_user(),
-                context.mysql_port(),
-                &manifest.short.queries,
-                window,
-                window_index,
-                timeout,
-                "short",
+                QueryWindowInput {
+                    user: context.mysql_user(),
+                    port: context.mysql_port(),
+                    queries: &manifest.short.queries,
+                    window,
+                    window_index,
+                    timeout,
+                    workload: "short",
+                },
                 monitor,
+                timeline,
             )?;
             all.extend(samples);
             measurement_windows.push(measurement_window);
@@ -163,6 +225,7 @@ fn run_mixed(
     binding: &MixedFixtureBinding,
     require_sustained_producers: bool,
     monitor: &ProcessResourceMonitor,
+    timeline: MonotonicTimeline,
 ) -> Result<(Vec<QuerySample>, Vec<MeasurementWindow>)> {
     let mut all = Vec::new();
     let mut measurement_windows = Vec::new();
@@ -182,6 +245,7 @@ fn run_mixed(
             window_index,
             require_sustained_producers,
             monitor,
+            timeline,
         );
         match result {
             Ok((queries, completed, measurement_window)) => {
@@ -217,6 +281,7 @@ fn run_mixed_window(
     window_index: usize,
     require_sustained_producers: bool,
     monitor: &ProcessResourceMonitor,
+    timeline: MonotonicTimeline,
 ) -> Result<(Vec<QuerySample>, Vec<BusinessSample>, MeasurementWindow)> {
     let timeout = Duration::from_millis(workload.job_timeout_ms)
         .min(context.remaining("run mixed performance window")?);
@@ -254,6 +319,7 @@ fn run_mixed_window(
             let result = (|| {
                 while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
                     let started = Instant::now();
+                    let started_elapsed_micros = timeline.elapsed_micros();
                     business::assert_rows(
                         &mut connection,
                         &table,
@@ -261,21 +327,19 @@ fn run_mixed_window(
                         business::sequence_sum(expected_rows)?,
                     )?;
                     let elapsed = started.elapsed().as_micros();
+                    let ended_elapsed_micros = timeline.elapsed_micros();
                     sender.send(MixedSample::Query(QuerySample {
                         workload: "mixed-foreground".into(),
                         window_index,
                         configured_concurrency,
                         client,
+                        started_elapsed_micros,
+                        ended_elapsed_micros,
                         first_row_micros: elapsed,
                         total_micros: elapsed,
                         rows: expected_rows,
                         bytes_read: None,
-                        outcome: if Instant::now() <= deadline {
-                            "success"
-                        } else {
-                            "drained-after-window"
-                        }
-                        .into(),
+                        outcome: completion_outcome(Instant::now(), deadline).into(),
                     }))?;
                 }
                 Ok(())
@@ -323,7 +387,7 @@ fn run_mixed_window(
         }));
     }
     drop(sender);
-    let started_elapsed_millis = monitor.elapsed_millis();
+    let started_elapsed_millis = timeline.elapsed_millis();
     window_deadline
         .set(Instant::now() + Duration::from_millis(workload.duration_ms))
         .map_err(|_| anyhow::anyhow!("mixed window deadline was initialized twice"))?;
@@ -371,16 +435,30 @@ fn run_mixed_window(
     ))
 }
 
-fn run_query_window(
-    user: &str,
+struct QueryWindowInput<'a> {
+    user: &'a str,
     port: u16,
-    queries: &[String],
-    window: &Window,
+    queries: &'a [String],
+    window: &'a Window,
     window_index: usize,
     timeout: Duration,
-    workload: &str,
+    workload: &'a str,
+}
+
+fn run_query_window(
+    input: QueryWindowInput<'_>,
     monitor: &ProcessResourceMonitor,
+    timeline: MonotonicTimeline,
 ) -> Result<(Vec<QuerySample>, MeasurementWindow)> {
+    let QueryWindowInput {
+        user,
+        port,
+        queries,
+        window,
+        window_index,
+        timeout,
+        workload,
+    } = input;
     let concurrency = window.concurrency;
     let warmup_ms = window.warmup_ms;
     let duration_ms = window.duration_ms;
@@ -405,6 +483,7 @@ fn run_query_window(
                         concurrency,
                         client,
                         &queries[index % queries.len()],
+                        timeline,
                     )?;
                     index += 1;
                 }
@@ -445,7 +524,10 @@ fn run_query_window(
                     concurrency,
                     client,
                     &queries[index % queries.len()],
+                    timeline,
                 )?;
+                let mut sample = sample;
+                sample.outcome = completion_outcome(Instant::now(), deadline).to_string();
                 sender.send(sample)?;
                 index += 1;
             }
@@ -453,7 +535,7 @@ fn run_query_window(
         }));
     }
     drop(sender);
-    let started_elapsed_millis = monitor.elapsed_millis();
+    let started_elapsed_millis = timeline.elapsed_millis();
     window_deadline
         .set(Instant::now() + Duration::from_millis(duration_ms))
         .map_err(|_| anyhow::anyhow!("short window deadline was initialized twice"))?;
@@ -483,8 +565,10 @@ fn measure_query(
     configured_concurrency: usize,
     client: usize,
     sql: &str,
+    timeline: MonotonicTimeline,
 ) -> Result<QuerySample> {
     let started = Instant::now();
+    let started_elapsed_micros = timeline.elapsed_micros();
     let mut result = connection
         .query_iter(sql)
         .with_context(|| format!("run performance query {workload}"))?;
@@ -496,11 +580,14 @@ fn measure_query(
         rows += 1;
     }
     ensure!(rows > 0, "performance query {workload} returned no rows");
+    let ended_elapsed_micros = timeline.elapsed_micros();
     Ok(QuerySample {
         workload: workload.to_string(),
         window_index,
         configured_concurrency,
         client,
+        started_elapsed_micros,
+        ended_elapsed_micros,
         first_row_micros: first_row.expect("row count is positive").as_micros(),
         total_micros: started.elapsed().as_micros(),
         rows,
@@ -513,74 +600,169 @@ fn run_slow_output(
     context: &ScenarioContext,
     workload: &SlowOutputWorkload,
     monitor: &ProcessResourceMonitor,
+    timeline: MonotonicTimeline,
 ) -> Result<(Vec<QuerySample>, Vec<MeasurementWindow>)> {
     let timeout = context.remaining("run slow-output performance window")?;
-    let mut slow = connect_raw_mysql(context.mysql_user(), context.mysql_port(), timeout)?;
-    send_query(&mut slow, &workload.query)?;
-    let mut unread = connect_raw_mysql(context.mysql_user(), context.mysql_port(), timeout)?;
-    send_query(&mut unread, &workload.query)?;
-
-    let started_elapsed_millis = monitor.elapsed_millis();
-    let started = Instant::now();
-    let deadline = started + Duration::from_millis(workload.duration_ms);
-    let interval = Duration::from_millis(workload.interval_ms);
-    slow.set_read_timeout(Some(interval.min(timeout)))?;
-    let mut bytes = 0_u64;
-    let mut first_byte = None;
-    let mut buffer = vec![0_u8; workload.bytes_per_interval.min(64 * 1024)];
-    while Instant::now() < deadline {
-        let interval_deadline = Instant::now() + interval;
-        let mut remaining = workload.bytes_per_interval;
-        while remaining > 0 {
-            let read_limit = remaining.min(buffer.len());
-            let count = match slow.read(&mut buffer[..read_limit]) {
-                Ok(0) => break,
-                Ok(count) => count,
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                {
-                    break;
+    let mut samples = Vec::new();
+    let mut windows = Vec::new();
+    for window_index in 0..workload.repetitions {
+        let mut slow = connect_raw_mysql(context.mysql_user(), context.mysql_port(), timeout)?;
+        send_query(&mut slow, &workload.query)?;
+        let mut unread = connect_raw_mysql(context.mysql_user(), context.mysql_port(), timeout)?;
+        send_query(&mut unread, &workload.query)?;
+        let started = Instant::now();
+        let started_elapsed_micros = timeline.elapsed_micros();
+        let started_elapsed_millis = started_elapsed_micros / 1000;
+        let deadline = started + Duration::from_millis(workload.duration_ms);
+        let ended_elapsed_micros = started_elapsed_micros
+            .saturating_add(u128::from(workload.duration_ms).saturating_mul(1000));
+        let interval = Duration::from_millis(workload.interval_ms);
+        let mut probe_workers = Vec::new();
+        for (client, name, sql) in [
+            (2, "slow-output-control", workload.control_query.clone()),
+            (
+                3,
+                "slow-output-foreground",
+                workload.foreground_query.clone(),
+            ),
+        ] {
+            let mut connection =
+                mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
+            probe_workers.push(thread::spawn(move || -> Result<Vec<QuerySample>> {
+                let mut probe_samples = Vec::new();
+                while Instant::now() < deadline {
+                    let interval_deadline = Instant::now() + interval;
+                    let mut sample = measure_query(
+                        &mut connection,
+                        name,
+                        window_index,
+                        4,
+                        client,
+                        &sql,
+                        timeline,
+                    )?;
+                    sample.outcome = completion_outcome_micros(
+                        sample.ended_elapsed_micros,
+                        ended_elapsed_micros,
+                    )
+                    .to_string();
+                    probe_samples.push(sample);
+                    thread::sleep(interval_deadline.saturating_duration_since(Instant::now()));
                 }
-                Err(error) => return Err(error).context("read throttled MySQL output"),
-            };
-            remaining -= count;
-            bytes += count as u64;
-            first_byte.get_or_insert_with(|| started.elapsed());
+                Ok(probe_samples)
+            }));
         }
-        thread::sleep(interval_deadline.saturating_duration_since(Instant::now()));
-    }
-    drop(unread);
-    let mut control = mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
-    let control_rows: Vec<mysql::Row> = control.query("SELECT 1")?;
-    ensure!(
-        !control_rows.is_empty(),
-        "control query made no progress while slow readers were active"
-    );
-    ensure!(bytes > 0, "slow-output client read no bytes");
-    let drain_ended_elapsed_millis = monitor.elapsed_millis();
-    Ok((
-        vec![QuerySample {
-            workload: "slow-output".to_string(),
-            window_index: 0,
-            configured_concurrency: 2,
+
+        slow.set_read_timeout(Some(interval.min(timeout)))?;
+        let mut bytes = 0_u64;
+        let mut first_byte = None;
+        let mut buffer = vec![0_u8; workload.bytes_per_interval.min(64 * 1024)];
+        while Instant::now() < deadline {
+            let interval_deadline = Instant::now() + interval;
+            let mut remaining = workload.bytes_per_interval;
+            while remaining > 0 {
+                let read_limit = remaining.min(buffer.len());
+                let count = match slow.read(&mut buffer[..read_limit]) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error).context("read throttled MySQL output"),
+                };
+                remaining -= count;
+                bytes += count as u64;
+                first_byte.get_or_insert_with(|| started.elapsed());
+            }
+            thread::sleep(interval_deadline.saturating_duration_since(Instant::now()));
+        }
+        let mut probe_samples = Vec::new();
+        for worker in probe_workers {
+            probe_samples.extend(
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("slow-output probe worker panicked"))??,
+            );
+        }
+        ensure!(
+            has_workload_progress_in_window(
+                &probe_samples,
+                "slow-output-control",
+                started_elapsed_micros,
+                ended_elapsed_micros,
+            ),
+            "control query made no progress while slow readers were active"
+        );
+        ensure!(
+            has_workload_progress_in_window(
+                &probe_samples,
+                "slow-output-foreground",
+                started_elapsed_micros,
+                ended_elapsed_micros,
+            ),
+            "foreground query made no progress while slow readers were active"
+        );
+        ensure!(bytes > 0, "slow-output client read no bytes");
+        drop(unread);
+        drop(slow);
+        samples.extend(probe_samples);
+        samples.push(QuerySample {
+            workload: "slow-output-client".to_string(),
+            window_index,
+            configured_concurrency: 4,
             client: 0,
+            started_elapsed_micros,
+            ended_elapsed_micros: timeline.elapsed_micros(),
             first_row_micros: first_byte
                 .context("slow-output client read no first byte")?
                 .as_micros(),
             total_micros: started.elapsed().as_micros(),
             rows: bytes,
             bytes_read: Some(bytes),
-            outcome: "success".to_string(),
-        }],
-        vec![MeasurementWindow {
+            outcome: "window-observation".to_string(),
+        });
+        windows.push(MeasurementWindow {
             workload: "slow-output".to_string(),
-            window_index: 0,
-            configured_concurrency: 2,
+            window_index,
+            configured_concurrency: 4,
             started_elapsed_millis,
-            ended_elapsed_millis: started_elapsed_millis + u128::from(workload.duration_ms),
-            drain_ended_elapsed_millis,
-        }],
-    ))
+            ended_elapsed_millis: ended_elapsed_micros / 1000,
+            drain_ended_elapsed_millis: monitor.elapsed_millis(),
+        });
+    }
+    Ok((samples, windows))
+}
+
+fn completion_outcome(completed: Instant, deadline: Instant) -> &'static str {
+    if completed <= deadline {
+        "success"
+    } else {
+        "drained-after-window"
+    }
+}
+
+fn completion_outcome_micros(completed: u128, deadline: u128) -> &'static str {
+    if completed <= deadline {
+        "success"
+    } else {
+        "drained-after-window"
+    }
+}
+
+fn has_workload_progress_in_window(
+    samples: &[QuerySample],
+    workload: &str,
+    window_started_micros: u128,
+    window_ended_micros: u128,
+) -> bool {
+    samples.iter().any(|sample| {
+        sample.workload == workload
+            && sample.outcome == "success"
+            && sample.started_elapsed_micros >= window_started_micros
+            && sample.ended_elapsed_micros <= window_ended_micros
+    })
 }
 
 fn connect_raw_mysql(user: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
@@ -662,4 +844,44 @@ fn write_packet(stream: &mut TcpStream, sequence: u8, payload: &[u8]) -> Result<
     stream.write_all(payload)?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_after_window_is_not_success() {
+        assert_eq!(completion_outcome_micros(100, 100), "success");
+        assert_eq!(completion_outcome_micros(101, 100), "drained-after-window");
+    }
+
+    #[test]
+    fn slow_output_control_must_complete_inside_the_active_window() {
+        let sample = QuerySample {
+            workload: "slow-output-control".to_string(),
+            window_index: 0,
+            configured_concurrency: 3,
+            client: 2,
+            started_elapsed_micros: 101,
+            ended_elapsed_micros: 199,
+            first_row_micros: 10,
+            total_micros: 98,
+            rows: 1,
+            bytes_read: None,
+            outcome: "success".to_string(),
+        };
+        assert!(has_workload_progress_in_window(
+            std::slice::from_ref(&sample),
+            "slow-output-control",
+            100,
+            200,
+        ));
+        assert!(!has_workload_progress_in_window(
+            &[sample],
+            "slow-output-control",
+            102,
+            200,
+        ));
+    }
 }

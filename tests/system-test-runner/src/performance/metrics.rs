@@ -26,6 +26,10 @@ pub struct QuerySample {
     pub window_index: usize,
     pub configured_concurrency: usize,
     pub client: usize,
+    /// Start and end use the same monotonic origin as `MeasurementWindow` and
+    /// `process-resources.json`.
+    pub started_elapsed_micros: u128,
+    pub ended_elapsed_micros: u128,
     pub first_row_micros: u128,
     pub total_micros: u128,
     pub rows: u64,
@@ -60,27 +64,51 @@ pub struct PreparationEvent {
 #[derive(Debug, Serialize)]
 pub struct PerformanceReport<'a> {
     pub schema_version: u32,
+    pub run_id: &'a str,
+    pub run_manifest_sha256: &'a str,
     pub manifest_sha256: &'a str,
     pub scenario: &'a str,
     pub query_samples: &'a [QuerySample],
     pub measurement_windows: &'a [MeasurementWindow],
+    pub preparation_events_status: &'a str,
     pub preparation_events: &'a [PreparationEvent],
 }
 
-pub fn write_report(
-    root: &Path,
-    manifest_sha256: &str,
-    scenario: &str,
-    samples: &[QuerySample],
-    measurement_windows: &[MeasurementWindow],
-    preparation_events: &[PreparationEvent],
-) -> Result<()> {
+pub struct PerformanceReportInput<'a> {
+    pub root: &'a Path,
+    pub run_id: &'a str,
+    pub run_manifest_sha256: &'a str,
+    pub manifest_sha256: &'a str,
+    pub scenario: &'a str,
+    pub samples: &'a [QuerySample],
+    pub measurement_windows: &'a [MeasurementWindow],
+    pub preparation_events: &'a [PreparationEvent],
+}
+
+pub fn write_report(input: PerformanceReportInput<'_>) -> Result<()> {
+    let PerformanceReportInput {
+        root,
+        run_id,
+        run_manifest_sha256,
+        manifest_sha256,
+        scenario,
+        samples,
+        measurement_windows,
+        preparation_events,
+    } = input;
     let report = PerformanceReport {
-        schema_version: 2,
+        schema_version: 3,
+        run_id,
+        run_manifest_sha256,
         manifest_sha256,
         scenario,
         query_samples: samples,
         measurement_windows,
+        preparation_events_status: if preparation_events.is_empty() {
+            "unsupported-not-wired"
+        } else {
+            "available"
+        },
         preparation_events,
     };
     let bytes = serde_json::to_vec_pretty(&report).context("serialize performance report")?;
