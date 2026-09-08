@@ -144,6 +144,7 @@ pub struct QueryTaskExecution {
     sink: Arc<dyn TaskOperationSink>,
     intake: StatusIntake,
     operation_targets: BTreeMap<TaskOperationId, OperationTarget>,
+    status_reconciliations: BTreeSet<QueryContextRef>,
     failure: TerminationLatch,
     read: ReadCompletionTracker,
     drained_tasks: BTreeSet<TaskId>,
@@ -212,6 +213,7 @@ impl QueryTaskExecution {
             sink,
             intake,
             operation_targets: BTreeMap::new(),
+            status_reconciliations: BTreeSet::new(),
             failure: TerminationLatch::open(),
             read,
             drained_tasks: BTreeSet::new(),
@@ -238,6 +240,12 @@ impl QueryTaskExecution {
 
     pub fn owner(&self, context: QueryContextRef) -> Option<&QueryContextOwner> {
         self.owners.get(&context)
+    }
+
+    /// Takes contexts whose task-operation acknowledgement requires an
+    /// immediate status resubscription from the frontend's held cursors.
+    pub fn take_status_reconciliations(&mut self) -> BTreeSet<QueryContextRef> {
+        std::mem::take(&mut self.status_reconciliations)
     }
 
     /// Every backend's sealed runtime-filter observation, as its release
@@ -455,6 +463,7 @@ impl QueryTaskExecution {
         let task = stage
             .task_mut(task_id)
             .ok_or(TaskExecutionError::UnknownOperation)?;
+        let context = task.context();
         match ack.kind() {
             OperationKind::CreateTask => {
                 let identity = task.identity();
@@ -486,6 +495,10 @@ impl QueryTaskExecution {
                         outcome,
                         detail: ack.detail().map(|d| d.as_str().to_owned()),
                     })
+                }
+                UpdateSettlement::AwaitingTerminalStatus => {
+                    self.status_reconciliations.insert(context);
+                    Ok(())
                 }
                 _ => Ok(()),
             },

@@ -1236,6 +1236,12 @@ fn a_terminal_rejected_update_waits_for_the_task_status_authority() {
     assert_eq!(task.pending_updates(), 0);
     assert_eq!(task.discarded_updates(), 1);
     assert_eq!(task.converged_after_terminal(), 1);
+    let context = task.context();
+    assert_eq!(
+        harness.execution.take_status_reconciliations(),
+        [context].into_iter().collect(),
+        "StopSendingAndReconcile requests an immediate status replay"
+    );
 
     assert_eq!(
         harness

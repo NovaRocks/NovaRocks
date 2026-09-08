@@ -299,6 +299,13 @@ impl TaskRound {
             self.execution.acknowledge(&ack)?;
         }
 
+        for context in self.execution.take_status_reconciliations() {
+            self.subscriber
+                .resubscribe(context, self.execution.status_cursors(context))
+                .map_err(TaskExecutionError::Schedule)?;
+            report.resubscriptions += 1;
+        }
+
         let status = self.execution.apply_status(STATUS_EVENTS_PER_TURN)?;
         report.status_events = status.accepted + status.ignored;
         if status.resubscribe {

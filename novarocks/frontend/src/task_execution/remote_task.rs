@@ -76,6 +76,9 @@ pub enum UpdateSettlement {
     /// The task went terminal while this request was in flight, so its
     /// outcome no longer changes anything.
     ConvergedAfterTerminal,
+    /// The backend says the task is terminal, but the frontend has not yet
+    /// observed the authoritative terminal status.
+    AwaitingTerminalStatus,
     /// The operation failed closed and this task is terminal.
     FailedClosed(OperationOutcome),
 }
@@ -569,6 +572,7 @@ impl RemoteTask {
                 self.converged_after_terminal += 1;
                 if !matches!(self.state, RemoteTaskState::Terminal) {
                     self.await_terminal_status();
+                    return Ok(UpdateSettlement::AwaitingTerminalStatus);
                 }
                 return Ok(UpdateSettlement::ConvergedAfterTerminal);
             }
