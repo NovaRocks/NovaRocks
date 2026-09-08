@@ -66,7 +66,8 @@ pub fn decode_connector_payload(
     let catalog_path = header_path.field("catalog");
     scan_message(encoded_catalog, &[(1, 2), (2, 2)], &catalog_path)?;
 
-    ledger.charge_items(1)?;
+    ledger.charge_items(8)?;
+    ledger.check_depth(3)?;
     ledger.charge_scalar(raw_header.provider_id.len())?;
     let provider_id = ConnectorProviderId::parse(&raw_header.provider_id).map_err(|_| {
         invalid(

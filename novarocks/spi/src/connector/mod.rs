@@ -75,10 +75,11 @@ pub use cleanup_maintenance::{
 };
 pub use codec::{
     ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
-    ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload,
-    ConnectorEnvelopeHeader, ConnectorFieldPath, ConnectorFieldPathSegment,
-    ConnectorPrivateDecoder, ConnectorPrivateEncoder, MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES,
-    MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
+    ConnectorDecodeCheckpoint, ConnectorDecodeContext, ConnectorDecodeDepthGuard,
+    ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload, ConnectorEnvelopeHeader,
+    ConnectorFieldPath, ConnectorFieldPathSegment, ConnectorPrivateDecoder,
+    ConnectorPrivateEncoder, MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES,
+    MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
 };
 pub use context::{
     ConnectorCancellation, ConnectorRequestContext, ConnectorRequestScope,

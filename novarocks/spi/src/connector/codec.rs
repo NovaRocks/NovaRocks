@@ -31,6 +31,7 @@ use super::{CatalogHandle, ConnectorProviderId};
 
 pub const MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH: usize = 64;
 pub const MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES: usize = 256;
+pub const MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ConnectorCodecCategory {
@@ -161,7 +162,7 @@ impl ConnectorCodecError {
         Self {
             path,
             kind,
-            detail: Arc::from(detail.as_ref()),
+            detail: Arc::from(bound_detail(detail.as_ref())),
         }
     }
 
@@ -189,6 +190,29 @@ impl fmt::Display for ConnectorCodecError {
 }
 
 impl Error for ConnectorCodecError {}
+
+fn bound_detail(detail: &str) -> String {
+    let mut value = detail.to_owned();
+    for marker in ["password=", "secret=", "token="] {
+        let mut offset = 0;
+        while let Some(relative) = value[offset..].find(marker) {
+            let start = offset + relative + marker.len();
+            let end = value[start..]
+                .find(char::is_whitespace)
+                .map_or(value.len(), |relative| start + relative);
+            value.replace_range(start..end, "[REDACTED]");
+            offset = start + "[REDACTED]".len();
+        }
+    }
+    if value.len() > MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES {
+        let mut end = MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectorDecodeLimits {
@@ -237,6 +261,33 @@ pub struct ConnectorDecodeLedger {
     retained_bytes: usize,
     scalar_bytes: usize,
     items: usize,
+    depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorDecodeCheckpoint {
+    raw_bytes: usize,
+    retained_bytes: usize,
+    scalar_bytes: usize,
+    items: usize,
+    depth: usize,
+}
+
+#[derive(Debug)]
+pub struct ConnectorDecodeDepthGuard<'a> {
+    ledger: &'a mut ConnectorDecodeLedger,
+}
+
+impl ConnectorDecodeDepthGuard<'_> {
+    pub fn ledger(&mut self) -> &mut ConnectorDecodeLedger {
+        self.ledger
+    }
+}
+
+impl Drop for ConnectorDecodeDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.ledger.depth -= 1;
+    }
 }
 
 /// Immutable binding facts plus the caller-owned structural budget available
@@ -301,6 +352,7 @@ impl ConnectorDecodeLedger {
             retained_bytes: 0,
             scalar_bytes: 0,
             items: 0,
+            depth: 0,
         }
     }
 
@@ -340,6 +392,30 @@ impl ConnectorDecodeLedger {
             return Err(capacity("nesting depth"));
         }
         Ok(())
+    }
+
+    pub fn enter_depth(&mut self) -> Result<ConnectorDecodeDepthGuard<'_>, ConnectorCodecError> {
+        self.check_depth(self.depth + 1)?;
+        self.depth += 1;
+        Ok(ConnectorDecodeDepthGuard { ledger: self })
+    }
+
+    pub const fn checkpoint(&self) -> ConnectorDecodeCheckpoint {
+        ConnectorDecodeCheckpoint {
+            raw_bytes: self.raw_bytes,
+            retained_bytes: self.retained_bytes,
+            scalar_bytes: self.scalar_bytes,
+            items: self.items,
+            depth: self.depth,
+        }
+    }
+
+    pub fn rollback(&mut self, checkpoint: ConnectorDecodeCheckpoint) {
+        self.raw_bytes = checkpoint.raw_bytes.min(self.raw_bytes);
+        self.retained_bytes = checkpoint.retained_bytes.min(self.retained_bytes);
+        self.scalar_bytes = checkpoint.scalar_bytes.min(self.scalar_bytes);
+        self.items = checkpoint.items.min(self.items);
+        self.depth = checkpoint.depth.min(self.depth);
     }
 
     pub const fn raw_bytes(&self) -> usize {
@@ -538,8 +614,12 @@ mod tests {
         let limits = ConnectorDecodeLimits::try_new(8, 8, 8, 8, 8).unwrap();
         let mut ledger = ConnectorDecodeLedger::new(limits);
         ledger.charge_raw(7).unwrap();
+        let checkpoint = ledger.checkpoint();
         assert!(ledger.charge_raw(2).is_err());
         assert_eq!(ledger.raw_bytes(), 7);
+        ledger.charge_scalar(4).unwrap();
+        ledger.rollback(checkpoint);
+        assert_eq!(ledger.scalar_bytes(), 0);
     }
 
     #[test]
@@ -617,5 +697,28 @@ mod tests {
         let error =
             ConnectorCodecError::new(too_deep, ConnectorCodecErrorKind::InvalidValue, "bad");
         assert_eq!(error.path().to_string(), "connector_payload");
+    }
+
+    #[test]
+    fn depth_guard_releases_its_level_and_errors_are_redacted_and_bounded() {
+        let limits = ConnectorDecodeLimits::try_new(8, 8, 8, 8, 1).unwrap();
+        let mut ledger = ConnectorDecodeLedger::new(limits);
+        {
+            let mut level = ledger.enter_depth().unwrap();
+            assert_eq!(
+                level.ledger().enter_depth().unwrap_err().kind(),
+                ConnectorCodecErrorKind::Capacity
+            );
+        }
+        ledger.enter_depth().unwrap();
+
+        let error = ConnectorCodecError::new(
+            ConnectorFieldPath::root("payload"),
+            ConnectorCodecErrorKind::InvalidValue,
+            format!("password=canary {}", "x".repeat(1024)),
+        );
+        assert!(!error.detail().contains("canary"));
+        assert!(error.detail().contains("password=[REDACTED]"));
+        assert!(error.detail().len() <= MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES);
     }
 }
