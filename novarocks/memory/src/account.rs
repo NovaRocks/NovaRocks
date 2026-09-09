@@ -308,8 +308,15 @@ pub struct Account {
     floor: AtomicU64,
     /// Bytes held beyond the applicable bound.
     excess: AtomicU64,
-    /// Closed to growth because the account is over its bound.
+    /// Bytes ever charged here without a grant.
+    unbudgeted: AtomicU64,
+    /// Closed to growth because the account is over its bound. This lifts on
+    /// its own once the commitment is back inside the bound.
     growth_frozen: AtomicBool,
+    /// Closed to growth because unbudgeted allocation was absorbed. This does
+    /// not lift on its own: releasing the bytes does not make the sizing that
+    /// produced them correct, so an arbitrator has to clear it.
+    unbudgeted_frozen: AtomicBool,
     /// Closed to growth because the work was cancelled.
     closed: AtomicBool,
     /// This account's own peak commitment.
@@ -398,9 +405,22 @@ impl Account {
         self.excess.load(Ordering::Acquire)
     }
 
+    /// Returns bytes ever charged here without a grant.
+    pub fn unbudgeted_bytes(&self) -> u64 {
+        self.unbudgeted.load(Ordering::Acquire)
+    }
+
+    /// Reports whether growth is closed because unbudgeted allocation is
+    /// unresolved.
+    pub fn is_frozen_by_unbudgeted(&self) -> bool {
+        self.unbudgeted_frozen.load(Ordering::Acquire)
+    }
+
     /// Reports whether the account is closed to growth for any reason.
     pub fn is_closed_to_growth(&self) -> bool {
-        self.closed.load(Ordering::Acquire) || self.growth_frozen.load(Ordering::Acquire)
+        self.closed.load(Ordering::Acquire)
+            || self.growth_frozen.load(Ordering::Acquire)
+            || self.unbudgeted_frozen.load(Ordering::Acquire)
     }
 
     /// Returns the version the account currently carries.
@@ -569,6 +589,12 @@ impl Account {
                 excess_bytes: self.excess_bytes(),
             });
         }
+        if self.unbudgeted_frozen.load(Ordering::Acquire) {
+            return Err(CapacityError::FrozenByExcess {
+                scope: self.id,
+                excess_bytes: self.unbudgeted_bytes(),
+            });
+        }
         Ok(())
     }
 
@@ -726,9 +752,20 @@ impl Account {
         }
         self.reserved.fetch_add(amount, Ordering::AcqRel);
         let live = self.live.fetch_add(amount, Ordering::AcqRel) + amount;
+        self.unbudgeted.fetch_add(amount, Ordering::AcqRel);
         self.record_peak_live(live);
         self.record_peak_committed();
         self.recompute_excess();
+        // Unbudgeted absorption freezes growth on its own account, whether or
+        // not any bound was exceeded. The process may well have had the
+        // capacity; what is broken is the caller's sizing, and letting it
+        // carry on allocating unbudgeted would turn one wrong estimate into an
+        // unbounded one.
+        if !self.unbudgeted_frozen.swap(true, Ordering::AcqRel) {
+            self.shared
+                .events
+                .record(MemoryEventKind::GrowthFrozen { scope: self.id });
+        }
         self.shared.events.record(MemoryEventKind::ExcessRecorded {
             scope: self.id,
             excess_bytes: amount,
@@ -913,7 +950,9 @@ impl Account {
             floor_bytes: self.floor_bytes(),
             policy_limit_bytes: self.policy_limit().map(|limit| limit.limit_bytes()),
             excess_bytes: self.excess_bytes(),
+            unbudgeted_bytes: self.unbudgeted_bytes(),
             growth_frozen: self.is_closed_to_growth(),
+            frozen_by_unbudgeted: self.is_frozen_by_unbudgeted(),
             peak_committed_bytes: self.peak_committed_bytes(),
             peak_live_bytes: self.peak_live_bytes(),
             policy_version: self.policy_version(),
@@ -977,7 +1016,9 @@ impl AccountHandle {
             handed_down: AtomicU64::new(0),
             floor: AtomicU64::new(0),
             excess: AtomicU64::new(0),
+            unbudgeted: AtomicU64::new(0),
             growth_frozen: AtomicBool::new(false),
+            unbudgeted_frozen: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             peak_committed: AtomicU64::new(0),
             peak_live: AtomicU64::new(0),
@@ -1045,7 +1086,9 @@ impl AccountHandle {
             handed_down: AtomicU64::new(0),
             floor: AtomicU64::new(0),
             excess: AtomicU64::new(0),
+            unbudgeted: AtomicU64::new(0),
             growth_frozen: AtomicBool::new(false),
+            unbudgeted_frozen: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             peak_committed: AtomicU64::new(0),
             peak_live: AtomicU64::new(0),
@@ -1097,7 +1140,7 @@ impl AccountHandle {
             version,
             committed_bytes: committed,
             excess_bytes: self.account.excess_bytes(),
-            growth_frozen: self.account.growth_frozen.load(Ordering::Acquire),
+            growth_frozen: self.account.is_closed_to_growth(),
         }
     }
 
@@ -1109,6 +1152,28 @@ impl AccountHandle {
     /// so a bounded step cannot have its working set taken away mid-flight.
     pub fn set_floor(&self, floor_bytes: u64) {
         self.account.floor.store(floor_bytes, Ordering::Release);
+    }
+
+    /// Lets the account grow again after unbudgeted allocation was resolved.
+    ///
+    /// This is the arbitrator's acknowledgement, and it is deliberately
+    /// explicit: an over-bound freeze lifts by itself when the commitment
+    /// comes back inside the bound, but unbudgeted allocation means a caller
+    /// sized something wrongly, and releasing the bytes does not fix that.
+    /// The cumulative record of what was absorbed is kept either way.
+    pub fn resume_growth_after_arbitration(&self) -> u64 {
+        let absorbed = self.account.unbudgeted_bytes();
+        if self.account.unbudgeted_frozen.swap(false, Ordering::AcqRel)
+            && !self.account.growth_frozen.load(Ordering::Acquire)
+        {
+            self.account
+                .shared
+                .events
+                .record(MemoryEventKind::GrowthResumed {
+                    scope: self.account.id,
+                });
+        }
+        absorbed
     }
 
     /// Closes the account to further growth while keeping every existing

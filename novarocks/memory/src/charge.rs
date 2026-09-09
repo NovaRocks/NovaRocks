@@ -71,7 +71,11 @@ impl ChargeState {
         })
     }
 
-    fn sponsor(&self) -> AccountHandle {
+    /// Returns the account currently sponsoring these bytes.
+    ///
+    /// An adapter that moves several charges together needs the origin handle
+    /// so a refusal partway through can put the moved ones back.
+    pub fn sponsor(&self) -> AccountHandle {
         self.sponsor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -161,10 +161,19 @@ fn concurrent_works_never_oversubscribe_the_capacity_bound() {
         })
     };
 
+    // A second barrier makes the contention structural instead of dependent
+    // on timing: every worker holds its first reservation until all of them
+    // have tried, so 16 accounts each needing a 256-byte top-up cannot all fit
+    // in 1024 bytes and some must be refused on every run.
+    let holding = Arc::new(Barrier::new(THREADS));
+    let first_round_refusals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     let workers: Vec<_> = (0..THREADS)
         .map(|index| {
             let authority = Arc::clone(&authority);
             let barrier = Arc::clone(&barrier);
+            let holding = Arc::clone(&holding);
+            let first_round_refusals = Arc::clone(&first_round_refusals);
             thread::spawn(move || {
                 let work = authority
                     .create_account(AccountKind::Work, ExternalRef::from_u128(index as u128 + 1))
@@ -172,6 +181,19 @@ fn concurrent_works_never_oversubscribe_the_capacity_bound() {
                 barrier.wait();
                 let mut granted = 0u64;
                 let mut refused = 0u64;
+
+                // Round one: everyone attempts and keeps what it got.
+                let first = work.request_grant(CHUNK);
+                match &first {
+                    Ok(_) => granted += 1,
+                    Err(_) => {
+                        refused += 1;
+                        first_round_refusals.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                holding.wait();
+                drop(first);
+
                 for round in 0..ROUNDS {
                     match work.request_grant(CHUNK) {
                         Ok(grant) => {
@@ -206,11 +228,15 @@ fn concurrent_works_never_oversubscribe_the_capacity_bound() {
     let samples = sampler.join().expect("sampler");
 
     assert!(samples > 0, "the sampler observed nothing");
-    assert_eq!(total_granted + total_refused, (THREADS * ROUNDS) as u64);
-    assert!(
-        total_refused > 0,
-        "the test is meant to run against a tight bound"
+    assert_eq!(
+        total_granted + total_refused,
+        (THREADS * ROUNDS) as u64 + THREADS as u64
     );
+    assert!(
+        first_round_refusals.load(Ordering::Relaxed) > 0,
+        "the bound is tight by construction: 16 accounts cannot all hold a          256-byte top-up inside 1024 bytes"
+    );
+    assert!(total_refused >= first_round_refusals.load(Ordering::Relaxed));
 
     // Every grant was dropped, so the whole capacity is returnable again.
     let snapshot = authority.snapshot();

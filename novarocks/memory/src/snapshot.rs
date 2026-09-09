@@ -70,11 +70,30 @@ pub struct AccountSnapshot {
     pub floor_bytes: u64,
     /// Installed policy limit, when one is installed.
     pub policy_limit_bytes: Option<u64>,
-    /// Bytes held beyond the installed policy. A lowered policy does not erase
-    /// commitments, so this is reported honestly rather than clamped.
+    /// Bytes held beyond the applicable bound: the account's own policy, or
+    /// the managed capacity at the root. A lowered policy does not erase
+    /// commitments, so this is reported honestly rather than clamped. It falls
+    /// back to zero on its own once the account is inside its bound again.
     pub excess_bytes: u64,
-    /// Whether the account is closed to further growth.
+    /// Bytes this account charged without a grant, cumulatively.
+    ///
+    /// This is a different fact from `excess_bytes` and must not be added to
+    /// it. An account can absorb unbudgeted allocation while staying well
+    /// inside every bound — the process simply had the capacity — and it can
+    /// exceed a bound without ever allocating unbudgeted. The first says a
+    /// caller's own sizing was wrong; the second says a limit is being
+    /// breached. This counter never decreases, because "this happened" does
+    /// not stop being true when the bytes are released.
+    pub unbudgeted_bytes: u64,
+    /// Whether the account is closed to further growth, for any reason.
     pub growth_frozen: bool,
+    /// Whether growth is closed specifically because unbudgeted allocation was
+    /// absorbed and no arbitrator has resolved it yet.
+    ///
+    /// Unlike an over-bound freeze, this one does not lift by itself:
+    /// releasing the bytes does not make the sizing that produced them
+    /// correct, so an arbitrator has to say the account may grow again.
+    pub frozen_by_unbudgeted: bool,
     /// This account's own peak `C`.
     pub peak_committed_bytes: u64,
     /// This account's own peak `L`.
@@ -353,7 +372,9 @@ mod tests {
             floor_bytes: 0,
             policy_limit_bytes: None,
             excess_bytes: 0,
+            unbudgeted_bytes: 0,
             growth_frozen: false,
+            frozen_by_unbudgeted: false,
             peak_committed_bytes: committed,
             peak_live_bytes: live,
             policy_version: PolicyVersion::INITIAL,

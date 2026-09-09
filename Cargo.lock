@@ -3945,6 +3945,15 @@ name = "novarocks-memory"
 version = "0.1.0"
 
 [[package]]
+name = "novarocks-memory-arrow"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-buffer",
+ "novarocks-memory",
+]
+
+[[package]]
 name = "novarocks-native-trust"
 version = "0.1.0"
 dependencies = [
@@ -4060,6 +4069,7 @@ dependencies = [
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-functions",
+ "novarocks-memory",
  "novarocks-native-trust",
  "novarocks-query-application",
  "novarocks-secret",
