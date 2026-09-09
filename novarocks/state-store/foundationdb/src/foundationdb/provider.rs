@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
     StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
     StateStoreProviderLifecycle,
@@ -415,7 +415,7 @@ mod tests {
     use tokio::sync::Notify;
     use uuid::Uuid;
 
-    use novarocks_spi::state_store::{
+    use novarocks_state_store_api::{
         ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore,
         StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
         StateStoreOpenRequest, StateStoreProviderFactory, StateStoreProviderInstance,

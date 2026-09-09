@@ -2428,6 +2428,7 @@ dependencies = [
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-state-store-api",
  "novarocks-task-codec",
  "novarocks-types",
  "novarocks-user-error",
@@ -2587,6 +2588,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "novarocks-state-store-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "sha2",
  "uuid",
 ]
 

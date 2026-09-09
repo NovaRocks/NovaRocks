@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     MAX_KEY_BYTES, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
     StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
     StateStoreProviderLifecycle,
@@ -147,7 +147,7 @@ mod tests {
     fn request(deadline: Instant) -> StateStoreOpenRequest {
         StateStoreOpenRequest {
             cluster_id: "cluster-a".to_owned(),
-            limits: novarocks_spi::state_store::StateStoreLimits::default(),
+            limits: novarocks_state_store_api::StateStoreLimits::default(),
             deadline,
         }
     }

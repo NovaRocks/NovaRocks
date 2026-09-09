@@ -18,7 +18,7 @@
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use crate::state_store::metrics::StateStoreMetrics;
 use crate::state_store::{OperationId, RunFailure, derive_transaction_id, run_side_effect_free};
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     CommitOutcome, CommitResolution, StateStore, StateStoreError, StateStoreErrorKind,
     TransactionId,
 };
@@ -84,7 +84,7 @@ pub(crate) async fn run<T, F>(
 ) -> Result<T, MvRepositoryError>
 where
     F: for<'a> FnMut(
-        &'a mut dyn novarocks_spi::state_store::WriteTransaction,
+        &'a mut dyn novarocks_state_store_api::WriteTransaction,
     ) -> futures::future::BoxFuture<'a, Result<T, StateStoreError>>,
 {
     run_raw(store, metrics, operation_id, purpose, operation)
@@ -101,7 +101,7 @@ pub(crate) async fn run_raw<T, F>(
 ) -> Result<T, RunFailure>
 where
     F: for<'a> FnMut(
-        &'a mut dyn novarocks_spi::state_store::WriteTransaction,
+        &'a mut dyn novarocks_state_store_api::WriteTransaction,
     ) -> futures::future::BoxFuture<'a, Result<T, StateStoreError>>,
 {
     let result = run_side_effect_free(
@@ -133,7 +133,7 @@ async fn run_after_known_abort<T, F>(
 ) -> Result<T, RunFailure>
 where
     F: for<'a> FnMut(
-        &'a mut dyn novarocks_spi::state_store::WriteTransaction,
+        &'a mut dyn novarocks_state_store_api::WriteTransaction,
     ) -> futures::future::BoxFuture<'a, Result<T, StateStoreError>>,
 {
     for attempt in 2..=store.limits().runner_max_attempts {

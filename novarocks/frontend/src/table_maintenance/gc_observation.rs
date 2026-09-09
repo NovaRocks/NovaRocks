@@ -24,7 +24,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, StateStoreError,
     WriteTransaction,
 };

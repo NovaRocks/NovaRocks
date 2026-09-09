@@ -13,7 +13,7 @@ bytes = "1"
 foundationdb = { version = "=0.11.0", optional = true, default-features = false, features = ["embedded-fdb-include", "fdb-7_3"] }
 futures = "0.3"
 hex = "0.4"
-novarocks-spi = { path = "../../spi" }
+novarocks-state-store-api = { path = "../api" }
 novarocks-secret = { path = "../../secret" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,7 +23,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
-novarocks-spi = { path = "../../spi", features = ["state-store-conformance"] }
+novarocks-state-store-testkit = { path = "../testkit" }
 tempfile = "3"
 
 [[bin]]

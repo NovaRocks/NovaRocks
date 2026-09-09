@@ -23,7 +23,7 @@
 //! instead of alongside the classification tag.
 
 use bytes::Bytes;
-use novarocks_spi::state_store::Key;
+use novarocks_state_store_api::Key;
 
 /// A StateStore key prefix owned by exactly one persistent state family.
 ///

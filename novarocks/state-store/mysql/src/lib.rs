@@ -58,7 +58,7 @@ use tokio::time::Instant;
 
 use self::identity::MysqlIdentitySnapshot;
 use self::runtime::MysqlProviderHandle;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
     StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot,
     StateStoreProviderId, StoreIdentity, TransactionId, WriteTransaction,

@@ -25,8 +25,8 @@ use tokio::time::{Instant, timeout_at};
 use super::codec::{KeyspaceCodec, REVISION_BYTES};
 use super::txn::create_raw_transaction;
 use super::{classify_native_read_error, record_provider_error_metric};
-use novarocks_spi::state_store::StateStoreMetrics;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::StateStoreMetrics;
+use novarocks_state_store_api::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, Key, StateStoreError,
     StateStoreErrorKind, StateStoreLimits, StoreIdentity, StoreRevision,
 };

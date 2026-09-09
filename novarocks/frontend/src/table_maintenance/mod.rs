@@ -29,7 +29,7 @@ use novarocks_spi::connector::{
     ConnectorCleanupCandidate, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
     ConnectorWriteOperationId, ExternalMutationFinalization, ExternalMutationOutcome,
 };
-use novarocks_spi::state_store::StateStore;
+use novarocks_state_store_api::StateStore;
 use tokio::runtime::Handle;
 
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;

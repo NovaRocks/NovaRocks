@@ -17,7 +17,7 @@
 
 use std::mem::size_of;
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     Precondition, StateStoreError, StateStoreErrorKind, StateStoreLimits,
 };
 
@@ -153,7 +153,7 @@ mod tests {
     use super::{
         TRANSACTION_ENVELOPE_BYTES, TransactionBudget, accounted_delete_bytes, accounted_put_bytes,
     };
-    use novarocks_spi::state_store::{
+    use novarocks_state_store_api::{
         Precondition, StateStoreErrorKind, StateStoreLimits, VersionToken,
     };
 

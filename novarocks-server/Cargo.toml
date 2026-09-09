@@ -20,6 +20,7 @@ novarocks-fs = { path = "../novarocks/fs" }
 novarocks-native-trust = { path = "../novarocks/native-trust" }
 novarocks-secret = { path = "../novarocks/secret" }
 novarocks-spi = { path = "../novarocks/spi" }
+novarocks-state-store-api = { path = "../novarocks/state-store/api" }
 novarocks-sql = { path = "../novarocks/sql" }
 novarocks-state-store-sqlite = { path = "../novarocks/state-store/sqlite" }
 novarocks-types = { path = "../novarocks/types" }

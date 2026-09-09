@@ -64,7 +64,7 @@ use novarocks_spi::connector::{
     ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableHandle,
     ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
 };
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Direction, Key, KeyRange,
     Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
     StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,

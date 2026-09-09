@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use novarocks_spi::state_store::{StateStoreError, StateStoreProviderId};
+use novarocks_state_store_api::{StateStoreError, StateStoreProviderId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateStoreHostErrorKind {

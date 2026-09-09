@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderId,
     StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
@@ -119,7 +119,7 @@ impl StateStoreHost {
 }
 
 fn validate_open_instance(
-    descriptor: novarocks_spi::state_store::StateStoreProviderDescriptor,
+    descriptor: novarocks_state_store_api::StateStoreProviderDescriptor,
     instance: &dyn StateStoreProviderInstance,
 ) -> Result<(), StateStoreHostError> {
     let provider_id = descriptor.id;

@@ -33,7 +33,7 @@ use novarocks_parser::{
     printer::print_query,
 };
 use novarocks_secret::SecretValue;
-use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
+use novarocks_state_store_api::{CommitOutcome, Key, Precondition, TransactionId, Value};
 use std::sync::Arc;
 use std::time::Duration;
 mod common;

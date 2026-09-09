@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     CommitOutcome, CommitResolution, Key, KeyRange, Precondition as StorePrecondition,
     RangeRequest, StateRecord, StateStore, TransactionId, Value, VersionToken, WriteTransaction,
 };
@@ -446,8 +446,8 @@ impl HelperState {
             range: KeyRange::new(store_key(raw_start)?, store_key(raw_end)?)
                 .map_err(display_error)?,
             direction: match direction {
-                Direction::Forward => novarocks_spi::state_store::Direction::Forward,
-                Direction::Reverse => novarocks_spi::state_store::Direction::Reverse,
+                Direction::Forward => novarocks_state_store_api::Direction::Forward,
+                Direction::Reverse => novarocks_state_store_api::Direction::Reverse,
             },
             page_size,
             continuation: None,

@@ -23,10 +23,10 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use novarocks_spi::state_store::testing::InMemoryStateStoreProviderFactory;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderId,
 };
+use novarocks_state_store_testkit::testing::InMemoryStateStoreProviderFactory;
 
 use super::{StateStoreHost as FrontendStateStoreHost, StateStoreHostError};
 use super::{StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry};
@@ -37,7 +37,7 @@ pub const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
 pub const TEST_STATE_STORE_DESCRIPTOR: StateStoreProviderDescriptor =
     StateStoreProviderDescriptor::new(
         TEST_STATE_STORE_PROVIDER_ID,
-        novarocks_spi::state_store::MAX_KEY_BYTES,
+        novarocks_state_store_api::MAX_KEY_BYTES,
     );
 
 pub fn registry() -> StateStoreProviderRegistry {

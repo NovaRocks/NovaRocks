@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use novarocks_spi::connector::ConnectorTableObjectId;
-use novarocks_spi::state_store::VersionToken;
+use novarocks_state_store_api::VersionToken;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

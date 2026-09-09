@@ -11,7 +11,7 @@ async-trait = "0.1"
 bytes = "1"
 fs2 = "0.4"
 log = "0.4"
-novarocks-spi = { path = "../../spi" }
+novarocks-state-store-api = { path = "../api" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v4", "v7"] }

@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     CommitOutcome, CommitReceipt, MAX_RUNNER_ATTEMPTS, StateStore, StateStoreError,
     StateStoreErrorKind, TransactionId, WriteTransaction,
 };

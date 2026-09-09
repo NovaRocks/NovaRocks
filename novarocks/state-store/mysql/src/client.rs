@@ -29,7 +29,7 @@ use mysql_async::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout_at};
 
-use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind};
 
 use super::error::MysqlNativeError;
 use crate::{MySqlClientConfig, MySqlTlsMode};

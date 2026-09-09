@@ -38,7 +38,7 @@ use novarocks_frontend::mv::repository::key::{
     projection_by_id_key, sequence_key, target_lookup_key,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
-use novarocks_spi::state_store::{Key, Value};
+use novarocks_state_store_api::{Key, Value};
 use uuid::Uuid;
 
 fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {

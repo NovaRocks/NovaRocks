@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
     StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderInstance,
     StateStoreProviderLifecycle,
@@ -448,12 +448,12 @@ mod tests {
     #[cfg(feature = "state-store-test-hooks")]
     use futures::future::BoxFuture;
     #[cfg(feature = "state-store-test-hooks")]
-    use novarocks_spi::state_store::{
+    use novarocks_state_store_api::{
         ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStoreErrorKind,
         StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest, StoreIdentity,
         TransactionId, WriteTransaction,
     };
-    use novarocks_spi::state_store::{StateStoreProviderFactory, StateStoreProviderInstance};
+    use novarocks_state_store_api::{StateStoreProviderFactory, StateStoreProviderInstance};
     #[cfg(feature = "state-store-test-hooks")]
     use tokio::sync::Notify;
 

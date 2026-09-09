@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant as StdInstant;
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreOpenRequest,
 };
 use tokio::sync::{Notify, oneshot};

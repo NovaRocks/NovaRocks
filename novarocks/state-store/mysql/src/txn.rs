@@ -38,8 +38,8 @@ use super::codec::MysqlCodec;
 use super::error::{MysqlNativeError, MysqlReadStatementError, MysqlTransactionDisposition};
 use super::range::{decode_record, read_range_page};
 use super::runtime::MysqlRuntimeGuard;
-use novarocks_spi::state_store::StateStoreMetrics;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::StateStoreMetrics;
+use novarocks_state_store_api::{
     CommitOutcome, CommitReceipt, ContinuationToken, Direction, Key, Precondition, RangePage,
     RangeRequest, ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind,
     StateStoreLimits, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value,
@@ -2119,7 +2119,7 @@ pub(crate) async fn insert_malformed_kv_row_for_test(
         statement_in_flight: false,
     };
     let key = key.to_vec();
-    let oversized_value = vec![0x5a; novarocks_spi::state_store::MAX_VALUE_BYTES + 1];
+    let oversized_value = vec![0x5a; novarocks_state_store_api::MAX_VALUE_BYTES + 1];
     transaction
         .run(move |connection| {
             Box::pin(connection.exec_drop(

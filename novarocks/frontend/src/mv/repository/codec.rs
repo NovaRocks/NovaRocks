@@ -21,7 +21,7 @@ use std::io::Cursor;
 use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value};
 use bytes::Bytes;
 use novarocks_spi::connector::ConnectorTableObjectId;
-use novarocks_spi::state_store::{Key, Value};
+use novarocks_state_store_api::{Key, Value};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;

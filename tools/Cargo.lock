@@ -3288,6 +3288,7 @@ dependencies = [
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-state-store-api",
  "novarocks-task-codec",
  "novarocks-types",
  "novarocks-user-error",
@@ -3437,6 +3438,7 @@ dependencies = [
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-state-store-api",
  "novarocks-state-store-sqlite",
  "novarocks-types",
  "novarocks-version",
@@ -3485,6 +3487,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-state-store-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "novarocks-state-store-sqlite"
 version = "0.1.0"
 dependencies = [
@@ -3492,7 +3504,7 @@ dependencies = [
  "bytes",
  "fs2",
  "log",
- "novarocks-spi",
+ "novarocks-state-store-api",
  "rusqlite",
  "tokio",
  "uuid",

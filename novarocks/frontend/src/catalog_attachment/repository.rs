@@ -27,7 +27,7 @@ use novarocks_spi::connector::{
     MAX_CATALOG_NON_SECRET_PROPERTIES, StaticCredentialReference,
     canonicalize_catalog_credential_bindings,
 };
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     CommitResolution, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreError, StateStoreErrorKind, VersionToken,
 };
@@ -111,7 +111,7 @@ impl CatalogAttachmentRepository {
         let repository = Self {
             durable: DurableRecordStore::new(Arc::clone(&store)),
             metrics: Arc::new(StateStoreMetrics::new(
-                novarocks_spi::state_store::StateStoreProviderId::new("frontend-catalog"),
+                novarocks_state_store_api::StateStoreProviderId::new("frontend-catalog"),
             )),
             store,
         };
@@ -319,7 +319,7 @@ impl CatalogAttachmentRepository {
     async fn resolve_create_unknown(
         &self,
         operation_id: OperationId,
-        transaction_id: novarocks_spi::state_store::TransactionId,
+        transaction_id: novarocks_state_store_api::TransactionId,
         attachment: CatalogAttachment,
         original: StateStoreError,
     ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
@@ -452,7 +452,7 @@ impl CatalogAttachmentRepository {
 /// repository cross-call: the caller owns the transaction which couples an MV
 /// definition/index write to catalog attachment existence.
 pub(crate) async fn assert_attachment_versions(
-    transaction: &mut dyn novarocks_spi::state_store::WriteTransaction,
+    transaction: &mut dyn novarocks_state_store_api::WriteTransaction,
     expected: &[CatalogAttachmentVersioned],
 ) -> Result<(), StateStoreError> {
     for expected in expected {
@@ -721,10 +721,8 @@ mod tests {
         builtin_state_store_provider_registry,
     };
     use bytes::Bytes;
-    use novarocks_spi::state_store::{
-        CommitOutcome, Precondition, StateStore, TransactionId,
-        conformance::{FaultGate, FaultInjectingStateStore},
-    };
+    use novarocks_state_store_api::{CommitOutcome, Precondition, StateStore, TransactionId};
+    use novarocks_state_store_testkit::conformance::{FaultGate, FaultInjectingStateStore};
 
     use super::*;
 

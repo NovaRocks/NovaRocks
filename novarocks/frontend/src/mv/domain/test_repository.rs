@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use bytes::Bytes;
-use novarocks_spi::state_store::VersionToken;
+use novarocks_state_store_api::VersionToken;
 use uuid::Uuid;
 
 use super::dependency::model::MvDependencyObjectRef;

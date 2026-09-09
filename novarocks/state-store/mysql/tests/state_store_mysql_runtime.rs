@@ -27,7 +27,7 @@
 use std::time::{Duration, Instant};
 
 use novarocks_secret::SecretValue;
-use novarocks_spi::state_store::StateStoreErrorKind;
+use novarocks_state_store_api::StateStoreErrorKind;
 use novarocks_state_store_mysql::test_support::{
     MysqlProviderTestHarness, acquire_operation, acquire_provider_handle, active_readiness,
     begin_shutdown, hold_connection, is_accepting, pollute_session, pool_count, prepare_pool,

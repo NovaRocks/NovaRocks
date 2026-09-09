@@ -96,7 +96,7 @@ code-anchors:
 
 领域哲学：SPI 只承载 NovaRocks 产品架构明确支持的可替换 provider 契约，不吸收所有跨 crate API。系统定义契约语义，provider 与 consumer 共同依赖统一 SPI，host 负责选择、装配与生命周期；domain API、consumer port、transport 和实现策略保持各自 owner。稳定性由原子演进、conformance 与真实分布式验证保证，不靠兼容 bridge 或 service locator。
 
-- ADR-0006 — 可替换 provider 契约为何统一进入一个系统 SPI，而普通跨 crate port 不进入（active）
+- ADR-0006 — 可替换 provider 契约为何统一进入一个系统 SPI，而普通跨 crate port 不进入（active；其中「Connector 与 StateStore 共用同一个物理 SPI package」这一条前提已由 ADR-0140 替换，其余原则仍有效）
 - ADR-0014 — 共享文件访问与 Parquet/ORC 物理解码为何属于无 Connector identity 的独立基础（active）
 - ADR-0015 — table-format Connector 为何拥有 read correctness，native fragment 只绑定已安装真实 instance（active）
 - ADR-0016 — Connector 为何共享逻辑 identity、但不共享 FE control 与 BE execution runtime（active）
@@ -130,6 +130,7 @@ code-anchors:
 - ADR-0112 — MV 运行态为何只属于当前进程、StateStore为何只保留 lake-source Accelerator（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
+- ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
 
 #### 历史
 
@@ -385,6 +386,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 - ADR-0122 — SQLite 为何是唯一 production StateStore、远程 provider 仅保留实验 leaf crate（active）
+- ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active）
 
 #### 历史
 

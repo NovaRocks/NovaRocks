@@ -720,7 +720,12 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   StarRocks is retired and must not be restored through a local-binding config
   or runtime fallback.
 - **FE/BE interface behavior**: inspect `novarocks/frontend/src/**`,
-  `novarocks/backend/src/**`, and the neutral contracts under `novarocks/spi/**`.
+  `novarocks/backend/src/**`, and the neutral contracts under `novarocks/spi/**`
+  (Connector) and `novarocks/state-store/api/**` (StateStore). Those two
+  provider domains are separate compilation units: the StateStore contract does
+  not depend on Arrow or on the Connector contract, and its shared test
+  mechanics live in `novarocks/state-store/testkit/**`, which no production
+  crate may depend on. See `docs/guides/development/state-store-boundary.md`.
 - **Optimizer observability / plan-shape regression**: see
   `src/sql/explain.rs` for the EXPLAIN formatter (Normal/Verbose/Costs/
   Analyze). `EXPLAIN ANALYZE` returns a query-level Planning/Execution/

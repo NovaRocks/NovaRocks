@@ -28,7 +28,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     Key, Precondition, StateStore, StateStoreError, StateStoreLimits, Value, WriteTransaction,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -259,9 +259,9 @@ mod tests {
                 &self.0
             }
 
-            fn metrics_snapshot(&self) -> novarocks_spi::state_store::StateStoreMetricsSnapshot {
-                novarocks_spi::state_store::StateStoreMetricsSnapshot {
-                    provider: novarocks_spi::state_store::StateStoreProviderId::new("durable-test"),
+            fn metrics_snapshot(&self) -> novarocks_state_store_api::StateStoreMetricsSnapshot {
+                novarocks_state_store_api::StateStoreMetricsSnapshot {
+                    provider: novarocks_state_store_api::StateStoreProviderId::new("durable-test"),
                     begin_count: 0,
                     get_count: 0,
                     range_count: 0,
@@ -284,14 +284,14 @@ mod tests {
 
             async fn begin_read(
                 &self,
-            ) -> Result<Box<dyn novarocks_spi::state_store::ReadTransaction>, StateStoreError>
+            ) -> Result<Box<dyn novarocks_state_store_api::ReadTransaction>, StateStoreError>
             {
                 unreachable!("encoding tests do not read")
             }
 
             async fn begin_write(
                 &self,
-                _: novarocks_spi::state_store::TransactionId,
+                _: novarocks_state_store_api::TransactionId,
                 _: &str,
             ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
                 unreachable!("encoding tests do not write")
@@ -299,21 +299,21 @@ mod tests {
 
             async fn poll_changes(
                 &self,
-                _: &novarocks_spi::state_store::ChangePollRequest,
-            ) -> Result<novarocks_spi::state_store::ChangePage, StateStoreError> {
+                _: &novarocks_state_store_api::ChangePollRequest,
+            ) -> Result<novarocks_state_store_api::ChangePage, StateStoreError> {
                 unreachable!("encoding tests do not poll")
             }
 
             async fn identity(
                 &self,
-            ) -> Result<novarocks_spi::state_store::StoreIdentity, StateStoreError> {
+            ) -> Result<novarocks_state_store_api::StoreIdentity, StateStoreError> {
                 unreachable!("encoding tests do not inspect identity")
             }
 
             async fn resolve_commit(
                 &self,
-                _: &novarocks_spi::state_store::TransactionId,
-            ) -> Result<novarocks_spi::state_store::CommitResolution, StateStoreError> {
+                _: &novarocks_state_store_api::TransactionId,
+            ) -> Result<novarocks_state_store_api::CommitResolution, StateStoreError> {
                 unreachable!("encoding tests do not resolve commits")
             }
         }

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![cfg(feature = "state-store-conformance")]
-
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
@@ -24,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangePage, ChangePollRequest, CommitResolution, MAX_KEY_BYTES, StateStore, StateStoreError,
     StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest,
     StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
@@ -86,7 +84,7 @@ impl StateStore for StubStateStore {
 
     async fn begin_read(
         &self,
-    ) -> Result<Box<dyn novarocks_spi::state_store::ReadTransaction>, StateStoreError> {
+    ) -> Result<Box<dyn novarocks_state_store_api::ReadTransaction>, StateStoreError> {
         Err(unused_transaction_error())
     }
 
@@ -94,7 +92,7 @@ impl StateStore for StubStateStore {
         &self,
         _: TransactionId,
         _: &str,
-    ) -> Result<Box<dyn novarocks_spi::state_store::WriteTransaction>, StateStoreError> {
+    ) -> Result<Box<dyn novarocks_state_store_api::WriteTransaction>, StateStoreError> {
         Err(unused_transaction_error())
     }
 

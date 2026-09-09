@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     Precondition, StateStoreError, StateStoreErrorKind, StateStoreLimits,
 };
 
@@ -222,7 +222,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use novarocks_spi::state_store::VersionToken;
+    use novarocks_state_store_api::VersionToken;
 
     fn limits(bytes: usize, operations: usize) -> StateStoreLimits {
         StateStoreLimits {
