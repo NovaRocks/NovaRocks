@@ -17,10 +17,12 @@
 
 //! Test-only input compatibility for the MySQL provider harness.
 
+use std::num::NonZeroUsize;
+
 use novarocks_state_store_api::{
-    DEFAULT_TRANSACTION_DEADLINE, MAX_PAGE_SIZE, MAX_RUNNER_ATTEMPTS, MAX_TRANSACTION_BYTES,
-    MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreError, StateStoreErrorKind,
-    StateStoreLimits,
+    DEFAULT_MAX_OUTSTANDING_ATTEMPTS, DEFAULT_TRANSACTION_DEADLINE, MAX_PAGE_SIZE,
+    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreError,
+    StateStoreErrorKind, StateStoreLimits,
 };
 
 use crate::{MYSQL_MAX_KEY_BYTES, MysqlStateStoreOpenConfig};
@@ -34,7 +36,6 @@ pub struct MysqlTestLimitOverrides {
     pub max_transaction_operations: Option<usize>,
     pub max_transaction_bytes: Option<usize>,
     pub transaction_deadline_ms: Option<u64>,
-    pub runner_max_attempts: Option<usize>,
 }
 
 #[doc(hidden)]
@@ -49,17 +50,40 @@ pub struct MysqlTestStoreConfig {
     pub cluster_id: String,
     pub limits: MysqlTestLimitOverrides,
     pub provider: MysqlTestProviderConfig,
+    /// Ceiling on attempts this instance keeps charged at once.
+    ///
+    /// It is a provider resource bound rather than a storage limit, which is
+    /// why it sits beside `limits` instead of inside it. Conformance runs it
+    /// small on purpose: an instance that never reaches its ceiling proves
+    /// nothing about admission accounting.
+    pub outstanding_attempts: Option<NonZeroUsize>,
 }
 
 impl MysqlTestStoreConfig {
-    pub(crate) fn into_mysql_open(self) -> Result<MysqlStateStoreOpenConfig, StateStoreError> {
+    pub(crate) fn into_mysql_open(
+        self,
+    ) -> Result<(MysqlStateStoreOpenConfig, NonZeroUsize), StateStoreError> {
+        let outstanding_attempts = resolve_outstanding_attempts(self.outstanding_attempts)?;
         let MysqlTestProviderConfig::Mysql { database } = self.provider;
-        Ok(MysqlStateStoreOpenConfig {
-            cluster_id: self.cluster_id,
-            database,
-            limits: resolve_limits(&self.limits)?,
-        })
+        Ok((
+            MysqlStateStoreOpenConfig {
+                cluster_id: self.cluster_id,
+                database,
+                limits: resolve_limits(&self.limits)?,
+            },
+            outstanding_attempts,
+        ))
     }
+}
+
+fn resolve_outstanding_attempts(
+    requested: Option<NonZeroUsize>,
+) -> Result<NonZeroUsize, StateStoreError> {
+    let ceiling = requested.unwrap_or_else(crate::default_attempt_capacity);
+    if ceiling.get() > DEFAULT_MAX_OUTSTANDING_ATTEMPTS {
+        return Err(invalid_limit());
+    }
+    Ok(ceiling)
 }
 
 fn resolve_limits(
@@ -92,11 +116,6 @@ fn resolve_limits(
             overrides.transaction_deadline_ms,
             DEFAULT_TRANSACTION_DEADLINE.as_millis() as u64,
         )?),
-        runner_max_attempts: tightened_usize(
-            "runner_max_attempts",
-            overrides.runner_max_attempts,
-            MAX_RUNNER_ATTEMPTS,
-        )?,
     })
 }
 

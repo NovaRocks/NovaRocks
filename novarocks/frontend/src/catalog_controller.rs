@@ -15,25 +15,65 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! StateStore change-hint controller for local catalog runtime projections.
+//! Wakeup-driven, complete-reread controller for local catalog projections.
 //!
-//! Change pages are intentionally only wakeups. Every relevant hint and every
-//! retention gap triggers a complete authoritative attachment reread.
+//! # Why there is no change feed here any more
+//!
+//! This controller used to poll a StateStore change feed. It never used what
+//! the feed carried: the poll extracted exactly one boolean from a page — "did
+//! any key under the attachment prefix move" — and answered it with a complete
+//! authoritative reread, the same reread it performed for a retention gap and
+//! for a store-identity change. Keeping a feed to transport one bit cost a
+//! retained cursor, per-provider change history, and a full enumeration every
+//! 250 ms whether or not anything had changed.
+//!
+//! Two deliberately unequal triggers replace it:
+//!
+//! * **A wakeup**, published by this process's own attachment repository when
+//!   one of its writes commits. This is the latency path, and it is lossy by
+//!   construction — a write on another frontend, or through a second
+//!   repository over the same store, produces no wakeup here. Nothing may rest
+//!   on receiving one.
+//! * **A periodic sweep**, which is the correctness floor: it bounds how long
+//!   *any* write can stay unobserved, including every write no wakeup could
+//!   reach.
+//!
+//! Every round is a complete reread, so a missed wakeup costs latency and
+//! never consistency. The sweep is timed from the end of the previous scan, so
+//! a slow store stretches the cadence instead of queueing rounds behind
+//! itself, and one controller never runs two scans at once.
+//!
+//! # Freshness does not run on the scan's clock
+//!
+//! Retiring projections that can no longer be confirmed has to happen on time
+//! *especially* when a scan is stuck — which is exactly when a timer driven by
+//! scan completions never fires. The freshness deadline is therefore armed
+//! from the last scan that actually completed under the current control
+//! generation, and is awaited *alongside* the in-flight scan rather than after
+//! it.
+//!
+//! When that deadline wins, the round's generation is superseded: local
+//! admission is withdrawn and the in-flight scan's result — whenever it
+//! arrives — neither republishes nor counts as freshness. A scan that outlived
+//! its generation enumerated a store state from before the expiry, so treating
+//! its completion as current would reset the very clock that just fired.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use novarocks_state_store_api::{ChangeCursor, ChangePollRequest, StateStore, StoreIdentity};
+use novarocks_state_store_api::{StateStore, StoreIdentity};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::catalog_application::FrontendCatalogApplicationPort;
-use crate::catalog_attachment::attachment_prefix;
+use crate::catalog_attachment::CatalogAttachmentWakeupSignal;
 
 #[derive(Default)]
 struct CatalogProjectionMetrics {
-    successful_polls: AtomicU64,
-    failed_polls: AtomicU64,
+    successful_rounds: AtomicU64,
+    failed_rounds: AtomicU64,
     resyncs: AtomicU64,
     freshness_expiries: AtomicU64,
 }
@@ -41,7 +81,17 @@ struct CatalogProjectionMetrics {
 #[derive(Clone, Debug)]
 pub struct CatalogProjectionConfig {
     pub page_size: usize,
-    pub poll_interval: Duration,
+    /// Floor on how long a write this process did not make can stay
+    /// unobserved.
+    ///
+    /// This is a complete authoritative enumeration, not a cheap liveness
+    /// poll, which is why it is seconds rather than the change feed's 250 ms:
+    /// at that cadence the enumeration was resident CPU cost for a deployment
+    /// where nothing had changed for hours. Local writes do not wait for it —
+    /// they arrive through the wakeup.
+    pub reconcile_interval: Duration,
+    /// How long local admission may keep serving projections that no completed
+    /// reconcile has been able to confirm.
     pub freshness_budget: Duration,
     pub retry_initial: Duration,
     pub retry_max: Duration,
@@ -53,7 +103,7 @@ impl Default for CatalogProjectionConfig {
     fn default() -> Self {
         Self {
             page_size: 256,
-            poll_interval: Duration::from_millis(250),
+            reconcile_interval: Duration::from_secs(5),
             freshness_budget: Duration::from_secs(30),
             retry_initial: Duration::from_millis(100),
             retry_max: Duration::from_secs(5),
@@ -63,12 +113,32 @@ impl Default for CatalogProjectionConfig {
     }
 }
 
+/// One reconcile round, stamped with the control generation it began under.
+struct ScanRound {
+    generation: u64,
+    identity: Result<StoreIdentity, String>,
+    outcome: Result<(), String>,
+}
+
 pub struct FrontendCatalogController {
     store: Arc<dyn StateStore>,
     projection: Arc<FrontendCatalogApplicationPort>,
     config: CatalogProjectionConfig,
     stopping: AtomicBool,
-    bootstrap_state: Mutex<Option<(StoreIdentity, ChangeCursor)>>,
+    /// Interrupts the worker's waits.
+    ///
+    /// A flag alone is not enough: it is only read between rounds, so a worker
+    /// parked on the sweep would take a whole interval to notice shutdown, and
+    /// the sweep is now seconds rather than milliseconds. This is a `watch`
+    /// rather than a notification because it holds state — a stop published
+    /// before the worker starts waiting is still seen.
+    stop: watch::Sender<bool>,
+    /// The identity `bootstrap` observed, handed once to the worker.
+    bootstrap_identity: Mutex<Option<StoreIdentity>>,
+    /// Monotonic control generation. A freshness expiry supersedes it, which
+    /// is what makes an abandoned scan's late completion inert rather than
+    /// merely unlikely.
+    generation: AtomicU64,
     metrics: CatalogProjectionMetrics,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -82,7 +152,7 @@ impl FrontendCatalogController {
         if config.page_size == 0 || config.page_size > store.limits().max_page_size {
             return Err("catalog controller page size is outside StateStore limits".to_string());
         }
-        if config.poll_interval.is_zero()
+        if config.reconcile_interval.is_zero()
             || config.freshness_budget.is_zero()
             || config.retry_initial.is_zero()
             || config.retry_max < config.retry_initial
@@ -98,44 +168,34 @@ impl FrontendCatalogController {
             projection,
             config,
             stopping: AtomicBool::new(false),
-            bootstrap_state: Mutex::new(None),
+            stop: watch::channel(false).0,
+            bootstrap_identity: Mutex::new(None),
+            generation: AtomicU64::new(0),
             metrics: CatalogProjectionMetrics::default(),
             worker: Mutex::new(None),
         }))
     }
 
-    /// Captures a polling HWM before the first authoritative attachment scan.
-    pub async fn bootstrap(&self) -> Result<ChangeCursor, String> {
+    /// Performs the first complete authoritative reread.
+    ///
+    /// There is no watermark to capture. A reconcile reads the attachment
+    /// family itself, so the only thing startup has to establish is that one
+    /// complete snapshot was applied; failing here fails frontend bootstrap,
+    /// which is the point — a frontend that never enumerated desired state
+    /// must not start serving a guess at it.
+    pub async fn bootstrap(&self) -> Result<(), String> {
         let identity = self
             .store
             .identity()
             .await
             .map_err(|error| error.to_string())?;
-        let page = self
-            .store
-            .poll_changes(&ChangePollRequest {
-                after: None,
-                page_size: self.config.page_size,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        self.projection
-            .reconcile_with_page_size(self.config.page_size, self.config.worker_count)
-            .await
-            .map_err(|error| error.to_string())?;
-        self.metrics.resyncs.fetch_add(1, Ordering::Relaxed);
-        self.publish_metrics();
-        let cursor = ChangeCursor::new(identity.store_id, page.high_watermark, u32::MAX)
-            .map_err(|error| error.to_string())?;
-        cursor
-            .decode(identity.store_id)
-            .map_err(|error| error.to_string())?;
+        self.reconcile().await?;
         *self
-            .bootstrap_state
+            .bootstrap_identity
             .lock()
             .map_err(|_| "catalog controller bootstrap state lock is poisoned".to_string())? =
-            Some((identity, cursor.clone()));
-        Ok(cursor)
+            Some(identity);
+        Ok(())
     }
 
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
@@ -147,6 +207,7 @@ impl FrontendCatalogController {
             return Err("catalog controller is already running".to_string());
         }
         self.stopping.store(false, Ordering::Release);
+        self.stop.send_replace(false);
         let controller = Arc::clone(self);
         *worker = Some(tokio::spawn(async move {
             controller.run().await;
@@ -156,6 +217,7 @@ impl FrontendCatalogController {
 
     pub async fn shutdown(&self) -> Result<(), String> {
         self.stopping.store(true, Ordering::Release);
+        self.stop.send_replace(true);
         let handle = self
             .worker
             .lock()
@@ -177,8 +239,8 @@ impl FrontendCatalogController {
     pub fn metrics_snapshot(&self) -> crate::catalog_application::CatalogProjectionMetricsSnapshot {
         crate::catalog_application::CatalogProjectionMetricsSnapshot {
             projected_catalogs: self.projection.projection_count(),
-            successful_polls: self.metrics.successful_polls.load(Ordering::Relaxed),
-            failed_polls: self.metrics.failed_polls.load(Ordering::Relaxed),
+            successful_rounds: self.metrics.successful_rounds.load(Ordering::Relaxed),
+            failed_rounds: self.metrics.failed_rounds.load(Ordering::Relaxed),
             resyncs: self.metrics.resyncs.load(Ordering::Relaxed),
             freshness_expiries: self.metrics.freshness_expiries.load(Ordering::Relaxed),
         }
@@ -189,105 +251,232 @@ impl FrontendCatalogController {
     }
 
     async fn run(&self) {
-        let bootstrap = match self.bootstrap_state.lock() {
+        let mut known_identity = match self.bootstrap_identity.lock() {
             Ok(mut state) => state.take(),
             Err(_) => {
                 tracing::warn!("catalog controller bootstrap state lock is poisoned");
                 None
             }
         };
-        let (mut identity, mut cursor) = bootstrap.map_or((None, None), |(identity, cursor)| {
-            (Some(identity), Some(cursor))
-        });
+        // A controller that never bootstrapped has published nothing, so its
+        // clock starts here and its first round is its bootstrap.
         let mut last_fresh = Instant::now();
         let mut retry = self.config.retry_initial;
-        let mut force_resync = identity.is_none();
+        let mut wakeup = self.projection.attachment_wakeup_signal();
+        let mut stop = self.stop.subscribe();
+        // True once this outage has already withdrawn admission. It also
+        // disarms the deadline, so an expiry cannot re-fire every round and
+        // supersede every scan forever.
         let mut fail_closed = false;
 
         while !self.stopping.load(Ordering::Acquire) {
-            let outcome = self
-                .poll_once(&mut identity, &mut cursor, &mut force_resync)
-                .await;
-            match outcome {
-                Ok(()) => {
+            let expiry = (!fail_closed).then(|| last_fresh + self.config.freshness_budget);
+            let round = self.run_round(expiry).await;
+            let superseded = round.generation != self.generation.load(Ordering::Acquire);
+
+            match &round.identity {
+                Ok(identity) if known_identity.as_ref() != Some(identity) => {
+                    // A different store is a different world, and the complete
+                    // reread this round already performed is the whole
+                    // recovery: nothing is carried over from the old store, so
+                    // there is no cursor or watermark left to invalidate.
+                    tracing::info!(
+                        store_id = %identity.store_id,
+                        "catalog controller observed a new StateStore identity"
+                    );
+                    known_identity = Some(identity.clone());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "catalog controller could not read store identity");
+                }
+            }
+
+            match round.outcome {
+                Ok(()) if !superseded => {
                     last_fresh = Instant::now();
                     retry = self.config.retry_initial;
                     fail_closed = false;
                     self.metrics
-                        .successful_polls
+                        .successful_rounds
                         .fetch_add(1, Ordering::Relaxed);
                     self.publish_metrics();
-                    tokio::time::sleep(self.config.poll_interval).await;
+                    self.await_next_round(
+                        wakeup.as_mut(),
+                        &mut stop,
+                        self.config.reconcile_interval,
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(()) => {
+                    tracing::warn!(
+                        "catalog attachment reconcile outlived its control generation; \
+                         its snapshot predates the freshness expiry and was discarded"
+                    );
+                    // The expiry that superseded it already withdrew admission.
+                    fail_closed = true;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "catalog attachment projection poll failed");
-                    self.metrics.failed_polls.fetch_add(1, Ordering::Relaxed);
-                    if !fail_closed && last_fresh.elapsed() >= self.config.freshness_budget {
-                        self.projection.unpublish_all();
-                        self.metrics
-                            .freshness_expiries
-                            .fetch_add(1, Ordering::Relaxed);
-                        force_resync = true;
+                    tracing::warn!(%error, "catalog attachment reconcile failed");
+                    self.metrics.failed_rounds.fetch_add(1, Ordering::Relaxed);
+                    if superseded {
+                        fail_closed = true;
+                    } else if !fail_closed && last_fresh.elapsed() >= self.config.freshness_budget {
+                        self.expire_freshness();
                         fail_closed = true;
                     }
-                    self.publish_metrics();
-                    tokio::time::sleep(retry).await;
-                    retry = retry.saturating_mul(2).min(self.config.retry_max);
+                }
+            }
+            self.publish_metrics();
+            // A wakeup during an outage is not worth waking for: the store is
+            // what is broken, so the backoff is honoured in full rather than
+            // raced against a signal. Shutdown still cuts it short.
+            self.sleep_unless_stopping(&mut stop, retry).await;
+            retry = retry.saturating_mul(2).min(self.config.retry_max);
+        }
+    }
+
+    /// Sleeps, unless the controller is asked to stop first.
+    ///
+    /// The stop flag on its own is read only between rounds, so a worker
+    /// parked on a wait would take the whole wait to notice shutdown. That was
+    /// invisible at the change feed's 250 ms poll and is not at a multi-second
+    /// sweep: it turns every frontend shutdown into a stall of one sweep.
+    async fn sleep_unless_stopping(&self, stop: &mut watch::Receiver<bool>, wait: Duration) {
+        tokio::select! {
+            _ = stop.wait_for(|stopping| *stopping) => {}
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+
+    /// Waits for the next reason to reconcile.
+    ///
+    /// A wakeup and the sweep race, and the sweep always exists: a controller
+    /// with no wakeup channel simply parks on the interval. Waiting on the
+    /// wakeup collapses a burst of DDL into one round rather than one round
+    /// per statement — the channel holds a single slot, so several commits
+    /// arriving during a scan produce exactly one wakeup afterwards.
+    async fn await_next_round(
+        &self,
+        wakeup: Option<&mut CatalogAttachmentWakeupSignal>,
+        stop: &mut watch::Receiver<bool>,
+        interval: Duration,
+    ) {
+        let Some(signal) = wakeup else {
+            self.sleep_unless_stopping(stop, interval).await;
+            return;
+        };
+        let woken = tokio::select! {
+            _ = stop.wait_for(|stopping| *stopping) => return,
+            woken = signal.changed() => woken,
+            () = tokio::time::sleep(interval) => true,
+        };
+        if !woken {
+            // A closed channel is a permanent answer, not a wakeup. Parking on
+            // the interval is what stops the loop from spinning once the
+            // publishing repository is gone.
+            self.sleep_unless_stopping(stop, interval).await;
+        }
+    }
+
+    /// Runs one reconcile round against the freshness deadline.
+    ///
+    /// The scan is awaited even after the deadline wins. Dropping it would
+    /// abandon the port's in-flight submissions mid-round, and it would not be
+    /// what makes the result safe anyway: the generation stamp is. Awaiting it
+    /// is also what keeps "one scan per controller" true — a second round
+    /// never starts beside a first.
+    async fn run_round(&self, expiry: Option<Instant>) -> ScanRound {
+        let generation = self.generation.load(Ordering::Acquire);
+        let mut scan = std::pin::pin!(self.scan_once());
+        let Some(expiry) = expiry else {
+            let (identity, outcome) = scan.await;
+            return ScanRound {
+                generation,
+                identity,
+                outcome,
+            };
+        };
+        let mut expired = false;
+        loop {
+            tokio::select! {
+                biased;
+                (identity, outcome) = &mut scan => {
+                    return ScanRound { generation, identity, outcome };
+                }
+                () = tokio::time::sleep_until(expiry), if !expired => {
+                    // Independent of the scan by construction: this fires on
+                    // the clock the last completed reconcile set, so a scan
+                    // that never returns cannot hold expired projections open.
+                    self.expire_freshness();
+                    expired = true;
                 }
             }
         }
     }
 
-    async fn poll_once(
-        &self,
-        known_identity: &mut Option<StoreIdentity>,
-        cursor: &mut Option<ChangeCursor>,
-        force_resync: &mut bool,
-    ) -> Result<(), String> {
+    /// One complete authoritative reread, plus the store identity it ran
+    /// against.
+    ///
+    /// The identity read is reported rather than propagated: a reconcile that
+    /// succeeded is a reconcile that succeeded, and losing the identity costs
+    /// only the log line that says which store it came from.
+    async fn scan_once(&self) -> (Result<StoreIdentity, String>, Result<(), String>) {
         let identity = self
             .store
             .identity()
             .await
-            .map_err(|error| error.to_string())?;
-        if known_identity.as_ref() != Some(&identity) {
-            *known_identity = Some(identity.clone());
-            *cursor = None;
-            *force_resync = true;
-        }
-        let page = self
-            .store
-            .poll_changes(&ChangePollRequest {
-                after: cursor.clone(),
-                page_size: self.config.page_size,
-            })
+            .map_err(|error| error.to_string());
+        let outcome = self.reconcile().await;
+        (identity, outcome)
+    }
+
+    /// Enumerates the complete desired state and applies it.
+    ///
+    /// Partial results cannot reach here: the source reports an incomplete
+    /// enumeration as a typed failure rather than as a smaller snapshot, so a
+    /// half-read store fails the round instead of retiring the catalogs it did
+    /// not manage to read.
+    async fn reconcile(&self) -> Result<(), String> {
+        self.projection
+            .reconcile_with_page_size(self.config.page_size, self.config.worker_count)
             .await
             .map_err(|error| error.to_string())?;
-        page.next_cursor
-            .decode(identity.store_id)
-            .map_err(|error| error.to_string())?;
-        *cursor = Some(page.next_cursor);
-
-        let prefix = attachment_prefix()?;
-        let relevant = page
-            .hints
-            .iter()
-            .any(|hint| hint.key.as_bytes().starts_with(prefix.as_bytes()));
-        if *force_resync || page.resync_required || relevant {
-            self.projection
-                .reconcile_with_page_size(self.config.page_size, self.config.worker_count)
-                .await
-                .map_err(|error| error.to_string())?;
-            self.metrics.resyncs.fetch_add(1, Ordering::Relaxed);
-            self.publish_metrics();
-            *force_resync = false;
-        }
+        self.metrics.resyncs.fetch_add(1, Ordering::Relaxed);
+        self.publish_metrics();
         Ok(())
+    }
+
+    /// Withdraws local admission for everything no completed reconcile can
+    /// still vouch for, and supersedes the control generation.
+    ///
+    /// The decision is recorded before it is acted on. Retiring first would
+    /// leave a window in which an operator — or a test — sees every projection
+    /// gone and no expiry counted, which reads as an unexplained outage rather
+    /// than as the deliberate fail-closed it is.
+    fn expire_freshness(&self) {
+        // Fence first, so a round still in flight cannot republish anything it
+        // read before this decision.
+        self.generation.fetch_add(1, Ordering::Release);
+        // Withdraw before counting, never the other way round. The counter is
+        // what an operator watches, so it must not become visible ahead of the
+        // withdrawal it claims: in that window a query would be admitted
+        // against a projection this very expiry has already judged
+        // unconfirmable. The opposite window costs only a brief withdrawal that
+        // no counter explains yet, which misleads nobody into using stale data.
+        self.projection.unpublish_all();
+        self.metrics
+            .freshness_expiries
+            .fetch_add(1, Ordering::Relaxed);
+        self.publish_metrics();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+    use std::time::Instant as StdInstant;
 
     use crate::catalog_application::desired_state::CatalogDesiredStateSource;
     use crate::catalog_application::{
@@ -302,11 +491,10 @@ mod tests {
     };
     use novarocks_spi::connector::{ConnectorControlResolver, ConnectorProviderId};
     use novarocks_state_store_api::{
-        ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore,
-        StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
-        StoreIdentity, TransactionId, WriteTransaction,
+        AttemptSupervisor, ReadTransaction, StateStore, StateStoreError, StateStoreErrorKind,
+        StateStoreLimits, StoreIdentity, WriteAttempt, WriteTransaction,
     };
-    use novarocks_state_store_testkit::conformance::FaultInjectingStateStore;
+    use tokio::sync::Semaphore;
 
     use super::*;
     use crate::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
@@ -314,10 +502,12 @@ mod tests {
 
     /// Mints a distinct control generation per materialization, like a real
     /// provider role factory: reusing an incarnation would trip the retired-generation guard
-    /// on a same-name recreate.
+    /// on a same-name recreate. It also counts materializations, so a test can
+    /// tell "reconciled again" apart from "materialized again".
     #[derive(Default)]
     struct ReadyFactory {
         incarnations: AtomicU8,
+        materializations: Arc<AtomicUsize>,
     }
 
     /// Fails local materialization without touching durable truth, so a test
@@ -346,65 +536,23 @@ mod tests {
         }
     }
 
-    struct PollUnavailableStore {
-        inner: Arc<dyn StateStore>,
-    }
-
     struct ToggleReadStore {
         inner: Arc<dyn StateStore>,
         reads_available: AtomicBool,
     }
 
+    /// Holds every read transaction open until a permit is released, so a test
+    /// can keep one reconcile scan genuinely in flight across a freshness
+    /// budget instead of approximating it with a sleep.
+    struct StallableReadStore {
+        inner: Arc<dyn StateStore>,
+        gate: Arc<Semaphore>,
+        stalled: AtomicBool,
+    }
+
     struct IdentityChangedStore {
         inner: Arc<dyn StateStore>,
         identity: StoreIdentity,
-        page: ChangePage,
-    }
-
-    #[async_trait::async_trait]
-    impl StateStore for PollUnavailableStore {
-        fn limits(&self) -> &StateStoreLimits {
-            self.inner.limits()
-        }
-
-        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-            self.inner.metrics_snapshot()
-        }
-
-        async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
-            self.inner.begin_read().await
-        }
-
-        async fn begin_write(
-            &self,
-            transaction_id: TransactionId,
-            purpose: &str,
-        ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-            self.inner.begin_write(transaction_id, purpose).await
-        }
-
-        async fn poll_changes(
-            &self,
-            _request: &ChangePollRequest,
-        ) -> Result<ChangePage, StateStoreError> {
-            Err(StateStoreError::new(
-                StateStoreErrorKind::ProviderUnavailable,
-                "injected catalog controller outage",
-            ))
-        }
-
-        async fn identity(
-            &self,
-        ) -> Result<novarocks_state_store_api::StoreIdentity, StateStoreError> {
-            self.inner.identity().await
-        }
-
-        async fn resolve_commit(
-            &self,
-            transaction_id: &TransactionId,
-        ) -> Result<CommitResolution, StateStoreError> {
-            self.inner.resolve_commit(transaction_id).await
-        }
     }
 
     #[async_trait::async_trait]
@@ -413,8 +561,8 @@ mod tests {
             self.inner.limits()
         }
 
-        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-            self.inner.metrics_snapshot()
+        fn attempts(&self) -> &AttemptSupervisor {
+            self.inner.attempts()
         }
 
         async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -429,28 +577,46 @@ mod tests {
 
         async fn begin_write(
             &self,
-            transaction_id: TransactionId,
+            attempt: WriteAttempt,
             purpose: &str,
         ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-            self.inner.begin_write(transaction_id, purpose).await
-        }
-
-        async fn poll_changes(
-            &self,
-            request: &ChangePollRequest,
-        ) -> Result<ChangePage, StateStoreError> {
-            self.inner.poll_changes(request).await
+            self.inner.begin_write(attempt, purpose).await
         }
 
         async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
             self.inner.identity().await
         }
+    }
 
-        async fn resolve_commit(
+    #[async_trait::async_trait]
+    impl StateStore for StallableReadStore {
+        fn limits(&self) -> &StateStoreLimits {
+            self.inner.limits()
+        }
+
+        fn attempts(&self) -> &AttemptSupervisor {
+            self.inner.attempts()
+        }
+
+        async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
+            if self.stalled.load(Ordering::Acquire) {
+                // Parks here for as long as the test holds the permit. The scan
+                // is not failing and not cancelled; it simply has not returned.
+                let _permit = self.gate.acquire().await.expect("stall gate");
+            }
+            self.inner.begin_read().await
+        }
+
+        async fn begin_write(
             &self,
-            transaction_id: &TransactionId,
-        ) -> Result<CommitResolution, StateStoreError> {
-            self.inner.resolve_commit(transaction_id).await
+            attempt: WriteAttempt,
+            purpose: &str,
+        ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+            self.inner.begin_write(attempt, purpose).await
+        }
+
+        async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
+            self.inner.identity().await
         }
     }
 
@@ -460,8 +626,8 @@ mod tests {
             self.inner.limits()
         }
 
-        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-            self.inner.metrics_snapshot()
+        fn attempts(&self) -> &AttemptSupervisor {
+            self.inner.attempts()
         }
 
         async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -470,28 +636,14 @@ mod tests {
 
         async fn begin_write(
             &self,
-            transaction_id: TransactionId,
+            attempt: WriteAttempt,
             purpose: &str,
         ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-            self.inner.begin_write(transaction_id, purpose).await
-        }
-
-        async fn poll_changes(
-            &self,
-            _request: &ChangePollRequest,
-        ) -> Result<ChangePage, StateStoreError> {
-            Ok(self.page.clone())
+            self.inner.begin_write(attempt, purpose).await
         }
 
         async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
             Ok(self.identity.clone())
-        }
-
-        async fn resolve_commit(
-            &self,
-            transaction_id: &TransactionId,
-        ) -> Result<CommitResolution, StateStoreError> {
-            self.inner.resolve_commit(transaction_id).await
         }
     }
 
@@ -529,6 +681,7 @@ mod tests {
         > {
             use futures::FutureExt;
 
+            self.materializations.fetch_add(1, Ordering::Relaxed);
             let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
             async move {
                 let control = crate::connector::control_host::tests::test_control_binding_for(
@@ -638,8 +791,8 @@ mod tests {
             self.inner.limits()
         }
 
-        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-            self.inner.metrics_snapshot()
+        fn attempts(&self) -> &AttemptSupervisor {
+            self.inner.attempts()
         }
 
         async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -651,28 +804,14 @@ mod tests {
 
         async fn begin_write(
             &self,
-            transaction_id: TransactionId,
+            attempt: WriteAttempt,
             purpose: &str,
         ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-            self.inner.begin_write(transaction_id, purpose).await
-        }
-
-        async fn poll_changes(
-            &self,
-            request: &ChangePollRequest,
-        ) -> Result<ChangePage, StateStoreError> {
-            self.inner.poll_changes(request).await
+            self.inner.begin_write(attempt, purpose).await
         }
 
         async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
             self.inner.identity().await
-        }
-
-        async fn resolve_commit(
-            &self,
-            transaction_id: &TransactionId,
-        ) -> Result<CommitResolution, StateStoreError> {
-            self.inner.resolve_commit(transaction_id).await
         }
     }
 
@@ -693,10 +832,10 @@ mod tests {
             hide_from_scan: AtomicBool::new(false),
         });
         let store = Arc::clone(&scanning) as Arc<dyn StateStore>;
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open attachment repository");
-        let (_control, port) = projection(repository);
+        let (_control, port, _materializations) = projection(repository);
 
         let command = create_command(false);
         let instance_id = command.instance_id.clone();
@@ -741,7 +880,7 @@ mod tests {
         drop(store);
         drop(scanning);
         drop(inner);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("state store shutdown");
     }
@@ -765,7 +904,7 @@ mod tests {
                 },
                 foundationdb_client: None,
             },
-            Instant::now() + Duration::from_secs(5),
+            StdInstant::now() + Duration::from_secs(5),
         )
         .await
         .expect("open SQLite StateStore");
@@ -792,10 +931,15 @@ mod tests {
     ) -> (
         Arc<ConnectorControlHost>,
         Arc<FrontendCatalogApplicationPort>,
+        Arc<AtomicUsize>,
     ) {
+        let materializations = Arc::new(AtomicUsize::new(0));
         let control = Arc::new(
-            ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory::default())])
-                .expect("control host"),
+            ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory {
+                incarnations: AtomicU8::new(0),
+                materializations: Arc::clone(&materializations),
+            })])
+            .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
             CatalogDesiredStateSource::dynamic_state_store(repository),
@@ -803,7 +947,7 @@ mod tests {
             crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
             tokio::runtime::Handle::current(),
         ));
-        (control, port)
+        (control, port, materializations)
     }
 
     fn create_command(if_not_exists: bool) -> CatalogCreateCommand {
@@ -837,17 +981,30 @@ mod tests {
         })
     }
 
+    async fn wait_for<F>(deadline: Duration, description: &str, mut ready: F)
+    where
+        F: FnMut() -> bool,
+    {
+        tokio::time::timeout(deadline, async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{description}"));
+    }
+
     /// Name uniqueness is arbitrated by the absent-precondition commit, not by a
     /// local lock: two independent frontend hosts racing the same SQL name
     /// produce exactly one durable attachment identity, and both converge on it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_create_of_one_catalog_name_yields_a_single_attachment_identity() {
         let (_directory, mut host, store) = open_store().await;
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
-        let (_first_control, first_port) = projection(repository.clone());
-        let (_second_control, second_port) = projection(repository.clone());
+        let (_first_control, first_port, _first_calls) = projection(repository.clone());
+        let (_second_control, second_port, _second_calls) = projection(repository.clone());
 
         // Plain OS threads, so each CREATE drives the port's blocking StateStore
         // path from outside the runtime and the two commits genuinely race.
@@ -920,7 +1077,7 @@ mod tests {
         drop(second_port);
         drop(repository);
         drop(store);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
     }
@@ -931,7 +1088,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn materialization_failure_keeps_durable_attachment() {
         let (_directory, mut host, store) = open_store().await;
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
         let control = Arc::new(
@@ -964,7 +1121,7 @@ mod tests {
         drop(port);
         drop(repository);
         drop(store);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
     }
@@ -975,7 +1132,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_keeps_the_committed_attachment_when_local_publication_fails() {
         let (_directory, mut host, store) = open_store().await;
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
         let control = Arc::new(
@@ -1021,7 +1178,7 @@ mod tests {
         drop(control);
         drop(repository);
         drop(store);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
     }
@@ -1031,10 +1188,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn existence_semantics_and_recreate_mint_a_fresh_attachment_identity() {
         let (_directory, mut host, store) = open_store().await;
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
-        let (control, port) = projection(repository.clone());
+        let (control, port, _materializations) = projection(repository.clone());
         let instance_id = create_command(false).instance_id;
 
         assert_eq!(
@@ -1096,27 +1253,36 @@ mod tests {
         drop(control);
         drop(repository);
         drop(store);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
     }
 
+    /// The sweep is a complete enumeration, not a liveness ping, so its default
+    /// cadence is a deliberate cost decision rather than a leftover: at the
+    /// change feed's 250 ms it was resident CPU for a deployment where nothing
+    /// changed. Local writes do not pay that latency; they arrive by wakeup.
     #[test]
-    fn defaults_match_the_cp2_operational_contract() {
+    fn defaults_state_the_sweep_and_freshness_contract() {
         let config = CatalogProjectionConfig::default();
         assert_eq!(config.page_size, 256);
-        assert_eq!(config.poll_interval, Duration::from_millis(250));
+        assert_eq!(config.reconcile_interval, Duration::from_secs(5));
         assert_eq!(config.freshness_budget, Duration::from_secs(30));
         assert_eq!(config.retry_initial, Duration::from_millis(100));
         assert_eq!(config.retry_max, Duration::from_secs(5));
         assert_eq!(config.worker_count, 8);
         assert_eq!(config.shutdown_deadline, Duration::from_secs(5));
+        assert!(
+            config.reconcile_interval < config.freshness_budget,
+            "a sweep that is slower than the freshness budget would expire \
+             projections it was still on course to confirm"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn publication_failure_keeps_durable_attachment_unavailable_and_retires_control() {
         let (_directory, mut host, store) = open_store().await;
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
         let created = repository
@@ -1149,26 +1315,23 @@ mod tests {
             CatalogAdmission::Unavailable { .. }
         ));
         assert_eq!(port.projection_count(), 0);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if control
+        wait_for(
+            Duration::from_secs(2),
+            "failed publication must retire its registered control generation",
+            || {
+                control
                     .observe_current_binding(&created.attachment.instance_id)
                     .is_err()
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("failed publication must retire its registered control generation");
+            },
+        )
+        .await;
 
         drop(controller);
         drop(port);
         drop(control);
         drop(repository);
         drop(store);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
     }
@@ -1176,9 +1339,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ready_admission_uses_only_the_local_projection_when_store_reads_fail() {
         let (_directory, mut host, store) = open_store().await;
-        let durable_repository = CatalogAttachmentRepository::open(Arc::clone(&store))
-            .await
-            .expect("open durable repository");
+        let durable_repository =
+            CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
+                .await
+                .expect("open durable repository");
         let created = durable_repository
             .create(attachment())
             .await
@@ -1187,10 +1351,10 @@ mod tests {
             inner: Arc::clone(&store),
             reads_available: AtomicBool::new(true),
         });
-        let repository = CatalogAttachmentRepository::open(toggle_store.clone())
+        let repository = CatalogAttachmentRepository::open(toggle_store.clone(), host.run_policy())
             .await
             .expect("open toggle repository");
-        let (_control, port) = projection(repository.clone());
+        let (_control, port, _materializations) = projection(repository.clone());
         let controller = FrontendCatalogController::new(
             toggle_store.clone(),
             Arc::clone(&port),
@@ -1214,247 +1378,375 @@ mod tests {
         drop(durable_repository);
         drop(toggle_store);
         drop(store);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn two_frontend_controllers_converge_after_change_gap_and_catalog_removal() {
+    /// A write no wakeup can reach must still converge, on the sweep.
+    ///
+    /// This replaces the old "converge after a change-feed gap" case, and it is
+    /// the same property with the mechanism the gap stood in for made explicit:
+    /// the removal here happens through a *second* repository instance, so
+    /// neither controller's wakeup channel ever hears about it. That is exactly
+    /// what a write on another frontend looks like from here, and it is why the
+    /// sweep is the correctness floor rather than a redundancy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_removal_no_wakeup_can_reach_still_converges_within_one_sweep() {
         let (_directory, mut host, store) = open_store().await;
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let writer = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
-            .expect("open catalog attachment repository");
-        let created = repository
+            .expect("open writing repository");
+        let created = writer
             .create(attachment())
             .await
             .expect("create attachment");
 
-        let (_first_control, first_port) = projection(repository.clone());
-        let (_second_control, second_port) = projection(repository.clone());
-        let first = FrontendCatalogController::new(
-            Arc::clone(&store),
-            Arc::clone(&first_port),
-            CatalogProjectionConfig::default(),
-        )
-        .expect("first controller");
-        let second = FrontendCatalogController::new(
-            Arc::clone(&store),
-            Arc::clone(&second_port),
-            CatalogProjectionConfig::default(),
-        )
-        .expect("second controller");
-        let first_cursor = first.bootstrap().await.expect("first bootstrap");
-        let second_cursor = second.bootstrap().await.expect("second bootstrap");
-        let high_watermark = store
-            .poll_changes(&ChangePollRequest {
-                after: None,
-                page_size: 256,
-            })
-            .await
-            .expect("read bootstrap high watermark")
-            .high_watermark;
-        assert_eq!(
-            first_cursor
-                .decode(store.identity().await.expect("store identity").store_id)
-                .expect("decode bootstrap cursor")
-                .0,
-            high_watermark
-        );
-        let (bootstrap_identity, bootstrap_cursor) = first
-            .bootstrap_state
-            .lock()
-            .expect("bootstrap state")
-            .clone()
-            .expect("bootstrap HWM retained for the worker");
-        assert_eq!(
-            bootstrap_identity,
-            store.identity().await.expect("store identity")
-        );
-        assert_eq!(bootstrap_cursor, first_cursor);
-        assert!(matches!(
-            first_port.admit_catalog(&created.attachment.instance_id),
-            CatalogAdmission::Ready(_)
-        ));
-        assert!(matches!(
-            second_port.admit_catalog(&created.attachment.instance_id),
-            CatalogAdmission::Ready(_)
-        ));
+        // Each controller reads through its own repository instance, so a write
+        // made through `writer` reaches none of their wakeup channels.
+        let config = CatalogProjectionConfig {
+            reconcile_interval: Duration::from_millis(20),
+            ..CatalogProjectionConfig::default()
+        };
+        let mut controllers = Vec::new();
+        let mut ports = Vec::new();
+        let mut controls = Vec::new();
+        for _ in 0..2 {
+            let repository =
+                CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
+                    .await
+                    .expect("open reading repository");
+            let (control, port, _materializations) = projection(repository);
+            let controller = FrontendCatalogController::new(
+                Arc::clone(&store),
+                Arc::clone(&port),
+                config.clone(),
+            )
+            .expect("controller");
+            controller.bootstrap().await.expect("bootstrap");
+            controller.start().expect("start controller");
+            assert!(matches!(
+                port.admit_catalog(&created.attachment.instance_id),
+                CatalogAdmission::Ready(_)
+            ));
+            controllers.push(controller);
+            ports.push(port);
+            controls.push(control);
+        }
 
-        repository
+        assert_eq!(
+            writer.published_wakeups(),
+            1,
+            "the writing repository is the only one that published anything"
+        );
+        writer
             .drop_exact(created.clone())
             .await
             .expect("remove durable attachment");
 
-        // A retention gap is only a wakeup: each controller rereads the
-        // attachment repository instead of trusting the synthetic page state.
-        let identity = store.identity().await.expect("store identity");
-        let change = store
-            .poll_changes(&ChangePollRequest {
-                after: Some(first_cursor.clone()),
-                page_size: 256,
-            })
-            .await
-            .expect("read change page");
-        let fault = FaultInjectingStateStore::new(Arc::clone(&store));
-        fault.script_next_change_page(novarocks_state_store_api::ChangePage {
-            resync_required: true,
-            ..change
-        });
-        let fault_store: Arc<dyn StateStore> = fault.clone();
-        let fault_controller = FrontendCatalogController::new(
-            fault_store,
-            Arc::clone(&first_port),
-            CatalogProjectionConfig::default(),
-        )
-        .expect("fault controller");
-        let mut first_identity = Some(identity.clone());
-        let mut first_cursor = Some(first_cursor);
-        let mut force_resync = false;
-        fault_controller
-            .poll_once(&mut first_identity, &mut first_cursor, &mut force_resync)
-            .await
-            .expect("retention gap resync");
-        assert!(!force_resync);
-
-        let mut second_identity = Some(identity);
-        let mut second_cursor = Some(second_cursor);
-        let mut second_force_resync = true;
-        second
-            .poll_once(
-                &mut second_identity,
-                &mut second_cursor,
-                &mut second_force_resync,
+        for (index, port) in ports.iter().enumerate() {
+            let port = Arc::clone(port);
+            let instance_id = created.attachment.instance_id.clone();
+            wait_for(
+                // Several sweeps of headroom: the assertion is that convergence
+                // happens on the sweep at all, not that it lands on the first.
+                Duration::from_secs(2),
+                &format!(
+                    "controller {index} must converge on the sweep even though no \
+                     wakeup could reach it"
+                ),
+                move || matches!(port.admit_catalog(&instance_id), CatalogAdmission::Absent),
             )
-            .await
-            .expect("second controller authoritative resync");
-        assert!(matches!(
-            first_port.admit_catalog(&created.attachment.instance_id),
-            CatalogAdmission::Absent
-        ));
-        assert!(matches!(
-            second_port.admit_catalog(&created.attachment.instance_id),
-            CatalogAdmission::Absent
-        ));
+            .await;
+        }
 
-        drop(fault_controller);
-        drop(fault);
-        drop(first);
-        drop(second);
-        drop(first_port);
-        drop(second_port);
-        drop(repository);
+        for controller in &controllers {
+            controller.shutdown().await.expect("shutdown controller");
+        }
+        drop(controllers);
+        drop(ports);
+        drop(controls);
+        drop(writer);
         drop(store);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
     }
 
+    /// A sweep that finds nothing new must not re-materialize anything.
+    ///
+    /// Without the installed-projection short circuit in `materialize_entry`,
+    /// every sweep would resubmit every catalog to the provider — which at the
+    /// old 250 ms cadence was invisible against the enumeration cost and at any
+    /// cadence is a provider call per catalog per round, for no change.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn freshness_expiry_unpublishes_ready_catalogs_before_retrying() {
+    async fn a_sweep_with_no_change_does_not_materialize_again() {
         let (_directory, mut host, store) = open_store().await;
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
         let created = repository
             .create(attachment())
             .await
             .expect("create attachment");
-        let (_control, port) = projection(repository.clone());
-        let bootstrap = FrontendCatalogController::new(
+        let (_control, port, materializations) = projection(repository.clone());
+        let controller = FrontendCatalogController::new(
             Arc::clone(&store),
             Arc::clone(&port),
-            CatalogProjectionConfig::default(),
+            CatalogProjectionConfig {
+                reconcile_interval: Duration::from_millis(10),
+                ..CatalogProjectionConfig::default()
+            },
         )
-        .expect("bootstrap controller");
-        bootstrap.bootstrap().await.expect("bootstrap projection");
+        .expect("controller");
+        controller.bootstrap().await.expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
+        assert_eq!(materializations.load(Ordering::Relaxed), 1);
 
-        let config = CatalogProjectionConfig {
-            poll_interval: Duration::from_millis(1),
-            freshness_budget: Duration::from_millis(10),
-            retry_initial: Duration::from_millis(1),
-            retry_max: Duration::from_millis(2),
-            ..CatalogProjectionConfig::default()
-        };
-        let unavailable_store: Arc<dyn StateStore> = Arc::new(PollUnavailableStore {
-            inner: Arc::clone(&store),
-        });
-        let controller =
-            FrontendCatalogController::new(unavailable_store, Arc::clone(&port), config)
-                .expect("outage controller");
-        controller.start().expect("start outage controller");
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        controller.start().expect("start controller");
+        let before = controller.metrics_snapshot().resyncs;
+        wait_for(
+            Duration::from_secs(2),
+            "the sweep must keep running with nothing to do",
+            || controller.metrics_snapshot().resyncs >= before + 5,
+        )
+        .await;
+        assert_eq!(
+            materializations.load(Ordering::Relaxed),
+            1,
+            "an unchanged catalog must be materialized once, not once per sweep"
+        );
         assert!(matches!(
             port.admit_catalog(&created.attachment.instance_id),
-            CatalogAdmission::Unavailable { .. }
+            CatalogAdmission::Ready(_)
         ));
-        let metrics = controller.metrics_snapshot();
-        assert_eq!(metrics.projected_catalogs, 0);
-        assert!(metrics.failed_polls > 0);
-        assert_eq!(metrics.freshness_expiries, 1);
-        controller.shutdown().await.expect("shutdown controller");
 
+        controller.shutdown().await.expect("shutdown controller");
         drop(controller);
-        drop(bootstrap);
         drop(port);
         drop(repository);
         drop(store);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn store_identity_change_discards_the_cursor_and_forces_authoritative_resync() {
-        let (_directory, mut host, store) = open_store().await;
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    /// Freshness must expire on its own clock, not on the scan's.
+    ///
+    /// The store here neither fails nor returns: one reconcile scan is held
+    /// inside `begin_read` for longer than the whole freshness budget. A
+    /// controller whose expiry ran after the scan — or that only checked
+    /// freshness when a round *failed* — would keep serving those projections
+    /// indefinitely, because no round ever ends. Local admission must be
+    /// withdrawn on time anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stalled_scan_does_not_hold_expired_projections_open() {
+        let (_directory, mut host, inner) = open_store().await;
+        let gate = Arc::new(Semaphore::new(0));
+        let stalling = Arc::new(StallableReadStore {
+            inner: Arc::clone(&inner),
+            gate: Arc::clone(&gate),
+            stalled: AtomicBool::new(false),
+        });
+        let store = Arc::clone(&stalling) as Arc<dyn StateStore>;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
         let created = repository
             .create(attachment())
             .await
             .expect("create attachment");
-        let (_control, port) = projection(repository.clone());
+        let (_control, port, _materializations) = projection(repository.clone());
+        let controller = FrontendCatalogController::new(
+            Arc::clone(&store),
+            Arc::clone(&port),
+            CatalogProjectionConfig {
+                reconcile_interval: Duration::from_millis(10),
+                freshness_budget: Duration::from_millis(80),
+                ..CatalogProjectionConfig::default()
+            },
+        )
+        .expect("controller");
+        controller.bootstrap().await.expect("bootstrap projection");
+        wait_for_ready(&port, &created.attachment.instance_id).await;
+
+        stalling.stalled.store(true, Ordering::Release);
+        controller.start().expect("start controller");
+        // The counter is the primary signal because it is published *after*
+        // the retirement it reports, so seeing it is proof the withdrawal has
+        // already happened. Waiting on it and then asserting admission is what
+        // makes that ordering a test rather than a comment.
+        wait_for(
+            Duration::from_secs(2),
+            "a scan that never returns must not keep unconfirmable projections admitted",
+            || controller.metrics_snapshot().freshness_expiries >= 1,
+        )
+        .await;
+        assert!(
+            matches!(
+                port.admit_catalog(&created.attachment.instance_id),
+                CatalogAdmission::Unavailable { .. } | CatalogAdmission::Absent
+            ),
+            "an expiry that counted itself must actually withdraw admission"
+        );
+        let metrics = controller.metrics_snapshot();
+        assert_eq!(metrics.projected_catalogs, 0);
+        assert_eq!(
+            metrics.failed_rounds, 0,
+            "the store never failed; a stall is not an error, and reporting it \
+             as one would hide that the scan is still running: {metrics:?}"
+        );
+
+        // Release the stall so the abandoned scan can finish and the worker can
+        // observe the shutdown flag rather than being aborted mid-read.
+        stalling.stalled.store(false, Ordering::Release);
+        gate.add_permits(64);
+        controller.shutdown().await.expect("shutdown controller");
+
+        drop(controller);
+        drop(port);
+        drop(repository);
+        drop(store);
+        drop(stalling);
+        drop(inner);
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    /// Freshness expiry is about persistent unreadability, not about a single
+    /// unlucky read.
+    ///
+    /// There is no change feed to fail any more, so the only thing that can
+    /// keep a controller from confirming desired state is the authoritative
+    /// read itself. Once it fails for longer than the budget, everything this
+    /// host was serving has to stop being admitted — the durable attachments
+    /// are untouched, so a later successful round republishes them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_persistently_unreadable_store_expires_freshness_before_retrying() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
+            .await
+            .expect("open catalog attachment repository");
+        let created = repository
+            .create(attachment())
+            .await
+            .expect("create attachment");
+        let toggle_store = Arc::new(ToggleReadStore {
+            inner: Arc::clone(&store),
+            reads_available: AtomicBool::new(true),
+        });
+        // The reconcile reads through the port's own source, so the outage has
+        // to be injected there: a controller whose store handle failed while
+        // its source still read cleanly would not be an outage at all.
+        let projected = CatalogAttachmentRepository::open(
+            Arc::clone(&toggle_store) as Arc<dyn StateStore>,
+            host.run_policy(),
+        )
+        .await
+        .expect("open the projecting repository");
+        let (_control, port, _materializations) = projection(projected);
+        let controller = FrontendCatalogController::new(
+            Arc::clone(&toggle_store) as Arc<dyn StateStore>,
+            Arc::clone(&port),
+            CatalogProjectionConfig {
+                reconcile_interval: Duration::from_millis(1),
+                freshness_budget: Duration::from_millis(10),
+                retry_initial: Duration::from_millis(1),
+                retry_max: Duration::from_millis(2),
+                ..CatalogProjectionConfig::default()
+            },
+        )
+        .expect("outage controller");
+        controller.bootstrap().await.expect("bootstrap projection");
+        wait_for_ready(&port, &created.attachment.instance_id).await;
+
+        toggle_store.reads_available.store(false, Ordering::Release);
+        controller.start().expect("start outage controller");
+        wait_for(
+            Duration::from_secs(2),
+            "a store that cannot be read for longer than the budget must stop being served",
+            || controller.metrics_snapshot().freshness_expiries >= 1,
+        )
+        .await;
+        assert!(
+            matches!(
+                port.admit_catalog(&created.attachment.instance_id),
+                CatalogAdmission::Unavailable { .. } | CatalogAdmission::Absent
+            ),
+            "an expiry that counted itself must actually withdraw admission"
+        );
+        let metrics = controller.metrics_snapshot();
+        assert_eq!(metrics.projected_catalogs, 0);
+        assert!(metrics.failed_rounds > 0);
+        assert_eq!(
+            metrics.freshness_expiries, 1,
+            "one outage withdraws admission once, not once per failed round: {metrics:?}"
+        );
+
+        // Recovery needs nothing but a readable store: the durable attachment
+        // was never touched.
+        toggle_store.reads_available.store(true, Ordering::Release);
+        wait_for_ready(&port, &created.attachment.instance_id).await;
+        assert_eq!(
+            controller.metrics_snapshot().freshness_expiries,
+            1,
+            "recovery must not be recorded as another expiry"
+        );
+
+        controller.shutdown().await.expect("shutdown controller");
+        drop(controller);
+        drop(port);
+        drop(repository);
+        drop(toggle_store);
+        drop(store);
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    /// A different store identity is a different world, and the controller
+    /// answers it the only way it can: with a complete authoritative reread.
+    ///
+    /// There is no cursor left to discard — that was the old change feed's
+    /// answer, and it was the reason identity had to be tracked at all. What
+    /// has to survive the removal is the behaviour: after the identity changes,
+    /// the very next round reads the whole attachment family again and the
+    /// projection matches what that store actually holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_changed_store_identity_is_answered_by_a_complete_reread() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
+            .await
+            .expect("open catalog attachment repository");
+        let created = repository
+            .create(attachment())
+            .await
+            .expect("create attachment");
+        let (_control, port, _materializations) = projection(repository.clone());
         let controller = FrontendCatalogController::new(
             Arc::clone(&store),
             Arc::clone(&port),
             CatalogProjectionConfig::default(),
         )
         .expect("controller");
-        let cursor = controller.bootstrap().await.expect("bootstrap projection");
+        controller.bootstrap().await.expect("bootstrap projection");
         wait_for_ready(&port, &created.attachment.instance_id).await;
+
+        // The attachment goes away, and the store reports a new identity. The
+        // controller has no state that could tell it what changed.
         repository
             .drop_exact(created.clone())
             .await
             .expect("remove durable attachment");
-
         let original_identity = store.identity().await.expect("original identity");
-        let high_watermark = store
-            .poll_changes(&ChangePollRequest {
-                after: None,
-                page_size: 256,
-            })
-            .await
-            .expect("read current high watermark")
-            .high_watermark;
         let changed_identity = StoreIdentity {
             store_id: uuid::Uuid::now_v7(),
             cluster_id: original_identity.cluster_id.clone(),
         };
+        assert_ne!(changed_identity.store_id, original_identity.store_id);
         let changed_store: Arc<dyn StateStore> = Arc::new(IdentityChangedStore {
             inner: Arc::clone(&store),
-            page: ChangePage {
-                hints: Vec::new(),
-                next_cursor: ChangeCursor::new(
-                    changed_identity.store_id,
-                    high_watermark.clone(),
-                    u32::MAX,
-                )
-                .expect("changed identity cursor"),
-                high_watermark,
-                resync_required: false,
-            },
             identity: changed_identity.clone(),
         });
         let changed_controller = FrontendCatalogController::new(
@@ -1463,26 +1755,142 @@ mod tests {
             CatalogProjectionConfig::default(),
         )
         .expect("changed-identity controller");
-        let mut known_identity = Some(original_identity);
-        let mut cursor = Some(cursor);
-        let mut force_resync = false;
-        changed_controller
-            .poll_once(&mut known_identity, &mut cursor, &mut force_resync)
-            .await
-            .expect("identity-change resync");
-        assert_eq!(known_identity, Some(changed_identity));
-        assert!(!force_resync);
-        assert!(matches!(
-            port.admit_catalog(&created.attachment.instance_id),
-            CatalogAdmission::Absent
-        ));
+
+        let round = changed_controller.run_round(None).await;
+        assert_eq!(
+            round.identity.expect("identity is observed"),
+            changed_identity,
+            "the round must report the identity it actually ran against"
+        );
+        round.outcome.expect("the round completes");
+        assert_eq!(
+            changed_controller.metrics_snapshot().resyncs,
+            1,
+            "the round is a complete authoritative reread, not a diff"
+        );
+        assert!(
+            matches!(
+                port.admit_catalog(&created.attachment.instance_id),
+                CatalogAdmission::Absent
+            ),
+            "the projection must match what the new store actually holds"
+        );
 
         drop(changed_controller);
         drop(controller);
         drop(port);
         drop(repository);
         drop(store);
-        host.shutdown(Instant::now() + Duration::from_secs(5))
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    /// Shutdown must not cost a sweep.
+    ///
+    /// The worker parks between rounds, and that park is now seconds rather
+    /// than the change feed's 250 ms. A stop flag read only *between* rounds
+    /// would therefore make every frontend shutdown wait out a whole sweep —
+    /// which is exactly how this surfaced: as a frontend cleanup deadline
+    /// elapsing on the catalog controller, not as anything about catalogs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_interrupts_the_sweep_instead_of_waiting_it_out() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
+            .await
+            .expect("open catalog attachment repository");
+        let (_control, port, _materializations) = projection(repository.clone());
+        let controller = FrontendCatalogController::new(
+            Arc::clone(&store),
+            Arc::clone(&port),
+            CatalogProjectionConfig {
+                // Far longer than any deadline a caller would allow, so a
+                // shutdown that waits for the park cannot pass this.
+                reconcile_interval: Duration::from_secs(3600),
+                shutdown_deadline: Duration::from_secs(30),
+                ..CatalogProjectionConfig::default()
+            },
+        )
+        .expect("controller");
+        controller.bootstrap().await.expect("bootstrap projection");
+        controller.start().expect("start controller");
+        wait_for(
+            Duration::from_secs(2),
+            "the worker reaches its park between rounds",
+            || controller.metrics_snapshot().resyncs >= 2,
+        )
+        .await;
+
+        let started = StdInstant::now();
+        controller.shutdown().await.expect("shutdown controller");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown must interrupt the park, not wait it out: took {elapsed:?}"
+        );
+
+        drop(controller);
+        drop(port);
+        drop(repository);
+        drop(store);
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    /// A wakeup is a hint, and a lost one costs latency rather than truth.
+    /// This pins the low-latency half: a write made through the repository the
+    /// port itself writes through wakes the controller well inside a sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_local_write_wakes_the_controller_without_waiting_for_the_sweep() {
+        let (_directory, mut host, store) = open_store().await;
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
+            .await
+            .expect("open catalog attachment repository");
+        let (_control, port, _materializations) = projection(repository.clone());
+        let controller = FrontendCatalogController::new(
+            Arc::clone(&store),
+            Arc::clone(&port),
+            CatalogProjectionConfig {
+                // Long enough that a sweep cannot explain the convergence
+                // below; only the wakeup can.
+                reconcile_interval: Duration::from_secs(3600),
+                ..CatalogProjectionConfig::default()
+            },
+        )
+        .expect("controller");
+        controller.bootstrap().await.expect("bootstrap projection");
+        controller.start().expect("start controller");
+        // The worker always runs one round of its own before it parks, so the
+        // baseline is taken after that round; otherwise this would pass on the
+        // worker's own startup round rather than on the wakeup.
+        wait_for(
+            Duration::from_secs(2),
+            "the worker performs its own first round before parking",
+            || controller.metrics_snapshot().resyncs >= 2,
+        )
+        .await;
+        let parked = controller.metrics_snapshot().resyncs;
+
+        let created = repository
+            .create(attachment())
+            .await
+            .expect("create attachment");
+        assert_eq!(repository.published_wakeups(), 1);
+        wait_for(
+            Duration::from_secs(2),
+            "a committed local write must wake the reconciler, not wait for the sweep",
+            || controller.metrics_snapshot().resyncs > parked,
+        )
+        .await;
+        wait_for_ready(&port, &created.attachment.instance_id).await;
+
+        controller.shutdown().await.expect("shutdown controller");
+        drop(controller);
+        drop(port);
+        drop(repository);
+        drop(store);
+        host.shutdown(StdInstant::now() + Duration::from_secs(5))
             .await
             .expect("shutdown SQLite StateStore");
     }

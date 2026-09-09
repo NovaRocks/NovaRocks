@@ -186,12 +186,21 @@ capabilities.
 `[connector.object_store]` supplies process-local object-store credentials for
 connector execution and does not create a native internal table store.
 
-SQLite is the only production StateStore provider. Its file uses schema v2; an
-old v1 file is rejected rather than migrated or reset. MySQL and FoundationDB
-implementations remain experimental leaf crates and are not Server configuration
-options. Optional `[state_store.history_retention]` values bound provider-owned
-change and commit-resolution history; all five fields have safe defaults in the
-FE example and a configured SQLite failure blocks FE startup.
+SQLite is the only production StateStore provider. Its file uses schema v3; an
+older file is rejected rather than migrated or reset, and its bytes are left
+untouched. MySQL and FoundationDB implementations remain experimental leaf
+crates and are not Server configuration options. A configured SQLite failure
+blocks FE startup.
+
+`[state_store.limits]` bounds what the provider enforces, including
+`transaction_timeout_ms` for one physical transaction.
+`[application.state_store_policy]` is separate and holds what the application
+decides: `max_attempts` and `operation_timeout_ms` for one logical operation.
+Both groups may tighten the built-in defaults and never relax them, and neither
+timeout constrains the other, because they bound different things. Unknown keys
+fail startup, so a configuration carrying the retired `history_retention`,
+`runner_max_attempts` or `transaction_deadline_ms` names is rejected rather than
+silently ignored.
 Secret-bearing scalars may be literal for local development or an exact
 `${ENV:VAR}` reference. References are resolved once by Server startup; missing,
 empty, malformed, and non-UTF-8 values fail startup without exposing the value.

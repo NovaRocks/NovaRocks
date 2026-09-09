@@ -297,7 +297,7 @@ async fn durable_records_written_by_real_owners_all_attribute_to_the_manifest() 
     let mut host = state_store_fixture::open("state-family-conformance-writes").await;
     let store = host.state_store().expect("configured StateStore");
 
-    let accelerator = GcOwnedRefObservationAccelerator::open(Arc::clone(&store))
+    let accelerator = GcOwnedRefObservationAccelerator::open(Arc::clone(&store), host.run_policy())
         .await
         .expect("open GC owned-ref observation accelerator");
     let observation = GcOwnedRefObservation::try_new(

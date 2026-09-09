@@ -404,22 +404,22 @@ impl FoundationDbProviderTestHarness {
 
 #[cfg(all(test, feature = "provider-internal-tests"))]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
-    use bytes::Bytes;
     use futures::future::BoxFuture;
     use tempfile::TempDir;
     use tokio::sync::Notify;
     use uuid::Uuid;
 
     use novarocks_state_store_api::{
-        ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore,
-        StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
-        StateStoreOpenRequest, StateStoreProviderFactory, StateStoreProviderInstance,
-        StoreIdentity, TransactionId, WriteTransaction,
+        AttemptId, AttemptOutcome, AttemptSupervisor, InDoubtAdjudicator, ReadTransaction,
+        StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreOpenRequest,
+        StateStoreProviderFactory, StateStoreProviderInstance, StoreIdentity, WriteAttempt,
+        WriteTransaction,
     };
 
     use crate::{
@@ -495,7 +495,7 @@ mod tests {
                 match open {
                     FakeOpen::Block(release) => {
                         release.notified().await;
-                        Ok(Arc::new(FakeStore) as Arc<dyn StateStore>)
+                        Ok(Arc::new(FakeStore::new()) as Arc<dyn StateStore>)
                     }
                     FakeOpen::Fail => Err(StateStoreError::new(
                         StateStoreErrorKind::Corruption,
@@ -532,7 +532,36 @@ mod tests {
         }
     }
 
-    struct FakeStore;
+    /// A store that exists only so the lifecycle owner has something to hand
+    /// back. These tests drive open, cancellation, and shutdown; no test ever
+    /// reads or writes through it.
+    struct FakeStore {
+        attempts: AttemptSupervisor,
+    }
+
+    impl FakeStore {
+        fn new() -> Self {
+            Self {
+                attempts: AttemptSupervisor::new(
+                    NonZeroUsize::new(1).expect("fake capacity"),
+                    Arc::new(UnusedAdjudicator),
+                ),
+            }
+        }
+    }
+
+    struct UnusedAdjudicator;
+
+    #[async_trait]
+    impl InDoubtAdjudicator for UnusedAdjudicator {
+        async fn adjudicate(&self, _: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+            panic!("unused fake store operation")
+        }
+
+        async fn release_evidence(&self, _: AttemptId) -> Result<(), StateStoreError> {
+            panic!("unused fake store operation")
+        }
+    }
 
     #[async_trait]
     impl StateStore for FakeStore {
@@ -542,8 +571,8 @@ mod tests {
             &LIMITS
         }
 
-        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-            panic!("unused fake store operation")
+        fn attempts(&self) -> &AttemptSupervisor {
+            &self.attempts
         }
 
         async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -552,27 +581,13 @@ mod tests {
 
         async fn begin_write(
             &self,
-            _transaction_id: TransactionId,
+            _attempt: WriteAttempt,
             _purpose: &str,
         ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
             panic!("unused fake store operation")
         }
 
-        async fn poll_changes(
-            &self,
-            _request: &ChangePollRequest,
-        ) -> Result<ChangePage, StateStoreError> {
-            panic!("unused fake store operation")
-        }
-
         async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
-            panic!("unused fake store operation")
-        }
-
-        async fn resolve_commit(
-            &self,
-            _transaction_id: &TransactionId,
-        ) -> Result<CommitResolution, StateStoreError> {
             panic!("unused fake store operation")
         }
     }

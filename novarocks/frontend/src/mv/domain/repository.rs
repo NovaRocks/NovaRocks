@@ -161,31 +161,39 @@ pub struct DeleteMvProjectionRequest {
     pub expected_source_revision: MvAcceleratorSourceRevision,
 }
 
-/// Synchronous application port. Concrete repositories may bridge to an async
-/// StateStore internally, but no raw key or transaction crosses this boundary.
+/// Asynchronous application port. Durable state is reached through an async
+/// StateStore, and this boundary says so rather than hiding a blocking bridge
+/// behind a synchronous signature. No raw key or transaction crosses it.
+///
+/// The port is async because the store is. The previous synchronous contract
+/// forced every implementation to block a worker thread, and made the whole
+/// port unusable on a current-thread runtime — which is what test
+/// compositions actually run on.
+#[async_trait::async_trait]
 pub trait MvRepository: Send + Sync {
-    fn create_projection(
+    async fn create_projection(
         &self,
         operation_id: Uuid,
         projection: MvProjectionRequest,
     ) -> Result<LoadedMvProjection, MvRepositoryError>;
 
-    fn replace_projection(
+    async fn replace_projection(
         &self,
         operation_id: Uuid,
         request: ReplaceMvProjectionRequest,
     ) -> Result<LoadedMvProjection, MvRepositoryError>;
 
-    fn load_by_id(&self, mv_id: i64) -> Result<Option<LoadedMvProjection>, MvRepositoryError>;
+    async fn load_by_id(&self, mv_id: i64)
+    -> Result<Option<LoadedMvProjection>, MvRepositoryError>;
 
-    fn find_by_target(
+    async fn find_by_target(
         &self,
         target: &MvTarget,
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError>;
 
-    fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError>;
+    async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError>;
 
-    fn delete_projection(
+    async fn delete_projection(
         &self,
         operation_id: Uuid,
         request: DeleteMvProjectionRequest,
@@ -193,7 +201,7 @@ pub trait MvRepository: Send + Sync {
 
     /// Test/harness-only destructive wipe of one rebuildable projection.
     /// It deliberately has no source-equivalence semantics.
-    fn wipe_projection_by_target(
+    async fn wipe_projection_by_target(
         &self,
         operation_id: Uuid,
         target: &MvTarget,
@@ -201,19 +209,19 @@ pub trait MvRepository: Send + Sync {
 
     /// Test/harness-only wipe of the complete current Accelerator family,
     /// including the internal sequence. Old physical families remain untouched.
-    fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvRepositoryError>;
+    async fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvRepositoryError>;
 
-    fn list_dependencies_by_downstream(
+    async fn list_dependencies_by_downstream(
         &self,
         mv_id: i64,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError>;
 
-    fn list_downstream_dependencies(
+    async fn list_downstream_dependencies(
         &self,
         upstream: &crate::mv::domain::dependency::model::MvDependencyObjectRef,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError>;
 
-    fn ensure_no_downstream_dependencies(
+    async fn ensure_no_downstream_dependencies(
         &self,
         upstream: &crate::mv::domain::dependency::model::MvDependencyObjectRef,
     ) -> Result<(), MvRepositoryError>;

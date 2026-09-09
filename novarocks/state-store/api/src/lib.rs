@@ -26,30 +26,29 @@
 //! suite live in the separate `novarocks-state-store-testkit` crate, so a
 //! production dependency can never pull them in.
 
+mod attempt;
 mod contract;
 mod error;
 mod limits;
-mod metrics;
 mod provider;
 mod range;
 
+pub use attempt::{
+    AttemptId, AttemptOutcome, AttemptSupervisor, CommitObservation,
+    DEFAULT_MAX_OUTSTANDING_ATTEMPTS, InDoubtAdjudicator, InstanceScope, WriteAttempt,
+};
 pub use contract::{
-    ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Key,
-    Precondition, RangePage, ReadTransaction, StateRecord, StateStore, StoreIdentity,
-    StoreRevision, TransactionId, Value, VersionToken, WriteTransaction,
+    CommitOutcome, CommitReceipt, Key, Precondition, RangePage, ReadTransaction, StateRecord,
+    StateStore, StoreIdentity, StoreRevision, Value, VersionToken, WriteTransaction,
 };
 pub use error::{StateStoreError, StateStoreErrorKind};
 pub use limits::{
-    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_RUNNER_ATTEMPTS,
-    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
-};
-pub use metrics::{
-    STATE_STORE_OPERATION_COUNT, STATE_STORE_OUTCOME_COUNT, StateStoreMetrics,
-    StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
+    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,
+    MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
 };
 pub use provider::{
     StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
     StateStoreProviderId, StateStoreProviderIdError, StateStoreProviderInstance,
     StateStoreProviderLifecycle,
 };
-pub use range::{ChangeCursor, ContinuationToken, Direction, KeyRange, RangeRequest};
+pub use range::{ContinuationToken, Direction, KeyRange, RangeRequest};

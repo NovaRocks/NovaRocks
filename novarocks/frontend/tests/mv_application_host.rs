@@ -91,7 +91,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
     let host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open its MV repository");
-    assert!(host.mv_repository().list_projections().is_ok());
+    assert!(host.mv_repository().list_projections().await.is_ok());
     let repository = host.mv_repository();
     drop(repository);
     host.shutdown()
@@ -101,7 +101,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
     let reopened = open_host(Some(config))
         .await
         .expect("same SQLite store must reopen its MV repository");
-    assert!(reopened.mv_repository().list_projections().is_ok());
+    assert!(reopened.mv_repository().list_projections().await.is_ok());
     reopened.shutdown().await.expect("reopened host shutdown");
 }
 

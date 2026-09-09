@@ -64,9 +64,9 @@ use novarocks_spi::connector::{
     ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
 };
 use novarocks_state_store_api::{
-    ChangePage, ChangePollRequest, CommitResolution, Key, RangePage, RangeRequest, ReadTransaction,
-    StateRecord, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StateStoreMetricsSnapshot, StoreIdentity, TransactionId, WriteTransaction,
+    AttemptSupervisor, Key, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
+    StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity, WriteAttempt,
+    WriteTransaction,
 };
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -344,8 +344,10 @@ impl StateStore for ScanFailingStore {
         self.inner.limits()
     }
 
-    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-        self.inner.metrics_snapshot()
+    /// Attempts belong to the wrapped instance: an identity minted here has to
+    /// be one the store that will run the write actually issued.
+    fn attempts(&self) -> &AttemptSupervisor {
+        self.inner.attempts()
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -357,28 +359,14 @@ impl StateStore for ScanFailingStore {
 
     async fn begin_write(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
         purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-        self.inner.begin_write(transaction_id, purpose).await
-    }
-
-    async fn poll_changes(
-        &self,
-        request: &ChangePollRequest,
-    ) -> Result<ChangePage, StateStoreError> {
-        self.inner.poll_changes(request).await
+        self.inner.begin_write(attempt, purpose).await
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
         self.inner.identity().await
-    }
-
-    async fn resolve_commit(
-        &self,
-        transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError> {
-        self.inner.resolve_commit(transaction_id).await
     }
 }
 
@@ -475,7 +463,7 @@ async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapsh
     let cluster = format!("catalog-desired-state-restart-{}", Uuid::now_v7());
     let first_host = state_store_fixture::open(cluster.clone()).await;
     let store = first_host.state_store().expect("test StateStore");
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), first_host.run_policy())
         .await
         .expect("open attachment repository");
     let source = CatalogDesiredStateSource::dynamic_state_store(repository.clone());
@@ -530,9 +518,10 @@ async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapsh
     // Restart: a brand new frontend composition over the same durable store.
     let second_host = state_store_fixture::open(cluster).await;
     let store = second_host.state_store().expect("test StateStore");
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
-        .await
-        .expect("reopen attachment repository");
+    let repository =
+        CatalogAttachmentRepository::open(Arc::clone(&store), second_host.run_policy())
+            .await
+            .expect("reopen attachment repository");
     let (_control, port) = port_with(
         CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
         SelectivelyFailingFactory::ready(),
@@ -584,7 +573,7 @@ async fn an_unimplemented_source_mode_rejects_sql_catalog_mutation_without_falli
     ))
     .await;
     let store = host.state_store().expect("test StateStore");
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await
         .expect("open attachment repository");
 
@@ -715,7 +704,7 @@ async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty
         scans_available: AtomicBool::new(true),
     });
     let store = Arc::clone(&scanning) as Arc<dyn StateStore>;
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await
         .expect("open attachment repository");
     let (_control, port) = port_with(
@@ -801,7 +790,7 @@ async fn one_catalogs_materialization_failure_leaves_every_other_catalog_serving
     ))
     .await;
     let store = host.state_store().expect("test StateStore");
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await
         .expect("open attachment repository");
 
@@ -878,7 +867,7 @@ async fn bootstrap_submits_63_healthy_catalogs_without_waiting_for_one_hanging_p
     ))
     .await;
     let store = host.state_store().expect("test StateStore");
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await
         .expect("open attachment repository");
 
@@ -950,7 +939,7 @@ async fn bootstrap_enqueues_complete_no_io_snapshots_through_1024_catalogs() {
         ))
         .await;
         let store = host.state_store().expect("test StateStore");
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open attachment repository");
         let names = seed_ready_catalogs(&repository, catalog_count).await;
@@ -993,7 +982,7 @@ async fn a_catalog_removed_from_the_source_is_not_revived_by_the_next_bootstrap(
     let cluster = format!("catalog-desired-state-removal-{}", Uuid::now_v7());
     let first_host = state_store_fixture::open(cluster.clone()).await;
     let store = first_host.state_store().expect("test StateStore");
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), first_host.run_policy())
         .await
         .expect("open attachment repository");
     let (_control, port) = port_with(
@@ -1025,9 +1014,10 @@ async fn a_catalog_removed_from_the_source_is_not_revived_by_the_next_bootstrap(
 
     let second_host = state_store_fixture::open(cluster).await;
     let store = second_host.state_store().expect("test StateStore");
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
-        .await
-        .expect("reopen attachment repository");
+    let repository =
+        CatalogAttachmentRepository::open(Arc::clone(&store), second_host.run_policy())
+            .await
+            .expect("reopen attachment repository");
     let (_control, port) = port_with(
         CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
         SelectivelyFailingFactory::ready(),

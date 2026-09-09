@@ -15,49 +15,59 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use std::collections::BTreeSet;
-
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_api::{AttemptId, StateStoreError, StateStoreErrorKind};
 
 const KEYSPACE_PREFIX: &[u8] = b"NRSS\x01";
 const META_TAG: u8 = 0x00;
 const RECORD_TAG: u8 = 0x01;
-const CHANGE_TAG: u8 = 0x02;
+// 0x02 was the change-feed key tag. The change feed is gone and nothing writes
+// that prefix any more; it is deliberately not reused, so an operator who
+// inspects a keyspace built by an older schema version can still tell the
+// orphaned rows apart. See `SCHEMA_VERSION`.
 const COMMIT_STATE_TAG: u8 = 0x03;
-const SCHEMA_VERSION: u8 = 1;
+/// Physical layout version of one keyspace.
+///
+/// Version 1 carried a change feed, a high watermark, a retention floor, and a
+/// three-state commit-state value keyed by a caller-supplied transaction UUID.
+/// None of those exist any more, and FoundationDB has no DDL that could migrate
+/// them, so a version-1 keyspace is refused at open rather than reinterpreted.
+const SCHEMA_VERSION: u8 = 2;
 const RECORD_FORMAT_VERSION: u8 = 1;
-const PENDING_TAG: u8 = 0x01;
 const COMMITTED_TAG: u8 = 0x02;
-const NOT_COMMITTED_TAG: u8 = 0x03;
 pub(super) const REVISION_BYTES: usize = 10;
+/// Physical width of one write attempt's identity: the opening instance's tag
+/// followed by the attempt sequence.
+pub(super) const ATTEMPT_TAG_BYTES: usize = 16 + 8;
 const KEYSPACE_HASH_HEX_BYTES: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum DurableCommitState {
-    Pending([u8; 16]),
-    Committed([u8; REVISION_BYTES]),
-    NotCommitted,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DecodedRecordValue {
-    pub transaction_id: [u8; 16],
+    pub attempt_tag: [u8; ATTEMPT_TAG_BYTES],
     pub payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct KeyspaceCodec {
     root: Vec<u8>,
+    instance_tag: Uuid,
 }
 
 impl KeyspaceCodec {
-    pub fn new(keyspace_id: Uuid) -> Self {
+    /// Builds the codec for one opened instance of one keyspace.
+    ///
+    /// `instance_tag` separates this open from every other open of the same
+    /// keyspace. It exists because an [`AttemptId`]'s scope is deliberately not
+    /// convertible to bytes: a store refuses any attempt another instance
+    /// issued, so within one codec an attempt is fully addressed by its
+    /// sequence, and this tag is what keeps two live instances from writing to
+    /// each other's commit-state keys.
+    pub fn new(keyspace_id: Uuid, instance_tag: Uuid) -> Self {
         Self {
             root: [KEYSPACE_PREFIX, keyspace_id.as_bytes()].concat(),
+            instance_tag,
         }
     }
 
@@ -67,6 +77,21 @@ impl KeyspaceCodec {
 
     pub fn keyspace_hash(&self) -> String {
         keyspace_hash(self.root())
+    }
+
+    /// Encodes one attempt as the fixed-width tag this keyspace addresses it by.
+    ///
+    /// Deliberately not the contract's `storage_key`, which SQLite and MySQL
+    /// both use. A keyspace is ordered by raw bytes, so a big-endian sequence
+    /// after a 16-byte instance tag makes one open's attempts a contiguous,
+    /// ascending range that a single range read can scan or clear. The decimal
+    /// text form would sort the same attempts lexicographically and cost more
+    /// than twice the bytes on every key.
+    pub fn attempt_tag(&self, attempt: AttemptId) -> [u8; ATTEMPT_TAG_BYTES] {
+        let mut tag = [0_u8; ATTEMPT_TAG_BYTES];
+        tag[..16].copy_from_slice(self.instance_tag.as_bytes());
+        tag[16..].copy_from_slice(&attempt.sequence().to_be_bytes());
+        tag
     }
 
     fn meta_key(&self, field: u8) -> Vec<u8> {
@@ -89,65 +114,12 @@ impl KeyspaceCodec {
         self.meta_key(0x03)
     }
 
-    pub fn high_watermark_key(&self) -> Vec<u8> {
-        self.meta_key(0x04)
-    }
-
-    pub fn retention_floor_key(&self) -> Vec<u8> {
-        self.meta_key(0x05)
-    }
-
     pub fn record_key(&self, logical_key: &[u8]) -> Vec<u8> {
         [self.root(), &[RECORD_TAG], logical_key].concat()
     }
 
-    pub fn change_key(&self, revision: &[u8], sequence: u32) -> Result<Vec<u8>, StateStoreError> {
-        let revision = self.decode_revision(revision)?;
-        Ok([
-            self.root(),
-            &[CHANGE_TAG],
-            &revision,
-            &sequence.to_be_bytes(),
-        ]
-        .concat())
-    }
-
-    pub fn decode_change_key(
-        &self,
-        key: &[u8],
-    ) -> Result<([u8; REVISION_BYTES], u32), StateStoreError> {
-        let expected_len = self.root.len() + 1 + REVISION_BYTES + 4;
-        if key.len() != expected_len
-            || !key.starts_with(self.root())
-            || key[self.root.len()] != CHANGE_TAG
-        {
-            return Err(corruption("FoundationDB change key is malformed"));
-        }
-        let revision_start = self.root.len() + 1;
-        let revision = copy_array::<REVISION_BYTES>(
-            &key[revision_start..revision_start + REVISION_BYTES],
-            "FoundationDB change revision is malformed",
-        )?;
-        let sequence = u32::from_be_bytes(copy_array::<4>(
-            &key[revision_start + REVISION_BYTES..],
-            "FoundationDB change sequence is malformed",
-        )?);
-        Ok((revision, sequence))
-    }
-
-    pub fn change_key_operand(&self, sequence: u32) -> Vec<u8> {
-        [
-            self.root(),
-            &[CHANGE_TAG],
-            &[0xff; REVISION_BYTES],
-            &sequence.to_be_bytes(),
-            &((self.root.len() + 1) as u32).to_le_bytes(),
-        ]
-        .concat()
-    }
-
-    pub fn commit_state_key(&self, transaction_id: [u8; 16]) -> Vec<u8> {
-        [self.root(), &[COMMIT_STATE_TAG], &transaction_id].concat()
+    pub fn commit_state_key(&self, attempt: AttemptId) -> Vec<u8> {
+        [self.root(), &[COMMIT_STATE_TAG], &self.attempt_tag(attempt)].concat()
     }
 
     pub fn schema_version_value(&self) -> Vec<u8> {
@@ -206,57 +178,41 @@ impl KeyspaceCodec {
         Ok(incarnation)
     }
 
-    pub fn zero_revision_value(&self) -> Vec<u8> {
-        vec![0; REVISION_BYTES]
-    }
-
-    pub fn decode_revision(&self, value: &[u8]) -> Result<[u8; REVISION_BYTES], StateStoreError> {
-        copy_array::<REVISION_BYTES>(value, "FoundationDB state store revision is malformed")
-    }
-
-    pub fn record_value(&self, transaction_id: [u8; 16], payload: &[u8]) -> Vec<u8> {
-        [&[RECORD_FORMAT_VERSION][..], &transaction_id, payload].concat()
+    pub fn record_value(&self, attempt_tag: [u8; ATTEMPT_TAG_BYTES], payload: &[u8]) -> Vec<u8> {
+        [&[RECORD_FORMAT_VERSION][..], &attempt_tag, payload].concat()
     }
 
     pub fn decode_record_value(&self, value: &[u8]) -> Result<DecodedRecordValue, StateStoreError> {
-        if value.len() < 17 || value[0] != RECORD_FORMAT_VERSION {
+        const HEADER: usize = 1 + ATTEMPT_TAG_BYTES;
+        if value.len() < HEADER || value[0] != RECORD_FORMAT_VERSION {
             return Err(corruption("FoundationDB state record is malformed"));
         }
         Ok(DecodedRecordValue {
-            transaction_id: copy_array::<16>(
-                &value[1..17],
-                "FoundationDB state record transaction id is malformed",
+            attempt_tag: copy_array::<ATTEMPT_TAG_BYTES>(
+                &value[1..HEADER],
+                "FoundationDB state record attempt tag is malformed",
             )?,
-            payload: value[17..].to_vec(),
+            payload: value[HEADER..].to_vec(),
         })
     }
 
-    pub fn pending_value(&self, reservation_token: [u8; 16]) -> Vec<u8> {
-        [&[PENDING_TAG][..], &reservation_token].concat()
-    }
-
-    pub fn not_committed_value(&self) -> Vec<u8> {
-        vec![NOT_COMMITTED_TAG]
-    }
-
-    pub fn decode_commit_state(&self, value: &[u8]) -> Result<DurableCommitState, StateStoreError> {
+    /// Decodes the only value a commit-state key can carry.
+    ///
+    /// The key is written exactly once, by the data transaction itself, through
+    /// a versionstamped mutation. Its presence therefore *is* the proof that
+    /// the transaction committed, and its value is that commit's revision.
+    /// Nothing writes a pending marker or a tombstone: an absent key proves
+    /// nothing at all, which is why it is not representable here.
+    pub fn decode_committed_revision(
+        &self,
+        value: &[u8],
+    ) -> Result<[u8; REVISION_BYTES], StateStoreError> {
         match value {
-            [PENDING_TAG, token @ ..] if token.len() == 16 => Ok(DurableCommitState::Pending(
-                copy_array::<16>(token, "FoundationDB pending commit state is malformed")?,
-            )),
             [COMMITTED_TAG, revision @ ..] if revision.len() == REVISION_BYTES => {
-                Ok(DurableCommitState::Committed(copy_array::<REVISION_BYTES>(
-                    revision,
-                    "FoundationDB committed state is malformed",
-                )?))
+                copy_array::<REVISION_BYTES>(revision, "FoundationDB committed state is malformed")
             }
-            [NOT_COMMITTED_TAG] => Ok(DurableCommitState::NotCommitted),
             _ => Err(corruption("FoundationDB commit state is malformed")),
         }
-    }
-
-    pub fn high_watermark_operand(&self) -> Vec<u8> {
-        [[0xff; REVISION_BYTES].as_slice(), &0_u32.to_le_bytes()].concat()
     }
 
     pub fn committed_value_operand(&self) -> Vec<u8> {
@@ -267,30 +223,61 @@ impl KeyspaceCodec {
         ]
         .concat()
     }
-
-    #[cfg(test)]
-    pub fn assign_change_sequences(
-        changed_keys: impl IntoIterator<Item = Vec<u8>>,
-    ) -> Vec<(Vec<u8>, u32)> {
-        changed_keys
-            .into_iter()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .enumerate()
-            .map(|(sequence, key)| {
-                (
-                    key,
-                    u32::try_from(sequence)
-                        .expect("state store operation limits keep change sequence in u32"),
-                )
-            })
-            .collect()
-    }
 }
 
 fn keyspace_hash(root: &[u8]) -> String {
     let digest = Sha256::digest(root);
     hex::encode(&digest[..KEYSPACE_HASH_HEX_BYTES])
+}
+
+/// Mints attempt identities for this crate's unit tests.
+///
+/// An [`AttemptId`] cannot be built from bytes, so a test that needs one has to
+/// obtain it the way the provider does: from a supervisor. The supervisor here
+/// is throwaway and its adjudicator is never driven, because these tests only
+/// ever read an identity's rendering.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    use novarocks_state_store_api::{
+        AttemptId, AttemptOutcome, AttemptSupervisor, InDoubtAdjudicator, StateStoreError,
+    };
+
+    struct UnusedAdjudicator;
+
+    #[async_trait::async_trait]
+    impl InDoubtAdjudicator for UnusedAdjudicator {
+        async fn adjudicate(&self, _: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+            unreachable!("test-support attempts are never adjudicated")
+        }
+
+        async fn release_evidence(&self, _: AttemptId) -> Result<(), StateStoreError> {
+            unreachable!("test-support attempts never release evidence")
+        }
+    }
+
+    /// Returns the identity of the `sequence`-th attempt of a fresh instance.
+    ///
+    /// Sequences are issued in order and cannot be chosen, so reaching a given
+    /// one means reserving up to it. Callers pass small numbers.
+    pub(crate) fn attempt_id(sequence: u64) -> AttemptId {
+        assert!(sequence >= 1, "attempt sequences start at one");
+        let supervisor = AttemptSupervisor::new(
+            NonZeroUsize::new(64).expect("test-support capacity"),
+            Arc::new(UnusedAdjudicator),
+        );
+        let mut held = Vec::new();
+        for _ in 0..sequence {
+            held.push(
+                supervisor
+                    .reserve()
+                    .expect("reserve a test-support attempt"),
+            );
+        }
+        held.last().expect("one reserved attempt").0.id()
+    }
 }
 
 #[cfg(test)]
@@ -300,13 +287,18 @@ mod observability_tests {
     #[test]
     fn keyspace_hash_is_stable_and_does_not_expose_the_uuid() {
         let keyspace_id = Uuid::parse_str("22db595e-3031-48eb-8212-f56d3626ee41").unwrap();
-        let codec = KeyspaceCodec::new(keyspace_id);
+        let codec = KeyspaceCodec::new(keyspace_id, Uuid::from_bytes([0x44; 16]));
         let hash = codec.keyspace_hash();
 
         assert_eq!(hash.len(), 16);
         assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(!hash.contains("22db595e"));
-        assert_eq!(hash, KeyspaceCodec::new(keyspace_id).keyspace_hash());
+        // The hash names the keyspace, not the open: a second instance of the
+        // same keyspace must remain recognisable in logs.
+        assert_eq!(
+            hash,
+            KeyspaceCodec::new(keyspace_id, Uuid::from_bytes([0x55; 16])).keyspace_hash()
+        );
     }
 }
 
@@ -325,16 +317,18 @@ fn corruption(message: &'static str) -> StateStoreError {
 mod tests {
     use uuid::Uuid;
 
-    use super::{DurableCommitState, KeyspaceCodec};
+    use super::KeyspaceCodec;
+    use super::tests_support::attempt_id;
     use novarocks_state_store_api::StateStoreErrorKind;
 
     fn codec() -> KeyspaceCodec {
-        KeyspaceCodec::new(Uuid::from_bytes([0x11; 16]))
+        KeyspaceCodec::new(Uuid::from_bytes([0x11; 16]), Uuid::from_bytes([0x22; 16]))
     }
 
     #[test]
     fn physical_keys_are_byte_exact() {
         let codec = codec();
+        let first = attempt_id(1);
         let expected_root = [b"NRSS\x01".as_slice(), &[0x11; 16]].concat();
         assert_eq!(codec.root(), expected_root);
         assert_eq!(
@@ -351,42 +345,49 @@ mod tests {
             [codec.root(), &[0x00, 0x03]].concat()
         );
         assert_eq!(
-            codec.high_watermark_key(),
-            [codec.root(), &[0x00, 0x04]].concat()
-        );
-        assert_eq!(
-            codec.retention_floor_key(),
-            [codec.root(), &[0x00, 0x05]].concat()
-        );
-        assert_eq!(
             codec.record_key(b"a\0\xff"),
             [codec.root(), &[0x01], b"a\0\xff"].concat()
         );
         assert_eq!(
-            codec.commit_state_key([0x22; 16]),
-            [codec.root(), &[0x03], &[0x22; 16]].concat()
+            codec.commit_state_key(first),
+            [
+                codec.root(),
+                &[0x03],
+                &[0x22; 16],
+                &first.sequence().to_be_bytes(),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn commit_state_keys_separate_attempts_and_separate_instances() {
+        let first = attempt_id(1);
+        let second = attempt_id(2);
+        let keyspace_id = Uuid::from_bytes([0x11; 16]);
+        let instance = KeyspaceCodec::new(keyspace_id, Uuid::from_bytes([0x22; 16]));
+        let other_instance = KeyspaceCodec::new(keyspace_id, Uuid::from_bytes([0x33; 16]));
+
+        assert_ne!(
+            instance.commit_state_key(first),
+            instance.commit_state_key(second),
+            "two attempts of one instance never share evidence"
+        );
+        assert_ne!(
+            instance.commit_state_key(first),
+            other_instance.commit_state_key(first),
+            "two opens of one keyspace never share evidence, even at the same sequence"
+        );
+        assert_eq!(
+            instance.commit_state_key(first),
+            instance.commit_state_key(first),
+            "one attempt always addresses the same evidence"
         );
     }
 
     #[test]
     fn versionstamp_operands_are_byte_exact() {
         let codec = codec();
-        let change = codec.change_key_operand(0x0102_0304);
-        assert_eq!(
-            change,
-            [
-                codec.root(),
-                &[0x02],
-                &[0xff; 10],
-                &0x0102_0304_u32.to_be_bytes(),
-                &((codec.root().len() + 1) as u32).to_le_bytes(),
-            ]
-            .concat()
-        );
-        assert_eq!(
-            codec.high_watermark_operand(),
-            [[0xff; 10].as_slice(), &0_u32.to_le_bytes()].concat()
-        );
         assert_eq!(
             codec.committed_value_operand(),
             [&[0x02][..], &[0xff; 10], &1_u32.to_le_bytes(),].concat()
@@ -396,38 +397,28 @@ mod tests {
     #[test]
     fn record_and_commit_values_are_byte_exact() {
         let codec = codec();
+        let attempt = attempt_id(1);
+        let tag = codec.attempt_tag(attempt);
         assert_eq!(
-            codec.record_value([0x33; 16], b"\0payload\xff"),
-            [&[0x01][..], &[0x33; 16], b"\0payload\xff"].concat()
+            tag.as_slice(),
+            [&[0x22; 16][..], &attempt.sequence().to_be_bytes()].concat()
+        );
+
+        assert_eq!(
+            codec.record_value(tag, b"\0payload\xff"),
+            [&[0x01][..], &tag, b"\0payload\xff"].concat()
         );
         let decoded = codec
-            .decode_record_value(&codec.record_value([0x33; 16], b"\0payload\xff"))
+            .decode_record_value(&codec.record_value(tag, b"\0payload\xff"))
             .expect("decode record envelope");
-        assert_eq!(decoded.transaction_id, [0x33; 16]);
+        assert_eq!(decoded.attempt_tag, tag);
         assert_eq!(decoded.payload, b"\0payload\xff");
 
         assert_eq!(
-            codec.pending_value([7; 16]),
-            [&[0x01][..], &[7; 16]].concat()
-        );
-        assert_eq!(codec.not_committed_value(), vec![0x03]);
-        assert_eq!(
             codec
-                .decode_commit_state(&codec.pending_value([7; 16]))
-                .expect("decode pending"),
-            DurableCommitState::Pending([7; 16])
-        );
-        assert_eq!(
-            codec
-                .decode_commit_state(&[&[0x02][..], &[9; 10]].concat())
+                .decode_committed_revision(&[&[0x02][..], &[9; 10]].concat())
                 .expect("decode committed"),
-            DurableCommitState::Committed([9; 10])
-        );
-        assert_eq!(
-            codec
-                .decode_commit_state(&codec.not_committed_value())
-                .expect("decode not committed"),
-            DurableCommitState::NotCommitted
+            [9; 10]
         );
     }
 
@@ -437,15 +428,18 @@ mod tests {
         for malformed in [
             vec![],
             vec![0x00],
-            vec![0x01],
-            [&[0x01][..], &[0; 15]].concat(),
+            vec![0x02],
             [&[0x02][..], &[0; 9]].concat(),
-            vec![0x03, 0x00],
+            [&[0x02][..], &[0; 11]].concat(),
+            // The retired pending and tombstone encodings are not commit proof
+            // and must not decode as one.
+            [&[0x01][..], &[0; 16]].concat(),
+            vec![0x03],
             vec![0xff],
         ] {
             assert_eq!(
                 codec
-                    .decode_commit_state(&malformed)
+                    .decode_committed_revision(&malformed)
                     .expect_err("malformed commit state must fail")
                     .kind(),
                 StateStoreErrorKind::Corruption
@@ -455,8 +449,8 @@ mod tests {
         for malformed in [
             vec![],
             vec![0x00],
-            [&[0x01][..], &[0; 15]].concat(),
-            [&[0x02][..], &[0; 16]].concat(),
+            [&[0x01][..], &[0; 23]].concat(),
+            [&[0x02][..], &[0; 24]].concat(),
         ] {
             assert_eq!(
                 codec
@@ -467,7 +461,7 @@ mod tests {
             );
         }
 
-        for malformed in [vec![], vec![0], vec![2], vec![1, 0]] {
+        for malformed in [vec![], vec![0x00], vec![0x01], vec![0x03], vec![0x02, 0x00]] {
             assert_eq!(
                 codec
                     .decode_schema_version(&malformed)
@@ -476,71 +470,26 @@ mod tests {
                 StateStoreErrorKind::Corruption
             );
         }
-        for malformed in [vec![0; 9], vec![0; 11]] {
-            assert_eq!(
-                codec
-                    .decode_revision(&malformed)
-                    .expect_err("revision length must be exact")
-                    .kind(),
-                StateStoreErrorKind::Corruption
-            );
-        }
     }
 
     #[test]
-    fn change_keys_round_trip_only_exact_revision_and_sequence() {
+    fn the_current_schema_version_is_the_only_accepted_one() {
         let codec = codec();
-        let key = codec
-            .change_key(&[0x44; 10], 0x0102_0304)
-            .expect("encode change key");
-        assert_eq!(
-            key,
-            [
-                codec.root(),
-                &[0x02],
-                &[0x44; 10],
-                &0x0102_0304_u32.to_be_bytes(),
-            ]
-            .concat()
-        );
-        assert_eq!(
-            codec.decode_change_key(&key).expect("decode change key"),
-            ([0x44; 10], 0x0102_0304)
-        );
-
-        for malformed in [
-            key[..key.len() - 1].to_vec(),
-            [key.as_slice(), &[0]].concat(),
-            [&[0][..], &key[1..]].concat(),
-        ] {
-            assert_eq!(
-                codec
-                    .decode_change_key(&malformed)
-                    .expect_err("malformed change key must fail")
-                    .kind(),
-                StateStoreErrorKind::Corruption
-            );
-        }
+        assert_eq!(codec.schema_version_value(), vec![0x02]);
         assert_eq!(
             codec
-                .change_key(&[0; 9], 0)
-                .expect_err("short revision must fail")
+                .decode_schema_version(&codec.schema_version_value())
+                .expect("current schema version"),
+            2
+        );
+        // A keyspace written by the change-feed schema is refused rather than
+        // reinterpreted: FoundationDB has no DDL that could migrate it.
+        assert_eq!(
+            codec
+                .decode_schema_version(&[1])
+                .expect_err("a version-1 keyspace must be refused")
                 .kind(),
             StateStoreErrorKind::Corruption
-        );
-    }
-
-    #[test]
-    fn change_sequences_are_unique_and_bytewise_sorted() {
-        let sequenced = KeyspaceCodec::assign_change_sequences([
-            b"z".to_vec(),
-            b"a".to_vec(),
-            b"z".to_vec(),
-            b"\0".to_vec(),
-        ]);
-        assert_eq!(
-            sequenced,
-            vec![(b"\0".to_vec(), 0), (b"a".to_vec(), 1), (b"z".to_vec(), 2),]
         );
     }
 }

@@ -453,8 +453,13 @@ impl CatalogApplicationPort for PublishedCatalogApplicationPort {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CatalogProjectionMetricsSnapshot {
     pub projected_catalogs: usize,
-    pub successful_polls: u64,
-    pub failed_polls: u64,
+    /// Reconcile rounds that completed against the current generation.
+    ///
+    /// A round, not a poll: there is no cursor and no change feed to poll. Each
+    /// round is a complete authoritative reread, whether a local wakeup or the
+    /// periodic sweep started it.
+    pub successful_rounds: u64,
+    pub failed_rounds: u64,
     pub resyncs: u64,
     pub freshness_expiries: u64,
 }

@@ -149,6 +149,9 @@ pub struct FrontendApplicationHost {
     statistics_application_service: Option<Arc<StatisticsApplicationService>>,
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     catalog_application_port: Option<Arc<FrontendCatalogApplicationPort>>,
+    /// Meets the attempt contract's host obligation to return abandoned
+    /// attempts; see `state_store::sweeper`.
+    abandoned_attempt_sweeper: Option<Arc<crate::state_store::AbandonedAttemptSweeper>>,
     catalog_controller: Option<Arc<FrontendCatalogController>>,
     catalog_prune: Option<Arc<FrontendCatalogPruneService>>,
     view_service: Option<Arc<dyn crate::view::ViewService>>,
@@ -476,6 +479,7 @@ impl FrontendApplicationHost {
             statistics_application_service: None,
             statistics_application_port: None,
             catalog_application_port: None,
+            abandoned_attempt_sweeper: None,
             catalog_controller: None,
             catalog_prune: None,
             view_service: None,
@@ -517,7 +521,7 @@ impl FrontendApplicationHost {
                         .await);
                 }
             };
-            match CatalogAttachmentRepository::open(store).await {
+            match CatalogAttachmentRepository::open(store, host.run_policy()).await {
                 Ok(repository) => Some(repository),
                 Err(error) => {
                     return Err(host
@@ -680,6 +684,24 @@ impl FrontendApplicationHost {
                 .await);
         }
         host.catalog_prune = Some(catalog_prune);
+
+        // Abandoned write attempts hold a capacity slot and a row of provider
+        // evidence until someone hands them back. The attempt contract makes
+        // that a host obligation on purpose, so this is where the obligation is
+        // met; without it the mechanism has no caller and the instance leaks.
+        if let Some(store) = host.state_store() {
+            let sweeper =
+                std::sync::Arc::new(crate::state_store::AbandonedAttemptSweeper::new(store));
+            if let Err(error) = sweeper.start() {
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::StateStoreHost,
+                        error,
+                    ))
+                    .await);
+            }
+            host.abandoned_attempt_sweeper = Some(sweeper);
+        }
         host.statistics_service = Some(Arc::new(FrontendStatisticsService::new()));
         let statistics = host.statistics_service();
         host.dml_service = Some(Arc::new(DmlService::new(statistics)));
@@ -687,7 +709,7 @@ impl FrontendApplicationHost {
         // load and no store to fail against.
         host.view_service = Some(Arc::new(FrontendViewService::new()));
         let table_maintenance_open = FrontendTableMaintenanceService::open(
-            host.state_store(),
+            host.durable(),
             tokio::runtime::Handle::current(),
         )
         .await
@@ -716,52 +738,50 @@ impl FrontendApplicationHost {
             return Err(host.cleanup_open_error(error).await);
         }
         match host.state_store() {
-            Some(store) => {
-                match StateStoreMvRepository::open(store, tokio::runtime::Handle::current()).await {
-                    Ok(repository) => {
-                        let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
-                            repository;
-                        let provider_activation =
-                            Arc::new(FrontendMvRefreshProviderActivationPort::new());
-                        let service = Arc::new(
-                            FrontendMvService::with_refresh_dependencies(
-                                Arc::clone(&repository),
-                                host.query_execution_service(),
-                                Arc::clone(&host.connector_control)
-                                    as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-                                Arc::clone(&provider_activation),
-                                host.execution_role,
-                                host.backend_topology_port(),
-                                execution.mv_scheduler.clone(),
-                                execution.mv_maintenance.clone(),
-                                host.table_maintenance_service(),
-                                host.optimizer_query_mem_limit_bytes,
-                                Duration::from_secs(30 * 60),
-                            )
-                            .with_workload_lifecycle((*host.serving_lifecycle()).clone()),
-                        );
-                        let application_service: Arc<
-                            dyn crate::mv::domain::application::MvApplicationService,
-                        > = Arc::clone(&service)
-                            as Arc<dyn crate::mv::domain::application::MvApplicationService>;
-                        host.mv_background_engine_sink = Some(
-                            FrontendMvService::background_engine_sink(Arc::clone(&service)),
-                        );
-                        host.mv_refresh_provider_activation = Some(provider_activation);
-                        host.mv_application_service = Some(application_service);
-                        host.mv_service = Some(service);
-                        host.mv_repository = Some(repository);
-                    }
-                    Err(error) => {
-                        return Err(host
-                            .cleanup_open_error(FrontendApplicationError::new(
-                                FrontendApplicationErrorKind::MvServiceOpen,
-                                error,
-                            ))
-                            .await);
-                    }
+            Some(store) => match StateStoreMvRepository::open(store, host.run_policy()).await {
+                Ok(repository) => {
+                    let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
+                        repository;
+                    let provider_activation =
+                        Arc::new(FrontendMvRefreshProviderActivationPort::new());
+                    let service = Arc::new(
+                        FrontendMvService::with_refresh_dependencies(
+                            Arc::clone(&repository),
+                            host.query_execution_service(),
+                            Arc::clone(&host.connector_control)
+                                as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+                            Arc::clone(&provider_activation),
+                            host.execution_role,
+                            host.backend_topology_port(),
+                            execution.mv_scheduler.clone(),
+                            execution.mv_maintenance.clone(),
+                            host.table_maintenance_service(),
+                            host.optimizer_query_mem_limit_bytes,
+                            Duration::from_secs(30 * 60),
+                        )
+                        .with_workload_lifecycle((*host.serving_lifecycle()).clone()),
+                    );
+                    let application_service: Arc<
+                        dyn crate::mv::domain::application::MvApplicationService,
+                    > = Arc::clone(&service)
+                        as Arc<dyn crate::mv::domain::application::MvApplicationService>;
+                    host.mv_background_engine_sink = Some(
+                        FrontendMvService::background_engine_sink(Arc::clone(&service)),
+                    );
+                    host.mv_refresh_provider_activation = Some(provider_activation);
+                    host.mv_application_service = Some(application_service);
+                    host.mv_service = Some(service);
+                    host.mv_repository = Some(repository);
                 }
-            }
+                Err(error) => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::MvServiceOpen,
+                            error,
+                        ))
+                        .await);
+                }
+            },
             None => {
                 return Err(host
                     .cleanup_open_error(FrontendApplicationError::new(
@@ -911,6 +931,30 @@ impl FrontendApplicationHost {
         self.state_store_host
             .as_ref()
             .and_then(StateStoreHost::state_store)
+    }
+
+    /// The policy this application applies to its own durable operations.
+    ///
+    /// Falls back to the built-in default when no store is configured, so a
+    /// consumer built without durable storage still has a coherent policy
+    /// rather than an absent one.
+    pub fn run_policy(&self) -> crate::state_store::StateStoreRunPolicy {
+        self.state_store_host
+            .as_ref()
+            .map(StateStoreHost::run_policy)
+            .unwrap_or_default()
+    }
+
+    /// The store together with the policy governing its use.
+    ///
+    /// Durable consumers take the pair, so none of them can be constructed
+    /// holding storage without an agreed retry budget for it.
+    pub fn durable(
+        &self,
+    ) -> Option<(Arc<dyn StateStore>, crate::state_store::StateStoreRunPolicy)> {
+        self.state_store_host
+            .as_ref()
+            .and_then(StateStoreHost::durable)
     }
 
     pub fn execution_role(&self) -> novarocks_types::ClusterRole {
@@ -1167,6 +1211,12 @@ impl FrontendApplicationHost {
         // their workers before closing the host's remaining durable owners.
         self.statistics_application_port.take();
         self.statistics_application_service.take();
+        // Stop the cadence before the store closes. The store host performs one
+        // final drain of its own, so nothing is lost here and no sweep races the
+        // instance going away.
+        if let Some(sweeper) = self.abandoned_attempt_sweeper.take() {
+            sweeper.shutdown().await;
+        }
         let catalog_controller_error = match self.catalog_controller.take() {
             Some(controller) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());

@@ -19,33 +19,27 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
-#[cfg(feature = "state-store-test-hooks")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "state-store-test-hooks")]
 use async_trait::async_trait;
 use bytes::Bytes;
-use foundationdb::Database;
-use foundationdb::options::TransactionOption;
+use foundationdb::options::{StreamingMode, TransactionOption};
+use foundationdb::{Database, KeySelector, RangeOption};
 use novarocks_state_store_api::{
-    ChangePollRequest, CommitOutcome, CommitResolution, Direction, Key, KeyRange, Precondition,
-    RangeRequest, StateStore, StateStoreErrorKind, TransactionId, Value,
+    AttemptOutcome, CommitObservation, CommitOutcome, Direction, Key, KeyRange, Precondition,
+    RangeRequest, StateStore, StateStoreErrorKind, Value, WriteTransaction,
 };
 use novarocks_state_store_foundationdb::{
-    FoundationDbClientConfig, FoundationDbProviderTestHarness, FoundationDbTestLimitOverrides,
-    FoundationDbTestProviderConfig, FoundationDbTestStoreConfig,
-};
-#[cfg(feature = "state-store-test-hooks")]
-use novarocks_state_store_foundationdb::{
-    FoundationDbCommitGateControl, arm_next_foundationdb_commit,
+    FoundationDbClientConfig, FoundationDbCommitGateControl, FoundationDbProviderTestHarness,
+    FoundationDbTestLimitOverrides, FoundationDbTestProviderConfig, FoundationDbTestStoreConfig,
+    arm_next_foundationdb_commit,
 };
 use uuid::Uuid;
 
-#[cfg(feature = "state-store-test-hooks")]
 use novarocks_state_store_testkit::conformance::{
-    self as state_store_conformance, PostDispatchControl, PostDispatchController,
-    PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
+    self as state_store_conformance, FaultStateStoreFactory, PostDispatchControl,
+    PostDispatchController, PostDispatchScenario, StateStoreFactory, StateStoreFaultFixture,
 };
 
 fn client_config() -> FoundationDbClientConfig {
@@ -86,30 +80,120 @@ fn test_deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 
-async fn write_partial_identity(keyspace_id: Uuid) {
-    let path = cluster_file();
-    let database = Database::from_path(path.to_str().expect("UTF-8 cluster file"))
-        .expect("create direct FoundationDB test handle");
-    let transaction = database
-        .create_trx()
-        .expect("create corruption transaction");
+fn raw_database() -> Database {
+    Database::from_path(
+        cluster_file()
+            .to_str()
+            .expect("UTF-8 FoundationDB cluster file"),
+    )
+    .expect("open raw FoundationDB inspection handle")
+}
+
+fn raw_transaction(database: &Database) -> foundationdb::Transaction {
+    let transaction = database.create_trx().expect("raw inspection transaction");
     transaction
         .set_option(TransactionOption::Timeout(4_000))
-        .expect("set corruption transaction timeout");
+        .expect("raw inspection timeout");
     transaction
         .set_option(TransactionOption::RetryLimit(0))
-        .expect("disable corruption transaction retries");
-    let schema_key = [
-        b"NRSS\x01".as_slice(),
-        keyspace_id.as_bytes(),
-        &[0x00, 0x00],
-    ]
-    .concat();
-    transaction.set(&schema_key, &[1]);
+        .expect("raw inspection retry limit");
+    transaction
+}
+
+fn keyspace_root(keyspace_id: Uuid) -> Vec<u8> {
+    [b"NRSS\x01".as_slice(), keyspace_id.as_bytes()].concat()
+}
+
+/// Counts the commit-state keys a keyspace currently holds.
+///
+/// The subspace is addressed without knowing any instance's private tag, which
+/// is the point: a test can tell how much evidence a keyspace is carrying
+/// without being able to forge, or even name, one attempt's key.
+async fn commit_state_key_count(keyspace_id: Uuid) -> usize {
+    let database = raw_database();
+    let transaction = raw_transaction(&database);
+    let root = keyspace_root(keyspace_id);
+    let start = [root.as_slice(), &[0x03]].concat();
+    let end = [root.as_slice(), &[0x04]].concat();
+    let values = transaction
+        .get_range(
+            &RangeOption {
+                begin: KeySelector::first_greater_or_equal(start),
+                end: KeySelector::first_greater_or_equal(end),
+                mode: StreamingMode::WantAll,
+                ..RangeOption::default()
+            },
+            1,
+            false,
+        )
+        .await
+        .expect("read the commit-state subspace");
+    values.len()
+}
+
+/// Waits for a keyspace's evidence to settle at `expected` keys.
+///
+/// Evidence is released by the commit owner, not by the caller it answered, so
+/// a caller that has already been told "committed" may still be a moment ahead
+/// of the release. Polling states the invariant without pretending the two are
+/// synchronous.
+async fn await_commit_state_key_count(keyspace_id: Uuid, expected: usize) {
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count = commit_state_key_count(keyspace_id).await;
+            if count == expected {
+                return count;
+            }
+            // Every poll is a real FoundationDB transaction, so this backs off
+            // rather than spinning one round trip per scheduler tick.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        observed.is_ok(),
+        "commit-state evidence never settled at {expected} keys; last count was {}",
+        commit_state_key_count(keyspace_id).await
+    );
+}
+
+async fn write_partial_identity(keyspace_id: Uuid) {
+    let database = raw_database();
+    let transaction = raw_transaction(&database);
+    let schema_key = [keyspace_root(keyspace_id).as_slice(), &[0x00, 0x00]].concat();
+    transaction.set(&schema_key, &[2]);
     transaction
         .commit()
         .await
         .expect("persist partial identity corruption");
+}
+
+/// Writes a complete identity in the retired change-feed schema.
+///
+/// FoundationDB has no DDL that could migrate such a keyspace, so opening it
+/// has to fail rather than reinterpret its rows. Nothing here resets it either:
+/// an operator's data is never rewritten by a version check.
+async fn write_version_one_identity(keyspace_id: Uuid, cluster_id: &str) {
+    let database = raw_database();
+    let transaction = raw_transaction(&database);
+    let root = keyspace_root(keyspace_id);
+    transaction.set(&[root.as_slice(), &[0x00, 0x00]].concat(), &[1]);
+    transaction.set(
+        &[root.as_slice(), &[0x00, 0x01]].concat(),
+        cluster_id.as_bytes(),
+    );
+    transaction.set(
+        &[root.as_slice(), &[0x00, 0x02]].concat(),
+        Uuid::new_v4().as_bytes(),
+    );
+    transaction.set(
+        &[root.as_slice(), &[0x00, 0x03]].concat(),
+        &1_u64.to_be_bytes(),
+    );
+    transaction
+        .commit()
+        .await
+        .expect("persist a version-one keyspace");
 }
 
 fn key(bytes: impl Into<Bytes>) -> Key {
@@ -135,6 +219,20 @@ fn range(
     }
 }
 
+/// Reserves one attempt and begins the write it authorises.
+async fn begin(
+    store: &Arc<dyn StateStore>,
+    purpose: &str,
+) -> (Box<dyn WriteTransaction>, CommitObservation) {
+    let (attempt, observation) = store.attempts().reserve().expect("reserve a write attempt");
+    let transaction = store
+        .begin_write(attempt, purpose)
+        .await
+        .expect("begin a write transaction");
+    assert_eq!(transaction.attempt(), observation.id());
+    (transaction, observation)
+}
+
 fn assert_committed(outcome: CommitOutcome) {
     assert!(
         matches!(outcome, CommitOutcome::Committed(_)),
@@ -142,11 +240,8 @@ fn assert_committed(outcome: CommitOutcome) {
     );
 }
 
-async fn seed(store: &dyn StateStore, records: &[(&'static [u8], &'static [u8])]) {
-    let mut transaction = store
-        .begin_write(TransactionId::from(Uuid::new_v4()), "seed")
-        .await
-        .expect("begin seed transaction");
+async fn seed(store: &Arc<dyn StateStore>, records: &[(&'static [u8], &'static [u8])]) {
+    let (mut transaction, observation) = begin(store, "seed").await;
     for (item, payload) in records {
         transaction
             .put(
@@ -158,6 +253,10 @@ async fn seed(store: &dyn StateStore, records: &[(&'static [u8], &'static [u8])]
             .expect("stage seed record");
     }
     assert_committed(transaction.commit().await);
+    assert_eq!(
+        observation.outcome().await.expect("seed verdict"),
+        observation.peek().expect("seed peek").expect("published"),
+    );
 }
 
 async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
@@ -172,10 +271,7 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
 
     let binary_key = key(Bytes::from_static(&[0x00, 0xff, 0x10]));
     let binary_value = value(Bytes::from_static(&[0xff, 0x00, 0x20]));
-    let mut ordered = store
-        .begin_write(TransactionId::from(Uuid::new_v4()), "ordered-overlay")
-        .await
-        .expect("begin ordered overlay");
+    let (mut ordered, _ordered_observation) = begin(&store, "ordered-overlay").await;
     ordered
         .put(binary_key.clone(), binary_value, Precondition::Absent)
         .await
@@ -206,7 +302,7 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
     assert_committed(ordered.commit().await);
     let mut repeatable = store.begin_read().await.expect("begin repeatable read");
     let before = repeatable.get(&binary_key).await.expect("first read");
-    seed(store.as_ref(), &[(&[0x00, 0xff, 0x10], b"changed")]).await;
+    seed(&store, &[(&[0x00, 0xff, 0x10], b"changed")]).await;
     assert_eq!(
         repeatable.get(&binary_key).await.expect("second read"),
         before
@@ -214,15 +310,9 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
     repeatable.abort().await.expect("abort repeatable read");
 
     let conflict_key = key(Bytes::from_static(b"same-key"));
-    seed(store.as_ref(), &[(b"same-key", b"base")]).await;
-    let mut left = store
-        .begin_write(TransactionId::from(Uuid::new_v4()), "same-left")
-        .await
-        .expect("begin left");
-    let mut right = store
-        .begin_write(TransactionId::from(Uuid::new_v4()), "same-right")
-        .await
-        .expect("begin right");
+    seed(&store, &[(b"same-key", b"base")]).await;
+    let (mut left, _left_observation) = begin(&store, "same-left").await;
+    let (mut right, right_observation) = begin(&store, "same-right").await;
     left.get(&conflict_key).await.expect("left read");
     right.get(&conflict_key).await.expect("right read");
     left.put(
@@ -242,16 +332,16 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
         .expect("right put");
     assert_committed(left.commit().await);
     assert!(matches!(right.commit().await, CommitOutcome::Conflict(_)));
+    // A conflict is FoundationDB's own statement that the write did not land,
+    // so it is published as a proven denial rather than left in doubt.
+    assert_eq!(
+        right_observation.peek().expect("conflict peek"),
+        Some(AttemptOutcome::NotCommitted)
+    );
 
-    seed(store.as_ref(), &[(b"skew-a", b"1"), (b"skew-b", b"1")]).await;
-    let mut skew_left = store
-        .begin_write(TransactionId::from(Uuid::new_v4()), "skew-left")
-        .await
-        .expect("begin skew left");
-    let mut skew_right = store
-        .begin_write(TransactionId::from(Uuid::new_v4()), "skew-right")
-        .await
-        .expect("begin skew right");
+    seed(&store, &[(b"skew-a", b"1"), (b"skew-b", b"1")]).await;
+    let (mut skew_left, _skew_left_observation) = begin(&store, "skew-left").await;
+    let (mut skew_right, _skew_right_observation) = begin(&store, "skew-right").await;
     skew_left
         .get(&key(Bytes::from_static(b"skew-a")))
         .await
@@ -282,15 +372,12 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
         CommitOutcome::Conflict(_)
     ));
 
-    let mut phantom = store
-        .begin_write(TransactionId::from(Uuid::new_v4()), "phantom-reader")
-        .await
-        .expect("begin phantom reader");
+    let (mut phantom, _phantom_observation) = begin(&store, "phantom-reader").await;
     phantom
         .range(&range(b"phantom-", b"phantom.", Direction::Forward, 2))
         .await
         .expect("read empty phantom range");
-    seed(store.as_ref(), &[(b"phantom-key", b"inserted")]).await;
+    seed(&store, &[(b"phantom-key", b"inserted")]).await;
     phantom
         .put(
             key(Bytes::from_static(b"phantom-outcome")),
@@ -302,7 +389,7 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
     assert!(matches!(phantom.commit().await, CommitOutcome::Conflict(_)));
 
     seed(
-        store.as_ref(),
+        &store,
         &[
             (b"page-0", b"0"),
             (b"page-1", b"1"),
@@ -313,10 +400,7 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
         ],
     )
     .await;
-    let mut overlay = store
-        .begin_write(TransactionId::from(Uuid::new_v4()), "overlay-refill")
-        .await
-        .expect("begin overlay refill");
+    let (mut overlay, overlay_observation) = begin(&store, "overlay-refill").await;
     for item in [b"page-0", b"page-1", b"page-2"] {
         overlay
             .delete(key(Bytes::from_static(item)), Precondition::Any)
@@ -348,14 +432,13 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
         StateStoreErrorKind::InvalidRequest
     );
     overlay.abort().await.expect("abort overlay refill");
+    assert_eq!(
+        overlay_observation.outcome().await.expect("abort verdict"),
+        AttemptOutcome::NotCommitted,
+        "an aborted transaction never reached storage"
+    );
 
-    let mut reverse_overlay = store
-        .begin_write(
-            TransactionId::from(Uuid::new_v4()),
-            "reverse-overlay-refill",
-        )
-        .await
-        .expect("begin reverse overlay refill");
+    let (mut reverse_overlay, _reverse_observation) = begin(&store, "reverse-overlay-refill").await;
     for item in [b"page-5", b"page-4", b"page-3"] {
         reverse_overlay
             .delete(key(Bytes::from_static(item)), Precondition::Any)
@@ -386,7 +469,7 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
         .await
         .expect("snapshot first page");
     let continuation = first_page.continuation.expect("snapshot continuation");
-    seed(store.as_ref(), &[(b"page-15", b"between")]).await;
+    seed(&store, &[(b"page-15", b"between")]).await;
     let mut continued_request = page_request.clone();
     continued_request.continuation = Some(continuation.clone());
     let same_snapshot = snapshot_scan
@@ -439,11 +522,7 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
         )
         .await
         .expect("open limited keyspace");
-    let transaction_id = TransactionId::from(Uuid::new_v4());
-    let mut limited = limited_store
-        .begin_write(transaction_id, "pre-io-limit")
-        .await
-        .expect("begin limited transaction without provider I/O");
+    let (mut limited, limited_observation) = begin(&limited_store, "pre-io-limit").await;
     assert_eq!(
         limited
             .put(
@@ -457,93 +536,36 @@ async fn transaction_scenarios(harness: &FoundationDbProviderTestHarness) {
         StateStoreErrorKind::LimitExceeded
     );
     limited.abort().await.expect("abort limited transaction");
-    let database = Database::from_path(
-        cluster_file()
-            .to_str()
-            .expect("UTF-8 FoundationDB cluster file"),
-    )
-    .expect("open raw FoundationDB controller handle");
-    let controller = database.create_trx().expect("controller transaction");
-    controller
-        .set_option(TransactionOption::Timeout(4_000))
-        .expect("controller timeout");
-    controller
-        .set_option(TransactionOption::RetryLimit(0))
-        .expect("controller retry limit");
-    let reservation_key = [
-        b"NRSS\x01".as_slice(),
-        limited_keyspace_id.as_bytes(),
-        &[0x03],
-        transaction_id.as_uuid().as_bytes(),
-    ]
-    .concat();
-    assert!(
-        controller
-            .get(&reservation_key, false)
+    assert_eq!(
+        limited_observation
+            .outcome()
             .await
-            .expect("read reservation key")
-            .is_none(),
-        "pre-I/O limit failure must not create a durable reservation"
+            .expect("pre-I/O limit verdict"),
+        AttemptOutcome::NotCommitted
+    );
+    assert_eq!(
+        commit_state_key_count(limited_keyspace_id).await,
+        0,
+        "a pre-I/O limit failure must leave no evidence behind"
     );
     drop(limited_store);
     drop(store);
 }
 
-async fn durable_commit_and_change_scenarios(harness: &FoundationDbProviderTestHarness) {
+async fn durable_commit_scenarios(harness: &FoundationDbProviderTestHarness) {
+    let keyspace_id = Uuid::new_v4();
     let store = harness
         .open_store(
-            transaction_store_config("durable-cluster", Uuid::new_v4()),
+            transaction_store_config("durable-cluster", keyspace_id),
             test_deadline(),
         )
         .await
         .expect("open durable commit keyspace");
 
-    let tombstoned = TransactionId::from(Uuid::new_v4());
-    assert_eq!(
-        store
-            .resolve_commit(&tombstoned)
-            .await
-            .expect("create absent resolution tombstone"),
-        CommitResolution::NotCommitted
-    );
-    assert_eq!(
-        store
-            .resolve_commit(&tombstoned)
-            .await
-            .expect("repeat stable tombstone resolution"),
-        CommitResolution::NotCommitted
-    );
-    let mut rejected = store
-        .begin_write(tombstoned, "reuse tombstoned transaction")
-        .await
-        .expect("begin tombstoned transaction");
-    rejected
-        .put(
-            key(Bytes::from_static(b"tombstoned")),
-            value(Bytes::from_static(b"must-not-commit")),
-            Precondition::Present,
-        )
-        .await
-        .expect("stage mismatched tombstoned transaction");
-    assert!(matches!(
-        rejected.commit().await,
-        CommitOutcome::DefiniteFailure(ref error)
-            if error.kind() == StateStoreErrorKind::InvalidRequest
-    ));
-    assert_eq!(
-        store
-            .resolve_commit(&tombstoned)
-            .await
-            .expect("resolve tombstone after rejected mismatched commit"),
-        CommitResolution::NotCommitted
-    );
-
-    let precondition_id = TransactionId::from(Uuid::new_v4());
-    seed(store.as_ref(), &[(b"precondition", b"present")]).await;
-    let mut mismatch = store
-        .begin_write(precondition_id, "durable precondition failure")
-        .await
-        .expect("begin precondition failure");
+    // A precondition FoundationDB refuses is proof, and a refused transaction
+    // stages its commit-state key inside the transaction that never committed.
+    seed(&store, &[(b"precondition", b"present")]).await;
+    let (mut mismatch, mismatch_observation) = begin(&store, "durable precondition failure").await;
     mismatch
         .put(
             key(Bytes::from_static(b"precondition")),
@@ -557,26 +579,11 @@ async fn durable_commit_and_change_scenarios(harness: &FoundationDbProviderTestH
         CommitOutcome::Conflict(_)
     ));
     assert_eq!(
-        store
-            .resolve_commit(&precondition_id)
-            .await
-            .expect("resolve precondition failure"),
-        CommitResolution::NotCommitted
+        mismatch_observation.outcome().await.expect("verdict"),
+        AttemptOutcome::NotCommitted
     );
 
-    let baseline = store
-        .poll_changes(&ChangePollRequest {
-            after: None,
-            page_size: store.limits().max_page_size,
-        })
-        .await
-        .expect("poll durable scenario baseline")
-        .next_cursor;
-    let committed_id = TransactionId::from(Uuid::new_v4());
-    let mut committed = store
-        .begin_write(committed_id, "durable committed transaction")
-        .await
-        .expect("begin committed transaction");
+    let (mut committed, committed_observation) = begin(&store, "durable committed").await;
     for item in [b"change-c", b"change-a", b"change-b"] {
         committed
             .put(
@@ -591,102 +598,31 @@ async fn durable_commit_and_change_scenarios(harness: &FoundationDbProviderTestH
         CommitOutcome::Committed(receipt) => receipt,
         other => panic!("expected durable commit, got {other:?}"),
     };
+    assert_eq!(receipt.attempt, committed_observation.id());
     assert_eq!(
-        store
-            .resolve_commit(&committed_id)
-            .await
-            .expect("resolve committed transaction"),
-        CommitResolution::Committed(receipt.clone())
+        committed_observation.peek().expect("published verdict"),
+        Some(AttemptOutcome::Committed(receipt.clone()))
+    );
+    // A published verdict survives its own evidence, which is exactly why the
+    // evidence may be dropped as soon as the verdict is recorded.
+    assert_eq!(
+        committed_observation.outcome().await.expect("verdict"),
+        AttemptOutcome::Committed(receipt)
     );
 
-    let mut duplicate = store
-        .begin_write(committed_id, "duplicate committed transaction")
-        .await
-        .expect("begin duplicate committed transaction");
-    duplicate
-        .put(
-            key(Bytes::from_static(b"duplicate-must-not-apply")),
-            value(Bytes::from_static(b"value")),
-            Precondition::Any,
-        )
-        .await
-        .expect("stage duplicate transaction");
-    assert_eq!(
-        duplicate.commit().await,
-        CommitOutcome::Committed(receipt.clone())
-    );
-
-    let first = store
-        .poll_changes(&ChangePollRequest {
-            after: Some(baseline),
-            page_size: 2,
-        })
-        .await
-        .expect("poll first same-revision page");
-    assert_eq!(first.hints.len(), 2);
-    assert!(
-        first
-            .hints
-            .iter()
-            .all(|hint| hint.revision == receipt.revision)
-    );
-    let second = store
-        .poll_changes(&ChangePollRequest {
-            after: Some(first.next_cursor),
-            page_size: 2,
-        })
-        .await
-        .expect("poll final same-revision page");
-    assert_eq!(second.hints.len(), 1);
-    assert_eq!(second.high_watermark, receipt.revision);
-    assert_eq!(
-        first
-            .hints
-            .iter()
-            .chain(second.hints.iter())
-            .map(|hint| hint.key.as_bytes())
-            .collect::<Vec<_>>(),
-        vec![
-            b"change-a".as_slice(),
-            b"change-b".as_slice(),
-            b"change-c".as_slice(),
-        ]
-    );
-    let identity = store.identity().await.expect("read durable identity");
-    let (cursor_revision, cursor_sequence) = second
-        .next_cursor
-        .decode(identity.store_id)
-        .expect("decode exhausted cursor");
-    assert_eq!(cursor_revision, receipt.revision);
-    assert_eq!(cursor_sequence, u32::MAX);
-
-    let empty_id = TransactionId::from(Uuid::new_v4());
-    let empty = store
-        .begin_write(empty_id, "high watermark without changes")
-        .await
-        .expect("begin empty transaction");
-    let empty_receipt = match empty.commit().await {
-        CommitOutcome::Committed(receipt) => receipt,
-        other => panic!("expected empty durable commit, got {other:?}"),
-    };
-    let empty_page = store
-        .poll_changes(&ChangePollRequest {
-            after: Some(second.next_cursor),
-            page_size: 2,
-        })
-        .await
-        .expect("poll high-watermark-only commit");
-    assert!(empty_page.hints.is_empty());
-    assert_eq!(empty_page.high_watermark, empty_receipt.revision);
+    // Every commit above was witnessed by its own owner, so every commit-state
+    // key it wrote is released. A provider that only cleaned up on abandonment
+    // would be holding one key per successful write here.
+    await_commit_state_key_count(keyspace_id, 0).await;
 
     drop(store);
 }
 
-#[cfg(feature = "state-store-test-hooks")]
 async fn cancellation_safe_supervisor_scenarios(harness: &FoundationDbProviderTestHarness) {
+    let keyspace_id = Uuid::new_v4();
     let store = harness
         .open_store(
-            transaction_store_config("supervisor-cluster", Uuid::new_v4()),
+            transaction_store_config("supervisor-cluster", keyspace_id),
             test_deadline(),
         )
         .await
@@ -694,11 +630,7 @@ async fn cancellation_safe_supervisor_scenarios(harness: &FoundationDbProviderTe
 
     let cancellation_control =
         arm_next_foundationdb_commit(true, false, false).expect("arm pre-native gate");
-    let cancellation_id = TransactionId::from(Uuid::new_v4());
-    let mut cancellation = store
-        .begin_write(cancellation_id, "cancel commit waiter")
-        .await
-        .expect("begin cancellation transaction");
+    let (mut cancellation, cancellation_observation) = begin(&store, "cancel commit waiter").await;
     cancellation
         .put(
             key(Bytes::from_static(b"cancel-owner")),
@@ -710,28 +642,37 @@ async fn cancellation_safe_supervisor_scenarios(harness: &FoundationDbProviderTe
     let waiter = tokio::spawn(async move { cancellation.commit().await });
     cancellation_control.wait_pre_native().await;
     assert_eq!(
-        store
-            .resolve_commit(&cancellation_id)
+        cancellation_observation
+            .outcome()
             .await
-            .expect("resolve held cancellation transaction"),
-        CommitResolution::Unresolved
+            .expect("resolve held attempt"),
+        AttemptOutcome::Unresolved,
+        "a held commit is undecided; absence of evidence is not evidence of absence"
+    );
+    assert_eq!(
+        cancellation_observation.peek().expect("peek held attempt"),
+        None
     );
     waiter.abort();
     assert!(waiter.await.expect_err("cancel waiter").is_cancelled());
+    // Losing the caller tells the store nothing, and the owner keeps going.
+    assert_eq!(
+        cancellation_observation
+            .outcome()
+            .await
+            .expect("resolve after cancellation"),
+        AttemptOutcome::Unresolved
+    );
     cancellation_control.release_pre_native();
     cancellation_control.wait_response().await;
     assert!(matches!(
-        await_terminal(store.as_ref(), cancellation_id).await,
-        CommitResolution::Committed(_)
+        await_terminal(&cancellation_observation).await,
+        AttemptOutcome::Committed(_)
     ));
 
     let response_control =
         arm_next_foundationdb_commit(false, true, true).expect("arm response-loss gate");
-    let response_id = TransactionId::from(Uuid::new_v4());
-    let mut response = store
-        .begin_write(response_id, "lose committed response")
-        .await
-        .expect("begin response-loss transaction");
+    let (mut response, response_observation) = begin(&store, "lose committed response").await;
     response
         .put(
             key(Bytes::from_static(b"response-loss")),
@@ -743,11 +684,8 @@ async fn cancellation_safe_supervisor_scenarios(harness: &FoundationDbProviderTe
     let waiter = tokio::spawn(async move { response.commit().await });
     response_control.wait_response().await;
     assert!(matches!(
-        store
-            .resolve_commit(&response_id)
-            .await
-            .expect("resolve committed response-loss transaction"),
-        CommitResolution::Committed(_)
+        await_terminal(&response_observation).await,
+        AttemptOutcome::Committed(_)
     ));
     response_control.release_response();
     assert!(matches!(
@@ -755,10 +693,32 @@ async fn cancellation_safe_supervisor_scenarios(harness: &FoundationDbProviderTe
         CommitOutcome::CommitUnknown(_)
     ));
 
+    // The ambiguous commit is the one case with no release hook: its verdict was
+    // published by the observation, not by the owner, so the provider was never
+    // told the key was spent. One key per such attempt is the honest cost, and
+    // the cancelled-then-released commit above is not part of it -- its owner
+    // witnessed a plain success and cleaned up after itself.
+    await_commit_state_key_count(keyspace_id, 1).await;
+
     drop(store);
 }
 
-#[cfg(feature = "state-store-test-hooks")]
+async fn await_terminal(observation: &CommitObservation) -> AttemptOutcome {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let verdict = observation.outcome().await.expect("resolve attempt");
+            if verdict.is_terminal() {
+                return verdict;
+            }
+            // An unresolved answer costs one auxiliary transaction, so the
+            // poll backs off instead of hammering the cluster.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a supervised attempt reaches a terminal state")
+}
+
 fn conformance_limit_overrides() -> FoundationDbTestLimitOverrides {
     FoundationDbTestLimitOverrides {
         max_key_bytes: Some(64),
@@ -767,39 +727,51 @@ fn conformance_limit_overrides() -> FoundationDbTestLimitOverrides {
         max_transaction_operations: Some(8),
         max_transaction_bytes: Some(16 * 1024),
         transaction_deadline_ms: Some(4_000),
-        runner_max_attempts: Some(3),
     }
 }
 
-#[cfg(feature = "state-store-test-hooks")]
+fn conformance_store_config() -> FoundationDbTestStoreConfig {
+    FoundationDbTestStoreConfig {
+        cluster_id: "foundationdb-conformance-cluster".to_owned(),
+        limits: conformance_limit_overrides(),
+        provider: FoundationDbTestProviderConfig::Foundationdb {
+            cluster_file: cluster_file(),
+            // A fresh keyspace per open: the attempt group only means something
+            // if two calls really are two instances.
+            keyspace_id: Uuid::new_v4(),
+        },
+    }
+}
+
 fn conformance_factory(runtime: Rc<FoundationDbProviderTestHarness>) -> StateStoreFactory {
     Rc::new(move || {
         let runtime = Rc::clone(&runtime);
         Box::pin(async move {
-            let store = runtime
-                .open_store(
-                    FoundationDbTestStoreConfig {
-                        cluster_id: "foundationdb-conformance-cluster".to_owned(),
-                        limits: conformance_limit_overrides(),
-                        provider: FoundationDbTestProviderConfig::Foundationdb {
-                            cluster_file: cluster_file(),
-                            keyspace_id: Uuid::new_v4(),
-                        },
-                    },
-                    test_deadline(),
-                )
-                .await?;
-            let controller: Arc<dyn PostDispatchController> =
-                Arc::new(FoundationDbPostDispatchController);
-            Ok(StateStoreConformanceFixture::new(store, controller))
+            runtime
+                .open_store(conformance_store_config(), test_deadline())
+                .await
         })
     })
 }
 
-#[cfg(feature = "state-store-test-hooks")]
+fn conformance_fault_factory(
+    runtime: Rc<FoundationDbProviderTestHarness>,
+) -> FaultStateStoreFactory {
+    Rc::new(move || {
+        let runtime = Rc::clone(&runtime);
+        Box::pin(async move {
+            let store = runtime
+                .open_store(conformance_store_config(), test_deadline())
+                .await?;
+            let controller: Arc<dyn PostDispatchController> =
+                Arc::new(FoundationDbPostDispatchController);
+            Ok(StateStoreFaultFixture::new(store, controller))
+        })
+    })
+}
+
 struct FoundationDbPostDispatchController;
 
-#[cfg(feature = "state-store-test-hooks")]
 #[async_trait]
 impl PostDispatchController for FoundationDbPostDispatchController {
     async fn arm(&self, scenario: PostDispatchScenario) -> Box<dyn PostDispatchControl> {
@@ -816,13 +788,11 @@ impl PostDispatchController for FoundationDbPostDispatchController {
     }
 }
 
-#[cfg(feature = "state-store-test-hooks")]
 struct FoundationDbPostDispatchControl {
     scenario: PostDispatchScenario,
     gate: FoundationDbCommitGateControl,
 }
 
-#[cfg(feature = "state-store-test-hooks")]
 #[async_trait]
 impl PostDispatchControl for FoundationDbPostDispatchControl {
     async fn wait_dispatched(&self) {
@@ -857,24 +827,6 @@ impl PostDispatchControl for FoundationDbPostDispatchControl {
     }
 }
 
-#[cfg(feature = "state-store-test-hooks")]
-async fn await_terminal(store: &dyn StateStore, transaction_id: TransactionId) -> CommitResolution {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let resolution = store
-                .resolve_commit(&transaction_id)
-                .await
-                .expect("resolve supervised transaction");
-            if !matches!(resolution, CommitResolution::Unresolved) {
-                return resolution;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("supervised transaction reaches durable terminal")
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn foundationdb_suite() {
     let runtime = Rc::new(
@@ -894,6 +846,29 @@ async fn foundationdb_suite() {
     let right_identity = right.identity().await.expect("read right identity");
     assert_eq!(left_identity, right_identity);
     assert_eq!(left_identity.cluster_id, "identity-cluster");
+    // Two opens of one keyspace are two instances, and a capability from one is
+    // not answerable by the other.
+    assert_ne!(left.attempts().scope(), right.attempts().scope());
+    {
+        // Scoped on purpose: an observation keeps its instance's supervisor --
+        // and through it the provider handle -- alive, so one held past the end
+        // of the test would block the runtime from ever draining.
+        let (foreign, foreign_observation) = left.attempts().reserve().expect("reserve on left");
+        assert_eq!(
+            right
+                .begin_write(foreign, "capability from the other open")
+                .await
+                .err()
+                .expect("a foreign capability must be refused")
+                .kind(),
+            StateStoreErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            foreign_observation.outcome().await.expect("verdict"),
+            AttemptOutcome::NotCommitted,
+            "a refusal happens before dispatch, so the attempt is proven effect-free"
+        );
+    }
 
     let mismatch = match runtime
         .open_store(
@@ -921,16 +896,44 @@ async fn foundationdb_suite() {
     };
     assert_eq!(corruption.kind(), StateStoreErrorKind::Corruption);
 
-    transaction_scenarios(runtime.as_ref()).await;
-    durable_commit_and_change_scenarios(runtime.as_ref()).await;
-    #[cfg(feature = "state-store-test-hooks")]
-    cancellation_safe_supervisor_scenarios(runtime.as_ref()).await;
-    #[cfg(feature = "state-store-test-hooks")]
+    let legacy_keyspace = Uuid::new_v4();
+    write_version_one_identity(legacy_keyspace, "identity-cluster").await;
+    let legacy = match runtime
+        .open_store(
+            store_config("identity-cluster", legacy_keyspace),
+            test_deadline(),
+        )
+        .await
     {
-        let factory = conformance_factory(Rc::clone(&runtime));
-        state_store_conformance::run_state_store_conformance(Rc::clone(&factory)).await;
-        drop(factory);
-    }
+        Ok(_) => panic!("a change-feed-era keyspace must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(legacy.kind(), StateStoreErrorKind::Corruption);
+    let legacy_root = keyspace_root(legacy_keyspace);
+    let database = raw_database();
+    let inspection = raw_transaction(&database);
+    assert_eq!(
+        inspection
+            .get(&[legacy_root.as_slice(), &[0x00, 0x00]].concat(), false)
+            .await
+            .expect("read refused schema version")
+            .map(|value| value.to_vec()),
+        Some(vec![1]),
+        "a refused keyspace is left exactly as the operator wrote it"
+    );
+    drop(inspection);
+
+    transaction_scenarios(runtime.as_ref()).await;
+    durable_commit_scenarios(runtime.as_ref()).await;
+    cancellation_safe_supervisor_scenarios(runtime.as_ref()).await;
+
+    let factory = conformance_factory(Rc::clone(&runtime));
+    state_store_conformance::run_basic_suite(&factory).await;
+    state_store_conformance::run_attempt_suite(&factory).await;
+    drop(factory);
+    let fault_factory = conformance_fault_factory(Rc::clone(&runtime));
+    state_store_conformance::run_fault_suite(&fault_factory).await;
+    drop(fault_factory);
 
     drop(right);
     drop(left);

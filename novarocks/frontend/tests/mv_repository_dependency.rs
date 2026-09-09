@@ -19,9 +19,9 @@ mod mv_repository_definition;
 
 use novarocks_frontend::mv::domain::repository::{MvRepository, ReplaceMvProjectionRequest};
 
-#[test]
-fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
-    let (_temp, _runtime, _host, repository) = mv_repository_definition::repository();
+#[tokio::test]
+async fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
+    let (_temp, _host, repository) = mv_repository_definition::repository().await;
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
@@ -32,11 +32,13 @@ fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
                 "orders",
             ),
         )
+        .await
         .unwrap();
     let upstream = created.definition.base_table_refs[0].clone();
     assert_eq!(
         repository
             .list_dependencies_by_downstream(created.definition.mv_id)
+            .await
             .unwrap()
             .len(),
         1
@@ -57,14 +59,17 @@ fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
                 projection: replacement,
             },
         )
+        .await
         .unwrap();
     let dependencies = repository
         .list_dependencies_by_downstream(replaced.definition.mv_id)
+        .await
         .unwrap();
     assert_eq!(dependencies.len(), 1);
     assert_eq!(dependencies[0].upstream.name, "customers");
     assert_ne!(replaced.definition.base_table_refs[0], upstream);
     repository
         .ensure_no_downstream_dependencies(&dependencies[0].upstream)
+        .await
         .expect_err("upstream guard must observe the symmetric index");
 }

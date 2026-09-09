@@ -60,18 +60,27 @@ impl MaintenanceCommandExecutor {
             execution.clone(),
             connector_context.clone(),
         );
-        self.kernel
-            .service()
-            .handle_typed_statement(
-                &engine,
-                lowered,
-                crate::table_maintenance::is_typed_spark_maintenance_call(statement),
-                MaintenanceRequestContext {
-                    current_catalog,
-                    current_database,
-                },
-            )
-            .map(statement_result)
+        // The maintenance domain contract is async, because its durable work is
+        // I/O. This call site is not: every SQL statement runs inside the
+        // `spawn_blocking` closure in `query.rs`, which is where the foreground
+        // statement lease, timeout and cancellation are anchored.
+        //
+        // Hoisting the command branch out of that closure means restructuring
+        // statement admission itself, which belongs to the query-application and
+        // query-preparation work lines, not here. So the adapter sits at this
+        // edge — the SQL routing boundary another work line owns — and never in
+        // a domain contract. It deletes when that closure is lifted.
+        let spark_call = crate::table_maintenance::is_typed_spark_maintenance_call(statement);
+        let service = self.kernel.service();
+        let context = MaintenanceRequestContext {
+            current_catalog,
+            current_database,
+        };
+        let outcome = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(service.handle_typed_statement(&engine, lowered, spark_call, context))
+        });
+        outcome.map(statement_result)
     }
 }
 
@@ -125,6 +134,7 @@ mod tests {
         called: std::sync::atomic::AtomicBool,
     }
 
+    #[async_trait::async_trait]
     impl TableMaintenanceService for ReadOnlyService {
         fn start(&self, _engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
             Ok(())
@@ -139,7 +149,7 @@ mod tests {
             Ok(MaintenanceStatementResult::Ok)
         }
 
-        fn execute_automatic_action(
+        async fn execute_automatic_action(
             &self,
             _engine: &dyn TableMaintenanceEngine,
             _request: MaintenanceActionRequest,

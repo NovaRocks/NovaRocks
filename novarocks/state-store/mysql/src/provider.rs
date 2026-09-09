@@ -445,13 +445,11 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(feature = "state-store-test-hooks")]
-    #[cfg(feature = "state-store-test-hooks")]
     use futures::future::BoxFuture;
     #[cfg(feature = "state-store-test-hooks")]
     use novarocks_state_store_api::{
-        ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStoreErrorKind,
-        StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOpenRequest, StoreIdentity,
-        TransactionId, WriteTransaction,
+        AttemptSupervisor, ReadTransaction, StateStoreErrorKind, StateStoreLimits,
+        StateStoreOpenRequest, StoreIdentity, WriteAttempt, WriteTransaction,
     };
     use novarocks_state_store_api::{StateStoreProviderFactory, StateStoreProviderInstance};
     #[cfg(feature = "state-store-test-hooks")]
@@ -509,7 +507,7 @@ mod tests {
             &LIMITS
         }
 
-        fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
+        fn attempts(&self) -> &AttemptSupervisor {
             panic!("unused fake store operation")
         }
 
@@ -519,27 +517,13 @@ mod tests {
 
         async fn begin_write(
             &self,
-            _transaction_id: TransactionId,
+            _attempt: WriteAttempt,
             _purpose: &str,
         ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
             panic!("unused fake store operation")
         }
 
-        async fn poll_changes(
-            &self,
-            _request: &ChangePollRequest,
-        ) -> Result<ChangePage, StateStoreError> {
-            panic!("unused fake store operation")
-        }
-
         async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
-            panic!("unused fake store operation")
-        }
-
-        async fn resolve_commit(
-            &self,
-            _transaction_id: &TransactionId,
-        ) -> Result<CommitResolution, StateStoreError> {
             panic!("unused fake store operation")
         }
     }

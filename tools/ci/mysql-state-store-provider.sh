@@ -50,9 +50,11 @@ test -n "$NOVAROCKS_MYSQL_IMAGE"
 cd "$WORKSPACE_ROOT"
 
 cargo fmt --all -- --check
-cargo test -p novarocks-spi
-cargo check -p novarocks-spi --no-default-features
-"$SCRIPT_DIR/check-spi-dependency-boundary.py" \
+# The contract this provider implements, and the boundary that contract keeps.
+# Both left novarocks-spi, which is connector-only now, so gating a StateStore
+# provider on the connector SPI was checking a package it no longer touches.
+cargo test -p novarocks-state-store-api -p novarocks-state-store-testkit
+"$SCRIPT_DIR/check-state-store-dependency-boundary.py" \
   --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
 cargo check -p novarocks-state-store-mysql --all-targets --all-features
 cargo test -p novarocks-state-store-mysql --lib --features state-store-test-hooks
@@ -80,10 +82,16 @@ cargo test -p novarocks-state-store-mysql --test state_store_mysql --features st
 cargo test -p novarocks-state-store-mysql --features state-store-test-hooks \
   --test state_store_mysql mysql_provider_state_store_accepts_3072_and_rejects_3073_before_io \
   -- --exact --nocapture --test-threads=1
-cargo test -p novarocks-state-store-mysql --features state-store-test-hooks --test state_store_mysql -- --list | \
-  awk '$1 == "mysql_suite:" { n++ } END { exit(n != 1) }'
-cargo test -p novarocks-state-store-mysql --features state-store-test-hooks \
-  --test state_store_mysql mysql_suite -- --exact --nocapture --test-threads=1
+# The one conformance entry point became three: the two mandatory groups plus
+# the optional fault group, which MySQL runs because it supplies a real
+# post-dispatch control. Each is gated on being present exactly once so a
+# renamed or dropped suite fails the gate instead of silently not running.
+for suite in mysql_basic_suite mysql_attempt_suite mysql_fault_suite; do
+  cargo test -p novarocks-state-store-mysql --features state-store-test-hooks --test state_store_mysql -- --list | \
+    awk -v suite="$suite:" '$1 == suite { n++ } END { exit(n != 1) }'
+  cargo test -p novarocks-state-store-mysql --features state-store-test-hooks \
+    --test state_store_mysql "$suite" -- --exact --nocapture --test-threads=1
+done
 cargo test -p novarocks-state-store-mysql --features state-store-test-hooks --test state_store_mysql_cross_process -- --list | \
   awk '$1 == "mysql_cross_process_suite:" { n++ } END { exit(n != 1) }'
 cargo test -p novarocks-state-store-mysql --features state-store-test-hooks \

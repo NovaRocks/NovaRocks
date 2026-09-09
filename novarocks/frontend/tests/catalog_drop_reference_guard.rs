@@ -65,10 +65,9 @@ use novarocks_spi::connector::{
     ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
 };
 use novarocks_state_store_api::{
-    ChangePage, ChangePollRequest, CommitOutcome, CommitResolution, Direction, Key, KeyRange,
-    Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStore,
-    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
-    StoreIdentity, TransactionId, Value, WriteTransaction,
+    AttemptId, AttemptSupervisor, CommitOutcome, Direction, Key, KeyRange, Precondition, RangePage,
+    RangeRequest, ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
+    StateStoreLimits, StoreIdentity, Value, WriteAttempt, WriteTransaction,
 };
 use uuid::Uuid;
 
@@ -291,8 +290,10 @@ impl StateStore for AcceleratorUnreadableStore {
         self.inner.limits()
     }
 
-    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-        self.inner.metrics_snapshot()
+    /// Attempts belong to the wrapped instance: an identity minted here has to
+    /// be one the store that will run the write actually issued.
+    fn attempts(&self) -> &AttemptSupervisor {
+        self.inner.attempts()
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -303,28 +304,14 @@ impl StateStore for AcceleratorUnreadableStore {
 
     async fn begin_write(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
         purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-        self.inner.begin_write(transaction_id, purpose).await
-    }
-
-    async fn poll_changes(
-        &self,
-        request: &ChangePollRequest,
-    ) -> Result<ChangePage, StateStoreError> {
-        self.inner.poll_changes(request).await
+        self.inner.begin_write(attempt, purpose).await
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
         self.inner.identity().await
-    }
-
-    async fn resolve_commit(
-        &self,
-        transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError> {
-        self.inner.resolve_commit(transaction_id).await
     }
 }
 
@@ -376,8 +363,8 @@ impl ReadTransaction for RecordingWrite {
 
 #[async_trait::async_trait]
 impl WriteTransaction for RecordingWrite {
-    fn transaction_id(&self) -> &TransactionId {
-        self.inner.transaction_id()
+    fn attempt(&self) -> AttemptId {
+        self.inner.attempt()
     }
 
     async fn put(
@@ -408,8 +395,8 @@ impl StateStore for WriteScanRecordingStore {
         self.inner.limits()
     }
 
-    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-        self.inner.metrics_snapshot()
+    fn attempts(&self) -> &AttemptSupervisor {
+        self.inner.attempts()
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -418,31 +405,17 @@ impl StateStore for WriteScanRecordingStore {
 
     async fn begin_write(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
         purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
         Ok(Box::new(RecordingWrite {
-            inner: self.inner.begin_write(transaction_id, purpose).await?,
+            inner: self.inner.begin_write(attempt, purpose).await?,
             accelerator_write_scans: Arc::clone(&self.accelerator_write_scans),
         }))
     }
 
-    async fn poll_changes(
-        &self,
-        request: &ChangePollRequest,
-    ) -> Result<ChangePage, StateStoreError> {
-        self.inner.poll_changes(request).await
-    }
-
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
         self.inner.identity().await
-    }
-
-    async fn resolve_commit(
-        &self,
-        transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError> {
-        self.inner.resolve_commit(transaction_id).await
     }
 }
 
@@ -509,8 +482,16 @@ async fn seed_dependency_reference(store: &Arc<dyn StateStore>, name: &str) {
 }
 
 async fn put_marker(store: &Arc<dyn StateStore>, key: Key, purpose: &str) {
+    // A write identity is issued by the store that will run it; seeding used to
+    // mint one from a fresh UUID, which is exactly what the attempt contract
+    // removed.
+    let attempt = store
+        .attempts()
+        .reserve()
+        .expect("reserve a seeding write attempt")
+        .0;
     let mut transaction = store
-        .begin_write(TransactionId::from(Uuid::now_v7()), purpose)
+        .begin_write(attempt, purpose)
         .await
         .expect("begin seed transaction");
     transaction
@@ -586,7 +567,7 @@ async fn an_observed_materialized_view_reference_refuses_the_drop_as_an_operatio
     let host =
         state_store_fixture::open(format!("catalog-drop-guard-refuse-{}", Uuid::now_v7())).await;
     let store = host.state_store().expect("test StateStore");
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await
         .expect("open attachment repository");
     let (_control, port) = port_with(CatalogDesiredStateSource::dynamic_state_store(
@@ -666,7 +647,7 @@ async fn an_entirely_wiped_accelerator_still_lets_the_catalog_drop() {
         inner: Arc::clone(&inner),
         accelerator_write_scans: Arc::clone(&accelerator_write_scans),
     }) as Arc<dyn StateStore>;
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await
         .expect("open attachment repository");
     let (_control, port) = port_with(CatalogDesiredStateSource::dynamic_state_store(
@@ -687,12 +668,12 @@ async fn an_entirely_wiped_accelerator_still_lets_the_catalog_drop() {
         CatalogApplicationErrorKind::Conflict
     );
 
-    let mv_repository =
-        StateStoreMvRepository::open(Arc::clone(&store), tokio::runtime::Handle::current())
-            .await
-            .expect("open MV accelerator repository");
+    let mv_repository = StateStoreMvRepository::open(Arc::clone(&store), host.run_policy())
+        .await
+        .expect("open MV accelerator repository");
     mv_repository
         .wipe_accelerator(Uuid::now_v7())
+        .await
         .expect("wipe the whole MV accelerator family");
     assert_eq!(
         accelerator_key_count(&store).await,
@@ -748,7 +729,7 @@ async fn an_unreadable_accelerator_does_not_block_the_durable_delete() {
     let store = Arc::new(AcceleratorUnreadableStore {
         inner: Arc::clone(&inner),
     }) as Arc<dyn StateStore>;
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await
         .expect("open attachment repository");
     let (_control, port) = port_with(CatalogDesiredStateSource::dynamic_state_store(
@@ -787,7 +768,7 @@ async fn an_unreferenced_catalog_drops_and_retires_its_projection() {
     let host =
         state_store_fixture::open(format!("catalog-drop-guard-plain-{}", Uuid::now_v7())).await;
     let store = host.state_store().expect("test StateStore");
-    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await
         .expect("open attachment repository");
     let (control, port) = port_with(CatalogDesiredStateSource::dynamic_state_store(

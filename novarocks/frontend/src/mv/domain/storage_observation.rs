@@ -769,7 +769,7 @@ impl MvRefreshTargetObservation {
                 return corrupt("MV refresh target lineage has a negative snapshot ID");
             }
         }
-        for (snapshot_id, marker) in &snapshot_markers {
+        for snapshot_id in snapshot_markers.keys() {
             if *snapshot_id < 0 {
                 return corrupt("MV refresh target marker has a negative snapshot ID");
             }

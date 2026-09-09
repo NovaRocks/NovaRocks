@@ -17,8 +17,8 @@
 
 use anyhow::{Result, bail};
 use novarocks_state_store_api::{
-    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_RUNNER_ATTEMPTS,
-    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
+    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,
+    MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -28,8 +28,7 @@ pub struct StateStoreLimitOverrides {
     pub max_page_size: Option<usize>,
     pub max_transaction_operations: Option<usize>,
     pub max_transaction_bytes: Option<usize>,
-    pub transaction_deadline_ms: Option<u64>,
-    pub runner_max_attempts: Option<usize>,
+    pub transaction_timeout_ms: Option<u64>,
 }
 
 pub(crate) fn resolve_state_store_limits(
@@ -42,8 +41,8 @@ pub(crate) fn resolve_state_store_limits(
         );
     }
     let deadline_ms = tightened_u64(
-        "transaction_deadline_ms",
-        overrides.transaction_deadline_ms,
+        "transaction_timeout_ms",
+        overrides.transaction_timeout_ms,
         DEFAULT_TRANSACTION_DEADLINE.as_millis() as u64,
     )?;
     Ok(StateStoreLimits {
@@ -69,11 +68,6 @@ pub(crate) fn resolve_state_store_limits(
             MAX_TRANSACTION_BYTES,
         )?,
         transaction_deadline: std::time::Duration::from_millis(deadline_ms),
-        runner_max_attempts: tightened_usize(
-            "runner_max_attempts",
-            overrides.runner_max_attempts,
-            MAX_RUNNER_ATTEMPTS,
-        )?,
     })
 }
 
@@ -114,7 +108,6 @@ mod tests {
         );
         assert_eq!(limits.max_transaction_bytes, MAX_TRANSACTION_BYTES);
         assert_eq!(limits.transaction_deadline, DEFAULT_TRANSACTION_DEADLINE);
-        assert_eq!(limits.runner_max_attempts, MAX_RUNNER_ATTEMPTS);
     }
 
     #[test]
@@ -125,8 +118,7 @@ mod tests {
             max_page_size: Some(100),
             max_transaction_operations: Some(200),
             max_transaction_bytes: Some(4096),
-            transaction_deadline_ms: Some(500),
-            runner_max_attempts: Some(2),
+            transaction_timeout_ms: Some(500),
         };
 
         let limits = resolve_state_store_limits(&overrides, MAX_KEY_BYTES).expect("tighter limits");
@@ -137,7 +129,6 @@ mod tests {
         assert_eq!(limits.max_transaction_operations, 200);
         assert_eq!(limits.max_transaction_bytes, 4096);
         assert_eq!(limits.transaction_deadline, Duration::from_millis(500));
-        assert_eq!(limits.runner_max_attempts, 2);
     }
 
     #[test]
@@ -214,32 +205,18 @@ mod tests {
                 },
             ),
             (
-                "transaction_deadline_ms",
+                "transaction_timeout_ms",
                 StateStoreLimitOverrides {
-                    transaction_deadline_ms: Some(0),
+                    transaction_timeout_ms: Some(0),
                     ..Default::default()
                 },
             ),
             (
-                "transaction_deadline_ms",
+                "transaction_timeout_ms",
                 StateStoreLimitOverrides {
-                    transaction_deadline_ms: Some(
+                    transaction_timeout_ms: Some(
                         DEFAULT_TRANSACTION_DEADLINE.as_millis() as u64 + 1,
                     ),
-                    ..Default::default()
-                },
-            ),
-            (
-                "runner_max_attempts",
-                StateStoreLimitOverrides {
-                    runner_max_attempts: Some(0),
-                    ..Default::default()
-                },
-            ),
-            (
-                "runner_max_attempts",
-                StateStoreLimitOverrides {
-                    runner_max_attempts: Some(MAX_RUNNER_ATTEMPTS + 1),
                     ..Default::default()
                 },
             ),

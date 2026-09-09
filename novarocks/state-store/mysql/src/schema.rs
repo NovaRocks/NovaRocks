@@ -31,13 +31,13 @@ use super::client::{
 };
 use super::codec::MysqlCodec;
 use super::identity::{
-    CHANGE_RETENTION_FLOOR_KEY, CLUSTER_ID_KEY, CURRENT_REVISION_KEY, INITIAL_INCARNATION_KEY,
-    MysqlIdentitySnapshot, SCHEMA_DIGEST_KEY, SCHEMA_VERSION_KEY, STORE_ID_KEY, advisory_lock_name,
-    decode_meta_rows, initial_meta_rows, validate_cluster_id,
+    CLUSTER_ID_KEY, CURRENT_REVISION_KEY, INITIAL_INCARNATION_KEY, SCHEMA_DIGEST_KEY,
+    SCHEMA_VERSION_KEY, STORE_ID_KEY, advisory_lock_name, decode_meta_rows, initial_meta_rows,
+    validate_cluster_id,
 };
 #[cfg(feature = "state-store-test-hooks")]
 use super::open_test_hooks::{MysqlOpenGatePhase, take_mysql_open_gate};
-use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 
 const SCHEMA_MANIFEST: &str = concat!(
     "CREATE TABLE state_store_meta (\n",
@@ -51,23 +51,16 @@ const SCHEMA_MANIFEST: &str = concat!(
     "    version_bytes BINARY(12) NOT NULL,\n",
     "    PRIMARY KEY (key_bytes)\n",
     ") ENGINE=InnoDB ROW_FORMAT=DYNAMIC;\n",
-    "CREATE TABLE state_store_changes (\n",
-    "    revision BIGINT UNSIGNED NOT NULL,\n",
-    "    sequence INT UNSIGNED NOT NULL,\n",
-    "    key_bytes VARBINARY(3072) NOT NULL,\n",
-    "    PRIMARY KEY (revision, sequence)\n",
-    ") ENGINE=InnoDB ROW_FORMAT=DYNAMIC;\n",
     "CREATE TABLE state_store_commits (\n",
-    "    transaction_id BINARY(16) NOT NULL,\n",
+    "    attempt_id VARBINARY(64) NOT NULL,\n",
     "    state TINYINT UNSIGNED NOT NULL,\n",
-    "    reservation_token BINARY(16) NULL,\n",
     "    revision BIGINT UNSIGNED NULL,\n",
     "    updated_at_ms BIGINT UNSIGNED NOT NULL,\n",
-    "    PRIMARY KEY (transaction_id)\n",
+    "    PRIMARY KEY (attempt_id)\n",
     ") ENGINE=InnoDB ROW_FORMAT=DYNAMIC;\n",
-    "meta:schema_version=u32be(1),schema_digest=lower_hex_sha256,",
+    "meta:schema_version=u32be(2),schema_digest=lower_hex_sha256,",
     "store_id=uuidv7_raw16,cluster_id=utf8,initial_incarnation=u64be(1),",
-    "current_revision=u64be(0),change_retention_floor=cursor_be(0,4294967295)\n",
+    "current_revision=u64be(0)\n",
 );
 
 const META_SCHEMA_SQL: &str = "CREATE TABLE state_store_meta (
@@ -81,19 +74,12 @@ const KV_SCHEMA_SQL: &str = "CREATE TABLE state_store_kv (
     version_bytes BINARY(12) NOT NULL,
     PRIMARY KEY (key_bytes)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC";
-const CHANGES_SCHEMA_SQL: &str = "CREATE TABLE state_store_changes (
-    revision BIGINT UNSIGNED NOT NULL,
-    sequence INT UNSIGNED NOT NULL,
-    key_bytes VARBINARY(3072) NOT NULL,
-    PRIMARY KEY (revision, sequence)
-) ENGINE=InnoDB ROW_FORMAT=DYNAMIC";
 const COMMITS_SCHEMA_SQL: &str = "CREATE TABLE state_store_commits (
-    transaction_id BINARY(16) NOT NULL,
+    attempt_id VARBINARY(64) NOT NULL,
     state TINYINT UNSIGNED NOT NULL,
-    reservation_token BINARY(16) NULL,
     revision BIGINT UNSIGNED NULL,
     updated_at_ms BIGINT UNSIGNED NOT NULL,
-    PRIMARY KEY (transaction_id)
+    PRIMARY KEY (attempt_id)
 ) ENGINE=InnoDB ROW_FORMAT=DYNAMIC";
 
 const TABLES_SQL: &str = "SELECT TABLE_NAME, TABLE_TYPE, ENGINE, ROW_FORMAT
@@ -153,7 +139,6 @@ pub struct SchemaSnapshot {
     pub cluster_id: String,
     pub initial_incarnation: u64,
     pub current_revision: u64,
-    pub change_retention_floor: (u64, u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,7 +181,7 @@ pub(super) async fn bootstrap_and_validate(
     max_key_bytes: usize,
     deadline: Instant,
     cancellation: &MysqlOpenCancellation,
-) -> Result<MysqlIdentitySnapshot, StateStoreError> {
+) -> Result<StoreIdentity, StateStoreError> {
     validate_cluster_id(cluster_id)?;
     let codec = MysqlCodec::new(max_key_bytes)?;
     let connection = checkout_hygienic_connection(pool, deadline).await?;
@@ -234,7 +219,7 @@ pub(crate) async fn validate_store_readiness(
     max_key_bytes: usize,
     deadline: Instant,
     cancellation: &MysqlOpenCancellation,
-) -> Result<(MysqlIdentitySnapshot, StoreReadinessSnapshot), StateStoreError> {
+) -> Result<(StoreIdentity, StoreReadinessSnapshot), StateStoreError> {
     let identity = bootstrap_and_validate(
         Arc::clone(&pool),
         database,
@@ -317,7 +302,7 @@ async fn bootstrap_locked(
     session: &mut SchemaSession,
     codec: &MysqlCodec,
     cluster_id: &str,
-) -> Result<MysqlIdentitySnapshot, StateStoreError> {
+) -> Result<StoreIdentity, StateStoreError> {
     let inventory = load_inventory(session).await?;
     if inventory.tables.is_empty() && inventory.views.is_empty() && inventory.triggers.is_empty() {
         create_schema(session, codec, cluster_id).await?;
@@ -336,12 +321,7 @@ async fn create_schema(
     codec: &MysqlCodec,
     cluster_id: &str,
 ) -> Result<(), StateStoreError> {
-    for sql in [
-        META_SCHEMA_SQL,
-        KV_SCHEMA_SQL,
-        CHANGES_SCHEMA_SQL,
-        COMMITS_SCHEMA_SQL,
-    ] {
+    for sql in [META_SCHEMA_SQL, KV_SCHEMA_SQL, COMMITS_SCHEMA_SQL] {
         session
             .run(move |connection| Box::pin(connection.query_drop(sql)))
             .await?;
@@ -490,29 +470,16 @@ fn validate_inventory(inventory: &SchemaInventory) -> Result<(), StateStoreError
 fn expected_tables() -> Vec<SchemaTableSnapshot> {
     vec![
         SchemaTableSnapshot {
-            name: "state_store_changes".to_owned(),
-            engine: "InnoDB".to_owned(),
-            row_format: "Dynamic".to_owned(),
-            columns: vec![
-                SchemaColumnSnapshot::new("revision", "bigint unsigned", false, 1),
-                SchemaColumnSnapshot::new("sequence", "int unsigned", false, 2),
-                SchemaColumnSnapshot::new("key_bytes", "varbinary(3072)", false, 0),
-            ],
-            primary_key: vec!["revision".to_owned(), "sequence".to_owned()],
-            secondary_indexes: Vec::new(),
-        },
-        SchemaTableSnapshot {
             name: "state_store_commits".to_owned(),
             engine: "InnoDB".to_owned(),
             row_format: "Dynamic".to_owned(),
             columns: vec![
-                SchemaColumnSnapshot::new("transaction_id", "binary(16)", false, 1),
+                SchemaColumnSnapshot::new("attempt_id", "varbinary(64)", false, 1),
                 SchemaColumnSnapshot::new("state", "tinyint unsigned", false, 0),
-                SchemaColumnSnapshot::new("reservation_token", "binary(16)", true, 0),
                 SchemaColumnSnapshot::new("revision", "bigint unsigned", true, 0),
                 SchemaColumnSnapshot::new("updated_at_ms", "bigint unsigned", false, 0),
             ],
-            primary_key: vec!["transaction_id".to_owned()],
+            primary_key: vec!["attempt_id".to_owned()],
             secondary_indexes: Vec::new(),
         },
         SchemaTableSnapshot {
@@ -697,15 +664,6 @@ fn test_snapshot_from_rows(
             .map(u64::from_be_bytes)
             .unwrap_or_default()
     };
-    let cursor = get(CHANGE_RETENTION_FLOOR_KEY);
-    let change_retention_floor = if let Ok(cursor) = <[u8; 12]>::try_from(cursor) {
-        (
-            u64::from_be_bytes(cursor[..8].try_into().expect("eight-byte revision")),
-            u32::from_be_bytes(cursor[8..].try_into().expect("four-byte sequence")),
-        )
-    } else {
-        (0, 0)
-    };
     SchemaSnapshot {
         tables: inventory.tables,
         views: inventory.views,
@@ -722,7 +680,6 @@ fn test_snapshot_from_rows(
         cluster_id: String::from_utf8_lossy(get(CLUSTER_ID_KEY)).into_owned(),
         initial_incarnation: u64_value(INITIAL_INCARNATION_KEY),
         current_revision: u64_value(CURRENT_REVISION_KEY),
-        change_retention_floor,
     }
 }
 
@@ -802,10 +759,10 @@ pub(crate) async fn apply_mutation_for_test(
             replace_schema_version(&mut session, vec![1]).await
         }
         SchemaMutation::OlderSchemaVersion => {
-            replace_schema_version(&mut session, 0_u32.to_be_bytes().to_vec()).await
+            replace_schema_version(&mut session, 1_u32.to_be_bytes().to_vec()).await
         }
         SchemaMutation::NewerSchemaVersion => {
-            replace_schema_version(&mut session, 2_u32.to_be_bytes().to_vec()).await
+            replace_schema_version(&mut session, 3_u32.to_be_bytes().to_vec()).await
         }
     }
 }

@@ -226,16 +226,44 @@ def copy_timings(checkout: Path, target: Path, destination: Path) -> None:
                     shutil.copy2(source, destination / f"default-{source.name}")
 
 
+def percentile(sorted_values: list[int], fraction: float) -> float:
+    """Linear-interpolated percentile, so a five-sample run still has a spread.
+
+    Sample counts here are deliberately small, so a percentile that snapped to
+    an existing observation would report the same number for P10 and P90 on
+    three samples and hide the very spread it exists to expose.
+    """
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    position = fraction * (len(sorted_values) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = position - lower
+    return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+
+
 def distribution(values: list[int]) -> dict[str, float | int]:
     if not values:
         return {}
     median = float(statistics.median(values))
     deviations = [abs(value - median) for value in values]
     mad = float(statistics.median(deviations))
+    ordered = sorted(values)
+    p10 = percentile(ordered, 0.10)
+    p90 = percentile(ordered, 0.90)
+    # Absolute noise band: whichever of the two disagreeing measures of spread
+    # is larger. Three times the MAD misses a distribution with a few slow
+    # outliers and a tight middle; the decile spread misses one that is broad
+    # but symmetric. Taking the maximum refuses to pick the flattering one.
+    noise_ns = max(3.0 * mad, p90 - p10)
     return {
         "samples": len(values),
         "median_ns": int(median),
         "mad_ns": int(mad),
+        "p10_ns": int(p10),
+        "p90_ns": int(p90),
+        "noise_ns": int(noise_ns),
+        "noise_fraction": noise_ns / median if median else 0.0,
         "noise_band": max(0.02, 3 * mad / median),
         "slowest_ns": max(values),
     }
@@ -322,16 +350,20 @@ def write_summary_markdown(summary: dict[str, Any], path: Path) -> None:
         "",
         f"Status: **{summary['status']}**",
         "",
-        "| Command | Median (s) | MAD (s) | Noise band | Slowest (s) | Peak RSS (MiB) |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Command | Median (s) | MAD (s) | P10-P90 (s) | Noise N (s) | N/median | Slowest (s) | Peak RSS (MiB) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for item in summary["commands"]:
         lines.append(
-            "| `{command}` | {median:.3f} | {mad:.3f} | {band:.2%} | {slowest:.3f} | {rss:.1f} |".format(
+            "| `{command}` | {median:.3f} | {mad:.3f} | {p10:.3f}-{p90:.3f} | {noise:.3f} | "
+            "{fraction:.2%} | {slowest:.3f} | {rss:.1f} |".format(
                 command=item["command"],
                 median=item["median_ns"] / 1e9,
                 mad=item["mad_ns"] / 1e9,
-                band=item["noise_band"],
+                p10=item["p10_ns"] / 1e9,
+                p90=item["p90_ns"] / 1e9,
+                noise=item["noise_ns"] / 1e9,
+                fraction=item["noise_fraction"],
                 slowest=item["slowest_ns"] / 1e9,
                 rss=(item["max_rss_bytes"] or 0) / (1024 * 1024),
             )

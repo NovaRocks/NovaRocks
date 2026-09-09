@@ -55,8 +55,8 @@ pub(crate) fn register_collectors(registry: &Registry) -> Result<(), String> {
 pub(crate) fn publish(snapshot: CatalogProjectionMetricsSnapshot) {
     Lazy::force(&FRONTEND_CATALOG_PROJECTION_CATALOGS).set(snapshot.projected_catalogs as i64);
     for (outcome, count) in [
-        ("poll_success", snapshot.successful_polls),
-        ("poll_failure", snapshot.failed_polls),
+        ("round_success", snapshot.successful_rounds),
+        ("round_failure", snapshot.failed_rounds),
         ("resync", snapshot.resyncs),
         ("freshness_expiry", snapshot.freshness_expiries),
     ] {

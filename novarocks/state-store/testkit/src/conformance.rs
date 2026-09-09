@@ -15,7 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+//! The behaviour every StateStore provider is expected to satisfy.
+//!
+//! The suite is split into three groups because they demand different things
+//! of a provider:
+//!
+//! * [`run_basic_suite`] -- isolation, conflicts, preconditions, paging,
+//!   limits, and atomicity. It needs nothing but an open store, so every
+//!   provider runs it.
+//! * [`run_attempt_suite`] -- write-attempt identity, terminal stability,
+//!   in-doubt honesty, and admission accounting. Also store-only, and also
+//!   mandatory: these are the rules a provider is most likely to get subtly
+//!   wrong.
+//! * [`run_fault_suite`] -- what happens when a commit is cancelled, its
+//!   answer is lost, or its result is ambiguous. It needs a provider-supplied
+//!   [`PostDispatchController`] that can genuinely hold a commit mid-flight, so
+//!   only providers that can offer one run it.
+//!
+//! A provider with no fault controller implements [`StateStoreFactory`] alone
+//! and still runs the two mandatory groups.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -25,31 +44,70 @@ use std::task::Poll;
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_state_store_api::{
-    ChangeCursor, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution,
-    Direction, Key, KeyRange, MAX_KEY_BYTES, Precondition, RangePage, RangeRequest,
-    ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
-    StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId, Value,
-    WriteTransaction,
+    AttemptOutcome, AttemptSupervisor, CommitObservation, CommitOutcome, CommitReceipt, Direction,
+    Key, KeyRange, MAX_KEY_BYTES, Precondition, RangePage, RangeRequest, ReadTransaction,
+    StateRecord, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity,
+    Value, WriteAttempt, WriteTransaction,
 };
 use tokio::sync::{oneshot, watch};
-use uuid::Uuid;
 
+/// Opens one store instance. Every call must open a *fresh* instance: the
+/// attempt group checks that a capability from one instance is refused by
+/// another, which only means anything if two calls are two instances.
 pub type StoreFuture =
-    Pin<Box<dyn Future<Output = Result<StateStoreConformanceFixture, StateStoreError>> + 'static>>;
+    Pin<Box<dyn Future<Output = Result<Arc<dyn StateStore>, StateStoreError>> + 'static>>;
 pub type StateStoreFactory = Rc<dyn Fn() -> StoreFuture>;
 
-pub struct StateStoreConformanceFixture {
+/// Opens a store together with the control surface the fault group needs.
+pub type FaultStoreFuture =
+    Pin<Box<dyn Future<Output = Result<StateStoreFaultFixture, StateStoreError>> + 'static>>;
+pub type FaultStateStoreFactory = Rc<dyn Fn() -> FaultStoreFuture>;
+
+pub struct StateStoreFaultFixture {
     pub store: Arc<dyn StateStore>,
     pub post_dispatch: Arc<dyn PostDispatchController>,
 }
 
-impl StateStoreConformanceFixture {
+impl StateStoreFaultFixture {
     pub fn new(store: Arc<dyn StateStore>, post_dispatch: Arc<dyn PostDispatchController>) -> Self {
         Self {
             store,
             post_dispatch,
         }
     }
+}
+
+/// Storage isolation, conflict detection, preconditions, paging, limits, and
+/// atomicity. Mandatory for every provider.
+pub async fn run_basic_suite(factory: &StateStoreFactory) {
+    snapshot_repeatable_read(factory).await;
+    same_key_conflict(factory).await;
+    write_skew_conflict(factory).await;
+    range_phantom_conflict(factory).await;
+    preconditions(factory).await;
+    forward_reverse_pages(factory).await;
+    limits_before_io(factory).await;
+    arbitrary_binary_payloads(factory).await;
+    atomic_commit(factory).await;
+}
+
+/// Write-attempt identity, terminal stability, in-doubt honesty, and admission
+/// accounting. Mandatory for every provider.
+pub async fn run_attempt_suite(factory: &StateStoreFactory) {
+    attempt_scope_is_instance_local(factory).await;
+    a_terminal_outcome_never_flips(factory).await;
+    an_attempt_without_a_dispatch_is_not_committed(factory).await;
+    a_published_terminal_outlives_its_evidence(factory).await;
+    an_unresolved_answer_is_not_a_denial(factory).await;
+    admission_saturates_without_stalling_observation(factory).await;
+}
+
+/// Cancellation after dispatch, response loss, and commit ambiguity. Only for
+/// providers that can supply a real [`PostDispatchController`].
+pub async fn run_fault_suite(factory: &FaultStateStoreFactory) {
+    post_dispatch_cancel_reconciles(factory).await;
+    post_dispatch_response_loss_reconciles(factory).await;
+    commit_ambiguity_is_resolved_by_the_attempt(factory).await;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,12 +126,16 @@ pub enum ExpectedTerminal {
 impl PostDispatchScenario {
     pub const fn expected_terminal(self) -> ExpectedTerminal {
         match self {
+            // A provider may or may not have applied before the waiter went
+            // away; both are honest, and the suite checks the store agrees
+            // with whichever it reports.
             Self::CancelWaiterBeforeApply => ExpectedTerminal::Either,
             Self::LoseCommittedResponse => ExpectedTerminal::Committed,
         }
     }
 }
 
+/// Arms one mid-commit fault on the next commit of the fixture's store.
 #[async_trait]
 pub trait PostDispatchController: Send + Sync {
     async fn arm(&self, scenario: PostDispatchScenario) -> Box<dyn PostDispatchControl>;
@@ -88,21 +150,9 @@ pub trait PostDispatchControl: Send + Sync {
     async fn wait_inner_dropped(&self);
 }
 
-pub async fn run_state_store_conformance(factory: StateStoreFactory) {
-    snapshot_repeatable_read(&factory).await;
-    same_key_conflict(&factory).await;
-    write_skew_conflict(&factory).await;
-    range_phantom_conflict(&factory).await;
-    preconditions(&factory).await;
-    forward_reverse_pages(&factory).await;
-    same_revision_change_pages(&factory).await;
-    notification_delivery_faults(&factory).await;
-    atomic_commit(&factory).await;
-    post_dispatch_cancel_waiter_reconciles(&factory).await;
-    post_dispatch_response_loss_reconciles(&factory).await;
-    limits_before_io(&factory).await;
-    arbitrary_binary_payloads(&factory).await;
-}
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
 
 fn key(bytes: impl Into<Vec<u8>>) -> Key {
     Key::try_from(Bytes::from(bytes.into())).expect("valid conformance key")
@@ -112,31 +162,89 @@ fn value(bytes: impl Into<Vec<u8>>) -> Value {
     Value::try_from(Bytes::from(bytes.into())).expect("valid conformance value")
 }
 
-fn transaction_id() -> TransactionId {
-    Uuid::now_v7().into()
-}
-
 async fn open(factory: &StateStoreFactory) -> Arc<dyn StateStore> {
-    open_fixture(factory).await.store
-}
-
-async fn open_fixture(factory: &StateStoreFactory) -> StateStoreConformanceFixture {
     factory().await.expect("open conformance state store")
 }
 
-async fn commit_puts(store: &Arc<dyn StateStore>, rows: &[(Key, Value)]) -> CommitReceipt {
-    let id = transaction_id();
-    let mut transaction = store
-        .begin_write(id, "state store conformance seed")
+async fn open_fault(factory: &FaultStateStoreFactory) -> StateStoreFaultFixture {
+    factory().await.expect("open conformance fault fixture")
+}
+
+/// Reserves one attempt and begins the write it authorises.
+///
+/// The observation comes back to the caller because the attempt itself is
+/// consumed by the store: after this, the handle is the only way to learn what
+/// happened.
+async fn begin_attempt(
+    store: &Arc<dyn StateStore>,
+    purpose: &str,
+) -> (Box<dyn WriteTransaction>, CommitObservation) {
+    let (attempt, observation) = store
+        .attempts()
+        .reserve()
+        .expect("reserve a conformance write attempt");
+    let transaction = store
+        .begin_write(attempt, purpose)
         .await
-        .expect("begin conformance seed");
+        .expect("begin conformance write");
+    assert_eq!(
+        transaction.attempt(),
+        observation.id(),
+        "a transaction must run under the attempt that authorised it"
+    );
+    (transaction, observation)
+}
+
+/// Commits, then checks the attempt's verdict says the same thing the caller
+/// was told, and releases the observation so the slot is freed.
+async fn commit_attempt(
+    transaction: Box<dyn WriteTransaction>,
+    observation: CommitObservation,
+) -> CommitOutcome {
+    let outcome = transaction.commit().await;
+    let verdict = observation.outcome().await.expect("attempt verdict");
+    match (&outcome, &verdict) {
+        (CommitOutcome::Committed(receipt), AttemptOutcome::Committed(published)) => {
+            assert_eq!(
+                receipt, published,
+                "the published receipt must be the one the caller was handed"
+            );
+        }
+        (
+            CommitOutcome::Conflict(_)
+            | CommitOutcome::TransientBeforeCommit(_)
+            | CommitOutcome::DefiniteFailure(_),
+            AttemptOutcome::NotCommitted,
+        ) => {}
+        // Ambiguity is the one answer a caller may not act on, so the attempt
+        // is allowed to be anything the store can actually prove.
+        (CommitOutcome::CommitUnknown(_), _) => {}
+        (outcome, verdict) => panic!(
+            "a witnessed commit outcome and its attempt verdict disagree: outcome={outcome:?}, verdict={verdict:?}"
+        ),
+    }
+    outcome
+}
+
+/// Aborts, checks the attempt is proven effect-free, and releases the slot.
+async fn abort_attempt(transaction: Box<dyn WriteTransaction>, observation: CommitObservation) {
+    transaction.abort().await.expect("abort conformance write");
+    assert_eq!(
+        observation.outcome().await.expect("attempt verdict"),
+        AttemptOutcome::NotCommitted,
+        "an aborted write never reached storage, so it is proven not committed"
+    );
+}
+
+async fn commit_puts(store: &Arc<dyn StateStore>, rows: &[(Key, Value)]) -> CommitReceipt {
+    let (mut transaction, observation) = begin_attempt(store, "state store conformance seed").await;
     for (key, value) in rows {
         transaction
             .put(key.clone(), value.clone(), Precondition::Any)
             .await
             .expect("stage conformance seed");
     }
-    committed(transaction.commit().await)
+    committed(commit_attempt(transaction, observation).await)
 }
 
 fn committed(outcome: CommitOutcome) -> CommitReceipt {
@@ -156,6 +264,39 @@ async fn read_record(store: &Arc<dyn StateStore>, item: &Key) -> Option<StateRec
     reader.abort().await.expect("abort conformance read");
     record
 }
+
+fn conformance_range(prefix: u8, direction: Direction, page_size: usize) -> RangeRequest {
+    RangeRequest {
+        range: KeyRange::new(key(vec![prefix, 0]), key(vec![prefix, 0xff]))
+            .expect("bounded conformance range"),
+        direction,
+        page_size,
+        continuation: None,
+    }
+}
+
+async fn collect_pages(store: &Arc<dyn StateStore>, mut request: RangeRequest) -> Vec<Vec<u8>> {
+    let mut reader = store.begin_read().await.expect("begin paginated read");
+    let mut keys = Vec::new();
+    loop {
+        let page = reader.range(&request).await.expect("read range page");
+        keys.extend(
+            page.records
+                .iter()
+                .map(|record| record.key.as_bytes().to_vec()),
+        );
+        let Some(continuation) = page.continuation else {
+            break;
+        };
+        request.continuation = Some(continuation);
+    }
+    reader.abort().await.expect("abort paginated read");
+    keys
+}
+
+// ---------------------------------------------------------------------------
+// Basic group
+// ---------------------------------------------------------------------------
 
 pub async fn snapshot_repeatable_read(factory: &StateStoreFactory) {
     let store = open(factory).await;
@@ -179,14 +320,8 @@ pub async fn same_key_conflict(factory: &StateStoreFactory) {
     let store = open(factory).await;
     let item = key(b"c02/same-key".to_vec());
     commit_puts(&store, &[(item.clone(), value(b"initial".to_vec()))]).await;
-    let mut first = store
-        .begin_write(transaction_id(), "same key first")
-        .await
-        .expect("begin first same-key write");
-    let mut second = store
-        .begin_write(transaction_id(), "same key second")
-        .await
-        .expect("begin second same-key write");
+    let (mut first, first_observation) = begin_attempt(&store, "same key first").await;
+    let (mut second, second_observation) = begin_attempt(&store, "same key second").await;
     first.get(&item).await.expect("establish first snapshot");
     second.get(&item).await.expect("establish second snapshot");
     first
@@ -197,8 +332,8 @@ pub async fn same_key_conflict(factory: &StateStoreFactory) {
         .put(item, value(b"second".to_vec()), Precondition::Any)
         .await
         .expect("stage second write");
-    committed(first.commit().await);
-    assert_conflict(second.commit().await);
+    committed(commit_attempt(first, first_observation).await);
+    assert_conflict(commit_attempt(second, second_observation).await);
 }
 
 pub async fn write_skew_conflict(factory: &StateStoreFactory) {
@@ -213,14 +348,8 @@ pub async fn write_skew_conflict(factory: &StateStoreFactory) {
         ],
     )
     .await;
-    let mut first = store
-        .begin_write(transaction_id(), "write skew first")
-        .await
-        .expect("begin first skew write");
-    let mut second = store
-        .begin_write(transaction_id(), "write skew second")
-        .await
-        .expect("begin second skew write");
+    let (mut first, first_observation) = begin_attempt(&store, "write skew first").await;
+    let (mut second, second_observation) = begin_attempt(&store, "write skew second").await;
     for item in [&left, &right] {
         first.get(item).await.expect("first skew read");
         second.get(item).await.expect("second skew read");
@@ -233,31 +362,15 @@ pub async fn write_skew_conflict(factory: &StateStoreFactory) {
         .delete(right, Precondition::Any)
         .await
         .expect("stage second skew delete");
-    committed(first.commit().await);
-    assert_conflict(second.commit().await);
-}
-
-fn conformance_range(prefix: u8, direction: Direction, page_size: usize) -> RangeRequest {
-    RangeRequest {
-        range: KeyRange::new(key(vec![prefix, 0]), key(vec![prefix, 0xff]))
-            .expect("bounded conformance range"),
-        direction,
-        page_size,
-        continuation: None,
-    }
+    committed(commit_attempt(first, first_observation).await);
+    assert_conflict(commit_attempt(second, second_observation).await);
 }
 
 pub async fn range_phantom_conflict(factory: &StateStoreFactory) {
     let store = open(factory).await;
     let request = conformance_range(4, Direction::Forward, 10);
-    let mut first = store
-        .begin_write(transaction_id(), "phantom first")
-        .await
-        .expect("begin first phantom write");
-    let mut second = store
-        .begin_write(transaction_id(), "phantom second")
-        .await
-        .expect("begin second phantom write");
+    let (mut first, first_observation) = begin_attempt(&store, "phantom first").await;
+    let (mut second, second_observation) = begin_attempt(&store, "phantom second").await;
     first.range(&request).await.expect("first phantom range");
     second.range(&request).await.expect("second phantom range");
     first
@@ -272,20 +385,16 @@ pub async fn range_phantom_conflict(factory: &StateStoreFactory) {
         )
         .await
         .expect("stage second phantom");
-    committed(first.commit().await);
-    assert_conflict(second.commit().await);
+    committed(commit_attempt(first, first_observation).await);
+    assert_conflict(commit_attempt(second, second_observation).await);
 
     let deleted = key(vec![14, 1]);
     commit_puts(&store, &[(deleted.clone(), value(b"present".to_vec()))]).await;
     let delete_request = conformance_range(14, Direction::Forward, 10);
-    let mut delete_first = store
-        .begin_write(transaction_id(), "delete phantom first")
-        .await
-        .expect("begin first delete phantom write");
-    let mut delete_second = store
-        .begin_write(transaction_id(), "delete phantom second")
-        .await
-        .expect("begin second delete phantom write");
+    let (mut delete_first, delete_first_observation) =
+        begin_attempt(&store, "delete phantom first").await;
+    let (mut delete_second, delete_second_observation) =
+        begin_attempt(&store, "delete phantom second").await;
     delete_first
         .range(&delete_request)
         .await
@@ -306,40 +415,32 @@ pub async fn range_phantom_conflict(factory: &StateStoreFactory) {
         )
         .await
         .expect("stage competing phantom insert");
-    committed(delete_first.commit().await);
-    assert_conflict(delete_second.commit().await);
+    committed(commit_attempt(delete_first, delete_first_observation).await);
+    assert_conflict(commit_attempt(delete_second, delete_second_observation).await);
 }
 
 pub async fn preconditions(factory: &StateStoreFactory) {
     let store = open(factory).await;
     let item = key(b"c05/item".to_vec());
-    let mut absent = store
-        .begin_write(transaction_id(), "absent precondition")
-        .await
-        .expect("begin absent write");
+    let (mut absent, absent_observation) = begin_attempt(&store, "absent precondition").await;
     absent
         .put(item.clone(), value(b"v1".to_vec()), Precondition::Absent)
         .await
         .expect("stage absent write");
-    committed(absent.commit().await);
+    committed(commit_attempt(absent, absent_observation).await);
     let original = read_record(&store, &item)
         .await
         .expect("precondition record");
 
-    let mut present = store
-        .begin_write(transaction_id(), "present precondition")
-        .await
-        .expect("begin present write");
+    let (mut present, present_observation) = begin_attempt(&store, "present precondition").await;
     present
         .put(item.clone(), value(b"v2".to_vec()), Precondition::Present)
         .await
         .expect("stage present write");
-    committed(present.commit().await);
+    committed(commit_attempt(present, present_observation).await);
 
-    let mut versioned = store
-        .begin_write(transaction_id(), "version precondition")
-        .await
-        .expect("begin version write");
+    let (mut versioned, versioned_observation) =
+        begin_attempt(&store, "version precondition").await;
     versioned
         .put(
             item.clone(),
@@ -353,12 +454,9 @@ pub async fn preconditions(factory: &StateStoreFactory) {
         )
         .await
         .expect("stage version write");
-    committed(versioned.commit().await);
+    committed(commit_attempt(versioned, versioned_observation).await);
 
-    let mut stale = store
-        .begin_write(transaction_id(), "stale precondition")
-        .await
-        .expect("begin stale write");
+    let (mut stale, stale_observation) = begin_attempt(&store, "stale precondition").await;
     stale
         .put(
             item.clone(),
@@ -367,12 +465,10 @@ pub async fn preconditions(factory: &StateStoreFactory) {
         )
         .await
         .expect("stage stale write");
-    assert_conflict(stale.commit().await);
+    assert_conflict(commit_attempt(stale, stale_observation).await);
 
-    let mut absent_failure = store
-        .begin_write(transaction_id(), "absent precondition failure")
-        .await
-        .expect("begin absent failure");
+    let (mut absent_failure, absent_failure_observation) =
+        begin_attempt(&store, "absent precondition failure").await;
     absent_failure
         .put(
             item.clone(),
@@ -381,13 +477,11 @@ pub async fn preconditions(factory: &StateStoreFactory) {
         )
         .await
         .expect("stage absent failure");
-    assert_conflict(absent_failure.commit().await);
+    assert_conflict(commit_attempt(absent_failure, absent_failure_observation).await);
 
     let missing = key(b"c05/missing".to_vec());
-    let mut present_failure = store
-        .begin_write(transaction_id(), "present precondition failure")
-        .await
-        .expect("begin present failure");
+    let (mut present_failure, present_failure_observation) =
+        begin_attempt(&store, "present precondition failure").await;
     present_failure
         .put(
             missing.clone(),
@@ -396,45 +490,21 @@ pub async fn preconditions(factory: &StateStoreFactory) {
         )
         .await
         .expect("stage present failure");
-    assert_conflict(present_failure.commit().await);
+    assert_conflict(commit_attempt(present_failure, present_failure_observation).await);
 
-    let mut missing_version = store
-        .begin_write(transaction_id(), "missing version failure")
-        .await
-        .expect("begin missing version failure");
+    let (mut missing_version, missing_version_observation) =
+        begin_attempt(&store, "missing version failure").await;
     missing_version
         .delete(missing, Precondition::Version(original.version.clone()))
         .await
         .expect("stage missing version failure");
-    assert_conflict(missing_version.commit().await);
+    assert_conflict(commit_attempt(missing_version, missing_version_observation).await);
 
-    let mut any = store
-        .begin_write(transaction_id(), "any precondition")
-        .await
-        .expect("begin any write");
+    let (mut any, any_observation) = begin_attempt(&store, "any precondition").await;
     any.delete(item, Precondition::Any)
         .await
         .expect("stage any delete");
-    committed(any.commit().await);
-}
-
-async fn collect_pages(store: &Arc<dyn StateStore>, mut request: RangeRequest) -> Vec<Vec<u8>> {
-    let mut reader = store.begin_read().await.expect("begin paginated read");
-    let mut keys = Vec::new();
-    loop {
-        let page = reader.range(&request).await.expect("read range page");
-        keys.extend(
-            page.records
-                .iter()
-                .map(|record| record.key.as_bytes().to_vec()),
-        );
-        let Some(continuation) = page.continuation else {
-            break;
-        };
-        request.continuation = Some(continuation);
-    }
-    reader.abort().await.expect("abort paginated read");
-    keys
+    committed(commit_attempt(any, any_observation).await);
 }
 
 pub async fn forward_reverse_pages(factory: &StateStoreFactory) {
@@ -502,10 +572,7 @@ pub async fn forward_reverse_pages(factory: &StateStoreFactory) {
     );
     reader.abort().await.expect("abort token read");
 
-    let mut writer = store
-        .begin_write(transaction_id(), "write range freeze")
-        .await
-        .expect("begin write range freeze");
+    let (mut writer, writer_observation) = begin_attempt(&store, "write range freeze").await;
     assert!(
         writer
             .range(&boundary_request)
@@ -522,285 +589,134 @@ pub async fn forward_reverse_pages(factory: &StateStoreFactory) {
             .kind(),
         StateStoreErrorKind::InvalidRequest
     );
-    writer.abort().await.expect("abort frozen writer");
+    abort_attempt(writer, writer_observation).await;
 }
 
-pub async fn same_revision_change_pages(factory: &StateStoreFactory) {
+pub async fn limits_before_io(factory: &StateStoreFactory) {
     let store = open(factory).await;
-    let mut baseline = None;
-    loop {
-        let page = store
-            .poll_changes(&ChangePollRequest {
-                after: baseline,
-                page_size: store.limits().max_page_size,
+    let limits = store.limits().clone();
+    assert!(limits.max_key_bytes < MAX_KEY_BYTES);
+    let oversized = key(vec![11; limits.max_key_bytes + 1]);
+    let visible = key(b"c11/visible".to_vec());
+    let mut reader = store.begin_read().await.expect("begin limited read");
+    assert_eq!(
+        reader
+            .get(&oversized)
+            .await
+            .expect_err("reject oversized get")
+            .kind(),
+        StateStoreErrorKind::LimitExceeded
+    );
+    commit_puts(&store, &[(visible.clone(), value(b"new".to_vec()))]).await;
+    assert!(
+        reader
+            .get(&visible)
+            .await
+            .expect("valid get after limit rejection")
+            .is_some()
+    );
+    reader.abort().await.expect("abort limited read");
+
+    let mut page_reader = store.begin_read().await.expect("begin page-limit read");
+    assert_eq!(
+        page_reader
+            .range(&RangeRequest {
+                page_size: limits.max_page_size + 1,
+                ..conformance_range(11, Direction::Forward, 1)
             })
             .await
-            .expect("drain change baseline");
-        baseline = Some(page.next_cursor);
-        if page.hints.len() < store.limits().max_page_size {
-            break;
-        }
-    }
-    let rows = (1_u8..=5)
-        .map(|suffix| (key(vec![7, suffix]), value(vec![suffix])))
-        .collect::<Vec<_>>();
-    let receipt = commit_puts(&store, &rows).await;
-    let first = store
-        .poll_changes(&ChangePollRequest {
-            after: baseline,
-            page_size: 2,
-        })
-        .await
-        .expect("poll first same-revision page");
-    assert_eq!(first.hints.len(), 2);
-    let second = store
-        .poll_changes(&ChangePollRequest {
-            after: Some(first.next_cursor),
-            page_size: 2,
-        })
-        .await
-        .expect("poll second same-revision page");
-    assert_eq!(second.hints.len(), 2);
-    let third = store
-        .poll_changes(&ChangePollRequest {
-            after: Some(second.next_cursor),
-            page_size: 2,
-        })
-        .await
-        .expect("poll final same-revision page");
-    assert_eq!(third.hints.len(), 1);
-    let tail_cursor = third.next_cursor.clone();
-    let high_watermark = third.high_watermark.clone();
-    let hints = first
-        .hints
-        .into_iter()
-        .chain(second.hints)
-        .chain(third.hints)
-        .collect::<Vec<_>>();
-    assert!(hints.iter().all(|hint| hint.revision == receipt.revision));
-    assert_eq!(
-        hints
-            .into_iter()
-            .map(|hint| hint.key.as_bytes().to_vec())
-            .collect::<Vec<_>>(),
-        rows.iter()
-            .map(|(key, _)| key.as_bytes().to_vec())
-            .collect::<Vec<_>>()
+            .expect_err("reject oversized page")
+            .kind(),
+        StateStoreErrorKind::LimitExceeded
     );
-
-    let fault = FaultInjectingStateStore::new(Arc::clone(&store));
-    fault.script_next_change_page(ChangePage {
-        hints: Vec::new(),
-        next_cursor: tail_cursor.clone(),
-        high_watermark,
-        resync_required: true,
-    });
-    let gap = fault
-        .poll_changes(&ChangePollRequest {
-            after: Some(tail_cursor),
-            page_size: 2,
-        })
-        .await
-        .expect("inject retention gap");
-    assert!(gap.resync_required);
-    assert!(gap.hints.is_empty());
-    let authoritative = collect_pages(
-        &(fault as Arc<dyn StateStore>),
-        conformance_range(7, Direction::Forward, 2),
-    )
-    .await;
-    assert_eq!(
-        authoritative,
-        rows.iter()
-            .map(|(key, _)| key.as_bytes().to_vec())
-            .collect::<Vec<_>>(),
-        "retention gaps require a bounded authoritative reload"
-    );
-}
-
-#[derive(Default)]
-struct AuthoritativeNotificationConsumer {
-    records: BTreeMap<Vec<u8>, Vec<u8>>,
-    authoritative_reads: usize,
-    reload_pages: usize,
-}
-
-impl AuthoritativeNotificationConsumer {
-    async fn consume(
-        &mut self,
-        store: &Arc<dyn StateStore>,
-        page: ChangePage,
-        mut reload_request: RangeRequest,
-    ) {
-        if page.resync_required {
-            let mut reader = store.begin_read().await.expect("begin notification resync");
-            let mut reloaded = BTreeMap::new();
-            loop {
-                let page = reader
-                    .range(&reload_request)
-                    .await
-                    .expect("read bounded notification resync page");
-                self.reload_pages += 1;
-                for record in page.records {
-                    reloaded.insert(
-                        record.key.as_bytes().to_vec(),
-                        record.value.as_bytes().to_vec(),
-                    );
-                }
-                let Some(continuation) = page.continuation else {
-                    break;
-                };
-                reload_request.continuation = Some(continuation);
-            }
-            reader.abort().await.expect("abort notification resync");
-            self.records = reloaded;
-            return;
-        }
-
-        let mut seen = HashSet::new();
-        for hint in page.hints {
-            let identity = (
-                hint.revision.as_bytes().to_vec(),
-                hint.key.as_bytes().to_vec(),
-            );
-            if !seen.insert(identity) {
-                continue;
-            }
-            self.authoritative_reads += 1;
-            match read_record(store, &hint.key).await {
-                Some(record) => {
-                    self.records.insert(
-                        record.key.as_bytes().to_vec(),
-                        record.value.as_bytes().to_vec(),
-                    );
-                }
-                None => {
-                    self.records.remove(hint.key.as_bytes());
-                }
-            }
-        }
-    }
-}
-
-pub async fn notification_delivery_faults(factory: &StateStoreFactory) {
-    let store = open(factory).await;
-    let mut baseline = None;
-    loop {
-        let page = store
-            .poll_changes(&ChangePollRequest {
-                after: baseline,
-                page_size: store.limits().max_page_size,
-            })
+    let page_visible = key(b"c11/page-visible".to_vec());
+    commit_puts(&store, &[(page_visible.clone(), value(b"new".to_vec()))]).await;
+    assert!(
+        page_reader
+            .get(&page_visible)
             .await
-            .expect("drain notification baseline");
-        baseline = Some(page.next_cursor);
-        if page.hints.len() < store.limits().max_page_size {
-            break;
-        }
+            .expect("valid get after page rejection")
+            .is_some()
+    );
+    page_reader.abort().await.expect("abort page-limit read");
+
+    let (mut value_writer, value_observation) = begin_attempt(&store, "value budget").await;
+    assert_eq!(
+        value_writer
+            .put(
+                key(b"c11/value".to_vec()),
+                value(vec![0; limits.max_value_bytes + 1]),
+                Precondition::Any,
+            )
+            .await
+            .expect_err("reject oversized value")
+            .kind(),
+        StateStoreErrorKind::LimitExceeded
+    );
+    abort_attempt(value_writer, value_observation).await;
+
+    let (mut writer, writer_observation) = begin_attempt(&store, "operation budget").await;
+    for index in 0..limits.max_transaction_operations {
+        writer
+            .put(
+                key(vec![11, (index >> 8) as u8, index as u8]),
+                value(b"v".to_vec()),
+                Precondition::Any,
+            )
+            .await
+            .expect("stage operation within budget");
     }
-
-    let rows = (1_u8..=3)
-        .map(|suffix| (key(vec![17, suffix]), value(vec![suffix])))
-        .collect::<Vec<_>>();
-    commit_puts(&store, &rows).await;
-    let original = store
-        .poll_changes(&ChangePollRequest {
-            after: baseline.clone(),
-            page_size: store.limits().max_page_size,
-        })
-        .await
-        .expect("poll original notification page");
-    let original_hint = original.hints[0].clone();
-
-    let updated_value = value(b"latest-after-delay".to_vec());
-    let delayed_receipt = commit_puts(
-        &store,
-        &[(original_hint.key.clone(), updated_value.clone())],
-    )
-    .await;
-    assert_ne!(original_hint.revision, delayed_receipt.revision);
-
-    let loss_key = key(vec![17, 4]);
-    commit_puts(&store, &[(loss_key.clone(), value(vec![4]))]).await;
-    let loss_page = store
-        .poll_changes(&ChangePollRequest {
-            after: Some(original.next_cursor.clone()),
-            page_size: store.limits().max_page_size,
-        })
-        .await
-        .expect("poll page to be replaced by loss signal");
-
-    let duplicate_page = ChangePage {
-        hints: vec![original_hint.clone(), original_hint.clone()],
-        next_cursor: original.next_cursor.clone(),
-        high_watermark: original.high_watermark.clone(),
-        resync_required: false,
-    };
-    let delayed_page = ChangePage {
-        hints: vec![original_hint],
-        next_cursor: original.next_cursor,
-        high_watermark: delayed_receipt.revision,
-        resync_required: false,
-    };
-    let resync_page = ChangePage {
-        hints: Vec::new(),
-        next_cursor: loss_page.next_cursor,
-        high_watermark: loss_page.high_watermark,
-        resync_required: true,
-    };
-
-    let fault = FaultInjectingStateStore::new(Arc::clone(&store));
-    fault.script_change_pages(vec![duplicate_page, delayed_page, resync_page]);
-    let consumer_store: Arc<dyn StateStore> = fault.clone();
-    let reload_request = conformance_range(17, Direction::Forward, 2);
-    let mut consumer = AuthoritativeNotificationConsumer::default();
-
-    let duplicate = fault
-        .poll_changes(&ChangePollRequest {
-            after: baseline,
-            page_size: 2,
-        })
-        .await
-        .expect("inject duplicate notifications");
-    assert_eq!(duplicate.hints.len(), 2);
-    consumer
-        .consume(&consumer_store, duplicate, reload_request.clone())
-        .await;
     assert_eq!(
-        consumer.authoritative_reads, 1,
-        "duplicate hints deduplicate"
+        writer
+            .put(
+                key(vec![11, 0xff, 0xff]),
+                value(b"v".to_vec()),
+                Precondition::Any
+            )
+            .await
+            .expect_err("reject operation over budget")
+            .kind(),
+        StateStoreErrorKind::LimitExceeded
     );
+    committed(commit_attempt(writer, writer_observation).await);
 
-    let delayed = fault
-        .poll_changes(&ChangePollRequest {
-            after: None,
-            page_size: 2,
-        })
-        .await
-        .expect("inject delayed notification");
-    consumer
-        .consume(&consumer_store, delayed, reload_request.clone())
-        .await;
+    let (mut byte_writer, byte_observation) = begin_attempt(&store, "byte budget").await;
+    for suffix in 1_u8..=4 {
+        byte_writer
+            .put(
+                key(vec![11, 0xfe, suffix]),
+                value(vec![suffix; limits.max_value_bytes]),
+                Precondition::Any,
+            )
+            .await
+            .expect("stage mutation within byte budget");
+    }
     assert_eq!(
-        consumer.records.get(original.hints[0].key.as_bytes()),
-        Some(&updated_value.as_bytes().to_vec()),
-        "delayed hints trigger an authoritative read instead of replaying stale payload"
+        byte_writer
+            .put(
+                key(vec![11, 0xfe, 5]),
+                value(vec![5; limits.max_value_bytes]),
+                Precondition::Any,
+            )
+            .await
+            .expect_err("reject transaction over byte budget")
+            .kind(),
+        StateStoreErrorKind::LimitExceeded
     );
+    committed(commit_attempt(byte_writer, byte_observation).await);
+}
 
-    let loss = fault
-        .poll_changes(&ChangePollRequest {
-            after: None,
-            page_size: 2,
-        })
+pub async fn arbitrary_binary_payloads(factory: &StateStoreFactory) {
+    let store = open(factory).await;
+    let item = key(vec![13, 0, 0xff, 0, 0xfe]);
+    let payload = value(vec![0xff, 0, 0xfe, 0, 0xfd]);
+    commit_puts(&store, &[(item.clone(), payload.clone())]).await;
+    let record = read_record(&store, &item)
         .await
-        .expect("inject notification loss signal");
-    assert!(loss.resync_required);
-    consumer
-        .consume(&consumer_store, loss, reload_request)
-        .await;
-    assert_eq!(consumer.reload_pages, 2, "resync reload stays paginated");
-    assert_eq!(consumer.records.len(), 4);
-    assert_eq!(consumer.records.get(loss_key.as_bytes()), Some(&vec![4]));
+        .expect("read arbitrary binary row");
+    assert_eq!(record.key, item);
+    assert_eq!(record.value, payload);
+    assert!(!record.version.as_bytes().is_empty());
 }
 
 pub async fn atomic_commit(factory: &StateStoreFactory) {
@@ -810,10 +726,10 @@ pub async fn atomic_commit(factory: &StateStoreFactory) {
     commit_puts(&store, &[(guard.clone(), value(b"original".to_vec()))]).await;
     let stale = read_record(&store, &guard).await.expect("guard version");
     commit_puts(&store, &[(guard.clone(), value(b"new".to_vec()))]).await;
-    let mut transaction = store
-        .begin_write(transaction_id(), "atomic conflict")
-        .await
-        .expect("begin atomic conflict");
+
+    // One failing precondition rejects the whole envelope, including the row
+    // that would have been perfectly acceptable on its own.
+    let (mut transaction, observation) = begin_attempt(&store, "atomic conflict").await;
     transaction
         .put(
             partial.clone(),
@@ -824,78 +740,41 @@ pub async fn atomic_commit(factory: &StateStoreFactory) {
         .expect("stage partial row");
     transaction
         .put(
-            guard,
+            guard.clone(),
             value(b"stale".to_vec()),
             Precondition::Version(stale.version),
         )
         .await
         .expect("stage conflicting row");
-    assert_conflict(transaction.commit().await);
+    assert_conflict(commit_attempt(transaction, observation).await);
     assert_eq!(read_record(&store, &partial).await, None);
+    assert_eq!(
+        read_record(&store, &guard).await.expect("guard row").value,
+        value(b"new".to_vec()),
+        "a rejected envelope must not disturb the row it lost to"
+    );
 
-    let mut baseline_cursor = None;
-    loop {
-        let page = store
-            .poll_changes(&ChangePollRequest {
-                after: baseline_cursor,
-                page_size: store.limits().max_page_size,
-            })
-            .await
-            .expect("poll scripted commit baseline");
-        let page_is_full = page.hints.len() == store.limits().max_page_size;
-        baseline_cursor = Some(page.next_cursor);
-        if !page_is_full {
-            break;
-        }
-    }
-    let fault = FaultInjectingStateStore::new(Arc::clone(&store));
-    let scripted_id = transaction_id();
-    let scripted_key = key(b"c08/scripted-committed".to_vec());
-    let mut scripted = fault
-        .begin_write(scripted_id, "scripted real commit")
-        .await
-        .expect("begin scripted committed transaction");
-    scripted
+    // An explicit abort makes the same all-or-nothing statement.
+    let abandoned = key(b"c08/abandoned".to_vec());
+    let (mut aborted, aborted_observation) = begin_attempt(&store, "atomic abort").await;
+    aborted
         .put(
-            scripted_key.clone(),
-            value(b"durable".to_vec()),
+            abandoned.clone(),
+            value(b"must-not-commit".to_vec()),
             Precondition::Any,
         )
         .await
-        .expect("stage scripted committed row");
-    fault.script_next_pre_commit(ScriptedCommitResult::Committed);
-    let scripted_receipt = committed(scripted.commit().await);
-    assert_eq!(
-        fault
-            .resolve_commit(&scripted_id)
-            .await
-            .expect("resolve scripted committed transaction"),
-        CommitResolution::Committed(scripted_receipt.clone())
-    );
-    assert_eq!(
-        read_record(&store, &scripted_key)
-            .await
-            .expect("scripted committed row must be durable")
-            .value,
-        value(b"durable".to_vec())
-    );
-    let change = store
-        .poll_changes(&ChangePollRequest {
-            after: baseline_cursor,
-            page_size: store.limits().max_page_size,
-        })
-        .await
-        .expect("poll scripted committed change");
-    assert!(
-        change
-            .hints
-            .iter()
-            .any(|hint| { hint.key == scripted_key && hint.revision == scripted_receipt.revision })
-    );
+        .expect("stage abandoned row");
+    abort_attempt(aborted, aborted_observation).await;
+    assert_eq!(read_record(&store, &abandoned).await, None);
 
-    let failure_cursor = Some(change.next_cursor);
-    let mut failure_keys = Vec::new();
+    // The remaining commit outcomes are ones a healthy store has no reason to
+    // produce, so they are scripted. The wrapper is built here out of the same
+    // store, which is why this still asks nothing of the provider.
+    let scripted = FaultInjectingStateStore::new(Arc::clone(&store));
+    let scripted_store: Arc<dyn StateStore> = scripted.clone();
     for (suffix, result) in [
+        ("committed", ScriptedCommitResult::Committed),
         ("conflict", ScriptedCommitResult::Conflict),
         (
             "transient-before-commit",
@@ -903,115 +782,358 @@ pub async fn atomic_commit(factory: &StateStoreFactory) {
         ),
         ("definite-failure", ScriptedCommitResult::DefiniteFailure),
     ] {
-        let transaction_id = transaction_id();
         let item = key(format!("c08/scripted-{suffix}").into_bytes());
-        let mut transaction = fault
-            .begin_write(transaction_id, "scripted failure must abort")
-            .await
-            .expect("begin scripted failure transaction");
+        let (mut transaction, observation) =
+            begin_attempt(&scripted_store, "scripted commit outcome").await;
         transaction
-            .put(
-                item.clone(),
-                value(b"must-not-commit".to_vec()),
-                Precondition::Any,
-            )
+            .put(item.clone(), value(b"scripted".to_vec()), Precondition::Any)
             .await
-            .expect("stage scripted failure row");
-        fault.script_next_pre_commit(result);
-        let outcome = transaction.commit().await;
-        assert!(
-            matches!(
-                (result, outcome),
-                (ScriptedCommitResult::Conflict, CommitOutcome::Conflict(_))
-                    | (
-                        ScriptedCommitResult::TransientBeforeCommit,
-                        CommitOutcome::TransientBeforeCommit(_)
-                    )
-                    | (
-                        ScriptedCommitResult::DefiniteFailure,
-                        CommitOutcome::DefiniteFailure(_)
-                    )
-            ),
-            "unexpected scripted failure outcome"
-        );
-        assert_eq!(
-            fault
-                .resolve_commit(&transaction_id)
-                .await
-                .expect("resolve scripted failure transaction"),
-            CommitResolution::NotCommitted
-        );
-        assert_eq!(read_record(&store, &item).await, None);
-        failure_keys.push(item);
+            .expect("stage scripted row");
+        scripted.script_next_pre_commit(result);
+        // `commit_attempt` is what checks the caller's outcome and the
+        // attempt's verdict tell the same story.
+        let outcome = commit_attempt(transaction, observation).await;
+        let durable = read_record(&store, &item).await;
+        match result {
+            ScriptedCommitResult::Committed => {
+                committed(outcome);
+                assert_eq!(
+                    durable.expect("a committed row must be readable").value,
+                    value(b"scripted".to_vec())
+                );
+            }
+            ScriptedCommitResult::Conflict => {
+                assert!(matches!(outcome, CommitOutcome::Conflict(_)), "{outcome:?}");
+                assert_eq!(durable, None, "a conflicted commit leaves nothing behind");
+            }
+            ScriptedCommitResult::TransientBeforeCommit => {
+                assert!(
+                    matches!(outcome, CommitOutcome::TransientBeforeCommit(_)),
+                    "{outcome:?}"
+                );
+                assert_eq!(
+                    durable, None,
+                    "'before commit' is a claim about write effect, not just timing"
+                );
+            }
+            ScriptedCommitResult::DefiniteFailure => {
+                assert!(
+                    matches!(outcome, CommitOutcome::DefiniteFailure(_)),
+                    "{outcome:?}"
+                );
+                assert_eq!(durable, None, "a definite failure leaves nothing behind");
+            }
+        }
     }
-    let failure_changes = store
-        .poll_changes(&ChangePollRequest {
-            after: failure_cursor,
-            page_size: store.limits().max_page_size,
-        })
+}
+
+// ---------------------------------------------------------------------------
+// Attempt group
+// ---------------------------------------------------------------------------
+
+pub async fn attempt_scope_is_instance_local(factory: &StateStoreFactory) {
+    let issuer = open(factory).await;
+    let other = open(factory).await;
+    assert_ne!(
+        issuer.attempts().scope(),
+        other.attempts().scope(),
+        "each opened instance mints its own scope"
+    );
+
+    let (attempt, observation) = issuer
+        .attempts()
+        .reserve()
+        .expect("reserve on the issuing instance");
+    assert_eq!(observation.id().scope(), issuer.attempts().scope());
+    let rejected = other
+        .begin_write(attempt, "capability from another instance")
         .await
-        .expect("poll scripted failure changes");
-    assert!(
-        failure_changes
-            .hints
-            .iter()
-            .all(|hint| !failure_keys.contains(&hint.key)),
-        "scripted failure outcomes must not publish change hints"
+        .err()
+        .expect("a capability from another instance must be refused, not answered");
+    assert_eq!(rejected.kind(), StateStoreErrorKind::InvalidRequest);
+
+    // Refusal happens before anything is dispatched, so the attempt is proven
+    // effect-free rather than left in doubt.
+    assert_eq!(
+        observation.outcome().await.expect("verdict"),
+        AttemptOutcome::NotCommitted
     );
 }
 
-pub async fn post_dispatch_cancel_waiter_reconciles(factory: &StateStoreFactory) {
+pub async fn a_terminal_outcome_never_flips(factory: &StateStoreFactory) {
+    let store = open(factory).await;
+    let item = key(b"a02/terminal".to_vec());
+
+    let (mut writer, committed_observation) = begin_attempt(&store, "terminal committed").await;
+    writer
+        .put(item.clone(), value(b"durable".to_vec()), Precondition::Any)
+        .await
+        .expect("stage committed row");
+    let receipt = committed(writer.commit().await);
+    assert_eq!(
+        receipt.attempt,
+        committed_observation.id(),
+        "a receipt names the attempt that earned it"
+    );
+    let proven = AttemptOutcome::Committed(receipt);
+    for round in 1..=3 {
+        assert_eq!(
+            committed_observation.outcome().await.expect("verdict"),
+            proven,
+            "a proven commit must not change on re-reading, round={round}"
+        );
+    }
+    assert_eq!(
+        committed_observation.peek().expect("peek"),
+        Some(proven),
+        "a terminal outcome is published, not re-derived on demand"
+    );
+    drop(committed_observation);
+
+    // A proven denial is just as terminal.
+    let stale = read_record(&store, &item).await.expect("staged row");
+    commit_puts(&store, &[(item.clone(), value(b"moved-on".to_vec()))]).await;
+    let (mut loser, loser_observation) = begin_attempt(&store, "terminal conflict").await;
+    loser
+        .put(
+            item.clone(),
+            value(b"stale".to_vec()),
+            Precondition::Version(stale.version),
+        )
+        .await
+        .expect("stage stale row");
+    assert_conflict(loser.commit().await);
+    for round in 1..=3 {
+        assert_eq!(
+            loser_observation.outcome().await.expect("verdict"),
+            AttemptOutcome::NotCommitted,
+            "a proven denial must not change on re-reading, round={round}"
+        );
+    }
+    assert_eq!(
+        read_record(&store, &item).await.expect("row").value,
+        value(b"moved-on".to_vec()),
+        "the denied attempt left nothing behind"
+    );
+}
+
+pub async fn an_attempt_without_a_dispatch_is_not_committed(factory: &StateStoreFactory) {
+    let store = open(factory).await;
+
+    // Reserved and never handed to the store: there is nothing to be unsure of.
+    let (attempt, observation) = store.attempts().reserve().expect("reserve");
+    assert_eq!(
+        observation.outcome().await.expect("verdict"),
+        AttemptOutcome::NotCommitted
+    );
+    drop(attempt);
+    assert_eq!(
+        observation.outcome().await.expect("verdict after drop"),
+        AttemptOutcome::NotCommitted
+    );
+    drop(observation);
+
+    // Begun and staged, then aborted: still nothing reached storage.
+    let item = key(b"a03/aborted".to_vec());
+    let (mut transaction, observation) = begin_attempt(&store, "aborted attempt").await;
+    transaction
+        .put(item.clone(), value(b"never".to_vec()), Precondition::Any)
+        .await
+        .expect("stage abandoned row");
+    abort_attempt(transaction, observation).await;
+    assert_eq!(read_record(&store, &item).await, None);
+}
+
+pub async fn a_published_terminal_outlives_its_evidence(factory: &StateStoreFactory) {
+    let store = open(factory).await;
+    let item = key(b"a04/published".to_vec());
+    let (mut writer, observation) = begin_attempt(&store, "published terminal").await;
+    writer
+        .put(item.clone(), value(b"durable".to_vec()), Precondition::Any)
+        .await
+        .expect("stage published row");
+    let receipt = committed(writer.commit().await);
+    let proven = AttemptOutcome::Committed(receipt);
+
+    // Published means recorded: reading it back costs no I/O, which is exactly
+    // why the decision cannot depend on evidence that may already be gone.
+    assert_eq!(observation.peek().expect("peek"), Some(proven.clone()));
+
+    // Draining cleanup is what releases provider-private evidence. The verdict
+    // must be indifferent to it.
+    store
+        .attempts()
+        .drain_abandoned_attempts()
+        .await
+        .expect("drain cleanup debt");
+    assert_eq!(observation.outcome().await.expect("verdict"), proven);
+    assert_eq!(observation.peek().expect("peek"), Some(proven));
+    assert_eq!(
+        read_record(&store, &item).await.expect("row").value,
+        value(b"durable".to_vec())
+    );
+}
+
+pub async fn an_unresolved_answer_is_not_a_denial(factory: &StateStoreFactory) {
+    let store = open(factory).await;
+    let item = key(b"a05/abandoned-dispatch".to_vec());
+    let payload = value(b"in-doubt".to_vec());
+    let (mut transaction, observation) = begin_attempt(&store, "abandoned dispatch").await;
+    transaction
+        .put(item.clone(), payload.clone(), Precondition::Any)
+        .await
+        .expect("stage abandoned dispatch");
+
+    // Poll the commit exactly once and then drop it. Whatever the provider put
+    // in flight on that first poll now has nobody waiting for it. This needs no
+    // fault hook, so every provider runs it.
+    {
+        let mut commit = transaction.commit();
+        std::future::poll_fn(|context| {
+            let _ = commit.as_mut().poll(context);
+            Poll::Ready(())
+        })
+        .await;
+        drop(commit);
+    }
+
+    // Committed, NotCommitted, and Unresolved are all legal answers here. What
+    // is not legal is an answer the store's own contents contradict.
+    let verdict = observation.outcome().await.expect("verdict");
+    let record = read_record(&store, &item).await;
+    match (&verdict, &record) {
+        (AttemptOutcome::Committed(receipt), Some(row)) => {
+            assert_eq!(receipt.attempt, observation.id());
+            assert_eq!(row.value, payload);
+        }
+        (AttemptOutcome::Committed(_), None) => {
+            panic!("an attempt reported committed must have left its row readable")
+        }
+        (AttemptOutcome::NotCommitted, None) => {}
+        (AttemptOutcome::NotCommitted, Some(_)) => panic!(
+            "a durable row was reported as not committed: absence of evidence is not evidence of absence"
+        ),
+        (AttemptOutcome::Unresolved, _) => {
+            // Unresolved is not a terminal and confers no right to run the work
+            // again, so nothing may be published for it.
+            assert!(!verdict.is_terminal());
+            assert_eq!(
+                observation.peek().expect("peek"),
+                None,
+                "an undecided attempt must not be published as terminal"
+            );
+        }
+    }
+
+    // Asking again may resolve an unknown, but may never contradict a terminal.
+    let again = observation.outcome().await.expect("verdict again");
+    if verdict.is_terminal() {
+        assert_eq!(again, verdict, "a terminal verdict must not be revisited");
+    }
+}
+
+pub async fn admission_saturates_without_stalling_observation(factory: &StateStoreFactory) {
+    let store = open(factory).await;
+    let supervisor: &AttemptSupervisor = store.attempts();
+    let capacity = supervisor.capacity();
+    let already = supervisor.outstanding();
+    assert!(
+        already <= capacity,
+        "an instance cannot be charged beyond its own ceiling"
+    );
+
+    // Reservation touches no storage, so filling the ceiling is pure admission
+    // accounting.
+    let mut held = Vec::with_capacity(capacity - already);
+    for _ in already..capacity {
+        held.push(supervisor.reserve().expect("reserve within the ceiling"));
+    }
+    assert_eq!(supervisor.outstanding(), capacity);
+
+    let refused = supervisor
+        .reserve()
+        .expect_err("a full instance must refuse a new attempt");
+    assert_eq!(refused.kind(), StateStoreErrorKind::Saturated);
+    assert_ne!(
+        refused.kind(),
+        StateStoreErrorKind::LimitExceeded,
+        "saturation is transient and effect-free, not a permanent property of the request"
+    );
+
+    // Admission is closed, but learning outcomes and reclaiming capacity are
+    // not: a store that blocked those would deadlock itself at the ceiling.
+    let (attempt, observation) = held.pop().expect("one attempt to observe");
+    assert_eq!(
+        observation
+            .outcome()
+            .await
+            .expect("verdict while saturated"),
+        AttemptOutcome::NotCommitted
+    );
+    supervisor
+        .drain_abandoned_attempts()
+        .await
+        .expect("cleanup still drains while saturated");
+    assert_eq!(
+        supervisor.reserve().err().map(|error| error.kind()),
+        Some(StateStoreErrorKind::Saturated),
+        "observing an attempt does not free its slot while a handle is alive"
+    );
+
+    drop(attempt);
+    drop(observation);
+    let (recovered, recovered_observation) = supervisor
+        .reserve()
+        .expect("capacity returns once a resolved attempt releases its handles");
+    drop(recovered);
+    drop(recovered_observation);
+    drop(held);
+}
+
+// ---------------------------------------------------------------------------
+// Fault group
+// ---------------------------------------------------------------------------
+
+pub async fn post_dispatch_cancel_reconciles(factory: &FaultStateStoreFactory) {
     run_post_dispatch_scenario(factory, PostDispatchScenario::CancelWaiterBeforeApply).await;
 }
 
-pub async fn post_dispatch_response_loss_reconciles(factory: &StateStoreFactory) {
+pub async fn post_dispatch_response_loss_reconciles(factory: &FaultStateStoreFactory) {
     run_post_dispatch_scenario(factory, PostDispatchScenario::LoseCommittedResponse).await;
 }
 
-async fn run_post_dispatch_scenario(factory: &StateStoreFactory, scenario: PostDispatchScenario) {
-    let fixture = open_fixture(factory).await;
+async fn run_post_dispatch_scenario(
+    factory: &FaultStateStoreFactory,
+    scenario: PostDispatchScenario,
+) {
+    let fixture = open_fault(factory).await;
     let store = fixture.store;
     let control = fixture.post_dispatch.arm(scenario).await;
-    let baseline = store
-        .poll_changes(&ChangePollRequest {
-            after: None,
-            page_size: store.limits().max_page_size,
-        })
-        .await
-        .expect("poll post-dispatch baseline")
-        .next_cursor;
-    let transaction_id = transaction_id();
     let item = key(match scenario {
-        PostDispatchScenario::CancelWaiterBeforeApply => b"c08/post-dispatch-cancel".to_vec(),
-        PostDispatchScenario::LoseCommittedResponse => b"c08/post-dispatch-response-loss".to_vec(),
+        PostDispatchScenario::CancelWaiterBeforeApply => b"f01/post-dispatch-cancel".to_vec(),
+        PostDispatchScenario::LoseCommittedResponse => b"f02/post-dispatch-response-loss".to_vec(),
     });
     let expected_value = value(b"authoritative".to_vec());
-    let mut transaction = store
-        .begin_write(transaction_id, "post-dispatch conformance")
-        .await
-        .expect("begin post-dispatch transaction");
+    let (mut transaction, observation) = begin_attempt(&store, "post-dispatch conformance").await;
     transaction
         .put(item.clone(), expected_value.clone(), Precondition::Any)
         .await
-        .expect("stage post-dispatch transaction");
+        .expect("stage post-dispatch row");
     let waiter = tokio::spawn(async move { transaction.commit().await });
     control.wait_dispatched().await;
 
     match scenario {
         PostDispatchScenario::CancelWaiterBeforeApply => {
-            assert_repeated_unresolved(&store, transaction_id, "before waiter cancellation").await;
+            assert_repeated_unresolved(&observation, "before waiter cancellation").await;
         }
         PostDispatchScenario::LoseCommittedResponse => {
-            let held_resolution = store
-                .resolve_commit(&transaction_id)
-                .await
-                .expect("resolve held post-dispatch commit");
+            let held = observation.outcome().await.expect("held verdict");
             assert!(
                 matches!(
-                    held_resolution,
-                    CommitResolution::Unresolved | CommitResolution::Committed(_)
+                    held,
+                    AttemptOutcome::Unresolved | AttemptOutcome::Committed(_)
                 ),
-                "response-loss hold exposed the wrong terminal: resolution={held_resolution:?}"
+                "a held commit may be undecided or already proven, never denied: verdict={held:?}"
             );
         }
     }
@@ -1026,16 +1148,17 @@ async fn run_post_dispatch_scenario(factory: &StateStoreFactory, scenario: PostD
                     .is_cancelled()
             );
             control.wait_waiter_cancelled().await;
-            assert_repeated_unresolved(&store, transaction_id, "after waiter cancellation").await;
+            // Losing the waiter tells the store nothing about the write.
+            assert_repeated_unresolved(&observation, "after waiter cancellation").await;
             control.release_response().await;
             control.wait_inner_dropped().await;
             control.allow_provider_progress().await;
-            await_expected_terminal(&store, transaction_id, scenario.expected_terminal()).await
+            await_expected_terminal(&observation, scenario.expected_terminal()).await
         }
         PostDispatchScenario::LoseCommittedResponse => {
             control.allow_provider_progress().await;
             let terminal =
-                await_expected_terminal(&store, transaction_id, scenario.expected_terminal()).await;
+                await_expected_terminal(&observation, scenario.expected_terminal()).await;
             control.release_response().await;
             assert!(matches!(
                 waiter.await.expect("join response-loss waiter"),
@@ -1046,109 +1169,123 @@ async fn run_post_dispatch_scenario(factory: &StateStoreFactory, scenario: PostD
         }
     };
 
-    assert_authoritative_terminal(
-        &store,
-        transaction_id,
-        &item,
-        &expected_value,
-        baseline,
-        &terminal,
-    )
-    .await;
+    assert_terminal_matches_storage(&store, &observation, &item, &expected_value, &terminal).await;
 }
 
-async fn assert_repeated_unresolved(
-    store: &Arc<dyn StateStore>,
-    transaction_id: TransactionId,
-    phase: &str,
-) {
-    for attempt in 1..=3 {
+pub async fn commit_ambiguity_is_resolved_by_the_attempt(factory: &FaultStateStoreFactory) {
+    let fixture = open_fault(factory).await;
+    let store = fixture.store;
+    let control = fixture
+        .post_dispatch
+        .arm(PostDispatchScenario::LoseCommittedResponse)
+        .await;
+    let item = key(b"f03/ambiguous-commit".to_vec());
+    let payload = value(b"durable-despite-the-unknown".to_vec());
+    let (mut transaction, observation) = begin_attempt(&store, "commit ambiguity").await;
+    transaction
+        .put(item.clone(), payload.clone(), Precondition::Any)
+        .await
+        .expect("stage ambiguous row");
+    let waiter = tokio::spawn(async move { transaction.commit().await });
+    control.wait_dispatched().await;
+    control.allow_provider_progress().await;
+    control.release_response().await;
+
+    let caller = waiter.await.expect("join ambiguous waiter");
+    assert!(
+        matches!(caller, CommitOutcome::CommitUnknown(_)),
+        "the caller must be told the outcome is unknown rather than guessed: {caller:?}"
+    );
+    control.wait_inner_dropped().await;
+
+    // The attempt owns the verdict, and here the verdict is Committed because
+    // the write is durable. A store that read the caller's ignorance as a
+    // denial would answer NotCommitted over a row it can still read.
+    let terminal = await_expected_terminal(&observation, ExpectedTerminal::Committed).await;
+    let AttemptOutcome::Committed(receipt) = &terminal else {
+        panic!("an ambiguous commit that landed must resolve to Committed: {terminal:?}");
+    };
+    assert_eq!(receipt.attempt, observation.id());
+    assert_eq!(
+        read_record(&store, &item).await.expect("durable row").value,
+        payload
+    );
+    assert_terminal_matches_storage(&store, &observation, &item, &payload, &terminal).await;
+}
+
+async fn assert_repeated_unresolved(observation: &CommitObservation, phase: &str) {
+    for round in 1..=3 {
         assert_eq!(
-            store
-                .resolve_commit(&transaction_id)
-                .await
-                .expect("resolve held post-dispatch commit"),
-            CommitResolution::Unresolved,
-            "pre-apply hold must stay unresolved {phase}, attempt={attempt}",
+            observation.outcome().await.expect("resolve held attempt"),
+            AttemptOutcome::Unresolved,
+            "a held commit must stay unresolved {phase}, round={round}",
+        );
+        assert_eq!(
+            observation.peek().expect("peek held attempt"),
+            None,
+            "an unresolved attempt must publish nothing {phase}, round={round}",
         );
     }
 }
 
 async fn await_expected_terminal(
-    store: &Arc<dyn StateStore>,
-    transaction_id: TransactionId,
+    observation: &CommitObservation,
     expected: ExpectedTerminal,
-) -> CommitResolution {
+) -> AttemptOutcome {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let resolution = store
-                .resolve_commit(&transaction_id)
-                .await
-                .expect("resolve post-dispatch commit");
-            match (&expected, &resolution) {
-                (ExpectedTerminal::Committed, CommitResolution::Committed(_))
-                | (ExpectedTerminal::NotCommitted, CommitResolution::NotCommitted) => {
-                    return resolution;
-                }
-                (ExpectedTerminal::Either, CommitResolution::Committed(_))
-                | (ExpectedTerminal::Either, CommitResolution::NotCommitted) => return resolution,
-                (_, CommitResolution::Unresolved) => tokio::task::yield_now().await,
+            let verdict = observation.outcome().await.expect("resolve attempt");
+            match (&expected, &verdict) {
+                (ExpectedTerminal::Committed, AttemptOutcome::Committed(_))
+                | (ExpectedTerminal::NotCommitted, AttemptOutcome::NotCommitted)
+                | (ExpectedTerminal::Either, AttemptOutcome::Committed(_))
+                | (ExpectedTerminal::Either, AttemptOutcome::NotCommitted) => return verdict,
+                (_, AttemptOutcome::Unresolved) => tokio::task::yield_now().await,
                 _ => panic!(
-                    "post-dispatch commit reached wrong terminal: expected={expected:?}, actual={resolution:?}"
+                    "a post-dispatch attempt reached the wrong terminal: expected={expected:?}, actual={verdict:?}"
                 ),
             }
         }
     })
     .await
-    .expect("post-dispatch commit must reach a terminal state")
+    .expect("a post-dispatch attempt must reach a terminal state")
 }
 
-async fn assert_authoritative_terminal(
+async fn assert_terminal_matches_storage(
     store: &Arc<dyn StateStore>,
-    transaction_id: TransactionId,
+    observation: &CommitObservation,
     item: &Key,
     expected_value: &Value,
-    baseline: ChangeCursor,
-    terminal: &CommitResolution,
+    terminal: &AttemptOutcome,
 ) {
     let record = read_record(store, item).await;
-    let changes = store
-        .poll_changes(&ChangePollRequest {
-            after: Some(baseline),
-            page_size: store.limits().max_page_size,
-        })
-        .await
-        .expect("poll post-dispatch authoritative changes");
     match terminal {
-        CommitResolution::Committed(receipt) => {
+        AttemptOutcome::Committed(receipt) => {
+            assert_eq!(receipt.attempt, observation.id());
             assert_eq!(
-                record.expect("committed post-dispatch record").value,
+                record
+                    .expect("a committed attempt leaves its row readable")
+                    .value,
                 expected_value.clone()
             );
-            assert!(
-                changes
-                    .hints
-                    .iter()
-                    .any(|hint| { hint.key == *item && hint.revision == receipt.revision })
-            );
         }
-        CommitResolution::NotCommitted => {
-            assert_eq!(record, None);
-            assert!(changes.hints.iter().all(|hint| hint.key != *item));
+        AttemptOutcome::NotCommitted => {
+            assert_eq!(record, None, "a denied attempt must leave nothing behind")
         }
-        CommitResolution::Unresolved => panic!("post-dispatch terminal stayed unresolved"),
+        AttemptOutcome::Unresolved => panic!("a post-dispatch attempt stayed unresolved"),
     }
-    for _ in 0..3 {
+    for round in 1..=3 {
         assert_eq!(
-            store
-                .resolve_commit(&transaction_id)
-                .await
-                .expect("repeat post-dispatch terminal"),
-            terminal.clone(),
-            "post-dispatch terminal must not regress"
+            &observation.outcome().await.expect("repeat terminal"),
+            terminal,
+            "a post-dispatch terminal must not regress, round={round}"
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fault injection
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
 pub enum ScriptedCommitResult {
@@ -1254,8 +1391,6 @@ struct FaultScript {
     operation: Option<StateStoreError>,
     pre_commit: Option<ScriptedCommitResult>,
     post_dispatch: Option<PostDispatchFault>,
-    change_poll: Option<StateStoreError>,
-    change_pages: VecDeque<ChangePage>,
 }
 
 struct PostDispatchFault {
@@ -1263,6 +1398,9 @@ struct PostDispatchFault {
     lose_response: bool,
 }
 
+/// Wraps any store and injects failures a provider cannot be asked to produce
+/// on demand. It owns no state of its own beyond the script, so it works over
+/// every provider.
 pub struct FaultInjectingStateStore {
     inner: Arc<dyn StateStore>,
     script: Arc<Mutex<FaultScript>>,
@@ -1300,26 +1438,6 @@ impl FaultInjectingStateStore {
             gate,
             lose_response: true,
         });
-    }
-
-    pub fn fail_next_change_poll(&self, error: StateStoreError) {
-        self.script.lock().expect("fault script").change_poll = Some(error);
-    }
-
-    pub fn script_next_change_page(&self, page: ChangePage) {
-        self.script
-            .lock()
-            .expect("fault script")
-            .change_pages
-            .push_back(page);
-    }
-
-    pub fn script_change_pages(&self, pages: impl IntoIterator<Item = ChangePage>) {
-        self.script
-            .lock()
-            .expect("fault script")
-            .change_pages
-            .extend(pages);
     }
 
     fn take_begin_error(&self) -> Option<StateStoreError> {
@@ -1427,8 +1545,8 @@ impl Drop for FaultWaiterCancellation {
 
 #[async_trait]
 impl WriteTransaction for FaultWriteTransaction {
-    fn transaction_id(&self) -> &TransactionId {
-        self.inner.transaction_id()
+    fn attempt(&self) -> novarocks_state_store_api::AttemptId {
+        self.inner.attempt()
     }
 
     async fn put(
@@ -1520,8 +1638,10 @@ impl StateStore for FaultInjectingStateStore {
         self.inner.limits()
     }
 
-    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-        self.inner.metrics_snapshot()
+    fn attempts(&self) -> &AttemptSupervisor {
+        // Attempts belong to the wrapped instance: a capability minted here has
+        // to be one the real store will accept.
+        self.inner.attempts()
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -1536,179 +1656,21 @@ impl StateStore for FaultInjectingStateStore {
 
     async fn begin_write(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
         purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
         if let Some(error) = self.take_begin_error() {
+            // The attempt is dropped without ever being dispatched, so its slot
+            // is released and no write effect can be attributed to it.
             return Err(error);
         }
         Ok(Box::new(FaultWriteTransaction {
-            inner: self.inner.begin_write(transaction_id, purpose).await?,
+            inner: self.inner.begin_write(attempt, purpose).await?,
             script: Arc::clone(&self.script),
         }))
-    }
-
-    async fn poll_changes(
-        &self,
-        request: &ChangePollRequest,
-    ) -> Result<ChangePage, StateStoreError> {
-        let (error, page) = {
-            let mut script = self.script.lock().expect("fault script");
-            (script.change_poll.take(), script.change_pages.pop_front())
-        };
-        if let Some(error) = error {
-            return Err(error);
-        }
-        if let Some(page) = page {
-            return Ok(page);
-        }
-        self.inner.poll_changes(request).await
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
         self.inner.identity().await
     }
-
-    async fn resolve_commit(
-        &self,
-        transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError> {
-        self.inner.resolve_commit(transaction_id).await
-    }
-}
-
-pub async fn limits_before_io(factory: &StateStoreFactory) {
-    let store = open(factory).await;
-    let limits = store.limits().clone();
-    assert!(limits.max_key_bytes < MAX_KEY_BYTES);
-    let oversized = key(vec![11; limits.max_key_bytes + 1]);
-    let visible = key(b"c11/visible".to_vec());
-    let mut reader = store.begin_read().await.expect("begin limited read");
-    assert_eq!(
-        reader
-            .get(&oversized)
-            .await
-            .expect_err("reject oversized get")
-            .kind(),
-        StateStoreErrorKind::LimitExceeded
-    );
-    commit_puts(&store, &[(visible.clone(), value(b"new".to_vec()))]).await;
-    assert!(
-        reader
-            .get(&visible)
-            .await
-            .expect("valid get after limit rejection")
-            .is_some()
-    );
-    reader.abort().await.expect("abort limited read");
-
-    let mut page_reader = store.begin_read().await.expect("begin page-limit read");
-    assert_eq!(
-        page_reader
-            .range(&RangeRequest {
-                page_size: limits.max_page_size + 1,
-                ..conformance_range(11, Direction::Forward, 1)
-            })
-            .await
-            .expect_err("reject oversized page")
-            .kind(),
-        StateStoreErrorKind::LimitExceeded
-    );
-    let page_visible = key(b"c11/page-visible".to_vec());
-    commit_puts(&store, &[(page_visible.clone(), value(b"new".to_vec()))]).await;
-    assert!(
-        page_reader
-            .get(&page_visible)
-            .await
-            .expect("valid get after page rejection")
-            .is_some()
-    );
-    page_reader.abort().await.expect("abort page-limit read");
-
-    let mut value_writer = store
-        .begin_write(transaction_id(), "value budget")
-        .await
-        .expect("begin value-limit write");
-    assert_eq!(
-        value_writer
-            .put(
-                key(b"c11/value".to_vec()),
-                value(vec![0; limits.max_value_bytes + 1]),
-                Precondition::Any,
-            )
-            .await
-            .expect_err("reject oversized value")
-            .kind(),
-        StateStoreErrorKind::LimitExceeded
-    );
-    value_writer.abort().await.expect("abort value-limit write");
-
-    let mut writer = store
-        .begin_write(transaction_id(), "operation budget")
-        .await
-        .expect("begin budget write");
-    for index in 0..limits.max_transaction_operations {
-        writer
-            .put(
-                key(vec![11, (index >> 8) as u8, index as u8]),
-                value(b"v".to_vec()),
-                Precondition::Any,
-            )
-            .await
-            .expect("stage operation within budget");
-    }
-    assert_eq!(
-        writer
-            .put(
-                key(vec![11, 0xff, 0xff]),
-                value(b"v".to_vec()),
-                Precondition::Any
-            )
-            .await
-            .expect_err("reject operation over budget")
-            .kind(),
-        StateStoreErrorKind::LimitExceeded
-    );
-    committed(writer.commit().await);
-
-    let mut byte_writer = store
-        .begin_write(transaction_id(), "byte budget")
-        .await
-        .expect("begin byte-budget write");
-    for suffix in 1_u8..=4 {
-        byte_writer
-            .put(
-                key(vec![11, 0xfe, suffix]),
-                value(vec![suffix; limits.max_value_bytes]),
-                Precondition::Any,
-            )
-            .await
-            .expect("stage mutation within byte budget");
-    }
-    assert_eq!(
-        byte_writer
-            .put(
-                key(vec![11, 0xfe, 5]),
-                value(vec![5; limits.max_value_bytes]),
-                Precondition::Any,
-            )
-            .await
-            .expect_err("reject transaction over byte budget")
-            .kind(),
-        StateStoreErrorKind::LimitExceeded
-    );
-    committed(byte_writer.commit().await);
-}
-
-pub async fn arbitrary_binary_payloads(factory: &StateStoreFactory) {
-    let store = open(factory).await;
-    let item = key(vec![13, 0, 0xff, 0, 0xfe]);
-    let payload = value(vec![0xff, 0, 0xfe, 0, 0xfd]);
-    commit_puts(&store, &[(item.clone(), payload.clone())]).await;
-    let record = read_record(&store, &item)
-        .await
-        .expect("read arbitrary binary row");
-    assert_eq!(record.key, item);
-    assert_eq!(record.value, payload);
-    assert!(!record.version.as_bytes().is_empty());
 }

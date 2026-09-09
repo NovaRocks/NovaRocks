@@ -28,7 +28,7 @@ use novarocks_state_store_api::{
 };
 use novarocks_state_store_testkit::testing::InMemoryStateStoreProviderFactory;
 
-use super::{StateStoreHost as FrontendStateStoreHost, StateStoreHostError};
+use super::{StateStoreHost as FrontendStateStoreHost, StateStoreHostError, StateStoreRunPolicy};
 use super::{StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry};
 
 pub const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
@@ -60,6 +60,7 @@ pub fn input(cluster_id: impl Into<String>) -> StateStoreHostInput {
         cluster_id: cluster_id.into(),
         provider_id: TEST_STATE_STORE_PROVIDER_ID,
         limits: StateStoreLimits::default(),
+        run_policy: StateStoreRunPolicy::default(),
     }
 }
 
@@ -73,7 +74,6 @@ pub struct StateStoreLimitOverrides {
     pub max_transaction_operations: Option<usize>,
     pub max_transaction_bytes: Option<usize>,
     pub transaction_deadline_ms: Option<u64>,
-    pub runner_max_attempts: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,8 +167,5 @@ fn apply_limits(limits: &mut StateStoreLimits, overrides: StateStoreLimitOverrid
     }
     if let Some(value) = overrides.transaction_deadline_ms {
         limits.transaction_deadline = std::time::Duration::from_millis(value);
-    }
-    if let Some(value) = overrides.runner_max_attempts {
-        limits.runner_max_attempts = value;
     }
 }

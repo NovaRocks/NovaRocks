@@ -75,6 +75,38 @@ NovaRocks FEs, and provide experimental cross-process provider evidence only.
 Remote provider format design, multi-FE protocol, and failover behavior remain
 future work.
 
+## Keyspace schema version 2
+
+A keyspace carries a physical schema version. Version 2 is the only one this
+provider accepts. Version 1 keyspaces existed while the store had a change feed
+and a caller-supplied transaction id: they hold change rows under the `0x02`
+key tag, a high watermark, a retention floor, and three-state commit-state
+values. None of those shapes exist any more.
+
+Opening a version-1 keyspace fails with `Corruption` and changes nothing.
+FoundationDB has no DDL that could migrate such a keyspace, and a version check
+is never a licence to rewrite an operator's data, so the provider will not
+reset, clear, or reinterpret it. Recovering one is an explicit operator
+decision: point the deployment at a fresh keyspace UUID, or delete the old
+subspace yourself.
+
+Two consequences are worth stating plainly, because nothing in the code will
+tell you about them:
+
+- **Orphaned change rows are not reclaimed.** A keyspace that was written by
+  the change-feed schema still holds its `0x02` rows. Nothing reads or deletes
+  them, and no migration tool is planned. The `0x02` tag is deliberately left
+  unused so those rows stay recognisable to an operator inspecting the
+  keyspace by hand.
+- **One commit-state key can survive per ambiguous commit.** A commit whose
+  outcome FoundationDB reported as unknown (`commit_unknown_result` and its
+  relatives) keeps its key under `0x03` when the attempt is later resolved from
+  that key rather than by its own commit owner: the resolution is published by
+  the caller's observation, which never tells the provider the key is spent.
+  Every witnessed commit releases its own key immediately, so this is bounded
+  by the number of genuinely ambiguous commits one open experienced, and those
+  keys belong to one dead open once its process is gone.
+
 `status.sh` prints the cluster-file path, but never prints its contents. The
 host cluster file points at the worktree-specific published port. Compose uses
 that absolute worktree runtime path as a read-only bind mount at
@@ -88,8 +120,10 @@ credentials as secrets. Do not print their contents or copy them into test
 output. NovaRocks structured logs expose lifecycle state (including retryable
 `shutdown_deferred`), the maximum and selected API versions, client readiness,
 and a one-way keyspace hash. Commit-state native error warnings additionally
-expose `transaction_id` as a canonical UUID, `phase`, `native_error_code`, and
-`category`. They do not log cluster-file contents, credential values,
+expose `attempt` as `<instance scope uuid>:<sequence>`, `phase`,
+`native_error_code`, and `category`. An instance scope is minted per open and
+is not derivable from anything durable, so it names a live process's attempt
+and nothing else. They do not log cluster-file contents, credential values,
 certificate/private-key contents, logical keys or values, secrets, or the raw
 keyspace UUID.
 

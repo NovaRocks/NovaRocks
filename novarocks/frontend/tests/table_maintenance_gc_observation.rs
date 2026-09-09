@@ -21,20 +21,23 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::state_store_fixture;
+use novarocks_frontend::StateStoreRunPolicy;
 use novarocks_frontend::table_maintenance::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
-use novarocks_state_store_api::{
-    CommitOutcome, Key, Precondition, StateStore, TransactionId, Value,
-};
+use novarocks_state_store_api::{CommitOutcome, Key, Precondition, StateStore, Value};
 use uuid::Uuid;
 
 const GC_OBSERVATION_PREFIX: &str =
     "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/";
 
-async fn store() -> Arc<dyn StateStore> {
+/// The store and the application policy the accelerator runs under.
+///
+/// They are handed out together because that is how the host exposes them: the
+/// retry budget belongs to the caller, not to the provider underneath.
+async fn store() -> (Arc<dyn StateStore>, StateStoreRunPolicy) {
     let host = state_store_fixture::open(format!("gc-observation-{}", Uuid::now_v7())).await;
-    host.state_store().expect("test StateStore exposure")
+    host.durable().expect("test StateStore exposure")
 }
 
 fn observation(
@@ -64,11 +67,10 @@ fn key(table_uuid: Uuid, ref_name: &str) -> Key {
 }
 
 async fn put_raw(store: &dyn StateStore, key: Key, value: Value) {
+    // Identity is issued by the open instance, never minted by the caller.
+    let (attempt, _observation) = store.attempts().reserve().expect("reserve a write attempt");
     let mut transaction = store
-        .begin_write(
-            TransactionId::from(Uuid::now_v7()),
-            "write GC observation corrupt test record",
-        )
+        .begin_write(attempt, "write GC observation corrupt test record")
         .await
         .expect("begin test write");
     transaction
@@ -83,8 +85,8 @@ async fn put_raw(store: &dyn StateStore, key: Key, value: Value) {
 
 #[tokio::test]
 async fn observations_survive_process_reopen_but_changed_facts_restart_maturity() {
-    let store = store().await;
-    let first = GcOwnedRefObservationAccelerator::open(Arc::clone(&store))
+    let (store, policy) = store().await;
+    let first = GcOwnedRefObservationAccelerator::open(Arc::clone(&store), policy)
         .await
         .expect("open accelerator");
     let table_uuid = Uuid::from_u128(0x3c1);
@@ -99,7 +101,7 @@ async fn observations_survive_process_reopen_but_changed_facts_restart_maturity(
     );
     drop(first);
 
-    let reopened = GcOwnedRefObservationAccelerator::open(Arc::clone(&store))
+    let reopened = GcOwnedRefObservationAccelerator::open(Arc::clone(&store), policy)
         .await
         .expect("reopen accelerator");
     assert_eq!(
@@ -119,8 +121,8 @@ async fn observations_survive_process_reopen_but_changed_facts_restart_maturity(
 
 #[tokio::test]
 async fn clone_wipe_is_idempotent_and_restarts_the_safety_clock() {
-    let store = store().await;
-    let accelerator = GcOwnedRefObservationAccelerator::open(Arc::clone(&store))
+    let (store, policy) = store().await;
+    let accelerator = GcOwnedRefObservationAccelerator::open(Arc::clone(&store), policy)
         .await
         .expect("open accelerator");
     let fact = observation(Uuid::from_u128(0x3c2), "__novarocks_clone", 101, 1, 9);
@@ -158,8 +160,8 @@ async fn clone_wipe_is_idempotent_and_restarts_the_safety_clock() {
 
 #[tokio::test]
 async fn corrupt_record_is_replaced_and_never_preserves_old_maturity() {
-    let store = store().await;
-    let accelerator = GcOwnedRefObservationAccelerator::open(Arc::clone(&store))
+    let (store, policy) = store().await;
+    let accelerator = GcOwnedRefObservationAccelerator::open(Arc::clone(&store), policy)
         .await
         .expect("open accelerator");
     let table_uuid = Uuid::from_u128(0x3c3);

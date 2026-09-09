@@ -799,10 +799,14 @@ pub fn state_store_input(config: &NovaRocksConfig) -> anyhow::Result<Option<Stat
         return Ok(None);
     };
     let limits = resolve_state_store_limits(&state_store.store.limits, MAX_KEY_BYTES)?;
+    // Two independently validated groups from two owners: what the provider
+    // enforces, and what this application does about failures.
+    let run_policy = config.application.state_store_policy.resolve()?;
     Ok(Some(StateStoreHostInput {
         cluster_id: state_store.store.cluster_id.clone(),
         provider_id: SQLITE_STATE_STORE_PROVIDER_ID,
         limits,
+        run_policy,
     }))
 }
 
@@ -813,10 +817,7 @@ pub fn state_store_provider_registry(
     let Some(state_store) = &config.state_store else {
         return Ok(registry);
     };
-    let contribution = SqliteStateStoreContribution::new(
-        state_store.store.path.clone(),
-        state_store.store.history_retention.clone(),
-    );
+    let contribution = SqliteStateStoreContribution::new(state_store.store.path.clone());
     let descriptor =
         StateStoreProviderDescriptor::new(SQLITE_STATE_STORE_PROVIDER_ID, MAX_KEY_BYTES);
     registry.register(StateStoreProviderRegistration::new(descriptor, move |_| {

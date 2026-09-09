@@ -33,8 +33,8 @@ use uuid::Uuid;
 
 use crate::durable::{DurableRecord, DurableRecordStore, EncodedRecord};
 use crate::state_family::{ClonePolicy, PersistentKeyPrefix, StateFamily};
-use crate::state_store::metrics::StateStoreMetrics;
-use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
+use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
+use crate::state_store::{RunFailure, StateStoreRunPolicy, run_side_effect_free};
 
 /// This family's entry in the closed state family manifest.  Every declarative
 /// fact below is read from it, so the module holds no second copy of the family
@@ -218,6 +218,7 @@ pub struct GcOwnedRefObservationAccelerator {
     store: Arc<dyn StateStore>,
     durable: DurableRecordStore,
     metrics: Arc<StateStoreMetrics>,
+    policy: StateStoreRunPolicy,
 }
 
 impl fmt::Debug for GcOwnedRefObservationAccelerator {
@@ -225,17 +226,24 @@ impl fmt::Debug for GcOwnedRefObservationAccelerator {
         formatter
             .debug_struct("GcOwnedRefObservationAccelerator")
             .field("family", &GC_OWNED_REF_OBSERVATION_FAMILY)
-            .field("provider", &self.metrics.provider())
+            .field("consumer", &self.metrics.consumer())
             .finish_non_exhaustive()
     }
 }
 
 impl GcOwnedRefObservationAccelerator {
-    pub async fn open(store: Arc<dyn StateStore>) -> Result<Self, GcOwnedRefObservationError> {
+    pub async fn open(
+        store: Arc<dyn StateStore>,
+        policy: StateStoreRunPolicy,
+    ) -> Result<Self, GcOwnedRefObservationError> {
         Ok(Self {
-            metrics: Arc::new(StateStoreMetrics::new(store.metrics_snapshot().provider)),
+            // A business owner, not the storage provider. GC used to label its
+            // counters with whatever provider happened to be underneath, which
+            // said nothing about which workload was retrying.
+            metrics: Arc::new(StateStoreMetrics::new(StateStoreConsumer::GC_OBSERVATION)),
             durable: DurableRecordStore::new(Arc::clone(&store)),
             store,
+            policy,
         })
     }
 
@@ -267,7 +275,7 @@ impl GcOwnedRefObservationAccelerator {
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
-            OperationId::new_v7(),
+            self.policy,
             "record frontend GC owned-ref observation",
             move |transaction| {
                 let observation = observation.clone();
@@ -300,7 +308,7 @@ impl GcOwnedRefObservationAccelerator {
         let result = run_side_effect_free(
             self.store.as_ref(),
             self.metrics.as_ref(),
-            OperationId::new_v7(),
+            self.policy,
             "remove frontend GC owned-ref observation",
             move |transaction| {
                 let key = key.clone();
@@ -340,7 +348,7 @@ impl GcOwnedRefObservationAccelerator {
             let result = run_side_effect_free(
                 self.store.as_ref(),
                 self.metrics.as_ref(),
-                OperationId::new_v7(),
+                self.policy,
                 "wipe frontend GC owned-ref observation family",
                 move |transaction| {
                     let range = range.clone();

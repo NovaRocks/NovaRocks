@@ -81,10 +81,19 @@ pub struct FrontendMvService {
 }
 
 impl FrontendMvService {
+    /// Constructs the service from inside the frontend's async assembly.
+    ///
+    /// The readiness port adapts the async MV repository for the synchronous
+    /// statement and maintenance callers, so it needs the runtime that is
+    /// already driving this composition; see `MvReadinessPort`.
     pub fn new(repository: Arc<dyn MvRepository>) -> Self {
         let runtime = Arc::new(ProcessRuntime::default());
         Self {
-            readiness: Arc::new(MvReadinessPort::new(Arc::clone(&repository), runtime)),
+            readiness: Arc::new(MvReadinessPort::new(
+                Arc::clone(&repository),
+                runtime,
+                tokio::runtime::Handle::current(),
+            )),
             refresh: None,
             activity_gate: MvActivityGate::new(),
             background: Mutex::new(None),
@@ -117,7 +126,11 @@ impl FrontendMvService {
         attempt_timeout: Duration,
     ) -> Self {
         let runtime = Arc::new(ProcessRuntime::default());
-        let readiness = Arc::new(MvReadinessPort::new(Arc::clone(&repository), runtime));
+        let readiness = Arc::new(MvReadinessPort::new(
+            Arc::clone(&repository),
+            runtime,
+            tokio::runtime::Handle::current(),
+        ));
         Self {
             refresh: Some(refresh::FrontendMvRefreshDependencies {
                 query_execution,
@@ -428,6 +441,7 @@ impl FrontendMvBackgroundRuntime {
                 workload_lifecycle: dependencies.workload_lifecycle.clone(),
                 coordinator_config: dependencies.maintenance_config.clone(),
                 attempt_timeout: dependencies.attempt_timeout,
+                runtime: tokio::runtime::Handle::current(),
             },
         ));
         let mut refresh_dependencies = dependencies;

@@ -16,8 +16,8 @@
 // under the License.
 
 use novarocks_state_store_api::{
-    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_RUNNER_ATTEMPTS,
-    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
+    DEFAULT_TRANSACTION_DEADLINE, MAX_KEY_BYTES, MAX_PAGE_SIZE, MAX_TRANSACTION_BYTES,
+    MAX_TRANSACTION_OPERATIONS, MAX_VALUE_BYTES, StateStoreLimits,
 };
 use uuid::Uuid;
 
@@ -30,7 +30,6 @@ pub struct FoundationDbTestLimitOverrides {
     pub max_transaction_operations: Option<usize>,
     pub max_transaction_bytes: Option<usize>,
     pub transaction_deadline_ms: Option<u64>,
-    pub runner_max_attempts: Option<usize>,
 }
 
 #[doc(hidden)]
@@ -75,6 +74,5 @@ pub(crate) fn resolve_test_limits(
             overrides.transaction_deadline_ms,
             DEFAULT_TRANSACTION_DEADLINE.as_millis() as u64,
         )?),
-        runner_max_attempts: tightened(overrides.runner_max_attempts, MAX_RUNNER_ATTEMPTS)?,
     })
 }

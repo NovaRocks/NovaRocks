@@ -14,7 +14,10 @@ doctest = false
 async-trait.workspace = true
 bytes.workspace = true
 sha2.workspace = true
-uuid = { workspace = true, features = ["serde", "v7"] }
+# v4 only: the instance scope is random, never a clock reading, and the
+# domain neither serialises a UUID nor mints a time-ordered one. Per ADR-0142
+# the root owns the version and this manifest owns the features it consumes.
+uuid = { workspace = true, features = ["v4"] }
 
 # Test-only. The provider-contract target drives async trait methods; this
 # never reaches the production closure, which the boundary guard verifies.

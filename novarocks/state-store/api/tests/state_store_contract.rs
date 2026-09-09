@@ -17,14 +17,9 @@
 
 use bytes::Bytes;
 use novarocks_state_store_api::{
-    ChangeCursor, Direction, Key, KeyRange, RangeRequest, StateStore, StateStoreErrorKind,
-    StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
-    StateStoreProviderId, StoreRevision, Value, VersionToken,
+    Direction, Key, KeyRange, RangeRequest, StateStore, StateStoreErrorKind, StateStoreLimits,
+    StoreRevision, Value, VersionToken,
 };
-use uuid::Uuid;
-
-const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
-    StateStoreProviderId::new("contract-test");
 
 #[allow(dead_code)]
 fn assert_object_safe(_: &dyn StateStore) {}
@@ -147,23 +142,6 @@ fn prefix_ranges_require_a_finite_successor() {
 }
 
 #[test]
-fn change_cursors_reject_a_different_store() {
-    let cursor = ChangeCursor::new(
-        Uuid::from_u128(1),
-        StoreRevision::try_from(Bytes::from_static(b"revision")).expect("revision"),
-        42,
-    )
-    .expect("cursor");
-    assert_eq!(
-        cursor
-            .decode(Uuid::from_u128(2))
-            .expect_err("different store")
-            .kind(),
-        StateStoreErrorKind::InvalidRequest
-    );
-}
-
-#[test]
 fn default_limits_cover_all_contract_fields() {
     let limits = StateStoreLimits::default();
     assert_eq!(limits.max_key_bytes, 8 * 1024);
@@ -172,37 +150,4 @@ fn default_limits_cover_all_contract_fields() {
     assert_eq!(limits.max_transaction_operations, 10_000);
     assert_eq!(limits.max_transaction_bytes, 4 * 1024 * 1024);
     assert_eq!(limits.transaction_deadline.as_secs(), 4);
-    assert_eq!(limits.runner_max_attempts, 5);
-}
-
-#[test]
-fn metrics_snapshot_uses_typed_provider_id_and_indexes_operation_outcome() {
-    let mut operation_outcomes = [[0; 6]; 6];
-    operation_outcomes[StateStoreOperation::Commit as usize]
-        [StateStoreOutcome::Conflict as usize] = 7;
-    let snapshot = StateStoreMetricsSnapshot {
-        provider: TEST_STATE_STORE_PROVIDER_ID,
-        begin_count: 0,
-        get_count: 0,
-        range_count: 0,
-        put_count: 0,
-        delete_count: 0,
-        commit_count: 7,
-        operation_outcomes,
-        operation_duration_micros: [0; 6],
-        operation_duration_observations: [0; 6],
-        retry_count: 0,
-        deadline_count: 0,
-        blocking_failure_count: 0,
-        bytes_read: 0,
-        bytes_written: 0,
-        page_records: 0,
-        notification_lag_micros: 0,
-        notification_lag_observations: 0,
-    };
-    assert_eq!(
-        snapshot.operation_outcome_count(StateStoreOperation::Commit, StateStoreOutcome::Conflict),
-        7
-    );
-    assert_eq!(snapshot.provider, TEST_STATE_STORE_PROVIDER_ID);
 }

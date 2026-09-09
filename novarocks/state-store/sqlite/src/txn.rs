@@ -15,110 +15,47 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use rusqlite::{Connection, InterruptHandle, OptionalExtension, ffi, params};
 
 use novarocks_state_store_api::{
-    CommitOutcome, CommitReceipt, CommitResolution, Key, Precondition, RangePage, RangeRequest,
-    ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value, VersionToken,
-    WriteTransaction,
+    AttemptId, AttemptOutcome, CommitOutcome, CommitReceipt, InDoubtAdjudicator, Key, Precondition,
+    RangePage, RangeRequest, ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind,
+    StateStoreLimits, StoreRevision, Value, VersionToken, WriteAttempt, WriteTransaction,
 };
 
-use novarocks_state_store_api::StateStoreMetrics;
-
-use super::{SqliteHistoryRetentionConfig, SqliteStateStore, history, open_connection, schema};
+use super::evidence::{
+    DispatchGuard, SqliteCommitEvidence, attempt_key, release_witnessed_evidence,
+};
+use super::metrics::{StateStoreMetrics, StateStoreOperation, StateStoreOutcome};
+use super::{SqliteStateStore, open_connection, schema};
 
 const MUTATION_KIND_BYTES: usize = 1;
 const PRECONDITION_KIND_BYTES: usize = 1;
 const PERSISTED_VERSION_BYTES: usize = size_of::<u64>();
-const CHANGE_REVISION_BYTES: usize = size_of::<u64>();
-const CHANGE_SEQUENCE_BYTES: usize = size_of::<u32>();
-const COMMIT_TRANSACTION_ID_BYTES: usize = 16;
+/// The durable commit row: one fixed-width attempt key and one revision.
+const COMMIT_ATTEMPT_KEY_BYTES: usize = super::evidence::ATTEMPT_KEY_BYTES;
 const COMMIT_REVISION_BYTES: usize = size_of::<u64>();
-const COMMIT_TIMESTAMP_BYTES: usize = size_of::<i64>();
 const CURRENT_REVISION_BYTES: usize = size_of::<u64>();
-const TRANSACTION_ENVELOPE_BYTES: usize = COMMIT_TRANSACTION_ID_BYTES
-    + COMMIT_REVISION_BYTES
-    + COMMIT_TIMESTAMP_BYTES
-    + CURRENT_REVISION_BYTES;
+/// What one transaction costs before it stages anything: the commit evidence
+/// row it will write and the current-revision metadata it will update.
+pub(super) const TRANSACTION_ENVELOPE_BYTES: usize =
+    COMMIT_ATTEMPT_KEY_BYTES + COMMIT_REVISION_BYTES + CURRENT_REVISION_BYTES;
 const SQLITE_BUSY_SNAPSHOT: i32 = ffi::SQLITE_BUSY_SNAPSHOT;
 const PROVISIONAL_VERSION_TAG: &[u8] = b"sqlite-provisional-v1\0";
+const PROVISIONAL_VERSION_BYTES: usize =
+    PROVISIONAL_VERSION_TAG.len() + COMMIT_ATTEMPT_KEY_BYTES + size_of::<u64>();
 const SQLITE_BUSY_RETRY_LIMIT: Duration = Duration::from_millis(50);
 const SQLITE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(1);
-
-pub(super) type CommitRegistry = Arc<Mutex<HashMap<TransactionId, CommitRegistryState>>>;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum CommitRegistryState {
-    InFlight,
-    Committed(CommitReceipt),
-    NotCommitted,
-}
-
-struct RecoveryReservation {
-    // Commit attempts and other resolvers only observe this InFlight entry. The blocking
-    // resolver closure that created the guard is the sole terminal publisher.
-    registry: CommitRegistry,
-    transaction_id: TransactionId,
-    active: bool,
-}
-
-impl RecoveryReservation {
-    fn new(registry: &CommitRegistry, transaction_id: TransactionId) -> Self {
-        Self {
-            registry: Arc::clone(registry),
-            transaction_id,
-            active: true,
-        }
-    }
-
-    fn publish(
-        mut self,
-        terminal: CommitRegistryState,
-    ) -> Result<CommitResolution, StateStoreError> {
-        let resolution = registry_resolution(&terminal);
-        let mut registry = lock_registry(&self.registry)?;
-        if !matches!(
-            registry.get(&self.transaction_id),
-            Some(CommitRegistryState::InFlight)
-        ) {
-            return Err(internal_error());
-        }
-        registry.insert(self.transaction_id, terminal);
-        self.active = false;
-        Ok(resolution)
-    }
-}
-
-impl Drop for RecoveryReservation {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        if let Ok(mut registry) = self.registry.lock()
-            && matches!(
-                registry.get(&self.transaction_id),
-                Some(CommitRegistryState::InFlight)
-            )
-        {
-            registry.remove(&self.transaction_id);
-        }
-    }
-}
-
-pub(super) fn new_commit_registry() -> CommitRegistry {
-    Arc::new(Mutex::new(HashMap::new()))
-}
 
 #[cfg(test)]
 pub(super) type TestHooks = Arc<TestHookState>;
@@ -126,8 +63,7 @@ pub(super) type TestHooks = Arc<TestHookState>;
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct TestHookState {
-    resolve_after_lookup: Mutex<Option<TestGate>>,
-    commit_after_inflight: Mutex<Option<TestGate>>,
+    commit_before_apply: Mutex<Option<TestGate>>,
     range_after_refill: Mutex<Option<TestGate>>,
     range_refill_count: AtomicUsize,
     fail_next_operation_worker: AtomicBool,
@@ -144,7 +80,7 @@ pub(super) struct TestGate {
 
 #[cfg(test)]
 impl TestGate {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             reached: Arc::new(std::sync::Barrier::new(2)),
             release: Arc::new(std::sync::Barrier::new(2)),
@@ -156,14 +92,14 @@ impl TestGate {
         self.release.wait();
     }
 
-    async fn wait_reached(&self) {
+    pub(super) async fn wait_reached(&self) {
         let reached = Arc::clone(&self.reached);
         tokio::task::spawn_blocking(move || reached.wait())
             .await
             .expect("test gate reach worker");
     }
 
-    async fn release(&self) {
+    pub(super) async fn release(&self) {
         let release = Arc::clone(&self.release);
         tokio::task::spawn_blocking(move || release.wait())
             .await
@@ -173,20 +109,9 @@ impl TestGate {
 
 #[cfg(test)]
 impl TestHookState {
-    fn pause_resolve_after_lookup(&self) {
+    fn pause_commit_before_apply(&self) {
         if let Some(gate) = self
-            .resolve_after_lookup
-            .lock()
-            .expect("resolve test hook")
-            .take()
-        {
-            gate.pause();
-        }
-    }
-
-    fn pause_commit_after_inflight(&self) {
-        if let Some(gate) = self
-            .commit_after_inflight
+            .commit_before_apply
             .lock()
             .expect("commit test hook")
             .take()
@@ -281,10 +206,10 @@ pub(super) struct SqliteReadTransaction {
 pub(super) struct SqliteWriteTransaction {
     owner: Option<TxnOwner>,
     metrics: Arc<StateStoreMetrics>,
-    transaction_id: TransactionId,
-    path: PathBuf,
-    history_retention: SqliteHistoryRetentionConfig,
-    commit_registry: CommitRegistry,
+    /// The one attempt this transaction body is authorised by, and the only
+    /// thing that may publish its terminal outcome.
+    attempt: WriteAttempt,
+    evidence: Arc<SqliteCommitEvidence>,
     #[cfg(test)]
     test_hooks: TestHooks,
 }
@@ -309,7 +234,7 @@ impl SqliteStateStore {
 
     pub(super) async fn begin_write(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
     ) -> Result<SqliteWriteTransaction, StateStoreError> {
         let started = Instant::now();
         let result = match validate_transaction_envelope(&self.limits) {
@@ -326,61 +251,39 @@ impl SqliteStateStore {
             Err(error) => Err(error),
         };
         record_result(&self.metrics, StateStoreOperation::Begin, started, &result);
-        let owner = result?;
-        let transaction_id_bytes = *transaction_id.as_uuid().as_bytes();
-        if let Err(error) = run_operation(&owner, move |state| {
-            if history::transaction_id_is_retired(&state.connection, &transaction_id_bytes)? {
-                return Err(retired_transaction_error());
+        let owner = match result {
+            Ok(owner) => owner,
+            Err(error) => {
+                // Nothing was dispatched, so the attempt is provably free of
+                // write effect rather than left in doubt.
+                let _ = attempt.cancel_before_dispatch();
+                return Err(error);
             }
-            Ok(())
-        })
-        .await
-        {
-            schedule_rollback(owner);
-            return Err(error);
-        }
+        };
         Ok(SqliteWriteTransaction {
             owner: Some(owner),
             metrics: Arc::clone(&self.metrics),
-            transaction_id,
-            path: self.path.clone(),
-            history_retention: self.history_retention.clone(),
-            commit_registry: Arc::clone(&self.commit_registry),
+            attempt,
+            evidence: Arc::clone(&self.evidence),
             #[cfg(test)]
             test_hooks: Arc::clone(&self.test_hooks),
         })
     }
 
-    pub(super) async fn resolve_commit(
-        &self,
-        transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError> {
-        let path = self.path.clone();
-        let registry = Arc::clone(&self.commit_registry);
-        #[cfg(test)]
-        let test_hooks = Arc::clone(&self.test_hooks);
-        let transaction_id = *transaction_id;
-        tokio::task::spawn_blocking(move || {
-            let reservation = {
-                let mut registry_guard = lock_registry(&registry)?;
-                if let Some(state) = registry_guard.get(&transaction_id) {
-                    return Ok(registry_resolution(state));
-                }
-                registry_guard.insert(transaction_id, CommitRegistryState::InFlight);
-                RecoveryReservation::new(&registry, transaction_id)
-            };
-
-            let terminal = match lookup_commit_resolution(&path, transaction_id)? {
-                CommitResolution::Committed(receipt) => CommitRegistryState::Committed(receipt),
-                CommitResolution::NotCommitted => CommitRegistryState::NotCommitted,
-                CommitResolution::Unresolved => CommitRegistryState::InFlight,
-            };
-            #[cfg(test)]
-            test_hooks.pause_resolve_after_lookup();
-            reservation.publish(terminal)
-        })
-        .await
-        .map_err(|_| worker_error())?
+    /// Installs a hold that stops the next commit worker before it applies.
+    ///
+    /// The provider genuinely dispatches on a blocking worker the caller does
+    /// not own, so a mid-commit fault can be staged for real rather than
+    /// simulated. Tests only.
+    #[cfg(test)]
+    pub(super) fn arm_commit_hold(&self) -> TestGate {
+        let gate = TestGate::new();
+        *self
+            .test_hooks
+            .commit_before_apply
+            .lock()
+            .expect("commit hold hook") = Some(gate.clone());
+        gate
     }
 }
 
@@ -489,7 +392,7 @@ impl SqliteWriteTransaction {
         precondition: Precondition,
     ) -> Result<(), StateStoreError> {
         let started = Instant::now();
-        let transaction_id = self.transaction_id;
+        let attempt = self.attempt.id();
         let setup = self.owner().and_then(|owner| {
             validate_key_value(&key, Some(&value), &owner.limits)?;
             let measured_bytes = accounted_mutation_bytes(
@@ -497,7 +400,7 @@ impl SqliteWriteTransaction {
                 &Mutation::Put {
                     value: value.clone(),
                     precondition: precondition.clone(),
-                    provisional_version: provisional_version(transaction_id, 1),
+                    provisional_version: provisional_version(attempt, 1),
                 },
             )?;
             Ok((owner.clone(), measured_bytes))
@@ -506,7 +409,7 @@ impl SqliteWriteTransaction {
             Ok((owner, measured_bytes)) => {
                 run_operation(&owner, move |state| {
                     let next_operation = next_operation_count(state)?;
-                    let provisional_version = provisional_version(transaction_id, next_operation);
+                    let provisional_version = provisional_version(attempt, next_operation);
                     stage_mutation(
                         state,
                         key,
@@ -565,7 +468,12 @@ impl SqliteWriteTransaction {
 
     pub(super) async fn abort(mut self) -> Result<(), StateStoreError> {
         let owner = self.take_owner()?;
-        run_operation(&owner, rollback).await
+        let result = run_operation(&owner, rollback).await;
+        // An abort never dispatches and never writes, so the attempt is closed
+        // as provably effect-free rather than settled from evidence there is
+        // none of.
+        self.cancel_attempt_before_dispatch();
+        result
     }
 
     pub(super) async fn commit(self) -> CommitOutcome {
@@ -584,60 +492,54 @@ impl SqliteWriteTransaction {
     async fn commit_inner(mut self) -> CommitOutcome {
         let owner = match self.take_owner() {
             Ok(owner) => owner,
-            Err(error) => return CommitOutcome::DefiniteFailure(error),
-        };
-
-        match register_inflight(&self.commit_registry, self.transaction_id) {
-            Ok(RegisterOutcome::AlreadyCommitted(receipt)) => {
-                schedule_rollback(owner);
-                return CommitOutcome::Committed(receipt);
-            }
-            Ok(RegisterOutcome::Registered) => {}
-            Ok(RegisterOutcome::NotCommitted) => {
-                schedule_rollback(owner);
-                return CommitOutcome::DefiniteFailure(StateStoreError::new(
-                    StateStoreErrorKind::InvalidRequest,
-                    "SQLite transaction id is terminally not committed",
-                ));
-            }
-            Ok(RegisterOutcome::InFlight) => {
-                schedule_rollback(owner);
-                return CommitOutcome::CommitUnknown(StateStoreError::new(
-                    StateStoreErrorKind::Conflict,
-                    "SQLite transaction id commit is already in flight",
-                ));
-            }
             Err(error) => {
-                schedule_rollback(owner);
-                return CommitOutcome::CommitUnknown(error);
+                let outcome = CommitOutcome::DefiniteFailure(error);
+                self.publish_witnessed_outcome(&outcome).await;
+                return outcome;
             }
+        };
+        let outcome = self.commit_dispatched(owner).await;
+        self.publish_witnessed_outcome(&outcome).await;
+        outcome
+    }
+
+    async fn commit_dispatched(&mut self, owner: TxnOwner) -> CommitOutcome {
+        let attempt = self.attempt.id();
+        // Liveness is registered before the attempt is marked dispatched, so an
+        // observer can never catch a dispatched attempt this provider holds no
+        // liveness record for and read that absence as a denial.
+        let guard = self.evidence.register_dispatch(attempt);
+        // Marked before the worker exists rather than before COMMIT: from here
+        // on, every statement the worker may run is one that could leave a
+        // trace a later reader would see.
+        if let Err(error) = self.attempt.mark_dispatched() {
+            self.evidence.forget_dispatch(attempt);
+            schedule_rollback(owner);
+            return CommitOutcome::DefiniteFailure(error);
         }
 
         let state = Arc::clone(&owner.state);
-        let registry = Arc::clone(&self.commit_registry);
-        let transaction_id = self.transaction_id;
-        let path = self.path.clone();
-        let recovery_registry = Arc::clone(&registry);
-        let recovery_path = path.clone();
-        let history_retention = self.history_retention.clone();
+        let evidence = Arc::clone(&self.evidence);
         #[cfg(test)]
         let test_hooks = Arc::clone(&self.test_hooks);
         let mut cancel_guard = CancelOnDrop::new(&owner);
         let mut worker = tokio::task::spawn_blocking(move || {
+            // Dropping this is the one statement that the physical worker has
+            // stopped touching the database. It happens on the ordinary return
+            // and on an unwinding panic alike, which is why nothing else is
+            // allowed to set that flag.
+            let _dispatch: DispatchGuard = guard;
             #[cfg(test)]
             {
-                test_hooks.pause_commit_after_inflight();
+                test_hooks.pause_commit_before_apply();
                 test_hooks.panic_commit_before_apply();
             }
             let outcome = match state.lock() {
-                Ok(mut state) => {
-                    commit_blocking(&mut state, transaction_id, &path, &history_retention)
-                }
+                Ok(mut state) => commit_blocking(&mut state, attempt, &evidence),
                 Err(_) => CommitOutcome::CommitUnknown(internal_error()),
             };
             #[cfg(test)]
             test_hooks.panic_commit_after_apply();
-            finalize_registry(&registry, transaction_id, &outcome);
             outcome
         });
 
@@ -648,13 +550,7 @@ impl SqliteWriteTransaction {
                 owner.metrics.record_blocking_failure();
                 cancel_guard.disarm();
                 drop(owner);
-                recover_commit_after_worker_failure(
-                    recovery_path,
-                    recovery_registry,
-                    transaction_id,
-                )
-                .await;
-                CommitOutcome::CommitUnknown(worker_error())
+                return self.recover_after_worker_failure(attempt).await;
             }
             Err(_) => {
                 cancel_guard.cancel();
@@ -664,19 +560,67 @@ impl SqliteWriteTransaction {
                         owner.metrics.record_blocking_failure();
                         cancel_guard.disarm();
                         drop(owner);
-                        recover_commit_after_worker_failure(
-                            recovery_path,
-                            recovery_registry,
-                            transaction_id,
-                        )
-                        .await;
-                        return CommitOutcome::CommitUnknown(worker_error());
+                        return self.recover_after_worker_failure(attempt).await;
                     }
                 }
             }
         };
         cancel_guard.disarm();
         outcome
+    }
+
+    /// Decides an attempt whose commit worker died before it could answer.
+    ///
+    /// This is a real in-doubt path inside one process: the worker may have
+    /// applied and committed before it fell over. The durable
+    /// `state_store_commits` row, written inside the very transaction that
+    /// carries the data, is the only thing that can say which -- and the
+    /// worker's liveness guard is released by the unwind, so by the time this
+    /// runs the row may finally be read as proof.
+    async fn recover_after_worker_failure(&self, attempt: AttemptId) -> CommitOutcome {
+        match InDoubtAdjudicator::adjudicate(self.evidence.as_ref(), attempt).await {
+            Ok(AttemptOutcome::Committed(receipt)) => CommitOutcome::Committed(receipt),
+            Ok(AttemptOutcome::NotCommitted) => CommitOutcome::DefiniteFailure(worker_error()),
+            Ok(AttemptOutcome::Unresolved) | Err(_) => CommitOutcome::CommitUnknown(worker_error()),
+        }
+    }
+
+    /// Closes the attempt with the terminal this caller actually witnessed,
+    /// then drops the evidence that terminal was derived from.
+    ///
+    /// The order is the contract: the proof is published first, so a later
+    /// reader reads a recorded verdict rather than re-deriving one from a row
+    /// on its way out. Releasing here, rather than leaving it to
+    /// [`novarocks_state_store_api::AttemptSupervisor::drain_abandoned_attempts`],
+    /// is what keeps this provider's evidence bounded: abandonment is the
+    /// exception, and a provider that only cleans up on abandonment grows one
+    /// row per commit for the life of the instance.
+    ///
+    /// [`CommitOutcome::CommitUnknown`] publishes nothing and releases nothing
+    /// on purpose. An ambiguous answer is not a verdict, and the row is the
+    /// only thing that can still resolve it.
+    async fn publish_witnessed_outcome(&self, outcome: &CommitOutcome) {
+        let verdict = match outcome {
+            CommitOutcome::Committed(receipt) => AttemptOutcome::Committed(receipt.clone()),
+            // All three say the write can no longer land: the transaction was
+            // rolled back, or the durable evidence agreed there is no row.
+            CommitOutcome::Conflict(_)
+            | CommitOutcome::TransientBeforeCommit(_)
+            | CommitOutcome::DefiniteFailure(_) => AttemptOutcome::NotCommitted,
+            CommitOutcome::CommitUnknown(_) => return,
+        };
+        if let Err(error) = self.attempt.settle(verdict) {
+            log::warn!("SQLite could not publish a witnessed commit outcome: {error}");
+            return;
+        }
+        release_witnessed_evidence(&self.evidence, self.attempt.id()).await;
+    }
+
+    /// Records that this attempt never reached storage.
+    fn cancel_attempt_before_dispatch(&self) {
+        if let Err(error) = self.attempt.cancel_before_dispatch() {
+            log::warn!("SQLite could not close an undispatched write attempt: {error}");
+        }
     }
 
     fn owner(&self) -> Result<&TxnOwner, StateStoreError> {
@@ -688,51 +632,16 @@ impl SqliteWriteTransaction {
     }
 }
 
-async fn recover_commit_after_worker_failure(
-    path: PathBuf,
-    registry: CommitRegistry,
-    transaction_id: TransactionId,
-) {
-    let recovery_registry = Arc::clone(&registry);
-    let recovery = tokio::task::spawn_blocking(move || {
-        let terminal = match lookup_commit(&path, transaction_id) {
-            Ok(Some(receipt)) => Some(CommitRegistryState::Committed(receipt)),
-            Ok(None) => Some(CommitRegistryState::NotCommitted),
-            Err(_) => None,
-        };
-        if let Ok(mut registry) = recovery_registry.lock()
-            && matches!(
-                registry.get(&transaction_id),
-                Some(CommitRegistryState::InFlight)
-            )
-        {
-            match terminal {
-                Some(terminal) => {
-                    registry.insert(transaction_id, terminal);
-                }
-                None => {
-                    registry.remove(&transaction_id);
-                }
-            }
-        }
-    })
-    .await;
-    if recovery.is_err()
-        && let Ok(mut registry) = registry.lock()
-        && matches!(
-            registry.get(&transaction_id),
-            Some(CommitRegistryState::InFlight)
-        )
-    {
-        registry.remove(&transaction_id);
-    }
-}
-
 impl Drop for SqliteWriteTransaction {
     fn drop(&mut self) {
         if let Some(owner) = self.owner.take() {
             schedule_rollback(owner);
         }
+        // Never dispatched: provably free of write effect, and saying so is
+        // what lets the supervisor reclaim the slot. If it was dispatched this
+        // call fails and is ignored -- an abandoned dispatch is decided by
+        // evidence, not by the handle going away.
+        let _ = self.attempt.cancel_before_dispatch();
     }
 }
 
@@ -1084,14 +993,14 @@ fn next_operation_count(state: &SqliteTxnState) -> Result<usize, StateStoreError
     Ok(next_operations)
 }
 
-fn accounted_mutation_bytes(key: &Key, mutation: &Mutation) -> Result<usize, StateStoreError> {
+pub(super) fn accounted_mutation_bytes(
+    key: &Key,
+    mutation: &Mutation,
+) -> Result<usize, StateStoreError> {
     let mut bytes = MUTATION_KIND_BYTES;
     bytes = checked_accounting_add(bytes, key.as_bytes().len())?;
     bytes = checked_accounting_add(bytes, PRECONDITION_KIND_BYTES)?;
     bytes = checked_accounting_add(bytes, precondition_bytes(mutation_precondition(mutation)))?;
-    bytes = checked_accounting_add(bytes, key.as_bytes().len())?;
-    bytes = checked_accounting_add(bytes, CHANGE_REVISION_BYTES)?;
-    bytes = checked_accounting_add(bytes, CHANGE_SEQUENCE_BYTES)?;
     match mutation {
         Mutation::Put {
             value,
@@ -1197,9 +1106,8 @@ fn commit_metric_outcome(outcome: &CommitOutcome) -> StateStoreOutcome {
 
 fn commit_blocking(
     state: &mut SqliteTxnState,
-    transaction_id: TransactionId,
-    path: &Path,
-    history_retention: &SqliteHistoryRetentionConfig,
+    attempt: AttemptId,
+    evidence: &SqliteCommitEvidence,
 ) -> CommitOutcome {
     if !state.active {
         return CommitOutcome::DefiniteFailure(transaction_finished());
@@ -1218,27 +1126,9 @@ fn commit_blocking(
         );
     }
 
-    match lookup_commit_on_connection(&state.connection, transaction_id) {
-        Ok(Some(receipt)) => {
-            return authoritative_committed_outcome(state, receipt);
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return rollback_outcome(state, classify_precommit_error(error));
-        }
-    }
-    let transaction_id_bytes = *transaction_id.as_uuid().as_bytes();
-    match history::transaction_id_is_retired(&state.connection, &transaction_id_bytes) {
-        Ok(true) => {
-            return rollback_outcome(
-                state,
-                CommitOutcome::DefiniteFailure(retired_transaction_error()),
-            );
-        }
-        Ok(false) => {}
-        Err(error) => return rollback_outcome(state, classify_precommit_error(error)),
-    }
-
+    // No "has this attempt already committed?" probe: an attempt authorises
+    // exactly one transaction body and is consumed by it, so there is nothing
+    // to be idempotent against and no reason to pay for the read.
     let current_revision = match load_current_revision(&state.connection) {
         Ok(revision) => revision,
         Err(error) => {
@@ -1260,8 +1150,6 @@ fn commit_blocking(
     };
 
     let mutations = state.mutations.clone();
-    let mut changed_keys = Vec::new();
-    let mut seen_changed_keys = HashSet::new();
     let mut logical_versions = HashMap::<Key, Option<VersionToken>>::new();
     for (key, mutation) in mutations {
         if state.cancelled.load(Ordering::Acquire) || Instant::now() >= state.deadline {
@@ -1295,12 +1183,8 @@ fn commit_blocking(
             state.deadline,
             &state.cancelled,
         );
-        let changed = match apply_result {
-            Ok(changed) => changed,
-            Err(outcome) => return rollback_outcome(state, outcome),
-        };
-        if changed && seen_changed_keys.insert(key.clone()) {
-            changed_keys.push(key.clone());
+        if let Err(outcome) = apply_result {
+            return rollback_outcome(state, outcome);
         }
         match &mutation {
             Mutation::Put {
@@ -1316,24 +1200,12 @@ fn commit_blocking(
     }
 
     let revision_i64 = i64::try_from(revision).expect("revision checked above");
-    let committed_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64;
-    for (sequence, key) in changed_keys.iter().enumerate() {
-        if let Err(error) = state.connection.execute(
-            "INSERT INTO state_store_changes(revision, sequence, key, committed_at_ms) VALUES (?1, ?2, ?3, ?4)",
-            params![revision_i64, sequence as i64, key.as_bytes(), committed_at_ms],
-        ) {
-            let outcome = classify_apply_error(&error);
-            return rollback_outcome(state, outcome);
-        }
-    }
-
+    // The evidence row rides inside the very transaction that carries the data:
+    // either both land or neither does, which is what makes its presence proof
+    // that the attempt committed.
     if let Err(error) = state.connection.execute(
-        "INSERT INTO state_store_commits(transaction_id, revision, committed_at_ms) VALUES (?1, ?2, ?3)",
-        params![transaction_id.as_uuid().as_bytes(), revision_i64, committed_at_ms],
+        "INSERT INTO state_store_commits(attempt, revision) VALUES (?1, ?2)",
+        params![attempt_key(attempt), revision_i64],
     ) {
         let outcome = classify_apply_error(&error);
         return rollback_outcome(state, outcome);
@@ -1361,32 +1233,15 @@ fn commit_blocking(
         }
     }
 
-    let reclaim_pending = match history::maintain_after_commit(
-        &state.connection,
-        history_retention,
-        revision,
-        committed_at_ms,
-    ) {
-        Ok(reclaim_pending) => reclaim_pending,
-        Err(error) => return rollback_outcome(state, classify_precommit_error(error)),
-    };
-
     match state.connection.execute_batch("COMMIT") {
         Ok(()) => {
             state.active = false;
-            if let Err(error) =
-                history::reclaim_after_commit(&state.connection, history_retention, reclaim_pending)
-            {
-                log::warn!(
-                    "SQLite StateStore committed revision {revision}, but deferred physical history reclamation failed: {error}"
-                );
-            }
             CommitOutcome::Committed(CommitReceipt {
-                transaction_id,
+                attempt,
                 revision: revision_token(revision),
             })
         }
-        Err(error) => classify_commit_error(state, transaction_id, path, &error),
+        Err(error) => classify_commit_error(state, attempt, evidence, &error),
     }
 }
 
@@ -1395,7 +1250,7 @@ fn apply_mutation(
     key: &Key,
     mutation: &Mutation,
     revision: u64,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<()> {
     let revision = i64::try_from(revision).expect("revision checked before apply");
     match mutation {
         Mutation::Put { value, .. } => {
@@ -1404,13 +1259,15 @@ fn apply_mutation(
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, version = excluded.version",
                 params![key.as_bytes(), value.as_bytes(), revision],
             )?;
-            Ok(true)
         }
-        Mutation::Delete { .. } => Ok(connection.execute(
-            "DELETE FROM state_store_kv WHERE key = ?1",
-            params![key.as_bytes()],
-        )? > 0),
+        Mutation::Delete { .. } => {
+            connection.execute(
+                "DELETE FROM state_store_kv WHERE key = ?1",
+                params![key.as_bytes()],
+            )?;
+        }
     }
+    Ok(())
 }
 
 fn apply_mutation_with_busy_retry(
@@ -1420,11 +1277,11 @@ fn apply_mutation_with_busy_retry(
     revision: u64,
     transaction_deadline: Instant,
     cancelled: &AtomicBool,
-) -> Result<bool, CommitOutcome> {
+) -> Result<(), CommitOutcome> {
     let retry_deadline = transaction_deadline.min(Instant::now() + SQLITE_BUSY_RETRY_LIMIT);
     loop {
         match apply_mutation(connection, key, mutation, revision) {
-            Ok(changed) => return Ok(changed),
+            Ok(()) => return Ok(()),
             Err(error) if is_base_busy(&error) => {
                 if cancelled.load(Ordering::Acquire) || Instant::now() >= transaction_deadline {
                     return Err(CommitOutcome::DefiniteFailure(deadline_error()));
@@ -1529,10 +1386,16 @@ fn classify_apply_error(error: &rusqlite::Error) -> CommitOutcome {
     }
 }
 
+/// Decides what a failed `COMMIT` actually did.
+///
+/// A transaction still open cannot have landed, so the answer comes from the
+/// rollback. A transaction that ended may have landed anyway, and the only
+/// thing that can say so is the durable evidence row -- read here on the
+/// evidence connection, which is not the one that just failed.
 fn classify_commit_error(
     state: &mut SqliteTxnState,
-    transaction_id: TransactionId,
-    path: &Path,
+    attempt: AttemptId,
+    evidence: &SqliteCommitEvidence,
     error: &rusqlite::Error,
 ) -> CommitOutcome {
     let mapped = operation_error(error, "SQLite transaction commit failed");
@@ -1547,7 +1410,7 @@ fn classify_commit_error(
         return CommitOutcome::CommitUnknown(mapped);
     }
     state.active = false;
-    match lookup_commit(path, transaction_id) {
+    match evidence.lookup_blocking(attempt) {
         Ok(Some(receipt)) => CommitOutcome::Committed(receipt),
         Ok(None) => CommitOutcome::DefiniteFailure(mapped),
         Err(_) => CommitOutcome::CommitUnknown(mapped),
@@ -1573,114 +1436,6 @@ fn rollback_outcome(state: &mut SqliteTxnState, outcome: CommitOutcome) -> Commi
     }
 }
 
-fn authoritative_committed_outcome(
-    state: &mut SqliteTxnState,
-    receipt: CommitReceipt,
-) -> CommitOutcome {
-    let _ = rollback(state);
-    state.active = false;
-    CommitOutcome::Committed(receipt)
-}
-
-enum RegisterOutcome {
-    Registered,
-    AlreadyCommitted(CommitReceipt),
-    InFlight,
-    NotCommitted,
-}
-
-fn register_inflight(
-    registry: &CommitRegistry,
-    transaction_id: TransactionId,
-) -> Result<RegisterOutcome, StateStoreError> {
-    let mut registry = lock_registry(registry)?;
-    match registry.get(&transaction_id) {
-        Some(CommitRegistryState::Committed(receipt)) => {
-            Ok(RegisterOutcome::AlreadyCommitted(receipt.clone()))
-        }
-        Some(CommitRegistryState::InFlight) => Ok(RegisterOutcome::InFlight),
-        Some(CommitRegistryState::NotCommitted) => Ok(RegisterOutcome::NotCommitted),
-        None => {
-            registry.insert(transaction_id, CommitRegistryState::InFlight);
-            Ok(RegisterOutcome::Registered)
-        }
-    }
-}
-
-fn finalize_registry(
-    registry: &CommitRegistry,
-    transaction_id: TransactionId,
-    outcome: &CommitOutcome,
-) {
-    if let Ok(mut registry) = registry.lock() {
-        match outcome {
-            CommitOutcome::Committed(receipt) => {
-                registry.insert(
-                    transaction_id,
-                    CommitRegistryState::Committed(receipt.clone()),
-                );
-            }
-            CommitOutcome::Conflict(_)
-            | CommitOutcome::TransientBeforeCommit(_)
-            | CommitOutcome::DefiniteFailure(_) => {
-                registry.insert(transaction_id, CommitRegistryState::NotCommitted);
-            }
-            CommitOutcome::CommitUnknown(_) => {
-                registry.remove(&transaction_id);
-            }
-        }
-    }
-}
-
-fn lookup_commit(
-    path: &Path,
-    transaction_id: TransactionId,
-) -> Result<Option<CommitReceipt>, StateStoreError> {
-    let connection = open_connection(path)?;
-    lookup_commit_on_connection(&connection, transaction_id)
-}
-
-fn lookup_commit_resolution(
-    path: &Path,
-    transaction_id: TransactionId,
-) -> Result<CommitResolution, StateStoreError> {
-    let connection = open_connection(path)?;
-    match lookup_commit_on_connection(&connection, transaction_id)? {
-        Some(receipt) => Ok(CommitResolution::Committed(receipt)),
-        None if history::transaction_id_is_retired(
-            &connection,
-            transaction_id.as_uuid().as_bytes(),
-        )? =>
-        {
-            Ok(CommitResolution::Unresolved)
-        }
-        None => Ok(CommitResolution::NotCommitted),
-    }
-}
-
-fn lookup_commit_on_connection(
-    connection: &Connection,
-    transaction_id: TransactionId,
-) -> Result<Option<CommitReceipt>, StateStoreError> {
-    let revision = connection
-        .query_row(
-            "SELECT revision FROM state_store_commits WHERE transaction_id = ?1",
-            params![transaction_id.as_uuid().as_bytes()],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(|error| operation_error(&error, "failed to resolve SQLite commit"))?;
-    revision
-        .map(|revision| {
-            let revision = u64::try_from(revision).map_err(|_| corruption_error())?;
-            Ok(CommitReceipt {
-                transaction_id,
-                revision: revision_token(revision),
-            })
-        })
-        .transpose()
-}
-
 fn classify_precommit_error(error: StateStoreError) -> CommitOutcome {
     match error.kind() {
         StateStoreErrorKind::Transient
@@ -1688,28 +1443,6 @@ fn classify_precommit_error(error: StateStoreError) -> CommitOutcome {
         | StateStoreErrorKind::DeadlineExceeded => CommitOutcome::TransientBeforeCommit(error),
         _ => CommitOutcome::DefiniteFailure(error),
     }
-}
-
-fn lock_registry(
-    registry: &CommitRegistry,
-) -> Result<std::sync::MutexGuard<'_, HashMap<TransactionId, CommitRegistryState>>, StateStoreError>
-{
-    registry.lock().map_err(|_| internal_error())
-}
-
-fn registry_resolution(state: &CommitRegistryState) -> CommitResolution {
-    match state {
-        CommitRegistryState::InFlight => CommitResolution::Unresolved,
-        CommitRegistryState::Committed(receipt) => CommitResolution::Committed(receipt.clone()),
-        CommitRegistryState::NotCommitted => CommitResolution::NotCommitted,
-    }
-}
-
-const fn retired_transaction_error() -> StateStoreError {
-    StateStoreError::new(
-        StateStoreErrorKind::InvalidRequest,
-        "SQLite transaction id is within retired history bounds",
-    )
 }
 
 fn is_busy_snapshot(error: &rusqlite::Error) -> bool {
@@ -1780,11 +1513,18 @@ pub(super) fn revision_version(revision: u64) -> VersionToken {
         .expect("u64 version is non-empty")
 }
 
-fn provisional_version(transaction_id: TransactionId, operation: usize) -> VersionToken {
-    let mut bytes = Vec::with_capacity(PROVISIONAL_VERSION_TAG.len() + 16 + 8);
+/// A read-your-writes version for a key this transaction has staged.
+///
+/// Tagged so it can never be mistaken for a persisted revision, and scoped to
+/// the attempt so a token from one transaction cannot satisfy a precondition in
+/// another. Fixed width, because transaction byte accounting charges for it.
+pub(super) fn provisional_version(attempt: AttemptId, operation: usize) -> VersionToken {
+    let attempt = attempt_key(attempt);
+    let mut bytes = Vec::with_capacity(PROVISIONAL_VERSION_BYTES);
     bytes.extend_from_slice(PROVISIONAL_VERSION_TAG);
-    bytes.extend_from_slice(transaction_id.as_uuid().as_bytes());
+    bytes.extend_from_slice(&attempt);
     bytes.extend_from_slice(&(operation as u64).to_be_bytes());
+    debug_assert_eq!(bytes.len(), PROVISIONAL_VERSION_BYTES);
     VersionToken::try_from(Bytes::from(bytes)).expect("provisional version is non-empty")
 }
 
@@ -1870,8 +1610,8 @@ impl ReadTransaction for SqliteWriteTransaction {
 
 #[async_trait]
 impl WriteTransaction for SqliteWriteTransaction {
-    fn transaction_id(&self) -> &TransactionId {
-        &self.transaction_id
+    fn attempt(&self) -> AttemptId {
+        self.attempt.id()
     }
 
     async fn put(
@@ -1903,14 +1643,12 @@ mod tests {
     use bytes::Bytes;
     use tempfile::TempDir;
     use tokio::sync::Barrier;
-    use uuid::Uuid;
 
-    use super::super::{SqliteHistoryRetentionConfig, SqliteStateStore};
+    use super::super::SqliteStateStore;
     use super::*;
     use novarocks_state_store_api::{
-        CommitOutcome, CommitReceipt, CommitResolution, Direction, Key, KeyRange, Precondition,
-        RangeRequest, StateRecord, StateStoreErrorKind, StateStoreOpenRequest, TransactionId,
-        Value, VersionToken,
+        CommitObservation, CommitOutcome, CommitReceipt, Direction, Key, KeyRange, Precondition,
+        RangeRequest, StateRecord, StateStoreErrorKind, StateStoreOpenRequest, Value, VersionToken,
     };
 
     #[derive(Default)]
@@ -1933,7 +1671,7 @@ mod tests {
             resolved.max_transaction_operations = value;
         }
         if let Some(value) = limits.transaction_deadline_ms {
-            resolved.transaction_deadline = std::time::Duration::from_millis(value);
+            resolved.transaction_deadline = Duration::from_millis(value);
         }
         resolved
     }
@@ -1944,10 +1682,6 @@ mod tests {
 
     fn value(value: &'static [u8]) -> Value {
         Value::try_from(Bytes::from_static(value)).expect("valid value")
-    }
-
-    fn transaction_id() -> TransactionId {
-        Uuid::now_v7().into()
     }
 
     async fn store(temp: &TempDir) -> Arc<SqliteStateStore> {
@@ -1961,11 +1695,10 @@ mod tests {
         Arc::new(
             SqliteStateStore::open(
                 temp.path().join("state-store.sqlite"),
-                super::super::SqliteHistoryRetentionConfig::default(),
                 StateStoreOpenRequest {
                     cluster_id: "cluster-a".to_owned(),
                     limits: resolve_state_store_limits(&limits),
-                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                    deadline: Instant::now() + Duration::from_secs(5),
                 },
             )
             .await
@@ -1973,48 +1706,22 @@ mod tests {
         )
     }
 
-    async fn store_with_policy(
-        temp: &TempDir,
-        limits: StateStoreLimitOverrides,
-        policy: SqliteHistoryRetentionConfig,
-    ) -> Arc<SqliteStateStore> {
-        Arc::new(
-            SqliteStateStore::open(
-                temp.path().join("state-store.sqlite"),
-                policy,
-                StateStoreOpenRequest {
-                    cluster_id: "cluster-a".to_owned(),
-                    limits: resolve_state_store_limits(&limits),
-                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-                },
-            )
-            .await
-            .expect("open SQLite store"),
-        )
+    /// Reserves one attempt and begins the write it authorises.
+    ///
+    /// The observation comes back separately because the attempt itself is
+    /// consumed by the store: afterwards the handle is the only way to learn
+    /// what happened to it.
+    async fn begin_attempt(
+        store: &SqliteStateStore,
+    ) -> (SqliteWriteTransaction, CommitObservation) {
+        let (attempt, observation) = store.attempts.reserve().expect("reserve attempt");
+        let transaction = store.begin_write(attempt).await.expect("begin write");
+        assert_eq!(transaction.attempt.id(), observation.id());
+        (transaction, observation)
     }
 
+    /// Current revision, live rows, and rows of commit evidence still on disk.
     async fn durable_counts(store: &SqliteStateStore) -> (u64, i64, i64) {
-        let path = store.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let connection = open_connection(&path).expect("inspection connection");
-            let revision = load_current_revision(&connection).expect("current revision");
-            let changes = connection
-                .query_row("SELECT COUNT(*) FROM state_store_changes", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .expect("change count");
-            let commits = connection
-                .query_row("SELECT COUNT(*) FROM state_store_commits", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .expect("commit count");
-            (revision, changes, commits)
-        })
-        .await
-        .expect("inspection worker")
-    }
-
-    async fn durable_state_counts(store: &SqliteStateStore) -> (u64, i64, i64, i64) {
         let path = store.path.clone();
         tokio::task::spawn_blocking(move || {
             let connection = open_connection(&path).expect("inspection connection");
@@ -2024,17 +1731,12 @@ mod tests {
                     row.get::<_, i64>(0)
                 })
                 .expect("KV count");
-            let changes = connection
-                .query_row("SELECT COUNT(*) FROM state_store_changes", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .expect("change count");
             let commits = connection
                 .query_row("SELECT COUNT(*) FROM state_store_commits", [], |row| {
                     row.get::<_, i64>(0)
                 })
                 .expect("commit count");
-            (revision, kv, changes, commits)
+            (revision, kv, commits)
         })
         .await
         .expect("inspection worker")
@@ -2057,16 +1759,59 @@ mod tests {
         }
     }
 
-    async fn put_committed(store: &SqliteStateStore, key: Key, value: Value) -> CommitReceipt {
-        let mut transaction = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin write");
+    /// Commits, then checks the attempt's verdict says what the caller was told.
+    async fn commit_attempt(
+        transaction: SqliteWriteTransaction,
+        observation: &CommitObservation,
+    ) -> CommitOutcome {
+        let outcome = transaction.commit().await;
+        let verdict = observation.outcome().await.expect("attempt verdict");
+        match (&outcome, &verdict) {
+            (CommitOutcome::Committed(receipt), AttemptOutcome::Committed(published)) => {
+                assert_eq!(receipt, published)
+            }
+            (
+                CommitOutcome::Conflict(_)
+                | CommitOutcome::TransientBeforeCommit(_)
+                | CommitOutcome::DefiniteFailure(_),
+                AttemptOutcome::NotCommitted,
+            ) => {}
+            (CommitOutcome::CommitUnknown(_), _) => {}
+            (outcome, verdict) => {
+                panic!("outcome and verdict disagree: outcome={outcome:?}, verdict={verdict:?}")
+            }
+        }
+        outcome
+    }
+
+    async fn put_committed(store: &SqliteStateStore, item: Key, payload: Value) -> CommitReceipt {
+        let (mut transaction, observation) = begin_attempt(store).await;
         transaction
-            .put(key, value, Precondition::Any)
+            .put(item, payload, Precondition::Any)
             .await
             .expect("stage put");
-        committed(transaction.commit().await)
+        committed(commit_attempt(transaction, &observation).await)
+    }
+
+    async fn read_value(store: &SqliteStateStore, key: &Key) -> Option<StateRecord> {
+        let mut transaction = store.begin_read().await.expect("begin read");
+        let value = transaction.get(key).await.expect("read key");
+        transaction.abort().await.expect("abort read");
+        value
+    }
+
+    async fn await_terminal(observation: &CommitObservation) -> AttemptOutcome {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let verdict = observation.outcome().await.expect("resolve attempt");
+                if verdict.is_terminal() {
+                    return verdict;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a dispatched attempt must reach a terminal state")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2100,22 +1845,29 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sqlite_transaction_exact_byte_accounting_accepts_boundary_and_rejects_overage() {
         let item = key(b"exact-budget");
-        let id = transaction_id();
-        let exact_mutation = Mutation::Put {
-            value: Value::try_from(Bytes::from(vec![7; 16])).expect("budget value"),
-            precondition: Precondition::Any,
-            provisional_version: provisional_version(id, 1),
-        };
-        let exact_budget = TRANSACTION_ENVELOPE_BYTES
-            .checked_add(accounted_mutation_bytes(&item, &exact_mutation).expect("exact bytes"))
-            .expect("exact budget");
-
         for (value_bytes, should_succeed, label) in [
             (15_usize, true, "boundary minus one"),
             (16_usize, true, "boundary"),
             (17_usize, false, "boundary plus one"),
         ] {
             let temp = TempDir::new().expect("budget temp dir");
+            let probe = store(&temp).await;
+            // The charge for a mutation depends on the attempt that stages it,
+            // so the budget is measured against a real attempt from this very
+            // instance rather than a guessed constant.
+            let (attempt, observation) = probe.attempts.reserve().expect("reserve probe");
+            let exact_mutation = Mutation::Put {
+                value: Value::try_from(Bytes::from(vec![7; 16])).expect("budget value"),
+                precondition: Precondition::Any,
+                provisional_version: provisional_version(attempt.id(), 1),
+            };
+            let exact_budget = TRANSACTION_ENVELOPE_BYTES
+                .checked_add(accounted_mutation_bytes(&item, &exact_mutation).expect("exact bytes"))
+                .expect("exact budget");
+            drop(attempt);
+            drop(observation);
+            drop(probe);
+
             let store = store_with_limits(
                 &temp,
                 StateStoreLimitOverrides {
@@ -2124,7 +1876,7 @@ mod tests {
                 },
             )
             .await;
-            let mut transaction = store.begin_write(id).await.expect("begin budget write");
+            let (mut transaction, observation) = begin_attempt(&store).await;
             let result = transaction
                 .put(
                     item.clone(),
@@ -2142,6 +1894,11 @@ mod tests {
                 assert_eq!(durable_counts(&store).await, (0, 0, 0));
             }
             transaction.abort().await.expect("abort budget transaction");
+            assert_eq!(
+                observation.outcome().await.expect("verdict"),
+                AttemptOutcome::NotCommitted,
+                "an aborted budget probe never reached storage"
+            );
         }
     }
 
@@ -2156,17 +1913,27 @@ mod tests {
             },
         )
         .await;
-        let durable_before = durable_state_counts(&under_budget_store).await;
+        let durable_before = durable_counts(&under_budget_store).await;
         let metrics_before = under_budget_store.metrics.snapshot();
-        let error = match under_budget_store.begin_write(transaction_id()).await {
+        let (attempt, observation) = under_budget_store
+            .attempts
+            .reserve()
+            .expect("reserve rejected attempt");
+        let error = match under_budget_store.begin_write(attempt).await {
             Ok(_) => panic!("transaction envelope must fit before provider I/O"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), StateStoreErrorKind::LimitExceeded);
+        // Refused before dispatch, so the attempt is proven effect-free rather
+        // than left in doubt.
+        assert_eq!(
+            observation.outcome().await.expect("verdict"),
+            AttemptOutcome::NotCommitted
+        );
         let metrics_after = under_budget_store.metrics.snapshot();
         assert_eq!(
-            metrics_after.begin_count,
-            metrics_before.begin_count + 1,
+            metrics_after.operation_duration_observations(StateStoreOperation::Begin),
+            metrics_before.operation_duration_observations(StateStoreOperation::Begin) + 1,
             "rejected envelope must count one begin attempt"
         );
         assert_eq!(
@@ -2176,14 +1943,7 @@ mod tests {
                 .operation_outcome_count(StateStoreOperation::Begin, StateStoreOutcome::Error)
                 + 1
         );
-        assert_eq!(
-            metrics_after.operation_duration_observations(StateStoreOperation::Begin),
-            metrics_before.operation_duration_observations(StateStoreOperation::Begin) + 1
-        );
-        assert_eq!(
-            durable_state_counts(&under_budget_store).await,
-            durable_before
-        );
+        assert_eq!(durable_counts(&under_budget_store).await, durable_before);
 
         let exact = TempDir::new().expect("exact-envelope temp dir");
         let exact_store = store_with_limits(
@@ -2194,20 +1954,16 @@ mod tests {
             },
         )
         .await;
-        let exact_before = durable_state_counts(&exact_store).await;
-        let exact_receipt = committed(
-            exact_store
-                .begin_write(transaction_id())
-                .await
-                .expect("exact envelope begins")
-                .commit()
-                .await,
-        );
-        let exact_after = durable_state_counts(&exact_store).await;
+        let exact_before = durable_counts(&exact_store).await;
+        let (transaction, observation) = begin_attempt(&exact_store).await;
+        let exact_receipt = committed(commit_attempt(transaction, &observation).await);
+        let exact_after = durable_counts(&exact_store).await;
         assert_eq!(exact_after.0, exact_before.0 + 1);
         assert_eq!(exact_after.1, exact_before.1);
-        assert_eq!(exact_after.2, exact_before.2);
-        assert_eq!(exact_after.3, exact_before.3 + 1);
+        assert_eq!(
+            exact_after.2, exact_before.2,
+            "a settled attempt releases the evidence it wrote"
+        );
         assert_eq!(exact_receipt.revision, revision_token(exact_after.0));
 
         let one_byte = TempDir::new().expect("one-byte mutation budget temp dir");
@@ -2219,11 +1975,8 @@ mod tests {
             },
         )
         .await;
-        let one_byte_before = durable_state_counts(&one_byte_store).await;
-        let mut transaction = one_byte_store
-            .begin_write(transaction_id())
-            .await
-            .expect("envelope plus one begins");
+        let one_byte_before = durable_counts(&one_byte_store).await;
+        let (mut transaction, _observation) = begin_attempt(&one_byte_store).await;
         assert_eq!(
             transaction
                 .delete(key(b"x"), Precondition::Any)
@@ -2236,14 +1989,7 @@ mod tests {
             .abort()
             .await
             .expect("abort one-byte transaction");
-        assert_eq!(durable_state_counts(&one_byte_store).await, one_byte_before);
-    }
-
-    async fn read_value(store: &SqliteStateStore, key: &Key) -> Option<StateRecord> {
-        let mut transaction = store.begin_read().await.expect("begin read");
-        let value = transaction.get(key).await.expect("read key");
-        transaction.abort().await.expect("abort read");
-        value
+        assert_eq!(durable_counts(&one_byte_store).await, one_byte_before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2276,10 +2022,7 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let store = store(&temp).await;
         let item = key(b"overlay");
-        let mut transaction = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin write");
+        let (mut transaction, observation) = begin_attempt(&store).await;
 
         transaction
             .put(item.clone(), value(b"v1"), Precondition::Absent)
@@ -2293,7 +2036,7 @@ mod tests {
         assert_eq!(first_overlay.value, value(b"v1"));
         assert_ne!(
             first_overlay.version.as_bytes().len(),
-            std::mem::size_of::<i64>(),
+            size_of::<i64>(),
             "transaction-local versions must not collide with persisted revisions"
         );
         transaction
@@ -2306,7 +2049,8 @@ mod tests {
             .await
             .expect("stage second put");
 
-        let receipt = committed(transaction.commit().await);
+        let receipt = committed(commit_attempt(transaction, &observation).await);
+        assert_eq!(receipt.attempt, observation.id());
         assert_eq!(
             read_value(&store, &item)
                 .await
@@ -2323,46 +2067,28 @@ mod tests {
                 .expect("SQLite revision encoding"),
         );
         let path = store.path.clone();
-        let transaction_id = receipt.transaction_id;
         let item_bytes = item.as_bytes().to_vec();
-        let (kv_version, ledger_revision, change_count, current_revision) =
-            tokio::task::spawn_blocking(move || {
-                let connection = open_connection(&path).expect("inspection connection");
-                let kv_version = connection
-                    .query_row(
-                        "SELECT version FROM state_store_kv WHERE key = ?1",
-                        params![item_bytes],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .expect("KV version");
-                let ledger_revision = connection
-                    .query_row(
-                        "SELECT revision FROM state_store_commits WHERE transaction_id = ?1",
-                        params![transaction_id.as_uuid().as_bytes()],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .expect("ledger revision");
-                let change_count = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM state_store_changes WHERE revision = ?1",
-                        params![revision as i64],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .expect("change rows");
-                let current_revision = connection
-                    .query_row(
-                        "SELECT value FROM state_store_meta WHERE key = ?1",
-                        params![schema::CURRENT_REVISION_KEY],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .expect("current revision");
-                (kv_version, ledger_revision, change_count, current_revision)
-            })
-            .await
-            .expect("inspection worker");
+        let (kv_version, current_revision) = tokio::task::spawn_blocking(move || {
+            let connection = open_connection(&path).expect("inspection connection");
+            let kv_version = connection
+                .query_row(
+                    "SELECT version FROM state_store_kv WHERE key = ?1",
+                    params![item_bytes],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("KV version");
+            let current_revision = connection
+                .query_row(
+                    "SELECT value FROM state_store_meta WHERE key = ?1",
+                    params![schema::CURRENT_REVISION_KEY],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .expect("current revision");
+            (kv_version, current_revision)
+        })
+        .await
+        .expect("inspection worker");
         assert_eq!(kv_version, revision as i64);
-        assert_eq!(ledger_revision, revision as i64);
-        assert_eq!(change_count, 1, "same-key changes must be deduplicated");
         assert_eq!(current_revision, revision.to_be_bytes());
     }
 
@@ -2375,10 +2101,7 @@ mod tests {
         put_committed(&store, guarded.clone(), value(b"original")).await;
         let durable_before = durable_counts(&store).await;
 
-        let mut transaction = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin write");
+        let (mut transaction, observation) = begin_attempt(&store).await;
         transaction
             .put(partial.clone(), value(b"partial"), Precondition::Any)
             .await
@@ -2387,7 +2110,7 @@ mod tests {
             .put(guarded.clone(), value(b"wrong"), Precondition::Absent)
             .await
             .expect("stage failing put");
-        assert_conflict(transaction.commit().await);
+        assert_conflict(commit_attempt(transaction, &observation).await);
 
         assert_eq!(read_value(&store, &partial).await, None);
         assert_eq!(
@@ -2400,7 +2123,7 @@ mod tests {
         assert_eq!(
             durable_counts(&store).await,
             durable_before,
-            "rollback must preserve revision, change rows, and commit ledger"
+            "rollback must preserve the revision, the rows, and the commit ledger"
         );
     }
 
@@ -2410,31 +2133,22 @@ mod tests {
         let store = store(&temp).await;
         let item = key(b"preconditions");
 
-        let mut absent = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin absent");
+        let (mut absent, absent_observation) = begin_attempt(&store).await;
         absent
             .put(item.clone(), value(b"v1"), Precondition::Absent)
             .await
             .expect("stage absent put");
-        committed(absent.commit().await);
+        committed(commit_attempt(absent, &absent_observation).await);
 
-        let mut present = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin present");
+        let (mut present, present_observation) = begin_attempt(&store).await;
         present
             .put(item.clone(), value(b"v2"), Precondition::Present)
             .await
             .expect("stage present put");
-        committed(present.commit().await);
+        committed(commit_attempt(present, &present_observation).await);
 
         let record = read_value(&store, &item).await.expect("versioned record");
-        let mut versioned = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin versioned");
+        let (mut versioned, versioned_observation) = begin_attempt(&store).await;
         versioned
             .put(
                 item.clone(),
@@ -2443,12 +2157,9 @@ mod tests {
             )
             .await
             .expect("stage versioned put");
-        committed(versioned.commit().await);
+        committed(commit_attempt(versioned, &versioned_observation).await);
 
-        let mut stale = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin stale");
+        let (mut stale, stale_observation) = begin_attempt(&store).await;
         stale
             .delete(
                 item.clone(),
@@ -2459,26 +2170,20 @@ mod tests {
             )
             .await
             .expect("stage stale delete");
-        assert_conflict(stale.commit().await);
+        assert_conflict(commit_attempt(stale, &stale_observation).await);
 
-        let mut missing = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin missing");
+        let (mut missing, missing_observation) = begin_attempt(&store).await;
         missing
             .delete(key(b"missing"), Precondition::Present)
             .await
             .expect("stage missing delete");
-        assert_conflict(missing.commit().await);
+        assert_conflict(commit_attempt(missing, &missing_observation).await);
 
-        let mut any = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin any");
+        let (mut any, any_observation) = begin_attempt(&store).await;
         any.delete(item.clone(), Precondition::Any)
             .await
             .expect("stage any delete");
-        committed(any.commit().await);
+        committed(commit_attempt(any, &any_observation).await);
         assert_eq!(read_value(&store, &item).await, None);
     }
 
@@ -2497,10 +2202,7 @@ mod tests {
                 let item = item.clone();
                 let barrier = Arc::clone(&barrier);
                 tokio::spawn(async move {
-                    let mut transaction = store
-                        .begin_write(transaction_id())
-                        .await
-                        .expect("begin concurrent write");
+                    let (mut transaction, observation) = begin_attempt(&store).await;
                     transaction
                         .get(&item)
                         .await
@@ -2511,7 +2213,7 @@ mod tests {
                         .put(item, next, Precondition::Any)
                         .await
                         .expect("stage concurrent put");
-                    transaction.commit().await
+                    commit_attempt(transaction, &observation).await
                 })
             })
             .collect::<Vec<_>>();
@@ -2546,10 +2248,7 @@ mod tests {
                 let right = right.clone();
                 let barrier = Arc::clone(&barrier);
                 tokio::spawn(async move {
-                    let mut transaction = store
-                        .begin_write(transaction_id())
-                        .await
-                        .expect("begin skew write");
+                    let (mut transaction, observation) = begin_attempt(&store).await;
                     transaction
                         .get(&left)
                         .await
@@ -2565,7 +2264,7 @@ mod tests {
                         .delete(delete_key, Precondition::Any)
                         .await
                         .expect("stage skew delete");
-                    transaction.commit().await
+                    commit_attempt(transaction, &observation).await
                 })
             })
             .collect::<Vec<_>>();
@@ -2586,308 +2285,127 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_transaction_resolves_inflight_committed_and_not_committed_ids() {
+    async fn sqlite_a_settled_attempt_publishes_before_it_releases_its_evidence() {
         let temp = TempDir::new().expect("temp dir");
         let store = store(&temp).await;
-        let committed_id = transaction_id();
-        let mut transaction = store
-            .begin_write(committed_id)
-            .await
-            .expect("begin committed transaction");
-        transaction
-            .put(key(b"ledger"), value(b"value"), Precondition::Any)
-            .await
-            .expect("stage ledger put");
-        let receipt = committed(transaction.commit().await);
-        assert_eq!(
-            store
-                .resolve_commit(&committed_id)
+
+        for round in 1..=8_u8 {
+            let (mut transaction, observation) = begin_attempt(&store).await;
+            transaction
+                .put(key(b"bounded"), value(b"payload"), Precondition::Any)
                 .await
-                .expect("resolve registry commit"),
-            CommitResolution::Committed(receipt.clone())
-        );
-
-        store
-            .commit_registry
-            .lock()
-            .expect("commit registry")
-            .remove(&committed_id);
-        assert_eq!(
-            store
-                .resolve_commit(&committed_id)
-                .await
-                .expect("resolve ledger commit"),
-            CommitResolution::Committed(receipt)
-        );
-
-        let missing_id = transaction_id();
-        assert_eq!(
-            store
-                .resolve_commit(&missing_id)
-                .await
-                .expect("resolve missing transaction"),
-            CommitResolution::NotCommitted
-        );
-        assert!(matches!(
-            store
-                .commit_registry
-                .lock()
-                .expect("commit registry")
-                .get(&missing_id),
-            Some(CommitRegistryState::NotCommitted)
-        ));
-
-        let inflight_id = transaction_id();
-        store
-            .commit_registry
-            .lock()
-            .expect("commit registry")
-            .insert(inflight_id, CommitRegistryState::InFlight);
-        assert_eq!(
-            store
-                .resolve_commit(&inflight_id)
-                .await
-                .expect("resolve in-flight transaction"),
-            CommitResolution::Unresolved
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_transaction_not_committed_id_cannot_be_reused() {
-        let temp = TempDir::new().expect("temp dir");
-        let store = store(&temp).await;
-        let reused_id = transaction_id();
-        let item = key(b"must-stay-absent");
-
-        assert_eq!(
-            store
-                .resolve_commit(&reused_id)
-                .await
-                .expect("resolve missing transaction"),
-            CommitResolution::NotCommitted
-        );
-
-        let mut transaction = store
-            .begin_write(reused_id)
-            .await
-            .expect("begin reused transaction");
-        transaction
-            .put(item.clone(), value(b"forbidden"), Precondition::Any)
-            .await
-            .expect("stage reused transaction");
-        match transaction.commit().await {
-            CommitOutcome::DefiniteFailure(error) => {
-                assert_eq!(error.kind(), StateStoreErrorKind::InvalidRequest)
-            }
-            other => panic!("expected definite invalid-request failure, got {other:?}"),
+                .expect("stage bounded put");
+            let receipt = committed(commit_attempt(transaction, &observation).await);
+            let proven = AttemptOutcome::Committed(receipt);
+            // Published, so reading it back costs no I/O -- which is exactly
+            // why the verdict cannot depend on evidence that is already gone.
+            assert_eq!(observation.peek().expect("peek"), Some(proven.clone()));
+            assert_eq!(observation.outcome().await.expect("verdict"), proven);
+            assert_eq!(
+                durable_counts(&store).await.2,
+                0,
+                "settled attempts must release their evidence rather than accumulate it, round={round}"
+            );
         }
-
-        assert_eq!(read_value(&store, &item).await, None);
         assert_eq!(
-            store
-                .resolve_commit(&reused_id)
-                .await
-                .expect("resolve terminal transaction"),
-            CommitResolution::NotCommitted
+            store.attempts.abandoned(),
+            0,
+            "no attempt should be waiting on the abandonment sweep"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_transaction_restart_duplicate_id_returns_original_receipt_without_mutating() {
-        let temp = TempDir::new().expect("temp dir");
-        let original_key = key(b"original-key");
-        let duplicate_key = key(b"duplicate-key");
-        let duplicate_id = transaction_id();
-
-        let initial_store = store(&temp).await;
-        let mut original = initial_store
-            .begin_write(duplicate_id)
-            .await
-            .expect("begin original transaction");
-        original
-            .put(original_key.clone(), value(b"original"), Precondition::Any)
-            .await
-            .expect("stage original transaction");
-        let original_receipt = committed(original.commit().await);
-        let durable_before = durable_counts(&initial_store).await;
-        drop(initial_store);
-
-        let reopened = store(&temp).await;
-        let mut duplicate = reopened
-            .begin_write(duplicate_id)
-            .await
-            .expect("begin duplicate transaction");
-        duplicate
-            .put(
-                duplicate_key.clone(),
-                value(b"must-not-apply"),
-                Precondition::Any,
-            )
-            .await
-            .expect("stage duplicate transaction");
-        assert_eq!(
-            committed(duplicate.commit().await),
-            original_receipt,
-            "the persistent ledger receipt must remain authoritative"
-        );
-
-        assert_eq!(read_value(&reopened, &duplicate_key).await, None);
-        assert_eq!(
-            read_value(&reopened, &original_key)
-                .await
-                .expect("original record")
-                .value,
-            value(b"original")
-        );
-        assert_eq!(durable_counts(&reopened).await, durable_before);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_transaction_recovery_reservation_rejects_commit_without_blocking_publish() {
+    async fn sqlite_a_release_that_fails_is_retried_rather_than_abandoned() {
         let temp = TempDir::new().expect("temp dir");
         let store = store(&temp).await;
-        let raced_id = transaction_id();
-        let item = key(b"resolver-race");
-        let mut transaction = store
-            .begin_write(raced_id)
+
+        // The verdict is already published when the release runs, so a failure
+        // here is garbage rather than a correctness problem -- but garbage that
+        // is dropped instead of retried is how an evidence table grows forever.
+        store.evidence.fail_next_release();
+        let (mut first, first_observation) = begin_attempt(&store).await;
+        first
+            .put(key(b"deferred"), value(b"payload"), Precondition::Any)
             .await
-            .expect("begin raced transaction");
+            .expect("stage first put");
+        let receipt = committed(commit_attempt(first, &first_observation).await);
+        assert_eq!(
+            first_observation.peek().expect("peek"),
+            Some(AttemptOutcome::Committed(receipt)),
+            "a failed release must not cost the caller its published proof"
+        );
+        assert_eq!(store.evidence.deferred_len(), 1);
+        assert_eq!(
+            durable_counts(&store).await.2,
+            1,
+            "the row that could not be deleted is still there"
+        );
+
+        // The next evidence operation drains the backlog before its own work.
+        let (mut second, second_observation) = begin_attempt(&store).await;
+        second
+            .put(key(b"drains"), value(b"payload"), Precondition::Any)
+            .await
+            .expect("stage second put");
+        committed(commit_attempt(second, &second_observation).await);
+        assert_eq!(store.evidence.deferred_len(), 0);
+        assert_eq!(
+            durable_counts(&store).await.2,
+            0,
+            "the retried release must clear the backlog as well as its own row"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_absent_evidence_adjudicates_unresolved_never_not_committed() {
+        let temp = TempDir::new().expect("temp dir");
+        let store = store(&temp).await;
+        let (attempt, observation) = store.attempts.reserve().expect("reserve attempt");
+        let id = attempt.id();
+        let evidence = Arc::clone(&store.evidence);
+
+        // Never dispatched: this provider knows nothing and may claim nothing.
+        assert_eq!(
+            InDoubtAdjudicator::adjudicate(evidence.as_ref(), id)
+                .await
+                .expect("adjudicate unknown"),
+            AttemptOutcome::Unresolved
+        );
+
+        let mut transaction = store.begin_write(attempt).await.expect("begin write");
         transaction
-            .put(item.clone(), value(b"must-not-commit"), Precondition::Any)
+            .put(key(b"never"), value(b"never"), Precondition::Any)
             .await
-            .expect("stage raced mutation");
-
-        let resolver_gate = TestGate::new();
-        *store
-            .test_hooks
-            .resolve_after_lookup
-            .lock()
-            .expect("resolve test hook") = Some(resolver_gate.clone());
-        let resolver_store = Arc::clone(&store);
-        let resolver = tokio::spawn(async move { resolver_store.resolve_commit(&raced_id).await });
-        resolver_gate.wait_reached().await;
-
-        let second_resolver_store = Arc::clone(&store);
-        let mut second_resolver =
-            tokio::spawn(async move { second_resolver_store.resolve_commit(&raced_id).await });
-        let mut commit = tokio::spawn(async move { transaction.commit().await });
-        let prepublish = tokio::time::timeout(Duration::from_secs(1), async {
-            let second_resolution = (&mut second_resolver).await;
-            let commit_outcome = (&mut commit).await;
-            (second_resolution, commit_outcome)
-        })
-        .await;
-        resolver_gate.release().await;
+            .expect("stage never-committed put");
         assert_eq!(
-            resolver
+            InDoubtAdjudicator::adjudicate(evidence.as_ref(), id)
                 .await
-                .expect("resolver task")
-                .expect("resolve raced transaction"),
-            CommitResolution::NotCommitted
+                .expect("adjudicate staged"),
+            AttemptOutcome::Unresolved,
+            "staging touches no storage, so absence still proves nothing"
         );
-        let (second_resolution, commit_outcome) = match prepublish {
-            Ok(results) => results,
-            Err(_) => {
-                let _ = second_resolver.await;
-                let _ = commit.await;
-                panic!("resolver reservation blocked concurrent registry operations")
-            }
-        };
+
+        transaction.abort().await.expect("abort");
         assert_eq!(
-            second_resolution
-                .expect("second resolver task")
-                .expect("resolve recovery reservation"),
-            CommitResolution::Unresolved
-        );
-        match commit_outcome.expect("commit task") {
-            CommitOutcome::CommitUnknown(error) => {
-                assert_eq!(error.kind(), StateStoreErrorKind::Conflict)
-            }
-            other => panic!("expected uncertain recovery-reservation rejection, got {other:?}"),
-        }
-        assert_eq!(read_value(&store, &item).await, None);
-        assert_eq!(
-            store
-                .resolve_commit(&raced_id)
+            InDoubtAdjudicator::adjudicate(evidence.as_ref(), id)
                 .await
-                .expect("resolve terminal race"),
-            CommitResolution::NotCommitted
+                .expect("adjudicate aborted"),
+            AttemptOutcome::Unresolved,
+            "an undispatched attempt is decided by the supervisor, not by a missing row"
+        );
+        assert_eq!(
+            observation.outcome().await.expect("verdict"),
+            AttemptOutcome::NotCommitted
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_transaction_real_commit_worker_transitions_inflight_to_terminal() {
+    async fn sqlite_commit_worker_panic_before_apply_settles_not_committed() {
         let temp = TempDir::new().expect("temp dir");
         let store = store(&temp).await;
-        let committed_id = transaction_id();
-        let mut transaction = store
-            .begin_write(committed_id)
-            .await
-            .expect("begin transaction");
-        transaction
-            .put(key(b"inflight"), value(b"value"), Precondition::Any)
-            .await
-            .expect("stage transaction");
-
-        let commit_gate = TestGate::new();
-        *store
-            .test_hooks
-            .commit_after_inflight
-            .lock()
-            .expect("commit test hook") = Some(commit_gate.clone());
-        let commit = tokio::spawn(async move { transaction.commit().await });
-        commit_gate.wait_reached().await;
-        assert_eq!(
-            store
-                .resolve_commit(&committed_id)
-                .await
-                .expect("resolve in-flight commit"),
-            CommitResolution::Unresolved
-        );
-
-        let duplicate_key = key(b"duplicate-inflight");
-        let mut duplicate = store
-            .begin_write(committed_id)
-            .await
-            .expect("begin duplicate transaction");
-        duplicate
-            .put(
-                duplicate_key.clone(),
-                value(b"must-not-apply"),
-                Precondition::Any,
-            )
-            .await
-            .expect("stage duplicate transaction");
-        match duplicate.commit().await {
-            CommitOutcome::CommitUnknown(error) => {
-                assert_eq!(error.kind(), StateStoreErrorKind::Conflict)
-            }
-            other => panic!("expected uncertain in-flight duplicate, got {other:?}"),
-        }
-        assert_eq!(read_value(&store, &duplicate_key).await, None);
-
-        commit_gate.release().await;
-        let receipt = committed(commit.await.expect("commit task"));
-        assert_eq!(
-            store
-                .resolve_commit(&committed_id)
-                .await
-                .expect("resolve committed transaction"),
-            CommitResolution::Committed(receipt)
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_commit_worker_panic_before_apply_recovers_not_committed() {
-        let temp = TempDir::new().expect("temp dir");
-        let store = store(&temp).await;
-        let transaction_id = transaction_id();
         let item = key(b"panic-before-apply");
-        let durable_before = durable_state_counts(&store).await;
-        let mut transaction = store
-            .begin_write(transaction_id)
-            .await
-            .expect("begin transaction");
+        let durable_before = durable_counts(&store).await;
+        let (mut transaction, observation) = begin_attempt(&store).await;
         transaction
             .put(item.clone(), value(b"must-not-apply"), Precondition::Any)
             .await
@@ -2897,33 +2415,31 @@ mod tests {
             .panic_next_commit_before_apply
             .store(true, Ordering::Release);
 
-        assert!(matches!(
-            transaction.commit().await,
-            CommitOutcome::CommitUnknown(_)
-        ));
-        for _ in 0..3 {
+        // The worker dies before touching anything, and its liveness guard is
+        // released by the unwind, so the missing row finally means something.
+        match transaction.commit().await {
+            CommitOutcome::DefiniteFailure(error) => {
+                assert_eq!(error.kind(), StateStoreErrorKind::Internal)
+            }
+            other => panic!("a worker that died before applying proved nothing landed: {other:?}"),
+        }
+        for round in 1..=3 {
             assert_eq!(
-                store
-                    .resolve_commit(&transaction_id)
-                    .await
-                    .expect("resolve failed commit worker"),
-                CommitResolution::NotCommitted
+                observation.outcome().await.expect("verdict"),
+                AttemptOutcome::NotCommitted,
+                "a proven denial must not change on re-reading, round={round}"
             );
         }
         assert_eq!(read_value(&store, &item).await, None);
-        assert_eq!(durable_state_counts(&store).await, durable_before);
+        assert_eq!(durable_counts(&store).await, durable_before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_commit_worker_panic_after_apply_recovers_committed() {
+    async fn sqlite_commit_worker_panic_after_apply_settles_committed() {
         let temp = TempDir::new().expect("temp dir");
         let store = store(&temp).await;
-        let transaction_id = transaction_id();
         let item = key(b"panic-after-apply");
-        let mut transaction = store
-            .begin_write(transaction_id)
-            .await
-            .expect("begin transaction");
+        let (mut transaction, observation) = begin_attempt(&store).await;
         transaction
             .put(item.clone(), value(b"must-apply-once"), Precondition::Any)
             .await
@@ -2933,25 +2449,14 @@ mod tests {
             .panic_next_commit_after_apply
             .store(true, Ordering::Release);
 
-        assert!(matches!(
-            transaction.commit().await,
-            CommitOutcome::CommitUnknown(_)
-        ));
-        let receipt = match store
-            .resolve_commit(&transaction_id)
-            .await
-            .expect("resolve committed worker failure")
-        {
-            CommitResolution::Committed(receipt) => receipt,
-            other => panic!("committed worker failure must recover immediately: {other:?}"),
-        };
-        for _ in 0..3 {
+        let receipt = committed(transaction.commit().await);
+        assert_eq!(receipt.attempt, observation.id());
+        let proven = AttemptOutcome::Committed(receipt);
+        for round in 1..=3 {
             assert_eq!(
-                store
-                    .resolve_commit(&transaction_id)
-                    .await
-                    .expect("repeat committed resolution"),
-                CommitResolution::Committed(receipt.clone())
+                observation.outcome().await.expect("verdict"),
+                proven,
+                "a proven commit must not change on re-reading, round={round}"
             );
         }
         assert_eq!(
@@ -2961,20 +2466,18 @@ mod tests {
                 .value,
             value(b"must-apply-once")
         );
-        assert_eq!(durable_state_counts(&store).await, (1, 1, 1, 1));
+        // Revision advanced, one row is live, and the proof outlived the
+        // evidence it was derived from.
+        assert_eq!(durable_counts(&store).await, (1, 1, 0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_transaction_cancelled_commit_worker_rolls_back_before_not_committed() {
+    async fn sqlite_cancelled_commit_worker_stays_unresolved_until_it_stops() {
         let temp = TempDir::new().expect("temp dir");
         let store = store(&temp).await;
-        let cancelled_id = transaction_id();
         let cancelled_key = key(b"cancelled-commit");
         let durable_before = durable_counts(&store).await;
-        let mut transaction = store
-            .begin_write(cancelled_id)
-            .await
-            .expect("begin transaction");
+        let (mut transaction, observation) = begin_attempt(&store).await;
         transaction
             .put(
                 cancelled_key.clone(),
@@ -2984,108 +2487,42 @@ mod tests {
             .await
             .expect("stage transaction");
 
-        let commit_gate = TestGate::new();
-        *store
-            .test_hooks
-            .commit_after_inflight
-            .lock()
-            .expect("commit test hook") = Some(commit_gate.clone());
+        let hold = store.arm_commit_hold();
         let commit = tokio::spawn(async move { transaction.commit().await });
-        commit_gate.wait_reached().await;
+        hold.wait_reached().await;
+
+        // The worker is parked with the database untouched. Nothing about that
+        // licenses a denial.
+        for round in 1..=3 {
+            assert_eq!(
+                observation.outcome().await.expect("verdict"),
+                AttemptOutcome::Unresolved,
+                "a held commit must stay unresolved, round={round}"
+            );
+            assert_eq!(observation.peek().expect("peek"), None);
+        }
+
         commit.abort();
         assert!(
             commit
                 .await
                 .expect_err("commit task must be cancelled")
-                .is_cancelled(),
-            "commit task cancellation must drop the commit future"
+                .is_cancelled()
         );
+        // Losing the caller says nothing about the write either.
         assert_eq!(
-            store
-                .resolve_commit(&cancelled_id)
-                .await
-                .expect("resolve paused cancelled commit"),
-            CommitResolution::Unresolved
+            observation.outcome().await.expect("verdict"),
+            AttemptOutcome::Unresolved
         );
 
-        commit_gate.release().await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match store
-                    .resolve_commit(&cancelled_id)
-                    .await
-                    .expect("resolve cancelled commit")
-                {
-                    CommitResolution::Unresolved => tokio::task::yield_now().await,
-                    CommitResolution::NotCommitted => break,
-                    CommitResolution::Committed(receipt) => {
-                        panic!("cancelled commit became committed: {receipt:?}")
-                    }
-                }
-            }
-        })
-        .await
-        .expect("cancelled commit must reach a terminal state");
-
+        hold.release().await;
+        assert_eq!(
+            await_terminal(&observation).await,
+            AttemptOutcome::NotCommitted,
+            "a cancelled worker rolls back, and only then may absence be read as a denial"
+        );
         assert_eq!(read_value(&store, &cancelled_key).await, None);
         assert_eq!(durable_counts(&store).await, durable_before);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sqlite_transaction_authoritative_receipt_survives_cleanup_failure() {
-        let temp = TempDir::new().expect("temp dir");
-        let duplicate_id = transaction_id();
-        let duplicate_key = key(b"cleanup-failure");
-        let initial_store = store(&temp).await;
-        let mut original = initial_store
-            .begin_write(duplicate_id)
-            .await
-            .expect("begin original transaction");
-        original
-            .put(key(b"committed"), value(b"value"), Precondition::Any)
-            .await
-            .expect("stage original transaction");
-        let original_receipt = committed(original.commit().await);
-        let durable_before = durable_counts(&initial_store).await;
-        drop(initial_store);
-
-        let reopened = store(&temp).await;
-        let mut duplicate = reopened
-            .begin_write(duplicate_id)
-            .await
-            .expect("begin duplicate transaction");
-        duplicate
-            .put(
-                duplicate_key.clone(),
-                value(b"must-not-apply"),
-                Precondition::Any,
-            )
-            .await
-            .expect("stage duplicate transaction");
-        let duplicate_state = Arc::clone(
-            &duplicate
-                .owner()
-                .expect("duplicate transaction owner")
-                .state,
-        );
-        tokio::task::spawn_blocking(move || {
-            let state = duplicate_state.lock().expect("duplicate transaction state");
-            state
-                .connection
-                .execute_batch("ROLLBACK")
-                .expect("force cleanup failure precondition");
-            assert!(state.active, "test must leave the owner marked active");
-        })
-        .await
-        .expect("cleanup fault worker");
-
-        assert_eq!(
-            committed(duplicate.commit().await),
-            original_receipt,
-            "the authoritative ledger receipt must survive cleanup failure"
-        );
-        assert_eq!(read_value(&reopened, &duplicate_key).await, None);
-        assert_eq!(durable_counts(&reopened).await, durable_before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3116,10 +2553,7 @@ mod tests {
         );
         reader.abort().await.expect("abort read");
 
-        let mut writer = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin write");
+        let (mut writer, _observation) = begin_attempt(&store).await;
         let error = writer
             .put(oversized, value(b"value"), Precondition::Any)
             .await
@@ -3151,10 +2585,7 @@ mod tests {
         )
         .await;
         let item = key(b"deadline-blocked");
-        let mut transaction = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin deadline transaction");
+        let (mut transaction, observation) = begin_attempt(&store).await;
         transaction
             .put(item.clone(), value(b"must-not-commit"), Precondition::Any)
             .await
@@ -3164,7 +2595,7 @@ mod tests {
         blocker
             .execute_batch("BEGIN IMMEDIATE")
             .expect("hold SQLite writer lock");
-        let outcome = tokio::time::timeout(Duration::from_secs(2), transaction.commit())
+        let outcome = tokio::time::timeout(Duration::from_secs(5), transaction.commit())
             .await
             .expect("transaction deadline must interrupt blocking SQL");
         blocker
@@ -3177,6 +2608,10 @@ mod tests {
             }
             other => panic!("expected definite deadline failure, got {other:?}"),
         }
+        assert_eq!(
+            observation.outcome().await.expect("verdict"),
+            AttemptOutcome::NotCommitted
+        );
         assert_eq!(read_value(&store, &item).await, None);
     }
 
@@ -3192,16 +2627,13 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let mut seed = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin seed write");
+        let (mut seed, seed_observation) = begin_attempt(&store).await;
         for (key, value) in &rows {
             seed.put(key.clone(), value.clone(), Precondition::Any)
                 .await
                 .expect("stage seed row");
         }
-        committed(seed.commit().await);
+        committed(commit_attempt(seed, &seed_observation).await);
         let durable_before = durable_counts(&store).await;
 
         let gate = TestGate::new();
@@ -3215,10 +2647,7 @@ mod tests {
             .range_refill_count
             .store(0, Ordering::Release);
 
-        let mut writer = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin overlay write");
+        let (mut writer, _writer_observation) = begin_attempt(&store).await;
         for (key, _) in &rows {
             writer
                 .delete(key.clone(), Precondition::Any)
@@ -3251,7 +2680,7 @@ mod tests {
         owner.interrupt_handle.interrupt();
         gate.release().await;
 
-        let (writer, result) = tokio::time::timeout(Duration::from_secs(2), task)
+        let (writer, result) = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("cancelled range worker must terminate")
             .expect("range task must join");
@@ -3279,75 +2708,6 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[tokio::test]
-    async fn sqlite_history_capacity_pruning_keeps_resolution_conservative() {
-        let temp = TempDir::new().expect("temporary directory");
-        let store = store_with_policy(
-            &temp,
-            StateStoreLimitOverrides {
-                max_transaction_operations: Some(1),
-                ..StateStoreLimitOverrides::default()
-            },
-            SqliteHistoryRetentionConfig {
-                max_age_secs: 60 * 60,
-                max_change_rows: 1,
-                max_commit_receipts: 1,
-                maintenance_interval_commits: 64,
-                incremental_vacuum_pages: 1,
-            },
-        )
-        .await;
-        let first = transaction_id();
-        let second = transaction_id();
-        for (transaction_id, key) in [(first, key(b"history-a")), (second, key(b"history-b"))] {
-            let mut transaction = store
-                .begin_write(transaction_id)
-                .await
-                .expect("begin retained-history transaction");
-            transaction
-                .put(key, value(b"value"), Precondition::Any)
-                .await
-                .expect("stage retained-history mutation");
-            committed(transaction.commit().await);
-        }
-
-        assert_eq!(durable_counts(&store).await, (2, 1, 1));
-        drop(store);
-        let store = store_with_policy(
-            &temp,
-            StateStoreLimitOverrides {
-                max_transaction_operations: Some(1),
-                ..StateStoreLimitOverrides::default()
-            },
-            SqliteHistoryRetentionConfig {
-                max_age_secs: 60 * 60,
-                max_change_rows: 1,
-                max_commit_receipts: 1,
-                maintenance_interval_commits: 64,
-                incremental_vacuum_pages: 1,
-            },
-        )
-        .await;
-        assert!(matches!(
-            store
-                .resolve_commit(&first)
-                .await
-                .expect("resolve retired id"),
-            CommitResolution::Unresolved
-        ));
-        match store.begin_write(first).await {
-            Ok(_) => panic!("retired transaction id must not be reusable"),
-            Err(error) => assert_eq!(error.kind(), StateStoreErrorKind::InvalidRequest),
-        }
-        assert!(matches!(
-            store
-                .resolve_commit(&Uuid::now_v7().into())
-                .await
-                .expect("resolve unknown id"),
-            CommitResolution::NotCommitted
-        ));
     }
 
     #[test]
@@ -3384,10 +2744,7 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let store = store(&temp).await;
         let item = key(b"contended");
-        let mut transaction = store
-            .begin_write(transaction_id())
-            .await
-            .expect("begin transaction");
+        let (mut transaction, observation) = begin_attempt(&store).await;
         assert_eq!(
             transaction.get(&item).await.expect("establish snapshot"),
             None
@@ -3406,5 +2763,10 @@ mod tests {
             .execute_batch("ROLLBACK")
             .expect("release writer lock");
         assert!(matches!(outcome, CommitOutcome::TransientBeforeCommit(_)));
+        assert_eq!(
+            observation.outcome().await.expect("verdict"),
+            AttemptOutcome::NotCommitted,
+            "'before commit' is a claim about write effect, not just timing"
+        );
     }
 }

@@ -1113,10 +1113,12 @@ mod tests {
         .await
         .expect("open frontend application host");
         let store = host.state_store().expect("frontend StateStore");
-        let attachments =
-            crate::catalog_attachment::CatalogAttachmentRepository::open(Arc::clone(&store))
-                .await
-                .expect("open catalog attachment repository");
+        let attachments = crate::catalog_attachment::CatalogAttachmentRepository::open(
+            Arc::clone(&store),
+            host.run_policy(),
+        )
+        .await
+        .expect("open catalog attachment repository");
 
         let session_factory = build_frontend_query_session_factory(
             &host,

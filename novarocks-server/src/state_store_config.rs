@@ -21,7 +21,6 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderId};
-use novarocks_state_store_sqlite::SqliteHistoryRetentionConfig;
 
 use crate::state_store_limits::{StateStoreLimitOverrides, resolve_state_store_limits};
 
@@ -38,7 +37,6 @@ pub struct StateStoreConfig {
     pub cluster_id: String,
     pub path: PathBuf,
     pub limits: StateStoreLimitOverrides,
-    pub history_retention: SqliteHistoryRetentionConfig,
 }
 
 impl StateStoreConfig {
@@ -49,21 +47,10 @@ impl StateStoreConfig {
         if self.path.as_os_str().is_empty() {
             bail!("InvalidStateStoreConfig: path must not be empty");
         }
-        let limits = resolve_state_store_limits(&self.limits, MAX_KEY_BYTES)?;
-        let retention = &self.history_retention;
-        if retention.max_age_secs == 0
-            || retention.max_change_rows == 0
-            || retention.max_commit_receipts == 0
-            || retention.maintenance_interval_commits == 0
-            || retention.incremental_vacuum_pages == 0
-        {
-            bail!("InvalidStateStoreConfig: history_retention values must be non-zero");
-        }
-        if retention.max_change_rows < limits.max_transaction_operations {
-            bail!(
-                "InvalidStateStoreConfig: history_retention.max_change_rows must be at least max_transaction_operations"
-            );
-        }
+        // Resolved for its validation only: an override that relaxes a hard
+        // bound has to fail here, before anything opens a database. The
+        // resolved value itself belongs to composition, which builds the store.
+        resolve_state_store_limits(&self.limits, MAX_KEY_BYTES)?;
         Ok(())
     }
 }
@@ -78,4 +65,3 @@ impl StateStoreAppConfig {
         self.store.validate()
     }
 }
-// Design: ADR-0122 (docs/adr/ADR-0122-sqlite-is-the-only-production-state-store.md)

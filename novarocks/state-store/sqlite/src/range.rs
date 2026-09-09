@@ -17,26 +17,18 @@
 
 use std::collections::VecDeque;
 use std::ops::Bound::{Excluded, Included};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use rusqlite::{Connection, params};
 
 use novarocks_state_store_api::{
-    ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, Direction, Key, RangePage,
-    RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind, StoreIdentity, StoreRevision,
+    Direction, Key, RangePage, RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind,
 };
 
-use novarocks_state_store_api::StateStoreMetrics;
-
-use super::open_connection;
-use super::schema::load_change_retention_floor;
 use super::txn::{
-    Mutation, SqliteTxnState, load_current_revision, operation_error, persisted_key,
-    persisted_row_error, persisted_value, range_refill_completed, range_refill_started,
-    revision_token, revision_version,
+    Mutation, SqliteTxnState, operation_error, persisted_key, persisted_row_error, persisted_value,
+    range_refill_completed, range_refill_started, revision_version,
 };
 
 struct BaseWindow {
@@ -273,160 +265,6 @@ fn next_overlay(
     }
 }
 
-pub(super) async fn poll_changes(
-    path: PathBuf,
-    identity: StoreIdentity,
-    request: ChangePollRequest,
-    metrics: Arc<StateStoreMetrics>,
-) -> Result<ChangePage, StateStoreError> {
-    let decoded_after = request
-        .after
-        .as_ref()
-        .map(|cursor| {
-            let (revision, sequence) = cursor.decode(identity.store_id)?;
-            Ok((decode_revision(&revision)?, sequence))
-        })
-        .transpose()?;
-    let worker_metrics = Arc::clone(&metrics);
-    tokio::task::spawn_blocking(move || {
-        poll_changes_blocking(&path, &identity, &request, decoded_after, &worker_metrics)
-    })
-    .await
-    .map_err(|_| {
-        metrics.record_blocking_failure();
-        StateStoreError::new(
-            StateStoreErrorKind::Internal,
-            "SQLite change polling worker failed",
-        )
-    })?
-}
-
-fn poll_changes_blocking(
-    path: &Path,
-    identity: &StoreIdentity,
-    request: &ChangePollRequest,
-    decoded_after: Option<(u64, u32)>,
-    metrics: &StateStoreMetrics,
-) -> Result<ChangePage, StateStoreError> {
-    let connection = open_connection(path)?;
-    connection
-        .execute_batch("BEGIN DEFERRED")
-        .map_err(|error| {
-            operation_error(&error, "failed to begin SQLite change polling snapshot")
-        })?;
-    let high_watermark = load_current_revision(&connection)?;
-    let retention_floor = load_change_retention_floor(&connection, high_watermark)?;
-    let start = decoded_after.unwrap_or((0, u32::MAX));
-
-    if start.0 > high_watermark {
-        connection.execute_batch("ROLLBACK").map_err(|error| {
-            operation_error(&error, "failed to finish SQLite change polling snapshot")
-        })?;
-        return Err(invalid_change_request());
-    }
-
-    if start < retention_floor {
-        connection.execute_batch("ROLLBACK").map_err(|error| {
-            operation_error(&error, "failed to finish SQLite change polling snapshot")
-        })?;
-        return Ok(ChangePage {
-            hints: Vec::new(),
-            next_cursor: ChangeCursor::new(
-                identity.store_id,
-                revision_token(retention_floor.0),
-                retention_floor.1,
-            )?,
-            high_watermark: revision_token(high_watermark),
-            resync_required: true,
-        });
-    }
-
-    let limit = i64::try_from(
-        request
-            .page_size
-            .checked_add(1)
-            .ok_or_else(invalid_change_request)?,
-    )
-    .map_err(|_| invalid_change_request())?;
-    let start_revision = i64::try_from(start.0).map_err(|_| invalid_change_request())?;
-    let start_sequence = i64::from(start.1);
-    let high_watermark_i64 = i64::try_from(high_watermark).map_err(|_| malformed_revision())?;
-    let mut statement = connection
-        .prepare(
-            "SELECT revision, sequence, key, committed_at_ms \
-             FROM state_store_changes \
-             WHERE revision <= ?1 \
-               AND ((revision > ?2) OR \
-                    (revision = ?2 AND sequence > ?3)) \
-             ORDER BY revision ASC, sequence ASC LIMIT ?4",
-        )
-        .map_err(|error| {
-            operation_error(&error, "failed to prepare bounded SQLite change query")
-        })?;
-    let rows = statement
-        .query_map(
-            params![high_watermark_i64, start_revision, start_sequence, limit],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )
-        .map_err(|error| {
-            operation_error(&error, "failed to execute bounded SQLite change query")
-        })?;
-    let mut decoded = Vec::with_capacity(request.page_size + 1);
-    for row in rows {
-        let (revision, sequence, key, committed_at_ms) = row.map_err(|error| {
-            persisted_row_error(&error, "failed to decode bounded SQLite change row")
-        })?;
-        let revision = u64::try_from(revision).map_err(|_| malformed_revision())?;
-        let sequence = u32::try_from(sequence).map_err(|_| malformed_sequence())?;
-        decoded.push((revision, sequence, key, committed_at_ms));
-    }
-    drop(statement);
-    connection.execute_batch("ROLLBACK").map_err(|error| {
-        operation_error(&error, "failed to finish SQLite change polling snapshot")
-    })?;
-    decoded.truncate(request.page_size);
-
-    let mut hints = Vec::with_capacity(decoded.len());
-    let mut last_position = None;
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64;
-    for (revision, sequence, key, committed_at_ms) in decoded {
-        metrics.record_notification_lag(Duration::from_millis(
-            now_ms.saturating_sub(committed_at_ms).max(0) as u64,
-        ));
-        hints.push(ChangeHint {
-            revision: revision_token(revision),
-            key: persisted_key(key)?,
-        });
-        last_position = Some((revision, sequence));
-    }
-    let next_cursor = match last_position {
-        Some((revision, sequence)) => {
-            ChangeCursor::new(identity.store_id, revision_token(revision), sequence)?
-        }
-        None => match &request.after {
-            Some(cursor) => cursor.clone(),
-            None => ChangeCursor::new(identity.store_id, revision_token(high_watermark), u32::MAX)?,
-        },
-    };
-    Ok(ChangePage {
-        hints,
-        next_cursor,
-        high_watermark: revision_token(high_watermark),
-        resync_required: false,
-    })
-}
-
 fn ensure_range_active(state: &SqliteTxnState) -> Result<(), StateStoreError> {
     if state.cancelled.load(Ordering::Acquire) || Instant::now() >= state.deadline {
         return Err(StateStoreError::new(
@@ -437,18 +275,6 @@ fn ensure_range_active(state: &SqliteTxnState) -> Result<(), StateStoreError> {
     Ok(())
 }
 
-fn decode_revision(revision: &StoreRevision) -> Result<u64, StateStoreError> {
-    let bytes: [u8; 8] = revision
-        .as_bytes()
-        .try_into()
-        .map_err(|_| invalid_change_request())?;
-    let revision = u64::from_be_bytes(bytes);
-    if i64::try_from(revision).is_err() {
-        return Err(invalid_change_request());
-    }
-    Ok(revision)
-}
-
 const fn invalid_range_request() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::InvalidRequest,
@@ -456,23 +282,9 @@ const fn invalid_range_request() -> StateStoreError {
     )
 }
 
-const fn invalid_change_request() -> StateStoreError {
-    StateStoreError::new(
-        StateStoreErrorKind::InvalidRequest,
-        "invalid SQLite change request",
-    )
-}
-
 const fn malformed_revision() -> StateStoreError {
     StateStoreError::new(
         StateStoreErrorKind::Corruption,
         "SQLite state store revision is malformed",
-    )
-}
-
-const fn malformed_sequence() -> StateStoreError {
-    StateStoreError::new(
-        StateStoreErrorKind::Corruption,
-        "SQLite state store change sequence is malformed",
     )
 }

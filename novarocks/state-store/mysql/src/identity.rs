@@ -23,7 +23,7 @@ use uuid::{Uuid, Version};
 use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 
 use super::codec::MysqlCodec;
-use crate::MYSQL_MAX_META_VALUE_BYTES;
+use crate::{MYSQL_MAX_META_VALUE_BYTES, MYSQL_SCHEMA_VERSION};
 
 pub(super) const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";
 pub(super) const SCHEMA_DIGEST_KEY: &[u8] = b"schema_digest";
@@ -31,10 +31,8 @@ pub(super) const STORE_ID_KEY: &[u8] = b"store_id";
 pub(super) const CLUSTER_ID_KEY: &[u8] = b"cluster_id";
 pub(super) const INITIAL_INCARNATION_KEY: &[u8] = b"initial_incarnation";
 pub(super) const CURRENT_REVISION_KEY: &[u8] = b"current_revision";
-pub(super) const CHANGE_RETENTION_FLOOR_KEY: &[u8] = b"change_retention_floor";
 
-pub(super) const META_KEYS: [&[u8]; 7] = [
-    CHANGE_RETENTION_FLOOR_KEY,
+pub(super) const META_KEYS: [&[u8]; 6] = [
     CLUSTER_ID_KEY,
     CURRENT_REVISION_KEY,
     INITIAL_INCARNATION_KEY,
@@ -42,13 +40,6 @@ pub(super) const META_KEYS: [&[u8]; 7] = [
     SCHEMA_VERSION_KEY,
     STORE_ID_KEY,
 ];
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MysqlIdentitySnapshot {
-    pub identity: StoreIdentity,
-    pub current_revision: u64,
-    pub change_retention_floor: (u64, u32),
-}
 
 pub(super) fn advisory_lock_name(database: &str) -> String {
     let digest = Sha256::digest(database.as_bytes());
@@ -72,7 +63,10 @@ pub(super) fn initial_meta_rows(
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     let store_id = Uuid::now_v7();
     vec![
-        (SCHEMA_VERSION_KEY.to_vec(), 1_u32.to_be_bytes().to_vec()),
+        (
+            SCHEMA_VERSION_KEY.to_vec(),
+            MYSQL_SCHEMA_VERSION.to_be_bytes().to_vec(),
+        ),
         (
             SCHEMA_DIGEST_KEY.to_vec(),
             schema_digest.as_bytes().to_vec(),
@@ -87,10 +81,6 @@ pub(super) fn initial_meta_rows(
             CURRENT_REVISION_KEY.to_vec(),
             codec.encode_revision(0).to_vec(),
         ),
-        (
-            CHANGE_RETENTION_FLOOR_KEY.to_vec(),
-            codec.encode_cursor(0, u32::MAX).to_vec(),
-        ),
     ]
 }
 
@@ -99,7 +89,7 @@ pub(super) fn decode_meta_rows(
     rows: Vec<(Vec<u8>, Vec<u8>)>,
     expected_cluster_id: &str,
     expected_schema_digest: &str,
-) -> Result<MysqlIdentitySnapshot, StateStoreError> {
+) -> Result<StoreIdentity, StateStoreError> {
     let meta = rows.into_iter().collect::<BTreeMap<_, _>>();
     if meta.len() != META_KEYS.len() || META_KEYS.iter().any(|key| !meta.contains_key::<[u8]>(*key))
     {
@@ -135,21 +125,11 @@ pub(super) fn decode_meta_rows(
     // This experimental provider retains its legacy physical metadata while
     // the public StoreIdentity exposes only store and cluster identity.
     codec.decode_initial_incarnation(value(INITIAL_INCARNATION_KEY)?)?;
-    let current_revision = codec.decode_revision(value(CURRENT_REVISION_KEY)?)?;
-    let change_retention_floor = codec.decode_cursor(value(CHANGE_RETENTION_FLOOR_KEY)?)?;
-    if change_retention_floor != (0, u32::MAX) {
-        return Err(corruption(
-            "MySQL state store change retention floor is malformed or unsupported",
-        ));
-    }
+    codec.decode_revision(value(CURRENT_REVISION_KEY)?)?;
 
-    Ok(MysqlIdentitySnapshot {
-        identity: StoreIdentity {
-            store_id,
-            cluster_id,
-        },
-        current_revision,
-        change_retention_floor,
+    Ok(StoreIdentity {
+        store_id,
+        cluster_id,
     })
 }
 

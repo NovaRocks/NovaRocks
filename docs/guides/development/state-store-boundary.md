@@ -79,6 +79,44 @@ and teaches people to edit the guard instead of thinking about the boundary.
 Adding a neutral utility crate to the API is a review question; adding Arrow to
 it is a build failure.
 
+## Attempts, and what an outcome is worth
+
+A write is authorised by a `WriteAttempt` the open store instance issues. A
+consumer cannot mint one, and an attempt from a previous instance is refused
+rather than answered, so "ask the store about an id I made up" is no longer a
+question the contract can be asked.
+
+Three answers exist and they are not interchangeable:
+
+- **Committed** and **NotCommitted** are terminal and never flip.
+- **Unresolved** means nothing was proven. It is not a denial, and it grants no
+  right to run the work again.
+
+`NotCommitted` is a proof obligation. A provider may return it only once the
+attempt can no longer commit, its worker or connection has finished, and the
+evidence the decision rests on was readable at that moment. A failed read,
+released evidence, or work still in flight all produce `Unresolved`. The
+temptation to treat absent evidence as absence of a commit is the single most
+dangerous shortcut available here, and it is the thing the shared suite checks
+hardest.
+
+## Who cleans up, and when
+
+A provider releases the evidence for an outcome **it witnessed itself**,
+immediately after publishing the terminal — publish first, release second, so a
+later reader reads a recorded verdict rather than re-deriving one from evidence
+on its way out. When an outcome is instead recovered through adjudication, the
+supervisor publishes it and therefore releases the evidence.
+
+That leaves one case with nobody in it: an attempt whose commit was dispatched
+and whose handles were all dropped before anything settled. Those queue as
+abandoned, keep their capacity slot, and are returned by a host driving
+`drain_abandoned_attempts` — see `state_store::sweeper`. The supervisor spawns
+nothing, so an unwired host means the mechanism never runs.
+
+A provider that is not ready to release yet says so without it counting as a
+fault, so an ordinary sweep on a busy instance is quiet.
+
 ## What the guard cannot tell you
 
 It cannot tell you whether a type belongs in the contract at all. A contract

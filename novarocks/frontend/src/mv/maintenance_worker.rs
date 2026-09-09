@@ -62,6 +62,9 @@ pub(crate) struct FrontendMaintenanceWorkerDependencies {
     pub(crate) workload_lifecycle: FrontendServingLifecycle,
     pub(crate) coordinator_config: MaintenanceCoordinatorConfig,
     pub(crate) attempt_timeout: Duration,
+    /// Captured at construction because the worker runs on bare threads that
+    /// have no runtime of their own.
+    pub(crate) runtime: tokio::runtime::Handle,
 }
 
 /// A maintenance pass is intentionally observable, including every complete
@@ -339,6 +342,7 @@ impl FrontendMaintenanceWorker {
                 workload_lease.cancellation_source().view(),
                 Instant::now() + self.dependencies.attempt_timeout,
             ),
+            handle: self.dependencies.runtime.clone(),
         };
         let execution = MaintenanceCoordinator::execute_attempt(&attempt, &mut runner);
         self.coordinator
@@ -369,6 +373,35 @@ struct TableMaintenanceAutomaticRunner {
     engine: Arc<dyn TableMaintenanceEngine>,
     service: Arc<dyn TableMaintenanceService>,
     context: AutomaticMaintenanceContext,
+    /// Captured where the worker thread is spawned, because the thread itself
+    /// has no runtime of its own.
+    handle: tokio::runtime::Handle,
+}
+
+impl TableMaintenanceAutomaticRunner {
+    /// Runs one durable maintenance action from a bare worker thread.
+    ///
+    /// Automatic maintenance fans out over `std::thread` rather than tasks, so
+    /// this adapter has no async context to await in. The maintenance service
+    /// is async because its work is durable I/O, and the adaptation therefore
+    /// happens here — in the type whose whole purpose is to present that
+    /// service to a thread-based runner — and in no domain contract. It goes
+    /// away when the maintenance workers become tasks.
+    fn run_durably(
+        &self,
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
+        let future = self.service.execute_automatic_action_with_context(
+            self.engine.as_ref(),
+            request,
+            &self.context,
+        );
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+            Err(_) => self.handle.block_on(future),
+        }
+        .map_err(durable_service_error)
+    }
 }
 
 impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
@@ -376,18 +409,14 @@ impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
         &mut self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
-        self.service
-            .execute_automatic_action_with_context(self.engine.as_ref(), request, &self.context)
-            .map_err(durable_service_error)
+        self.run_durably(request)
     }
 
     fn rewrite_position_deletes_durably(
         &mut self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
-        self.service
-            .execute_automatic_action_with_context(self.engine.as_ref(), request, &self.context)
-            .map_err(durable_service_error)
+        self.run_durably(request)
     }
 
     fn optimize_durably(

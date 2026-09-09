@@ -8,7 +8,7 @@ superseded-by: null
 date: 2026-09-09
 provenance:
   - "discussion: 2026-09-09 StateStore contract package independence and test-mechanics isolation"
-  - "PR: <backfill after merge>"
+  - "PR: StateStore contract and testkit crate split #1031"
 code-anchors:
   - "novarocks/state-store/api/src/lib.rs (StateStore, StateStoreProviderFactory)"
   - "novarocks/state-store/testkit/src/lib.rs (conformance, testing)"

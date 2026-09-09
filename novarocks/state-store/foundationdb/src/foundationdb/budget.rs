@@ -15,22 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::codec::{ATTEMPT_TAG_BYTES, REVISION_BYTES};
 use novarocks_state_store_api::{
     Precondition, StateStoreError, StateStoreErrorKind, StateStoreLimits,
 };
 
 const RECORD_TAG_BYTES: usize = 1;
-const RECORD_ENVELOPE_BYTES: usize = 1 + 16;
-const CHANGE_TAG_BYTES: usize = 1;
-const REVISION_BYTES: usize = 10;
-const SEQUENCE_BYTES: usize = 4;
+const RECORD_ENVELOPE_BYTES: usize = 1 + ATTEMPT_TAG_BYTES;
 const VERSIONSTAMP_TRAILER_BYTES: usize = 4;
 const COMMIT_TAG_BYTES: usize = 1;
-const TRANSACTION_ID_BYTES: usize = 16;
-const PENDING_VALUE_BYTES: usize = 1 + 16;
 const COMMITTED_VALUE_OPERAND_BYTES: usize = 1 + REVISION_BYTES + VERSIONSTAMP_TRAILER_BYTES;
-const HIGH_WATERMARK_FIELD_BYTES: usize = 2;
-const HIGH_WATERMARK_OPERAND_BYTES: usize = REVISION_BYTES + VERSIONSTAMP_TRAILER_BYTES;
 
 #[derive(Clone, Debug)]
 pub(super) struct TransactionBudget {
@@ -128,20 +122,14 @@ impl TransactionBudget {
 }
 
 fn fixed_envelope_bytes(root_len: usize) -> Result<usize, StateStoreError> {
-    let commit_key = checked_add(root_len, COMMIT_TAG_BYTES + TRANSACTION_ID_BYTES)?;
-    let high_watermark_key = checked_add(root_len, HIGH_WATERMARK_FIELD_BYTES)?;
-    let mut bytes = 0;
-    // Reservation read/write plus exact read/write conflict endpoints.
-    bytes = checked_add(bytes, commit_key)?;
-    bytes = checked_add(bytes, PENDING_VALUE_BYTES)?;
-    bytes = checked_add(bytes, checked_mul(exact_conflict_bytes(commit_key)?, 2)?)?;
-    // Data transaction terminal state and versionstamped high-watermark mutations.
-    bytes = checked_add(bytes, commit_key)?;
+    // The data transaction stages exactly one fixed mutation: the
+    // versionstamped commit-state value that is this attempt's only durable
+    // evidence. There is no separate reservation transaction and no change-feed
+    // high watermark any more, so nothing else is charged up front.
+    let commit_key = checked_add(root_len, COMMIT_TAG_BYTES + ATTEMPT_TAG_BYTES)?;
+    let mut bytes = commit_key;
     bytes = checked_add(bytes, COMMITTED_VALUE_OPERAND_BYTES)?;
     bytes = checked_add(bytes, exact_conflict_bytes(commit_key)?)?;
-    bytes = checked_add(bytes, high_watermark_key)?;
-    bytes = checked_add(bytes, HIGH_WATERMARK_OPERAND_BYTES)?;
-    bytes = checked_add(bytes, exact_conflict_bytes(high_watermark_key)?)?;
     Ok(bytes)
 }
 
@@ -153,15 +141,9 @@ fn accounted_put_bytes(
 ) -> Result<usize, StateStoreError> {
     let record_key = checked_add(checked_add(root_len, RECORD_TAG_BYTES)?, key_len)?;
     let record_value = checked_add(RECORD_ENVELOPE_BYTES, value_len)?;
-    let change_key_operand = checked_add(
-        root_len,
-        CHANGE_TAG_BYTES + REVISION_BYTES + SEQUENCE_BYTES + VERSIONSTAMP_TRAILER_BYTES,
-    )?;
     let mut bytes = logical_request_bytes(key_len, value_len, precondition)?;
     bytes = checked_add(bytes, record_key)?;
     bytes = checked_add(bytes, record_value)?;
-    bytes = checked_add(bytes, change_key_operand)?;
-    bytes = checked_add(bytes, key_len)?;
     // Non-snapshot precondition read and ordinary set exact conflicts.
     bytes = checked_add(bytes, checked_mul(exact_conflict_bytes(record_key)?, 2)?)?;
     Ok(bytes)
@@ -173,14 +155,8 @@ fn accounted_delete_bytes(
     precondition: &Precondition,
 ) -> Result<usize, StateStoreError> {
     let record_key = checked_add(checked_add(root_len, RECORD_TAG_BYTES)?, key_len)?;
-    let change_key_operand = checked_add(
-        root_len,
-        CHANGE_TAG_BYTES + REVISION_BYTES + SEQUENCE_BYTES + VERSIONSTAMP_TRAILER_BYTES,
-    )?;
     let mut bytes = logical_request_bytes(key_len, 0, precondition)?;
     bytes = checked_add(bytes, record_key)?;
-    bytes = checked_add(bytes, change_key_operand)?;
-    bytes = checked_add(bytes, key_len)?;
     bytes = checked_add(bytes, checked_mul(exact_conflict_bytes(record_key)?, 2)?)?;
     Ok(bytes)
 }
@@ -251,17 +227,17 @@ mod tests {
 
         assert_eq!(
             fixed_envelope_bytes(root_len).expect("fixed accounting"),
-            434
+            157
         );
         assert_eq!(
             accounted_put_bytes(root_len, key_len, value_len, &Precondition::Any)
                 .expect("put accounting"),
-            208
+            172
         );
         assert_eq!(
             accounted_delete_bytes(root_len, key_len, &Precondition::Any)
                 .expect("delete accounting"),
-            181
+            137
         );
 
         let fixed = fixed_envelope_bytes(root_len).expect("fixed accounting");
@@ -279,9 +255,9 @@ mod tests {
         let root_len = 22;
         let key = b"key";
         let value = b"value";
-        let fixed = 434;
-        let put = 208;
-        let delete = 181;
+        let fixed = 157;
+        let put = 172;
+        let delete = 137;
         let get = 2 * (root_len + RECORD_TAG_BYTES + key.len()) + 1;
 
         assert_eq!(
@@ -380,8 +356,16 @@ mod tests {
         }
         assert_eq!(
             max_value_budget.accounted_bytes(),
-            CONFORMANCE_TRANSACTION_BYTES - 1
+            fixed_envelope_bytes(KEYSPACE_ROOT_BYTES).expect("fixed envelope")
+                + 4 * accounted_put_bytes(
+                    KEYSPACE_ROOT_BYTES,
+                    CONFORMANCE_KEY_BYTES,
+                    CONFORMANCE_MAX_VALUE_BYTES,
+                    &Precondition::Any,
+                )
+                .expect("max-sized put accounting")
         );
+        assert!(max_value_budget.accounted_bytes() < CONFORMANCE_TRANSACTION_BYTES);
         assert_eq!(
             max_value_budget
                 .stage_put(

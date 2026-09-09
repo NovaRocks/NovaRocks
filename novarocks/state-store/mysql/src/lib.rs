@@ -21,7 +21,6 @@
 //! deliberately contains no application host, registry, or TOML wire model.
 
 mod budget;
-mod changes;
 mod client;
 mod codec;
 mod commit;
@@ -30,6 +29,7 @@ mod error;
 #[doc(hidden)]
 pub mod helper_protocol;
 mod identity;
+mod metrics;
 #[cfg(feature = "state-store-test-hooks")]
 mod open_test_hooks;
 mod provider;
@@ -47,6 +47,7 @@ pub mod test_support;
 use std::fmt;
 use std::fs::File;
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,16 +57,30 @@ use async_trait::async_trait;
 use novarocks_secret::SecretValue;
 use tokio::time::Instant;
 
-use self::identity::MysqlIdentitySnapshot;
+use self::commit::MysqlEvidence;
+use self::metrics::StateStoreMetrics;
 use self::runtime::MysqlProviderHandle;
 use novarocks_state_store_api::{
-    ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot,
-    StateStoreProviderId, StoreIdentity, TransactionId, WriteTransaction,
+    AttemptSupervisor, DEFAULT_MAX_OUTSTANDING_ATTEMPTS, InDoubtAdjudicator, ReadTransaction,
+    StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreProviderId,
+    StoreIdentity, WriteAttempt, WriteTransaction,
 };
 
 pub const MYSQL_STATE_STORE_PROVIDER_ID: StateStoreProviderId = StateStoreProviderId::new("mysql");
 pub const MYSQL_MAX_KEY_BYTES: usize = 3072;
+/// Physical width of the commit ledger key.
+///
+/// An attempt renders as `<instance scope uuid>:<sequence>`, so 36 + 1 + 20
+/// bytes is the widest identity this instance can issue.
+pub(crate) const MYSQL_MAX_ATTEMPT_ID_BYTES: usize = 64;
+/// Physical format generation.
+///
+/// Bumped from 1 when the change feed and its retention floor were removed and
+/// the commit ledger was rekeyed from a caller-minted transaction UUID to an
+/// issued attempt identity. The schema digest would have rejected an old
+/// database on its own; the version is what says *why*, and neither gate
+/// migrates -- an older store is refused, never rewritten.
+pub(crate) const MYSQL_SCHEMA_VERSION: u32 = 2;
 const MYSQL_MAX_META_VALUE_BYTES: usize = 4096;
 const MYSQL_MAX_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const MYSQL_MAX_INACTIVE_CONNECTION_TTL_MS: u64 = 86_400_000;
@@ -230,9 +245,11 @@ pub use test_config::{MysqlTestLimitOverrides, MysqlTestProviderConfig, MysqlTes
 
 struct MysqlStateStore {
     lease: MysqlProviderHandle,
-    identity: MysqlIdentitySnapshot,
+    identity: StoreIdentity,
     limits: StateStoreLimits,
     metrics: Arc<StateStoreMetrics>,
+    attempts: AttemptSupervisor,
+    evidence: Arc<MysqlEvidence>,
 }
 
 #[derive(Clone)]
@@ -246,6 +263,7 @@ impl MysqlStateStore {
         database: String,
         cluster_id: String,
         limits: StateStoreLimits,
+        outstanding_attempts: NonZeroUsize,
         deadline: Instant,
         cancellation: MysqlOpenCancellation,
     ) -> Result<Self, StateStoreError> {
@@ -260,13 +278,29 @@ impl MysqlStateStore {
         .await?;
         cancellation.check()?;
         tracing::info!(provider = "mysql", client_status = "ready", identity_hash = %codec::redacted_identity_hash(format!("{database}\0{cluster_id}").as_bytes()), "MySQL state store client is ready");
+        let evidence = Arc::new(MysqlEvidence::new(
+            lease.pool(),
+            lease.operations(),
+            codec::MysqlCodec::new(limits.max_key_bytes)?,
+            limits.transaction_deadline,
+        ));
+        let attempts = AttemptSupervisor::new(
+            outstanding_attempts,
+            Arc::clone(&evidence) as Arc<dyn InDoubtAdjudicator>,
+        );
         Ok(Self {
             lease,
             identity,
             limits,
-            metrics: Arc::new(StateStoreMetrics::new(MYSQL_STATE_STORE_PROVIDER_ID)),
+            metrics: Arc::new(StateStoreMetrics::new()),
+            attempts,
+            evidence,
         })
     }
+}
+
+pub(crate) fn default_attempt_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_MAX_OUTSTANDING_ATTEMPTS).expect("default attempt capacity")
 }
 
 impl MysqlOpenCancellation {
@@ -294,8 +328,8 @@ impl StateStore for MysqlStateStore {
     fn limits(&self) -> &StateStoreLimits {
         &self.limits
     }
-    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-        self.metrics.snapshot()
+    fn attempts(&self) -> &AttemptSupervisor {
+        &self.attempts
     }
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
         let operation = self.lease.acquire_operation()?;
@@ -311,68 +345,29 @@ impl StateStore for MysqlStateStore {
     }
     async fn begin_write(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
         _purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
+        // A capability another instance issued is refused before anything is
+        // acquired, so a handle retained across a reopen cannot address this
+        // store and is left provably without effect.
+        attempt.require_scope(self.attempts.scope())?;
         let operation = self.lease.acquire_operation()?;
         Ok(Box::new(
             txn::begin_write(
                 self.lease.pool(),
                 operation,
-                transaction_id,
+                attempt,
+                Arc::clone(&self.evidence),
                 self.limits.clone(),
                 Arc::clone(&self.metrics),
             )
             .await?,
         ))
     }
-    async fn poll_changes(
-        &self,
-        request: &ChangePollRequest,
-    ) -> Result<ChangePage, StateStoreError> {
-        let operation = self.lease.acquire_operation()?;
-        let pool = self.lease.pool();
-        let identity = self.identity.clone();
-        let request = request.clone();
-        let limits = self.limits.clone();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _operation = operation;
-            let result = changes::poll_changes(pool, &identity, &request, &limits).await;
-            let _ = sender.send(result);
-        });
-        receiver.await.map_err(|_| {
-            StateStoreError::new(
-                StateStoreErrorKind::ProviderUnavailable,
-                "MySQL change polling supervisor stopped unexpectedly",
-            )
-        })?
-    }
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
         let _operation = self.lease.acquire_operation()?;
-        Ok(self.identity.identity.clone())
-    }
-    async fn resolve_commit(
-        &self,
-        transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError> {
-        let operation = self.lease.acquire_operation()?;
-        let codec = codec::MysqlCodec::new(self.limits.max_key_bytes)?;
-        let pool = self.lease.pool();
-        let transaction_id = *transaction_id;
-        let deadline = Instant::now() + self.limits.transaction_deadline;
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _operation = operation;
-            let result = commit::resolve_commit(pool, &codec, &transaction_id, deadline).await;
-            let _ = sender.send(result);
-        });
-        receiver.await.map_err(|_| {
-            StateStoreError::new(
-                StateStoreErrorKind::ProviderUnavailable,
-                "MySQL commit resolution supervisor stopped unexpectedly",
-            )
-        })?
+        Ok(self.identity.clone())
     }
 }
 

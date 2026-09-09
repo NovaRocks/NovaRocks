@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_state_store_api::{
-    CommitOutcome, CommitResolution, Key, KeyRange, Precondition as StorePrecondition,
-    RangeRequest, StateRecord, StateStore, TransactionId, Value, VersionToken, WriteTransaction,
+    AttemptOutcome, CommitObservation, CommitOutcome, Key, KeyRange,
+    Precondition as StorePrecondition, RangeRequest, StateRecord, StateStore, Value, VersionToken,
+    WriteTransaction,
 };
 use novarocks_state_store_foundationdb::{
     FoundationDbClientConfig, FoundationDbProviderTestHarness, FoundationDbTestLimitOverrides,
@@ -34,6 +35,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+/// A helper-local name for one write.
+///
+/// It is deliberately not a store identity: an attempt is issued by the opened
+/// instance and cannot be built from bytes, so nothing a peer process sends can
+/// address a write this process made. The handle only says which of *this*
+/// helper's transactions a command is about.
+pub type Handle = Uuid;
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum Command {
     Open {
@@ -41,40 +50,40 @@ pub enum Command {
         keyspace_id: Uuid,
     },
     Begin {
-        transaction_id: Uuid,
+        handle: Uuid,
         description: String,
     },
     Get {
-        transaction_id: Uuid,
+        handle: Uuid,
         key: Vec<u8>,
     },
     Range {
-        transaction_id: Uuid,
+        handle: Uuid,
         start: Vec<u8>,
         end: Vec<u8>,
         direction: Direction,
         page_size: usize,
     },
     Put {
-        transaction_id: Uuid,
+        handle: Uuid,
         key: Vec<u8>,
         value: Vec<u8>,
         precondition: Precondition,
     },
     Delete {
-        transaction_id: Uuid,
+        handle: Uuid,
         key: Vec<u8>,
         precondition: Precondition,
     },
     Commit {
-        transaction_id: Uuid,
+        handle: Uuid,
         hold_pre_native: bool,
     },
     Resolve {
-        transaction_id: Uuid,
+        handle: Uuid,
     },
     Release {
-        transaction_id: Uuid,
+        handle: Uuid,
     },
     Shutdown,
 }
@@ -101,41 +110,41 @@ enum RawCommand {
         keyspace_id: Uuid,
     },
     Begin {
-        transaction_id: Uuid,
+        handle: Uuid,
         description: String,
     },
     Get {
-        transaction_id: Uuid,
+        handle: Uuid,
         key: String,
     },
     Range {
-        transaction_id: Uuid,
+        handle: Uuid,
         start: String,
         end: String,
         direction: Direction,
         page_size: usize,
     },
     Put {
-        transaction_id: Uuid,
+        handle: Uuid,
         key: String,
         value: String,
         precondition: RawPrecondition,
     },
     Delete {
-        transaction_id: Uuid,
+        handle: Uuid,
         key: String,
         precondition: RawPrecondition,
     },
     Commit {
-        transaction_id: Uuid,
+        handle: Uuid,
         #[serde(default)]
         hold_pre_native: bool,
     },
     Resolve {
-        transaction_id: Uuid,
+        handle: Uuid,
     },
     Release {
-        transaction_id: Uuid,
+        handle: Uuid,
     },
     Shutdown,
 }
@@ -172,61 +181,58 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
             keyspace_id,
         }),
         RawCommand::Begin {
-            transaction_id,
+            handle,
             description,
         } => Ok(Command::Begin {
-            transaction_id,
+            handle,
             description,
         }),
-        RawCommand::Get {
-            transaction_id,
-            key,
-        } => Ok(Command::Get {
-            transaction_id,
+        RawCommand::Get { handle, key } => Ok(Command::Get {
+            handle,
             key: decode_hex("key", &key)?,
         }),
         RawCommand::Range {
-            transaction_id,
+            handle,
             start,
             end,
             direction,
             page_size,
         } => Ok(Command::Range {
-            transaction_id,
+            handle,
             start: decode_hex("range start", &start)?,
             end: decode_hex("range end", &end)?,
             direction,
             page_size,
         }),
         RawCommand::Put {
-            transaction_id,
+            handle,
             key,
             value,
             precondition,
         } => Ok(Command::Put {
-            transaction_id,
+            handle,
             key: decode_hex("key", &key)?,
             value: decode_hex("value", &value)?,
             precondition: decode_precondition(precondition)?,
         }),
         RawCommand::Delete {
-            transaction_id,
+            handle,
             key,
             precondition,
         } => Ok(Command::Delete {
-            transaction_id,
+            handle,
             key: decode_hex("key", &key)?,
             precondition: decode_precondition(precondition)?,
         }),
         RawCommand::Commit {
-            transaction_id,
+            handle,
             hold_pre_native,
         } => Ok(Command::Commit {
-            transaction_id,
+            handle,
             hold_pre_native,
         }),
-        RawCommand::Resolve { transaction_id } => Ok(Command::Resolve { transaction_id }),
-        RawCommand::Release { transaction_id } => Ok(Command::Release { transaction_id }),
+        RawCommand::Resolve { handle } => Ok(Command::Resolve { handle }),
+        RawCommand::Release { handle } => Ok(Command::Release { handle }),
         RawCommand::Shutdown => Ok(Command::Shutdown),
     }
 }
@@ -311,8 +317,11 @@ struct PendingCommit {
 struct HelperState {
     runtime: Option<FoundationDbProviderTestHarness>,
     store: Option<Arc<dyn StateStore>>,
-    transactions: HashMap<Uuid, Box<dyn WriteTransaction>>,
-    pending: HashMap<Uuid, PendingCommit>,
+    transactions: HashMap<Handle, Box<dyn WriteTransaction>>,
+    /// Retained past the commit, because after it the observation is the only
+    /// thing that can say what happened to the attempt.
+    observations: HashMap<Handle, CommitObservation>,
+    pending: HashMap<Handle, PendingCommit>,
     terminal_error: Option<String>,
 }
 
@@ -324,40 +333,34 @@ impl HelperState {
                 keyspace_id,
             } => self.open(cluster_id, keyspace_id).await,
             Command::Begin {
-                transaction_id,
+                handle,
                 description,
-            } => self.begin(transaction_id, description).await,
-            Command::Get {
-                transaction_id,
-                key,
-            } => self.get(transaction_id, key).await,
+            } => self.begin(handle, description).await,
+            Command::Get { handle, key } => self.get(handle, key).await,
             Command::Range {
-                transaction_id,
+                handle,
                 start,
                 end,
                 direction,
                 page_size,
-            } => {
-                self.range(transaction_id, start, end, direction, page_size)
-                    .await
-            }
+            } => self.range(handle, start, end, direction, page_size).await,
             Command::Put {
-                transaction_id,
+                handle,
                 key,
                 value,
                 precondition,
-            } => self.put(transaction_id, key, value, precondition).await,
+            } => self.put(handle, key, value, precondition).await,
             Command::Delete {
-                transaction_id,
+                handle,
                 key,
                 precondition,
-            } => self.delete(transaction_id, key, precondition).await,
+            } => self.delete(handle, key, precondition).await,
             Command::Commit {
-                transaction_id,
+                handle,
                 hold_pre_native,
-            } => self.commit(transaction_id, hold_pre_native).await,
-            Command::Resolve { transaction_id } => self.resolve(transaction_id).await,
-            Command::Release { transaction_id } => self.release(transaction_id).await,
+            } => self.commit(handle, hold_pre_native).await,
+            Command::Resolve { handle } => self.resolve(handle).await,
+            Command::Release { handle } => self.release(handle).await,
             Command::Shutdown => self.shutdown().await,
         }
     }
@@ -403,29 +406,25 @@ impl HelperState {
         Ok(Response::success("Opened"))
     }
 
-    async fn begin(
-        &mut self,
-        transaction_id: Uuid,
-        description: String,
-    ) -> Result<Response, String> {
-        if self.transactions.contains_key(&transaction_id)
-            || self.pending.contains_key(&transaction_id)
-        {
-            return Err(format!("transaction {transaction_id} is already active"));
+    async fn begin(&mut self, handle: Uuid, description: String) -> Result<Response, String> {
+        if self.transactions.contains_key(&handle) || self.pending.contains_key(&handle) {
+            return Err(format!("transaction {handle} is already active"));
         }
-        let transaction = self
-            .store()?
-            .begin_write(transaction_id.into(), &description)
+        let store = self.store()?;
+        let (attempt, observation) = store.attempts().reserve().map_err(display_error)?;
+        let transaction = store
+            .begin_write(attempt, &description)
             .await
             .map_err(display_error)?;
-        self.transactions.insert(transaction_id, transaction);
+        self.observations.insert(handle, observation);
+        self.transactions.insert(handle, transaction);
         Ok(Response::success("Begun"))
     }
 
-    async fn get(&mut self, transaction_id: Uuid, raw_key: Vec<u8>) -> Result<Response, String> {
+    async fn get(&mut self, handle: Uuid, raw_key: Vec<u8>) -> Result<Response, String> {
         let key = store_key(raw_key)?;
         let record = self
-            .transaction_mut(transaction_id)?
+            .transaction_mut(handle)?
             .get(&key)
             .await
             .map_err(display_error)?;
@@ -436,7 +435,7 @@ impl HelperState {
 
     async fn range(
         &mut self,
-        transaction_id: Uuid,
+        handle: Uuid,
         raw_start: Vec<u8>,
         raw_end: Vec<u8>,
         direction: Direction,
@@ -453,7 +452,7 @@ impl HelperState {
             continuation: None,
         };
         let page = self
-            .transaction_mut(transaction_id)?
+            .transaction_mut(handle)?
             .range(&request)
             .await
             .map_err(display_error)?;
@@ -464,13 +463,13 @@ impl HelperState {
 
     async fn put(
         &mut self,
-        transaction_id: Uuid,
+        handle: Uuid,
         raw_key: Vec<u8>,
         raw_value: Vec<u8>,
         precondition: Precondition,
     ) -> Result<Response, String> {
         let precondition = store_precondition(precondition)?;
-        self.transaction_mut(transaction_id)?
+        self.transaction_mut(handle)?
             .put(
                 store_key(raw_key)?,
                 Value::try_from(Bytes::from(raw_value)).map_err(display_error)?,
@@ -483,28 +482,24 @@ impl HelperState {
 
     async fn delete(
         &mut self,
-        transaction_id: Uuid,
+        handle: Uuid,
         raw_key: Vec<u8>,
         precondition: Precondition,
     ) -> Result<Response, String> {
         let key = store_key(raw_key)?;
         let precondition = store_precondition(precondition)?;
-        self.transaction_mut(transaction_id)?
+        self.transaction_mut(handle)?
             .delete(key, precondition)
             .await
             .map_err(display_error)?;
         Ok(Response::success("Staged"))
     }
 
-    async fn commit(
-        &mut self,
-        transaction_id: Uuid,
-        hold_pre_native: bool,
-    ) -> Result<Response, String> {
+    async fn commit(&mut self, handle: Uuid, hold_pre_native: bool) -> Result<Response, String> {
         let transaction = self
             .transactions
-            .remove(&transaction_id)
-            .ok_or_else(|| format!("transaction {transaction_id} is not active"))?;
+            .remove(&handle)
+            .ok_or_else(|| format!("transaction {handle} is not active"))?;
         if !hold_pre_native {
             return Ok(commit_response(transaction.commit().await));
         }
@@ -512,24 +507,29 @@ impl HelperState {
         let owner = tokio::spawn(async move { transaction.commit().await });
         control.wait_pre_native().await;
         self.pending
-            .insert(transaction_id, PendingCommit { control, owner });
+            .insert(handle, PendingCommit { control, owner });
         Ok(Response::success("CommitHeld"))
     }
 
-    async fn resolve(&self, transaction_id: Uuid) -> Result<Response, String> {
-        let resolution = self
-            .store()?
-            .resolve_commit(&TransactionId::from(transaction_id))
-            .await
-            .map_err(display_error)?;
-        Ok(resolution_response(resolution))
+    /// Answers for a write *this* helper made.
+    ///
+    /// There is deliberately no way to ask about a peer's write: an attempt is
+    /// scoped to the instance that issued it, so an unknown handle is an error
+    /// rather than a verdict of "not committed".
+    async fn resolve(&self, handle: Handle) -> Result<Response, String> {
+        let observation = self
+            .observations
+            .get(&handle)
+            .ok_or_else(|| format!("handle {handle} was never issued by this process"))?;
+        let outcome = observation.outcome().await.map_err(display_error)?;
+        Ok(resolution_response(outcome))
     }
 
-    async fn release(&mut self, transaction_id: Uuid) -> Result<Response, String> {
+    async fn release(&mut self, handle: Uuid) -> Result<Response, String> {
         let pending = self
             .pending
-            .remove(&transaction_id)
-            .ok_or_else(|| format!("transaction {transaction_id} is not held"))?;
+            .remove(&handle)
+            .ok_or_else(|| format!("transaction {handle} is not held"))?;
         pending.control.release_pre_native();
         let outcome = pending
             .owner
@@ -540,6 +540,7 @@ impl HelperState {
 
     async fn shutdown(&mut self) -> Result<Response, String> {
         self.transactions.clear();
+        self.observations.clear();
         let pending = std::mem::take(&mut self.pending);
         for (_, pending) in pending {
             pending.control.release_pre_native();
@@ -565,13 +566,10 @@ impl HelperState {
             .ok_or_else(|| "helper is not open".to_owned())
     }
 
-    fn transaction_mut(
-        &mut self,
-        transaction_id: Uuid,
-    ) -> Result<&mut Box<dyn WriteTransaction>, String> {
+    fn transaction_mut(&mut self, handle: Uuid) -> Result<&mut Box<dyn WriteTransaction>, String> {
         self.transactions
-            .get_mut(&transaction_id)
-            .ok_or_else(|| format!("transaction {transaction_id} is not active"))
+            .get_mut(&handle)
+            .ok_or_else(|| format!("transaction {handle} is not active"))
     }
 }
 
@@ -652,18 +650,19 @@ fn commit_response(outcome: CommitOutcome) -> Response {
     response
 }
 
-fn resolution_response(resolution: CommitResolution) -> Response {
+fn resolution_response(outcome: AttemptOutcome) -> Response {
     let mut response = Response::success("Resolve");
-    match resolution {
-        CommitResolution::Committed(receipt) => {
+    match outcome {
+        AttemptOutcome::Committed(receipt) => {
             response.resolution = Some("Committed".to_owned());
             response.revision = Some(hex::encode(receipt.revision.as_bytes()));
         }
-        CommitResolution::NotCommitted => {
+        AttemptOutcome::NotCommitted => {
             response.resolution = Some("NotCommitted".to_owned());
         }
-        CommitResolution::Unresolved => {
-            response.resolution = Some("Pending".to_owned());
+        // Not a terminal, and deliberately not reported as one.
+        AttemptOutcome::Unresolved => {
+            response.resolution = Some("Unresolved".to_owned());
         }
     }
     response

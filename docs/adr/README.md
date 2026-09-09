@@ -131,6 +131,7 @@ code-anchors:
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
+- ADR-0141 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
 
 #### 历史
 
@@ -266,7 +267,7 @@ fencing/takeover 仍须单独裁决。
 
 #### 历史
 
- - ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（superseded → ADR-0111）
+- ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（superseded → ADR-0111）
 - ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（superseded → ADR-0105）
 - ADR-0105 — Provider wire authority 为何与 SPI domain carrier 分离、但仍保持单一 Protocol digest（superseded → ADR-0106）
 
@@ -282,8 +283,8 @@ generation；`Absent`（未知）与 `Unavailable`（本机未物化）永远分
 admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。跨 family 的同事务约束不可用：被读的一侧若是
 可清除的加速态，那个「保证」会在缓存被清空时静默消失。
 
-- ADR-0115 — catalog 期望态为何收敛为单一 typed 快照 + 三个互斥 source mode（active）
-- ADR-0116 — `DROP CATALOG` 的 MV 引用检查为何降级为 best-effort 运维保护（active）
+- ADR-0115 — catalog 期望态为何收敛为单一 typed 快照 + 三个互斥 source mode（active；其继承自 ADR-0066 的 durable change-hint 机制已由 ADR-0141 换成进程内唤醒 + 周期 sweep，快照与重读裁决不变）
+- ADR-0116 — `DROP CATALOG` 的 MV 引用检查为何降级为 best-effort 运维保护（active；裁决第 4 条点名的 `resolve_commit` 已由 ADR-0141 换成 attempt 观察，未知即三态的语义不变）
 
 历史：
 
@@ -306,6 +307,7 @@ admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。跨 
 StateStore 的全局单值限制保持公共契约，record owner 负责自己的 schema、状态机与错误映射，索引和控制值保持独立小值路径。
 
 - ADR-0074 — Frontend durable record 为何统一采用有界 canonical 编码与整记录预算（active）
+- ADR-0141 — StateStore 为何只回答自己签发过的 attempt，并把提交结果收敛为不可翻转的三态（active）
 
 ### frontend-dml
 
@@ -385,7 +387,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
-- ADR-0122 — SQLite 为何是唯一 production StateStore、远程 provider 仅保留实验 leaf crate（active）
+- ADR-0122 — SQLite 为何是唯一 production StateStore、远程 provider 仅保留实验 leaf crate（active；其中 schema 版本、history 保留与 commit-resolution 三项承诺已由 ADR-0141 替换，产品裁决仍有效）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active）
 - ADR-0142 — NovaRocks 自有 packages 为何共享一个 Cargo workspace、resolver 与 lock authority（active）
 
