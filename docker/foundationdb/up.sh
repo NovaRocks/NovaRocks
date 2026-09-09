@@ -219,6 +219,27 @@ if [[ ! "$docker_timeout_seconds" =~ ^[1-9][0-9]*$ || ! "$ready_timeout_seconds"
   exit 2
 fi
 
+# Fixtures never pull during a run. `pull_policy: never` in compose.yml
+# refuses the download; this turns a missing image into an actionable message.
+fdb_image="$(run_with_timeout 15 docker compose \
+  --env-file "$compose_env" \
+  -p "$compose_project" \
+  -f "$compose_file" \
+  config --images | awk 'NF { print; exit }')"
+if [[ -z "$fdb_image" ]]; then
+  echo "cannot resolve the FoundationDB service image from $compose_file" >&2
+  exit 1
+fi
+if ! run_with_timeout 15 docker image inspect "$fdb_image" >/dev/null 2>&1; then
+  cat >&2 <<EOF
+Missing local image (FoundationDB server): $fdb_image
+
+This fixture never pulls during a run. Import it once, then re-run:
+  docker pull $fdb_image
+EOF
+  exit 1
+fi
+
 run_with_timeout "$docker_timeout_seconds" docker compose \
   --env-file "$compose_env" \
   -p "$compose_project" \

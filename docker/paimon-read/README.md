@@ -4,13 +4,34 @@
 
 ## 固定输入
 
-- Spark 基础镜像固定为 `apache/spark:3.5.3` 的 Linux/amd64 manifest digest。所有主机都运行同一个 manifest，包括 Apple Silicon Docker Desktop。
+- Spark 基础镜像固定为 `apache/spark:3.5.3` 的 Linux/amd64 manifest digest。所有主机都运行同一个 manifest，包括 Apple Silicon Docker Desktop。该 manifest 必须**预先存在于本机镜像库**：准备过程只从本地取镜像，绝不现场拉取。
 - `paimon-spark-3.5:1.3.1` 与 `paimon-s3:1.3.1` 固定 Maven Central 坐标、字节数和 SHA-1。镜像构建时同时校验长度和 checksum。
 - writer 使用独立镜像和一次性容器，不向共享 Iceberg Spark 服务安装 JAR。
 - warehouse 位于 `s3://novarocks/fixtures/paimon-read/<env>/<run>-<digest>`；生成器拒绝其他 bucket、共享 benchmark prefix、路径跳转和自由指定的清理目标。
 
-如果 Docker daemon 无法访问 Docker Hub，可以显式设置
-`PAIMON_SPARK_IMAGE_REPOSITORY=dockerproxy.net/apache/spark`。该值只替换镜像仓库传输路径；构建仍强制使用 `versions.env` 中同一个 Linux/amd64 manifest digest，并把实际仓库写入证据 manifest。
+## 基础镜像必须在本机
+
+准备过程从不拉镜像，镜像缺失是错误而不是下载。首次使用先把固定 manifest 导入本机，之后离线也能跑：
+
+```bash
+docker pull --platform linux/amd64 \
+  apache/spark@sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955
+```
+
+如果 Docker daemon 无法访问 Docker Hub，就用能通的镜像站拉**同一个 digest**，再用
+`PAIMON_SPARK_IMAGE_REPOSITORY` 告诉 fixture 它在本机叫什么：
+
+```bash
+docker pull --platform linux/amd64 \
+  dockerproxy.net/apache/spark@sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955
+PAIMON_SPARK_IMAGE_REPOSITORY=dockerproxy.net/apache/spark docker/paimon-read/prepare.sh ...
+```
+
+该值只是本机镜像的名字；构建仍强制使用 `versions.env` 中同一个 Linux/amd64 manifest digest，并把实际仓库写入证据 manifest。
+
+`fixture.py` 会先在本机按 digest 找到这个 manifest、校验它的平台与身份，再打一个本地别名 tag 交给
+BuildKit。Dockerfile 里**不能**写 digest 形式的 `FROM`：BuildKit 对 `FROM repo@sha256:...`
+一律先去 registry 解析元数据，本地已有同一个镜像且 RepoDigest 完全匹配也不例外，于是连一次完全命中缓存的构建都会变成 registry 往返，在拉不到 registry 的机器上直接失败。digest 仍是唯一权威，只是校验点从 BuildKit 的 resolver 移到了显式预检。
 
 版本和 checksum 的唯一清单是 [versions.env](versions.env)。变更任何镜像、JAR、SQL 或 oracle 文件都会改变 fixture definition SHA，从而产生新的对象前缀。
 

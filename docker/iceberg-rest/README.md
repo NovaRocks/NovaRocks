@@ -206,13 +206,21 @@ a crashed run's Docker project and runtime entry can still be reclaimed.
 
 ## Required Images
 
-Pull the external service images once before first use:
+The fixture never pulls during a run: every Compose service is declared
+`pull_policy: never`, and `up.sh` reports a missing image instead of
+downloading one mid-test. Import the external images once before first use:
 
 ```bash
 docker pull quay.io/minio/minio:latest
 docker pull quay.io/minio/mc:latest
 docker pull --platform linux/arm64 apache/iceberg-rest-fixture:1.10.1
+docker pull apache/spark:3.5.5-java17
 ```
+
+`apache/spark:3.5.5-java17` is the base of the locally built Spark image, and
+`up.sh` requires it locally before building: BuildKit resolves any `FROM` it
+cannot find in the local store by pulling from the registry, and `docker build`
+has no `--pull never`.
 
 The default REST Catalog image is `apache/iceberg-rest-fixture:1.10.1`.
 
@@ -234,7 +242,7 @@ docker build \
 ```
 
 If the default Spark image is missing, `docker/iceberg-rest/up.sh` builds it
-before starting Docker Compose.
+before starting Docker Compose, provided its base image is already local.
 
 If Docker Hub is unavailable, pull and tag from a mirror first:
 

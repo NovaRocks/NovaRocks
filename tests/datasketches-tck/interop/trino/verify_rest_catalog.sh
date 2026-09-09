@@ -31,8 +31,9 @@ Usage:
   verify_rest_catalog.sh verify-current NAMESPACE TABLE COLUMN EXPECTED_ROWS EXPECTED_NDV EXPECTED_MIN EXPECTED_MAX
 
 The script starts one transient released Trino 483 container on the existing
-Iceberg REST fixture network. NOVA_TRINO_IMAGE may select a registry mirror,
-but it must retain the frozen manifest-list digest.
+Iceberg REST fixture network. It never pulls: the frozen manifest must already
+be in this host's image store, under any local name. NOVA_TRINO_IMAGE may name
+a specific local reference, but it must retain the frozen manifest digest.
 EOF
 }
 
@@ -45,6 +46,42 @@ require_identifier() {
   local value=$1
   local label=$2
   [[ "$value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "$label is not a safe SQL identifier: $value"
+}
+
+trino_image_exposes_pin() {
+  local candidate=$1 id digests
+  id=$(docker image inspect "$candidate" --format '{{.Id}}' 2>/dev/null) || return 1
+  # A containerd image store reports the manifest digest as the image id; a
+  # graphdriver store reports the config digest and carries the manifest
+  # digest in RepoDigests. Either one proves the frozen identity.
+  if [[ "$id" == "$trino_manifest_digest" ]]; then
+    return 0
+  fi
+  digests=$(docker image inspect "$candidate" \
+    --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null || true)
+  grep -Fq "@$trino_manifest_digest" <<<"$digests"
+}
+
+resolve_local_trino_image() {
+  # Design: ADR-0141 (docs/adr/ADR-0141-fixture-images-never-pull.md)
+  # The frozen manifest digest is the authority for which image may run; the
+  # name it carries on this host is not. A mirror pull records
+  # `<mirror>/trinodb/trino@<digest>` rather than `trinodb/trino@<digest>`,
+  # and `docker tag` cannot create a digest reference to paper over that, so
+  # look the pinned manifest up under every name it could have locally. A
+  # candidate that is present but carries a different manifest is fatal, not
+  # skipped.
+  local candidate
+  for candidate in "$@"; do
+    [[ -n "$candidate" ]] || continue
+    docker image inspect "$candidate" >/dev/null 2>&1 || continue
+    if trino_image_exposes_pin "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    fail "local image $candidate does not expose frozen Trino manifest $trino_manifest_digest"
+  done
+  return 1
 }
 
 if [[ $# -lt 3 ]]; then
@@ -99,9 +136,39 @@ source "$runtime_env"
 network="${NOVA_ENV_COMPOSE_PROJECT}_iceberg_net"
 docker network inspect "$network" >/dev/null 2>&1 || fail "missing Docker network $network; run docker/iceberg-rest/up.sh"
 
-trino_image=${NOVA_TRINO_IMAGE:-$default_trino_image}
-[[ "$trino_image" == *@"$trino_manifest_digest" ]] || \
-  fail "NOVA_TRINO_IMAGE must pin released Trino $trino_release manifest $trino_manifest_digest"
+if [[ -n "${NOVA_TRINO_IMAGE:-}" ]]; then
+  [[ "$NOVA_TRINO_IMAGE" == *@"$trino_manifest_digest" ]] || \
+    fail "NOVA_TRINO_IMAGE must pin released Trino $trino_release manifest $trino_manifest_digest"
+fi
+# Interop runs never pull: the frozen manifest must already be in this host's
+# image store, under any name. Resolving it before the container starts also
+# proves the identity without having run an unverified image.
+trino_candidates=(
+  "${NOVA_TRINO_IMAGE:-}"
+  "$default_trino_image"
+  # A containerd image store keys images by manifest digest, so this finds the
+  # frozen manifest whatever local name it carries -- including a mirror name
+  # that no `docker tag` could rewrite into `trinodb/trino@<digest>`.
+  "$trino_manifest_digest"
+)
+if ! trino_image=$(resolve_local_trino_image "${trino_candidates[@]}"); then
+  cat >&2 <<EOF
+Missing local image (Trino $trino_release manifest $trino_manifest_digest)
+
+This interop check never pulls during a run. Import the frozen manifest once,
+then re-run:
+  docker pull $default_trino_image
+
+If the daemon cannot reach Docker Hub, pull the same digest through a
+reachable mirror; no further setup is needed, because the manifest is then
+found under the mirror's own name:
+  docker pull dockerproxy.net/trinodb/trino@$trino_manifest_digest
+
+Local references tried:
+$(printf '  %s\n' "${trino_candidates[@]}")
+EOF
+  exit 1
+fi
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/novarocks-trino-rest-interop.XXXXXX")
 container_name="nr-trino483-${$}-$(date +%s)"
@@ -112,6 +179,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 docker run --detach --rm \
+  --pull never \
   --name "$container_name" \
   --label org.novarocks.test=trino-rest-interop \
   --network "$network" \
@@ -120,10 +188,6 @@ docker run --detach --rm \
   --env NOVA_TRINO_S3_SECRET_KEY="$AWS_S3_SECRET_ACCESS_KEY" \
   --mount "type=bind,src=$script_dir/rest-catalog,dst=/etc/trino,readonly" \
   "$trino_image" >"$work_dir/container-id"
-
-resolved_digests=$(docker image inspect "$trino_image" --format '{{range .RepoDigests}}{{println .}}{{end}}')
-grep -Fq "@$trino_manifest_digest" <<<"$resolved_digests" || \
-  fail "resolved image does not expose frozen Trino manifest $trino_manifest_digest"
 
 healthy=false
 for _ in $(seq 1 120); do

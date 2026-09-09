@@ -105,6 +105,100 @@ class FixtureContractTest(unittest.TestCase):
         self.assertIn(versions["SPARK_IMAGE_MANIFEST_DIGEST"], dockerfile)
         self.assertNotIn(":latest", dockerfile)
 
+    def test_dockerfile_base_resolves_from_the_local_image_store(self) -> None:
+        versions = fixture.load_versions()
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        from_lines = [
+            line for line in dockerfile.splitlines() if line.startswith("FROM")
+        ]
+        self.assertEqual(len(from_lines), 1)
+        # BuildKit resolves a digest-pinned FROM against the registry even when
+        # the image is already local with a matching RepoDigest, so the base
+        # must be named by the local alias and the digest checked separately.
+        self.assertNotIn("@sha256:", from_lines[0])
+        self.assertIn(
+            f"ARG SPARK_BASE={fixture.local_base_alias(versions)}", dockerfile
+        )
+
+    def test_local_base_is_resolved_by_digest_and_tagged_once(self) -> None:
+        versions = fixture.load_versions()
+        digest = versions["SPARK_IMAGE_MANIFEST_DIGEST"]
+        reference = f"{versions['SPARK_IMAGE_REPOSITORY']}@{digest}"
+        # A graphdriver store reports the config digest as the id and carries
+        # the manifest digest in RepoDigests; that still proves the identity.
+        local = {
+            reference: {
+                "Id": "sha256:" + "c" * 64,
+                "RepoDigests": [reference],
+                "Os": "linux",
+                "Architecture": "amd64",
+            }
+        }
+        with mock.patch.object(
+            fixture, "inspect_local_image", side_effect=local.get
+        ), mock.patch.object(fixture, "run_command") as run:
+            alias = fixture.resolve_local_base_image(versions)
+        self.assertEqual(alias, fixture.local_base_alias(versions))
+        self.assertEqual(
+            run.call_args_list, [mock.call(["docker", "tag", reference, alias])]
+        )
+
+    def test_missing_local_base_is_an_error_and_never_pulls(self) -> None:
+        versions = fixture.load_versions()
+        with mock.patch.object(
+            fixture, "inspect_local_image", return_value=None
+        ), mock.patch.object(fixture, "run_command") as run:
+            with self.assertRaises(fixture.FixtureError) as raised:
+                fixture.resolve_local_base_image(versions)
+        run.assert_not_called()
+        message = str(raised.exception)
+        self.assertIn("never pulls", message)
+        self.assertIn(versions["SPARK_IMAGE_MANIFEST_DIGEST"], message)
+
+    def test_local_base_rejects_a_foreign_platform_or_manifest(self) -> None:
+        versions = fixture.load_versions()
+        digest = versions["SPARK_IMAGE_MANIFEST_DIGEST"]
+        reference = f"{versions['SPARK_IMAGE_REPOSITORY']}@{digest}"
+        rejected = {
+            "foreign-platform": {
+                "Id": digest,
+                "RepoDigests": [reference],
+                "Os": "linux",
+                "Architecture": "arm64",
+            },
+            "foreign-manifest": {
+                "Id": "sha256:" + "d" * 64,
+                "RepoDigests": [
+                    f"{versions['SPARK_IMAGE_REPOSITORY']}@sha256:{'e' * 64}"
+                ],
+                "Os": "linux",
+                "Architecture": "amd64",
+            },
+        }
+        for reason, info in rejected.items():
+            with self.subTest(reason=reason), mock.patch.object(
+                fixture, "inspect_local_image", return_value=info
+            ), mock.patch.object(fixture, "run_command") as run:
+                with self.assertRaises(fixture.FixtureError):
+                    fixture.resolve_local_base_image(versions)
+                run.assert_not_called()
+
+    def test_container_commands_never_pull(self) -> None:
+        versions = fixture.load_versions()
+        with tempfile.TemporaryDirectory() as root:
+            runtime = self.runtime(Path(root))
+            spark = fixture.spark_command(runtime, versions, "local/tag:1")
+            self.assertEqual(spark[:4], ["docker", "run", "--pull", "never"])
+            with mock.patch.object(
+                fixture,
+                "run_command",
+                return_value=subprocess.CompletedProcess([], 0, stdout=""),
+            ) as run:
+                fixture.compose_mc(runtime, "true", "target")
+            command = list(run.call_args.args[0])
+            run_at = command.index("run")
+            self.assertEqual(command[run_at + 1 : run_at + 3], ["--pull", "never"])
+
     def test_rendered_sql_covers_fixed_matrix_and_has_no_secret(self) -> None:
         sql = "\n".join(fixture.render_stage(stage) for stage in fixture.STAGES)
         for required in (

@@ -8,6 +8,14 @@ Linux x86_64. macOS results are developer auxiliary evidence and do not replace
 that check. Starting the server requires Docker 29 or newer with
 Docker Compose.
 
+The fixture never pulls during a run: `compose.yml` declares
+`pull_policy: never` and `up.sh` reports a missing image instead of downloading
+one. Import the pinned server image once:
+
+```bash
+docker pull foundationdb/foundationdb:7.3.69
+```
+
 Supported client platforms:
 
 - macOS arm64 developer machines:

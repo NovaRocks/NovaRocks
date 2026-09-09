@@ -55,8 +55,17 @@ Java 21 run, or the Java 6.2.0 oracle above, must not be reported as Trino evide
 connector in a transient Docker container. It does not use a host JDK, publish a host port, or add
 a service to the shared Compose project. The container joins the existing Iceberg REST/MinIO
 network, mounts the checked-in configuration read-only, and is removed on every success or error
-path. The image reference must carry the frozen Trino 483 multi-platform manifest digest
+path. The image must carry the frozen Trino 483 manifest digest
 `sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534`.
+
+The check never pulls: that manifest must already be in the host's image store,
+and it is resolved there **under any local name** -- the pinned digest, not a
+repository path, is the identity. A mirror pull therefore needs no further
+setup, because the manifest is found under the mirror's own name. This matters
+because a mirror records `<mirror>/trinodb/trino@<digest>` rather than
+`trinodb/trino@<digest>`, and `docker tag` cannot create a digest reference to
+rewrite one into the other. A local image that is present but carries a
+different manifest is a hard failure, never a silent substitution.
 
 The strongest product path is the native `statistics/trino_rest_puffin_show_stats.sql` regression:
 Trino creates an Iceberg v3 table, writes `{1,2}`, and publishes its parent Puffin with `ANALYZE`;
@@ -71,7 +80,6 @@ Run it against the canonical REST fixture and native `1FE+3BE` topology:
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 export NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_RUNTIME_DIR/env.sh"
-export NOVA_TRINO_IMAGE='trinodb/trino@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534'
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite statistics \
@@ -83,5 +91,18 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --fail-fast -j 1
 ```
 
-`NOVA_TRINO_IMAGE` may use a registry mirror when Docker Hub is unavailable, but it must retain
-the exact digest above. Omitting it uses the official `trinodb/trino` repository at that digest.
+Import the manifest once before the first run:
+
+```shell
+docker pull 'trinodb/trino@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534'
+```
+
+If Docker Hub is unavailable, pull the same digest through a reachable mirror; nothing else
+changes, because the manifest is then found under the mirror's own local name:
+
+```shell
+docker pull 'dockerproxy.net/trinodb/trino@sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534'
+```
+
+`NOVA_TRINO_IMAGE` is optional and pins one specific local reference; it must retain the exact
+digest above. Leave it unset to let the check find the manifest under whatever name the host has.
