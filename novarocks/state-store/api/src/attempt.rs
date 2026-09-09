@@ -516,12 +516,17 @@ impl WriteAttempt {
             .state
             .lock()
             .map_err(|_| internal("state store attempt slot lock is poisoned"))?;
-        match *state {
+        match &*state {
             SlotState::Reserved => {
                 *state = SlotState::CancelledBeforeDispatch;
                 Ok(())
             }
             SlotState::CancelledBeforeDispatch => Ok(()),
+            // The observer got here first and recorded the same fact. Agreeing
+            // with a published `NotCommitted` is not a contract break, the same
+            // way re-settling an identical outcome is not: both statements say
+            // the attempt had no effect.
+            SlotState::Settled(AttemptOutcome::NotCommitted) => Ok(()),
             SlotState::Dispatched | SlotState::Settled(_) => Err(StateStoreError::new(
                 StateStoreErrorKind::Internal,
                 "a dispatched write attempt cannot be cancelled as having no effect",
@@ -572,17 +577,34 @@ impl CommitObservation {
     /// re-adjudicated, so a decision cannot be revisited after the evidence it
     /// rested on has been released.
     pub async fn outcome(&self) -> Result<AttemptOutcome, StateStoreError> {
-        match self.slot.read()? {
-            SlotState::Settled(outcome) => return Ok(outcome),
-            SlotState::CancelledBeforeDispatch => return Ok(AttemptOutcome::NotCommitted),
-            SlotState::Reserved => {
-                // Nothing reached storage, so there is nothing to ask the
-                // provider about and no effect to be unsure of. This rests
-                // entirely on providers honouring the ordering rule stated on
-                // `WriteAttempt::mark_dispatched`.
-                return Ok(AttemptOutcome::NotCommitted);
+        // Reading `Reserved` and answering from it has to be one step. A
+        // provider whose commit runs on a task the caller does not own can mark
+        // the attempt dispatched at any moment, so a lock taken only to read
+        // would let this answer `NotCommitted` and the attempt reach storage
+        // immediately afterwards -- the terminal would then flip to
+        // `Unresolved` on the next question. Settling here instead makes the
+        // answer decisive: the later `mark_dispatched` fails, and every
+        // provider already turns that failure into a definite failure rather
+        // than writing.
+        {
+            let mut state = self
+                .slot
+                .state
+                .lock()
+                .map_err(|_| internal("state store attempt slot lock is poisoned"))?;
+            match &*state {
+                SlotState::Settled(outcome) => return Ok(outcome.clone()),
+                SlotState::CancelledBeforeDispatch => return Ok(AttemptOutcome::NotCommitted),
+                SlotState::Reserved => {
+                    // Nothing reached storage: the ordering rule on
+                    // `WriteAttempt::mark_dispatched` says a provider marks
+                    // before the first operation that could leave a trace, and
+                    // this claims the slot before it can.
+                    *state = SlotState::Settled(AttemptOutcome::NotCommitted);
+                    return Ok(AttemptOutcome::NotCommitted);
+                }
+                SlotState::Dispatched => {}
             }
-            SlotState::Dispatched => {}
         }
 
         let decided = self
@@ -1124,6 +1146,47 @@ mod tests {
             adjudicator.adjudicated.load(Ordering::Relaxed),
             0,
             "nothing was dispatched, so there is nothing to ask the provider"
+        );
+    }
+
+    /// A provider whose commit runs on a task the caller does not own can mark
+    /// an attempt dispatched at any moment. If observing a reserved slot only
+    /// read it, the observer could answer `NotCommitted` and the very next
+    /// instant the attempt could reach storage -- so the next question would
+    /// answer `Unresolved`, flipping a terminal. Two providers here work that
+    /// way, so this is the real shape, not a contrived interleaving.
+    #[tokio::test]
+    async fn observing_a_reserved_attempt_shuts_the_door_on_a_later_dispatch() {
+        let (supervisor, adjudicator) = supervisor(4);
+        let (attempt, observation) = supervisor.reserve().expect("reserve");
+
+        assert_eq!(
+            observation.outcome().await.expect("outcome"),
+            AttemptOutcome::NotCommitted
+        );
+
+        // The worker wakes up after the answer was given. It must be refused,
+        // because the alternative is a durable write behind a published
+        // "nothing happened".
+        let refused = attempt
+            .mark_dispatched()
+            .expect_err("a dispatch after the attempt was answered must be refused");
+        assert_eq!(refused.kind(), StateStoreErrorKind::InvalidRequest);
+
+        // And the answer stands, without asking the provider anything.
+        assert_eq!(
+            observation.outcome().await.expect("outcome again"),
+            AttemptOutcome::NotCommitted
+        );
+        assert_eq!(
+            observation.peek().expect("peek"),
+            Some(AttemptOutcome::NotCommitted),
+            "the answer was published, not merely returned"
+        );
+        assert_eq!(
+            adjudicator.adjudicated.load(Ordering::Relaxed),
+            0,
+            "nothing reached storage, so the provider was never asked"
         );
     }
 

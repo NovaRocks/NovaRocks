@@ -456,11 +456,19 @@ impl FrontendCatalogController {
     /// gone and no expiry counted, which reads as an unexplained outage rather
     /// than as the deliberate fail-closed it is.
     fn expire_freshness(&self) {
+        // Fence first, so a round still in flight cannot republish anything it
+        // read before this decision.
         self.generation.fetch_add(1, Ordering::Release);
+        // Withdraw before counting, never the other way round. The counter is
+        // what an operator watches, so it must not become visible ahead of the
+        // withdrawal it claims: in that window a query would be admitted
+        // against a projection this very expiry has already judged
+        // unconfirmable. The opposite window costs only a brief withdrawal that
+        // no counter explains yet, which misleads nobody into using stale data.
+        self.projection.unpublish_all();
         self.metrics
             .freshness_expiries
             .fetch_add(1, Ordering::Relaxed);
-        self.projection.unpublish_all();
         self.publish_metrics();
     }
 }
@@ -1564,9 +1572,10 @@ mod tests {
 
         stalling.stalled.store(true, Ordering::Release);
         controller.start().expect("start controller");
-        // The counter is the primary signal because the expiry records its
-        // decision before acting on it; waiting on admission instead would
-        // race the retirement it triggers.
+        // The counter is the primary signal because it is published *after*
+        // the retirement it reports, so seeing it is proof the withdrawal has
+        // already happened. Waiting on it and then asserting admission is what
+        // makes that ordering a test rather than a comment.
         wait_for(
             Duration::from_secs(2),
             "a scan that never returns must not keep unconfirmable projections admitted",
