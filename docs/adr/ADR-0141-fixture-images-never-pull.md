@@ -8,7 +8,7 @@ superseded-by: null
 date: 2026-09-09
 provenance:
   - "discussion: 2026-09-09 BuildKit resolves a digest-pinned FROM against the registry even for a local image"
-  - "PR: pending — backfill the number once the never-pull fixture convergence merges"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/1032"
 code-anchors:
   - "docker/paimon-read/fixture.py (resolve_local_base_image)"
   - "docker/paimon-read/Dockerfile (SPARK_BASE)"
