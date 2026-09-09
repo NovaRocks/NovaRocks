@@ -22,6 +22,7 @@ novarocks-failpoint.workspace = true
 novarocks-frontend.workspace = true
 novarocks-functions.workspace = true
 novarocks-fs.workspace = true
+novarocks-memory.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-query-application.workspace = true
 novarocks-secret.workspace = true

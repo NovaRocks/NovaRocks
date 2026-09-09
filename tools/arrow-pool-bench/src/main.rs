@@ -52,11 +52,17 @@ fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
 struct Measurement {
     scenario: &'static str,
     unit: &'static str,
+    operations: u64,
     median: Duration,
     p90: Duration,
 }
 
-fn measure(scenario: &'static str, unit: &'static str, mut work: impl FnMut()) -> Measurement {
+fn measure(
+    scenario: &'static str,
+    unit: &'static str,
+    operations: u64,
+    mut work: impl FnMut(),
+) -> Measurement {
     for _ in 0..WARMUP {
         work();
     }
@@ -70,6 +76,7 @@ fn measure(scenario: &'static str, unit: &'static str, mut work: impl FnMut()) -
     Measurement {
         scenario,
         unit,
+        operations,
         median: percentile(&samples, 0.5),
         p90: percentile(&samples, 0.9),
     }
@@ -103,6 +110,13 @@ fn reallocate_doubling() {
 /// `pool` feature off these calls are a plain field store, and a loop of
 /// identical dead stores is eliminated entirely by the optimiser, which would
 /// make the baseline measure nothing and any later comparison meaningless.
+///
+/// Note what this scenario does and does not cover. `truncate` returns early
+/// when the requested length is above the current one, and the length here
+/// only ever decreases, so after the first cycle roughly seven calls in eight
+/// return before touching any bookkeeping. It therefore measures the guard,
+/// not the lock. `mutable_resize` and `mutable_clear_resize` are the honest
+/// per-call bookkeeping measurements.
 fn truncate_in_place(buffer: &mut MutableBuffer, len: usize) {
     let mut observed = 0usize;
     for index in 0..OPS {
@@ -162,26 +176,31 @@ fn main() {
         measure(
             "mutable_with_capacity_push_1mib",
             "1 MiB of u64 pushes",
+            (PAYLOAD_BYTES / size_of::<u64>()) as u64,
             with_capacity_push,
         ),
         measure(
             "mutable_reallocate_doubling_10",
             "10 doubling reserves",
+            10,
             reallocate_doubling,
         ),
-        measure("mutable_truncate", "1e6 truncate calls", || {
+        measure("mutable_truncate", "1e6 truncate calls", OPS as u64, || {
             truncate_in_place(&mut in_place, in_place_len)
         }),
-        measure("mutable_resize", "1e6 resize calls", || {
+        measure("mutable_resize", "1e6 resize calls", OPS as u64, || {
             resize_in_place(&mut in_place, in_place_len)
         }),
-        measure("mutable_clear_resize", "1e6 clear+resize pairs", || {
-            clear_in_place(&mut in_place)
-        }),
-        measure("buffer_slice_drop", "1e6 slice+drop", || {
+        measure(
+            "mutable_clear_resize",
+            "1e6 clear+resize pairs",
+            2 * OPS as u64,
+            || clear_in_place(&mut in_place),
+        ),
+        measure("buffer_slice_drop", "1e6 slice+drop", OPS as u64, || {
             slice_drop(&shared)
         }),
-        measure("buffer_clone_drop", "1e6 clone+drop", || {
+        measure("buffer_clone_drop", "1e6 clone+drop", OPS as u64, || {
             clone_drop(&shared)
         }),
     ];
@@ -198,15 +217,20 @@ fn main() {
         size_of::<std::sync::Mutex<Option<Box<()>>>>()
     );
     println!(
-        "{:<34} {:>14} {:>14}  {}",
-        "scenario", "median_ns", "p90_ns", "work unit"
+        "{:<34} {:>14} {:>14} {:>12}  {}",
+        "scenario", "median_ns", "p90_ns", "ns_per_op", "work unit"
     );
     for measurement in &measurements {
+        // With the feature off, the in-place primitives are one field store,
+        // so a percentage against them is dominated by the baseline being
+        // sub-nanosecond. The per-operation figure is what a reader can use.
+        let per_op = measurement.median.as_nanos() as f64 / measurement.operations as f64;
         println!(
-            "{:<34} {:>14} {:>14}  {}",
+            "{:<34} {:>14} {:>14} {:>12.3}  {}",
             measurement.scenario,
             measurement.median.as_nanos(),
             measurement.p90.as_nanos(),
+            per_op,
             measurement.unit
         );
     }

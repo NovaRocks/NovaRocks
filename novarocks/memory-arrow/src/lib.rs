@@ -17,8 +17,7 @@
 
 //! Binding a capacity charge to an Arrow buffer's real backing.
 //!
-//! Design: ADR number assigned in MEM-1 wave-1 T09
-//! (docs/adr/README.md, domain `memory-governance`).
+//! Design: ADR-0143 (docs/adr/ADR-0143-process-memory-capacity-authority.md)
 //!
 //! # The problem this solves
 //!

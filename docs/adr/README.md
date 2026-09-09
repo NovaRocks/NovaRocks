@@ -386,6 +386,12 @@ fallback 模糊 owner 和故障语义。
 - ADR-0065 — 同一张表的维护为何以单个 per-table lease attempt 为唯一派发权威、并在同事务内校验 fence（superseded → ADR-0111）
 - ADR-0067 — 收敛已死 generation 的维护为何是独立 provider capability，而不是放宽 exact-generation reconcile（superseded → ADR-0111）
 
+### memory-governance
+
+领域哲学：Rust 的普通分配失败会终止进程，所以可恢复的容量控制只能建立在**比单次分配更粗的事前授权**上——先取额度、再分配、最后结算，且授予额度内的结算不会因容量失败。一个进程一个权威，账户成严格树，账户对父级持有的份额**就是**它的承诺；本地 slack 内的请求不触根，硬边界因此每次量化 top-up 才在根上执行一次。归属绑定在真实 backing 的最后持有者，不绑在测量它的包装对象上。覆盖是**两级**且诚实的：硬治理覆盖声明的对象集合，其余由进程分配观测按 headroom 预算测量并列出盲区——不冒充按查询精确归属，也不承诺避免所有物理 OOM。授权、实际分配、共享持有、回收估计与物理压力是五个必须分别表达、永不相加的事实。
+
+- ADR-0143 — 为何采用唯一的非等待进程容量权威，并把 Arrow charge 绑定到真实 backing（active）
+
 ### crate-boundary
 
 领域哲学：架构隔离由 crate 依赖图强制——一个 crate 不能命名它没有依赖的 crate，
