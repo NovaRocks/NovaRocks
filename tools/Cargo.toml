@@ -15,11 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# The repository root excludes this tooling crate. Declaring an empty workspace
-# here keeps Cargo from walking out of a nested worktree into its enclosing
-# checkout, where this manifest is neither a member nor an exclusion.
-[workspace]
-
 [package]
 name = "novarocks-tools"
 version = "0.1.0"
@@ -39,9 +34,3 @@ parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
 novarocks-fs = { path = "../novarocks/fs" }
 novarocks-server = { path = "../novarocks-server" }
 novarocks-spi = { path = "../novarocks/spi" }
-
-[patch.crates-io]
-paimon = { path = "../vendor/paimon-0.3.0" }
-iceberg = { path = "../vendor/iceberg-0.9.0" }
-iceberg-catalog-rest = { path = "../vendor/iceberg-catalog-rest-0.9.0" }
-iceberg-catalog-hms = { path = "../vendor/iceberg-catalog-hms-0.9.0" }

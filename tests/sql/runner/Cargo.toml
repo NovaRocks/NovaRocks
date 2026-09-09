@@ -15,14 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Own workspace root. The repository root manifest excludes this directory so the
-# runner keeps its own [profile.*] tables, but relying on that exclusion alone
-# breaks whenever the checkout lives inside another checkout (for example a git
-# worktree under <repo>/.claude/worktrees/): cargo then walks past the local
-# root and lands on the outer workspace, which neither lists nor excludes this
-# path. Declaring an empty workspace here stops that upward search.
-[workspace]
-
 [package]
 name = "novarocks-sql-test-runner"
 version = "0.1.0"
@@ -64,11 +56,3 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "signal"] }
 
 [dev-dependencies]
-
-[profile.dev-opt]
-inherits = "dev"
-opt-level = 1
-debug = 1
-incremental = true
-lto = false
-codegen-units = 256

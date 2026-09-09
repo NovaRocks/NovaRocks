@@ -526,8 +526,8 @@ run_cargo_gates() {
   # missing from it. A stale manifest therefore does not surface as "this file
   # is out of date" -- it surfaces as an unrelated suite failing to load its
   # cases. Regenerating is the fix (`cargo run -p novarocks-error-manifest`).
-  # This tool currently owns an independent workspace and therefore uses its
-  # own default profile until the Cargo governance topology cut lands.
+  # The manifest path keeps the entry point explicit while Cargo resolves the
+  # package through the repository workspace, profile, and committed lock.
   run_fail_fast_stage "SQL error manifest freshness" "error-manifest-check.log" \
     cargo run --quiet --locked --manifest-path tools/error-manifest/Cargo.toml -- --check
 

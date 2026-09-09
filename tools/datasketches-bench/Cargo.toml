@@ -21,8 +21,6 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-[workspace]
-
 [dependencies]
 datasketches = { version = "=0.5.0-rc.1", default-features = false, features = ["hll", "theta"] }
 serde = { version = "1.0", features = ["derive"] }

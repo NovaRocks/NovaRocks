@@ -15,20 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Design: ADR-0142 (docs/adr/ADR-0142-single-cargo-workspace-authority.md)
 # Virtual workspace manifest. Internal library crates live under
 # `novarocks/<name>` (datafusion-style: directory drops the `novarocks-`
 # prefix, package name keeps it); the server binary lives at top-level
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks/backend", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/failpoint", "novarocks/frontend", "novarocks/fs", "novarocks/functions", "novarocks/native-trust", "novarocks/parser", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/testkit", "novarocks/state-store/sqlite", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/task-codec", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks-server", "tests/cluster-harness", "tests/datasketches-tck", "tests/system-test-runner", "tests/test-support"]
+members = ["novarocks/backend", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/failpoint", "novarocks/frontend", "novarocks/fs", "novarocks/functions", "novarocks/native-trust", "novarocks/parser", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/testkit", "novarocks/state-store/sqlite", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/task-codec", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks-server", "tests/cluster-harness", "tests/datasketches-tck", "tests/system-test-runner", "tests/test-support", "tests/sql/runner", "tools", "tools/connector-binding-bench", "tools/datasketches-bench", "tools/error-manifest"]
 # Native development defaults to the server package.
 default-members = ["novarocks-server"]
-# Existing standalone crates under the workspace tree are excluded rather than
-# pulled in as members: they run independently via `--manifest-path`, and
-# tests/sql/runner defines its own [profile.*] that a workspace root would
-# otherwise override. Excluding keeps their build behavior exactly as-is.
-exclude = ["vendor", "tools", "tests/sql/runner"]
+# Vendored upstream packages keep their own workspace and lock authority.
+exclude = ["vendor"]
 
 [workspace.dependencies]
 datasketches = { version = "=0.5.0-rc.1", default-features = false }

@@ -19,9 +19,10 @@ under the License.
 
 # NovaRocks DataSketches substrate benchmark
 
-This independent Cargo workspace measures the exact registry dependency
+This root-workspace benchmark package measures the exact registry dependency
 `datasketches = "=0.5.0-rc.1"` with the `theta` and `hll` features. It does not
-participate in production dependency composition.
+participate in production dependency composition. Its `--manifest-path` commands
+resolve through the repository root lock and resolver.
 
 The deterministic workload is defined in `workloads.toml`. The harness parses
 that file outside measured closures, pre-constructs input vectors, and records
