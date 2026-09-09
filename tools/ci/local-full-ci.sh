@@ -33,6 +33,8 @@ KNOWN_FAILURES_FILE="$SCRIPT_DIR/baselines/known-failures.toml"
 RUN_MODE="stable"
 CI_TIER="full"
 CI_FROM_RUN_DIR=""
+CARGO_ONLY="false"
+CARGO_ONLY_CONFLICT="false"
 ALL_DISCOVERED_REQUESTED="false"
 KEEP_RUNTIME="false"
 SKIP_CARGO_TEST="false"
@@ -82,6 +84,8 @@ full-suite matrix, and NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=1 to make failures
 in an appended matrix fail CI.
 
 Options:
+  --cargo-only          Run only the deterministic Cargo and repository guards.
+                        This mode does not prepare runtime services or run SQL.
   --all-discovered      Run every correctness suite through typed runner discovery.
   --suite <name>        Run only the named SQL suite. May be repeated.
   --tier <name>         Stable tier: smoke, targeted, or full. Default: full.
@@ -140,11 +144,17 @@ validate_tier_arg() {
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --cargo-only)
+        CARGO_ONLY="true"
+        shift
+        ;;
       --all-discovered)
+        CARGO_ONLY_CONFLICT="true"
         ALL_DISCOVERED_REQUESTED="true"
         shift
         ;;
       --suite)
+        CARGO_ONLY_CONFLICT="true"
         if [ "$#" -lt 2 ]; then
           echo "error: --suite requires a suite name" >&2
           exit 2
@@ -153,6 +163,7 @@ parse_args() {
         shift 2
         ;;
       --tier)
+        CARGO_ONLY_CONFLICT="true"
         if [ "$#" -lt 2 ]; then
           echo "error: --tier requires a tier name" >&2
           exit 2
@@ -162,6 +173,7 @@ parse_args() {
         shift 2
         ;;
       --from)
+        CARGO_ONLY_CONFLICT="true"
         if [ "$#" -lt 2 ]; then
           echo "error: --from requires a run directory" >&2
           exit 2
@@ -170,14 +182,17 @@ parse_args() {
         shift 2
         ;;
       --skip-cargo-test)
+        CARGO_ONLY_CONFLICT="true"
         SKIP_CARGO_TEST="true"
         shift
         ;;
       --skip-system-scenarios)
+        CARGO_ONLY_CONFLICT="true"
         SKIP_SYSTEM_SCENARIOS="true"
         shift
         ;;
       --cluster-mode)
+        CARGO_ONLY_CONFLICT="true"
         if [ "$#" -lt 2 ]; then
           echo "error: --cluster-mode requires a mode" >&2
           exit 2
@@ -196,6 +211,7 @@ parse_args() {
         shift 2
         ;;
       --cluster-size)
+        CARGO_ONLY_CONFLICT="true"
         if [ "$#" -lt 2 ]; then
           echo "error: --cluster-size requires a count" >&2
           exit 2
@@ -205,6 +221,7 @@ parse_args() {
         shift 2
         ;;
       --keep-runtime)
+        CARGO_ONLY_CONFLICT="true"
         KEEP_RUNTIME="true"
         shift
         ;;
@@ -222,6 +239,11 @@ parse_args() {
 
   validate_cluster_args
   validate_tier_arg
+
+  if [ "$CARGO_ONLY" = "true" ] && [ "$CARGO_ONLY_CONFLICT" = "true" ]; then
+    echo "error: --cargo-only cannot be combined with runtime, SQL, reclassification, or skip options" >&2
+    exit 2
+  fi
 
   if [ "$ALL_DISCOVERED_REQUESTED" = "true" ] && [ "${#REQUESTED_SUITES[@]}" -gt 0 ]; then
     echo "error: --all-discovered cannot be combined with --suite" >&2
@@ -440,6 +462,8 @@ run_fail_fast_stage() {
 }
 
 run_cargo_gates() {
+  run_fail_fast_stage "locked Cargo metadata" "cargo-metadata.log" \
+    cargo metadata --locked --format-version 1 --no-deps
   run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
     tools/ci/check-generated-artifacts.sh
   run_fail_fast_stage "DataSketches resolved source" "datasketches-source.log" \
@@ -487,23 +511,25 @@ run_cargo_gates() {
   run_fail_fast_stage "shared benchmark fixture contract" "shared-benchmark-fixture-contract.log" \
     python3 tests/sql/fixtures/benchmarks/tests/fixture-contract-test.py
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
+  run_fail_fast_stage "cargo check all targets" "cargo-check-all-targets.log" \
+    cargo check --workspace --all-targets --locked
   # `--workspace` is load-bearing. Without it Cargo falls back to
   # `default-members = ["novarocks-server"]`, so the lint/build/test gates
   # silently covered one package and every other workspace member's tests
   # never ran.
   run_fail_fast_stage "cargo clippy" "cargo-clippy.log" \
-    cargo clippy --workspace --all-targets
+    cargo clippy --workspace --all-targets --locked
   run_fail_fast_stage "cargo build" "cargo-build.log" \
-    cargo build --workspace --profile "$NOVA_CI_CARGO_PROFILE"
+    cargo build --workspace --profile "$NOVA_CI_CARGO_PROFILE" --locked
   # The SQL error manifest is a generated whitelist that other tools consume as
   # fact: the sql-test runner include_str!s it and rejects any @expect_sql_code
   # missing from it. A stale manifest therefore does not surface as "this file
   # is out of date" -- it surfaces as an unrelated suite failing to load its
   # cases. Regenerating is the fix (`cargo run -p novarocks-error-manifest`).
-  # This tool is its own workspace and defines no dev-opt profile, so it builds
-  # under the default one.
+  # This tool currently owns an independent workspace and therefore uses its
+  # own default profile until the Cargo governance topology cut lands.
   run_fail_fast_stage "SQL error manifest freshness" "error-manifest-check.log" \
-    cargo run --quiet --manifest-path tools/error-manifest/Cargo.toml -- --check
+    cargo run --quiet --locked --manifest-path tools/error-manifest/Cargo.toml -- --check
 
   if [ "$SKIP_CARGO_TEST" = "true" ]; then
     ci_record_stage "workspace component tests" "SKIP" "0" ""
@@ -521,13 +547,13 @@ run_cargo_gates() {
   #   - server smoke: the child-process binary target only.
   run_fail_fast_stage "workspace component tests" "cargo-test-component.log" \
     cargo test --workspace --exclude novarocks-server \
-    --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
+    --profile "$NOVA_CI_CARGO_PROFILE" --locked -- --test-threads=1
   run_fail_fast_stage "server owner tests" "cargo-test-server-owner.log" \
     cargo test -p novarocks-server --lib --bins --test state_store_app_config \
-    --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
+    --profile "$NOVA_CI_CARGO_PROFILE" --locked -- --test-threads=1
   run_fail_fast_stage "server binary smoke" "cargo-test-server-smoke.log" \
     cargo test -p novarocks-server --test server_binary_smoke \
-    --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
+    --profile "$NOVA_CI_CARGO_PROFILE" --locked -- --test-threads=1
 }
 
 run_system_scenario_fixture_stage() {
@@ -1258,6 +1284,14 @@ main() {
 
   init_run_dir
   validate_explicit_suites_early
+
+  if [ "$CARGO_ONLY" = "true" ]; then
+    run_cargo_gates
+    ci_render_summary "PASS"
+    echo "PASS: $CI_SUMMARY"
+    exit 0
+  fi
+
   trap cleanup EXIT
 
   prepare_runtime

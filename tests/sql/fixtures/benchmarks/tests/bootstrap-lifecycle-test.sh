@@ -19,6 +19,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
+export NOVAROCKS_WORKSPACE_ROOT="$ROOT"
 BOOTSTRAP="$ROOT/tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh"
 PUBLICATION="$ROOT/tests/sql/fixtures/benchmarks/benchmark_fixture_publication.sh"
 TMP="$(mktemp -d)"
