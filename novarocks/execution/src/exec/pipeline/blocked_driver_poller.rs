@@ -50,13 +50,17 @@ struct PollerState {
     cv: Condvar,
     cv_mutex: Mutex<()>,
     shutdown: AtomicBool,
+    producers_done: AtomicBool,
     started: AtomicBool,
+    #[cfg(test)]
+    thread_exited: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 /// Poller that tracks blocked drivers and re-queues them once blocking dependencies are satisfied.
 pub(crate) struct BlockedDriverPoller {
     state: Arc<PollerState>,
+    thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 impl BlockedDriverPoller {
@@ -68,10 +72,14 @@ impl BlockedDriverPoller {
             cv: Condvar::new(),
             cv_mutex: Mutex::new(()),
             shutdown: AtomicBool::new(false),
+            producers_done: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            #[cfg(test)]
+            thread_exited: Arc::new(AtomicBool::new(false)),
         };
         Self {
             state: Arc::new(state),
+            thread: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -80,10 +88,11 @@ impl BlockedDriverPoller {
             return;
         }
         let state = Arc::clone(&self.state);
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("blocked_driver_poller".to_string())
             .spawn(move || run_poller(state))
             .expect("blocked driver poller thread");
+        *self.thread.lock().expect("blocked poller thread lock") = Some(handle);
     }
 
     pub(crate) fn add_pending_finish(&self, task: DriverTask) {
@@ -96,16 +105,74 @@ impl BlockedDriverPoller {
         blocked.push_back(BlockedTask { task, next_poll_at });
         self.state.cv.notify_one();
     }
+
+    pub(crate) fn signal_shutdown(&self) {
+        self.state.shutdown.store(true, Ordering::Release);
+        self.state.cv.notify_all();
+    }
+
+    pub(crate) fn finish_producers(&self) {
+        self.state.producers_done.store(true, Ordering::Release);
+        self.state.cv.notify_all();
+    }
+
+    pub(crate) fn take_thread(&self) -> Option<thread::JoinHandle<()>> {
+        self.thread
+            .lock()
+            .expect("blocked poller thread lock")
+            .take()
+    }
+
+    pub(crate) fn shutdown_and_join(&self) {
+        self.signal_shutdown();
+        self.finish_producers();
+        if let Some(thread) = self.take_thread() {
+            let _ = thread.join();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exit_probe(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.state.thread_exited)
+    }
+}
+
+impl Drop for BlockedDriverPoller {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.thread) != 1 {
+            return;
+        }
+        self.shutdown_and_join();
+    }
 }
 
 fn run_poller(state: Arc<PollerState>) {
+    #[cfg(test)]
+    let _exit_guard = PollerExitGuard(&state.thread_exited);
     debug!(
         "BlockedDriverPoller started with poll_interval={:?}",
         state.poll_interval
     );
     loop {
-        if state.shutdown.load(Ordering::Acquire) {
+        let shutting_down = state.shutdown.load(Ordering::Acquire);
+        if shutting_down
+            && state.producers_done.load(Ordering::Acquire)
+            && state
+                .blocked
+                .lock()
+                .expect("blocked poller lock")
+                .is_empty()
+        {
             break;
+        }
+
+        if shutting_down {
+            let blocked = state.blocked.lock().expect("blocked poller lock");
+            for entry in blocked.iter() {
+                entry
+                    .task
+                    .fail("driver executor is shutting down".to_string());
+            }
         }
 
         let mut ready_tasks = Vec::new();
@@ -124,7 +191,18 @@ fn run_poller(state: Arc<PollerState>) {
             }
         }
         for task in ready_tasks {
-            enqueue_one(&state.shared, task);
+            if shutting_down {
+                if let Some(task) = task.finish_due_to_abort() {
+                    let next_poll_at = Instant::now() + state.poll_interval;
+                    state
+                        .blocked
+                        .lock()
+                        .expect("blocked poller lock")
+                        .push_back(BlockedTask { task, next_poll_at });
+                }
+            } else {
+                enqueue_one(&state.shared, task);
+            }
         }
 
         let guard = state.cv_mutex.lock().expect("blocked poller cv lock");
@@ -132,6 +210,16 @@ fn run_poller(state: Arc<PollerState>) {
             .cv
             .wait_timeout(guard, state.poll_interval)
             .expect("blocked poller cv wait");
+    }
+}
+
+#[cfg(test)]
+struct PollerExitGuard<'a>(&'a AtomicBool);
+
+#[cfg(test)]
+impl Drop for PollerExitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -173,7 +261,7 @@ fn enqueue_one(shared: &ExecutorShared, task: DriverTask) {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
@@ -194,6 +282,7 @@ mod tests {
     impl Drop for PollerGuard {
         fn drop(&mut self) {
             self.state.shutdown.store(true, Ordering::Release);
+            self.state.producers_done.store(true, Ordering::Release);
             self.state.cv.notify_all();
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
@@ -266,7 +355,9 @@ mod tests {
         let shared = Arc::new(ExecutorShared {
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
+            admission_closed: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            live_workers: AtomicUsize::new(0),
         });
         let poller = BlockedDriverPoller::new(Arc::clone(&shared));
         let state = Arc::clone(&poller.state);

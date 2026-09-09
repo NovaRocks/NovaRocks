@@ -33,7 +33,7 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::domain::DomainVersion;
 use novarocks_execution::task_execution::operation::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
-    FinalTaskInfo, MaxWait, OperationOutcome, TaskIdentity, TaskOperationId,
+    FinalTaskInfo, MaxWait, OperationOutcome, ResultPacketSequence, TaskIdentity, TaskOperationId,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
@@ -161,7 +161,9 @@ pub enum RootResultOutcome {
     },
     /// Nothing available within this poll's wait.
     NotReady,
-    /// The stream ended. Its own sequence closes the frontend's accounting.
+    /// EOS arrived at this sequence but still needs the frontend's final ACK.
+    EndOfStreamPending { packet_sequence: u64 },
+    /// The stream ended and the backend accepted the final packet ACK.
     EndOfStream { packet_sequence: u64 },
     /// The poll was refused, or the root's execution failed.
     Failed(String),
@@ -177,6 +179,10 @@ impl fmt::Debug for RootResultOutcome {
                 .field("packet_sequence", packet_sequence)
                 .finish_non_exhaustive(),
             Self::NotReady => formatter.write_str("NotReady"),
+            Self::EndOfStreamPending { packet_sequence } => formatter
+                .debug_struct("EndOfStreamPending")
+                .field("packet_sequence", packet_sequence)
+                .finish(),
             Self::EndOfStream { packet_sequence } => formatter
                 .debug_struct("EndOfStream")
                 .field("packet_sequence", packet_sequence)
@@ -308,6 +314,7 @@ pub trait TaskResultTransport: Send + Sync + 'static {
         &self,
         root_task: TaskIdentity,
         max_wait: MaxWait,
+        acknowledged: Option<ResultPacketSequence>,
         expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
     ) -> Result<RootResultOutcome, String>;
 
@@ -393,10 +400,11 @@ impl TaskResultTransport for NativeTaskResultTransport {
         &self,
         root_task: TaskIdentity,
         max_wait: MaxWait,
+        acknowledged: Option<ResultPacketSequence>,
         expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
     ) -> Result<RootResultOutcome, String> {
         let (client, address) = self.client_of(root_task)?;
-        let request = encode_fetch_task_result(root_task, max_wait);
+        let request = encode_fetch_task_result(root_task, max_wait, acknowledged);
         let wait = max_wait.get();
         let deadline = self.grace.deadline_for(wait);
         let response = self.data_runtime.block_on(async {
@@ -441,7 +449,7 @@ impl TaskResultTransport for NativeTaskResultTransport {
                     )
                 })?;
                 if response.eos {
-                    return Ok(RootResultOutcome::EndOfStream { packet_sequence });
+                    return Ok(RootResultOutcome::EndOfStreamPending { packet_sequence });
                 }
                 if response.result_arrow_ipc.is_empty() {
                     return Err(format!("{address}: root result READY carries no payload"));
@@ -455,14 +463,15 @@ impl TaskResultTransport for NativeTaskResultTransport {
             }
             FetchStatus::NotReady => Ok(RootResultOutcome::NotReady),
             FetchStatus::Error => Ok(RootResultOutcome::Failed(response.message)),
-            // The task-addressed path reports the end of the stream as the
-            // last `READY` packet, which is the only form that carries the
-            // sequence the frontend's accounting needs. A bare `EOF` has no
-            // sequence, so accepting it would mean closing the stream at a
-            // position this frontend cannot check.
-            FetchStatus::Eof => Err(format!(
-                "{address}: root result poll answered with a sequence-less end of stream"
-            )),
+            FetchStatus::Eof => acknowledged
+                .map(|sequence| RootResultOutcome::EndOfStream {
+                    packet_sequence: sequence.get(),
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "{address}: root result poll answered EOF before any packet acknowledgement"
+                    )
+                }),
             FetchStatus::ResultStatusUnspecified => Err(format!(
                 "{address}: root result poll returned an unspecified status"
             )),

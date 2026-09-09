@@ -28,14 +28,17 @@ use crate::catalog_source_config::{CatalogSourceConfig, preflight_catalog_source
 use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
-use novarocks_execution::task_execution::{
-    DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait, TransportBudget,
-};
+use novarocks_execution_contract::{LeaseValidFor, MaxWait};
 use novarocks_frontend::StateStoreRunPolicy;
 use novarocks_native_trust::NativeTransportMode;
+use novarocks_query_application::coordination::{
+    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
+};
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::{ClusterRole, NativeEndpoint};
+use novarocks_worker::LeaseBounds;
 
 pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 
@@ -622,6 +625,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_connector_credential_configuration(&cfg)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
+    validate_result_retained_config(&cfg.runtime)?;
     validate_lake_publication_runtime_policy(&cfg.runtime)?;
     #[cfg(not(debug_assertions))]
     reject_fault_injection_environment()?;
@@ -1129,6 +1133,12 @@ pub struct RuntimeConfig {
     pub write_commit_evidence_max_bytes: usize,
     #[serde(default = "default_write_commit_evidence_max_entries")]
     pub write_commit_evidence_max_entries: usize,
+    /// Joint Arrow-input plus encoded-output memory allowed per root stream.
+    #[serde(default = "default_result_retained_bytes_per_root")]
+    pub result_retained_bytes_per_root: usize,
+    /// Joint Arrow-input plus encoded-output memory allowed across the BE.
+    #[serde(default = "default_result_retained_bytes_per_process")]
+    pub result_retained_bytes_per_process: usize,
     #[serde(default = "default_lake_publication_max_attempt_duration_ms")]
     pub lake_publication_max_attempt_duration_ms: u64,
     #[serde(default = "default_lake_publication_safe_gc_age_ms")]
@@ -1433,7 +1443,7 @@ fn default_task_lease_max_ms() -> u64 {
 /// No neutral type owns this number: the protocol requires the budget to be
 /// bounded without fixing its size, so the deployment owns it.
 fn default_task_status_subscription_error_budget() -> u32 {
-    novarocks_execution::task_execution::DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET
+    DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET
 }
 
 fn duration_millis(value: Duration) -> u64 {
@@ -1562,6 +1572,16 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
         bail!("runtime.task_lease_max_ms must not exceed {lease_ceiling} ms");
     }
     Ok(())
+}
+
+fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
+    novarocks_backend::BackendResultRetainedLimits::try_new(
+        runtime.result_retained_bytes_per_root,
+        runtime.result_retained_bytes_per_process,
+    )
+    .map(|_| ())
+    .map_err(anyhow::Error::msg)
+    .context("validate native result retained-byte limits")
 }
 
 fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
@@ -1752,6 +1772,14 @@ fn default_write_commit_evidence_max_entries() -> usize {
     novarocks_spi::connector::DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES
 }
 
+fn default_result_retained_bytes_per_root() -> usize {
+    16 * 1024 * 1024
+}
+
+fn default_result_retained_bytes_per_process() -> usize {
+    256 * 1024 * 1024
+}
+
 fn default_lake_publication_max_attempt_duration_ms() -> u64 {
     30 * 60 * 1_000
 }
@@ -1902,6 +1930,8 @@ impl Default for RuntimeConfig {
             task_status_subscription_error_budget: default_task_status_subscription_error_budget(),
             write_commit_evidence_max_bytes: default_write_commit_evidence_max_bytes(),
             write_commit_evidence_max_entries: default_write_commit_evidence_max_entries(),
+            result_retained_bytes_per_root: default_result_retained_bytes_per_root(),
+            result_retained_bytes_per_process: default_result_retained_bytes_per_process(),
             lake_publication_max_attempt_duration_ms:
                 default_lake_publication_max_attempt_duration_ms(),
             lake_publication_safe_gc_age_ms: default_lake_publication_safe_gc_age_ms(),
@@ -2226,7 +2256,8 @@ mod tests {
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait,
         NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
-        TransportBudget, validate_query_control_config, validate_task_execution_config,
+        TransportBudget, validate_query_control_config, validate_result_retained_config,
+        validate_task_execution_config,
     };
     use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
     use novarocks_types::ClusterRole;
@@ -2587,6 +2618,36 @@ access_key_secret = ""
         );
         assert!(runtime.task_status_subscription_error_budget > 0);
         validate_task_execution_config(&runtime).expect("the frozen defaults are valid");
+        validate_result_retained_config(&runtime)
+            .expect("the default native result retained-byte hierarchy is valid");
+    }
+
+    #[test]
+    fn result_retained_config_rejects_zero_and_inverted_limits() {
+        let mut runtime = RuntimeConfig {
+            result_retained_bytes_per_root: 0,
+            ..Default::default()
+        };
+        let error = validate_result_retained_config(&runtime)
+            .expect_err("a zero per-root retained-byte cap must fail");
+        assert!(format!("{error:#}").contains("per-root"));
+
+        runtime = RuntimeConfig {
+            result_retained_bytes_per_process: 0,
+            ..Default::default()
+        };
+        let error = validate_result_retained_config(&runtime)
+            .expect_err("a zero per-process retained-byte cap must fail");
+        assert!(format!("{error:#}").contains("per-process"));
+
+        runtime = RuntimeConfig {
+            result_retained_bytes_per_root: 33,
+            result_retained_bytes_per_process: 32,
+            ..Default::default()
+        };
+        let error = validate_result_retained_config(&runtime)
+            .expect_err("a per-root cap above the process cap must fail");
+        assert!(format!("{error:#}").contains("must not exceed"));
     }
 
     #[test]

@@ -40,8 +40,8 @@ use novarocks_execution_contract::task_execution::operation::{
     CreateTask, CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters,
     GetFinalTaskInfo, MaxWait, OperationEnvelope, OperationKind, OperationOutcome,
     QueryContextAdmissionTicketReceipt, QueryContextDomainReceipt, QueryContextReceipt,
-    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, TaskDomainReceipt,
-    UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, ResultPacketSequence,
+    TaskDomainReceipt, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_proto_models::novarocks;
@@ -419,12 +419,24 @@ pub fn decode_operation(
                     error.to_string(),
                 )
             })?;
+            let admission_epoch_capability =
+                acquire.admission_epoch_capability.as_ref().ok_or_else(|| {
+                    missing(
+                        acquire_path.clone().field("admission_epoch_capability"),
+                        "admission ticket acquisition requires an admission epoch capability",
+                    )
+                })?;
+            let admission_epoch_capability = crate::identity::decode_admission_epoch_capability(
+                admission_epoch_capability,
+                acquire_path.field("admission_epoch_capability"),
+            )?;
             Ok(DecodedOperation::AcquireQueryContextAdmissionTicket(
                 AcquireQueryContextAdmissionTicket::new(
                     envelope.operation_id(),
                     context,
                     valid_for,
                     native_compatibility_id,
+                    admission_epoch_capability,
                 ),
             ))
         }
@@ -1075,7 +1087,7 @@ pub fn decode_get_final_task_info(
 pub fn decode_fetch_task_result(
     src: &novarocks::FetchTaskResultRequest,
     path: FieldPath,
-) -> Result<(TaskIdentity, Duration), ProtocolError> {
+) -> Result<(TaskIdentity, Duration, Option<ResultPacketSequence>), ProtocolError> {
     let root = src.root_task.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("root_task"),
@@ -1088,7 +1100,10 @@ pub fn decode_fetch_task_result(
         path.field("max_wait_millis"),
         MaxWait::MAX_REPRESENTABLE,
     )?;
-    Ok((root, max_wait))
+    let acknowledged = src
+        .acknowledged_packet_sequence
+        .map(ResultPacketSequence::new);
+    Ok((root, max_wait, acknowledged))
 }
 
 /// Decodes one server-reported operation outcome.
@@ -1128,12 +1143,14 @@ pub fn encode_get_final_task_info(identity: TaskIdentity) -> novarocks::GetFinal
 pub fn encode_fetch_task_result(
     root_task: TaskIdentity,
     max_wait: MaxWait,
+    acknowledged: Option<ResultPacketSequence>,
 ) -> novarocks::FetchTaskResultRequest {
     novarocks::FetchTaskResultRequest {
         root_task: Some(crate::identity::encode_task_identity(root_task)),
         // `MaxWait` is already bounded by `MAX_REPRESENTABLE`, so this cannot
         // narrow a wait the caller asked for.
         max_wait_millis: u64::try_from(max_wait.get().as_millis()).unwrap_or(u64::MAX),
+        acknowledged_packet_sequence: acknowledged.map(ResultPacketSequence::get),
     }
 }
 
@@ -1361,6 +1378,11 @@ pub fn encode_acquire_query_context_admission_ticket(
                     native_compatibility_id: Some(novarocks::NativeCompatibilityId {
                         value: request.native_compatibility_id().as_bytes().to_vec(),
                     }),
+                    admission_epoch_capability: Some(
+                        crate::identity::encode_admission_epoch_capability(
+                            request.admission_epoch_capability(),
+                        ),
+                    ),
                 },
             ),
         ),

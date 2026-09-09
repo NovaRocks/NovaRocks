@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
 use novarocks_types::BackendProcessId;
 
@@ -221,6 +222,7 @@ pub enum HeartbeatOutcome {
         descriptor: BackendProcessDescriptor,
         reported_state: BackendReportedState,
         num_cores: u32,
+        admission_epoch_capability: AdmissionEpochCapability,
         now_ms: i64,
     },
     Failed {
@@ -238,13 +240,19 @@ pub fn record_successful_stage(_backend_idx: usize, fragment_count: usize) {
 pub struct LiveBackendTarget {
     backend_idx: usize,
     descriptor: BackendProcessDescriptor,
+    admission_epoch_capability: AdmissionEpochCapability,
 }
 
 impl LiveBackendTarget {
-    pub fn new(backend_idx: usize, descriptor: BackendProcessDescriptor) -> Self {
+    pub fn new(
+        backend_idx: usize,
+        descriptor: BackendProcessDescriptor,
+        admission_epoch_capability: AdmissionEpochCapability,
+    ) -> Self {
         Self {
             backend_idx,
             descriptor,
+            admission_epoch_capability,
         }
     }
 
@@ -254,6 +262,10 @@ impl LiveBackendTarget {
 
     pub fn descriptor(&self) -> &BackendProcessDescriptor {
         &self.descriptor
+    }
+
+    pub const fn admission_epoch_capability(&self) -> AdmissionEpochCapability {
+        self.admission_epoch_capability
     }
 
     pub fn process_id(&self) -> Result<BackendProcessId, novarocks_proto_codec::ProtocolError> {
@@ -278,6 +290,7 @@ impl PartialEq for LiveBackendTarget {
     fn eq(&self, other: &Self) -> bool {
         self.backend_idx == other.backend_idx
             && self.descriptor.as_proto() == other.descriptor.as_proto()
+            && self.admission_epoch_capability == other.admission_epoch_capability
     }
 }
 
@@ -397,6 +410,11 @@ mod tests {
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_types::BackendProcessId;
 
+    fn admission_epoch() -> novarocks_execution::task_execution::AdmissionEpochCapability {
+        novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes([0x61; 16])
+            .expect("nonzero epoch")
+    }
+
     fn descriptor(endpoint: SocketAddr) -> BackendProcessDescriptor {
         BackendProcessDescriptor::new(
             BackendProcessId::new_v7(),
@@ -415,8 +433,8 @@ mod tests {
         let snapshot = BackendTopologySnapshot::try_new(
             7,
             vec![
-                LiveBackendTarget::new(9, descriptor(endpoint)),
-                LiveBackendTarget::new(2, descriptor(endpoint)),
+                LiveBackendTarget::new(9, descriptor(endpoint), admission_epoch()),
+                LiveBackendTarget::new(2, descriptor(endpoint), admission_epoch()),
             ],
         )
         .expect("distinct targets form a snapshot");
@@ -439,8 +457,8 @@ mod tests {
             BackendTopologySnapshot::try_new(
                 7,
                 vec![
-                    LiveBackendTarget::new(2, descriptor(endpoint)),
-                    LiveBackendTarget::new(2, descriptor(endpoint)),
+                    LiveBackendTarget::new(2, descriptor(endpoint), admission_epoch()),
+                    LiveBackendTarget::new(2, descriptor(endpoint), admission_epoch()),
                 ],
             ),
             Err(BackendTopologyError::DuplicateBackendId { backend_idx: 2 })

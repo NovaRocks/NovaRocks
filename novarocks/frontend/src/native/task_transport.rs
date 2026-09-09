@@ -2544,11 +2544,17 @@ mod tests {
         let context = context(backend);
         let valid_for = LeaseValidFor::new(Duration::from_secs(10)).expect("a legal validity");
         let compatibility = novarocks_types::NativeCompatibilityId::new([0x71; 32]);
+        let admission_epoch_capability =
+            novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                [0x61; 16],
+            )
+            .expect("nonzero epoch");
         let request = AcquireQueryContextAdmissionTicket::new(
             TaskOperationId::new_v7(),
             context,
             valid_for,
             compatibility,
+            admission_epoch_capability,
         );
         let encoded = encode_operation(
             &OperationIntent::AcquireQueryContextAdmissionTicket(request),

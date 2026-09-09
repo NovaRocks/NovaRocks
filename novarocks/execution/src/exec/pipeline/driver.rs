@@ -1173,7 +1173,7 @@ impl PipelineDriver {
                 continue;
             }
             let downstream_idx = e + 1;
-            let (downstream_name, need_input) = {
+            let downstream_name = {
                 let Some(downstream_op) = self.operators.get(downstream_idx) else {
                     return Err("pipeline operator index out of bounds".to_string());
                 };
@@ -1184,11 +1184,12 @@ impl PipelineDriver {
                         downstream_name
                     )
                 })?;
-                (downstream_name, downstream.need_input())
+                let chunk = self.edge_chunks[e].as_ref().expect("checked is_some");
+                if !downstream.can_accept_input(chunk)? {
+                    continue;
+                }
+                downstream_name
             };
-            if !need_input {
-                continue;
-            }
             let chunk = self.edge_chunks[e].take().expect("checked is_some");
             let (mut chunk, dict_stats) = {
                 let downstream_ref = self

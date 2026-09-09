@@ -42,7 +42,8 @@ use crate::task_execution::domain::{
     TaskDomainKind,
 };
 use crate::task_execution::identity::{
-    AdmissionTicketId, IdentityMismatch, QueryContextRef, TaskIdentity, TaskOperationId,
+    AdmissionEpochCapability, AdmissionTicketId, IdentityMismatch, QueryContextRef, TaskIdentity,
+    TaskOperationId,
 };
 use crate::task_execution::lease::{LeaseReceipt, LeaseSequence, LeaseValidFor};
 use crate::task_execution::status::{AbortCause, CancelReason, TaskStatus};
@@ -101,6 +102,30 @@ impl fmt::Display for MaxWaitError {
 }
 
 impl std::error::Error for MaxWaitError {}
+
+/// Zero-based sequence of one root result packet.
+///
+/// Acknowledgements use this type so the absence of an acknowledgement stays
+/// distinct from acknowledging packet zero.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ResultPacketSequence(u64);
+
+impl ResultPacketSequence {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
 
 /// How long a backend may spend on one operation.
 ///
@@ -765,6 +790,7 @@ pub struct AcquireQueryContextAdmissionTicket {
     context: QueryContextRef,
     valid_for: LeaseValidFor,
     native_compatibility_id: NativeCompatibilityId,
+    admission_epoch_capability: AdmissionEpochCapability,
 }
 
 impl AcquireQueryContextAdmissionTicket {
@@ -773,6 +799,7 @@ impl AcquireQueryContextAdmissionTicket {
         context: QueryContextRef,
         valid_for: LeaseValidFor,
         native_compatibility_id: NativeCompatibilityId,
+        admission_epoch_capability: AdmissionEpochCapability,
     ) -> Self {
         Self {
             envelope: OperationEnvelope::with_default_wait(
@@ -782,6 +809,7 @@ impl AcquireQueryContextAdmissionTicket {
             context,
             valid_for,
             native_compatibility_id,
+            admission_epoch_capability,
         }
     }
 
@@ -799,6 +827,10 @@ impl AcquireQueryContextAdmissionTicket {
 
     pub const fn native_compatibility_id(self) -> NativeCompatibilityId {
         self.native_compatibility_id
+    }
+
+    pub const fn admission_epoch_capability(self) -> AdmissionEpochCapability {
+        self.admission_epoch_capability
     }
 }
 
@@ -1220,8 +1252,8 @@ mod request_tests {
         SplitSequence, TaskDomainKind,
     };
     use crate::task_execution::identity::{
-        AdmissionTicketId, IdentityField, IdentityMismatch, QueryContextRef, TaskIdentity,
-        TaskOperationId,
+        AdmissionEpochCapability, AdmissionTicketId, IdentityField, IdentityMismatch,
+        QueryContextRef, TaskIdentity, TaskOperationId,
     };
     use crate::task_execution::lease::{LeaseSequence, LeaseValidFor};
     use crate::task_execution::status::{AbortCause, CancelReason};
@@ -1507,6 +1539,7 @@ mod request_tests {
             context,
             valid_for,
             native_compatibility_id,
+            AdmissionEpochCapability::try_from_bytes([0x51; 16]).expect("nonzero epoch"),
         );
         assert_eq!(
             request.envelope().kind(),

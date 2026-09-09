@@ -15,4 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use novarocks_state_store_runtime::{RunFailure, RunSuccess, run_side_effect_free};
+//! Provider-neutral application support for durable StateStore operations.
+//!
+//! Concrete provider construction and configuration belong to Server. Durable
+//! record families and prefixes remain with the application domain that owns
+//! those records.
+
+mod runner;
+
+pub use novarocks_state_store_api::StateStoreMetrics;
+pub use runner::{
+    OperationId, RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free,
+};

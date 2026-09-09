@@ -40,7 +40,7 @@ use tracing::{info, warn};
 use super::builder::build_native_pipeline_graph_for_exec_plan_with_runtime_settings;
 use super::dependency::DependencyManager;
 use super::fragment_context::FragmentContext;
-use super::global_driver_executor::{DriverTask, FragmentCompletion};
+use super::global_driver_executor::{DriverTask, FragmentCompletion, FragmentStoppedFact};
 use super::operator_factory::OperatorFactory;
 use super::pipeline::Pipeline;
 use crate::runtime::endpoint::RuntimeEndpoint;
@@ -114,12 +114,20 @@ impl PreparedPipelineExecution {
             #[cfg(not(test))]
             panic!("prepared execution requires an ExecutionRuntime");
         }
+        let fragment_wall_timer = Arc::new(Mutex::new(fragment_wall_timer));
+        let timer_on_stop = Arc::clone(&fragment_wall_timer);
+        completion.subscribe_stopped(Box::new(move |_| {
+            timer_on_stop
+                .lock()
+                .expect("fragment wall timer lock")
+                .take();
+        }));
         RunningPipelineExecution {
             completion,
             fragment_ctx,
             runtime_state,
             submitted_driver_count,
-            fragment_wall_timer: Mutex::new(fragment_wall_timer),
+            fragment_wall_timer,
             terminal_scan_ops,
         }
     }
@@ -131,7 +139,7 @@ pub struct RunningPipelineExecution {
     fragment_ctx: Arc<FragmentContext>,
     runtime_state: Arc<RuntimeState>,
     submitted_driver_count: usize,
-    fragment_wall_timer: Mutex<Option<ScopedTimer>>,
+    fragment_wall_timer: Arc<Mutex<Option<ScopedTimer>>>,
     terminal_scan_ops: Vec<Arc<dyn ScanOp>>,
 }
 
@@ -152,6 +160,24 @@ impl RunningPipelineExecution {
 
     pub fn fail(&self, err: String) -> bool {
         self.cancel(err)
+    }
+
+    /// Returns the local execution conclusion as soon as it is known.
+    ///
+    /// An error can be visible while submitted drivers are still draining.
+    pub fn conclusion(&self) -> Option<Result<(), String>> {
+        self.completion.conclusion()
+    }
+
+    /// Returns actual-stop proof only after every submitted driver has exited.
+    pub fn stopped_fact(&self) -> Option<FragmentStoppedFact> {
+        self.completion.stopped_fact()
+    }
+
+    /// Registers a one-shot callback for actual driver stop without a
+    /// check/register lost-wakeup window.
+    pub fn subscribe_stopped(&self, observer: impl FnOnce(FragmentStoppedFact) + Send + 'static) {
+        self.completion.subscribe_stopped(Box::new(observer));
     }
 
     /// Drain submitted drivers and return their local terminal result.
@@ -183,10 +209,13 @@ impl RunningPipelineExecution {
         if let Err(err) = &result {
             self.fragment_ctx.set_final_status(err.clone());
         }
-        self.fragment_wall_timer
-            .lock()
-            .expect("fragment wall timer lock")
-            .take();
+        debug_assert!(
+            self.fragment_wall_timer
+                .lock()
+                .expect("fragment wall timer lock")
+                .is_none(),
+            "stopped observer must close the fragment wall timer"
+        );
         result
     }
 }

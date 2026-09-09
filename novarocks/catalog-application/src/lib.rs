@@ -15,4 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use novarocks_state_store_runtime::{RunFailure, RunSuccess, run_side_effect_free};
+//! Long-lived frontend Catalog application state.
+//!
+//! This crate owns process-local Catalog generations and their retirement.
+//! Query-local compiler mappings and Connector execution instances belong to
+//! their respective application domains and are intentionally absent.
+
+mod generation;
+
+pub use generation::{
+    CatalogGenerationError, CatalogGenerationLease, CatalogGenerationOwner,
+    PreparedCatalogGeneration,
+};

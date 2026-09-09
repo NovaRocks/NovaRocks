@@ -23,7 +23,7 @@
 //! terminal record, and `Gone` is the retirement fence that keeps a legal late
 //! request from being mistaken for a brand new task.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
@@ -39,6 +39,7 @@ use novarocks_execution_contract::task_execution::status::{
     AbortCause, FinalTaskInfo, TaskStatus, TerminationDetail,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
+use novarocks_types::identity::{StageId, TaskId};
 use novarocks_worker::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
 
 use super::domains::{InitialDomainKey, TaskDomains};
@@ -148,6 +149,11 @@ pub(super) struct LiveTask {
     pub(super) fingerprint: ContentFingerprint,
     pub(super) initial_domains: Vec<InitialDomainKey>,
     pub(super) receipt: CreateTaskReceipt,
+    /// The immutable create verdict when this worker was submitted after its
+    /// context had already closed. The worker remains owned until physical
+    /// convergence, but neither the winner nor a replay may turn that losing
+    /// create into an acknowledgement.
+    pub(super) creation_failure: Option<CreationFailure>,
     pub(super) status: Arc<TaskStatusOwner>,
     pub(super) runnable: Arc<dyn RunnableTask>,
     pub(super) domains: TaskDomains,
@@ -160,13 +166,15 @@ pub(super) struct LiveTask {
 /// It is secret-free by construction: the descriptor, the plan, the split
 /// payloads, and every credential are dropped at retirement and only the
 /// receipt, the descriptor fingerprint, the immutable terminal status, the
-/// final info, and the retirement instant survive.
+/// final info, the result-owner bit, and the retirement instant survive.
 pub(super) struct RetiredTask {
     pub(super) fingerprint: ContentFingerprint,
     pub(super) initial_domains: Vec<InitialDomainKey>,
     pub(super) receipt: CreateTaskReceipt,
+    pub(super) creation_failure: Option<CreationFailure>,
     pub(super) status: TaskStatus,
     pub(super) final_info: Option<FinalTaskInfo>,
+    pub(super) result_owner: bool,
     pub(super) retired_at: MonotonicInstant,
     pub(super) bytes: usize,
 }
@@ -182,6 +190,25 @@ pub(super) enum TaskEntry {
     /// that never existed. It deliberately carries nothing else: its content
     /// is exactly the fact that this identity was used and is finished.
     Gone,
+}
+
+/// The part of a task identity not already fixed by its owning context.
+///
+/// Query execution and backend process are identical for every member of one
+/// context, so retaining them 4096 times would add no fencing strength.
+#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SpentTaskIdentity {
+    stage: StageId,
+    task: TaskId,
+}
+
+impl SpentTaskIdentity {
+    const fn of(identity: TaskIdentity) -> Self {
+        Self {
+            stage: identity.stage_id(),
+            task: identity.task_id(),
+        }
+    }
 }
 
 impl TaskEntry {
@@ -243,6 +270,11 @@ pub(super) struct ContextEntry {
     pub(super) domains: QueryContextDomains,
     pub(super) source: Arc<TaskStatusSource>,
     pub(super) tasks: BTreeMap<TaskIdentity, TaskEntry>,
+    /// Compact, context-lifetime anti-replay fence for every task identity
+    /// that reached an installed worker. Detailed terminal records may be
+    /// reclaimed independently; an identity in this set cannot be created a
+    /// second time while the context remains addressable.
+    spent_tasks: BTreeSet<SpentTaskIdentity>,
     pub(super) retired_at: Option<MonotonicInstant>,
     /// When this context entered `ABORTING`. It bounds how long an
     /// uncooperative task may delay cleanup.
@@ -275,6 +307,7 @@ impl ContextEntry {
             domains: QueryContextDomains::empty(),
             source,
             tasks: BTreeMap::new(),
+            spent_tasks: BTreeSet::new(),
             retired_at: None,
             terminating_since: None,
             last_retire_revision: None,
@@ -283,15 +316,33 @@ impl ContextEntry {
         }
     }
 
-    /// How many task identities this context currently occupies.
+    /// How many task identities this context has cumulatively occupied.
     ///
-    /// A creation in progress counts: two concurrent creates must not both
-    /// slip past the per-context bound.
+    /// A creation in progress counts before it becomes spent, and every
+    /// installed worker remains counted after its detailed record is
+    /// reclaimed. Two concurrent creates therefore cannot slip past the
+    /// bound, and retirement cannot replenish the context's identity budget.
     pub(super) fn occupied_slots(&self) -> usize {
-        self.tasks
-            .values()
-            .filter(|entry| !matches!(entry, TaskEntry::Gone))
-            .count()
+        self.spent_tasks.len()
+            + self
+                .tasks
+                .iter()
+                .filter(|(identity, entry)| {
+                    !self.has_spent(**identity) && matches!(entry, TaskEntry::Creating(_))
+                })
+                .count()
+    }
+
+    pub(super) fn has_spent(&self, identity: TaskIdentity) -> bool {
+        self.spent_tasks.contains(&SpentTaskIdentity::of(identity))
+    }
+
+    pub(super) fn mark_spent(&mut self, identity: TaskIdentity) {
+        self.spent_tasks.insert(SpentTaskIdentity::of(identity));
+    }
+
+    pub(super) fn clear_spent(&mut self) {
+        self.spent_tasks.clear();
     }
 
     /// The abort cause a terminal receipt reports.

@@ -23,6 +23,7 @@
 //! transport model and has no dependency on a query application or frontend.
 
 mod admission;
+mod convergence;
 mod domain;
 mod ingress;
 mod lease;
@@ -34,6 +35,9 @@ pub use admission::{
     AdmissionTicketGrant, AdmissionTicketProgression, AdmissionTicketRedemption,
     AdmissionTicketRedemptionRejection, AdmissionTicketState, MAX_ADMISSION_RESERVATIONS,
     MAX_ADMISSION_TICKET_VALID_FOR,
+};
+pub use convergence::{
+    TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
 };
 pub use domain::{
     DomainPolicyRejection, InitialDomainKey, QueryContextDomains, TaskDomains,

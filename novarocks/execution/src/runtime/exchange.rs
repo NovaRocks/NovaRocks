@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -52,6 +52,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 
 use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -1038,6 +1039,105 @@ fn encode_exchange_payload_envelope(
     out
 }
 
+/// One exchange payload encoded into a single bounded backing allocation.
+///
+/// `retained_bytes` is the capacity of the allocation transferred into
+/// `Bytes`, rather than only its visible length. A result owner can therefore
+/// retain the exact credit that still backs the payload after encoding.
+#[derive(Debug)]
+pub struct BoundedExchangePayload {
+    bytes: Bytes,
+    retained_bytes: usize,
+}
+
+impl BoundedExchangePayload {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    pub fn into_parts(self) -> (Bytes, usize) {
+        (self.bytes, self.retained_bytes)
+    }
+}
+
+struct BoundedPayloadWriter {
+    buffer: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedPayloadWriter {
+    fn try_new(limit: usize, initial_capacity: usize) -> Result<Self, String> {
+        if initial_capacity > limit {
+            return Err(format!(
+                "bounded exchange payload initial capacity {initial_capacity} exceeds packet cap {limit}"
+            ));
+        }
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(initial_capacity).map_err(|error| {
+            format!(
+                "failed to reserve {initial_capacity} bytes for bounded exchange payload: {error}"
+            )
+        })?;
+        if buffer.capacity() > limit {
+            return Err(format!(
+                "bounded exchange payload allocation of {} bytes exceeds packet cap {limit}",
+                buffer.capacity()
+            ));
+        }
+        Ok(Self { buffer, limit })
+    }
+
+    fn into_payload(self) -> BoundedExchangePayload {
+        let retained_bytes = self.buffer.capacity();
+        BoundedExchangePayload {
+            bytes: Bytes::from(self.buffer),
+            retained_bytes,
+        }
+    }
+}
+
+impl Write for BoundedPayloadWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let required = self
+            .buffer
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("bounded exchange payload length overflow"))?;
+        if required > self.limit {
+            return Err(std::io::Error::other(format!(
+                "bounded exchange payload of at least {required} bytes exceeds packet cap {}",
+                self.limit
+            )));
+        }
+        if required > self.buffer.capacity() {
+            self.buffer
+                .try_reserve_exact(required - self.buffer.len())
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to grow bounded exchange payload to {required} bytes: {error}"
+                    ))
+                })?;
+            if self.buffer.capacity() < required || self.buffer.capacity() > self.limit {
+                return Err(std::io::Error::other(format!(
+                    "bounded exchange payload allocation of {} bytes cannot satisfy required {required} bytes within packet cap {}",
+                    self.buffer.capacity(),
+                    self.limit
+                )));
+            }
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn decode_exchange_payload_envelope(bytes: &[u8]) -> Result<DecodedExchangePayload<'_>, String> {
     if bytes.is_empty() {
         return Ok(DecodedExchangePayload {
@@ -1235,11 +1335,19 @@ fn is_exchange_dictionary_carrier_for_expected(expected: &DataType, actual: &Dat
 }
 
 fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
+    let mut buffer = Vec::new();
+    encode_arrow_ipc_chunks_to(chunks, &mut buffer)?;
+    Ok(buffer)
+}
+
+fn encode_arrow_ipc_chunks_to<W: std::io::Write>(
+    chunks: &[Chunk],
+    output: &mut W,
+) -> Result<(), String> {
     if chunks.is_empty() {
-        return Ok(vec![]);
+        return Ok(());
     }
 
-    let mut buffer = Vec::new();
     let schema = exchange_wire_schema_from_first_chunk(chunks)?;
     let mut batches = Vec::with_capacity(chunks.len());
     let writer_schema = if schema.fields().is_empty() {
@@ -1259,7 +1367,7 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
             .map(|batch| batch.schema())
             .unwrap_or(schema)
     };
-    let mut writer = StreamWriter::try_new(&mut buffer, &writer_schema)
+    let mut writer = StreamWriter::try_new(output, &writer_schema)
         .map_err(|e| format!("failed to create Arrow IPC writer: {e}"))?;
 
     for batch in batches {
@@ -1273,7 +1381,7 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
         .finish()
         .map_err(|e| format!("failed to finish Arrow IPC writer: {e}"))?;
 
-    Ok(buffer)
+    Ok(())
 }
 
 fn decode_arrow_ipc_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, String> {
@@ -1487,6 +1595,82 @@ pub fn encode_chunks(chunks: &[Chunk], include_slot_ids: bool) -> Result<Vec<u8>
     ))
 }
 
+/// Encodes chunks directly into one allocation that cannot grow beyond
+/// `packet_cap` through this writer.
+///
+/// This is used by retained result streams after the owner has reserved the
+/// complete packet cap. It avoids the unbounded encoder's Arrow-payload plus
+/// envelope copy and fails while writing as soon as the cap would be crossed.
+pub fn encode_chunks_bounded(
+    chunks: &[Chunk],
+    include_slot_ids: bool,
+    packet_cap: usize,
+) -> Result<BoundedExchangePayload, String> {
+    if chunks.is_empty() {
+        return Ok(BoundedExchangePayload {
+            bytes: Bytes::new(),
+            retained_bytes: 0,
+        });
+    }
+
+    let wire_meta = if include_slot_ids {
+        ExchangeWireMeta::from_chunks(chunks)?
+    } else {
+        None
+    };
+    let slot_id_bytes = wire_meta
+        .as_ref()
+        .map(|meta| {
+            meta.slot_ids_by_index
+                .len()
+                .saturating_mul(std::mem::size_of::<u32>())
+        })
+        .unwrap_or(0);
+    let envelope_bytes = EXCHANGE_PAYLOAD_MAGIC
+        .len()
+        .saturating_add(2)
+        .saturating_add(std::mem::size_of::<u32>())
+        .saturating_add(slot_id_bytes);
+    let logical_bytes = chunks.iter().fold(0usize, |total, chunk| {
+        total.saturating_add(chunk.logical_bytes())
+    });
+    let initial_capacity = envelope_bytes
+        .saturating_add(logical_bytes)
+        .saturating_add(4096)
+        .min(packet_cap);
+    let mut output = BoundedPayloadWriter::try_new(packet_cap, initial_capacity)?;
+
+    output
+        .write_all(EXCHANGE_PAYLOAD_MAGIC)
+        .map_err(|error| format!("failed to write exchange payload magic: {error}"))?;
+    output
+        .write_all(&[EXCHANGE_PAYLOAD_VERSION])
+        .map_err(|error| format!("failed to write exchange payload version: {error}"))?;
+    output
+        .write_all(&[if wire_meta.is_some() {
+            EXCHANGE_PAYLOAD_FLAG_SLOT_IDS
+        } else {
+            0
+        }])
+        .map_err(|error| format!("failed to write exchange payload flags: {error}"))?;
+    let slot_count = wire_meta
+        .as_ref()
+        .map(|meta| meta.slot_ids_by_index.len() as u32)
+        .unwrap_or(0);
+    output
+        .write_all(&slot_count.to_le_bytes())
+        .map_err(|error| format!("failed to write exchange payload slot count: {error}"))?;
+    if let Some(meta) = wire_meta.as_ref() {
+        for slot_id in &meta.slot_ids_by_index {
+            output
+                .write_all(&slot_id.as_u32().to_le_bytes())
+                .map_err(|error| format!("failed to write exchange payload slot id: {error}"))?;
+        }
+    }
+    encode_arrow_ipc_chunks_to(chunks, &mut output)?;
+    Ok(output.into_payload())
+}
+
 pub fn decode_root_result_chunks(
     bytes: &[u8],
     expected_chunk_schema: Option<&ChunkSchemaRef>,
@@ -1686,13 +1870,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ExchangeKey, ExchangePopResult, ExchangeSenderIdentity, ExecutionExchangeRegistry,
-        cancel_exchange_key, decode_chunks, decode_chunks_for_sender, decode_root_result_chunks,
-        encode_chunks, get_receiver_handle, push_chunks, register_expected_chunk_schema,
-        set_expected_senders, snapshot_receiver_state,
+        BoundedPayloadWriter, ExchangeKey, ExchangePopResult, ExchangeSenderIdentity,
+        ExecutionExchangeRegistry, cancel_exchange_key, decode_chunks, decode_chunks_for_sender,
+        decode_root_result_chunks, encode_chunks, encode_chunks_bounded, get_receiver_handle,
+        push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
     };
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
     use novarocks_types::{SlotId, UniqueId};
+    use std::io::Write as _;
 
     const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
         SlotId::new(33),
@@ -1896,6 +2081,54 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn bounded_encode_uses_one_capped_backing_payload() {
+        let chunk = exchange_test_chunk("name");
+        let expected = encode_chunks(std::slice::from_ref(&chunk), true).expect("encode payload");
+        let packet_cap = expected.len() + 1024;
+        let encoded = encode_chunks_bounded(&[chunk], true, packet_cap).expect("bounded encode");
+        let (payload, retained_bytes) = encoded.into_parts();
+
+        assert_eq!(payload.as_ref(), expected.as_slice());
+        assert!(retained_bytes >= payload.len());
+        assert!(retained_bytes <= packet_cap);
+    }
+
+    #[test]
+    fn bounded_encode_fails_while_crossing_packet_cap() {
+        let error = encode_chunks_bounded(&[exchange_test_chunk("name")], true, 32)
+            .expect_err("Arrow payload must exceed the bounded packet cap");
+
+        assert!(error.contains("exceeds packet cap"), "{error}");
+    }
+
+    #[test]
+    fn bounded_writer_grows_from_spare_capacity_without_unbounded_extend() {
+        let mut writer = BoundedPayloadWriter::try_new(10, 8).expect("bounded writer");
+        writer.write_all(&[1; 4]).expect("initial write");
+        assert_eq!(writer.buffer.len(), 4);
+        assert_eq!(writer.buffer.capacity(), 8);
+
+        writer.write_all(&[2; 6]).expect("bounded growth");
+        assert_eq!(writer.buffer.len(), 10);
+        assert_eq!(writer.buffer.capacity(), 10);
+    }
+
+    #[test]
+    fn bounded_writer_rejects_over_cap_without_mutating_buffer() {
+        let mut writer = BoundedPayloadWriter::try_new(10, 8).expect("bounded writer");
+        writer.write_all(&[1; 4]).expect("initial write");
+        let before_len = writer.buffer.len();
+        let before_capacity = writer.buffer.capacity();
+
+        let error = writer
+            .write_all(&[2; 7])
+            .expect_err("write beyond cap must fail");
+        assert!(error.to_string().contains("exceeds packet cap"));
+        assert_eq!(writer.buffer.len(), before_len);
+        assert_eq!(writer.buffer.capacity(), before_capacity);
     }
 
     #[test]

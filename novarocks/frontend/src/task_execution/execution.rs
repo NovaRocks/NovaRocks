@@ -28,8 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
-    AbortCause, OperationKind, QueryContextRef, TaskDomainUpdate, TaskIdentity, TaskOperationId,
-    TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, UpdateQueryContext,
+    AbortCause, AdmissionEpochCapability, OperationKind, QueryContextRef, TaskDomainUpdate,
+    TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail,
+    UpdateQueryContext,
 };
 use novarocks_query_application::coordination::{
     AttemptDrainFacts, DispatchBudget, GoneObservation, LatchOutcome, StageState,
@@ -163,6 +164,7 @@ impl QueryTaskExecution {
         budget: DispatchBudget,
         transport: TransportBudget,
         native_compatibility_id: NativeCompatibilityId,
+        admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
         clock: Arc<dyn TaskProtocolClock>,
         sink: Arc<dyn TaskOperationSink>,
         intake: StatusIntake,
@@ -175,9 +177,23 @@ impl QueryTaskExecution {
             *tasks_per_context.entry(task.context()).or_default() += 1;
         }
         for (&context, &tasks) in &tasks_per_context {
+            let admission_epoch_capability = admission_epochs
+                .get(&context.backend_process_id())
+                .copied()
+                .ok_or_else(|| {
+                    TaskExecutionError::Schedule(format!(
+                        "backend {} has no frozen admission epoch capability",
+                        context.backend_process_id()
+                    ))
+                })?;
             owners.insert(
                 context,
-                QueryContextOwner::new(context, tasks, native_compatibility_id),
+                QueryContextOwner::new(
+                    context,
+                    tasks,
+                    native_compatibility_id,
+                    admission_epoch_capability,
+                ),
             );
         }
 

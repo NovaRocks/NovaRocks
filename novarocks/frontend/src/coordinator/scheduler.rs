@@ -57,7 +57,14 @@ impl FrontendBackendSnapshot {
                     novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 )
                 .map_err(|error| contract_error(error.to_string()))?;
-                Ok(LiveBackendTarget::new(backend_idx, descriptor))
+                Ok(LiveBackendTarget::new(
+                    backend_idx,
+                    descriptor,
+                    novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                        [0x61; 16],
+                    )
+                    .expect("nonzero test epoch"),
+                ))
             })
             .collect::<Result<Vec<_>, DistributedQueryError>>()?;
         Self::validate(targets)

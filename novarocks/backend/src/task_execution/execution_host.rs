@@ -41,7 +41,7 @@
 //! query-scoped fact it needs arrives through [`TaskQueryContextFacts`], which
 //! the query context half of execution implements.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -68,7 +68,7 @@ use novarocks_execution_contract::task_execution::descriptor::{ExchangeSource, T
 use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ContentFingerprint, DomainVersion,
 };
-use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
@@ -229,8 +229,18 @@ pub trait TaskQueryContextFacts: Send + Sync {
 /// Installation is exclusive on that key: two live tasks sharing one kernel
 /// key would make a frame ambiguous, and no later check could disambiguate it.
 #[derive(Debug, Default)]
+struct TaskInboundCapabilityState {
+    installed: HashMap<UniqueId, Arc<TaskDescriptor>>,
+    /// A descriptor carries no frontend process identity. The registry owns
+    /// that mapping and permits only one context for a query execution, so the
+    /// execution identity is the complete key this data-plane owner can and
+    /// must fence.
+    closed_executions: HashSet<QueryExecutionId>,
+}
+
+#[derive(Debug, Default)]
 pub struct TaskInboundCapabilities {
-    installed: Mutex<HashMap<UniqueId, Arc<TaskDescriptor>>>,
+    state: Mutex<TaskInboundCapabilityState>,
 }
 
 /// The task and the frozen source one admitted frame belongs to.
@@ -270,10 +280,20 @@ impl TaskInboundCapabilities {
         sender_count: u32,
     ) -> Result<InboundFrameAdmission, IngressRejection> {
         let descriptor = {
-            let installed = self.installed.lock().expect(CAPABILITY_LOCK);
-            installed.get(&destination_kernel_key).map(Arc::clone)
+            let state = self.state.lock().expect(CAPABILITY_LOCK);
+            let descriptor = state
+                .installed
+                .get(&destination_kernel_key)
+                .map(Arc::clone)
+                .ok_or(IngressRejection::UnknownDestinationTask)?;
+            if state
+                .closed_executions
+                .contains(&descriptor.identity().query_execution_id())
+            {
+                return Err(IngressRejection::UnknownDestinationTask);
+            }
+            descriptor
         };
-        let descriptor = descriptor.ok_or(IngressRejection::UnknownDestinationTask)?;
         let source = authorize_inbound_frame(
             &descriptor,
             destination_kernel_key,
@@ -300,14 +320,28 @@ impl TaskInboundCapabilities {
     pub fn claim_frame(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
         let node_id = FragmentNodeId::new(query.destination_node_id);
         let descriptor = {
-            let installed = self.installed.lock().expect(CAPABILITY_LOCK);
-            installed
+            let state = self.state.lock().expect(CAPABILITY_LOCK);
+            state
+                .installed
                 .get(&query.destination_fragment_instance_id)
-                .map(Arc::clone)
+                .map(|descriptor| {
+                    (
+                        Arc::clone(descriptor),
+                        state
+                            .closed_executions
+                            .contains(&descriptor.identity().query_execution_id()),
+                    )
+                })
         };
-        let Some(descriptor) = descriptor else {
+        let Some((descriptor, context_closed)) = descriptor else {
             return ExchangeRouteClaim::NotHeld;
         };
+        if context_closed {
+            return ExchangeRouteClaim::Refused(format!(
+                "task {} belongs to a query context whose data-plane admission is closed",
+                descriptor.identity()
+            ));
+        }
         match authorize_inbound_frame(
             &descriptor,
             query.destination_fragment_instance_id,
@@ -326,7 +360,7 @@ impl TaskInboundCapabilities {
 
     /// How many tasks currently accept inbound frames.
     pub fn len(&self) -> usize {
-        self.installed.lock().expect(CAPABILITY_LOCK).len()
+        self.state.lock().expect(CAPABILITY_LOCK).installed.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -335,8 +369,17 @@ impl TaskInboundCapabilities {
 
     fn install(&self, descriptor: Arc<TaskDescriptor>) -> Result<(), HostRejection> {
         let key = descriptor.fragment_instance_id();
-        let mut installed = self.installed.lock().expect(CAPABILITY_LOCK);
-        if let Some(existing) = installed.get(&key) {
+        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+        if state
+            .closed_executions
+            .contains(&descriptor.identity().query_execution_id())
+        {
+            return Err(protocol(format!(
+                "task {} cannot install inbound capability after its query context closed",
+                descriptor.identity()
+            )));
+        }
+        if let Some(existing) = state.installed.get(&key) {
             // Replacing it would silently re-route the other task's frames,
             // so the second claimant is refused instead.
             return Err(protocol(format!(
@@ -345,8 +388,26 @@ impl TaskInboundCapabilities {
                 existing.identity()
             )));
         }
-        installed.insert(key, descriptor);
+        state.installed.insert(key, descriptor);
         Ok(())
+    }
+
+    fn close_context(&self, context: QueryContextRef) {
+        self.state
+            .lock()
+            .expect(CAPABILITY_LOCK)
+            .closed_executions
+            .insert(context.query_execution_id());
+    }
+
+    fn forget_context(&self, context: QueryContextRef) {
+        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
+        debug_assert!(state.installed.values().all(|descriptor| {
+            descriptor.identity().query_execution_id() != context.query_execution_id()
+        }));
+        state
+            .closed_executions
+            .remove(&context.query_execution_id());
     }
 
     /// Withdraws exactly this task's capability.
@@ -355,13 +416,14 @@ impl TaskInboundCapabilities {
     /// the same kernel key at different times; removing another task's entry
     /// would open a hole no later step closes.
     fn remove(&self, descriptor: &TaskDescriptor) {
-        let mut installed = self.installed.lock().expect(CAPABILITY_LOCK);
+        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
         let key = descriptor.fragment_instance_id();
-        if installed
+        if state
+            .installed
             .get(&key)
             .is_some_and(|held| held.identity() == descriptor.identity())
         {
-            installed.remove(&key);
+            state.installed.remove(&key);
         }
     }
 }
@@ -776,6 +838,14 @@ impl NativeTaskExecutionHost {
 }
 
 impl TaskExecutionHost for NativeTaskExecutionHost {
+    fn close_context_admission(&self, context: QueryContextRef) {
+        self.capabilities.close_context(context);
+    }
+
+    fn forget_context_admission(&self, context: QueryContextRef) {
+        self.capabilities.forget_context(context);
+    }
+
     /// Decodes the descriptor's plan and prepares the whole fragment.
     ///
     /// Receiver registration is not separable from preparation: the kernel
@@ -928,6 +998,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .with_fragment_commit_port(Arc::clone(&self.commit_port))
             .with_exchange_receiver_port(Arc::clone(&self.exchange_receiver_port))
             .with_execution_runtime(Arc::clone(&self.execution_runtime))
+            .with_result_identity(identity)
             // Binding the gates here is what makes the closed-edge barrier
             // real: the sinks this fragment builds consult them before every
             // send, so a producer cannot reach a destination that has not
@@ -1089,6 +1160,10 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 // task would run to completion after being told to stop.
                 worker.attach(Arc::new(running.clone()));
                 let fact = running.join();
+                // `join` is the positive local evidence that pipeline work
+                // stopped. A terminal status, abort acknowledgement, or
+                // timeout cannot manufacture this fact.
+                reporter.note_actual_stopped();
                 // The sampling tick stops firing the moment the drivers
                 // finish, so the last event-driven snapshot predates the rows
                 // the operators counted on their way out. The terminal fact
@@ -1104,6 +1179,10 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 split_queues.close_attempt(attempt);
                 queries.unregister_fragment_execution(execution, kernel_key);
                 queries.finish_fragment(execution);
+                // Every runtime owner named above has now returned its local
+                // responsibility. Registry-owned receiver/capability state is
+                // released later, by the retirement transition itself.
+                reporter.note_resources_converged();
             })
             .map_err(|error| {
                 resource_exhausted(format!("spawn native task worker failed: {error}"))
@@ -1504,7 +1583,7 @@ mod tests {
         CodecOwnedContent, ContentFingerprint, DomainVersion, EdgeOpenVersion, ExchangeEdgeId,
         PlanNodeId, SplitOffer, SplitSequence,
     };
-    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
     use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
     use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
@@ -1520,7 +1599,7 @@ mod tests {
     use novarocks_task_codec::descriptor::WireFragmentPlan;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
-        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use novarocks_worker::IngressRejection;
 
@@ -1905,7 +1984,7 @@ mod tests {
             facts,
             TaskInboundCapabilities::new(),
             crate::fragment::grpc_exchange_transmitter(data_runtime),
-            crate::fragment::native_result_writer(),
+            crate::fragment::test_native_result_writer(),
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(crate::runtime::sink_commit::BackendSinkCommitPort),
             test_execution_runtime(),
@@ -1988,6 +2067,66 @@ mod tests {
                 received: 2,
             })
         );
+    }
+
+    #[test]
+    fn closing_a_context_fences_an_installed_capability_and_any_late_install() {
+        let consumer = identity(16, 1, 1);
+        let producer = identity(16, 2, 1);
+        let producer_key = UniqueId::new(121, 122);
+        let node = FragmentNodeId::new(11);
+        let kernel_key = UniqueId::new(131, 132);
+        let descriptor = descriptor_with(
+            consumer,
+            kernel_key,
+            1,
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
+            wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
+        );
+        let context = QueryContextRef::new(
+            consumer.query_execution_id(),
+            FrontendProcessId::new_v7(),
+            consumer.backend_process_id(),
+        );
+        let capabilities = TaskInboundCapabilities::new();
+        capabilities
+            .install(Arc::new(descriptor.clone()))
+            .expect("a legal install");
+
+        capabilities.close_context(context);
+        let claim = capabilities.claim_frame(ExchangeRouteQuery {
+            destination_fragment_instance_id: kernel_key,
+            destination_node_id: node.get(),
+            source_fragment_instance_id: producer_key,
+            sender_ordinal: 0,
+            sender_count: 1,
+        });
+        let ExchangeRouteClaim::Refused(detail) = claim else {
+            panic!("a closed context must refuse its still-installed destination");
+        };
+        assert!(
+            detail.contains("data-plane admission is closed"),
+            "{detail}"
+        );
+        assert_eq!(
+            capabilities.authorize_frame(kernel_key, node, producer_key, 0, 1),
+            Err(IngressRejection::UnknownDestinationTask)
+        );
+
+        capabilities.remove(&descriptor);
+        let late = identity(16, 1, 2);
+        let late_key = UniqueId::new(141, 142);
+        let late_descriptor = descriptor_with(
+            late,
+            late_key,
+            1,
+            inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
+            wire_plan(late.query_execution_id().query_id(), late_key, 1),
+        );
+        let rejection = capabilities
+            .install(Arc::new(late_descriptor))
+            .expect_err("a create already in flight cannot reopen a closed context");
+        assert!(rejection.detail().as_str().contains("context closed"));
     }
 
     /// The defect this catches: the exchange data plane asked only the
@@ -2797,6 +2936,20 @@ mod tests {
         panic!("task did not reach a terminal state: {:?}", owner.state());
     }
 
+    fn await_runtime_convergence(owner: &TaskStatusOwner) {
+        for _ in 0..600 {
+            let convergence = owner.convergence();
+            if convergence.actual_stopped() && convergence.resources_converged() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!(
+            "task runtime did not converge after its terminal: {:?}",
+            owner.convergence()
+        );
+    }
+
     #[test]
     fn a_submitted_task_runs_and_publishes_its_own_terminal_status() {
         let facts = Arc::new(StubContextFacts::default());
@@ -2821,6 +2974,10 @@ mod tests {
             owner.output_released(),
             "a finished non-root task has released its output responsibility"
         );
+        await_runtime_convergence(&owner);
+        let convergence = owner.convergence();
+        assert!(convergence.conclusion_stable());
+        assert!(convergence.retirement_ready());
         // Standing a finished task down must be inert rather than a panic on
         // an already-consumed handle.
         runnable.abort(AbortCause::QueryFailed);
@@ -2844,7 +3001,7 @@ mod tests {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
         let task = identity(26, 1, 1);
-        let descriptor = consistent_descriptor(task, UniqueId::new(211, 212));
+        let descriptor = consistent_descriptor(task, UniqueId::new(213, 214));
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
@@ -3027,7 +3184,7 @@ mod tests {
         // which may land before or after the worker started the fragment.
         // Either way the task must terminate: a stand-down lost in that window
         // would leave the query waiting for a task nothing can stop.
-        owner.force_terminal(AbortCause::QueryFailed);
+        owner.force_conclusion(AbortCause::QueryFailed);
         runnable.abort(AbortCause::QueryFailed);
 
         assert_eq!(await_terminal(&owner), TaskState::Aborted);

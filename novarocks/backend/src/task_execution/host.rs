@@ -227,6 +227,15 @@ pub trait RunnableTask: fmt::Debug + Send + Sync {
 /// that can start a thread, so a failure in any earlier step is reported
 /// before a worker exists to clean up.
 pub trait TaskExecutionHost: Send + Sync {
+    /// Closes data-plane admission for every task of this exact query
+    /// execution. The registry calls this while it linearizes context
+    /// termination, before any per-task capability can be withdrawn.
+    fn close_context_admission(&self, context: QueryContextRef);
+
+    /// Reclaims the compact context fence after the registry has forgotten
+    /// the context itself. No task capability for the execution may remain.
+    fn forget_context_admission(&self, context: QueryContextRef);
+
     fn install_receiver(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection>;
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);

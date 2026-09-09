@@ -218,13 +218,8 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             .iter()
             .map(|property| CatalogNonSecretProperty::try_new(property.key(), property.value()))
             .collect::<Result<Vec<_>, _>>()?;
-        let (entries, refresh_endpoint, provider_refresher) =
+        let (entries, _refresh_endpoint, provider_refresher) =
             contribution.into_parts_with_refresher();
-        if refresh_endpoint.is_some() != provider_refresher.is_some() {
-            return Err(collector_error(
-                "vended S3 credential refresh endpoint and provider source differ",
-            ));
-        }
         let mut state = self
             .state
             .lock()
@@ -254,7 +249,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             )
             .map(|input| input.derive_access_domain())?;
             let lease_id = credential_lease_id(self.execution_id, &owner, &prefix)?;
-            let refresh_capable = refresh_endpoint.is_some();
+            let refresh_capable = provider_refresher.is_some();
             let descriptor = CredentialLeaseDescriptor::try_new(
                 lease_id,
                 1,
@@ -995,9 +990,10 @@ mod tests {
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
         CatalogProperties, CatalogVersion, ConnectorControlPlanningLease, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorVendedCredentialLeaseSink, CredentialConsumerRole,
-        StorageAccessRequest, StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
-        VendedS3CredentialLeaseEntry,
+        ConnectorProviderId, ConnectorVendedCredentialLeaseSink,
+        ConnectorVendedS3CredentialLeaseRefresher, CredentialConsumerRole, StorageAccessRequest,
+        StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
+        VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
     };
     use novarocks_types::BackendProcessId;
 
@@ -1071,6 +1067,17 @@ mod tests {
         .expect("contribution")
     }
 
+    struct ProviderLocalRefresher;
+
+    impl ConnectorVendedS3CredentialLeaseRefresher for ProviderLocalRefresher {
+        fn refresh_vended_s3_credentials(
+            &self,
+        ) -> Result<VendedS3CredentialLeaseRefresh, novarocks_spi::connector::ConnectorError>
+        {
+            panic!("the capability is not invoked by this collection test")
+        }
+    }
+
     #[test]
     fn attempt_collector_deduplicates_scope_and_drains_once() {
         let collector = AttemptCredentialLeaseCollector::new(execution_id());
@@ -1084,7 +1091,27 @@ mod tests {
 
         let leases = collector.into_credential_leases().expect("one-time drain");
         assert_eq!(leases.leases().len(), 1);
+        assert!(
+            !leases.leases()[0].descriptor().refresh_capable(),
+            "an endpoint-free contribution without a provider source is not refreshable"
+        );
         assert!(collector.into_credential_leases().is_err());
+    }
+
+    #[test]
+    fn provider_local_refresh_capability_does_not_require_a_public_endpoint() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let properties = vended_catalog_properties();
+        let contribution = vended_contribution("load-table")
+            .with_refresher(Arc::new(ProviderLocalRefresher))
+            .expect("provider-local refresher");
+        collector
+            .offer_vended_s3_credential_lease(&properties, contribution)
+            .expect("provider-local contribution");
+
+        let leases = collector.into_credential_leases().expect("one-time drain");
+        assert!(leases.leases()[0].descriptor().refresh_capable());
+        assert!(leases.leases()[0].refresher().is_some());
     }
 
     #[test]
@@ -1155,6 +1182,10 @@ mod tests {
                 novarocks_types::NativeCompatibilityId::new([0x72; 32]),
             )
             .expect("valid descriptor"),
+            novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                [0x61; 16],
+            )
+            .expect("nonzero epoch"),
         );
 
         let error = match QueryInitOptions::new(

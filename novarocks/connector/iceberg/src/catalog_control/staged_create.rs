@@ -268,31 +268,33 @@ pub(crate) fn prepare_rest_staged_table(
                 .ok_or_else(|| RestStagedPrepareFailure::CommitUnknown(
                     "REST staged create returned vended credentials but the request has no query-attempt lease consumer".to_string(),
                 ))?;
-                let refresh_scope = seed.refresh_scope();
+                // A staged target is not yet addressable through load_table,
+                // so load-table-only delegation cannot renew its authority.
+                // The staging side effect may already exist at this point;
+                // report an unknown outcome instead of returning a handle
+                // whose credentials can expire without a legal renewal path.
+                let refresh_scope = seed
+                    .staged_refresh_scope()
+                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
                 let contribution = seed
                     .into_vended_s3_credential_lease_contribution()
                     .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
-                let contribution = match refresh_scope {
-                    None => contribution,
-                    Some(scope) => contribution
-                        .with_refresher(Arc::new(IcebergRestVendedS3LeaseRefresher::new(
-                            runtime
-                                .novarocks_catalog()
-                                .vended_credential_refresh_catalog()
-                                .ok_or_else(|| {
-                                    RestStagedPrepareFailure::CommitUnknown(
-                                        "REST staged create vended refresh has no catalog owner"
-                                            .to_string(),
-                                    )
-                                })?,
-                            runtime.resources().catalog_runtime().clone(),
-                            scope,
-                        ))
-                            as Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>)
-                        .map_err(|error| {
-                            RestStagedPrepareFailure::CommitUnknown(error.to_string())
-                        })?,
-                };
+                let contribution = contribution
+                    .with_refresher(Arc::new(IcebergRestVendedS3LeaseRefresher::new(
+                        runtime
+                            .novarocks_catalog()
+                            .vended_credential_refresh_catalog()
+                            .ok_or_else(|| {
+                                RestStagedPrepareFailure::CommitUnknown(
+                                    "REST staged create vended refresh has no catalog owner"
+                                        .to_string(),
+                                )
+                            })?,
+                        runtime.resources().catalog_runtime().clone(),
+                        refresh_scope,
+                    ))
+                        as Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>)
+                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
                 collection
                     .offer_vended_s3_credential_lease(contribution)
                     .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;

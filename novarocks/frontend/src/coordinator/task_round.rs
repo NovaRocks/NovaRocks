@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_execution::task_execution::operation::CredentialUpdate;
+use novarocks_execution::task_execution::{AdmissionEpochCapability, operation::CredentialUpdate};
 use novarocks_query_application::coordination::DispatchBudget;
 use novarocks_sql::plan_read::FragmentEdge;
 use novarocks_task_codec::TransportBudget;
@@ -152,6 +152,7 @@ pub(crate) fn assemble_round(
     schedule: &SchedulingPlan,
     edges: &[FragmentEdge],
     backend_process_ids: &BTreeMap<usize, BackendProcessId>,
+    admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
     backends: &[(BackendProcessId, RuntimeEndpoint)],
     submissions: Vec<ValidatedNativeSubmission>,
     establish: AttemptEstablishFacts,
@@ -204,6 +205,7 @@ pub(crate) fn assemble_round(
         transport.budget,
         transport.transport,
         native_compatibility_id,
+        admission_epochs,
         Arc::new(ProcessMonotonicClock::new()),
         sink,
         intake,

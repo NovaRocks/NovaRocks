@@ -347,7 +347,7 @@ fn a_scan_whose_catalog_handle_does_not_resolve_fails_closed() {
         "an uninstalled catalog handle cannot be planned",
     );
     assert!(
-        error.contains("no complete typed control generation"),
+        error.contains("NotFound: Catalog generation is not available"),
         "unexpected error: {error}"
     );
 }

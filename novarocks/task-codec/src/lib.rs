@@ -90,14 +90,14 @@ mod tests {
         CredentialEpoch, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId,
     };
     use novarocks_execution_contract::task_execution::identity::{
-        AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
+        AdmissionEpochCapability, AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
     };
     use novarocks_execution_contract::task_execution::lease::{
         LeaseReceipt, LeaseSequence, LeaseValidFor,
     };
     use novarocks_execution_contract::task_execution::operation::{
         AcquireQueryContextAdmissionTicket, MaxWait, OperationKind, OperationOutcome,
-        QueryContextAdmissionTicketReceipt, ReleaseOutcome,
+        QueryContextAdmissionTicketReceipt, ReleaseOutcome, ResultPacketSequence,
     };
     use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
@@ -877,17 +877,24 @@ mod tests {
         let process = backend();
         let root = identity(4, 7, process);
 
-        let poll = encode_fetch_task_result(root, MaxWait::default_for(OperationKind::CancelTask));
-        let (decoded, max_wait) =
+        let acknowledged = ResultPacketSequence::new(19);
+        let poll = encode_fetch_task_result(
+            root,
+            MaxWait::default_for(OperationKind::CancelTask),
+            Some(acknowledged),
+        );
+        let (decoded, max_wait, decoded_acknowledged) =
             decode_fetch_task_result(&poll, FieldPath::root("fetch")).expect("a legal poll");
         assert_eq!(decoded, root);
         assert_eq!(max_wait, MaxWait::DEFAULT_UPDATE);
+        assert_eq!(decoded_acknowledged, Some(acknowledged));
 
         // A poll that names no task cannot be answered from "the" result
         // buffer, because the address is the only thing that says which one.
         let anonymous = novarocks::FetchTaskResultRequest {
             root_task: None,
             max_wait_millis: 1_000,
+            acknowledged_packet_sequence: None,
         };
         assert_eq!(
             decode_fetch_task_result(&anonymous, FieldPath::root("fetch"))
@@ -900,6 +907,7 @@ mod tests {
         let zero = novarocks::FetchTaskResultRequest {
             root_task: Some(encode_task_identity(root)),
             max_wait_millis: 0,
+            acknowledged_packet_sequence: None,
         };
         assert!(decode_fetch_task_result(&zero, FieldPath::root("fetch")).is_err());
 
@@ -933,11 +941,14 @@ mod tests {
         let query_context = context(backend());
         let valid_for = LeaseValidFor::new(Duration::from_secs(12)).expect("representable");
         let native_compatibility_id = NativeCompatibilityId::new([0x47; 32]);
+        let admission_epoch_capability =
+            AdmissionEpochCapability::try_from_bytes([0x51; 16]).expect("nonzero epoch");
         let request = AcquireQueryContextAdmissionTicket::new(
             TaskOperationId::new_v7(),
             query_context,
             valid_for,
             native_compatibility_id,
+            admission_epoch_capability,
         );
         let wire = encode_acquire_query_context_admission_ticket(request);
         let decoded = decode_operation_batch(
@@ -957,6 +968,51 @@ mod tests {
         assert_eq!(
             decoded_request.native_compatibility_id(),
             native_compatibility_id
+        );
+        assert_eq!(
+            decoded_request.admission_epoch_capability(),
+            admission_epoch_capability
+        );
+
+        let mut missing_epoch = wire.clone();
+        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
+            missing_epoch.operation.as_mut()
+        else {
+            panic!("fixture carries an admission ticket acquisition");
+        };
+        acquire.admission_epoch_capability = None;
+        assert_eq!(
+            decode_operation_batch(
+                &novarocks::ApplyTaskOperationsRequest {
+                    operations: vec![missing_epoch],
+                },
+                TransportBudget::DEFAULT,
+                FieldPath::root("batch"),
+            )
+            .expect_err("admission epoch is required before worker admission")
+            .kind(),
+            ProtocolErrorKind::MissingField
+        );
+
+        let mut zero_epoch = wire.clone();
+        let Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire)) =
+            zero_epoch.operation.as_mut()
+        else {
+            panic!("fixture carries an admission ticket acquisition");
+        };
+        acquire.admission_epoch_capability =
+            Some(novarocks::AdmissionEpochCapability { value: vec![0; 16] });
+        assert_eq!(
+            decode_operation_batch(
+                &novarocks::ApplyTaskOperationsRequest {
+                    operations: vec![zero_epoch],
+                },
+                TransportBudget::DEFAULT,
+                FieldPath::root("batch"),
+            )
+            .expect_err("an all-zero admission epoch must fail")
+            .kind(),
+            ProtocolErrorKind::InvalidValue
         );
 
         let mut missing_compatibility = wire.clone();
@@ -1031,6 +1087,7 @@ mod tests {
             query_context,
             other_valid_for,
             native_compatibility_id,
+            admission_epoch_capability,
         );
         assert_eq!(
             decode_query_context_admission_ticket_ack(
@@ -1049,6 +1106,7 @@ mod tests {
             other_context,
             valid_for,
             native_compatibility_id,
+            admission_epoch_capability,
         );
         assert_eq!(
             decode_query_context_admission_ticket_ack(

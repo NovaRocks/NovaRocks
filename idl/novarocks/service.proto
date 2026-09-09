@@ -533,6 +533,7 @@ message HeartbeatResponse {
   uint32 num_cores = 3;    // available cores for scheduling
   BackendProcessDescriptor descriptor = 5;
   BackendReportedState reported_state = 6;
+  AdmissionEpochCapability admission_epoch_capability = 7;
 }
 
 // ============================================================================
@@ -566,6 +567,13 @@ message TaskOperationId {
 // ownership, and expiry are bound by the acquisition receipt, not encoded in
 // the identity.
 message AdmissionTicketId {
+  bytes value = 1;  // exactly 16 nonzero unpredictable nonce bytes
+}
+
+// Opaque worker-local admission issuance epoch. It is published by the
+// authenticated heartbeat and rotated whenever retired acquisition history is
+// reclaimed. A sealed epoch permits retained exact replay only.
+message AdmissionEpochCapability {
   bytes value = 1;  // exactly 16 nonzero unpredictable nonce bytes
 }
 
@@ -773,6 +781,7 @@ message AcquireQueryContextAdmissionTicketRequest {
   QueryContextRef query_context = 1;
   uint64 valid_for_millis = 2;  // nonzero, <= 3600000
   NativeCompatibilityId native_compatibility_id = 3;
+  AdmissionEpochCapability admission_epoch_capability = 4;
 }
 
 // Create one task. The descriptor is a required field of this message and of
@@ -1282,4 +1291,9 @@ message GetFinalTaskInfoResponse {
 message FetchTaskResultRequest {
   TaskIdentity root_task = 1;
   uint64 max_wait_millis = 2;  // nonzero, <= 300000
+  // Highest packet durably accepted into the frontend's bounded delivery
+  // queue. Absent means this frontend has not accepted any packet yet. The
+  // backend retains and exactly replays one unacknowledged packet; gaps and
+  // future acknowledgements fail closed.
+  optional uint64 acknowledged_packet_sequence = 3;
 }

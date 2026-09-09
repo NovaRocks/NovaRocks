@@ -91,7 +91,8 @@ use crate::task_execution::round::{TaskRound, TurnReport};
 use crate::task_execution::split_transport::SplitDeliveryBridge;
 use crate::task_execution::status_intake::{CondvarWake, StatusIntakeWake};
 use novarocks_execution::task_execution::{
-    AbortCause, FinalTaskInfo, MaxWait, OperationKind, TaskIdentity, TaskState, TerminationDetail,
+    AbortCause, FinalTaskInfo, MaxWait, OperationKind, ResultPacketSequence, TaskIdentity,
+    TaskState, TerminationDetail,
 };
 
 trait QueryIdSource: Send + Sync + 'static {
@@ -857,6 +858,7 @@ impl FrontendDistributedQueryCoordinator {
             .copied()
             .collect::<BTreeMap<usize, BackendProcessId>>();
         let mut backends = Vec::with_capacity(backend_process_ids.len());
+        let mut admission_epochs = BTreeMap::new();
         for target in &backend_services.live_backends {
             let Some(&process_id) = backend_process_ids.get(&target.backend_idx()) else {
                 // Live but not scheduled. Freezing it would let an operation
@@ -867,6 +869,7 @@ impl FrontendDistributedQueryCoordinator {
                 .endpoint()
                 .map_err(|error| failed(error.to_string()))?;
             backends.push((process_id, endpoint));
+            admission_epochs.insert(process_id, target.admission_epoch_capability());
         }
         if backends.len() != backend_process_ids.len() {
             return Err(failed(
@@ -968,6 +971,7 @@ impl FrontendDistributedQueryCoordinator {
             prepared.scheduling_plan(),
             prepared.fragment_edges(),
             &backend_process_ids,
+            &admission_epochs,
             &backends,
             submissions,
             establish,
@@ -1333,6 +1337,18 @@ impl FrontendDistributedQueryCoordinator {
                         }
                         last_root_poll = RootResultPoll::Packet(packet_sequence);
                         moved = true;
+                    }
+                    Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) => {
+                        break Err(self.fail_task_round(
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            QueryFailureCause::FrontendExecution,
+                            format!(
+                                "root result poller exposed unacknowledged end of stream packet {packet_sequence}"
+                            ),
+                        ));
                     }
                     Ok(RootResultOutcome::EndOfStream { packet_sequence }) => {
                         if let Err(error) = round.consume_root_result_packet(packet_sequence, true)
@@ -2472,7 +2488,7 @@ mod tests {
 
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
-        QueryIdSource, StatisticsTaskCompletionFact, UniqueQueryIdSource,
+        QueryIdSource, ResultPacketSequence, StatisticsTaskCompletionFact, UniqueQueryIdSource,
         distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
         pre_ready_topology_validation_error, statistics_all_success_failure_message,
     };
@@ -2902,6 +2918,10 @@ mod tests {
             descriptor.clone(),
             BackendReportedState::Running,
             2,
+            novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                [0x61; 16],
+            )
+            .expect("nonzero epoch"),
             now_ms,
         );
     }
@@ -3113,6 +3133,10 @@ mod tests {
             FrontendBackendSnapshot::from_live_targets(vec![LiveBackendTarget::new(
                 0,
                 replacement_for_scheduler,
+                novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                    [0x61; 16],
+                )
+                .expect("nonzero epoch"),
             )])
             .expect("replacement scheduler"),
         );
@@ -3206,6 +3230,10 @@ mod tests {
             FrontendBackendSnapshot::from_live_targets(vec![LiveBackendTarget::new(
                 0,
                 replacement.clone(),
+                novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                    [0x62; 16],
+                )
+                .expect("nonzero replacement epoch"),
             )])
             .expect("replacement scheduler"),
         );
@@ -3331,6 +3359,7 @@ mod tests {
         /// Received once per poll before it answers.
         releases: Mutex<std::sync::mpsc::Receiver<()>>,
         polls: AtomicUsize,
+        acknowledgements: Mutex<Vec<Option<ResultPacketSequence>>>,
     }
 
     impl super::TaskResultTransport for ScriptedRootResult {
@@ -3338,6 +3367,7 @@ mod tests {
             &self,
             _root_task: TaskIdentity,
             _max_wait: MaxWait,
+            acknowledged: Option<ResultPacketSequence>,
             _expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
         ) -> Result<RootResultOutcome, String> {
             self.releases
@@ -3346,6 +3376,10 @@ mod tests {
                 .recv()
                 .map_err(|_| "the test stopped releasing polls".to_owned())?;
             self.polls.fetch_add(1, Ordering::SeqCst);
+            self.acknowledgements
+                .lock()
+                .expect("scripted acknowledgement lock")
+                .push(acknowledged);
             self.answers
                 .lock()
                 .expect("scripted answer lock")
@@ -3421,6 +3455,7 @@ mod tests {
             answers: Mutex::new(
                 [
                     RootResultOutcome::NotReady,
+                    RootResultOutcome::EndOfStreamPending { packet_sequence: 7 },
                     RootResultOutcome::EndOfStream { packet_sequence: 7 },
                 ]
                 .into_iter()
@@ -3428,6 +3463,7 @@ mod tests {
             ),
             releases: Mutex::new(releases),
             polls: AtomicUsize::new(0),
+            acknowledgements: Mutex::new(Vec::new()),
         });
         let wake = Arc::new(crate::task_execution::status_intake::CountingWake::default());
         let mut polls = super::RootResultPolls::start(
@@ -3462,6 +3498,9 @@ mod tests {
         assert!(wake.count() >= 1, "an answer wakes the loop");
 
         release.send(()).expect("the poller polls again by itself");
+        release
+            .send(())
+            .expect("the poller acknowledges end of stream by itself");
         let second = answer_within(&mut polls, Duration::from_secs(10))
             .expect("the second answer reaches the loop");
         assert!(
@@ -3486,8 +3525,15 @@ mod tests {
         );
         assert_eq!(
             transport.polls.load(Ordering::SeqCst),
-            2,
-            "exactly the two polls this test released"
+            3,
+            "exactly the three polls this test released"
+        );
+        assert_eq!(
+            *transport
+                .acknowledgements
+                .lock()
+                .expect("scripted acknowledgement lock"),
+            vec![None, None, Some(ResultPacketSequence::new(7))]
         );
     }
 }
@@ -3899,6 +3945,7 @@ impl RootResultPolls {
         std::thread::Builder::new()
             .name("root-result-polls".to_owned())
             .spawn(move || {
+                let mut acknowledged = None;
                 loop {
                     let now = Instant::now();
                     if now >= statement_deadline {
@@ -3907,22 +3954,34 @@ impl RootResultPolls {
                     let answer = transport.fetch_root_result(
                         root_task,
                         max_root_result_wait(now, statement_deadline),
+                        acknowledged,
                         Some(ExpectedOutputSchemaView::new(&expected_output_schema)),
                     );
+                    if let Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) = &answer {
+                        acknowledged = Some(ResultPacketSequence::new(*packet_sequence));
+                        continue;
+                    }
                     // Nothing is polled after an answer the loop cannot ask
                     // to be repeated. The stream has ended or the read
                     // failed, and a poll past that point is refused by a
                     // backend that has already handed its result over -- an
                     // error the loop would read as this query's failure.
                     let last = !matches!(
-                        answer,
+                        &answer,
                         Ok(RootResultOutcome::Ready { .. } | RootResultOutcome::NotReady)
                     );
+                    let next_acknowledged = match &answer {
+                        Ok(RootResultOutcome::Ready {
+                            packet_sequence, ..
+                        }) => Some(ResultPacketSequence::new(*packet_sequence)),
+                        _ => acknowledged,
+                    };
                     if sender.send(answer).is_err() {
                         // The loop stopped reading, so this attempt is over.
                         break;
                     }
                     wake.wake();
+                    acknowledged = next_acknowledged;
                     if last {
                         break;
                     }

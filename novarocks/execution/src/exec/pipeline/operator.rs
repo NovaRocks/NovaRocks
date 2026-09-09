@@ -179,6 +179,16 @@ impl FinishingWait {
 pub trait ProcessorOperator: Operator {
     fn need_input(&self) -> bool;
 
+    /// Non-blocking admission for the exact chunk currently retained on the
+    /// upstream edge.
+    ///
+    /// Most operators use their ordinary `need_input` decision. A bounded
+    /// terminal sink may reserve byte credit here before the driver transfers
+    /// ownership to `push_chunk`.
+    fn can_accept_input(&self, _chunk: &Chunk) -> Result<bool, String> {
+        Ok(self.need_input())
+    }
+
     fn has_output(&self) -> bool;
 
     fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String>;

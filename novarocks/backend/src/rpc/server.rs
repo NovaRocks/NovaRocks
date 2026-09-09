@@ -30,7 +30,7 @@ use std::thread::JoinHandle;
 
 use crate::rpc::data_plane::BackendDataPlane;
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
-use crate::task_execution::TaskInboundCapabilities;
+use crate::task_execution::{TaskExecutionRegistry, TaskInboundCapabilities};
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -100,6 +100,7 @@ pub(crate) struct BackendProcessFacts {
     pub(crate) process_id: BackendProcessId,
     pub(crate) descriptor: BackendProcessDescriptor,
     pub(crate) drain: Arc<BackendDrainState>,
+    pub(crate) task_execution_registry: Arc<TaskExecutionRegistry>,
 }
 
 /// Backend-owned production Tonic service. Domain owners contribute the narrow
@@ -302,6 +303,14 @@ impl NovaRocksGrpc for BackendRpcService {
             } else {
                 proto::BackendReportedState::Running as i32
             },
+            admission_epoch_capability: Some(proto::AdmissionEpochCapability {
+                value: self
+                    .process
+                    .task_execution_registry
+                    .admission_epoch_capability()
+                    .to_bytes()
+                    .to_vec(),
+            }),
         }))
     }
 
@@ -369,13 +378,10 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<proto::FetchTaskResultRequest>,
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
-        let ingress = Arc::clone(&self.task_execution_ingress);
-        let response =
-            tokio::task::spawn_blocking(move || ingress.fetch_task_result(request.into_inner()))
-                .await
-                .map_err(|error| {
-                    tonic::Status::internal(format!("fetch_task_result handler panicked: {error}"))
-                })??;
+        let response = self
+            .task_execution_ingress
+            .fetch_task_result(request.into_inner())
+            .await?;
         Ok(tonic::Response::new(response))
     }
 }

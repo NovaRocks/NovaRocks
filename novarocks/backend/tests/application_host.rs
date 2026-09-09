@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_backend::{
-    BackendApplicationHost, BackendDataRuntime, BackendNativeTransport, BackendServerConfig,
+    BackendApplicationHost, BackendDataRuntime, BackendNativeTransport,
+    BackendResultRetainedLimits, BackendServerConfig,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -70,6 +71,11 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         announce_max_backoff: Duration::from_secs(2),
         write_commit_evidence_limits: novarocks_spi::connector::WriteCommitEvidenceLimits::default(
         ),
+        result_retained_limits: BackendResultRetainedLimits::try_new(
+            16 * 1024 * 1024,
+            32 * 1024 * 1024,
+        )
+        .expect("valid test result retained-byte limits"),
         execution_runtime_config: ExecutionRuntimeConfig {
             driver_threads: 1,
             scan_threads: 1,

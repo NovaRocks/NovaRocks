@@ -368,11 +368,27 @@ pub(crate) fn heartbeat(
                 parse_reported_state(response.reported_state)
                     .map(|reported_state| (descriptor, reported_state))
                     .map_err(|error| error.to_string())
+            })
+            .and_then(|(descriptor, reported_state)| {
+                let capability = response
+                    .admission_epoch_capability
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "heartbeat response missing admission epoch capability".to_string()
+                    })?;
+                let capability = novarocks_task_codec::identity::decode_admission_epoch_capability(
+                    capability,
+                    novarocks_proto_codec::FieldPath::root("heartbeat_response")
+                        .field("admission_epoch_capability"),
+                )
+                .map_err(|error| error.to_string())?;
+                Ok((descriptor, reported_state, capability))
             }) {
-            Ok((descriptor, reported_state)) => HeartbeatOutcome::Ok {
+            Ok((descriptor, reported_state, admission_epoch_capability)) => HeartbeatOutcome::Ok {
                 descriptor,
                 reported_state,
                 num_cores: response.num_cores,
+                admission_epoch_capability,
                 now_ms: now_millis(),
             },
             Err(err) => HeartbeatOutcome::Failed { err },

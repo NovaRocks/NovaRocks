@@ -29,11 +29,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_execution::task_execution::{
-    AbortCause, AbortQueryContext, AcquireQueryContextAdmissionTicket, CodecOwnedContent,
-    CredentialUpdate, EstablishQueryContext, LeaseSequence, LeaseValidFor, OperationKind,
-    OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef, QueryContextState,
-    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, TaskOperationId,
-    UpdateQueryContext,
+    AbortCause, AbortQueryContext, AcquireQueryContextAdmissionTicket, AdmissionEpochCapability,
+    CodecOwnedContent, CredentialUpdate, EstablishQueryContext, LeaseSequence, LeaseValidFor,
+    OperationKind, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef,
+    QueryContextState, ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease,
+    TaskOperationId, UpdateQueryContext,
 };
 use novarocks_query_application::coordination::{
     ContextTransition, FrontendAction, MonotonicInstant, QueryContextEvent, RenewSchedule,
@@ -152,6 +152,7 @@ pub enum ReleaseSettlement {
 pub struct QueryContextOwner {
     context: QueryContextRef,
     native_compatibility_id: NativeCompatibilityId,
+    admission_epoch_capability: AdmissionEpochCapability,
     state: QueryContextState,
     admission: Option<ReleasedAdmission>,
     admission_ticket: Option<GrantedAdmission>,
@@ -191,10 +192,12 @@ impl QueryContextOwner {
         context: QueryContextRef,
         tasks: usize,
         native_compatibility_id: NativeCompatibilityId,
+        admission_epoch_capability: AdmissionEpochCapability,
     ) -> Self {
         Self {
             context,
             native_compatibility_id,
+            admission_epoch_capability,
             state: QueryContextState::Absent,
             admission: None,
             admission_ticket: None,
@@ -307,6 +310,7 @@ impl QueryContextOwner {
             self.context,
             valid_for,
             self.native_compatibility_id,
+            self.admission_epoch_capability,
         );
         self.admission = Some(ReleasedAdmission {
             request,

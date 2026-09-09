@@ -128,6 +128,49 @@ impl fmt::Debug for AdmissionTicketId {
     }
 }
 
+/// Opaque capability naming the worker-local admission issuance epoch.
+///
+/// A worker publishes its current capability through the authenticated
+/// heartbeat. Acquisition requests freeze that exact value. Once the worker
+/// seals an epoch, requests from it may only replay retained operations; they
+/// can never mint a replacement ticket after replay history is reclaimed.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct AdmissionEpochCapability([u8; 16]);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionEpochCapabilityError {
+    Zero,
+}
+
+impl fmt::Display for AdmissionEpochCapabilityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Zero => "admission epoch capability must not be all zeroes",
+        })
+    }
+}
+
+impl std::error::Error for AdmissionEpochCapabilityError {}
+
+impl AdmissionEpochCapability {
+    pub fn try_from_bytes(value: [u8; 16]) -> Result<Self, AdmissionEpochCapabilityError> {
+        if value == [0; 16] {
+            return Err(AdmissionEpochCapabilityError::Zero);
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for AdmissionEpochCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdmissionEpochCapability([redacted])")
+    }
+}
+
 /// Which identity component failed an exact match.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum IdentityField {
@@ -391,8 +434,9 @@ impl fmt::Display for QueryContextRef {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdmissionTicketId, AdmissionTicketIdError, IdentityField, IdentityMismatch,
-        QueryContextRef, TaskIdentity, TaskOperationId, TaskOperationIdError,
+        AdmissionEpochCapability, AdmissionEpochCapabilityError, AdmissionTicketId,
+        AdmissionTicketIdError, IdentityField, IdentityMismatch, QueryContextRef, TaskIdentity,
+        TaskOperationId, TaskOperationIdError,
     };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -444,6 +488,21 @@ mod tests {
         let arbitrary = AdmissionTicketId::try_from_bytes([0x5a; 16]).expect("nonzero nonce");
         assert_eq!(arbitrary.to_bytes(), [0x5a; 16]);
         assert_eq!(format!("{arbitrary:?}"), "AdmissionTicketId([redacted])");
+    }
+
+    #[test]
+    fn admission_epoch_accepts_any_nonzero_capability_without_exposing_it() {
+        assert_eq!(
+            AdmissionEpochCapability::try_from_bytes([0; 16]),
+            Err(AdmissionEpochCapabilityError::Zero)
+        );
+        let capability =
+            AdmissionEpochCapability::try_from_bytes([0x6a; 16]).expect("nonzero capability");
+        assert_eq!(capability.to_bytes(), [0x6a; 16]);
+        assert_eq!(
+            format!("{capability:?}"),
+            "AdmissionEpochCapability([redacted])"
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub(crate) type TaskStatusEventStream =
 /// not be understood at all; a request that was understood and refused comes
 /// back as a typed receipt or outcome inside a successful response, which is
 /// what lets a frontend classify it without reading an error message.
+#[tonic::async_trait]
 pub(crate) trait TaskExecutionIngress: Send + Sync {
     /// Applies a per-backend batch, one receipt per item in request order.
     ///
@@ -77,7 +78,7 @@ pub(crate) trait TaskExecutionIngress: Send + Sync {
     /// Unlike the fragment-instance-addressed form it replaces, the request
     /// names an exact task, so it is fenced against a replaced backend
     /// process before it reaches a result buffer.
-    fn fetch_task_result(
+    async fn fetch_task_result(
         &self,
         request: proto::FetchTaskResultRequest,
     ) -> Result<proto::FetchResultResponse, tonic::Status>;

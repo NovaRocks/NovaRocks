@@ -31,6 +31,7 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
 use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, NativeEndpoint};
 use tokio::runtime::Handle;
@@ -244,6 +245,7 @@ struct BackendFacts {
     /// A stale old process may not reclaim it by announcing again.
     superseded: bool,
     num_cores: u32,
+    admission_epoch_capability: Option<AdmissionEpochCapability>,
     last_heartbeat_ms: i64,
     missed_heartbeats: u32,
     scheduled_fragments: u64,
@@ -257,6 +259,7 @@ impl BackendFacts {
             && self.reported_state == BackendReportedState::Running
             && self.compatibility.is_compatible()
             && self.endpoint_owned
+            && self.admission_epoch_capability.is_some()
     }
 }
 
@@ -404,6 +407,7 @@ impl ClusterBackendService {
                     endpoint_owned: true,
                     superseded: false,
                     num_cores: 0,
+                    admission_epoch_capability: Some(target.admission_epoch_capability()),
                     last_heartbeat_ms: 0,
                     missed_heartbeats: 0,
                     scheduled_fragments: 0,
@@ -480,6 +484,7 @@ impl ClusterBackendService {
                 endpoint_owned,
                 superseded: false,
                 num_cores: 0,
+                admission_epoch_capability: None,
                 last_heartbeat_ms: 0,
                 missed_heartbeats: 0,
                 scheduled_fragments: 0,
@@ -572,12 +577,14 @@ impl ClusterBackendService {
                             descriptor,
                             reported_state,
                             num_cores,
+                            admission_epoch_capability,
                             now_ms,
                         } => self.record_heartbeat_success(
                             process_id,
                             descriptor,
                             reported_state,
                             num_cores,
+                            admission_epoch_capability,
                             now_ms,
                         ),
                         HeartbeatOutcome::Failed { err } => {
@@ -649,6 +656,7 @@ impl ClusterBackendService {
         descriptor: BackendProcessDescriptor,
         reported_state: BackendReportedState,
         num_cores: u32,
+        admission_epoch_capability: AdmissionEpochCapability,
         now_ms: i64,
     ) {
         self.refresh_expired_announce_leases(std::time::Instant::now());
@@ -704,6 +712,7 @@ impl ClusterBackendService {
             facts.compatibility = compatibility;
             facts.endpoint_owned = endpoint_owned;
             facts.num_cores = num_cores;
+            facts.admission_epoch_capability = Some(admission_epoch_capability);
             facts.last_heartbeat_ms = now_ms;
             facts.missed_heartbeats = 0;
             facts.last_err = None;
@@ -1082,7 +1091,13 @@ fn live_targets(state: &TopologyState) -> Vec<LiveBackendTarget> {
         .filter(|facts| facts.eligible())
         .enumerate()
         .map(|(membership_ordinal, facts)| {
-            LiveBackendTarget::new(membership_ordinal, facts.descriptor.clone())
+            LiveBackendTarget::new(
+                membership_ordinal,
+                facts.descriptor.clone(),
+                facts
+                    .admission_epoch_capability
+                    .expect("eligible backend has an admission epoch capability"),
+            )
         })
         .collect()
 }
@@ -1123,7 +1138,12 @@ fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
 /// invalid deployment.
 fn advance_if_membership_changed(
     state: &mut TopologyState,
-    before: BTreeSet<(BackendProcessId, RuntimeEndpoint, u8)>,
+    before: BTreeSet<(
+        BackendProcessId,
+        RuntimeEndpoint,
+        u8,
+        Option<AdmissionEpochCapability>,
+    )>,
 ) -> Result<bool, String> {
     if before == revision_members(state) {
         return Ok(false);
@@ -1139,7 +1159,14 @@ fn advance_if_membership_changed(
     Ok(true)
 }
 
-fn revision_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, RuntimeEndpoint, u8)> {
+fn revision_members(
+    state: &TopologyState,
+) -> BTreeSet<(
+    BackendProcessId,
+    RuntimeEndpoint,
+    u8,
+    Option<AdmissionEpochCapability>,
+)> {
     state
         .processes
         .iter()
@@ -1154,7 +1181,7 @@ fn revision_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, Runtim
             };
             descriptor_runtime_endpoint(&facts.descriptor)
                 .ok()
-                .map(|endpoint| (*id, endpoint, category))
+                .map(|endpoint| (*id, endpoint, category, facts.admission_epoch_capability))
         })
         .collect()
 }
@@ -1163,6 +1190,7 @@ fn revision_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, Runtim
 mod tests {
     use super::{BackendIslandSnapshotReader, ClusterBackendService};
     use crate::common::backend_topology::BackendTopologyPort;
+    use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
     use novarocks_types::BackendProcessId;
@@ -1197,6 +1225,7 @@ mod tests {
             descriptor.clone(),
             BackendReportedState::Running,
             2,
+            AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("nonzero epoch"),
             1,
         );
     }
@@ -1210,6 +1239,36 @@ mod tests {
         assert!(service.snapshot().unwrap().targets().is_empty());
         verify(&service, &descriptor);
         assert_eq!(service.snapshot().unwrap().targets().len(), 1);
+    }
+
+    #[test]
+    fn admission_epoch_rotation_advances_the_frozen_topology_revision() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let descriptor = descriptor("127.0.0.1:9079".parse().unwrap());
+        service
+            .record_announce(descriptor.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &descriptor);
+        let first = service.snapshot().expect("first eligible snapshot");
+        let first_revision = first.revision();
+        let first_epoch = first.targets()[0].admission_epoch_capability();
+        let next_epoch =
+            AdmissionEpochCapability::try_from_bytes([0x62; 16]).expect("nonzero next epoch");
+
+        service.record_heartbeat_success(
+            descriptor.process_id().unwrap(),
+            descriptor,
+            BackendReportedState::Running,
+            2,
+            next_epoch,
+            2,
+        );
+
+        let second = service.snapshot().expect("rotated eligible snapshot");
+        assert!(second.revision() > first_revision);
+        assert_ne!(first_epoch, next_epoch);
+        assert_eq!(second.targets()[0].admission_epoch_capability(), next_epoch);
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -1435,6 +1494,7 @@ mod tests {
             descriptor,
             BackendReportedState::Running,
             2,
+            AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("nonzero epoch"),
             2,
         );
 

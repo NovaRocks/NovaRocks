@@ -699,6 +699,18 @@ impl ConnectorControlBinding {
         self
     }
 
+    /// Returns the execution identity when this control generation also owns
+    /// a BE-materializable catalog binding.
+    ///
+    /// A control-only generation legitimately returns `None`; callers that
+    /// require execution properties must continue to use `catalog_handle` or
+    /// `catalog_properties` and fail closed.
+    pub fn execution_catalog_handle(&self) -> Option<&CatalogHandle> {
+        self.catalog_properties
+            .as_ref()
+            .map(CatalogProperties::handle)
+    }
+
     /// Returns the desired-state-derived execution identity. A binding which
     /// was not admitted through the catalog application owner must fail
     /// closed instead of deriving an identity from its control incarnation.

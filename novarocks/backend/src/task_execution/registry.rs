@@ -28,8 +28,8 @@
 //! One mutex guards all owner state and one condition variable wakes every
 //! waiter. Two kinds of call are allowed while that mutex is held: reading or
 //! writing a task's own status, and the teardown ports
-//! (`remove_receiver`, `remove_inbound_capability`, `release`), which are
-//! local map removals. Everything that can block — `materialize`, the two
+//! (`remove_receiver`, `remove_inbound_capability`, context-admission fence
+//! changes, and `release`), which are local map operations. Everything that can block — `materialize`, the two
 //! installs, `submit_runnable`, `apply_task_domain`,
 //! `advance_shared_domain`, and `cancel` / `abort` on a runnable — is called
 //! with the mutex released. The lock order is owner, then status, then
@@ -120,6 +120,8 @@ pub struct TaskExecutionRegistryConfig {
     pub admission_tickets: AdmissionTicketConfig,
     pub request_horizon: RequestHorizon,
     pub metric_publish_min_interval: Duration,
+    /// Cumulative task identities one context may consume. Retiring a task
+    /// does not replenish this bound.
     pub max_tasks_per_context: usize,
     pub max_active_tasks_per_backend: usize,
     /// Terminal task records retained past retirement.
@@ -275,6 +277,10 @@ impl TaskExecutionRegistry {
         context_host: Arc<dyn QueryContextHost>,
         task_host: Arc<dyn TaskExecutionHost>,
     ) -> Arc<Self> {
+        assert!(
+            config.max_tasks_per_context <= TransportBudget::DEFAULT.max_tasks_per_context(),
+            "task registry context bound exceeds the transport contract"
+        );
         Arc::new(Self {
             config,
             clock,
@@ -303,6 +309,13 @@ impl TaskExecutionRegistry {
 
     pub const fn config(&self) -> &TaskExecutionRegistryConfig {
         &self.config
+    }
+
+    /// The worker-local epoch capability a new acquisition must freeze.
+    pub fn admission_epoch_capability(
+        &self,
+    ) -> novarocks_execution_contract::AdmissionEpochCapability {
+        self.admission_tickets.current_epoch(self.clock.now())
     }
 
     pub fn counters(&self) -> RegistryCounters {
@@ -411,7 +424,11 @@ impl TaskExecutionRegistry {
             TaskLocation::Creating => RootResultRoute::Creating,
             TaskLocation::Retired => {
                 let retired = retired_task(&state, context, identity).expect("retired task");
-                RootResultRoute::Terminal(retired.status.state())
+                if retired.result_owner {
+                    RootResultRoute::TerminalResultOwner(retired.status.state())
+                } else {
+                    RootResultRoute::Terminal(retired.status.state())
+                }
             }
             TaskLocation::Gone => RootResultRoute::Gone,
             TaskLocation::Unknown => RootResultRoute::UnknownTask,
@@ -489,7 +506,8 @@ impl TaskExecutionRegistry {
                     }
                     AdmissionTicketAcquisitionRejection::ValidityExceedsWorkerLimit
                     | AdmissionTicketAcquisitionRejection::ContextAlreadyGranted
-                    | AdmissionTicketAcquisitionRejection::OperationReplayConflict => {
+                    | AdmissionTicketAcquisitionRejection::OperationReplayConflict
+                    | AdmissionTicketAcquisitionRejection::SealedEpoch => {
                         OperationOutcome::InvalidStateOrRequest
                     }
                 };
@@ -633,11 +651,12 @@ impl TaskExecutionRegistry {
         };
 
         let receipt = CreateTaskReceipt::new(identity, receipts, status.current());
-        if let Some(orphan) = transaction.commit(LiveTask {
+        if let Some((runnable, status)) = transaction.commit(LiveTask {
             descriptor: Arc::clone(&transaction.descriptor),
             fingerprint,
             initial_domains: initial_keys,
             receipt: receipt.clone(),
+            creation_failure: None,
             status,
             runnable,
             domains: task_domains,
@@ -645,14 +664,18 @@ impl TaskExecutionRegistry {
             capability_installed: true,
         }) {
             // The context closed while this task was being built. Stand the
-            // submitted worker down before its handle is dropped, so the
-            // rollback does not leave a thread nothing owns.
+            // submitted worker down. The closing context retained the live
+            // entry, so its eventual stop and resource convergence remain
+            // owned and charged rather than becoming an untracked orphan.
             let cause = self
                 .termination_cause(context)
                 .unwrap_or(AbortCause::QueryFailed);
-            orphan.runnable.abort(cause);
-            orphan.status.force_terminal(cause);
-            return transaction.abandon(
+            runnable.abort(cause);
+            status.force_conclusion(cause);
+            self.counters
+                .creations_rolled_back
+                .fetch_add(1, Ordering::Relaxed);
+            return OperationReceipt::rejected(
                 operation,
                 OperationOutcome::ContextTerminalReceipt,
                 "the query context closed while this task was being created",
@@ -710,6 +733,43 @@ impl TaskExecutionRegistry {
                     )));
                 }
                 OperationAdmission::TerminalReceipt => {
+                    // A create already holding this exact identity must finish
+                    // publishing its immutable verdict even if context
+                    // termination won in the meantime. Returning the generic
+                    // context terminal here would make the converging caller
+                    // disagree with the creation owner.
+                    if let Some(TaskEntry::Creating(cell)) = state
+                        .contexts
+                        .get(&context)
+                        .and_then(|entry| entry.tasks.get(&identity))
+                    {
+                        if !cell.same_creation(fingerprint, initial_keys) {
+                            return Err(Box::new(OperationReceipt::rejected(
+                                operation,
+                                OperationOutcome::CreateConflict,
+                                "a different descriptor is already being created for this identity",
+                            )));
+                        }
+                        if let Some(failure) = cell.failure() {
+                            self.counters
+                                .creations_converged
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Err(Box::new(OperationReceipt::rejected(
+                                operation,
+                                failure.outcome,
+                                failure.detail,
+                            )));
+                        }
+                        if now.has_reached(deadline) {
+                            return Err(Box::new(OperationReceipt::rejected(
+                                operation,
+                                OperationOutcome::OperationTimedOut,
+                                "create exceeded its effective wait behind a converging creation",
+                            )));
+                        }
+                        state = self.wait_gate(state);
+                        continue;
+                    }
                     // The context is closed, but a create that already
                     // succeeded is still answerable from its retained record.
                     if let Some(outcome) = retained_create_reply(
@@ -758,34 +818,46 @@ impl TaskExecutionRegistry {
                         }
                     }
                     Some(TaskEntry::Live(live)) => Decision::done(
-                        if live.fingerprint == fingerprint && live.initial_domains == initial_keys {
+                        if live.fingerprint != fingerprint || live.initial_domains != initial_keys {
+                            OperationReceipt::rejected(
+                                operation,
+                                OperationOutcome::CreateConflict,
+                                "this identity already carries a different descriptor",
+                            )
+                        } else if let Some(failure) = &live.creation_failure {
+                            OperationReceipt::rejected(
+                                operation,
+                                failure.outcome,
+                                failure.detail.clone(),
+                            )
+                        } else {
                             OperationReceipt::acknowledged(
                                 operation,
                                 OperationOutcome::Idempotent,
                                 live.receipt.clone(),
                             )
-                        } else {
+                        },
+                    ),
+                    Some(TaskEntry::Retired(retired)) => Decision::done(
+                        if retired.fingerprint != fingerprint
+                            || retired.initial_domains != initial_keys
+                        {
                             OperationReceipt::rejected(
                                 operation,
                                 OperationOutcome::CreateConflict,
                                 "this identity already carries a different descriptor",
                             )
-                        },
-                    ),
-                    Some(TaskEntry::Retired(retired)) => Decision::done(
-                        if retired.fingerprint == fingerprint
-                            && retired.initial_domains == initial_keys
-                        {
+                        } else if let Some(failure) = &retired.creation_failure {
+                            OperationReceipt::rejected(
+                                operation,
+                                failure.outcome,
+                                failure.detail.clone(),
+                            )
+                        } else {
                             OperationReceipt::acknowledged(
                                 operation,
                                 OperationOutcome::Idempotent,
                                 retired.receipt.clone(),
-                            )
-                        } else {
-                            OperationReceipt::rejected(
-                                operation,
-                                OperationOutcome::CreateConflict,
-                                "this identity already carries a different descriptor",
                             )
                         },
                     ),
@@ -794,12 +866,19 @@ impl TaskExecutionRegistry {
                         OperationOutcome::Gone,
                         "this identity's retained record was reclaimed",
                     )),
+                    None if entry.has_spent(identity) => {
+                        Decision::done(OperationReceipt::rejected(
+                            operation,
+                            OperationOutcome::Gone,
+                            "this identity's detailed record was reclaimed",
+                        ))
+                    }
                     None => {
                         if entry.occupied_slots() >= self.config.max_tasks_per_context {
                             Decision::done(OperationReceipt::rejected(
                                 operation,
                                 OperationOutcome::ResourceExhausted,
-                                "query context reached its task bound",
+                                "query context reached its cumulative task bound",
                             ))
                         } else if state.active_tasks >= self.config.max_active_tasks_per_backend {
                             Decision::done(OperationReceipt::rejected(
@@ -1511,6 +1590,10 @@ impl TaskExecutionRegistry {
         };
 
         let (status, runnable) = runnable.expect("a live task was located");
+        // Cancellation revokes client-visible output at its own linearization
+        // point. The fragment may already have finished producing and dropped
+        // its runnable handle, so task retirement cannot be the only cleanup.
+        crate::runtime::result_buffer::discard_task(identity);
         runnable.cancel(request.reason());
         OperationReceipt::acknowledged(operation, OperationOutcome::Accepted, status.current())
     }
@@ -1662,6 +1745,7 @@ impl TaskExecutionRegistry {
                 if self.release_ready_locked(&state, context) {
                     let entry = state.contexts.get_mut(&context).expect("active context");
                     entry.state = QueryContextState::Releasing;
+                    self.task_host.close_context_admission(context);
                     self.admission_tickets.revoke_unredeemed(context, now);
                     (ReleaseOutcome::Released, OperationOutcome::Accepted, true)
                 } else {
@@ -1998,6 +2082,7 @@ impl TaskExecutionRegistry {
                 .context_by_execution
                 .insert(context.query_execution_id(), context);
             state.retired_context_order.push_back(context);
+            self.task_host.close_context_admission(context);
             self.admission_tickets.release_context(context, now);
             return true;
         }
@@ -2007,7 +2092,7 @@ impl TaskExecutionRegistry {
         ) {
             return false;
         }
-        let won = {
+        let (won, task_identities) = {
             let entry = state
                 .contexts
                 .get_mut(&context)
@@ -2015,6 +2100,7 @@ impl TaskExecutionRegistry {
             if !matches!(entry.latch.latch(detail), LatchOutcome::Won) {
                 return false;
             }
+            self.task_host.close_context_admission(context);
             entry.state = QueryContextState::Aborting;
             entry.terminating_since = Some(now);
             entry.lease = None;
@@ -2028,9 +2114,15 @@ impl TaskExecutionRegistry {
                     live.capability_installed = false;
                 }
             }
-            true
+            (true, entry.tasks.keys().copied().collect::<Vec<_>>())
         };
         if won {
+            // The context termination invalidates every unconsumed root result
+            // immediately, including output whose producer already finished
+            // and no longer holds a fragment cancellation handle.
+            for identity in task_identities {
+                crate::runtime::result_buffer::discard_task(identity);
+            }
             self.admission_tickets.revoke_unredeemed(context, now);
             state.pending_termination.insert(context);
         }
@@ -2072,9 +2164,10 @@ impl TaskExecutionRegistry {
 
     /// Moves every terminal task into its secret-free retained record.
     ///
-    /// A terminating context forces the move: cleanup is driven, not awaited,
-    /// so an aborted task whose host never reports an output release cannot
-    /// pin the context open forever.
+    /// A task only moves after its stable conclusion, actual stop, output
+    /// release, and runtime-resource convergence have each been observed.
+    /// Termination grace may fix the conclusion, but cannot manufacture any
+    /// of the physical convergence facts.
     fn retire_locked(&self, state: &mut RegistryState, now: MonotonicInstant) -> usize {
         let contexts: Vec<QueryContextRef> = state.contexts.keys().copied().collect();
         let mut retired = 0;
@@ -2083,9 +2176,9 @@ impl TaskExecutionRegistry {
                 state.context_state(context),
                 QueryContextState::Aborting | QueryContextState::TerminalRetained
             );
-            // A task that ignored its stand-down request gets a bounded
-            // window and is then terminated by the owner, so cleanup always
-            // finishes.
+            // A task that ignored stand-down gets a bounded window before its
+            // conclusion is fixed. It remains live and charged until its
+            // execution owner supplies the remaining convergence facts.
             if force {
                 self.force_stalled_tasks_locked(state, context, now);
             } else {
@@ -2107,12 +2200,7 @@ impl TaskExecutionRegistry {
                     .tasks
                     .iter()
                     .filter_map(|(identity, task)| match task {
-                        TaskEntry::Live(live)
-                            if live.status.is_terminal()
-                                && (force || live.status.output_released()) =>
-                        {
-                            Some(*identity)
-                        }
+                        TaskEntry::Live(live) if live.status.retirement_ready() => Some(*identity),
                         _ => None,
                     })
                     .collect();
@@ -2122,6 +2210,9 @@ impl TaskExecutionRegistry {
                         continue;
                     };
                     let mut live = *live;
+                    live.status
+                        .retire()
+                        .expect("a retirement-ready live task can retire exactly once");
                     if live.capability_installed {
                         self.task_host.remove_inbound_capability(&live.descriptor);
                         live.capability_installed = false;
@@ -2132,6 +2223,7 @@ impl TaskExecutionRegistry {
                     }
                     let status = live.status.current();
                     let final_info = live.status.final_info();
+                    let result_owner = live.descriptor.sink_kind() == FragmentSinkKind::Result;
                     let bytes =
                         estimate_retained_bytes(&live.receipt, &status, final_info.as_ref());
                     let terminal_state = status.state();
@@ -2141,8 +2233,10 @@ impl TaskExecutionRegistry {
                             fingerprint: live.fingerprint,
                             initial_domains: live.initial_domains,
                             receipt: live.receipt,
+                            creation_failure: live.creation_failure,
                             status,
                             final_info,
+                            result_owner,
                             retired_at: now,
                             bytes,
                         })),
@@ -2152,6 +2246,7 @@ impl TaskExecutionRegistry {
                 retirements
             };
             for (identity, bytes, terminal_state) in retirements {
+                crate::runtime::result_buffer::retire_task_result(identity);
                 state.active_tasks = state.active_tasks.saturating_sub(1);
                 state.retained_tasks = state.retained_tasks.saturating_add(1);
                 state.retained_bytes = state.retained_bytes.saturating_add(bytes);
@@ -2163,7 +2258,7 @@ impl TaskExecutionRegistry {
         retired
     }
 
-    /// Terminates every task that outlived the termination grace.
+    /// Fixes the conclusion of every task that outlived termination grace.
     fn force_stalled_tasks_locked(
         &self,
         state: &mut RegistryState,
@@ -2191,7 +2286,7 @@ impl TaskExecutionRegistry {
             })
             .collect();
         for status in stalled {
-            status.force_terminal(cause);
+            status.force_conclusion(cause);
         }
     }
 
@@ -2215,7 +2310,7 @@ impl TaskExecutionRegistry {
             let ContextTransition::Apply(next) = classify_context_transition(current, event) else {
                 continue;
             };
-            {
+            let task_identities = {
                 let entry = state
                     .contexts
                     .get_mut(&context)
@@ -2239,6 +2334,10 @@ impl TaskExecutionRegistry {
                         entry.tasks.len(),
                     );
                 }
+                entry.tasks.keys().copied().collect::<Vec<_>>()
+            };
+            for identity in task_identities {
+                crate::runtime::result_buffer::discard_task(identity);
             }
             self.admission_tickets.release_context(context, now);
             state.retired_context_order.push_back(context);
@@ -2300,6 +2399,7 @@ impl TaskExecutionRegistry {
         context: QueryContextRef,
         identity: TaskIdentity,
     ) {
+        crate::runtime::result_buffer::discard_task(identity);
         let bytes = {
             let Some(entry) = state.contexts.get_mut(&context) else {
                 return;
@@ -2333,6 +2433,7 @@ impl TaskExecutionRegistry {
             entry.tasks.keys().copied().collect()
         };
         for identity in &identities {
+            crate::runtime::result_buffer::discard_task(*identity);
             let bytes = state
                 .contexts
                 .get(&context)
@@ -2345,6 +2446,7 @@ impl TaskExecutionRegistry {
         }
         if let Some(entry) = state.contexts.get_mut(&context) {
             entry.tasks.clear();
+            entry.clear_spent();
         }
         state.gone_context_order.push_back(context);
     }
@@ -2376,7 +2478,13 @@ impl TaskExecutionRegistry {
             if let Some(entry) = state.contexts.get_mut(&context) {
                 entry.tasks.remove(&identity);
             }
-            state.task_index.remove(&identity);
+            let spent = state
+                .contexts
+                .get(&context)
+                .is_some_and(|entry| entry.has_spent(identity));
+            if !spent {
+                state.task_index.remove(&identity);
+            }
         }
         while state.retired_context_order.len() > self.config.retained_context_capacity {
             let Some(context) = state.retired_context_order.pop_front() else {
@@ -2393,6 +2501,7 @@ impl TaskExecutionRegistry {
                     state.task_index.remove(identity);
                 }
             }
+            self.task_host.forget_context_admission(context);
             state.task_index.retain(|_, owner| *owner != context);
             if state
                 .context_by_execution
@@ -2454,6 +2563,13 @@ impl TaskExecutionRegistry {
             Some(TaskEntry::Live(_)) => TaskLocation::Live,
             Some(TaskEntry::Retired(_)) => TaskLocation::Retired,
             Some(TaskEntry::Gone) => TaskLocation::Gone,
+            None if state
+                .contexts
+                .get(&context)
+                .is_some_and(|entry| entry.has_spent(identity)) =>
+            {
+                TaskLocation::Gone
+            }
             None => TaskLocation::Unknown,
         }
     }
@@ -2670,34 +2786,66 @@ impl CreationTransaction<'_> {
         OperationReceipt::rejected(operation, outcome, detail)
     }
 
-    /// Installs the task, or hands it back when the context closed underneath
-    /// the transaction.
+    /// Installs the task, retaining convergence handles when the context
+    /// closed underneath the transaction.
     ///
     /// The installs and the submission ran with the lock released, so an abort
     /// may have linearized in the meantime. Committing into a closed context
-    /// would leave a live task nothing has agreed to supervise, so the create
-    /// loses the race instead.
-    fn commit(&mut self, live: LiveTask) -> Option<LiveTask> {
+    /// would leave a live task nothing has agreed to supervise. The create
+    /// still loses the race, but the closing context owns the submitted task
+    /// until its physical responsibilities converge.
+    fn commit(
+        &mut self,
+        mut live: LiveTask,
+    ) -> Option<(Arc<dyn RunnableTask>, Arc<TaskStatusOwner>)> {
         let status = Arc::clone(&live.status);
+        let runnable = Arc::clone(&live.runnable);
+        let closed;
         {
             let mut state = self.registry.state.lock().expect(REGISTRY_LOCK);
-            let closed = state.context_state(self.context) != QueryContextState::Active;
-            let Some(entry) = state.contexts.get_mut(&self.context) else {
-                return Some(live);
-            };
+            closed = state.context_state(self.context) != QueryContextState::Active;
             if closed {
-                return Some(live);
+                let failure = CreationFailure {
+                    outcome: OperationOutcome::ContextTerminalReceipt,
+                    detail: "the query context closed while this task was being created".to_owned(),
+                };
+                self.cell.fail(failure.clone());
+                live.creation_failure = Some(failure);
             }
+            let entry = state
+                .contexts
+                .get_mut(&self.context)
+                .expect("a reserved creation retains its query context");
+            entry.mark_spent(self.identity);
             entry
                 .tasks
                 .insert(self.identity, TaskEntry::Live(Box::new(live)));
-            // The acknowledgement is the linearization point, so the first
-            // snapshot becomes observable exactly here.
-            status.release_to_observers();
+            if !closed {
+                // The acknowledgement is the linearization point, so the
+                // first snapshot becomes observable exactly here.
+                status.release_to_observers();
+            }
+        }
+        if closed {
+            // The context already revoked new work. Close the submitted
+            // task's independently installed data-plane capability as part of
+            // the same losing create, while retaining its receiver until the
+            // running task supplies actual-stop and resource evidence.
+            self.registry
+                .task_host
+                .remove_inbound_capability(&self.descriptor);
+            let mut state = self.registry.state.lock().expect(REGISTRY_LOCK);
+            if let Some(TaskEntry::Live(live)) = state
+                .contexts
+                .get_mut(&self.context)
+                .and_then(|entry| entry.tasks.get_mut(&self.identity))
+            {
+                live.capability_installed = false;
+            }
         }
         self.committed = true;
         self.registry.gate.notify_all();
-        None
+        closed.then_some((runnable, status))
     }
 }
 
@@ -2820,6 +2968,13 @@ fn retained_create_reply(
                     "this identity already carries a different descriptor",
                 ));
             }
+            if let Some(failure) = &retired.creation_failure {
+                return Some(OperationReceipt::rejected(
+                    operation,
+                    failure.outcome,
+                    failure.detail.clone(),
+                ));
+            }
             Some(OperationReceipt::acknowledged(
                 operation,
                 OperationOutcome::Idempotent,
@@ -2832,6 +2987,13 @@ fn retained_create_reply(
                     operation,
                     OperationOutcome::CreateConflict,
                     "this identity already carries a different descriptor",
+                ));
+            }
+            if let Some(failure) = &live.creation_failure {
+                return Some(OperationReceipt::rejected(
+                    operation,
+                    failure.outcome,
+                    failure.detail.clone(),
                 ));
             }
             Some(OperationReceipt::acknowledged(

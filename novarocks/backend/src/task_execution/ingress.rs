@@ -306,6 +306,7 @@ fn encode_item<T>(
     ))
 }
 
+#[tonic::async_trait]
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
     fn apply_task_operations(
         &self,
@@ -423,14 +424,14 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         })
     }
 
-    fn fetch_task_result(
+    async fn fetch_task_result(
         &self,
         request: proto::FetchTaskResultRequest,
     ) -> Result<proto::FetchResultResponse, tonic::Status> {
         // The semantics live with the result plane, beside the buffer they
         // read. Two implementations of one RPC drift, and the one that drifts
         // is always the one nobody is looking at.
-        crate::rpc::data_plane::fetch_task_result(&self.registry, request)
+        crate::rpc::data_plane::fetch_task_result(&self.registry, request).await
     }
 }
 
@@ -611,6 +612,10 @@ mod tests {
     }
 
     impl TaskExecutionHost for AcceptingTaskHost {
+        fn close_context_admission(&self, _context: QueryContextRef) {}
+
+        fn forget_context_admission(&self, _context: QueryContextRef) {}
+
         fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
             Ok(())
         }
@@ -737,6 +742,7 @@ mod tests {
                 context,
                 TaskOperationId::new_v7(),
                 self.native_compatibility_id,
+                self.registry.admission_epoch_capability(),
             )]);
             let Some(ReceiptAck::QueryContextAdmissionTicket(ack)) = &response.receipts[0].ack
             else {
@@ -778,6 +784,7 @@ mod tests {
         context: QueryContextRef,
         operation: TaskOperationId,
         native_compatibility_id: NativeCompatibilityId,
+        admission_epoch_capability: novarocks_execution_contract::AdmissionEpochCapability,
     ) -> proto::TaskOperation {
         proto::TaskOperation {
             envelope: Some(envelope(operation)),
@@ -788,6 +795,9 @@ mod tests {
                         valid_for_millis: 10_000,
                         native_compatibility_id: Some(proto::NativeCompatibilityId {
                             value: native_compatibility_id.as_bytes().to_vec(),
+                        }),
+                        admission_epoch_capability: Some(proto::AdmissionEpochCapability {
+                            value: admission_epoch_capability.to_bytes().to_vec(),
                         }),
                     },
                 ),
@@ -980,6 +990,7 @@ mod tests {
             context,
             TaskOperationId::new_v7(),
             NativeCompatibilityId::new([0x72; 32]),
+            fixture.registry.admission_epoch_capability(),
         )]);
 
         assert_eq!(response.receipts.len(), 1);
@@ -1051,6 +1062,7 @@ mod tests {
                 rejected_context,
                 TaskOperationId::new_v7(),
                 NativeCompatibilityId::new([0x72; 32]),
+                fixture.registry.admission_epoch_capability(),
             ),
             establish_with_compatibility(
                 accepted_context,
@@ -1378,8 +1390,8 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
-    #[test]
-    fn a_result_poll_for_a_foreign_task_is_refused_before_a_buffer() {
+    #[tokio::test]
+    async fn a_result_poll_for_a_foreign_task_is_refused_before_a_buffer() {
         let fixture = Fixture::new();
         let foreign = fixture.identity_on(1, 1, BackendProcessId::new_v7());
         let response = fixture
@@ -1387,7 +1399,9 @@ mod tests {
             .fetch_task_result(proto::FetchTaskResultRequest {
                 root_task: Some(encode_task_identity(foreign)),
                 max_wait_millis: 60_000,
+                acknowledged_packet_sequence: None,
             })
+            .await
             .expect("a fenced poll is answered, not errored");
         assert_eq!(
             response.status,
@@ -1456,8 +1470,8 @@ mod tests {
         assert!(response.domains.is_empty());
     }
 
-    #[test]
-    fn a_result_poll_aimed_at_an_exchange_producer_is_refused() {
+    #[tokio::test]
+    async fn a_result_poll_aimed_at_an_exchange_producer_is_refused() {
         // Every task owns a result buffer keyed by its kernel key, so routing
         // a poll by that key alone would hand back an exchange producer's
         // output as if it were the query's answer. Owning a buffer and owing
@@ -1476,7 +1490,9 @@ mod tests {
             .fetch_task_result(proto::FetchTaskResultRequest {
                 root_task: Some(encode_task_identity(producer)),
                 max_wait_millis: 60_000,
+                acknowledged_packet_sequence: None,
             })
+            .await
             .expect("a fenced poll is answered, not errored");
         assert_eq!(
             response.status,

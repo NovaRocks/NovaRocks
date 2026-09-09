@@ -174,11 +174,6 @@ impl VendedS3CredentialLeaseContribution {
         mut self,
         refresher: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
     ) -> Result<Self, ConnectorError> {
-        if self.refresh_endpoint.is_none() {
-            return Err(invalid(
-                "vended S3 credential refresher without refresh endpoint",
-            ));
-        }
         self.refresher = Some(refresher);
         Ok(self)
     }
@@ -547,9 +542,10 @@ mod tests {
 
     use super::{
         ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
-        CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
-        MAX_CREDENTIAL_LEASE_PREFIXES, VendedS3CredentialLeaseContribution,
-        VendedS3CredentialLeaseEntry,
+        ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
+        CredentialLeaseProvider, MAX_CREDENTIAL_LEASE_PREFIXES,
+        VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
+        VendedS3CredentialLeaseRefresh,
     };
     use crate::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
@@ -568,6 +564,16 @@ mod tests {
 
     fn prefix(value: &str) -> StorageCredentialScopePrefix {
         StorageCredentialScopePrefix::try_from_normalized(value).expect("prefix")
+    }
+
+    struct ProviderLocalRefresher;
+
+    impl ConnectorVendedS3CredentialLeaseRefresher for ProviderLocalRefresher {
+        fn refresh_vended_s3_credentials(
+            &self,
+        ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
+            panic!("the capability is not invoked by this construction test")
+        }
     }
 
     fn descriptor(
@@ -603,6 +609,29 @@ mod tests {
         )
         .expect("refresh descriptor");
         assert!(first.has_same_refresh_scope(&second));
+    }
+
+    #[test]
+    fn a_provider_local_refresher_does_not_require_a_public_endpoint() {
+        let contribution = VendedS3CredentialLeaseContribution::try_new(
+            vec![
+                VendedS3CredentialLeaseEntry::try_new(
+                    prefix("s3://bucket/table"),
+                    10,
+                    SecretValue::new("access"),
+                    SecretValue::new("secret"),
+                    SecretValue::new("token"),
+                )
+                .expect("entry"),
+            ],
+            None,
+        )
+        .expect("contribution")
+        .with_refresher(Arc::new(ProviderLocalRefresher))
+        .expect("provider-local refresh needs no fabricated endpoint");
+
+        assert!(contribution.refresh_endpoint().is_none());
+        assert!(contribution.refresher().is_some());
     }
 
     #[test]

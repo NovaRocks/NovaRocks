@@ -1,6 +1,7 @@
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -55,7 +56,6 @@ use novarocks_spi::connector::WriteCommitEvidenceLimits;
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ANNOUNCE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// How often the task protocol owner re-evaluates its own deadlines.
 ///
 /// Nothing in that protocol expires by itself: a lease expiry, a creation-gate
@@ -90,6 +90,8 @@ pub struct BackendServerConfig {
     pub announce_max_backoff: Duration,
     /// Server-resolved per-fragment terminal write evidence budget.
     pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
+    /// Server-validated hierarchy for retained native query results.
+    pub result_retained_limits: BackendResultRetainedLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
     /// Server-frozen bounded failure and provider-bind policy for the BE
     /// catalog manager.
@@ -97,6 +99,46 @@ pub struct BackendServerConfig {
     /// Provider-owned complete BE role factories. The backend seals exactly
     /// one factory per provider kind before query lifecycle admission.
     pub execution_role_binding_factories: Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>,
+}
+
+/// Positive, ordered joint result-memory limits injected by Server composition.
+///
+/// During publication the limits cover the simultaneously live Arrow input and
+/// encoded output. After publication they cover the encoded retained backing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackendResultRetainedLimits {
+    per_root: NonZeroUsize,
+    per_process: NonZeroUsize,
+}
+
+impl BackendResultRetainedLimits {
+    pub fn try_new(per_root: usize, per_process: usize) -> Result<Self, String> {
+        let per_root = NonZeroUsize::new(per_root).ok_or_else(|| {
+            "per-root joint result retained-byte cap must be greater than 0".to_string()
+        })?;
+        let per_process = NonZeroUsize::new(per_process).ok_or_else(|| {
+            "per-process joint result retained-byte cap must be greater than 0".to_string()
+        })?;
+        if per_root > per_process {
+            return Err(format!(
+                "per-root joint result retained-byte cap {} must not exceed per-process cap {}",
+                per_root.get(),
+                per_process.get()
+            ));
+        }
+        Ok(Self {
+            per_root,
+            per_process,
+        })
+    }
+
+    pub fn per_root(self) -> NonZeroUsize {
+        self.per_root
+    }
+
+    pub fn per_process(self) -> NonZeroUsize {
+        self.per_process
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,7 +187,7 @@ impl std::error::Error for BackendApplicationError {}
 pub struct BackendApplicationHost {
     ready_marker: String,
     grpc_server: BackendRpcServerHandle,
-    _execution_runtime: Arc<ExecutionRuntime>,
+    execution_runtime: Arc<ExecutionRuntime>,
     task_deadline_tick: TaskDeadlineTickTask,
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
@@ -366,6 +408,10 @@ struct UnroutedTaskExecutionHost;
 
 #[cfg(test)]
 impl TaskExecutionHost for UnroutedTaskExecutionHost {
+    fn close_context_admission(&self, _context: QueryContextRef) {}
+
+    fn forget_context_admission(&self, _context: QueryContextRef) {}
+
     fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
         Err(HostRejection::new(
             TaskFailureCategory::Internal,
@@ -507,6 +553,7 @@ fn compose_backend_application_services(
     native_compatibility_id: NativeCompatibilityId,
     native_transport_confidentiality: ConfidentialTransport,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
+    result_retained_limits: BackendResultRetainedLimits,
     catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
@@ -565,12 +612,15 @@ fn compose_backend_application_services(
         data_runtime.clone(),
     ));
     let inbound_capabilities = crate::task_execution::TaskInboundCapabilities::new();
+    let result_retained_budget = crate::runtime::result_buffer::ResultRetainedBudget::new(
+        result_retained_limits.per_process(),
+    );
     let execution_host = Arc::new(crate::task_execution::NativeTaskExecutionHost::new(
         crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global(),
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::TaskQueryContextFacts>,
         Arc::clone(&inbound_capabilities),
         grpc_exchange_transmitter(data_runtime.clone()),
-        native_result_writer(),
+        native_result_writer(result_retained_budget, result_retained_limits.per_root()),
         Arc::clone(&exchange_receiver_port),
         Arc::new(
             crate::runtime::sink_commit::ConfiguredBackendSinkCommitPort::new(
@@ -672,11 +722,14 @@ impl BackendApplicationHost {
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
         self.announce_task.stop();
         self.task_deadline_tick.stop();
+        let execution_result = self.execution_runtime.shutdown_driver_execution();
         let listener_shutdown = self.grpc_server.stop();
         let metrics_result = self.metrics_http_server.stop();
-        combine_shutdown_results(listener_shutdown, metrics_result).map_err(|error| {
-            BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
-        })
+        combine_shutdown_results(
+            combine_shutdown_results(execution_result, listener_shutdown),
+            metrics_result,
+        )
+        .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error))
     }
 
     fn open_with_readiness_timeout(
@@ -698,6 +751,7 @@ impl BackendApplicationHost {
             announce_initial_backoff,
             announce_max_backoff,
             write_commit_evidence_limits,
+            result_retained_limits,
             execution_runtime_config,
             catalog_manager_config,
             execution_role_binding_factories,
@@ -717,6 +771,7 @@ impl BackendApplicationHost {
             native_compatibility_id,
             native_transport.confidentiality(),
             write_commit_evidence_limits,
+            result_retained_limits,
             catalog_manager_config,
             &execution_role_binding_factories,
         )?;
@@ -773,6 +828,7 @@ impl BackendApplicationHost {
                     process_id: services.backend_process_id,
                     descriptor: process_descriptor.clone(),
                     drain: Arc::clone(&services.drain),
+                    task_execution_registry: Arc::clone(&services.task_execution_registry),
                 },
             ),
             native_trust,
@@ -824,7 +880,7 @@ impl BackendApplicationHost {
                 std::process::id()
             ),
             grpc_server,
-            _execution_runtime: services.execution_runtime,
+            execution_runtime: services.execution_runtime,
             task_deadline_tick,
             metrics_http_server,
             process_descriptor,
@@ -1003,9 +1059,9 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendExecutionRuntimeInput, BackendServerConfig, ConfidentialTransport, QueryContextRef,
-        TaskDeadlineTickTask, TaskExecutionRegistryConfig, UnroutedQueryContextHost,
-        UnroutedTaskExecutionHost, combine_primary_and_shutdown,
+        BackendExecutionRuntimeInput, BackendResultRetainedLimits, BackendServerConfig,
+        ConfidentialTransport, QueryContextRef, TaskDeadlineTickTask, TaskExecutionRegistryConfig,
+        UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
         compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
@@ -1169,6 +1225,11 @@ mod tests {
             announce_initial_backoff: Duration::from_millis(100),
             announce_max_backoff: Duration::from_secs(2),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
+            result_retained_limits: BackendResultRetainedLimits::try_new(
+                16 * 1024 * 1024,
+                32 * 1024 * 1024,
+            )
+            .expect("valid test result retained-byte limits"),
             execution_runtime_config: execution_runtime_config(),
             catalog_manager_config:
                 crate::connector::catalog_manager::CatalogManagerConfig::default(),
@@ -1220,6 +1281,8 @@ mod tests {
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ConfidentialTransport::Plaintext,
             WriteCommitEvidenceLimits::default(),
+            BackendResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
+                .expect("valid test result retained-byte limits"),
             crate::connector::catalog_manager::CatalogManagerConfig::default(),
             &[],
         )
@@ -1340,6 +1403,23 @@ mod tests {
         assert!(metrics.contains(
             "novarocks_native_authentication_failures_total{reason=\"authentication\"} 1"
         ));
+
+        let mut authenticated = NovaRocksGrpcClient::with_interceptor(
+            connect_live_channel(grpc_port).await,
+            test_backend_native_trust().client_interceptor(),
+        );
+        let heartbeat = authenticated
+            .heartbeat(HeartbeatRequest {
+                expected_process_id: host.process_descriptor().as_proto().process_id.clone(),
+            })
+            .await
+            .expect("authenticated heartbeat succeeds")
+            .into_inner();
+        let capability = heartbeat
+            .admission_epoch_capability
+            .expect("heartbeat publishes the current admission epoch capability");
+        assert_eq!(capability.value.len(), 16);
+        assert!(capability.value.iter().any(|byte| *byte != 0));
 
         let channel = connect_live_channel(grpc_port).await;
         let service = tonic::service::interceptor::InterceptedService::new(

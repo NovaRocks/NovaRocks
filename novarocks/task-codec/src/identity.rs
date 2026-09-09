@@ -18,7 +18,7 @@
 //! Task protocol identity codec.
 
 use novarocks_execution_contract::task_execution::identity::{
-    AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
+    AdmissionEpochCapability, AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
 };
 use novarocks_proto_models::novarocks;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, StageId, TaskId};
@@ -83,6 +83,24 @@ pub fn decode_admission_ticket_id(
 
 pub fn encode_admission_ticket_id(value: AdmissionTicketId) -> novarocks::AdmissionTicketId {
     novarocks::AdmissionTicketId {
+        value: value.to_bytes().to_vec(),
+    }
+}
+
+/// Decodes the opaque worker admission issuance epoch.
+pub fn decode_admission_epoch_capability(
+    src: &novarocks::AdmissionEpochCapability,
+    path: FieldPath,
+) -> Result<AdmissionEpochCapability, ProtocolError> {
+    let bytes = decode_identity_bytes(&src.value, path.clone().field("value"))?;
+    AdmissionEpochCapability::try_from_bytes(bytes)
+        .map_err(|error| invalid(path.field("value"), error.to_string()))
+}
+
+pub fn encode_admission_epoch_capability(
+    value: AdmissionEpochCapability,
+) -> novarocks::AdmissionEpochCapability {
+    novarocks::AdmissionEpochCapability {
         value: value.to_bytes().to_vec(),
     }
 }

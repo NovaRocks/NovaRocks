@@ -29,13 +29,13 @@ use std::time::Duration;
 use novarocks_execution::exec::fragment::program::{FragmentContractVersion, FragmentSinkKind};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
-    AbortCause, AdmissionTicketId, CancelReason, CodecOwnedContent, ConfidentialContent,
-    ContentFingerprint, CreateTaskReceipt, CredentialEpoch, CredentialLeaseId, CredentialUpdate,
-    DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion, ExchangeEdgeId, LeaseReceipt,
-    LeaseSequence, LeaseValidFor, OperationKind, OperationOutcome, PhysicalFragmentPlan,
-    PlanNodeId, PlanNodeSplitReceipt, QueryContextAdmissionTicketReceipt, QueryContextReceipt,
-    QueryContextRef, QueryContextState, ReleaseOutcome, SplitAssignmentIntent, SplitOffer,
-    SplitSequence, SplitWatermark, TaskDomainReceipt, TaskDomainUpdate, TaskIdentity,
+    AbortCause, AdmissionEpochCapability, AdmissionTicketId, CancelReason, CodecOwnedContent,
+    ConfidentialContent, ContentFingerprint, CreateTaskReceipt, CredentialEpoch, CredentialLeaseId,
+    CredentialUpdate, DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion, ExchangeEdgeId,
+    LeaseReceipt, LeaseSequence, LeaseValidFor, OperationKind, OperationOutcome,
+    PhysicalFragmentPlan, PlanNodeId, PlanNodeSplitReceipt, QueryContextAdmissionTicketReceipt,
+    QueryContextReceipt, QueryContextRef, QueryContextState, ReleaseOutcome, SplitAssignmentIntent,
+    SplitOffer, SplitSequence, SplitWatermark, TaskDomainReceipt, TaskDomainUpdate, TaskIdentity,
     TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
     UpdateQueryContext, UpdateTaskReceipt,
 };
@@ -308,6 +308,10 @@ fn backends(count: usize) -> BTreeMap<usize, BackendProcessId> {
         .collect()
 }
 
+fn admission_epoch() -> AdmissionEpochCapability {
+    AdmissionEpochCapability::try_from_bytes([0x61; 16]).expect("nonzero epoch")
+}
+
 /// One fragment's placements, taking the kernel key from the same derivation
 /// the production schedule uses.
 fn placements(
@@ -472,11 +476,16 @@ impl Harness {
         let clock = Arc::new(ManualClock::new());
         let wake = Arc::new(CountingWake::default());
         let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+        let admission_epochs = graph
+            .contexts()
+            .map(|context| (context.backend_process_id(), admission_epoch()))
+            .collect::<BTreeMap<_, _>>();
         let execution = QueryTaskExecution::new(
             graph,
             DispatchBudget::DEFAULT,
             TransportBudget::DEFAULT,
             NativeCompatibilityId::new([0x41; 32]),
+            &admission_epochs,
             Arc::clone(&clock) as Arc<dyn TaskProtocolClock>,
             Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
             intake,
@@ -1495,7 +1504,12 @@ fn a_release_waits_for_closure_and_drain_and_a_not_ready_keeps_renewing() {
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(context, 2, NativeCompatibilityId::new([0x41; 32]));
+    let mut owner = QueryContextOwner::new(
+        context,
+        2,
+        NativeCompatibilityId::new([0x41; 32]),
+        admission_epoch(),
+    );
     assert!(
         owner.release_intent(MonotonicInstant::ORIGIN).is_none(),
         "a release may not precede the establish acknowledgement"
@@ -1663,7 +1677,7 @@ fn an_admission_transport_unknown_replays_exactly_and_only_the_next_turn_establi
         BackendProcessId::new_v7(),
     );
     let compatibility = NativeCompatibilityId::new([0x42; 32]);
-    let mut owner = QueryContextOwner::new(context, 0, compatibility);
+    let mut owner = QueryContextOwner::new(context, 0, compatibility, admission_epoch());
     let first = owner
         .admission_intent(MonotonicInstant::ORIGIN)
         .expect("the request is legal")
@@ -2112,7 +2126,12 @@ fn an_establish_accounts_for_its_query_options_payload() {
         FrontendProcessId::new_v7(),
         BackendProcessId::new_v7(),
     );
-    let mut owner = QueryContextOwner::new(context, 0, NativeCompatibilityId::new([0x41; 32]));
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x41; 32]),
+        admission_epoch(),
+    );
     let facts = FakeEstablish
         .facts_for(context)
         .expect("the fake source has facts");

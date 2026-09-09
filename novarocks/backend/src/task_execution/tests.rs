@@ -192,6 +192,7 @@ struct HostLedger {
     receivers_removed: AtomicUsize,
     capabilities_installed: AtomicUsize,
     capabilities_removed: AtomicUsize,
+    contexts_closed: AtomicUsize,
     submit_attempts: AtomicUsize,
     runnables_submitted: AtomicUsize,
     facts_materialized: AtomicUsize,
@@ -372,6 +373,8 @@ impl RunnableTask for FakeRunnable {
         }
         self.reporter.canceled(reason);
         self.reporter.release_output();
+        self.reporter.note_actual_stopped();
+        self.reporter.note_resources_converged();
     }
 
     fn abort(&self, cause: AbortCause) {
@@ -386,6 +389,8 @@ impl RunnableTask for FakeRunnable {
         }
         self.reporter.aborted(cause);
         self.reporter.release_output();
+        self.reporter.note_actual_stopped();
+        self.reporter.note_resources_converged();
     }
 }
 
@@ -438,6 +443,12 @@ impl FakeTaskHost {
 }
 
 impl TaskExecutionHost for FakeTaskHost {
+    fn close_context_admission(&self, _context: QueryContextRef) {
+        self.ledger.contexts_closed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn forget_context_admission(&self, _context: QueryContextRef) {}
+
     fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
         let required = self.require_arrivals.load(Ordering::SeqCst);
         if required > 0 {
@@ -643,6 +654,7 @@ impl Fixture {
             context,
             LeaseValidFor::new(Duration::from_secs(10)).expect("legal ticket validity"),
             NativeCompatibilityId::new([0x71; 32]),
+            self.registry.admission_epoch_capability(),
         );
         self.registry
             .acquire_query_context_admission_ticket(request)
@@ -692,6 +704,8 @@ impl Fixture {
             reporter.finished(TaskOutputFacts::new(true)),
             StatusAdvance::Published(_)
         ));
+        reporter.note_actual_stopped();
+        reporter.note_resources_converged();
     }
 }
 
@@ -1250,6 +1264,9 @@ fn a_task_failure_can_win_the_context_latch() {
         reporter.failed(failure),
         StatusAdvance::Published(_)
     ));
+    reporter.release_output();
+    reporter.note_actual_stopped();
+    reporter.note_resources_converged();
 
     fixture.registry.advance_deadlines();
     assert_eq!(
@@ -1338,6 +1355,7 @@ fn abort_before_establish_fences_a_later_establish_and_create() {
         context,
         LeaseValidFor::new(Duration::from_secs(10)).expect("legal ticket validity"),
         NativeCompatibilityId::new([0x71; 32]),
+        fixture.registry.admission_epoch_capability(),
     );
     let late_acquire = fixture
         .registry
@@ -1469,6 +1487,43 @@ fn an_exact_establish_replay_is_idempotent() {
 }
 
 // -------------------------------------------------------------------- release
+
+#[test]
+fn a_terminal_status_and_output_release_do_not_prove_actual_stop() {
+    let fixture = Fixture::new();
+    let context = fixture.establish(90);
+    let reporter = fixture.create(fixture.identity(90, 1, 1), 5);
+    assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
+    assert!(matches!(
+        reporter.finished(TaskOutputFacts::new(true)),
+        StatusAdvance::Published(_)
+    ));
+    reporter.release_output();
+
+    let release = fixture
+        .registry
+        .release_query_context(&ReleaseQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    assert_eq!(release.outcome(), OperationOutcome::ReleaseNotReady);
+    assert!(fixture.registry.has_live_task(reporter.identity()));
+    assert_eq!(fixture.registry.admission_reservation_count(), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 0);
+
+    reporter.note_actual_stopped();
+    reporter.note_resources_converged();
+    let release = fixture
+        .registry
+        .release_query_context(&ReleaseQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    assert_eq!(release.outcome(), OperationOutcome::Accepted);
+    assert!(!fixture.registry.has_live_task(reporter.identity()));
+    assert_eq!(fixture.registry.admission_reservation_count(), 0);
+    assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 1);
+}
 
 #[test]
 fn release_reports_not_ready_before_it_succeeds() {
@@ -2178,11 +2233,17 @@ fn a_shared_domain_advance_applies_once_and_replays_idempotently() {
 
 #[test]
 fn a_cancel_stands_a_task_down_and_a_late_cancel_is_settled() {
+    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+
     let fixture = Fixture::new();
     fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
     let reporter = fixture.create(identity, 5);
     assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
+    crate::runtime::result_buffer::create_task_typed_sender(identity);
+    crate::runtime::result_buffer::insert_task_typed(identity, vec![1, 2, 3])
+        .expect("retain produced output before cancellation");
+    crate::runtime::result_buffer::close_task_ok(identity);
 
     let request = CancelTask::new(
         TaskOperationId::new_v7(),
@@ -2193,6 +2254,11 @@ fn a_cancel_stands_a_task_down_and_a_late_cancel_is_settled() {
     assert_eq!(cancel.outcome(), OperationOutcome::Accepted);
     assert_eq!(HostLedger::get(&fixture.ledger.cancels), 1);
     assert_eq!(reporter.current().state(), TaskState::Canceled);
+    assert_eq!(
+        fetch_status(&poll_root_result(&fixture.registry, identity)),
+        FetchStatus::Error,
+        "accepted cancellation revokes output even after its producer finished"
+    );
 
     let late = fixture.registry.cancel_task(&request);
     assert_eq!(
@@ -2256,16 +2322,29 @@ fn poll_root_result(
     registry: &TaskExecutionRegistry,
     identity: TaskIdentity,
 ) -> novarocks_proto_models::novarocks::FetchResultResponse {
-    crate::rpc::data_plane::fetch_task_result(
-        registry,
-        novarocks_proto_models::novarocks::FetchTaskResultRequest {
-            root_task: Some(novarocks_task_codec::identity::encode_task_identity(
-                identity,
-            )),
-            max_wait_millis: 1,
-        },
-    )
-    .expect("a poll that reaches a decision is answered in band")
+    poll_root_result_after(registry, identity, None)
+}
+
+fn poll_root_result_after(
+    registry: &TaskExecutionRegistry,
+    identity: TaskIdentity,
+    acknowledged_packet_sequence: Option<u64>,
+) -> novarocks_proto_models::novarocks::FetchResultResponse {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("root result test runtime")
+        .block_on(crate::rpc::data_plane::fetch_task_result(
+            registry,
+            novarocks_proto_models::novarocks::FetchTaskResultRequest {
+                root_task: Some(novarocks_task_codec::identity::encode_task_identity(
+                    identity,
+                )),
+                max_wait_millis: 1,
+                acknowledged_packet_sequence,
+            },
+        ))
+        .expect("a poll that reaches a decision is answered in band")
 }
 
 fn fetch_status(
@@ -2373,16 +2452,15 @@ fn the_root_stays_flushing_until_the_frontend_consumes_end_of_stream() {
     let fixture = Fixture::new();
     fixture.establish(74);
     let root = fixture.identity(74, 74, 1);
-    let kernel_key = UniqueId::new(74, 1);
     let reporter = fixture.create(root, 5);
     assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
 
-    crate::runtime::result_buffer::create_typed_sender(kernel_key);
-    crate::runtime::result_buffer::insert_typed(kernel_key, vec![1, 2, 3]).expect("one payload");
+    crate::runtime::result_buffer::create_task_typed_sender(root);
+    crate::runtime::result_buffer::insert_task_typed(root, vec![1, 2, 3]).expect("one payload");
     // The pipeline is done producing, so the runtime moves the task to
     // FLUSHING and closes the buffer. The output responsibility is still
     // outstanding: the coordinator has not read a byte.
-    crate::runtime::result_buffer::close_ok(kernel_key);
+    crate::runtime::result_buffer::close_task_ok(root);
     assert!(matches!(reporter.flushing(), StatusAdvance::Published(_)));
     assert_eq!(reporter.current().state(), TaskState::Flushing);
     assert!(!reporter.current().output().responsibility_complete());
@@ -2390,17 +2468,22 @@ fn the_root_stays_flushing_until_the_frontend_consumes_end_of_stream() {
     let payload = poll_root_result(&fixture.registry, root);
     assert_eq!(fetch_status(&payload), FetchStatus::Ready);
     assert!(!payload.eos);
-    assert_eq!(payload.result_arrow_ipc, vec![1, 2, 3]);
+    assert_eq!(payload.result_arrow_ipc.as_ref(), &[1, 2, 3]);
     assert_eq!(
         reporter.current().state(),
         TaskState::Flushing,
         "a delivered payload is not the end of the stream"
     );
 
-    let version_before = reporter.current().version();
-    let end = poll_root_result(&fixture.registry, root);
+    let end = poll_root_result_after(&fixture.registry, root, Some(0));
     assert_eq!(fetch_status(&end), FetchStatus::Ready);
     assert!(end.eos);
+    assert_eq!(reporter.current().state(), TaskState::Flushing);
+    assert!(!reporter.current().output().responsibility_complete());
+
+    let version_before = reporter.current().version();
+    let acknowledged = poll_root_result_after(&fixture.registry, root, Some(1));
+    assert_eq!(fetch_status(&acknowledged), FetchStatus::Eof);
     let terminal = reporter.current();
     assert_eq!(terminal.state(), TaskState::Finished);
     assert!(terminal.output().responsibility_complete());
@@ -2429,7 +2512,61 @@ fn the_root_stays_flushing_until_the_frontend_consumes_end_of_stream() {
         "final info is exactly the terminal that was published"
     );
 
-    crate::runtime::result_buffer::discard(kernel_key);
+    crate::runtime::result_buffer::discard_task(root);
+}
+
+#[test]
+fn final_eos_ack_replays_after_task_retirement_until_context_release() {
+    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+
+    let fixture = Fixture::new();
+    let context = fixture.establish(78);
+    let root = fixture.identity(78, 78, 1);
+    let reporter = fixture.create(root, 5);
+    assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
+    crate::runtime::result_buffer::create_task_typed_sender(root);
+    crate::runtime::result_buffer::close_task_ok(root);
+    assert!(matches!(reporter.flushing(), StatusAdvance::Published(_)));
+    reporter.note_actual_stopped();
+    reporter.note_resources_converged();
+
+    let eos = poll_root_result(&fixture.registry, root);
+    assert_eq!(fetch_status(&eos), FetchStatus::Ready);
+    assert!(eos.eos);
+    let first_ack = poll_root_result_after(
+        &fixture.registry,
+        root,
+        Some(u64::try_from(eos.packet_seq).expect("nonnegative eos sequence")),
+    );
+    assert_eq!(fetch_status(&first_ack), FetchStatus::Eof);
+    assert_eq!(first_ack.packet_seq, eos.packet_seq);
+
+    fixture.registry.advance_deadlines();
+    assert!(matches!(
+        fixture.registry.root_result_route(root),
+        RootResultRoute::TerminalResultOwner(TaskState::Finished)
+    ));
+    let replayed = poll_root_result_after(
+        &fixture.registry,
+        root,
+        Some(u64::try_from(eos.packet_seq).expect("nonnegative eos sequence")),
+    );
+    assert_eq!(fetch_status(&replayed), FetchStatus::Eof);
+    assert_eq!(replayed.packet_seq, first_ack.packet_seq);
+
+    let released = fixture
+        .registry
+        .release_query_context(&ReleaseQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+        ));
+    assert_eq!(released.outcome(), OperationOutcome::Accepted);
+    let after_release = poll_root_result_after(
+        &fixture.registry,
+        root,
+        Some(u64::try_from(eos.packet_seq).expect("nonnegative eos sequence")),
+    );
+    assert_eq!(fetch_status(&after_release), FetchStatus::Error);
 }
 
 #[test]
@@ -2516,6 +2653,10 @@ fn a_result_poll_after_retirement_reports_the_terminal_rather_than_a_buffer() {
     let RootResultRoute::Serve(binding) = fixture.registry.root_result_route(root) else {
         panic!("a running root owns the query's result buffer");
     };
+    // The pipeline has already joined and released its runtime resources;
+    // only the client-visible output responsibility remains.
+    reporter.note_actual_stopped();
+    reporter.note_resources_converged();
     assert!(matches!(
         binding.note_result_stream_drained(),
         StatusAdvance::Published(_)
@@ -2529,7 +2670,10 @@ fn a_result_poll_after_retirement_reports_the_terminal_rather_than_a_buffer() {
 
     let route = fixture.registry.root_result_route(root);
     assert!(
-        matches!(route, RootResultRoute::Terminal(TaskState::Finished)),
+        matches!(
+            route,
+            RootResultRoute::TerminalResultOwner(TaskState::Finished)
+        ),
         "{route:?}"
     );
     let refused = poll_root_result(&fixture.registry, root);
@@ -2694,7 +2838,7 @@ fn every_receipt_carries_its_own_operation_id() {
 }
 
 #[test]
-fn an_uncooperative_task_is_terminated_after_the_termination_grace() {
+fn termination_grace_fixes_the_conclusion_without_forging_convergence() {
     let fixture = Fixture::new();
     let context = fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
@@ -2746,13 +2890,53 @@ fn an_uncooperative_task_is_terminated_after_the_termination_grace() {
     fixture.registry.advance_deadlines();
     assert_eq!(
         fixture.registry.context_state(context),
+        QueryContextState::Aborting
+    );
+    assert_eq!(reporter.current().state(), TaskState::Aborted);
+    let concluded = reporter.convergence();
+    assert!(concluded.conclusion_stable());
+    assert!(!concluded.actual_stopped());
+    assert!(!concluded.output_released());
+    assert!(!concluded.resources_converged());
+    assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 0);
+    assert_eq!(
+        fixture.registry.admission_reservation_count(),
+        1,
+        "a forced conclusion does not release the redeemed reservation"
+    );
+
+    reporter.note_actual_stopped();
+    let stopped = reporter.convergence();
+    assert!(stopped.version() > concluded.version());
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Aborting
+    );
+    assert_eq!(fixture.registry.admission_reservation_count(), 1);
+
+    reporter.release_output();
+    let output_released = reporter.convergence();
+    assert!(output_released.version() > stopped.version());
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Aborting
+    );
+
+    reporter.note_resources_converged();
+    let resources_converged = reporter.convergence();
+    assert!(resources_converged.version() > output_released.version());
+    fixture.registry.advance_deadlines();
+    assert_eq!(
+        fixture.registry.context_state(context),
         QueryContextState::TerminalRetained
     );
     assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 1);
     assert_eq!(
         fixture.registry.admission_reservation_count(),
         0,
-        "the reservation is released with the actual terminal transition"
+        "the reservation is released only after actual convergence"
     );
     let info = fixture
         .registry
@@ -2768,18 +2952,29 @@ fn an_uncooperative_task_is_terminated_after_the_termination_grace() {
 }
 
 #[test]
-fn a_create_that_loses_to_an_abort_rolls_back_its_submitted_worker() {
+fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
     let fixture = Fixture::new();
     let context = fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
+    fixture
+        .task_host
+        .ignore_stand_down
+        .store(true, Ordering::SeqCst);
 
     // Hold the creation owner inside `submit_runnable`, after both installs
     // have already succeeded.
     fixture.task_host.submit_gate.close();
-    let registry = Arc::clone(&fixture.registry);
     let request = fixture.create_request(identity, 5);
-    let creating = std::thread::spawn(move || registry.create_task(&request));
+    let registry = Arc::clone(&fixture.registry);
+    let owner_request = request.clone();
+    let creating = std::thread::spawn(move || registry.create_task(&owner_request));
     while HostLedger::get(&fixture.ledger.submit_attempts) == 0 {
+        std::thread::yield_now();
+    }
+
+    let registry = Arc::clone(&fixture.registry);
+    let converging = std::thread::spawn(move || registry.create_task(&request));
+    while fixture.registry.in_flight_operations(context) < 2 {
         std::thread::yield_now();
     }
 
@@ -2794,15 +2989,44 @@ fn a_create_that_loses_to_an_abort_rolls_back_its_submitted_worker() {
 
     fixture.task_host.submit_gate.open();
     let created = creating.join().expect("creating thread");
+    let replay = converging.join().expect("converging create thread");
     assert_eq!(
         created.outcome(),
         OperationOutcome::ContextTerminalReceipt,
         "the abort linearized first, so the create must not install a task"
     );
     assert!(created.acknowledgement().is_none());
+    assert_eq!(replay.outcome(), created.outcome());
+    assert_eq!(replay.detail(), created.detail());
+    assert!(replay.acknowledgement().is_none());
+    assert_eq!(
+        HostLedger::get(&fixture.ledger.contexts_closed),
+        1,
+        "the abort winner closes the context-wide admission fence once"
+    );
 
-    // Nothing was left behind: no live task, both installs undone, and the
-    // submitted worker was stood down rather than orphaned.
+    // The submitted worker lost creation eligibility, but it stays owned and
+    // charged because the fake ignored stand-down. The data-plane capability
+    // is already closed while its receiver remains until actual convergence.
+    assert!(fixture.registry.has_live_task(identity));
+    assert_eq!(fixture.registry.admission_reservation_count(), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.capabilities_removed), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 0);
+    let reporter = fixture.task_host.reporter(identity);
+    let convergence = reporter.convergence();
+    assert!(convergence.conclusion_stable());
+    assert!(!convergence.actual_stopped());
+    assert!(!convergence.resources_converged());
+    assert_eq!(
+        fixture.registry.context_state(context),
+        QueryContextState::Aborting
+    );
+
+    reporter.note_actual_stopped();
+    reporter.release_output();
+    reporter.note_resources_converged();
+    fixture.registry.advance_deadlines();
+
     assert!(!fixture.registry.has_live_task(identity));
     assert_eq!(
         HostLedger::get(&fixture.ledger.receivers_installed),
@@ -2816,9 +3040,55 @@ fn a_create_that_loses_to_an_abort_rolls_back_its_submitted_worker() {
     assert_eq!(HostLedger::get(&fixture.ledger.aborts), 1);
     assert_eq!(fixture.registry.counters().creations_rolled_back, 1);
     assert_eq!(fixture.registry.counters().tasks_created, 0);
+    assert_eq!(fixture.registry.admission_reservation_count(), 0);
     assert_eq!(
         fixture.registry.context_state(context),
         QueryContextState::TerminalRetained
+    );
+
+    let terminal_replay = fixture
+        .registry
+        .create_task(&fixture.create_request(identity, 5));
+    assert_eq!(terminal_replay.outcome(), created.outcome());
+    assert_eq!(terminal_replay.detail(), created.detail());
+    assert!(terminal_replay.acknowledgement().is_none());
+}
+
+#[test]
+fn an_active_context_never_reuses_a_spent_task_identity_or_cumulative_slot() {
+    let fixture = Fixture::with_config(|config| {
+        config.max_tasks_per_context = 2;
+        config.retained_task_capacity = 0;
+        config.gone_fence_capacity = 0;
+    });
+    fixture.establish(91);
+
+    let first = fixture.identity(91, 1, 1);
+    let reporter = fixture.create(first, 5);
+    fixture.finish(&reporter);
+    reporter.release_output();
+    fixture.registry.advance_deadlines();
+
+    let replay = fixture
+        .registry
+        .create_task(&fixture.create_request(first, 5));
+    assert_eq!(
+        replay.outcome(),
+        OperationOutcome::Gone,
+        "reclaiming the detailed Gone record must not revive an old identity"
+    );
+
+    let second = fixture.identity(91, 1, 2);
+    fixture.create(second, 5);
+    let third = fixture.identity(91, 1, 3);
+    let exhausted = fixture
+        .registry
+        .create_task(&fixture.create_request(third, 5));
+    assert_eq!(exhausted.outcome(), OperationOutcome::ResourceExhausted);
+    assert!(
+        exhausted
+            .detail()
+            .is_some_and(|detail| detail.as_str().contains("cumulative task bound"))
     );
 }
 

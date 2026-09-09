@@ -28,8 +28,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, AdmissionTicketId, QueryContextAdmissionTicketReceipt,
-    QueryContextRef, TaskOperationId,
+    AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
+    QueryContextAdmissionTicketReceipt, QueryContextRef, TaskOperationId,
 };
 use novarocks_types::NativeCompatibilityId;
 use uuid::Uuid;
@@ -148,6 +148,7 @@ pub enum AdmissionTicketAcquisitionRejection {
     ReplayCapacityExhausted,
     ContextAlreadyGranted,
     OperationReplayConflict,
+    SealedEpoch,
     Inactive(AdmissionTicketState),
 }
 
@@ -165,6 +166,7 @@ impl fmt::Display for AdmissionTicketAcquisitionRejection {
             Self::OperationReplayConflict => {
                 "admission ticket operation id was replayed with different content"
             }
+            Self::SealedEpoch => "admission epoch is sealed",
             Self::Inactive(AdmissionTicketState::Closed) => "admission ticket is closed",
             Self::Inactive(AdmissionTicketState::Expired) => "admission ticket is expired",
             Self::Inactive(AdmissionTicketState::Issued | AdmissionTicketState::Redeemed) => {
@@ -208,6 +210,7 @@ impl std::error::Error for AdmissionTicketRedemptionRejection {}
 #[derive(Copy, Clone)]
 struct TicketRecord {
     operation_id: TaskOperationId,
+    admission_epoch_capability: AdmissionEpochCapability,
     native_compatibility_id: NativeCompatibilityId,
     receipt: QueryContextAdmissionTicketReceipt,
     expires_at: MonotonicInstant,
@@ -215,13 +218,26 @@ struct TicketRecord {
     terminal_at: Option<MonotonicInstant>,
 }
 
-#[derive(Default)]
 struct AdmissionTicketStateOwner {
+    current_epoch: AdmissionEpochCapability,
     tickets: BTreeMap<AdmissionTicketId, TicketRecord>,
     ticket_by_operation: BTreeMap<TaskOperationId, AdmissionTicketId>,
     terminal_order: VecDeque<AdmissionTicketId>,
     issued: usize,
     reserved: usize,
+}
+
+impl AdmissionTicketStateOwner {
+    fn new() -> Self {
+        Self {
+            current_epoch: mint_admission_epoch_capability(),
+            tickets: BTreeMap::new(),
+            ticket_by_operation: BTreeMap::new(),
+            terminal_order: VecDeque::new(),
+            issued: 0,
+            reserved: 0,
+        }
+    }
 }
 
 /// The only worker-local owner allowed to mint, redeem, and close grants.
@@ -234,12 +250,24 @@ impl AdmissionTicketAuthority {
     pub fn new(config: AdmissionTicketConfig) -> Self {
         Self {
             config,
-            state: Mutex::new(AdmissionTicketStateOwner::default()),
+            state: Mutex::new(AdmissionTicketStateOwner::new()),
         }
     }
 
     pub const fn config(&self) -> AdmissionTicketConfig {
         self.config
+    }
+
+    /// Returns the capability that may authorize new acquisitions now.
+    ///
+    /// Advancing retention here ensures a heartbeat never republishes an
+    /// epoch after reclaiming one of its acquisition decisions made that
+    /// epoch unsafe for unknown operations.
+    pub fn current_epoch(&self, now: MonotonicInstant) -> AdmissionEpochCapability {
+        let mut state = self.state.lock().expect(AUTHORITY_LOCK);
+        self.expire_locked(&mut state, now);
+        self.reap_locked(&mut state, now);
+        state.current_epoch
     }
 
     /// Issues or exactly replays one immutable acquisition request.
@@ -265,6 +293,7 @@ impl AdmissionTicketAuthority {
             if record.receipt.context() != request.context()
                 || record.receipt.valid_for() != request.valid_for()
                 || record.native_compatibility_id != request.native_compatibility_id()
+                || record.admission_epoch_capability != request.admission_epoch_capability()
             {
                 return Err(AdmissionTicketAcquisitionRejection::OperationReplayConflict);
             }
@@ -276,6 +305,10 @@ impl AdmissionTicketAuthority {
                     Err(AdmissionTicketAcquisitionRejection::Inactive(state))
                 }
             };
+        }
+
+        if request.admission_epoch_capability() != state.current_epoch {
+            return Err(AdmissionTicketAcquisitionRejection::SealedEpoch);
         }
 
         if state.reserved >= self.config.max_reservations {
@@ -310,6 +343,7 @@ impl AdmissionTicketAuthority {
             ticket_id,
             TicketRecord {
                 operation_id,
+                admission_epoch_capability: request.admission_epoch_capability(),
                 native_compatibility_id: request.native_compatibility_id(),
                 receipt,
                 expires_at: now.saturating_add(request.valid_for().get()),
@@ -483,6 +517,7 @@ impl AdmissionTicketAuthority {
     }
 
     fn reap_locked(&self, state: &mut AdmissionTicketStateOwner, now: MonotonicInstant) {
+        let mut reclaimed = false;
         while let Some(ticket_id) = state.terminal_order.front().copied() {
             let Some(record) = state.tickets.get(&ticket_id) else {
                 state.terminal_order.pop_front();
@@ -499,8 +534,17 @@ impl AdmissionTicketAuthority {
             state.terminal_order.pop_front();
             state.tickets.remove(&ticket_id);
             state.ticket_by_operation.remove(&operation_id);
+            reclaimed = true;
+        }
+        if reclaimed {
+            state.current_epoch = mint_admission_epoch_capability();
         }
     }
+}
+
+fn mint_admission_epoch_capability() -> AdmissionEpochCapability {
+    AdmissionEpochCapability::try_from_bytes(Uuid::new_v4().into_bytes())
+        .expect("UUIDv4 is a nonzero 16-byte admission epoch capability")
 }
 
 impl Default for AdmissionTicketAuthority {
@@ -543,6 +587,7 @@ mod tests {
     }
 
     fn request(
+        authority: &AdmissionTicketAuthority,
         operation_id: TaskOperationId,
         context: QueryContextRef,
         seconds: u64,
@@ -552,6 +597,7 @@ mod tests {
             context,
             LeaseValidFor::new(Duration::from_secs(seconds)).expect("representable validity"),
             NativeCompatibilityId::new([0x41; 32]),
+            authority.current_epoch(at(0)),
         )
     }
 
@@ -565,7 +611,7 @@ mod tests {
     #[test]
     fn exact_acquisition_replay_returns_the_same_ticket_without_extending_it() {
         let authority = small_authority();
-        let request = request(TaskOperationId::new_v7(), context(1), 5);
+        let request = request(&authority, TaskOperationId::new_v7(), context(1), 5);
         let first = authority.acquire(request, at(0)).expect("issued");
         assert_eq!(first.progression(), AdmissionTicketProgression::Issued);
         let replay = authority.acquire(request, at(3)).expect("replayed");
@@ -586,14 +632,14 @@ mod tests {
     fn operation_replay_with_different_content_is_a_conflict() {
         let authority = small_authority();
         let operation_id = TaskOperationId::new_v7();
-        let first = request(operation_id, context(1), 5);
+        let first = request(&authority, operation_id, context(1), 5);
         authority.acquire(first, at(0)).expect("issued");
         assert_eq!(
-            authority.acquire(request(operation_id, context(2), 5), at(0)),
+            authority.acquire(request(&authority, operation_id, context(2), 5), at(0)),
             Err(AdmissionTicketAcquisitionRejection::OperationReplayConflict)
         );
         assert_eq!(
-            authority.acquire(request(operation_id, first.context(), 6), at(0)),
+            authority.acquire(request(&authority, operation_id, first.context(), 6), at(0)),
             Err(AdmissionTicketAcquisitionRejection::OperationReplayConflict)
         );
         assert_eq!(
@@ -603,6 +649,7 @@ mod tests {
                     first.context(),
                     first.valid_for(),
                     NativeCompatibilityId::new([0x42; 32]),
+                    first.admission_epoch_capability(),
                 ),
                 at(0),
             ),
@@ -614,17 +661,29 @@ mod tests {
     fn issued_capacity_and_ticket_validity_are_hard_bounds() {
         let authority = small_authority();
         authority
-            .acquire(request(TaskOperationId::new_v7(), context(1), 5), at(0))
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), context(1), 5),
+                at(0),
+            )
             .expect("first ticket");
         authority
-            .acquire(request(TaskOperationId::new_v7(), context(2), 5), at(0))
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), context(2), 5),
+                at(0),
+            )
             .expect("second ticket");
         assert_eq!(
-            authority.acquire(request(TaskOperationId::new_v7(), context(3), 5), at(0)),
+            authority.acquire(
+                request(&authority, TaskOperationId::new_v7(), context(3), 5),
+                at(0)
+            ),
             Err(AdmissionTicketAcquisitionRejection::ReservationCapacityExhausted)
         );
         assert_eq!(
-            authority.acquire(request(TaskOperationId::new_v7(), context(4), 11), at(0)),
+            authority.acquire(
+                request(&authority, TaskOperationId::new_v7(), context(4), 11),
+                at(0)
+            ),
             Err(AdmissionTicketAcquisitionRejection::ValidityExceedsWorkerLimit)
         );
     }
@@ -635,10 +694,16 @@ mod tests {
         let first_context = context(1);
         let second_context = context(2);
         let first = authority
-            .acquire(request(TaskOperationId::new_v7(), first_context, 5), at(0))
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), first_context, 5),
+                at(0),
+            )
             .expect("first ticket");
         let second = authority
-            .acquire(request(TaskOperationId::new_v7(), second_context, 5), at(0))
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), second_context, 5),
+                at(0),
+            )
             .expect("second ticket");
         authority
             .redeem(first.receipt().ticket_id(), first_context, at(0))
@@ -650,14 +715,20 @@ mod tests {
         assert_eq!(authority.issued_count(at(0)), 0);
         assert_eq!(authority.reserved_count(at(0)), 2);
         assert_eq!(
-            authority.acquire(request(TaskOperationId::new_v7(), context(3), 5), at(0)),
+            authority.acquire(
+                request(&authority, TaskOperationId::new_v7(), context(3), 5),
+                at(0)
+            ),
             Err(AdmissionTicketAcquisitionRejection::ReservationCapacityExhausted)
         );
 
         assert_eq!(authority.release_context(first_context, at(0)), 1);
         assert_eq!(authority.reserved_count(at(0)), 1);
         authority
-            .acquire(request(TaskOperationId::new_v7(), context(3), 5), at(0))
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), context(3), 5),
+                at(0),
+            )
             .expect("released reservation admits another context");
     }
 
@@ -666,7 +737,10 @@ mod tests {
         let authority = small_authority();
         let owner = context(1);
         let grant = authority
-            .acquire(request(TaskOperationId::new_v7(), owner, 5), at(0))
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), owner, 5),
+                at(0),
+            )
             .expect("issued");
         let ticket_id = grant.receipt().ticket_id();
         authority.redeem(ticket_id, owner, at(0)).expect("redeemed");
@@ -693,7 +767,7 @@ mod tests {
         let foreign = context(2);
         let operation_id = TaskOperationId::new_v7();
         let grant = authority
-            .acquire(request(operation_id, owner, 5), at(0))
+            .acquire(request(&authority, operation_id, owner, 5), at(0))
             .expect("issued");
         let ticket_id = grant.receipt().ticket_id();
         assert_eq!(
@@ -714,7 +788,7 @@ mod tests {
             Err(AdmissionTicketRedemptionRejection::Closed)
         );
         assert_eq!(
-            authority.acquire(request(operation_id, owner, 5), at(9)),
+            authority.acquire(request(&authority, operation_id, owner, 5), at(9)),
             Err(AdmissionTicketAcquisitionRejection::Inactive(
                 AdmissionTicketState::Closed
             ))
@@ -722,11 +796,11 @@ mod tests {
     }
 
     #[test]
-    fn a_reclaimed_ticket_is_unknown_and_cannot_be_revived() {
+    fn reclaimed_acquisition_history_seals_its_epoch_and_old_acquire_cannot_reissue() {
         let authority = small_authority();
         let owner = context(1);
-        let request = request(TaskOperationId::new_v7(), owner, 1);
-        let grant = authority.acquire(request, at(0)).expect("issued");
+        let old_request = request(&authority, TaskOperationId::new_v7(), owner, 1);
+        let grant = authority.acquire(old_request, at(0)).expect("issued");
         let ticket_id = grant.receipt().ticket_id();
         assert_eq!(authority.advance_deadlines(at(1)), 1);
         authority.advance_deadlines(at(3));
@@ -736,15 +810,74 @@ mod tests {
             Err(AdmissionTicketRedemptionRejection::Unknown)
         );
 
-        let replacement = authority
-            .acquire(request, at(3))
-            .expect("a request beyond retained replay detail receives a new grant");
-        assert_ne!(replacement.receipt().ticket_id(), ticket_id);
         assert_eq!(
-            authority.redeem(ticket_id, owner, at(3)),
-            Err(AdmissionTicketRedemptionRejection::Unknown),
-            "a newly issued nonce cannot revive the old establish bytes"
+            authority.acquire(old_request, at(3)),
+            Err(AdmissionTicketAcquisitionRejection::SealedEpoch),
+            "reclaimed history must not turn old acquire bytes into a new issuance"
         );
+
+        let replacement_request = request(&authority, TaskOperationId::new_v7(), owner, 1);
+        let replacement = authority
+            .acquire(replacement_request, at(3))
+            .expect("a fresh operation on the current epoch may acquire");
+        assert_ne!(replacement.receipt().ticket_id(), ticket_id);
+    }
+
+    #[test]
+    fn sealed_epoch_allows_only_retained_exact_replay() {
+        let authority = small_authority();
+        let expiring = request(&authority, TaskOperationId::new_v7(), context(1), 1);
+        let retained = request(&authority, TaskOperationId::new_v7(), context(2), 10);
+        authority.acquire(expiring, at(0)).expect("expiring ticket");
+        let original = authority.acquire(retained, at(0)).expect("retained ticket");
+
+        authority.advance_deadlines(at(1));
+        authority.advance_deadlines(at(3));
+        assert_ne!(
+            authority.current_epoch(at(3)),
+            retained.admission_epoch_capability(),
+            "reclaiming any decision seals the issuance epoch"
+        );
+        let replay = authority
+            .acquire(retained, at(3))
+            .expect("retained exact replay remains available in a sealed epoch");
+        assert_eq!(replay.progression(), AdmissionTicketProgression::Replayed);
+        assert_eq!(replay.receipt(), original.receipt());
+
+        let stale_new_operation = AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context(3),
+            retained.valid_for(),
+            retained.native_compatibility_id(),
+            retained.admission_epoch_capability(),
+        );
+        assert_eq!(
+            authority.acquire(stale_new_operation, at(3)),
+            Err(AdmissionTicketAcquisitionRejection::SealedEpoch)
+        );
+    }
+
+    #[test]
+    fn process_replacement_has_a_new_epoch_and_rejects_predecessor_acquire() {
+        let predecessor = small_authority();
+        let old_request = request(&predecessor, TaskOperationId::new_v7(), context(1), 5);
+        let replacement = small_authority();
+
+        assert_ne!(
+            predecessor.current_epoch(at(0)),
+            replacement.current_epoch(at(0)),
+            "independent worker processes must mint independent capabilities"
+        );
+        assert_eq!(
+            replacement.acquire(old_request, at(0)),
+            Err(AdmissionTicketAcquisitionRejection::SealedEpoch)
+        );
+        replacement
+            .acquire(
+                request(&replacement, TaskOperationId::new_v7(), context(2), 5),
+                at(0),
+            )
+            .expect("replacement process accepts its own current epoch");
     }
 
     #[test]
@@ -753,7 +886,10 @@ mod tests {
         for seed in 1..=super::MAX_ADMISSION_RESERVATIONS {
             let owner = context(seed as i64);
             let grant = authority
-                .acquire(request(TaskOperationId::new_v7(), owner, 10), at(0))
+                .acquire(
+                    request(&authority, TaskOperationId::new_v7(), owner, 10),
+                    at(0),
+                )
                 .expect("reservation below the product limit");
             authority
                 .redeem(grant.receipt().ticket_id(), owner, at(0))
@@ -761,7 +897,7 @@ mod tests {
         }
         assert_eq!(
             authority.acquire(
-                request(TaskOperationId::new_v7(), context(2_000), 10),
+                request(&authority, TaskOperationId::new_v7(), context(2_000), 10),
                 at(0),
             ),
             Err(AdmissionTicketAcquisitionRejection::ReservationCapacityExhausted)

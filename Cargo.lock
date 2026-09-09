@@ -3622,6 +3622,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-catalog-application"
+version = "0.1.0"
+dependencies = [
+ "novarocks-spi",
+]
+
+[[package]]
 name = "novarocks-cluster-harness"
 version = "0.1.0"
 dependencies = [
@@ -3850,6 +3857,7 @@ dependencies = [
  "hex",
  "libc",
  "mysql_common 0.32.4",
+ "novarocks-catalog-application",
  "novarocks-connector-starrocks",
  "novarocks-execution",
  "novarocks-execution-contract",
@@ -3866,6 +3874,7 @@ dependencies = [
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-state-store-api",
+ "novarocks-state-store-runtime",
  "novarocks-state-store-testkit",
  "novarocks-task-codec",
  "novarocks-types",
@@ -3992,6 +4001,7 @@ dependencies = [
 name = "novarocks-proto-models"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "prost 0.13.5",
  "prost-build",
  "prost-reflect",
@@ -4027,19 +4037,23 @@ dependencies = [
  "novarocks-connector-iceberg-functions",
  "novarocks-connector-paimon",
  "novarocks-execution",
+ "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-functions",
  "novarocks-native-trust",
+ "novarocks-query-application",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-state-store-api",
  "novarocks-state-store-sqlite",
+ "novarocks-task-codec",
  "novarocks-test-support",
  "novarocks-types",
  "novarocks-version",
+ "novarocks-worker",
  "serde",
  "tempfile",
  "tokio",
@@ -4164,6 +4178,18 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "novarocks-state-store-runtime"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "novarocks-state-store-api",
+ "novarocks-state-store-testkit",
+ "sha2",
+ "tokio",
  "uuid",
 ]
 

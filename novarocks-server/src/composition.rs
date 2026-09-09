@@ -33,9 +33,6 @@ use novarocks_connector_iceberg::storage_inspector::{
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
-use novarocks_execution::task_execution::{
-    DispatchBudget, LeaseBounds, OperationWaitCaps, TaskExecutionBudgets, TransportBudget,
-};
 use novarocks_frontend::{
     CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
     FrontendQueryControlTimeouts, FrontendServerConfig, LakePublicationRuntimePolicy,
@@ -48,6 +45,7 @@ use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
     TokioFileIoRuntime, TokioFileTaskSpawner,
 };
+use novarocks_query_application::coordination::{CoordinationBudgets, DispatchBudget};
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
@@ -61,7 +59,9 @@ use novarocks_spi::connector::{
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::{ClusterRole, NativeCompatibilityId};
+use novarocks_worker::{LeaseBounds, OperationWaitCaps};
 
 use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
@@ -421,6 +421,11 @@ pub fn compose_backend_server_config(
             runtime_config.write_commit_evidence_max_entries,
         )
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
+        result_retained_limits: novarocks_backend::BackendResultRetainedLimits::try_new(
+            runtime_config.result_retained_bytes_per_root,
+            runtime_config.result_retained_bytes_per_process,
+        )
+        .map_err(|error| anyhow::anyhow!("resolve native result retained-byte limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
         catalog_manager_config:
             novarocks_backend::connector::catalog_manager::CatalogManagerConfig {
@@ -465,6 +470,7 @@ pub fn compose_frontend_server_config(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("compose frontend server without catalog source preflight"))?
         .input()?;
+    let task_execution_budgets = compose_task_execution_budgets(config)?;
     let mut execution = FrontendExecutionConfig::new(
         native_trust.advertised_endpoint().host().to_string(),
         native_trust.advertised_endpoint().port(),
@@ -520,7 +526,10 @@ pub fn compose_frontend_server_config(
     )
     // Composed and validated here, then frozen: the coordinator never reads a
     // process-global configuration per attempt.
-    .with_task_execution_budgets(compose_task_execution_budgets(config)?);
+    .with_task_execution_budgets(
+        task_execution_budgets.coordination,
+        task_execution_budgets.transport,
+    );
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
         execution =
@@ -599,11 +608,19 @@ pub fn compose_frontend_server_config(
 /// disagree, which is worth failing startup over rather than clamping.
 #[allow(
     dead_code,
-    reason = "The native task protocol is not routed into production yet; the coordinator cutover reads these budgets."
+    reason = "Worker-owned bounds are validated with the complete startup budget before backend composition consumes them."
 )]
-pub fn compose_task_execution_budgets(
+#[derive(Clone, Copy, Debug)]
+struct ComposedTaskExecutionBudgets {
+    coordination: CoordinationBudgets,
+    wait_caps: OperationWaitCaps,
+    lease_bounds: LeaseBounds,
+    transport: TransportBudget,
+}
+
+fn compose_task_execution_budgets(
     config: &NovaRocksConfig,
-) -> anyhow::Result<TaskExecutionBudgets> {
+) -> anyhow::Result<ComposedTaskExecutionBudgets> {
     let runtime = &config.runtime;
     let dispatch = DispatchBudget::new(
         runtime.task_dispatch_create_permits,
@@ -643,12 +660,14 @@ pub fn compose_task_execution_budgets(
              query's queue, and that queue in the process's"
         )
     })?;
-    Ok(TaskExecutionBudgets {
-        dispatch,
+    Ok(ComposedTaskExecutionBudgets {
+        coordination: CoordinationBudgets {
+            dispatch,
+            status_subscription_error_budget: runtime.task_status_subscription_error_budget,
+        },
         wait_caps,
         lease_bounds,
         transport,
-        status_subscription_error_budget: runtime.task_status_subscription_error_budget,
     })
 }
 
@@ -832,7 +851,10 @@ mod tests {
         IcebergStorageLakeTargetSnapshotObservation, compose_task_execution_budgets,
         mv_lake_target_snapshot_observation,
     };
-    use novarocks_execution::task_execution::{DispatchBudget, LeaseBounds, TransportBudget};
+    use novarocks_execution_contract::{MaxWait, OperationKind};
+    use novarocks_query_application::coordination::DispatchBudget;
+    use novarocks_task_codec::TransportBudget;
+    use novarocks_worker::LeaseBounds;
     use std::time::Duration;
 
     #[test]
@@ -887,7 +909,7 @@ mod tests {
         let config = crate::app_config::NovaRocksConfig::default();
         let budgets = compose_task_execution_budgets(&config).expect("default budgets");
 
-        assert_eq!(budgets.dispatch, DispatchBudget::DEFAULT);
+        assert_eq!(budgets.coordination.dispatch, DispatchBudget::DEFAULT);
         assert_eq!(budgets.lease_bounds, LeaseBounds::DEFAULT);
         let frozen = TransportBudget::DEFAULT;
         assert_eq!(
@@ -934,20 +956,18 @@ mod tests {
         // through the clamp they exist for.
         assert_eq!(
             budgets.wait_caps.clamp(
-                novarocks_execution::task_execution::OperationKind::CreateTask,
-                novarocks_execution::task_execution::MaxWait::new(Duration::from_secs(300))
-                    .expect("representable"),
+                OperationKind::CreateTask,
+                MaxWait::new(Duration::from_secs(300)).expect("representable"),
             ),
-            novarocks_execution::task_execution::MaxWait::DEFAULT_CREATE
+            MaxWait::DEFAULT_CREATE
         );
         assert_eq!(
             budgets.wait_caps.clamp(
-                novarocks_execution::task_execution::OperationKind::UpdateTask,
-                novarocks_execution::task_execution::MaxWait::new(Duration::from_secs(300))
-                    .expect("representable"),
+                OperationKind::UpdateTask,
+                MaxWait::new(Duration::from_secs(300)).expect("representable"),
             ),
-            novarocks_execution::task_execution::MaxWait::DEFAULT_UPDATE
+            MaxWait::DEFAULT_UPDATE
         );
-        assert!(budgets.status_subscription_error_budget > 0);
+        assert!(budgets.coordination.status_subscription_error_budget > 0);
     }
 }
