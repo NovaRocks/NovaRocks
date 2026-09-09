@@ -119,6 +119,7 @@ pub fn input(cluster_id: impl Into<String>) -> StateStoreHostInput {
         cluster_id: cluster_id.into(),
         provider_id: TEST_STATE_STORE_PROVIDER_ID,
         limits: StateStoreLimits::default(),
+        run_policy: StateStoreRunPolicy::default(),
     }
 }
 
@@ -145,9 +146,7 @@ pub async fn open_with_input(input: StateStoreHostInput) -> FrontendStateStoreHo
 // Transitional test adapter. It converts legacy fixture literals directly to
 // provider-neutral `StateStoreHostInput`; it never opens a concrete provider.
 pub use novarocks_frontend::state_store::{StateStoreHostErrorKind, StateStoreHostLifecycle};
-pub use novarocks_frontend::{
-    OperationId, RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free,
-};
+pub use novarocks_frontend::{RunFailure, RunSuccess, StateStoreRunPolicy, run_side_effect_free};
 
 #[derive(Clone, Debug, Default)]
 pub struct StateStoreLimitOverrides {
@@ -157,7 +156,6 @@ pub struct StateStoreLimitOverrides {
     pub max_transaction_operations: Option<usize>,
     pub max_transaction_bytes: Option<usize>,
     pub transaction_deadline_ms: Option<u64>,
-    pub runner_max_attempts: Option<usize>,
 }
 #[derive(Clone, Debug)]
 pub enum StateStoreProviderConfig {
@@ -219,9 +217,6 @@ impl TestStateStoreHost {
         }
         if let Some(value) = limits.transaction_deadline_ms {
             opening.limits.transaction_deadline = std::time::Duration::from_millis(value);
-        }
-        if let Some(value) = limits.runner_max_attempts {
-            opening.limits.runner_max_attempts = value;
         }
         let registry = registry();
         FrontendStateStoreHost::open(&registry, opening, deadline)

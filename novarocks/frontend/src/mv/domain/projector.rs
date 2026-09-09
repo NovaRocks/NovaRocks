@@ -32,19 +32,19 @@ impl MvAcceleratorProjector {
     /// Converge one freshly observed package.  A conflict is returned to the
     /// outer observer loop; it must acquire a retained generation and rebuild
     /// a new payload before retrying.
-    pub(crate) fn project_once(
+    pub(crate) async fn project_once(
         &self,
         operation_id: Uuid,
         package: &MvLakePackageObservation,
     ) -> Result<(), MvRepositoryError> {
-        project_observed_repository(self.repository.as_ref(), operation_id, package)
+        project_observed_repository(self.repository.as_ref(), operation_id, package).await
     }
 }
 
 /// The only repository mutation entry for a lake observation. Startup rebuild
 /// and explicit resync use this function rather than becoming independent
 /// projection writers.
-pub(crate) fn project_observed_repository(
+pub(crate) async fn project_observed_repository(
     repository: &dyn MvRepository,
     operation_id: Uuid,
     package: &MvLakePackageObservation,
@@ -56,20 +56,24 @@ pub(crate) fn project_observed_repository(
         database: package.table.namespace.to_string(),
         name: package.table.table.to_string(),
     };
-    let Some(current) = repository.find_by_target(&target)? else {
-        repository.create_projection(operation_id, projection)?;
+    let Some(current) = repository.find_by_target(&target).await? else {
+        repository
+            .create_projection(operation_id, projection)
+            .await?;
         return Ok(());
     };
     if current.definition.source_revision == projection.source_revision {
         return Ok(());
     }
-    repository.replace_projection(
-        operation_id,
-        ReplaceMvProjectionRequest {
-            mv_id: current.definition.mv_id,
-            expected_version: current.version,
-            projection,
-        },
-    )?;
+    repository
+        .replace_projection(
+            operation_id,
+            ReplaceMvProjectionRequest {
+                mv_id: current.definition.mv_id,
+                expected_version: current.version,
+                projection,
+            },
+        )
+        .await?;
     Ok(())
 }

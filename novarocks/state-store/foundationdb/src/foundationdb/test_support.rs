@@ -220,7 +220,7 @@ mod tests {
             gates
                 .before_response(CommitOutcome::Committed(
                     novarocks_state_store_api::CommitReceipt {
-                        transaction_id: uuid::Uuid::from_bytes([0x11; 16]).into(),
+                        attempt: crate::codec::tests_support::attempt_id(1),
                         revision: novarocks_state_store_api::StoreRevision::try_from(
                             bytes::Bytes::from_static(&[0x22; 10]),
                         )

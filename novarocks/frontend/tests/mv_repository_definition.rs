@@ -35,8 +35,9 @@ use novarocks_frontend::mv::domain::repository::{
     ReplaceMvProjectionRequest,
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
+use novarocks_frontend::state_store::StateStoreRunPolicy;
 use novarocks_spi::connector::ConnectorTableObjectId;
-use novarocks_state_store_api::{CommitOutcome, Key, Precondition, TransactionId, Value};
+use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
 #[path = "common/mod.rs"]
 mod common;
 use common::state_store_fixture::{
@@ -44,43 +45,38 @@ use common::state_store_fixture::{
     StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
 };
 
-pub(crate) fn repository() -> (
+pub(crate) async fn repository() -> (
     tempfile::TempDir,
-    tokio::runtime::Runtime,
     StateStoreHost,
     Arc<StateStoreMvRepository>,
 ) {
     let temp = tempfile::tempdir().expect("temporary StateStore directory");
     let cluster_id = format!("mv-accelerator-test-{}", temp.path().display());
-    let runtime = tokio::runtime::Runtime::new().expect("repository runtime");
     let registry = builtin_state_store_provider_registry().expect("built-in StateStore providers");
-    let host = runtime
-        .block_on(StateStoreHost::open(
-            &registry,
-            StateStoreHostConfig {
-                state_store: StateStoreAppConfig {
-                    store: StateStoreConfig {
-                        cluster_id,
-                        limits: StateStoreLimitOverrides::default(),
-                        provider: StateStoreProviderConfig::Sqlite {
-                            path: temp.path().join("state-store.sqlite"),
-                        },
+    let host = StateStoreHost::open(
+        &registry,
+        StateStoreHostConfig {
+            state_store: StateStoreAppConfig {
+                store: StateStoreConfig {
+                    cluster_id,
+                    limits: StateStoreLimitOverrides::default(),
+                    provider: StateStoreProviderConfig::Sqlite {
+                        path: temp.path().join("state-store.sqlite"),
                     },
-                    mysql_client: None,
                 },
-                foundationdb_client: None,
+                mysql_client: None,
             },
-            Instant::now() + Duration::from_secs(5),
-        ))
-        .expect("open SQLite StateStore host");
+            foundationdb_client: None,
+        },
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .expect("open SQLite StateStore host");
     let store = host.state_store().expect("host exposes StateStore");
-    let repository = runtime
-        .block_on(StateStoreMvRepository::open(
-            store,
-            runtime.handle().clone(),
-        ))
+    let repository = StateStoreMvRepository::open(store, StateStoreRunPolicy::default())
+        .await
         .expect("open MV Accelerator repository");
-    (temp, runtime, host, repository)
+    (temp, host, repository)
 }
 
 pub(crate) fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
@@ -156,26 +152,28 @@ pub(crate) fn projection_request(
     }
 }
 
-#[test]
-fn sqlite_reopen_retains_the_exact_lake_source_projection() {
-    let (_temp, runtime, host, repository) = repository();
+#[tokio::test]
+async fn sqlite_reopen_retains_the_exact_lake_source_projection() {
+    let (_temp, host, repository) = repository().await;
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
             projection_request("retained", b"retained-object", 9, "orders"),
         )
+        .await
         .unwrap();
     drop(repository);
 
-    let reopened = runtime
-        .block_on(StateStoreMvRepository::open(
-            host.state_store().expect("reopen StateStore"),
-            runtime.handle().clone(),
-        ))
-        .expect("reopen MV Accelerator repository");
+    let reopened = StateStoreMvRepository::open(
+        host.state_store().expect("reopen StateStore"),
+        StateStoreRunPolicy::default(),
+    )
+    .await
+    .expect("reopen MV Accelerator repository");
     assert_eq!(
         reopened
             .load_by_id(created.definition.mv_id)
+            .await
             .unwrap()
             .unwrap()
             .definition,
@@ -183,14 +181,15 @@ fn sqlite_reopen_retains_the_exact_lake_source_projection() {
     );
 }
 
-#[test]
-fn whole_projection_cas_replaces_root_target_and_dependency_indexes() {
-    let (_temp, _runtime, _host, repository) = repository();
+#[tokio::test]
+async fn whole_projection_cas_replaces_root_target_and_dependency_indexes() {
+    let (_temp, _host, repository) = repository().await;
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
             projection_request("orders_mv", b"object-a", 11, "orders"),
         )
+        .await
         .expect("create projection");
     let stale_version = created.version.clone();
 
@@ -203,23 +202,27 @@ fn whole_projection_cas_replaces_root_target_and_dependency_indexes() {
                 projection: projection_request("orders_mv_v2", b"object-a", 12, "customers"),
             },
         )
+        .await
         .expect("replace projection");
 
     assert!(
         repository
             .find_by_target(&target("orders_mv"))
+            .await
             .unwrap()
             .is_none()
     );
     assert_eq!(
         repository
             .find_by_target(&target("orders_mv_v2"))
+            .await
             .unwrap()
             .unwrap(),
         replaced
     );
     let dependencies = repository
         .list_dependencies_by_downstream(replaced.definition.mv_id)
+        .await
         .unwrap();
     assert_eq!(dependencies.len(), 1);
     assert_eq!(dependencies[0].upstream.name, "customers");
@@ -233,24 +236,27 @@ fn whole_projection_cas_replaces_root_target_and_dependency_indexes() {
                 projection: projection_request("stale", b"object-a", 13, "orders"),
             },
         )
+        .await
         .expect_err("stale CAS must fail");
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
 }
 
-#[test]
-fn replacement_target_conflict_rolls_back_the_whole_projection() {
-    let (_temp, _runtime, _host, repository) = repository();
+#[tokio::test]
+async fn replacement_target_conflict_rolls_back_the_whole_projection() {
+    let (_temp, _host, repository) = repository().await;
     let first = repository
         .create_projection(
             uuid::Uuid::now_v7(),
             projection_request("first", b"object-first", 21, "orders"),
         )
+        .await
         .unwrap();
     repository
         .create_projection(
             uuid::Uuid::now_v7(),
             projection_request("second", b"object-second", 22, "customers"),
         )
+        .await
         .unwrap();
 
     assert!(
@@ -263,22 +269,24 @@ fn replacement_target_conflict_rolls_back_the_whole_projection() {
                     projection: projection_request("second", b"object-first", 23, "lineitem",),
                 },
             )
+            .await
             .is_err()
     );
     assert_eq!(
-        repository.load_by_id(first.definition.mv_id).unwrap(),
+        repository.load_by_id(first.definition.mv_id).await.unwrap(),
         Some(first)
     );
 }
 
-#[test]
-fn delete_requires_exact_object_source_and_version() {
-    let (_temp, _runtime, _host, repository) = repository();
+#[tokio::test]
+async fn delete_requires_exact_object_source_and_version() {
+    let (_temp, _host, repository) = repository().await;
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
             projection_request("delete_me", b"object-live", 31, "orders"),
         )
+        .await
         .unwrap();
     let mut stale_source = created.definition.source_revision.clone();
     stale_source.target_object_id = object_id(b"object-recreated");
@@ -291,11 +299,13 @@ fn delete_requires_exact_object_source_and_version() {
                 expected_source_revision: stale_source,
             },
         )
+        .await
         .expect_err("logical name cannot authorize deletion");
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
     assert!(
         repository
             .load_by_id(created.definition.mv_id)
+            .await
             .unwrap()
             .is_some()
     );
@@ -309,63 +319,74 @@ fn delete_requires_exact_object_source_and_version() {
                 expected_source_revision: created.definition.source_revision,
             },
         )
+        .await
         .expect("exact guarded delete");
     assert!(
         repository
             .find_by_target(&target("delete_me"))
+            .await
             .unwrap()
             .is_none()
     );
 }
 
-#[test]
-fn whole_family_wipe_allows_internal_id_reallocation() {
-    let (_temp, _runtime, _host, repository) = repository();
+#[tokio::test]
+async fn whole_family_wipe_allows_internal_id_reallocation() {
+    let (_temp, _host, repository) = repository().await;
     let first = repository
         .create_projection(
             uuid::Uuid::now_v7(),
             projection_request("before_wipe", b"object-before", 41, "orders"),
         )
+        .await
         .unwrap();
     repository
         .wipe_accelerator(uuid::Uuid::now_v7())
+        .await
         .expect("wipe current Accelerator family");
     let rebuilt = repository
         .create_projection(
             uuid::Uuid::now_v7(),
             projection_request("after_wipe", b"object-after", 42, "orders"),
         )
+        .await
         .unwrap();
     assert_eq!(first.definition.mv_id, rebuilt.definition.mv_id);
 }
 
-#[test]
-fn whole_family_wipe_removes_an_unknown_current_record_without_decoding_it() {
-    let (_temp, runtime, host, repository) = repository();
+#[tokio::test]
+async fn whole_family_wipe_removes_an_unknown_current_record_without_decoding_it() {
+    let (_temp, host, repository) = repository().await;
     let store = host.state_store().expect("StateStore");
     let key = Key::try_from(Bytes::from_static(
         b"novarocks/frontend/mv/accelerator/v1/unknown/future-record",
     ))
     .unwrap();
     let value = Value::try_from(Bytes::from_static(b"opaque-corrupt-record")).unwrap();
-    let mut transaction = runtime
-        .block_on(store.begin_write(
-            TransactionId::from(uuid::Uuid::now_v7()),
-            "inject unknown MV Accelerator record",
-        ))
+    // The store issues the attempt this write is authorised by; a test cannot
+    // mint one, which is exactly the property the new contract is after.
+    let (attempt, _observation) = store
+        .attempts()
+        .reserve()
+        .expect("reserve one write attempt");
+    let mut transaction = store
+        .begin_write(attempt, "inject unknown MV Accelerator record")
+        .await
         .unwrap();
-    runtime
-        .block_on(transaction.put(key.clone(), value, Precondition::Absent))
+    transaction
+        .put(key.clone(), value, Precondition::Absent)
+        .await
         .unwrap();
     assert!(matches!(
-        runtime.block_on(transaction.commit()),
+        transaction.commit().await,
         CommitOutcome::Committed(_)
     ));
 
     repository
         .wipe_accelerator(uuid::Uuid::now_v7())
+        .await
         .expect("wipe opaque current record");
-    let mut read = runtime.block_on(store.begin_read()).unwrap();
-    assert!(runtime.block_on(read.get(&key)).unwrap().is_none());
-    runtime.block_on(read.abort()).unwrap();
+    let mut read = store.begin_read().await.unwrap();
+    assert!(read.get(&key).await.unwrap().is_none());
+    read.abort().await.unwrap();
 }

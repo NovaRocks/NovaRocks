@@ -84,8 +84,8 @@ pub use server::{
 };
 pub use session_error::SESSION_ERROR_CODE_DESCRIPTORS;
 pub use state_store::{
-    OperationId, RunFailure, RunSuccess, StateStoreHost, StateStoreHostInput,
-    StateStoreProviderRegistry, derive_transaction_id, run_side_effect_free,
+    RunFailure, RunSuccess, StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry,
+    StateStoreRunPolicy, run_side_effect_free,
 };
 pub use statistics::FrontendStatisticsService;
 pub use system_catalog::SystemCatalogService;

@@ -31,10 +31,10 @@ use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_execution::task_execution::{
     DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait, TransportBudget,
 };
+use novarocks_frontend::StateStoreRunPolicy;
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
-use novarocks_state_store_sqlite::SqliteHistoryRetentionConfig;
 use novarocks_types::{ClusterRole, NativeEndpoint};
 
 pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
@@ -73,8 +73,6 @@ struct StateStoreAppConfigWire {
     path: PathBuf,
     #[serde(default)]
     limits: StateStoreLimitOverridesWire,
-    #[serde(default)]
-    history_retention: SqliteHistoryRetentionConfigWire,
 }
 
 #[derive(Default, Deserialize)]
@@ -85,8 +83,13 @@ struct StateStoreLimitOverridesWire {
     max_page_size: Option<usize>,
     max_transaction_operations: Option<usize>,
     max_transaction_bytes: Option<usize>,
-    transaction_deadline_ms: Option<u64>,
-    runner_max_attempts: Option<usize>,
+    /// Ceiling on one physical transaction. A storage property.
+    ///
+    /// How many attempts an operation may make, and how long it may take
+    /// overall, are application decisions and live under `[application]`. The
+    /// two used to share this section, which let storage configuration dictate
+    /// application retry behaviour.
+    transaction_timeout_ms: Option<u64>,
 }
 impl From<StateStoreLimitOverridesWire> for StateStoreLimitOverrides {
     fn from(w: StateStoreLimitOverridesWire) -> Self {
@@ -96,37 +99,43 @@ impl From<StateStoreLimitOverridesWire> for StateStoreLimitOverrides {
             max_page_size: w.max_page_size,
             max_transaction_operations: w.max_transaction_operations,
             max_transaction_bytes: w.max_transaction_bytes,
-            transaction_deadline_ms: w.transaction_deadline_ms,
-            runner_max_attempts: w.runner_max_attempts,
+            transaction_timeout_ms: w.transaction_timeout_ms,
         }
     }
 }
 
-#[derive(Default, Deserialize)]
+/// Application-owned policy, as distinct from provider-enforced limits.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct SqliteHistoryRetentionConfigWire {
-    max_age_secs: Option<u64>,
-    max_change_rows: Option<usize>,
-    max_commit_receipts: Option<usize>,
-    maintenance_interval_commits: Option<usize>,
-    incremental_vacuum_pages: Option<usize>,
+pub struct ApplicationConfig {
+    #[serde(default)]
+    pub state_store_policy: StateStoreRunPolicyWire,
 }
-impl From<SqliteHistoryRetentionConfigWire> for SqliteHistoryRetentionConfig {
-    fn from(w: SqliteHistoryRetentionConfigWire) -> Self {
-        let defaults = SqliteHistoryRetentionConfig::default();
-        Self {
-            max_age_secs: w.max_age_secs.unwrap_or(defaults.max_age_secs),
-            max_change_rows: w.max_change_rows.unwrap_or(defaults.max_change_rows),
-            max_commit_receipts: w
-                .max_commit_receipts
-                .unwrap_or(defaults.max_commit_receipts),
-            maintenance_interval_commits: w
-                .maintenance_interval_commits
-                .unwrap_or(defaults.maintenance_interval_commits),
-            incremental_vacuum_pages: w
-                .incremental_vacuum_pages
-                .unwrap_or(defaults.incremental_vacuum_pages),
-        }
+
+/// How hard this application tries against durable storage.
+///
+/// Both fields may tighten the built-in defaults and never relax them, and the
+/// two are validated independently: an operation budget is not required to be
+/// larger or smaller than the provider's per-transaction timeout, because they
+/// bound different things.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreRunPolicyWire {
+    pub operation_timeout_ms: Option<u64>,
+    pub max_attempts: Option<usize>,
+}
+
+impl StateStoreRunPolicyWire {
+    pub fn resolve(&self) -> anyhow::Result<StateStoreRunPolicy> {
+        let defaults = StateStoreRunPolicy::default();
+        let timeout = self.operation_timeout_ms.map_or(
+            defaults.operation_timeout(),
+            std::time::Duration::from_millis,
+        );
+        let attempts = self.max_attempts.unwrap_or(defaults.max_attempts());
+        StateStoreRunPolicy::new(attempts, timeout).map_err(|error| {
+            anyhow::anyhow!("InvalidApplicationConfig: state_store_policy.{error}")
+        })
     }
 }
 
@@ -137,7 +146,6 @@ fn state_store_from_wire(wire: StateStoreAppConfigWire) -> StateStoreAppConfig {
             cluster_id: wire.cluster_id,
             path: wire.path,
             limits: wire.limits.into(),
-            history_retention: wire.history_retention.into(),
         },
     }
 }
@@ -423,6 +431,14 @@ pub struct NovaRocksConfig {
     #[serde(default, deserialize_with = "deserialize_state_store")]
     pub state_store: Option<StateStoreAppConfig>,
 
+    /// Decisions this application makes about its own durable operations.
+    ///
+    /// Kept apart from `[state_store]`, which describes what the storage
+    /// provider enforces. Retry counts and operation budgets belong to whoever
+    /// is asking, not to the thing being asked.
+    #[serde(default)]
+    pub application: ApplicationConfig,
+
     #[serde(default, rename = "foundationdb_client")]
     rejected_foundationdb_client: Option<toml::Value>,
 
@@ -602,6 +618,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
         .try_into()
         .with_context(|| format!("deserialize config TOML: {}", path.display()))?;
     validate_state_store_configuration(&cfg)?;
+    validate_application_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
@@ -652,6 +669,7 @@ impl Default for NovaRocksConfig {
             catalog_source: None,
             runtime: RuntimeConfig::default(),
             state_store: None,
+            application: ApplicationConfig::default(),
             rejected_foundationdb_client: None,
             standalone_server: None,
             connector: ConnectorConfig::default(),
@@ -669,6 +687,17 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
     if let Some(state_store) = &config.state_store {
         state_store.validate()?;
     }
+    Ok(())
+}
+
+/// Reject an application policy that relaxes a built-in bound, at load.
+///
+/// The policy is resolved again by composition, which is what actually builds
+/// the runner. Doing it here as well is deliberate: a configuration file is
+/// read by more than the startup path, and a value that can never be honoured
+/// should be refused where it is written, not where it is first used.
+fn validate_application_configuration(config: &NovaRocksConfig) -> Result<()> {
+    config.application.state_store_policy.resolve()?;
     Ok(())
 }
 

@@ -4154,6 +4154,7 @@ dependencies = [
  "fs2",
  "log",
  "novarocks-state-store-api",
+ "novarocks-state-store-testkit",
  "rusqlite",
  "tempfile",
  "tokio",

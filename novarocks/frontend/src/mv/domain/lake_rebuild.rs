@@ -469,12 +469,15 @@ fn rebuild_one_lake_package_if_missing_with_readiness(
         .map_err(|error| format!("project iceberg MV lake observation failed: {error}"))
 }
 
-/// Targeted lake-package rebuild with the only capability it actually needs:
-/// durable MV repository mutation.  Unlike startup discovery, the caller has
-/// already selected and observed one exact package, so it must not acquire a
-/// new catalog projection or connector lease while rebuilding the cache.
-pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
-    repository: &dyn crate::mv::domain::repository::MvRepository,
+/// Targeted lake-package rebuild that additionally asserts definition
+/// equivalence.  Unlike startup discovery, the caller has already selected and
+/// observed one exact package, so it must not acquire a new catalog projection
+/// or connector lease while rebuilding the cache.
+///
+/// Durable access goes through the readiness port because the only caller is
+/// the synchronous statement thread; see [`MvReadinessPort`].
+pub(crate) fn rebuild_one_lake_package_if_missing_verified(
+    readiness: &MvReadinessPort,
     package: &MvLakePackageObservation,
 ) -> Result<(), String> {
     let rebuilt = rebuild_mv_definition_from_lake(package)?;
@@ -482,8 +485,8 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
     // target must describe exactly the same immutable definition. Silently
     // accepting a mismatch would let a restart reinterpret user SQL under a
     // different frozen context.
-    let existing = repository
-        .find_by_target(&crate::mv::domain::model::MvTarget {
+    let existing = readiness
+        .load_ready(&crate::mv::domain::model::MvTarget {
             catalog: Some(package.table.instance_id.as_str().to_string()),
             database: package.table.namespace.to_string(),
             name: package.table.table.to_string(),
@@ -502,13 +505,7 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
         return Ok(());
     }
 
-    crate::mv::domain::projector::project_observed_repository(
-        repository,
-        uuid::Uuid::now_v7(),
-        package,
-    )
-    .map_err(|e| format!("project iceberg MV lake observation failed: {e}"))?;
-    Ok(())
+    rebuild_one_lake_package_if_missing_with_readiness(readiness, package)
 }
 
 fn stored_definition_matches_rebuilt_request(
@@ -843,13 +840,16 @@ mod tests {
         assert!(rebuilt.create_request.schema_contract.is_some());
     }
 
-    #[test]
-    fn incomplete_catalog_quarantine_hides_retained_projection_from_consumers() {
+    // The readiness port drives the async repository from a synchronous
+    // caller, so its tests need a multi-thread runtime to block on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incomplete_catalog_quarantine_hides_retained_projection_from_consumers() {
         let repository = Arc::new(InMemoryMvRepository::default());
         let repository_port: Arc<dyn MvRepository> = repository;
         let readiness = MvReadinessPort::new(
             Arc::clone(&repository_port),
             Arc::new(ProcessRuntime::default()),
+            tokio::runtime::Handle::current(),
         );
         let package = sample_package(sample_publication());
 
@@ -876,13 +876,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn incomplete_catalog_quarantine_preserves_other_catalog_projections() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incomplete_catalog_quarantine_preserves_other_catalog_projections() {
         let repository = Arc::new(InMemoryMvRepository::default());
         let repository_port: Arc<dyn MvRepository> = repository;
         let readiness = MvReadinessPort::new(
             Arc::clone(&repository_port),
             Arc::new(ProcessRuntime::default()),
+            tokio::runtime::Handle::current(),
         );
         let affected = sample_package_for_catalog("ice_a", "analytics_a", "mv_orders_a");
         let unaffected = sample_package_for_catalog("ice_b", "analytics_b", "mv_orders_b");

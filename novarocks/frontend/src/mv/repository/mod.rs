@@ -21,7 +21,6 @@ pub mod key;
 mod operation;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::sync::Arc;
 
 use novarocks_state_store_api::{
@@ -38,7 +37,8 @@ use crate::mv::domain::repository::{
     MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTarget,
     MvTargetLookup, ReplaceMvProjectionRequest,
 };
-use crate::state_store::metrics::StateStoreMetrics;
+use crate::state_store::StateStoreRunPolicy;
+use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
 
 use self::codec::{
     DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_record, encode_projection,
@@ -54,40 +54,27 @@ use self::key::{
 /// StateStore owner for the single current MV Accelerator family.
 pub struct StateStoreMvRepository {
     store: Arc<dyn StateStore>,
-    runtime: tokio::runtime::Handle,
+    run_policy: StateStoreRunPolicy,
     runner_metrics: StateStoreMetrics,
 }
 
 impl StateStoreMvRepository {
+    /// Opens the repository against one store instance under one application
+    /// run policy.
+    ///
+    /// The policy is supplied rather than read from the store: how many
+    /// attempts an MV write is worth and how long the caller will wait are
+    /// application decisions, and a provider no longer reports an attempt
+    /// ceiling for anyone to borrow.
     pub async fn open(
         store: Arc<dyn StateStore>,
-        runtime: tokio::runtime::Handle,
+        run_policy: StateStoreRunPolicy,
     ) -> Result<Arc<Self>, MvRepositoryError> {
         Ok(Arc::new(Self {
-            runner_metrics: StateStoreMetrics::new(
-                novarocks_state_store_api::StateStoreProviderId::new("frontend-mv-accelerator"),
-            ),
+            runner_metrics: StateStoreMetrics::new(StateStoreConsumer::MV_ACCELERATOR),
             store,
-            runtime,
+            run_policy,
         }))
-    }
-
-    fn blocking<T>(
-        &self,
-        future: impl Future<Output = Result<T, MvRepositoryError>>,
-    ) -> Result<T, MvRepositoryError> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle)
-                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread =>
-            {
-                return Err(MvRepositoryError::new(
-                    MvRepositoryErrorKind::Unavailable,
-                    "MV Accelerator synchronous port cannot block a current-thread runtime",
-                ));
-            }
-            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
-            Err(_) => self.runtime.block_on(future),
-        }
     }
 
     async fn scan_prefix(&self, prefix: Key) -> Result<Vec<StateRecord>, MvRepositoryError> {
@@ -116,8 +103,11 @@ impl StateStoreMvRepository {
             .map_err(operation::state_store_error)?;
         Ok(record)
     }
+}
 
-    async fn create_projection_async(
+#[async_trait::async_trait]
+impl MvRepository for StateStoreMvRepository {
+    async fn create_projection(
         &self,
         operation_id: Uuid,
         projection: MvProjectionRequest,
@@ -128,7 +118,7 @@ impl StateStoreMvRepository {
         let mv_id = operation::run(
             store.as_ref(),
             &self.runner_metrics,
-            operation_id,
+            self.run_policy,
             "create MV Accelerator projection",
             move |transaction| {
                 let projection = projection.clone();
@@ -186,12 +176,12 @@ impl StateStoreMvRepository {
             },
         )
         .await?;
-        self.load_by_id_async(mv_id)
+        self.load_by_id(mv_id)
             .await?
             .ok_or_else(|| corruption("created MV Accelerator projection is missing"))
     }
 
-    async fn replace_projection_async(
+    async fn replace_projection(
         &self,
         operation_id: Uuid,
         request: ReplaceMvProjectionRequest,
@@ -209,7 +199,7 @@ impl StateStoreMvRepository {
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
-            operation_id,
+            self.run_policy,
             "replace MV Accelerator projection",
             move |transaction| {
                 let request = request.clone();
@@ -250,12 +240,12 @@ impl StateStoreMvRepository {
             },
         )
         .await?;
-        self.load_by_id_async(mv_id)
+        self.load_by_id(mv_id)
             .await?
             .ok_or_else(|| corruption("replaced MV Accelerator projection is missing"))
     }
 
-    async fn load_by_id_async(
+    async fn load_by_id(
         &self,
         mv_id: i64,
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
@@ -269,7 +259,7 @@ impl StateStoreMvRepository {
             .transpose()
     }
 
-    async fn find_by_target_async(
+    async fn find_by_target(
         &self,
         target: &MvTarget,
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
@@ -279,12 +269,9 @@ impl StateStoreMvRepository {
         };
         let lookup: DecodedMvRecord<MvTargetLookup> =
             decode_record(&key, &lookup_record.value).map_err(corruption)?;
-        let loaded = self
-            .load_by_id_async(lookup.value.mv_id)
-            .await?
-            .ok_or_else(|| {
-                corruption("MV Accelerator target lookup references a missing projection")
-            })?;
+        let loaded = self.load_by_id(lookup.value.mv_id).await?.ok_or_else(|| {
+            corruption("MV Accelerator target lookup references a missing projection")
+        })?;
         if definition_target(&loaded.definition).map_err(corruption)? != *target {
             return Err(corruption(
                 "MV Accelerator target lookup does not match its projection",
@@ -293,7 +280,7 @@ impl StateStoreMvRepository {
         Ok(Some(loaded))
     }
 
-    async fn list_projections_async(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
+    async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
         let records = self
             .scan_prefix(projection_prefix().map_err(corruption)?)
             .await?;
@@ -306,9 +293,11 @@ impl StateStoreMvRepository {
             .collect()
     }
 
-    async fn delete_projection_async(
+    /// A delete stamps no record, so it carries no operation provenance; the
+    /// runner owns the attempt identity this write is retried under.
+    async fn delete_projection(
         &self,
-        operation_id: Uuid,
+        _operation_id: Uuid,
         request: DeleteMvProjectionRequest,
     ) -> Result<bool, MvRepositoryError> {
         if request.mv_id <= 0 {
@@ -320,7 +309,7 @@ impl StateStoreMvRepository {
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
-            operation_id,
+            self.run_policy,
             "delete MV Accelerator projection",
             move |transaction| {
                 let request = request.clone();
@@ -359,7 +348,7 @@ impl StateStoreMvRepository {
         .await
     }
 
-    async fn wipe_accelerator_async(&self, operation_id: Uuid) -> Result<(), MvRepositoryError> {
+    async fn wipe_accelerator(&self, _operation_id: Uuid) -> Result<(), MvRepositoryError> {
         let records = self
             .scan_prefix(accelerator_prefix().map_err(corruption)?)
             .await?;
@@ -367,7 +356,7 @@ impl StateStoreMvRepository {
         operation::run(
             store.as_ref(),
             &self.runner_metrics,
-            operation_id,
+            self.run_policy,
             "wipe MV Accelerator family",
             move |transaction| {
                 let records = records.clone();
@@ -393,7 +382,7 @@ impl StateStoreMvRepository {
         .await
     }
 
-    async fn list_dependencies_downstream_async(
+    async fn list_dependencies_by_downstream(
         &self,
         mv_id: i64,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
@@ -403,7 +392,7 @@ impl StateStoreMvRepository {
         decode_dependencies(records)
     }
 
-    async fn list_dependencies_upstream_async(
+    async fn list_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectRef,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
@@ -412,54 +401,13 @@ impl StateStoreMvRepository {
             .await?;
         decode_dependencies(records)
     }
-}
 
-impl MvRepository for StateStoreMvRepository {
-    fn create_projection(
-        &self,
-        operation_id: Uuid,
-        projection: MvProjectionRequest,
-    ) -> Result<LoadedMvProjection, MvRepositoryError> {
-        self.blocking(self.create_projection_async(operation_id, projection))
-    }
-
-    fn replace_projection(
-        &self,
-        operation_id: Uuid,
-        request: ReplaceMvProjectionRequest,
-    ) -> Result<LoadedMvProjection, MvRepositoryError> {
-        self.blocking(self.replace_projection_async(operation_id, request))
-    }
-
-    fn load_by_id(&self, mv_id: i64) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        self.blocking(self.load_by_id_async(mv_id))
-    }
-
-    fn find_by_target(
-        &self,
-        target: &MvTarget,
-    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        self.blocking(self.find_by_target_async(target))
-    }
-
-    fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
-        self.blocking(self.list_projections_async())
-    }
-
-    fn delete_projection(
-        &self,
-        operation_id: Uuid,
-        request: DeleteMvProjectionRequest,
-    ) -> Result<bool, MvRepositoryError> {
-        self.blocking(self.delete_projection_async(operation_id, request))
-    }
-
-    fn wipe_projection_by_target(
+    async fn wipe_projection_by_target(
         &self,
         operation_id: Uuid,
         target: &MvTarget,
     ) -> Result<bool, MvRepositoryError> {
-        let Some(loaded) = self.find_by_target(target)? else {
+        let Some(loaded) = self.find_by_target(target).await? else {
             return Ok(false);
         };
         self.delete_projection(
@@ -470,31 +418,14 @@ impl MvRepository for StateStoreMvRepository {
                 expected_source_revision: loaded.definition.source_revision,
             },
         )
+        .await
     }
 
-    fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvRepositoryError> {
-        self.blocking(self.wipe_accelerator_async(operation_id))
-    }
-
-    fn list_dependencies_by_downstream(
-        &self,
-        mv_id: i64,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.blocking(self.list_dependencies_downstream_async(mv_id))
-    }
-
-    fn list_downstream_dependencies(
-        &self,
-        upstream: &MvDependencyObjectRef,
-    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        self.blocking(self.list_dependencies_upstream_async(upstream))
-    }
-
-    fn ensure_no_downstream_dependencies(
+    async fn ensure_no_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectRef,
     ) -> Result<(), MvRepositoryError> {
-        let dependencies = self.list_downstream_dependencies(upstream)?;
+        let dependencies = self.list_downstream_dependencies(upstream).await?;
         if dependencies.is_empty() {
             Ok(())
         } else {

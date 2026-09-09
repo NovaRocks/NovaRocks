@@ -28,17 +28,15 @@ use tokio::time::{Instant, timeout_at};
 use super::FoundationDbStateStore;
 use super::budget::TransactionBudget;
 use super::codec::KeyspaceCodec;
-use super::commit::{
-    PreparedCommit, PreparedFailure, supervise_commit, supervise_pre_dispatch_failure,
-};
+use super::commit::{PreparedCommit, supervise_commit};
+use super::metrics::{ProviderMetrics, ProviderOperation, ProviderOutcome};
 use super::range::range_page;
 use super::{classify_native_read_error, record_provider_error_metric};
 use crate::runtime::OperationHandle;
-use novarocks_state_store_api::StateStoreMetrics;
 use novarocks_state_store_api::{
-    CommitOutcome, Key, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord,
-    StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreOperation, StateStoreOutcome,
-    TransactionId, Value, VersionToken, WriteTransaction,
+    AttemptId, CommitOutcome, Key, Precondition, RangePage, RangeRequest, ReadTransaction,
+    StateRecord, StateStoreError, StateStoreErrorKind, StateStoreLimits, Value, VersionToken,
+    WriteAttempt, WriteTransaction,
 };
 
 const PROVISIONAL_VERSION_TAG: &[u8] = b"fdb-provisional-v1\0";
@@ -68,7 +66,7 @@ pub(super) struct FoundationDbReadTransaction {
     codec: KeyspaceCodec,
     limits: StateStoreLimits,
     deadline: Instant,
-    metrics: Arc<StateStoreMetrics>,
+    metrics: Arc<ProviderMetrics>,
     _operation: OperationHandle,
 }
 
@@ -78,9 +76,15 @@ pub(super) struct FoundationDbWriteTransaction {
     codec: KeyspaceCodec,
     limits: StateStoreLimits,
     deadline: Instant,
-    metrics: Arc<StateStoreMetrics>,
+    metrics: Arc<ProviderMetrics>,
     operation: OperationHandle,
-    transaction_id: TransactionId,
+    /// The one write this transaction is authorised to make.
+    ///
+    /// It is consumed by [`PreparedCommit`], which is why a prepared commit is
+    /// the only thing that may dispatch it. A transaction dropped or aborted
+    /// before that point drops the attempt while it is still merely reserved,
+    /// and a reserved attempt is provably free of write effect.
+    attempt: WriteAttempt,
     mutations: Vec<(Key, Mutation)>,
     pub(super) overlay: BTreeMap<Key, Mutation>,
     budget: TransactionBudget,
@@ -89,12 +93,9 @@ pub(super) struct FoundationDbWriteTransaction {
 
 enum CommitPreparation {
     Ready(PreparedCommit),
-    DurableFailure(PreparedFailure, CommitOutcome),
-    Immediate(CommitOutcome),
-}
-
-fn decide_prepare_error(error: StateStoreError) -> CommitOutcome {
-    classify_precommit_error(error)
+    /// Nothing was dispatched, so the attempt is closed as effect-free before
+    /// the caller is answered.
+    UndispatchedFailure(WriteAttempt, CommitOutcome),
 }
 
 impl FoundationDbStateStore {
@@ -116,13 +117,13 @@ impl FoundationDbStateStore {
                 _operation: operation,
             })
         })();
-        record_result(&self.metrics, StateStoreOperation::Begin, started, &result);
+        record_result(&self.metrics, ProviderOperation::Begin, started, &result);
         result
     }
 
     pub(super) fn begin_write_transaction(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
     ) -> Result<FoundationDbWriteTransaction, StateStoreError> {
         let started = StdInstant::now();
         let result = (|| {
@@ -139,14 +140,14 @@ impl FoundationDbStateStore {
                 deadline,
                 metrics: Arc::clone(&self.metrics),
                 operation,
-                transaction_id,
+                attempt,
                 mutations: Vec::new(),
                 overlay: BTreeMap::new(),
                 budget,
                 range_frozen: false,
             })
         })();
-        record_result(&self.metrics, StateStoreOperation::Begin, started, &result);
+        record_result(&self.metrics, ProviderOperation::Begin, started, &result);
         result
     }
 }
@@ -273,7 +274,7 @@ impl FoundationDbWriteTransaction {
         let operation = self
             .budget
             .stage_put(key.as_bytes(), value.as_bytes(), &precondition)?;
-        let provisional_version = provisional_version(self.transaction_id, operation);
+        let provisional_version = provisional_version(self.attempt.id(), operation);
         let mutation = Mutation::Put {
             value,
             precondition,
@@ -302,19 +303,29 @@ impl FoundationDbWriteTransaction {
         Ok(bytes)
     }
 
+    /// Stages every physical mutation this attempt will commit.
+    ///
+    /// Everything here is client-side buffering and snapshot reads: nothing
+    /// leaves a trace a later reader could see, which is why the attempt is
+    /// still merely reserved when this returns and why dispatch is recorded by
+    /// the commit supervisor rather than here.
     async fn prepare_commit(mut self) -> CommitPreparation {
         let transaction = match self.transaction.take() {
             Some(transaction) => transaction,
             None => {
-                return CommitPreparation::Immediate(CommitOutcome::DefiniteFailure(
-                    transaction_finished(),
-                ));
+                return CommitPreparation::UndispatchedFailure(
+                    self.attempt,
+                    CommitOutcome::DefiniteFailure(transaction_finished()),
+                );
             }
         };
         if Instant::now() >= self.deadline {
             let error = deadline_error();
             record_provider_error_metric(self.metrics.as_ref(), &error);
-            return CommitPreparation::Immediate(CommitOutcome::DefiniteFailure(error));
+            return CommitPreparation::UndispatchedFailure(
+                self.attempt,
+                CommitOutcome::DefiniteFailure(error),
+            );
         }
 
         let mut touched = BTreeSet::new();
@@ -325,80 +336,40 @@ impl FoundationDbWriteTransaction {
                 Ok(record) => record,
                 Err(error) => {
                     record_provider_error_metric(self.metrics.as_ref(), &error);
-                    let outcome = decide_prepare_error(error);
+                    let outcome = classify_precommit_error(error);
                     drop(transaction);
-                    return CommitPreparation::DurableFailure(
-                        PreparedFailure {
-                            database: self.database,
-                            codec: self.codec,
-                            limits: self.limits,
-                            deadline: self.deadline,
-                            metrics: self.metrics,
-                            _operation: self.operation,
-                            transaction_id: self.transaction_id,
-                        },
-                        outcome,
-                    );
+                    return CommitPreparation::UndispatchedFailure(self.attempt, outcome);
                 }
             };
             base.insert(key.clone(), record);
         }
 
-        let changed = match replay_for_commit(&self.mutations, &base) {
-            Ok(changed) => changed,
-            Err(error) => {
-                drop(transaction);
-                return CommitPreparation::DurableFailure(
-                    PreparedFailure {
-                        database: self.database,
-                        codec: self.codec,
-                        limits: self.limits,
-                        deadline: self.deadline,
-                        metrics: self.metrics,
-                        _operation: self.operation,
-                        transaction_id: self.transaction_id,
-                    },
-                    CommitOutcome::Conflict(error),
-                );
-            }
-        };
+        if let Err(error) = replay_for_commit(&self.mutations, &base) {
+            drop(transaction);
+            return CommitPreparation::UndispatchedFailure(
+                self.attempt,
+                CommitOutcome::Conflict(error),
+            );
+        }
+
+        let attempt_tag = self.codec.attempt_tag(self.attempt.id());
         for (key, mutation) in &self.overlay {
             let physical_key = self.codec.record_key(key.as_bytes());
             match mutation {
                 Mutation::Put { value, .. } => transaction.set(
                     &physical_key,
-                    &self
-                        .codec
-                        .record_value(*self.transaction_id.as_uuid().as_bytes(), value.as_bytes()),
+                    &self.codec.record_value(attempt_tag, value.as_bytes()),
                 ),
                 Mutation::Delete { .. } => transaction.clear(&physical_key),
             }
         }
 
-        for (sequence, key) in changed.iter().enumerate() {
-            let sequence = match u32::try_from(sequence) {
-                Ok(sequence) => sequence,
-                Err(_) => {
-                    return CommitPreparation::Immediate(CommitOutcome::DefiniteFailure(
-                        limit_error("transaction change sequence exceeds FoundationDB range"),
-                    ));
-                }
-            };
-            transaction.atomic_op(
-                &self.codec.change_key_operand(sequence),
-                key.as_bytes(),
-                MutationType::SetVersionstampedKey,
-            );
-        }
+        // The one piece of evidence this provider keeps, staged inside the data
+        // transaction itself. FoundationDB publishes it atomically with the rows
+        // above, so the key's presence *is* the proof that this attempt
+        // committed, and nothing outside a real commit can create it.
         transaction.atomic_op(
-            &self.codec.high_watermark_key(),
-            &self.codec.high_watermark_operand(),
-            MutationType::SetVersionstampedValue,
-        );
-        transaction.atomic_op(
-            &self
-                .codec
-                .commit_state_key(*self.transaction_id.as_uuid().as_bytes()),
+            &self.codec.commit_state_key(self.attempt.id()),
             &self.codec.committed_value_operand(),
             MutationType::SetVersionstampedValue,
         );
@@ -409,8 +380,8 @@ impl FoundationDbWriteTransaction {
             limits: self.limits,
             deadline: self.deadline,
             metrics: self.metrics,
-            _operation: self.operation,
-            transaction_id: self.transaction_id,
+            operation: self.operation,
+            attempt: self.attempt,
         })
     }
 }
@@ -434,7 +405,7 @@ async fn load_record(
             Ok(StateRecord {
                 key: key.clone(),
                 value: Value::try_from(Bytes::from(decoded.payload))?,
-                version: VersionToken::try_from(Bytes::copy_from_slice(&decoded.transaction_id))?,
+                version: VersionToken::try_from(Bytes::copy_from_slice(&decoded.attempt_tag))?,
             })
         })
         .transpose()
@@ -462,12 +433,19 @@ fn replay_visible_record<'a>(
     state
 }
 
+/// Re-checks every staged precondition against the state its own predecessors
+/// would have produced.
+///
+/// A transaction may touch one key repeatedly, so a precondition has to be
+/// judged against the value the earlier mutations in *this* transaction left,
+/// not against the base snapshot. There is no longer a change list to derive:
+/// the feed that consumed it is gone, so this only answers whether the ordered
+/// replay is admissible.
 fn replay_for_commit(
     mutations: &[(Key, Mutation)],
     base: &BTreeMap<Key, Option<StateRecord>>,
-) -> Result<BTreeSet<Key>, StateStoreError> {
+) -> Result<(), StateStoreError> {
     let mut state = base.clone();
-    let mut changed = BTreeSet::new();
     for (key, mutation) in mutations {
         let current = state.get(key).cloned().flatten();
         if !precondition_matches(mutation.precondition(), current.as_ref()) {
@@ -488,16 +466,9 @@ fn replay_for_commit(
             }),
             Mutation::Delete { .. } => None,
         };
-        if logical_value(&current) != logical_value(&next) {
-            changed.insert(key.clone());
-        }
         state.insert(key.clone(), next);
     }
-    Ok(changed)
-}
-
-fn logical_value(record: &Option<StateRecord>) -> Option<&[u8]> {
-    record.as_ref().map(|record| record.value.as_bytes())
+    Ok(())
 }
 
 fn precondition_matches(precondition: &Precondition, current: Option<&StateRecord>) -> bool {
@@ -511,10 +482,17 @@ fn precondition_matches(precondition: &Precondition, current: Option<&StateRecor
     }
 }
 
-fn provisional_version(transaction_id: TransactionId, operation: u64) -> VersionToken {
+/// Names a value that exists only inside one uncommitted transaction.
+///
+/// It is tagged so it can never be confused with a persisted version, which is
+/// the attempt tag alone; a caller that stored one and presented it later would
+/// be presenting a version this keyspace never published.
+fn provisional_version(attempt: AttemptId, operation: u64) -> VersionToken {
     let bytes = [
         PROVISIONAL_VERSION_TAG,
-        transaction_id.as_uuid().as_bytes(),
+        attempt.scope().to_string().as_bytes(),
+        b"\0",
+        &attempt.sequence().to_be_bytes(),
         &operation.to_be_bytes(),
     ]
     .concat();
@@ -576,31 +554,31 @@ fn ensure_active(deadline: Instant) -> Result<(), StateStoreError> {
 }
 
 fn record_result<T>(
-    metrics: &StateStoreMetrics,
-    operation: StateStoreOperation,
+    metrics: &ProviderMetrics,
+    operation: ProviderOperation,
     started: StdInstant,
     result: &Result<T, StateStoreError>,
 ) {
     metrics.record_operation(
         operation,
         if result.is_ok() {
-            StateStoreOutcome::Success
+            ProviderOutcome::Success
         } else {
-            StateStoreOutcome::Error
+            ProviderOutcome::Error
         },
         started.elapsed(),
     );
 }
 
-fn record_commit(metrics: &StateStoreMetrics, started: StdInstant, outcome: &CommitOutcome) {
+fn record_commit(metrics: &ProviderMetrics, started: StdInstant, outcome: &CommitOutcome) {
     let metric = match outcome {
-        CommitOutcome::Committed(_) => StateStoreOutcome::Success,
-        CommitOutcome::Conflict(_) => StateStoreOutcome::Conflict,
-        CommitOutcome::TransientBeforeCommit(_) => StateStoreOutcome::TransientBeforeCommit,
-        CommitOutcome::DefiniteFailure(_) => StateStoreOutcome::DefiniteFailure,
-        CommitOutcome::CommitUnknown(_) => StateStoreOutcome::CommitUnknown,
+        CommitOutcome::Committed(_) => ProviderOutcome::Success,
+        CommitOutcome::Conflict(_) => ProviderOutcome::Conflict,
+        CommitOutcome::TransientBeforeCommit(_) => ProviderOutcome::TransientBeforeCommit,
+        CommitOutcome::DefiniteFailure(_) => ProviderOutcome::DefiniteFailure,
+        CommitOutcome::CommitUnknown(_) => ProviderOutcome::CommitUnknown,
     };
-    metrics.record_operation(StateStoreOperation::Commit, metric, started.elapsed());
+    metrics.record_operation(ProviderOperation::Commit, metric, started.elapsed());
 }
 
 fn writes_frozen() -> StateStoreError {
@@ -633,14 +611,14 @@ impl ReadTransaction for FoundationDbReadTransaction {
     async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
         let started = StdInstant::now();
         let result = self.get_inner(key).await;
-        record_result(&self.metrics, StateStoreOperation::Get, started, &result);
+        record_result(&self.metrics, ProviderOperation::Get, started, &result);
         result
     }
 
     async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
         let started = StdInstant::now();
         let result = self.range_inner(request).await;
-        record_result(&self.metrics, StateStoreOperation::Range, started, &result);
+        record_result(&self.metrics, ProviderOperation::Range, started, &result);
         if let Ok(page) = &result {
             self.metrics.record_page_records(page.records.len() as u64);
         }
@@ -658,14 +636,14 @@ impl ReadTransaction for FoundationDbWriteTransaction {
     async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
         let started = StdInstant::now();
         let result = self.get_inner(key).await;
-        record_result(&self.metrics, StateStoreOperation::Get, started, &result);
+        record_result(&self.metrics, ProviderOperation::Get, started, &result);
         result
     }
 
     async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
         let started = StdInstant::now();
         let result = self.range_inner(request).await;
-        record_result(&self.metrics, StateStoreOperation::Range, started, &result);
+        record_result(&self.metrics, ProviderOperation::Range, started, &result);
         if let Ok(page) = &result {
             self.metrics.record_page_records(page.records.len() as u64);
         }
@@ -673,15 +651,21 @@ impl ReadTransaction for FoundationDbWriteTransaction {
     }
 
     async fn abort(mut self: Box<Self>) -> Result<(), StateStoreError> {
-        self.transaction.take().ok_or_else(transaction_finished)?;
+        let finished = self.transaction.take().ok_or_else(transaction_finished);
+        // An abort stages nothing and dispatches nothing, so the attempt is
+        // closed as provably effect-free rather than left to be decided from
+        // evidence there is none of. Simply dropping it would say the same
+        // thing, but saying it here is what makes the intent checkable.
+        close_undispatched(&self.attempt);
+        finished?;
         Ok(())
     }
 }
 
 #[async_trait]
 impl WriteTransaction for FoundationDbWriteTransaction {
-    fn transaction_id(&self) -> &TransactionId {
-        &self.transaction_id
+    fn attempt(&self) -> AttemptId {
+        self.attempt.id()
     }
 
     async fn put(
@@ -692,7 +676,7 @@ impl WriteTransaction for FoundationDbWriteTransaction {
     ) -> Result<(), StateStoreError> {
         let started = StdInstant::now();
         let result = self.put_inner(key, value, precondition);
-        record_result(&self.metrics, StateStoreOperation::Put, started, &result);
+        record_result(&self.metrics, ProviderOperation::Put, started, &result);
         if let Ok(bytes) = result {
             self.metrics
                 .record_bytes_written(u64::try_from(bytes).unwrap_or(u64::MAX));
@@ -709,7 +693,7 @@ impl WriteTransaction for FoundationDbWriteTransaction {
     ) -> Result<(), StateStoreError> {
         let started = StdInstant::now();
         let result = self.delete_inner(key, precondition);
-        record_result(&self.metrics, StateStoreOperation::Delete, started, &result);
+        record_result(&self.metrics, ProviderOperation::Delete, started, &result);
         if let Ok(bytes) = result {
             self.metrics
                 .record_bytes_written(u64::try_from(bytes).unwrap_or(u64::MAX));
@@ -724,10 +708,8 @@ impl WriteTransaction for FoundationDbWriteTransaction {
         let started = StdInstant::now();
         match (*self).prepare_commit().await {
             CommitPreparation::Ready(prepared) => supervise_commit(prepared, started).await,
-            CommitPreparation::DurableFailure(prepared, outcome) => {
-                supervise_pre_dispatch_failure(prepared, outcome, started).await
-            }
-            CommitPreparation::Immediate(outcome) => {
+            CommitPreparation::UndispatchedFailure(attempt, outcome) => {
+                close_undispatched(&attempt);
                 record_commit(&metrics, started, &outcome);
                 outcome
             }
@@ -735,9 +717,28 @@ impl WriteTransaction for FoundationDbWriteTransaction {
     }
 }
 
+/// Records that an attempt never reached storage.
+///
+/// The attempt would answer the same way on being dropped while reserved, so a
+/// failure here is a diagnostic rather than a correctness problem -- but it does
+/// mean the provider's own state machine disagrees with the supervisor's, which
+/// is worth a log line.
+fn close_undispatched(attempt: &WriteAttempt) {
+    if let Err(error) = attempt.cancel_before_dispatch() {
+        tracing::warn!(
+            provider = "foundationdb",
+            attempt = %attempt.id(),
+            error_kind = ?error.kind(),
+            "FoundationDB could not close an undispatched write attempt"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::ATTEMPT_TAG_BYTES;
+    use crate::codec::tests_support::attempt_id;
 
     fn key(value: &'static [u8]) -> Key {
         Key::try_from(Bytes::from_static(value)).expect("key")
@@ -750,57 +751,74 @@ mod tests {
     fn put(
         value: &'static [u8],
         precondition: Precondition,
-        transaction_id: TransactionId,
+        attempt: AttemptId,
         operation: u64,
     ) -> Mutation {
         Mutation::Put {
             value: self::value(value),
             precondition,
-            provisional_version: provisional_version(transaction_id, operation),
+            provisional_version: provisional_version(attempt, operation),
         }
     }
 
     #[test]
-    fn provisional_versions_are_operation_specific_and_wire_exact() {
-        let id = TransactionId::from(uuid::Uuid::from_bytes([0x5a; 16]));
-        let first = provisional_version(id, 1);
-        let second = provisional_version(id, 2);
+    fn provisional_versions_are_operation_specific_and_never_a_persisted_version() {
+        let attempt = attempt_id(1);
+        let first = provisional_version(attempt, 1);
+        let second = provisional_version(attempt, 2);
         assert_ne!(first, second);
+        assert!(first.as_bytes().starts_with(PROVISIONAL_VERSION_TAG));
+        // A persisted version is the bare attempt tag, so the two encodings can
+        // never be mistaken for one another.
         assert_eq!(
             first.as_bytes(),
-            [PROVISIONAL_VERSION_TAG, &[0x5a; 16], &1_u64.to_be_bytes()].concat()
+            [
+                PROVISIONAL_VERSION_TAG,
+                attempt.scope().to_string().as_bytes(),
+                b"\0",
+                &attempt.sequence().to_be_bytes(),
+                &1_u64.to_be_bytes(),
+            ]
+            .concat()
+        );
+        assert_ne!(first.as_bytes().len(), ATTEMPT_TAG_BYTES);
+    }
+
+    #[test]
+    fn two_attempts_never_share_a_provisional_version() {
+        assert_ne!(
+            provisional_version(attempt_id(1), 1),
+            provisional_version(attempt_id(1), 1),
+            "two instances at the same sequence are still two attempts"
         );
     }
 
     #[test]
     fn ordered_replay_preserves_intermediate_preconditions() {
-        let id = TransactionId::from(uuid::Uuid::from_bytes([0x11; 16]));
+        let attempt = attempt_id(1);
         let item = key(b"item");
-        let first = provisional_version(id, 1);
+        let first = provisional_version(attempt, 1);
         let mutations = vec![
-            (item.clone(), put(b"v1", Precondition::Absent, id, 1)),
+            (item.clone(), put(b"v1", Precondition::Absent, attempt, 1)),
             (
                 item.clone(),
                 Mutation::Delete {
                     precondition: Precondition::Version(first),
                 },
             ),
-            (item.clone(), put(b"v2", Precondition::Absent, id, 3)),
+            (item.clone(), put(b"v2", Precondition::Absent, attempt, 3)),
         ];
-        let base = BTreeMap::from([(item.clone(), None)]);
-        assert_eq!(
-            replay_for_commit(&mutations, &base).expect("ordered replay"),
-            BTreeSet::from([item])
-        );
+        let base = BTreeMap::from([(item, None)]);
+        replay_for_commit(&mutations, &base).expect("ordered replay");
     }
 
     #[test]
     fn ordered_replay_rejects_a_hidden_stale_precondition() {
-        let id = TransactionId::from(uuid::Uuid::from_bytes([0x22; 16]));
+        let attempt = attempt_id(1);
         let item = key(b"item");
         let mutations = vec![
-            (item.clone(), put(b"v1", Precondition::Any, id, 1)),
-            (item.clone(), put(b"v2", Precondition::Absent, id, 2)),
+            (item.clone(), put(b"v1", Precondition::Any, attempt, 1)),
+            (item.clone(), put(b"v2", Precondition::Absent, attempt, 2)),
         ];
         let base = BTreeMap::from([(item, None)]);
         assert_eq!(
@@ -837,7 +855,10 @@ mod tests {
     }
 
     #[test]
-    fn prepare_errors_require_an_authoritative_durable_state_fallback() {
+    fn no_preparation_failure_is_ever_classified_as_ambiguous() {
+        // Preparation happens strictly before the native commit, so the write
+        // provably did not land. Reporting `CommitUnknown` here would put an
+        // attempt in doubt that this provider can prove nothing was done for.
         for kind in [
             StateStoreErrorKind::Corruption,
             StateStoreErrorKind::InvalidRequest,
@@ -847,14 +868,10 @@ mod tests {
             StateStoreErrorKind::DeadlineExceeded,
             StateStoreErrorKind::LimitExceeded,
         ] {
-            let outcome = decide_prepare_error(StateStoreError::new(kind, "prepare error"));
-            assert_eq!(
-                matches!(outcome, CommitOutcome::TransientBeforeCommit(_)),
-                matches!(
-                    kind,
-                    StateStoreErrorKind::Transient | StateStoreErrorKind::ProviderUnavailable
-                ),
-                "unexpected local classification for {kind:?}"
+            let outcome = classify_precommit_error(StateStoreError::new(kind, "prepare error"));
+            assert!(
+                !matches!(outcome, CommitOutcome::CommitUnknown(_)),
+                "an undispatched failure is never ambiguous, but {kind:?} was"
             );
         }
     }

@@ -39,7 +39,7 @@ fn helper_protocol_accepts_only_the_frozen_command_set_and_hex_payloads() {
     assert!(matches!(open, helper::Command::Open { .. }));
 
     let put = helper::parse_command(
-        r#"{"command":"Put","transaction_id":"00000000-0000-4000-8000-000000000002","key":"00ff","value":"ff00","precondition":"Any"}"#,
+        r#"{"command":"Put","handle":"00000000-0000-4000-8000-000000000002","key":"00ff","value":"ff00","precondition":"Any"}"#,
     )
     .expect("parse binary Put");
     assert!(matches!(
@@ -60,21 +60,21 @@ fn helper_protocol_accepts_only_the_frozen_command_set_and_hex_payloads() {
     }
     assert!(
         helper::parse_command(
-            r#"{"command":"Put","transaction_id":"00000000-0000-4000-8000-000000000002","key":"not-hex","value":"00","precondition":"Any"}"#,
+            r#"{"command":"Put","handle":"00000000-0000-4000-8000-000000000002","key":"not-hex","value":"00","precondition":"Any"}"#,
         )
         .is_err(),
         "helper protocol must reject non-hex payloads"
     );
     assert!(
         helper::parse_command(
-            r#"{"command":"Get","transaction_id":"00000000-0000-4000-8000-000000000002","key":"00","unexpected":true}"#,
+            r#"{"command":"Get","handle":"00000000-0000-4000-8000-000000000002","key":"00","unexpected":true}"#,
         )
         .is_err(),
         "helper protocol must reject unknown fields"
     );
     assert!(
         helper::parse_command(
-            r#"{"command":"Put","transaction_id":"00000000-0000-4000-8000-000000000002","key":"00","value":"01","precondition":{"version":"00","unexpected":true}}"#,
+            r#"{"command":"Put","handle":"00000000-0000-4000-8000-000000000002","key":"00","value":"01","precondition":{"version":"00","unexpected":true}}"#,
         )
         .is_err(),
         "helper protocol must reject unknown nested precondition fields"
@@ -197,7 +197,12 @@ impl Drop for HelperProcess {
     }
 }
 
-fn transaction() -> Uuid {
+/// Mints a helper-local name for one write.
+///
+/// It is not a store identity and cannot be: an attempt is issued by the
+/// opened instance, so this only tells one helper which of its own
+/// transactions a command is about.
+fn handle() -> Uuid {
     Uuid::now_v7()
 }
 
@@ -231,25 +236,19 @@ fn helper_open_failure_shuts_down_runtime_and_exits_deterministically() {
     );
 }
 
-fn begin(helper: &mut HelperProcess, transaction_id: Uuid, description: &str) {
+fn begin(helper: &mut HelperProcess, handle: Uuid, description: &str) {
     let response = helper.request(json!({
         "command": "Begin",
-        "transaction_id": transaction_id,
+        "handle": handle,
         "description": description,
     }));
     assert_eq!(response.event, "Begun");
 }
 
-fn put(
-    helper: &mut HelperProcess,
-    transaction_id: Uuid,
-    key: &[u8],
-    value: &[u8],
-    precondition: &str,
-) {
+fn put(helper: &mut HelperProcess, handle: Uuid, key: &[u8], value: &[u8], precondition: &str) {
     let response = helper.request(json!({
         "command": "Put",
-        "transaction_id": transaction_id,
+        "handle": handle,
         "key": hex::encode(key),
         "value": hex::encode(value),
         "precondition": precondition,
@@ -257,10 +256,10 @@ fn put(
     assert_eq!(response.event, "Staged");
 }
 
-fn commit(helper: &mut HelperProcess, transaction_id: Uuid) -> helper::Response {
+fn commit(helper: &mut HelperProcess, handle: Uuid) -> helper::Response {
     helper.request(json!({
         "command": "Commit",
-        "transaction_id": transaction_id,
+        "handle": handle,
     }))
 }
 
@@ -269,11 +268,24 @@ fn assert_outcome(response: &helper::Response, expected: &str) {
     assert_eq!(response.outcome.as_deref(), Some(expected));
 }
 
-fn resolve(helper: &mut HelperProcess, transaction_id: Uuid) -> helper::Response {
+fn resolve(helper: &mut HelperProcess, handle: Uuid) -> helper::Response {
     helper.request(json!({
         "command": "Resolve",
-        "transaction_id": transaction_id,
+        "handle": handle,
     }))
+}
+
+/// Asks a helper about a write it did not make.
+///
+/// This has to fail rather than answer: attempt identity is issued by one open
+/// instance and is not constructible from bytes, so there is no request a peer
+/// could send that would name another process's write.
+fn resolve_unchecked(helper: &mut HelperProcess, handle: Uuid) -> helper::Response {
+    helper.send(json!({
+        "command": "Resolve",
+        "handle": handle,
+    }));
+    helper.receive_unchecked()
 }
 
 #[test]
@@ -301,35 +313,29 @@ fn foundationdb_cross_process_suite() {
         "helpers must be separate execs"
     );
 
-    let seed_id = transaction();
+    let seed_id = handle();
     begin(&mut left, seed_id, "seed same-key conflict");
     put(&mut left, seed_id, b"same-key", b"seed", "Any");
     assert_outcome(&commit(&mut left, seed_id), "Committed");
 
-    let same_left = transaction();
-    let same_right = transaction();
+    let same_left = handle();
+    let same_right = handle();
     begin(&mut left, same_left, "same-key left");
     begin(&mut right, same_right, "same-key right");
-    for (helper, transaction_id) in [(&mut left, same_left), (&mut right, same_right)] {
+    for (helper, handle) in [(&mut left, same_left), (&mut right, same_right)] {
         let response = helper.request(json!({
             "command": "Get",
-            "transaction_id": transaction_id,
+            "handle": handle,
             "key": hex::encode(b"same-key"),
         }));
         assert_eq!(
             response.record.expect("same-key seed").value,
             hex::encode(b"seed")
         );
-        put(
-            helper,
-            transaction_id,
-            b"same-key",
-            transaction_id.as_bytes(),
-            "Present",
-        );
+        put(helper, handle, b"same-key", handle.as_bytes(), "Present");
     }
-    left.send(json!({"command": "Commit", "transaction_id": same_left}));
-    right.send(json!({"command": "Commit", "transaction_id": same_right}));
+    left.send(json!({"command": "Commit", "handle": same_left}));
+    right.send(json!({"command": "Commit", "handle": same_right}));
     let same_outcomes = [
         left.receive().outcome.expect("left same-key outcome"),
         right.receive().outcome.expect("right same-key outcome"),
@@ -351,8 +357,8 @@ fn foundationdb_cross_process_suite() {
         "same-key commits must have exactly one conflict: {same_outcomes:?}"
     );
 
-    let disjoint_left = transaction();
-    let disjoint_right = transaction();
+    let disjoint_left = handle();
+    let disjoint_right = handle();
     begin(&mut left, disjoint_left, "disjoint left");
     begin(&mut right, disjoint_right, "disjoint right");
     put(&mut left, disjoint_left, b"disjoint-left", b"left", "Any");
@@ -363,23 +369,23 @@ fn foundationdb_cross_process_suite() {
         b"right",
         "Any",
     );
-    left.send(json!({"command": "Commit", "transaction_id": disjoint_left}));
-    right.send(json!({"command": "Commit", "transaction_id": disjoint_right}));
+    left.send(json!({"command": "Commit", "handle": disjoint_left}));
+    right.send(json!({"command": "Commit", "handle": disjoint_right}));
     assert_outcome(&left.receive(), "Committed");
     assert_outcome(&right.receive(), "Committed");
 
-    let phantom_reader = transaction();
+    let phantom_reader = handle();
     begin(&mut left, phantom_reader, "range phantom reader");
     let page = left.request(json!({
         "command": "Range",
-        "transaction_id": phantom_reader,
+        "handle": phantom_reader,
         "start": hex::encode(b"phantom/"),
         "end": hex::encode(b"phantom0"),
         "direction": "Forward",
         "page_size": 10,
     }));
     assert!(page.records.is_empty(), "phantom range must start empty");
-    let phantom_writer = transaction();
+    let phantom_writer = handle();
     begin(&mut right, phantom_writer, "range phantom writer");
     put(
         &mut right,
@@ -398,43 +404,55 @@ fn foundationdb_cross_process_suite() {
     );
     assert_outcome(&commit(&mut left, phantom_reader), "Conflict");
 
-    let committed_resolution = resolve(&mut right, disjoint_left);
+    // The process that made the write is the one that can answer for it.
     assert_eq!(
-        committed_resolution.resolution.as_deref(),
+        resolve(&mut left, disjoint_left).resolution.as_deref(),
         Some("Committed")
     );
-
-    let pending_id = transaction();
-    begin(&mut left, pending_id, "held cross-process resolution");
-    put(
-        &mut left,
-        pending_id,
-        b"pending-key",
-        b"pending-value",
-        "Any",
+    // Its peer cannot, and says so rather than inventing a denial. An attempt
+    // belongs to the instance that issued it; a foreign name is not a question
+    // this store is able to answer.
+    let foreign = resolve_unchecked(&mut right, disjoint_left);
+    assert!(
+        !foreign.ok,
+        "a peer's write must not be resolvable here: {foreign:?}"
     );
+    assert_ne!(
+        foreign.resolution.as_deref(),
+        Some("NotCommitted"),
+        "not knowing about a write is not proof that it did not happen"
+    );
+
+    let pending = handle();
+    begin(&mut left, pending, "held commit resolution");
+    put(&mut left, pending, b"pending-key", b"pending-value", "Any");
     let held = left.request(json!({
         "command": "Commit",
-        "transaction_id": pending_id,
+        "handle": pending,
         "hold_pre_native": true,
     }));
     assert_eq!(held.event, "CommitHeld");
-    let pending_resolution = resolve(&mut right, pending_id);
-    assert_eq!(pending_resolution.resolution.as_deref(), Some("Pending"));
+    // Held means dispatched-but-undecided. The honest answer is that nothing is
+    // known yet, and losing the caller would not change that.
+    assert_eq!(
+        resolve(&mut left, pending).resolution.as_deref(),
+        Some("Unresolved")
+    );
     let released = left.request(json!({
         "command": "Release",
-        "transaction_id": pending_id,
+        "handle": pending,
     }));
     assert_outcome(&released, "Committed");
     assert_eq!(
-        resolve(&mut right, pending_id).resolution.as_deref(),
+        resolve(&mut left, pending).resolution.as_deref(),
         Some("Committed")
     );
 
-    let absent_id = transaction();
-    assert_eq!(
-        resolve(&mut right, absent_id).resolution.as_deref(),
-        Some("NotCommitted")
+    // A name nobody ever issued is unanswerable, not a denial.
+    let never_issued = resolve_unchecked(&mut right, handle());
+    assert!(
+        !never_issued.ok,
+        "an unissued name must not resolve: {never_issued:?}"
     );
 
     left.shutdown();

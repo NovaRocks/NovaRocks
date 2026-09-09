@@ -237,6 +237,8 @@ impl DurableRecordStore {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_state_store_testkit::testing::InMemoryStateStore;
+
     use super::*;
 
     #[derive(Serialize)]
@@ -250,75 +252,18 @@ mod tests {
         const ENCODED_LIMIT: usize = 20;
     }
 
+    /// Builds the encoder against the shared in-memory reference store.
+    ///
+    /// It goes through `DurableRecordStore::new` on purpose, so the budget the
+    /// encoder enforces is the one a real `StateStore` reports. The hand-written
+    /// stub this replaces implemented the whole trait for a helper that only
+    /// ever called `limits()`, which meant every contract change had to be
+    /// mirrored here for no coverage in return.
     fn store(limits: StateStoreLimits) -> DurableRecordStore {
-        struct TestStore(StateStoreLimits);
-
-        #[async_trait::async_trait]
-        impl StateStore for TestStore {
-            fn limits(&self) -> &StateStoreLimits {
-                &self.0
-            }
-
-            fn metrics_snapshot(&self) -> novarocks_state_store_api::StateStoreMetricsSnapshot {
-                novarocks_state_store_api::StateStoreMetricsSnapshot {
-                    provider: novarocks_state_store_api::StateStoreProviderId::new("durable-test"),
-                    begin_count: 0,
-                    get_count: 0,
-                    range_count: 0,
-                    put_count: 0,
-                    delete_count: 0,
-                    commit_count: 0,
-                    operation_outcomes: [[0; 6]; 6],
-                    operation_duration_micros: [0; 6],
-                    operation_duration_observations: [0; 6],
-                    retry_count: 0,
-                    deadline_count: 0,
-                    blocking_failure_count: 0,
-                    bytes_read: 0,
-                    bytes_written: 0,
-                    page_records: 0,
-                    notification_lag_micros: 0,
-                    notification_lag_observations: 0,
-                }
-            }
-
-            async fn begin_read(
-                &self,
-            ) -> Result<Box<dyn novarocks_state_store_api::ReadTransaction>, StateStoreError>
-            {
-                unreachable!("encoding tests do not read")
-            }
-
-            async fn begin_write(
-                &self,
-                _: novarocks_state_store_api::TransactionId,
-                _: &str,
-            ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-                unreachable!("encoding tests do not write")
-            }
-
-            async fn poll_changes(
-                &self,
-                _: &novarocks_state_store_api::ChangePollRequest,
-            ) -> Result<novarocks_state_store_api::ChangePage, StateStoreError> {
-                unreachable!("encoding tests do not poll")
-            }
-
-            async fn identity(
-                &self,
-            ) -> Result<novarocks_state_store_api::StoreIdentity, StateStoreError> {
-                unreachable!("encoding tests do not inspect identity")
-            }
-
-            async fn resolve_commit(
-                &self,
-                _: &novarocks_state_store_api::TransactionId,
-            ) -> Result<novarocks_state_store_api::CommitResolution, StateStoreError> {
-                unreachable!("encoding tests do not resolve commits")
-            }
-        }
-
-        DurableRecordStore::new(Arc::new(TestStore(limits)))
+        DurableRecordStore::new(Arc::new(InMemoryStateStore::with_limits(
+            "frontend-durable-record",
+            limits,
+        )))
     }
 
     #[test]

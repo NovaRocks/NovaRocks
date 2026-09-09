@@ -59,7 +59,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{CatalogApplicationError, CatalogApplicationErrorKind};
-use crate::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
+use crate::catalog_attachment::{
+    CatalogAttachment, CatalogAttachmentRepository, CatalogAttachmentWakeupSignal,
+};
 use crate::state_family::StateFamily;
 
 /// Domain separator for the snapshot identity digest.
@@ -715,6 +717,24 @@ impl CatalogDesiredStateSource {
     /// Whether SQL may write catalog desired state through this source.
     pub const fn sql_mutation_admission(&self) -> CatalogSqlMutationAdmission {
         self.mode.sql_mutation_admission()
+    }
+
+    /// A signal that fires when this process writes desired state, when the
+    /// source is one this process can write at all.
+    ///
+    /// `None` is not a degraded case: an immutable file source and an
+    /// unimplemented mode have no writes of ours to announce, so there is
+    /// nothing for a consumer to wait on and its periodic sweep is the whole
+    /// story. A consumer that treats `None` as a fault would be inventing a
+    /// dependency the source does not have.
+    pub(crate) fn attachment_wakeup_signal(&self) -> Option<CatalogAttachmentWakeupSignal> {
+        match &self.authority {
+            CatalogDesiredStateAuthority::DynamicStateStore(attachments) => {
+                Some(attachments.wakeup_signal())
+            }
+            CatalogDesiredStateAuthority::StaticFile(_)
+            | CatalogDesiredStateAuthority::Unimplemented => None,
+        }
     }
 
     /// The complete set of catalogs this source currently declares.

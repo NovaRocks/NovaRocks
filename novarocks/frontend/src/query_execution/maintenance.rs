@@ -586,13 +586,14 @@ pub trait TableMaintenanceEngine: Send + Sync {
     }
 }
 
+#[async_trait::async_trait]
 pub trait TableMaintenanceService: Send + Sync {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String>;
 
     /// Executes one already-lowered maintenance write statement. The parser
     /// owner has consumed SQL syntax before this boundary, so implementations
     /// must not reparse or probe raw source text.
-    fn handle_typed_statement(
+    async fn handle_typed_statement(
         &self,
         _engine: &dyn TableMaintenanceEngine,
         _statement: crate::table_maintenance::ParsedMaintenanceStatement,
@@ -616,20 +617,20 @@ pub trait TableMaintenanceService: Send + Sync {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
-    fn execute_automatic_action(
+    async fn execute_automatic_action(
         &self,
         engine: &dyn TableMaintenanceEngine,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String>;
 
-    fn execute_automatic_action_with_context(
+    async fn execute_automatic_action_with_context(
         &self,
         engine: &dyn TableMaintenanceEngine,
         request: MaintenanceActionRequest,
         context: &AutomaticMaintenanceContext,
     ) -> Result<MaintenanceActionOutcome, String> {
         context.ensure_active()?;
-        self.execute_automatic_action(engine, request)
+        self.execute_automatic_action(engine, request).await
     }
 
     fn submit_automatic_optimize(

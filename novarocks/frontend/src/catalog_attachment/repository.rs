@@ -19,8 +19,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::state_store::metrics::StateStoreMetrics;
-use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
+use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
+use crate::state_store::{RunFailure, StateStoreRunPolicy, run_side_effect_free};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
@@ -28,7 +28,7 @@ use novarocks_spi::connector::{
     canonicalize_catalog_credential_bindings,
 };
 use novarocks_state_store_api::{
-    CommitResolution, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
+    AttemptOutcome, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreError, StateStoreErrorKind, VersionToken,
 };
 use uuid::Uuid;
@@ -40,8 +40,19 @@ use super::codec::{
     StoredProperty, decode, encode,
 };
 use super::key::{attachment_key, attachment_prefix};
+use super::wakeup::{CatalogAttachmentWakeup, CatalogAttachmentWakeupSignal};
 
 const DEFAULT_ATTACHMENT_SCAN_PAGE_SIZE: usize = 256;
+
+/// How many times one logical create/drop may be replayed after the store
+/// proved the previous attempt did not commit.
+///
+/// A proven `NotCommitted` licenses a replay, and each replay is new work
+/// under a new attempt identity. The bound exists only so a store that keeps
+/// losing commit responses ends in a reported failure rather than an unbounded
+/// loop; it is not a retry policy, which belongs to
+/// [`StateStoreRunPolicy`] and is applied inside each attempt.
+const MAX_PROVEN_UNCOMMITTED_REPLAYS: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogAttachment {
@@ -104,19 +115,47 @@ pub struct CatalogAttachmentRepository {
     store: Arc<dyn StateStore>,
     durable: DurableRecordStore,
     metrics: Arc<StateStoreMetrics>,
+    policy: StateStoreRunPolicy,
+    /// Wakeups for this repository instance's own committed writes. Shared by
+    /// every clone, so the port that writes and the controller that reads see
+    /// one channel.
+    wakeup: Arc<CatalogAttachmentWakeup>,
 }
 
 impl CatalogAttachmentRepository {
-    pub async fn open(store: Arc<dyn StateStore>) -> Result<Self, CatalogAttachmentError> {
+    pub async fn open(
+        store: Arc<dyn StateStore>,
+        policy: StateStoreRunPolicy,
+    ) -> Result<Self, CatalogAttachmentError> {
         let repository = Self {
             durable: DurableRecordStore::new(Arc::clone(&store)),
+            // A business owner, not the storage provider. This consumer used to
+            // invent a `frontend-catalog` provider identity so it had something
+            // to label counters with, which attributed catalog retries to a
+            // provider that does not exist.
             metrics: Arc::new(StateStoreMetrics::new(
-                novarocks_state_store_api::StateStoreProviderId::new("frontend-catalog"),
+                StateStoreConsumer::CATALOG_ATTACHMENT,
             )),
             store,
+            policy,
+            wakeup: Arc::new(CatalogAttachmentWakeup::new()),
         };
         repository.list().await?;
         Ok(repository)
+    }
+
+    /// Subscribes to committed-write wakeups from this repository instance.
+    ///
+    /// Deliberately lossy: it reports only writes made through *this*
+    /// instance, so a consumer must own a periodic sweep and must never treat
+    /// the absence of a wakeup as the absence of a write.
+    pub fn wakeup_signal(&self) -> CatalogAttachmentWakeupSignal {
+        self.wakeup.subscribe()
+    }
+
+    /// Wakeups this instance has published. Observability and tests only.
+    pub fn published_wakeups(&self) -> u64 {
+        self.wakeup.published()
     }
 
     pub async fn get(
@@ -187,21 +226,185 @@ impl CatalogAttachmentRepository {
         Ok(attachments)
     }
 
+    /// Creates one attachment under an absent-precondition CAS.
+    ///
+    /// # Losing sight of the commit
+    ///
+    /// A lost commit response is answered by asking the attempt that was in
+    /// flight, through the commit observation the failure carries. There is
+    /// no reconstructed identity and no "replay under the same id": the
+    /// attempt is addressed directly, and a replay is new work under a new
+    /// attempt, which is the only reading of `NotCommitted` that is honest —
+    /// the previous attempt is proven never to commit, so nothing about it is
+    /// worth resuming.
     pub async fn create(
         &self,
         attachment: CatalogAttachment,
     ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
         validate_attachment(&attachment)?;
-        let operation_id = OperationId::new_v7();
-        self.create_with_operation(operation_id, attachment).await
+        let key = attachment_key(&attachment.instance_id).map_err(invalid)?;
+        let value = encode(&self.durable, &stored_from(&attachment)).map_err(durable_record)?;
+        let mut replays = 0_usize;
+        loop {
+            let outcome = run_side_effect_free(
+                self.store.as_ref(),
+                self.metrics.as_ref(),
+                self.policy,
+                "create catalog attachment",
+                |transaction| {
+                    let key = key.clone();
+                    let value = value.clone();
+                    let durable = self.durable.clone();
+                    Box::pin(async move {
+                        durable
+                            .put_record(transaction, key, value, Precondition::Absent)
+                            .await?;
+                        Ok(())
+                    })
+                },
+            )
+            .await;
+            let unresolved = match outcome {
+                Ok(_) => return self.committed_create(&attachment).await,
+                Err(RunFailure::Operation(error) | RunFailure::RetryExhausted(error))
+                    if error.kind() == StateStoreErrorKind::PreconditionFailed =>
+                {
+                    return Err(CatalogAttachmentError::new(
+                        CatalogAttachmentErrorKind::AlreadyExists,
+                        "catalog attachment already exists",
+                    ));
+                }
+                Err(RunFailure::CommitUnknown { observation, error }) => {
+                    match observation.outcome().await.map_err(store)? {
+                        AttemptOutcome::Committed(_) => {
+                            return self.committed_create(&attachment).await;
+                        }
+                        AttemptOutcome::NotCommitted => {
+                            if replays >= MAX_PROVEN_UNCOMMITTED_REPLAYS {
+                                return Err(CatalogAttachmentError::new(
+                                    // Proven not to have landed, so this is an
+                                    // availability answer, not an unknown one.
+                                    CatalogAttachmentErrorKind::Unavailable,
+                                    format!(
+                                        "create catalog attachment kept losing its commit \
+                                         response and is proven not to have committed: {error}"
+                                    ),
+                                ));
+                            }
+                            replays += 1;
+                            continue;
+                        }
+                        AttemptOutcome::Unresolved => error,
+                    }
+                }
+                Err(error) => return Err(run_failure("create catalog attachment", error)),
+            };
+            // Nothing can be proven about the attempt, so the authoritative
+            // record is the last word. Our exact identity being there means the
+            // write did land: nobody else could have minted it.
+            return match self.matching(&attachment).await? {
+                Some(found) => {
+                    self.wakeup.publish();
+                    Ok(found)
+                }
+                None => Err(CatalogAttachmentError::new(
+                    CatalogAttachmentErrorKind::CommitUnknown,
+                    format!("create catalog attachment commit outcome is unknown: {unresolved}"),
+                )),
+            };
+        }
     }
 
+    /// Deletes exactly the frozen attachment record, in a transaction that
+    /// touches the catalog attachment family and nothing else.
+    ///
+    /// The version precondition is the whole fence: it fails the delete if the
+    /// record changed — including a same-name drop/recreate — since the caller
+    /// read it. A lost commit response is not folded into that; it is resolved
+    /// through the in-flight attempt's own observation, exactly as `create`
+    /// resolves it.
     pub async fn drop_exact(
         &self,
         expected: CatalogAttachmentVersioned,
     ) -> Result<(), CatalogAttachmentError> {
-        let operation_id = OperationId::new_v7();
-        self.drop_with_operation(operation_id, expected).await
+        let key = attachment_key(&expected.attachment.instance_id).map_err(invalid)?;
+        let mut replays = 0_usize;
+        loop {
+            let outcome = run_side_effect_free(
+                self.store.as_ref(),
+                self.metrics.as_ref(),
+                self.policy,
+                "drop catalog attachment",
+                |transaction| {
+                    let key = key.clone();
+                    let version = expected.version.clone();
+                    Box::pin(async move {
+                        transaction
+                            .delete(key, Precondition::Version(version))
+                            .await?;
+                        Ok(())
+                    })
+                },
+            )
+            .await;
+            let unresolved = match outcome {
+                Ok(_) => {
+                    self.wakeup.publish();
+                    return Ok(());
+                }
+                Err(RunFailure::Operation(error) | RunFailure::RetryExhausted(error))
+                    if matches!(
+                        error.kind(),
+                        StateStoreErrorKind::PreconditionFailed | StateStoreErrorKind::Conflict
+                    ) =>
+                {
+                    return Err(CatalogAttachmentError::new(
+                        CatalogAttachmentErrorKind::Conflict,
+                        "catalog attachment changed before drop",
+                    ));
+                }
+                Err(RunFailure::CommitUnknown { observation, error }) => {
+                    match observation.outcome().await.map_err(store)? {
+                        AttemptOutcome::Committed(_) => {
+                            self.wakeup.publish();
+                            return Ok(());
+                        }
+                        AttemptOutcome::NotCommitted => {
+                            if replays >= MAX_PROVEN_UNCOMMITTED_REPLAYS {
+                                return Err(CatalogAttachmentError::new(
+                                    CatalogAttachmentErrorKind::Unavailable,
+                                    format!(
+                                        "drop catalog attachment kept losing its commit response \
+                                         and is proven not to have committed: {error}"
+                                    ),
+                                ));
+                            }
+                            replays += 1;
+                            continue;
+                        }
+                        AttemptOutcome::Unresolved => error,
+                    }
+                }
+                Err(error) => return Err(run_failure("drop catalog attachment", error)),
+            };
+            // Undecidable: fall back on the authoritative record. The exact
+            // identity still being present is the only reading under which the
+            // delete demonstrably did not happen.
+            return match self.get(&expected.attachment.instance_id).await? {
+                Some(current)
+                    if current.attachment.attachment_id == expected.attachment.attachment_id =>
+                {
+                    Err(CatalogAttachmentError::new(
+                        CatalogAttachmentErrorKind::CommitUnknown,
+                        format!("drop catalog attachment commit outcome is unknown: {unresolved}"),
+                    ))
+                }
+                _ => {
+                    self.wakeup.publish();
+                    Ok(())
+                }
+            };
+        }
     }
 
     /// Best-effort operational check: refuse the drop while the MV Accelerator
@@ -262,166 +465,20 @@ impl CatalogAttachmentRepository {
         }
     }
 
-    async fn create_with_operation(
-        &self,
-        operation_id: OperationId,
-        attachment: CatalogAttachment,
-    ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
-        let key = attachment_key(&attachment.instance_id).map_err(invalid)?;
-        let value = encode(&self.durable, &stored_from(&attachment)).map_err(durable_record)?;
-        let outcome = run_side_effect_free(
-            self.store.as_ref(),
-            self.metrics.as_ref(),
-            operation_id,
-            "create catalog attachment",
-            |transaction| {
-                let key = key.clone();
-                let value = value.clone();
-                let durable = self.durable.clone();
-                Box::pin(async move {
-                    durable
-                        .put_record(transaction, key, value, Precondition::Absent)
-                        .await?;
-                    Ok(())
-                })
-            },
-        )
-        .await;
-        match outcome {
-            Ok(_) => self.require_matching(&attachment).await,
-            Err(RunFailure::Operation(error))
-                if error.kind() == StateStoreErrorKind::PreconditionFailed =>
-            {
-                Err(CatalogAttachmentError::new(
-                    CatalogAttachmentErrorKind::AlreadyExists,
-                    "catalog attachment already exists",
-                ))
-            }
-            Err(RunFailure::RetryExhausted(error))
-                if error.kind() == StateStoreErrorKind::PreconditionFailed =>
-            {
-                Err(CatalogAttachmentError::new(
-                    CatalogAttachmentErrorKind::AlreadyExists,
-                    "catalog attachment already exists",
-                ))
-            }
-            Err(RunFailure::CommitUnknown {
-                transaction_id,
-                error,
-            }) => {
-                self.resolve_create_unknown(operation_id, transaction_id, attachment, error)
-                    .await
-            }
-            Err(error) => Err(run_failure("create catalog attachment", error)),
-        }
-    }
-
-    async fn resolve_create_unknown(
-        &self,
-        operation_id: OperationId,
-        transaction_id: novarocks_state_store_api::TransactionId,
-        attachment: CatalogAttachment,
-        original: StateStoreError,
-    ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
-        match self
-            .store
-            .resolve_commit(&transaction_id)
-            .await
-            .map_err(store)?
-        {
-            CommitResolution::Committed(_) => self.require_matching(&attachment).await,
-            CommitResolution::NotCommitted => {
-                Box::pin(self.create_with_operation(operation_id, attachment)).await
-            }
-            CommitResolution::Unresolved => match self.matching(&attachment).await? {
-                Some(found) => Ok(found),
-                None => Err(CatalogAttachmentError::new(
-                    CatalogAttachmentErrorKind::CommitUnknown,
-                    format!("create catalog attachment commit outcome is unknown: {original}"),
-                )),
-            },
-        }
-    }
-
-    /// Deletes exactly the frozen attachment record, in a transaction that
-    /// touches the catalog attachment family and nothing else.
+    /// Confirms a committed create against the authoritative record and wakes
+    /// the local reconciler.
     ///
-    /// The version precondition is the whole fence: it fails the delete if the
-    /// record changed — including a same-name drop/recreate — since the caller
-    /// read it. `CommitUnknown` is not folded into that: a lost commit response
-    /// leaves the outcome genuinely unknown, so it is resolved against the
-    /// store and only reported as unknown when the store cannot decide either.
-    async fn drop_with_operation(
+    /// The wakeup is published only here and on a committed drop, so it always
+    /// means "a write of ours landed". An attempt whose outcome is unknown
+    /// publishes nothing: a wakeup that turned out to mean "maybe" would train
+    /// the consumer to reconcile on non-events.
+    async fn committed_create(
         &self,
-        operation_id: OperationId,
-        expected: CatalogAttachmentVersioned,
-    ) -> Result<(), CatalogAttachmentError> {
-        let key = attachment_key(&expected.attachment.instance_id).map_err(invalid)?;
-        let version = expected.version.clone();
-        let outcome = run_side_effect_free(
-            self.store.as_ref(),
-            self.metrics.as_ref(),
-            operation_id,
-            "drop catalog attachment",
-            |transaction| {
-                let key = key.clone();
-                let version = version.clone();
-                Box::pin(async move {
-                    transaction
-                        .delete(key, Precondition::Version(version))
-                        .await?;
-                    Ok(())
-                })
-            },
-        )
-        .await;
-        match outcome {
-            Ok(_) => Ok(()),
-            Err(RunFailure::Operation(error) | RunFailure::RetryExhausted(error))
-                if matches!(
-                    error.kind(),
-                    StateStoreErrorKind::PreconditionFailed | StateStoreErrorKind::Conflict
-                ) =>
-            {
-                Err(CatalogAttachmentError::new(
-                    CatalogAttachmentErrorKind::Conflict,
-                    "catalog attachment changed before drop",
-                ))
-            }
-            Err(RunFailure::CommitUnknown {
-                transaction_id,
-                error,
-            }) => {
-                match self
-                    .store
-                    .resolve_commit(&transaction_id)
-                    .await
-                    .map_err(store)?
-                {
-                    CommitResolution::Committed(_) => Ok(()),
-                    CommitResolution::NotCommitted => {
-                        Box::pin(self.drop_with_operation(operation_id, expected)).await
-                    }
-                    CommitResolution::Unresolved => {
-                        match self.get(&expected.attachment.instance_id).await? {
-                            Some(current)
-                                if current.attachment.attachment_id
-                                    == expected.attachment.attachment_id =>
-                            {
-                                Err(CatalogAttachmentError::new(
-                                    CatalogAttachmentErrorKind::CommitUnknown,
-                                    format!(
-                                        "drop catalog attachment commit outcome is unknown: {error}"
-                                    ),
-                                ))
-                            }
-                            _ => Ok(()),
-                        }
-                    }
-                }
-            }
-            Err(error) => Err(run_failure("drop catalog attachment", error)),
-        }
+        attachment: &CatalogAttachment,
+    ) -> Result<CatalogAttachmentVersioned, CatalogAttachmentError> {
+        let created = self.require_matching(attachment).await?;
+        self.wakeup.publish();
+        Ok(created)
     }
 
     async fn matching(
@@ -721,10 +778,24 @@ mod tests {
         builtin_state_store_provider_registry,
     };
     use bytes::Bytes;
-    use novarocks_state_store_api::{CommitOutcome, Precondition, StateStore, TransactionId};
+    use novarocks_state_store_api::{CommitOutcome, Precondition, StateStore};
     use novarocks_state_store_testkit::conformance::{FaultGate, FaultInjectingStateStore};
 
     use super::*;
+
+    /// Reserves one write attempt from the store that will run it.
+    ///
+    /// Seeding used to mint a `TransactionId` from a fresh UUID, which is the
+    /// exact shape the attempt contract removed: an identity the store never
+    /// issued, that the store could then be asked about. Reserving keeps the
+    /// fixture on the same path production uses.
+    fn reserve(store: &dyn StateStore) -> novarocks_state_store_api::WriteAttempt {
+        store
+            .attempts()
+            .reserve()
+            .expect("reserve a seeding write attempt")
+            .0
+    }
 
     fn object_store_binding(generation: &str) -> CatalogCredentialBinding {
         CatalogCredentialBinding::try_new(
@@ -794,7 +865,7 @@ mod tests {
         .expect("open SQLite StateStore");
         assert_eq!(host.provider_id(), TEST_STATE_STORE_PROVIDER_ID);
         let store = host.state_store().expect("ready StateStore");
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
 
@@ -863,7 +934,7 @@ mod tests {
         .await
         .expect("open SQLite StateStore");
         let store = host.state_store().expect("ready StateStore");
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
         let requested = attachment(vec![("type".into(), "iceberg".into())]);
@@ -873,7 +944,7 @@ mod tests {
             .expect("create attachment");
         drop(repository);
 
-        let reopened = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let reopened = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("reopen catalog attachment repository");
         let reconstructed = reopened
@@ -922,7 +993,7 @@ mod tests {
         .await
         .expect("open SQLite StateStore");
         let store = host.state_store().expect("ready StateStore");
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
 
@@ -959,8 +1030,20 @@ mod tests {
             .expect("shutdown SQLite StateStore");
     }
 
+    /// A lost commit response must not cost the caller its answer, and must
+    /// not cost the catalog its identity.
+    ///
+    /// The mechanism this rests on changed — the outcome is read from the
+    /// in-flight attempt's own observation rather than derived from a
+    /// reconstructed transaction id — but the business property did not, so
+    /// this asserts the property and nothing about the mechanism: after the
+    /// response is dropped on the floor, CREATE still reports the exact
+    /// attachment identity the caller asked for, exactly one durable record
+    /// exists, and the matching exact DROP still succeeds. A second create
+    /// afterwards must still be refused as a duplicate, which is what would
+    /// break if recovery had quietly written a second record.
     #[tokio::test]
-    async fn commit_response_loss_recovers_create_and_exact_drop_without_new_identity() {
+    async fn a_lost_commit_response_is_resolved_and_keeps_one_stable_attachment_identity() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
         let registry =
             builtin_state_store_provider_registry().expect("builtin StateStore registry");
@@ -986,7 +1069,7 @@ mod tests {
         let store = host.state_store().expect("ready StateStore");
         let fault = FaultInjectingStateStore::new(Arc::clone(&store));
         let fault_store: Arc<dyn StateStore> = fault.clone();
-        let repository = CatalogAttachmentRepository::open(fault_store)
+        let repository = CatalogAttachmentRepository::open(fault_store, host.run_policy())
             .await
             .expect("open catalog attachment repository");
 
@@ -1003,9 +1086,24 @@ mod tests {
         let created = create_task
             .await
             .expect("create task joins")
-            .expect("commit resolution recovers create");
-        assert_eq!(created.attachment.attachment_id, requested.attachment_id);
+            .expect("the attempt's own observation recovers the create");
+        assert_eq!(
+            created.attachment.attachment_id, requested.attachment_id,
+            "recovery must report the identity the caller asked for, not a new one"
+        );
         assert_eq!(repository.list().await.expect("list attachments").len(), 1);
+        // A recovered create wrote once. A second create sees the record it
+        // left behind, which a duplicating recovery could not produce.
+        assert_eq!(
+            repository
+                .create(attachment(vec![("type".into(), "iceberg".into())]))
+                .await
+                .expect_err("the recovered record is a real, unique record")
+                .kind(),
+            CatalogAttachmentErrorKind::AlreadyExists
+        );
+        // The commit landed, so the local reconciler was told exactly once.
+        assert_eq!(repository.published_wakeups(), 1);
 
         let drop_gate = FaultGate::new();
         fault.lose_next_post_dispatch_response(drop_gate.clone());
@@ -1018,8 +1116,9 @@ mod tests {
         drop_task
             .await
             .expect("drop task joins")
-            .expect("commit resolution recovers exact drop");
+            .expect("the attempt's own observation recovers the exact drop");
         assert!(repository.list().await.expect("list after drop").is_empty());
+        assert_eq!(repository.published_wakeups(), 2);
 
         drop(repository);
         drop(fault);
@@ -1058,7 +1157,7 @@ mod tests {
         .await
         .expect("open SQLite StateStore");
         let store = host.state_store().expect("ready StateStore");
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
         let created = repository
@@ -1077,7 +1176,7 @@ mod tests {
             .expect("MV upstream dependency key");
         let mut transaction = store
             .begin_write(
-                TransactionId::from(Uuid::now_v7()),
+                reserve(store.as_ref()),
                 "seed materialized view dependency for catalog drop fence",
             )
             .await
@@ -1155,7 +1254,7 @@ mod tests {
         .await
         .expect("open SQLite StateStore");
         let store = host.state_store().expect("ready StateStore");
-        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
             .expect("open catalog attachment repository");
         let observed = repository
@@ -1165,10 +1264,7 @@ mod tests {
 
         // A writer that still holds the live observation may proceed.
         let mut transaction = store
-            .begin_write(
-                TransactionId::from(Uuid::now_v7()),
-                "assert live catalog attachment",
-            )
+            .begin_write(reserve(store.as_ref()), "assert live catalog attachment")
             .await
             .expect("begin live assertion transaction");
         assert_attachment_versions(transaction.as_mut(), std::slice::from_ref(&observed))
@@ -1181,10 +1277,7 @@ mod tests {
             .await
             .expect("DROP commits first");
         let mut transaction = store
-            .begin_write(
-                TransactionId::from(Uuid::now_v7()),
-                "assert dropped catalog attachment",
-            )
+            .begin_write(reserve(store.as_ref()), "assert dropped catalog attachment")
             .await
             .expect("begin dropped assertion transaction");
         assert_eq!(
@@ -1208,7 +1301,7 @@ mod tests {
         );
         let mut transaction = store
             .begin_write(
-                TransactionId::from(Uuid::now_v7()),
+                reserve(store.as_ref()),
                 "assert recreated catalog attachment",
             )
             .await

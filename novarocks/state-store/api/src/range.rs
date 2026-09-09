@@ -17,9 +17,8 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
-use super::contract::{Key, StoreRevision, validate_page_size};
+use super::contract::{Key, validate_page_size};
 use super::error::{StateStoreError, StateStoreErrorKind};
 use super::limits::StateStoreLimits;
 
@@ -169,61 +168,6 @@ impl TryFrom<Bytes> for ContinuationToken {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ChangeCursor(Bytes);
-
-impl ChangeCursor {
-    pub fn new(
-        store_id: Uuid,
-        revision: StoreRevision,
-        sequence: u32,
-    ) -> Result<Self, StateStoreError> {
-        let revision_len =
-            u32::try_from(revision.as_bytes().len()).map_err(|_| invalid_cursor())?;
-        let capacity = 1usize
-            .checked_add(16)
-            .and_then(|size| size.checked_add(4))
-            .and_then(|size| size.checked_add(revision.as_bytes().len()))
-            .and_then(|size| size.checked_add(4))
-            .ok_or_else(invalid_cursor)?;
-        let mut encoded = BytesMut::with_capacity(capacity);
-        encoded.put_u8(CODEC_VERSION);
-        encoded.extend_from_slice(store_id.as_bytes());
-        encoded.put_u32(revision_len);
-        encoded.extend_from_slice(revision.as_bytes());
-        encoded.put_u32(sequence);
-        Ok(Self(encoded.freeze()))
-    }
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-    pub fn into_bytes(self) -> Bytes {
-        self.0
-    }
-    pub fn decode(&self, expected_store_id: Uuid) -> Result<(StoreRevision, u32), StateStoreError> {
-        let mut reader = CheckedReader::new(self.as_bytes(), invalid_cursor);
-        if reader.read_u8()? != CODEC_VERSION {
-            return Err(invalid_cursor());
-        }
-        if reader.read_exact(16)? != expected_store_id.as_bytes() {
-            return Err(invalid_cursor());
-        }
-        let revision_len = usize::try_from(reader.read_u32()?).map_err(|_| invalid_cursor())?;
-        let revision =
-            StoreRevision::try_from(Bytes::copy_from_slice(reader.read_exact(revision_len)?))?;
-        let sequence = reader.read_u32()?;
-        reader.finish()?;
-        Ok((revision, sequence))
-    }
-}
-
-impl TryFrom<Bytes> for ChangeCursor {
-    type Error = StateStoreError;
-    fn try_from(value: Bytes) -> Result<Self, Self::Error> {
-        Ok(Self(value))
-    }
-}
-
 fn request_fingerprint(
     range: &KeyRange,
     direction: Direction,
@@ -283,7 +227,4 @@ const fn invalid_token() -> StateStoreError {
         StateStoreErrorKind::InvalidRequest,
         "invalid continuation token",
     )
-}
-const fn invalid_cursor() -> StateStoreError {
-    StateStoreError::new(StateStoreErrorKind::InvalidRequest, "invalid change cursor")
 }

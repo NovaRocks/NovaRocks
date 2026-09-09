@@ -24,23 +24,13 @@ use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind, StoreIdent
 
 use super::sqlite_error;
 
-pub(super) const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub(super) const CURRENT_SCHEMA_VERSION: u32 = 3;
 pub(super) const SCHEMA_VERSION_KEY: &[u8] = b"schema_version";
 pub(super) const CLUSTER_ID_KEY: &[u8] = b"cluster_id";
 pub(super) const STORE_ID_KEY: &[u8] = b"store_id";
 pub(super) const CURRENT_REVISION_KEY: &[u8] = b"current_revision";
-pub(super) const CHANGE_RETENTION_FLOOR_KEY: &[u8] = b"change_retention_floor";
-pub(super) const CHANGE_ROW_COUNT_KEY: &[u8] = b"change_row_count";
-pub(super) const COMMIT_RECEIPT_COUNT_KEY: &[u8] = b"commit_receipt_count";
-pub(super) const RETIRED_TRANSACTION_ID_MIN_KEY: &[u8] = b"retired_transaction_id_min";
-pub(super) const RETIRED_TRANSACTION_ID_MAX_KEY: &[u8] = b"retired_transaction_id_max";
-pub(super) const LAST_HISTORY_MAINTENANCE_MS_KEY: &[u8] = b"last_history_maintenance_ms";
-pub(super) const PHYSICAL_RECLAIM_PENDING_KEY: &[u8] = b"physical_reclaim_pending";
 
 const INITIAL_REVISION: u64 = 0;
-const INITIAL_CHANGE_RETENTION_FLOOR: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
-const INITIAL_METADATA_COUNT: u64 = 0;
-const INITIAL_PHYSICAL_RECLAIM_PENDING: [u8; 1] = [0];
 
 const META_SCHEMA_SQL: &str = r#"
     CREATE TABLE state_store_meta (
@@ -55,29 +45,11 @@ const KV_SCHEMA_SQL: &str = r#"
         version INTEGER NOT NULL
     )
 "#;
-const CHANGES_SCHEMA_SQL: &str = r#"
-    CREATE TABLE state_store_changes (
-        revision INTEGER NOT NULL,
-        sequence INTEGER NOT NULL,
-        key BLOB NOT NULL,
-        committed_at_ms INTEGER NOT NULL,
-        PRIMARY KEY(revision, sequence)
-    )
-"#;
 const COMMITS_SCHEMA_SQL: &str = r#"
     CREATE TABLE state_store_commits (
-        transaction_id BLOB PRIMARY KEY,
-        revision INTEGER NOT NULL,
-        committed_at_ms INTEGER NOT NULL
+        attempt BLOB PRIMARY KEY,
+        revision INTEGER NOT NULL
     )
-"#;
-const CHANGES_COMMITTED_AT_INDEX_SQL: &str = r#"
-    CREATE INDEX state_store_changes_committed_at_revision_sequence
-    ON state_store_changes(committed_at_ms, revision, sequence)
-"#;
-const COMMITS_COMMITTED_AT_INDEX_SQL: &str = r#"
-    CREATE INDEX state_store_commits_committed_at_revision
-    ON state_store_commits(committed_at_ms, revision)
 "#;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -95,36 +67,16 @@ struct SchemaObject {
     table_name: String,
 }
 
-const EXPECTED_TABLES: [(&str, &str); 4] = [
-    ("state_store_changes", CHANGES_SCHEMA_SQL),
+const EXPECTED_TABLES: [(&str, &str); 3] = [
     ("state_store_commits", COMMITS_SCHEMA_SQL),
     ("state_store_kv", KV_SCHEMA_SQL),
     ("state_store_meta", META_SCHEMA_SQL),
 ];
-const EXPECTED_INDEXES: [(&str, &str, &str); 2] = [
-    (
-        "state_store_changes_committed_at_revision_sequence",
-        "state_store_changes",
-        CHANGES_COMMITTED_AT_INDEX_SQL,
-    ),
-    (
-        "state_store_commits_committed_at_revision",
-        "state_store_commits",
-        COMMITS_COMMITTED_AT_INDEX_SQL,
-    ),
-];
-const EXPECTED_META_KEYS: [&[u8]; 11] = [
+const EXPECTED_META_KEYS: [&[u8]; 4] = [
     SCHEMA_VERSION_KEY,
     CLUSTER_ID_KEY,
     STORE_ID_KEY,
     CURRENT_REVISION_KEY,
-    CHANGE_RETENTION_FLOOR_KEY,
-    CHANGE_ROW_COUNT_KEY,
-    COMMIT_RECEIPT_COUNT_KEY,
-    RETIRED_TRANSACTION_ID_MIN_KEY,
-    RETIRED_TRANSACTION_ID_MAX_KEY,
-    LAST_HISTORY_MAINTENANCE_MS_KEY,
-    PHYSICAL_RECLAIM_PENDING_KEY,
 ];
 
 pub(super) fn initialize(
@@ -133,6 +85,11 @@ pub(super) fn initialize(
 ) -> Result<StoreIdentity, StateStoreError> {
     let existing_objects = state_store_objects(connection)?;
     if existing_objects.is_empty() {
+        // An empty file becomes a store; a file holding somebody else's tables
+        // does not. Adopting one would vacuum it and add tables to it, which is
+        // the same class of damage as migrating a version this build cannot
+        // read -- and a mistyped path is how it would happen.
+        reject_foreign_database(connection)?;
         configure_auto_vacuum(connection)?;
     } else {
         let version = inspect_schema_version(connection, &existing_objects)?;
@@ -150,15 +107,6 @@ pub(super) fn initialize(
         })?;
     let identity = if existing_objects.is_empty() {
         for (_, sql) in EXPECTED_TABLES {
-            transaction.execute_batch(sql).map_err(|error| {
-                sqlite_error(
-                    &error,
-                    StateStoreErrorKind::Internal,
-                    "failed to create SQLite state store schema",
-                )
-            })?;
-        }
-        for (_, _, sql) in EXPECTED_INDEXES {
             transaction.execute_batch(sql).map_err(|error| {
                 sqlite_error(
                     &error,
@@ -188,8 +136,7 @@ fn state_store_objects(connection: &Connection) -> Result<Vec<SchemaObject>, Sta
             "SELECT name, type, tbl_name FROM sqlite_schema \
              WHERE lower(name) GLOB 'state_store_*' \
                 OR lower(tbl_name) IN (\
-                    'state_store_changes', 'state_store_commits', \
-                    'state_store_kv', 'state_store_meta'\
+                    'state_store_commits', 'state_store_kv', 'state_store_meta'\
                 ) \
                 OR (lower(type) = 'view' AND lower(COALESCE(sql, '')) GLOB '*state_store_*') \
              ORDER BY name, type, tbl_name",
@@ -256,6 +203,30 @@ fn inspect_schema_version(
         .ok_or_else(|| schema_error("SQLite state store schema version is missing"))
 }
 
+/// Refuses a database that already holds something this build did not write.
+fn reject_foreign_database(connection: &Connection) -> Result<(), StateStoreError> {
+    let objects = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            sqlite_error(
+                &error,
+                StateStoreErrorKind::Corruption,
+                "failed to inspect SQLite database contents",
+            )
+        })?;
+    if objects != 0 {
+        return Err(StateStoreError::new(
+            StateStoreErrorKind::UnsupportedFormat,
+            "SQLite path holds a database that is not a NovaRocks state store",
+        ));
+    }
+    Ok(())
+}
+
 fn configure_auto_vacuum(connection: &Connection) -> Result<(), StateStoreError> {
     connection
         .pragma_update(None, "auto_vacuum", "INCREMENTAL")
@@ -316,15 +287,11 @@ fn validate_schema(
             ]
         })
         .collect::<Vec<_>>();
-    expected_objects.extend(
-        EXPECTED_INDEXES
-            .iter()
-            .map(|(name, table_name, _)| SchemaObject {
-                name: (*name).to_owned(),
-                object_type: "index".to_owned(),
-                table_name: (*table_name).to_owned(),
-            }),
-    );
+    // Schema v3 declares no explicit index. Both former indexes only served
+    // sweeping history by age; commit evidence is released by attempt through
+    // its primary key, and the change feed is gone. Every object below is
+    // therefore a table or its primary-key autoindex, and anything else in the
+    // file is unexpected.
     expected_objects.sort();
     if objects != expected_objects {
         return Err(schema_error(
@@ -350,35 +317,13 @@ fn validate_schema(
     validate_table_sql(transaction, "state_store_kv", KV_SCHEMA_SQL)?;
     validate_table(
         transaction,
-        "state_store_changes",
-        &[
-            ("revision", "INTEGER", true, 1),
-            ("sequence", "INTEGER", true, 2),
-            ("key", "BLOB", true, 0),
-            ("committed_at_ms", "INTEGER", true, 0),
-        ],
-    )?;
-    validate_table_sql(transaction, "state_store_changes", CHANGES_SCHEMA_SQL)?;
-    validate_index_sql(
-        transaction,
-        "state_store_changes_committed_at_revision_sequence",
-        CHANGES_COMMITTED_AT_INDEX_SQL,
-    )?;
-    validate_table(
-        transaction,
         "state_store_commits",
         &[
-            ("transaction_id", "BLOB", false, 1),
+            ("attempt", "BLOB", false, 1),
             ("revision", "INTEGER", true, 0),
-            ("committed_at_ms", "INTEGER", true, 0),
         ],
     )?;
-    validate_table_sql(transaction, "state_store_commits", COMMITS_SCHEMA_SQL)?;
-    validate_index_sql(
-        transaction,
-        "state_store_commits_committed_at_revision",
-        COMMITS_COMMITTED_AT_INDEX_SQL,
-    )
+    validate_table_sql(transaction, "state_store_commits", COMMITS_SCHEMA_SQL)
 }
 
 fn validate_table_sql(
@@ -402,32 +347,6 @@ fn validate_table_sql(
     if normalize_schema_sql(&actual) != normalize_schema_sql(expected) {
         return Err(schema_error(
             "SQLite state store table constraints are malformed",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_index_sql(
-    transaction: &Transaction<'_>,
-    index: &'static str,
-    expected: &str,
-) -> Result<(), StateStoreError> {
-    let actual = transaction
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1",
-            params![index],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|error| {
-            sqlite_error(
-                &error,
-                StateStoreErrorKind::Corruption,
-                "failed to inspect SQLite state store index definition",
-            )
-        })?;
-    if normalize_schema_sql(&actual) != normalize_schema_sql(expected) {
-        return Err(schema_error(
-            "SQLite state store index constraints are malformed",
         ));
     }
     Ok(())
@@ -528,33 +447,6 @@ fn initialize_identity(
         CURRENT_REVISION_KEY,
         &INITIAL_REVISION.to_be_bytes(),
     )?;
-    insert_meta(
-        transaction,
-        CHANGE_RETENTION_FLOOR_KEY,
-        &INITIAL_CHANGE_RETENTION_FLOOR,
-    )?;
-    insert_meta(
-        transaction,
-        CHANGE_ROW_COUNT_KEY,
-        &INITIAL_METADATA_COUNT.to_be_bytes(),
-    )?;
-    insert_meta(
-        transaction,
-        COMMIT_RECEIPT_COUNT_KEY,
-        &INITIAL_METADATA_COUNT.to_be_bytes(),
-    )?;
-    insert_meta(transaction, RETIRED_TRANSACTION_ID_MIN_KEY, &[])?;
-    insert_meta(transaction, RETIRED_TRANSACTION_ID_MAX_KEY, &[])?;
-    insert_meta(
-        transaction,
-        LAST_HISTORY_MAINTENANCE_MS_KEY,
-        &INITIAL_METADATA_COUNT.to_be_bytes(),
-    )?;
-    insert_meta(
-        transaction,
-        PHYSICAL_RECLAIM_PENDING_KEY,
-        &INITIAL_PHYSICAL_RECLAIM_PENDING,
-    )?;
 
     Ok(StoreIdentity {
         store_id,
@@ -590,28 +482,7 @@ fn load_identity(
             "SQLite current revision exceeds the supported integer range",
         ));
     }
-    let retention_floor =
-        decode_change_retention_floor(&load_required(transaction, CHANGE_RETENTION_FLOOR_KEY)?)?;
-    validate_change_retention_floor(retention_floor, current_revision)?;
     validate_metadata_inventory(transaction)?;
-    let change_row_count = validate_u64_metadata(
-        transaction,
-        CHANGE_ROW_COUNT_KEY,
-        "SQLite change row count is malformed",
-    )?;
-    let commit_receipt_count = validate_u64_metadata(
-        transaction,
-        COMMIT_RECEIPT_COUNT_KEY,
-        "SQLite commit receipt count is malformed",
-    )?;
-    validate_history_row_counts(transaction, change_row_count, commit_receipt_count)?;
-    validate_retired_transaction_bounds(transaction)?;
-    validate_u64_metadata(
-        transaction,
-        LAST_HISTORY_MAINTENANCE_MS_KEY,
-        "SQLite history maintenance timestamp is malformed",
-    )?;
-    validate_physical_reclaim_pending(transaction)?;
 
     let cluster_id = String::from_utf8(stored_cluster_id)
         .map_err(|_| schema_error("SQLite cluster id is not UTF-8"))?;
@@ -619,38 +490,6 @@ fn load_identity(
         store_id,
         cluster_id,
     })
-}
-
-fn validate_history_row_counts(
-    transaction: &Transaction<'_>,
-    expected_changes: u64,
-    expected_commits: u64,
-) -> Result<(), StateStoreError> {
-    let actual_changes = load_table_count(transaction, "state_store_changes")?;
-    let actual_commits = load_table_count(transaction, "state_store_commits")?;
-    if actual_changes != expected_changes || actual_commits != expected_commits {
-        return Err(schema_error(
-            "SQLite history row counters do not match persisted rows",
-        ));
-    }
-    Ok(())
-}
-
-fn load_table_count(
-    transaction: &Transaction<'_>,
-    table: &'static str,
-) -> Result<u64, StateStoreError> {
-    let sql = format!("SELECT COUNT(*) FROM {table}");
-    let count = transaction
-        .query_row(&sql, [], |row| row.get::<_, i64>(0))
-        .map_err(|error| {
-            sqlite_error(
-                &error,
-                StateStoreErrorKind::Corruption,
-                "failed to inspect SQLite state store history rows",
-            )
-        })?;
-    u64::try_from(count).map_err(|_| schema_error("SQLite history row count is malformed"))
 }
 
 fn validate_metadata_inventory(transaction: &Transaction<'_>) -> Result<(), StateStoreError> {
@@ -688,95 +527,6 @@ fn validate_metadata_inventory(transaction: &Transaction<'_>) -> Result<(), Stat
     if actual != expected {
         return Err(schema_error(
             "SQLite state store metadata inventory is incomplete or unexpected",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_u64_metadata(
-    transaction: &Transaction<'_>,
-    key: &[u8],
-    message: &'static str,
-) -> Result<u64, StateStoreError> {
-    decode_u64(&load_required(transaction, key)?, message)
-}
-
-fn validate_retired_transaction_bounds(
-    transaction: &Transaction<'_>,
-) -> Result<(), StateStoreError> {
-    let min = load_required(transaction, RETIRED_TRANSACTION_ID_MIN_KEY)?;
-    let max = load_required(transaction, RETIRED_TRANSACTION_ID_MAX_KEY)?;
-    let min = decode_optional_transaction_id(&min)?;
-    let max = decode_optional_transaction_id(&max)?;
-    if min.is_some() != max.is_some() || min.zip(max).is_some_and(|(min, max)| min > max) {
-        return Err(schema_error(
-            "SQLite retired transaction bounds are malformed",
-        ));
-    }
-    Ok(())
-}
-
-fn decode_optional_transaction_id(value: &[u8]) -> Result<Option<Uuid>, StateStoreError> {
-    if value.is_empty() {
-        return Ok(None);
-    }
-    let transaction_id = Uuid::from_slice(value)
-        .map_err(|_| schema_error("SQLite retired transaction id is malformed"))?;
-    Ok(Some(transaction_id))
-}
-
-fn validate_physical_reclaim_pending(transaction: &Transaction<'_>) -> Result<(), StateStoreError> {
-    match load_required(transaction, PHYSICAL_RECLAIM_PENDING_KEY)?.as_slice() {
-        [0] | [1] => Ok(()),
-        _ => Err(schema_error("SQLite physical reclaim marker is malformed")),
-    }
-}
-
-pub(super) fn load_change_retention_floor(
-    connection: &Connection,
-    current_revision: u64,
-) -> Result<(u64, u32), StateStoreError> {
-    let value = connection
-        .query_row(
-            "SELECT value FROM state_store_meta WHERE key = ?1",
-            params![CHANGE_RETENTION_FLOOR_KEY],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()
-        .map_err(|error| {
-            sqlite_error(
-                &error,
-                StateStoreErrorKind::Corruption,
-                "failed to read SQLite change retention floor",
-            )
-        })?
-        .ok_or_else(|| schema_error("SQLite change retention floor is missing"))?;
-    let retention_floor = decode_change_retention_floor(&value)?;
-    validate_change_retention_floor(retention_floor, current_revision)?;
-    Ok(retention_floor)
-}
-
-fn decode_change_retention_floor(value: &[u8]) -> Result<(u64, u32), StateStoreError> {
-    let bytes: [u8; 12] = value
-        .try_into()
-        .map_err(|_| schema_error("SQLite change retention floor is malformed"))?;
-    let revision = u64::from_be_bytes(bytes[..8].try_into().expect("fixed revision bytes"));
-    if i64::try_from(revision).is_err() {
-        return Err(schema_error(
-            "SQLite change retention floor revision is out of range",
-        ));
-    }
-    let sequence = u32::from_be_bytes(bytes[8..].try_into().expect("fixed sequence bytes"));
-    Ok((revision, sequence))
-}
-
-fn validate_change_retention_floor(
-    retention_floor: (u64, u32),
-    current_revision: u64,
-) -> Result<(), StateStoreError> {
-    if retention_floor.0 > current_revision {
-        return Err(schema_error(
-            "SQLite change retention floor is ahead of current revision",
         ));
     }
     Ok(())

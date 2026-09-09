@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::policy::StateStoreRunPolicy;
 use novarocks_state_store_api::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderId,
     StateStoreProviderInstance, StateStoreProviderLifecycle,
@@ -37,6 +38,7 @@ pub struct StateStoreHost {
     provider_id: StateStoreProviderId,
     lifecycle: StateStoreHostLifecycle,
     state_store: Option<Arc<dyn StateStore>>,
+    run_policy: StateStoreRunPolicy,
     instance: Box<dyn StateStoreProviderInstance>,
 }
 
@@ -47,6 +49,7 @@ impl StateStoreHost {
         deadline: Instant,
     ) -> Result<Self, StateStoreHostError> {
         let provider_id = input.provider_id;
+        let run_policy = input.run_policy;
         let bound = registry.bind(&input)?;
         let request = StateStoreOpenRequest {
             cluster_id: input.cluster_id,
@@ -74,6 +77,7 @@ impl StateStoreHost {
             provider_id,
             lifecycle: StateStoreHostLifecycle::Ready,
             state_store: Some(state_store),
+            run_policy,
             instance,
         })
     }
@@ -90,9 +94,57 @@ impl StateStoreHost {
         self.state_store.clone()
     }
 
+    pub const fn run_policy(&self) -> StateStoreRunPolicy {
+        self.run_policy
+    }
+
+    /// The store together with the policy governing its use.
+    ///
+    /// Consumers take this pair rather than the two separately, so a component
+    /// cannot end up holding durable storage with no agreed budget for it.
+    pub fn durable(&self) -> Option<(Arc<dyn StateStore>, StateStoreRunPolicy)> {
+        self.state_store
+            .clone()
+            .map(|store| (store, self.run_policy))
+    }
+
+    /// Releases evidence for attempts that were dispatched and then abandoned.
+    ///
+    /// The contract states that cleanup is driven by a host, never spawned by
+    /// the supervisor. This is that driver: without it an abandoned attempt
+    /// keeps both its capacity slot and its provider-side evidence for the life
+    /// of the instance, which is the failure the bounded-evidence rule exists
+    /// to prevent. Call it on a cadence the caller can account for.
+    ///
+    /// A provider that is not ready to release yet reports that without it
+    /// counting as a fault, so an ordinary tick is quiet.
+    pub async fn release_abandoned_attempts(&self) -> Result<usize, StateStoreHostError> {
+        let Some(store) = &self.state_store else {
+            return Ok(0);
+        };
+        store
+            .attempts()
+            .drain_abandoned_attempts()
+            .await
+            .map_err(|error| {
+                StateStoreHostError::provider_failure(
+                    StateStoreHostErrorKind::Shutdown,
+                    self.provider_id,
+                    "state store provider failed to release abandoned attempt evidence",
+                    error,
+                )
+            })
+    }
+
     pub async fn shutdown(&mut self, deadline: Instant) -> Result<(), StateStoreHostError> {
         if self.lifecycle == StateStoreHostLifecycle::Stopped {
             return Ok(());
+        }
+        // Last chance to hand evidence back before the instance goes away.
+        // A failure here must not stop the shutdown: the store is closing
+        // either way, and reporting it as a shutdown failure would hide that.
+        if let Err(error) = self.release_abandoned_attempts().await {
+            tracing::warn!(%error, "abandoned state store attempts were not released before shutdown");
         }
         self.lifecycle = StateStoreHostLifecycle::Draining;
         self.state_store.take();

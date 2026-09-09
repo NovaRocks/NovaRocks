@@ -22,7 +22,7 @@ use foundationdb::{Database, FdbError, Transaction};
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
-use super::codec::{KeyspaceCodec, REVISION_BYTES};
+use super::codec::KeyspaceCodec;
 use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(4);
@@ -44,23 +44,16 @@ fn classify_identity_commit_error(error: FdbError) -> IdentityCommitErrorDisposi
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct IdentitySnapshot {
-    pub identity: StoreIdentity,
-    pub high_watermark: [u8; REVISION_BYTES],
-    pub retention_floor: [u8; REVISION_BYTES],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum IdentityRead {
     Absent,
-    Present(IdentitySnapshot),
+    Present(StoreIdentity),
 }
 
 pub(super) async fn open_identity(
     database: &Database,
     codec: &KeyspaceCodec,
     cluster_id: &str,
-) -> Result<IdentitySnapshot, StateStoreError> {
+) -> Result<StoreIdentity, StateStoreError> {
     let deadline = Instant::now() + OPEN_TIMEOUT;
     probe_read_version(database, deadline).await?;
 
@@ -72,13 +65,9 @@ pub(super) async fn open_identity(
             let store_id = Uuid::new_v4();
             write_new_identity(&transaction, codec, cluster_id, store_id);
             match timeout_at(deadline, transaction.commit()).await {
-                Ok(Ok(_)) => Ok(IdentitySnapshot {
-                    identity: StoreIdentity {
-                        store_id,
-                        cluster_id: cluster_id.to_owned(),
-                    },
-                    high_watermark: [0; REVISION_BYTES],
-                    retention_floor: [0; REVISION_BYTES],
+                Ok(Ok(_)) => Ok(StoreIdentity {
+                    store_id,
+                    cluster_id: cluster_id.to_owned(),
                 }),
                 Ok(Err(error)) => match classify_identity_commit_error(*error) {
                     IdentityCommitErrorDisposition::AuthoritativeReload => {
@@ -95,7 +84,7 @@ pub(super) async fn open_identity(
 pub(super) fn decode_identity_values(
     codec: &KeyspaceCodec,
     expected_cluster_id: &str,
-    values: &[Option<Vec<u8>>; 6],
+    values: &[Option<Vec<u8>>; 4],
 ) -> Result<IdentityRead, StateStoreError> {
     if values.iter().all(Option::is_none) {
         return Ok(IdentityRead::Absent);
@@ -124,15 +113,9 @@ pub(super) fn decode_identity_values(
     // This experimental provider retains its legacy physical metadata while
     // the public StoreIdentity exposes only store and cluster identity.
     codec.decode_initial_incarnation(value(3))?;
-    let high_watermark = codec.decode_revision(value(4))?;
-    let retention_floor = codec.decode_revision(value(5))?;
-    Ok(IdentityRead::Present(IdentitySnapshot {
-        identity: StoreIdentity {
-            store_id,
-            cluster_id: stored_cluster_id,
-        },
-        high_watermark,
-        retention_floor,
+    Ok(IdentityRead::Present(StoreIdentity {
+        store_id,
+        cluster_id: stored_cluster_id,
     }))
 }
 
@@ -150,7 +133,7 @@ async fn authoritative_reload(
     codec: &KeyspaceCodec,
     cluster_id: &str,
     deadline: Instant,
-) -> Result<IdentitySnapshot, StateStoreError> {
+) -> Result<StoreIdentity, StateStoreError> {
     for _ in 0..MAX_AUTHORITATIVE_READ_ATTEMPTS {
         if Instant::now() >= deadline {
             return Err(deadline_error());
@@ -204,16 +187,14 @@ async fn read_identity_values(
     transaction: &Transaction,
     codec: &KeyspaceCodec,
     deadline: Instant,
-) -> Result<[Option<Vec<u8>>; 6], StateStoreError> {
+) -> Result<[Option<Vec<u8>>; 4], StateStoreError> {
     let keys = [
         codec.schema_version_key(),
         codec.cluster_id_key(),
         codec.store_id_key(),
         codec.initial_incarnation_key(),
-        codec.high_watermark_key(),
-        codec.retention_floor_key(),
     ];
-    let mut values: [Option<Vec<u8>>; 6] = std::array::from_fn(|_| None);
+    let mut values: [Option<Vec<u8>>; 4] = std::array::from_fn(|_| None);
     for (index, key) in keys.iter().enumerate() {
         let value = timeout_at(deadline, transaction.get(key, false))
             .await
@@ -237,8 +218,6 @@ fn write_new_identity(
         &codec.initial_incarnation_key(),
         &codec.initial_incarnation_value(),
     );
-    transaction.set(&codec.high_watermark_key(), &codec.zero_revision_value());
-    transaction.set(&codec.retention_floor_key(), &codec.zero_revision_value());
 }
 
 fn deadline_error() -> StateStoreError {
@@ -268,25 +247,23 @@ mod tests {
     use novarocks_state_store_api::StateStoreErrorKind;
 
     fn codec() -> KeyspaceCodec {
-        KeyspaceCodec::new(Uuid::from_bytes([0x11; 16]))
+        KeyspaceCodec::new(Uuid::from_bytes([0x11; 16]), Uuid::from_bytes([0x22; 16]))
     }
 
-    fn complete_values(cluster_id: &str, store_id: Uuid) -> [Option<Vec<u8>>; 6] {
+    fn complete_values(cluster_id: &str, store_id: Uuid) -> [Option<Vec<u8>>; 4] {
         let codec = codec();
         [
             Some(codec.schema_version_value()),
             Some(codec.cluster_id_value(cluster_id)),
             Some(codec.store_id_value(store_id)),
             Some(codec.initial_incarnation_value()),
-            Some(codec.zero_revision_value()),
-            Some(codec.zero_revision_value()),
         ]
     }
 
     #[test]
     fn absent_identity_is_distinct_from_complete_identity() {
         assert_eq!(
-            decode_identity_values(&codec(), "cluster-a", &[None, None, None, None, None, None])
+            decode_identity_values(&codec(), "cluster-a", &[None, None, None, None])
                 .expect("fully absent identity"),
             IdentityRead::Absent
         );
@@ -298,19 +275,17 @@ mod tests {
             &complete_values("cluster-a", store_id),
         )
         .expect("complete identity");
-        let IdentityRead::Present(snapshot) = decoded else {
+        let IdentityRead::Present(identity) = decoded else {
             panic!("complete identity must be present");
         };
-        assert_eq!(snapshot.identity.store_id, store_id);
-        assert_eq!(snapshot.identity.cluster_id, "cluster-a");
-        assert_eq!(snapshot.high_watermark, [0; 10]);
-        assert_eq!(snapshot.retention_floor, [0; 10]);
+        assert_eq!(identity.store_id, store_id);
+        assert_eq!(identity.cluster_id, "cluster-a");
     }
 
     #[test]
     fn partial_identity_fails_closed() {
-        let mut values = [None, None, None, None, None, None];
-        values[0] = Some(vec![1]);
+        let mut values = [None, None, None, None];
+        values[0] = Some(vec![2]);
         assert_eq!(
             decode_identity_values(&codec(), "cluster-a", &values)
                 .expect_err("partial identity must fail")
@@ -322,12 +297,12 @@ mod tests {
     #[test]
     fn malformed_identity_fields_fail_closed() {
         for (field, malformed) in [
-            (0, vec![2]),
+            // A complete keyspace written by the retired change-feed schema is
+            // refused rather than reinterpreted.
+            (0, vec![1]),
             (1, vec![0xff]),
             (2, vec![0; 15]),
             (3, [1_u64.to_be_bytes().as_slice(), &[0]].concat()),
-            (4, vec![0; 11]),
-            (5, vec![0; 9]),
         ] {
             let mut values = complete_values("cluster-a", Uuid::from_bytes([0x22; 16]));
             values[field] = Some(malformed);

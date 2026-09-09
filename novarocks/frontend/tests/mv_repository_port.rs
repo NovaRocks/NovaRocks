@@ -22,8 +22,8 @@ use novarocks_frontend::mv::domain::repository::{
 };
 use novarocks_frontend::mv::domain::test_repository::InMemoryMvRepository;
 
-#[test]
-fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_delete() {
+#[tokio::test]
+async fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_delete() {
     let repository = InMemoryMvRepository::default();
     let created = repository
         .create_projection(
@@ -35,10 +35,12 @@ fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_delete() 
                 "orders",
             ),
         )
+        .await
         .expect("create projection through port");
     assert_eq!(
         repository
             .find_by_target(&mv_repository_definition::target("orders_mv"))
+            .await
             .unwrap(),
         Some(created.clone())
     );
@@ -57,6 +59,7 @@ fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_delete() 
                 ),
             },
         )
+        .await
         .unwrap();
     let stale_delete = repository
         .delete_projection(
@@ -67,6 +70,7 @@ fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_delete() 
                 expected_source_revision: created.definition.source_revision,
             },
         )
+        .await
         .expect_err("stale root version must not delete the replacement");
     assert_eq!(stale_delete.kind(), MvRepositoryErrorKind::Conflict);
 
@@ -79,6 +83,7 @@ fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_delete() 
                 expected_source_revision: replaced.definition.source_revision,
             },
         )
+        .await
         .expect("exact guarded delete");
-    assert!(repository.list_projections().unwrap().is_empty());
+    assert!(repository.list_projections().await.unwrap().is_empty());
 }

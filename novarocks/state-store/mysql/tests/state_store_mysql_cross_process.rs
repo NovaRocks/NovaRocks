@@ -560,14 +560,13 @@ fn mysql_helper_protocol_accepts_only_frozen_commands_and_hex_payloads() {
     assert!(responses[0]["pid"].as_u64().is_some_and(|pid| pid > 0));
 
     for command in [
-        json!({"id": 1, "command": "Begin", "transaction_id": Uuid::nil(), "description": "protocol"}),
-        json!({"id": 1, "command": "Get", "transaction_id": Uuid::nil(), "key": "00ff"}),
-        json!({"id": 1, "command": "Range", "transaction_id": Uuid::nil(), "start": "00", "end": "ff", "direction": "Forward", "page_size": 1}),
-        json!({"id": 1, "command": "Put", "transaction_id": Uuid::nil(), "key": "00", "value": "ff", "precondition": "Any"}),
-        json!({"id": 1, "command": "Delete", "transaction_id": Uuid::nil(), "key": "00", "precondition": "Any"}),
-        json!({"id": 1, "command": "Commit", "transaction_id": Uuid::nil(), "lose_response": false}),
-        json!({"id": 1, "command": "Resolve", "transaction_id": Uuid::nil()}),
-        json!({"id": 1, "command": "Poll", "after": null, "page_size": 1}),
+        json!({"id": 1, "command": "Begin", "handle": Uuid::nil(), "description": "protocol"}),
+        json!({"id": 1, "command": "Get", "handle": Uuid::nil(), "key": "00ff"}),
+        json!({"id": 1, "command": "Range", "handle": Uuid::nil(), "start": "00", "end": "ff", "direction": "Forward", "page_size": 1}),
+        json!({"id": 1, "command": "Put", "handle": Uuid::nil(), "key": "00", "value": "ff", "precondition": "Any"}),
+        json!({"id": 1, "command": "Delete", "handle": Uuid::nil(), "key": "00", "precondition": "Any"}),
+        json!({"id": 1, "command": "Commit", "handle": Uuid::nil(), "lose_response": false}),
+        json!({"id": 1, "command": "Resolve", "handle": Uuid::nil()}),
     ] {
         let mut encoded = serde_json::to_vec(&command).expect("encode frozen command");
         encoded.push(b'\n');
@@ -579,15 +578,15 @@ fn mysql_helper_protocol_accepts_only_frozen_commands_and_hex_payloads() {
         assert_terminal_protocol_error(input.as_bytes(), "InvalidJson");
     }
     assert_terminal_protocol_error(
-        b"{\"id\":1,\"command\":\"Put\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"not-hex\",\"value\":\"00\",\"precondition\":\"Any\"}\n",
+        b"{\"id\":1,\"command\":\"Put\",\"handle\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"not-hex\",\"value\":\"00\",\"precondition\":\"Any\"}\n",
         "InvalidHex",
     );
     assert_terminal_protocol_error(
-        b"{\"id\":1,\"command\":\"Get\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"unexpected\":true}\n",
+        b"{\"id\":1,\"command\":\"Get\",\"handle\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"unexpected\":true}\n",
         "InvalidJson",
     );
     assert_terminal_protocol_error(
-        b"{\"id\":1,\"command\":\"Delete\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"precondition\":{\"version\":\"00\",\"unexpected\":true}}\n",
+        b"{\"id\":1,\"command\":\"Delete\",\"handle\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"precondition\":{\"version\":\"00\",\"unexpected\":true}}\n",
         "InvalidJson",
     );
     assert_terminal_protocol_error_with_id(
@@ -596,12 +595,12 @@ fn mysql_helper_protocol_accepts_only_frozen_commands_and_hex_payloads() {
         0,
     );
     let oversized = format!(
-        "{{\"id\":1,\"command\":\"Put\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"value\":\"{}\",\"precondition\":\"Any\"}}\n",
+        "{{\"id\":1,\"command\":\"Put\",\"handle\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"00\",\"value\":\"{}\",\"precondition\":\"Any\"}}\n",
         "00".repeat(90_000)
     );
     assert_terminal_protocol_error_with_id(oversized.as_bytes(), "LineTooLong", 0);
     let oversized_key = format!(
-        "{{\"id\":1,\"command\":\"Get\",\"transaction_id\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"{}\"}}\n",
+        "{{\"id\":1,\"command\":\"Get\",\"handle\":\"00000000-0000-0000-0000-000000000000\",\"key\":\"{}\"}}\n",
         "00".repeat(3_073)
     );
     assert_terminal_protocol_error(oversized_key.as_bytes(), "HexTooLong");
@@ -667,7 +666,7 @@ fn mysql_cross_process_suite() {
 
 #[test]
 fn mysql_helper_response_loss_predispatch_terminal_is_bounded() {
-    predispatch_tombstone_response_loss_case();
+    predispatch_response_loss_case();
 }
 
 struct TestDatabase {
@@ -993,32 +992,30 @@ fn redact_test_material(raw: &str) -> String {
 }
 
 fn run_mysql_cross_process_suite() {
-    predispatch_tombstone_response_loss_case();
+    predispatch_response_loss_case();
     same_key_cas_case();
     write_skew_case();
     range_phantom_case();
     response_loss_resolution_case();
-    transaction_tombstone_reuse_case();
-    change_order_case();
+    foreign_handle_is_not_resolvable_case();
     cluster_and_database_mismatch_case();
     request_identifier_case();
 }
 
-fn predispatch_tombstone_response_loss_case() {
-    let (_database, mut left, mut right) = open_pair("predispatch-loss");
-    let transaction_id = Uuid::now_v7();
-    assert_eq!(
-        resolve(&mut right, transaction_id)["resolution"],
-        "NotCommitted"
-    );
-    begin(
-        &mut left,
-        transaction_id,
-        "predispatch tombstone response loss",
-    );
+/// A commit whose response is lost before dispatch must not publish, and the
+/// store must stay usable afterwards.
+///
+/// The old version opened by asking a second process to resolve an identifier
+/// nobody had issued yet, and expected "NotCommitted". That question cannot be
+/// posed any more -- an attempt identity is minted by one open instance and is
+/// meaningless to another -- so only the physical half of the case remains.
+fn predispatch_response_loss_case() {
+    let (_database, mut left, right) = open_pair("predispatch-loss");
+    let handle = Uuid::now_v7();
+    begin(&mut left, handle, "predispatch response loss");
     put(
         &mut left,
-        transaction_id,
+        handle,
         b"predispatch/key",
         b"must-not-publish",
         json!("Any"),
@@ -1027,7 +1024,7 @@ fn predispatch_tombstone_response_loss_case() {
         .request_with_timeout(
             json!({
                 "command": "Commit",
-                "transaction_id": transaction_id,
+                "handle": handle,
                 "lose_response": true,
             }),
             Duration::from_secs(2),
@@ -1099,29 +1096,29 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn begin(helper: &mut HelperProcess, transaction_id: Uuid, description: &str) {
+fn begin(helper: &mut HelperProcess, handle: Uuid, description: &str) {
     let response = helper.request(json!({
         "command": "Begin",
-        "transaction_id": transaction_id,
+        "handle": handle,
         "description": description,
     }));
     assert_eq!(response["event"], "Begun");
 }
 
-fn get(helper: &mut HelperProcess, transaction_id: Uuid, key: &[u8]) -> JsonValue {
+fn get(helper: &mut HelperProcess, handle: Uuid, key: &[u8]) -> JsonValue {
     let response = helper.request(json!({
         "command": "Get",
-        "transaction_id": transaction_id,
+        "handle": handle,
         "key": hex::encode(key),
     }));
     assert_eq!(response["event"], "Get");
     response["record"].clone()
 }
 
-fn range(helper: &mut HelperProcess, transaction_id: Uuid, start: &[u8], end: &[u8]) -> JsonValue {
+fn range(helper: &mut HelperProcess, handle: Uuid, start: &[u8], end: &[u8]) -> JsonValue {
     let response = helper.request(json!({
         "command": "Range",
-        "transaction_id": transaction_id,
+        "handle": handle,
         "start": hex::encode(start),
         "end": hex::encode(end),
         "direction": "Forward",
@@ -1133,14 +1130,14 @@ fn range(helper: &mut HelperProcess, transaction_id: Uuid, start: &[u8], end: &[
 
 fn put(
     helper: &mut HelperProcess,
-    transaction_id: Uuid,
+    handle: Uuid,
     key: &[u8],
     value: &[u8],
     precondition: JsonValue,
 ) {
     let response = helper.request(json!({
         "command": "Put",
-        "transaction_id": transaction_id,
+        "handle": handle,
         "key": hex::encode(key),
         "value": hex::encode(value),
         "precondition": precondition,
@@ -1148,35 +1145,32 @@ fn put(
     assert_eq!(response["event"], "Staged");
 }
 
-fn commit(helper: &mut HelperProcess, transaction_id: Uuid, lose_response: bool) -> JsonValue {
+fn commit(helper: &mut HelperProcess, handle: Uuid, lose_response: bool) -> JsonValue {
     let response = helper.request(json!({
         "command": "Commit",
-        "transaction_id": transaction_id,
+        "handle": handle,
         "lose_response": lose_response,
     }));
     assert_eq!(response["event"], "Commit");
     response
 }
 
-fn resolve(helper: &mut HelperProcess, transaction_id: Uuid) -> JsonValue {
+fn resolve(helper: &mut HelperProcess, handle: Uuid) -> JsonValue {
     let response = helper.request(json!({
         "command": "Resolve",
-        "transaction_id": transaction_id,
+        "handle": handle,
     }));
     assert_eq!(response["event"], "Resolve");
     response
 }
 
 fn seed(helper: &mut HelperProcess, rows: &[(&[u8], &[u8])]) {
-    let transaction_id = Uuid::now_v7();
-    begin(helper, transaction_id, "cross-process seed");
+    let handle = Uuid::now_v7();
+    begin(helper, handle, "cross-process seed");
     for (key, value) in rows {
-        put(helper, transaction_id, key, value, json!("Any"));
+        put(helper, handle, key, value, json!("Any"));
     }
-    assert_eq!(
-        commit(helper, transaction_id, false)["outcome"],
-        "Committed"
-    );
+    assert_eq!(commit(helper, handle, false)["outcome"], "Committed");
 }
 
 fn same_key_cas_case() {
@@ -1269,99 +1263,77 @@ fn range_phantom_case() {
     right.shutdown();
 }
 
+/// A lost commit response is still resolvable from durable evidence.
+///
+/// The resolution is asked of `left`, the process that issued the attempt.
+/// `right` stays in the case because the write has to survive being read by a
+/// separate process, which is the cross-process fact worth checking; it is no
+/// longer asked to adjudicate somebody else's attempt.
 fn response_loss_resolution_case() {
     let (_database, mut left, mut right) = open_pair("cross-process-unknown");
-    let transaction_id = Uuid::now_v7();
-    begin(&mut left, transaction_id, "response-loss commit");
+    let handle = Uuid::now_v7();
+    begin(&mut left, handle, "response-loss commit");
     put(
         &mut left,
-        transaction_id,
+        handle,
         b"unknown/key",
         b"committed",
         json!("Any"),
     );
-    assert_eq!(
-        commit(&mut left, transaction_id, true)["outcome"],
-        "CommitUnknown"
-    );
-    let resolution = resolve(&mut right, transaction_id);
+    assert_eq!(commit(&mut left, handle, true)["outcome"], "CommitUnknown");
+    let resolution = resolve(&mut left, handle);
     assert_eq!(resolution["resolution"], "Committed");
     assert!(
         resolution["revision"]
             .as_str()
             .is_some_and(|value| !value.is_empty())
     );
+    // The row itself is physically durable and visible to the other process.
+    let reader = Uuid::now_v7();
+    begin(&mut right, reader, "response-loss cross-process read");
+    assert_eq!(
+        get(&mut right, reader, b"unknown/key")["value"],
+        hex::encode(b"committed")
+    );
     left.shutdown();
     right.shutdown();
 }
 
-fn transaction_tombstone_reuse_case() {
-    let (_database, mut left, mut right) = open_pair("cross-process-tombstone");
-    let transaction_id = Uuid::now_v7();
-    assert_eq!(
-        resolve(&mut right, transaction_id)["resolution"],
-        "NotCommitted"
-    );
-    begin(&mut left, transaction_id, "tombstoned transaction reuse");
+/// A handle one process opened is meaningless to another.
+///
+/// This replaces the old "tombstoned transaction reuse" case, and the change
+/// feed's ordering case with it. The first asked a second process to resolve an
+/// identifier the first had used and expected a durable `NotCommitted`
+/// tombstone; both halves are gone by construction, because an attempt identity
+/// carries the instance scope that issued it and nothing writes a tombstone for
+/// an identity it never saw. What is still worth pinning is that the second
+/// process says so plainly instead of inventing a verdict.
+fn foreign_handle_is_not_resolvable_case() {
+    let (_database, mut left, mut right) = open_pair("cross-process-foreign-handle");
+    let handle = Uuid::now_v7();
+    begin(&mut left, handle, "foreign handle");
     put(
         &mut left,
-        transaction_id,
-        b"tombstone/key",
-        b"must-not-publish",
+        handle,
+        b"foreign/key",
+        b"committed",
         json!("Any"),
     );
-    assert_ne!(
-        commit(&mut left, transaction_id, false)["outcome"],
-        "Committed"
-    );
-    assert_eq!(
-        resolve(&mut right, transaction_id)["resolution"],
-        "NotCommitted"
-    );
-    left.shutdown();
-    right.shutdown();
-}
+    assert_eq!(commit(&mut left, handle, false)["outcome"], "Committed");
 
-fn change_order_case() {
-    let (_database, mut left, mut right) = open_pair("cross-process-changes");
-    let transaction_id = Uuid::now_v7();
-    begin(&mut left, transaction_id, "ordered change hints");
-    for (key, value) in [
-        (b"changes/z".as_slice(), b"z".as_slice()),
-        (b"changes/a".as_slice(), b"a".as_slice()),
-        (b"changes/m".as_slice(), b"m".as_slice()),
-    ] {
-        put(&mut left, transaction_id, key, value, json!("Any"));
-    }
-    assert_eq!(
-        commit(&mut left, transaction_id, false)["outcome"],
-        "Committed"
-    );
-    let page = right.request(json!({"command": "Poll", "after": null, "page_size": 10}));
-    assert_eq!(page["event"], "Poll");
-    let keys = page["hints"]
-        .as_array()
-        .expect("change hints array")
-        .iter()
-        .map(|hint| hint["key"].as_str().expect("hex change key"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        keys,
-        [b"changes/a", b"changes/m", b"changes/z"]
-            .map(hex::encode)
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-    );
-    let revisions = page["hints"]
-        .as_array()
-        .expect("change hints array")
-        .iter()
-        .map(|hint| hint["revision"].as_str().expect("change revision"))
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(revisions.len(), 1, "one commit must produce one revision");
+    // Same handle value, different process: not a verdict, an error.
+    let response = right.request_unchecked(json!({
+        "command": "Resolve",
+        "handle": handle,
+    }));
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "UnknownAttempt");
+    right.wait_for_failure();
+    assert!(right.safe_stderr().is_empty());
+
+    // The issuing process still answers for its own attempt.
+    assert_eq!(resolve(&mut left, handle)["resolution"], "Committed");
     left.shutdown();
-    right.shutdown();
 }
 
 fn cluster_and_database_mismatch_case() {
@@ -1396,7 +1368,7 @@ fn request_identifier_case() {
     let mut duplicate = HelperProcess::spawn(&database.name);
     duplicate.open("mysql-cross-process-cluster");
     let response =
-        duplicate.send_with_id(1, json!({"command": "Poll", "after": null, "page_size": 1}));
+        duplicate.send_with_id(1, json!({"command": "Resolve", "handle": Uuid::now_v7()}));
     assert_eq!(response["ok"], false);
     assert_eq!(response["code"], "DuplicateId");
     duplicate.wait_for_failure();
@@ -1405,7 +1377,7 @@ fn request_identifier_case() {
     let mut out_of_order = HelperProcess::spawn(&database.name);
     out_of_order.open("mysql-cross-process-cluster");
     let response =
-        out_of_order.send_with_id(3, json!({"command": "Poll", "after": null, "page_size": 1}));
+        out_of_order.send_with_id(3, json!({"command": "Resolve", "handle": Uuid::now_v7()}));
     assert_eq!(response["ok"], false);
     assert_eq!(response["code"], "OutOfOrderId");
     out_of_order.wait_for_failure();

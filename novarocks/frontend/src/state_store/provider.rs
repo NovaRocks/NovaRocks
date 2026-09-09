@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::policy::StateStoreRunPolicy;
 use novarocks_state_store_api::{
     StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
 };
@@ -29,7 +30,13 @@ use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
 pub struct StateStoreHostInput {
     pub cluster_id: String,
     pub provider_id: StateStoreProviderId,
+    /// What the provider will enforce.
     pub limits: StateStoreLimits,
+    /// What this application will do about failures. Separate from `limits`
+    /// on purpose: a storage ceiling and a retry budget are different
+    /// decisions with different owners, and folding them together is what let
+    /// a provider dictate how hard consumers tried.
+    pub run_policy: StateStoreRunPolicy,
 }
 
 /// A provider factory builder supplied by the concrete composition root.

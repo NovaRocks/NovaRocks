@@ -15,44 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::time::Duration;
+//! Running one logical StateStore operation under an application budget.
+//!
+//! Every consumer of durable state goes through here, so attempt counting,
+//! the overall deadline, and what counts as grounds for another try are
+//! decided once. They used to be read out of the provider's limits, which let
+//! storage dictate application policy and let two call sites disagree about
+//! what a "known abort" permitted.
+//!
+//! # Identity is held, not re-derived
+//!
+//! An attempt's identity is issued by the open store instance. A caller that
+//! loses sight of a commit does not reconstruct an id to ask about; it keeps
+//! the [`CommitObservation`] it was handed and asks that. This is why the
+//! failure carrying an unknown outcome carries the observation itself.
 
 use futures::future::BoxFuture;
 use novarocks_state_store_api::{
-    CommitOutcome, CommitReceipt, MAX_RUNNER_ATTEMPTS, StateStore, StateStoreError,
-    StateStoreErrorKind, TransactionId, WriteTransaction,
+    CommitObservation, CommitOutcome, CommitReceipt, StateStore, StateStoreError,
+    StateStoreErrorKind, WriteTransaction,
 };
-use sha2::{Digest, Sha256};
 use tokio::time::{Instant, sleep_until, timeout_at};
-use uuid::Uuid;
 
 use super::metrics::StateStoreMetrics;
-
-const RETRY_BACKOFFS: [Duration; MAX_RUNNER_ATTEMPTS - 1] = [
-    Duration::from_millis(10),
-    Duration::from_millis(20),
-    Duration::from_millis(40),
-    Duration::from_millis(80),
-];
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct OperationId(uuid::Uuid);
-
-impl OperationId {
-    pub fn new_v7() -> Self {
-        Self(uuid::Uuid::now_v7())
-    }
-
-    pub const fn as_uuid(&self) -> &uuid::Uuid {
-        &self.0
-    }
-}
-
-impl From<uuid::Uuid> for OperationId {
-    fn from(value: uuid::Uuid) -> Self {
-        Self(value)
-    }
-}
+use super::policy::StateStoreRunPolicy;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunSuccess<T> {
@@ -60,73 +46,90 @@ pub struct RunSuccess<T> {
     pub receipt: CommitReceipt,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Why one logical operation did not produce a proven commit.
+#[derive(Clone, Debug)]
 pub enum RunFailure {
+    /// The store refused to start a transaction.
     Begin(StateStoreError),
+    /// The transaction body itself failed. No write landed.
     Operation(StateStoreError),
+    /// Every permitted attempt was spent on retryable failures.
     RetryExhausted(StateStoreError),
+    /// The store proved the write can never land.
     DefiniteFailure(StateStoreError),
+    /// The commit may or may not have landed.
+    ///
+    /// The observation addresses the exact attempt in question. Resolving it
+    /// is the only honest way to find out; assuming either answer is a bug,
+    /// and starting fresh work without resolving it risks a double effect.
     CommitUnknown {
-        transaction_id: TransactionId,
+        observation: CommitObservation,
         error: StateStoreError,
     },
+    /// The operation budget ran out.
     DeadlineExceeded,
-}
-
-pub fn derive_transaction_id(operation_id: OperationId, attempt: usize) -> TransactionId {
-    assert!(
-        (1..=MAX_RUNNER_ATTEMPTS).contains(&attempt),
-        "state store runner attempt must be between 1 and 5"
-    );
-
-    let mut digest = Sha256::new();
-    digest.update(operation_id.as_uuid().as_bytes());
-    digest.update((attempt as u32).to_be_bytes());
-    let digest = digest.finalize();
-
-    let mut bytes = [0_u8; 16];
-    bytes[..6].copy_from_slice(&operation_id.as_uuid().as_bytes()[..6]);
-    bytes[6..].copy_from_slice(&digest[..10]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    TransactionId::from(Uuid::from_bytes(bytes))
 }
 
 /// Runs a transaction body that has no externally visible side effects.
 ///
-/// The operation may be replayed from the beginning after a conflict or a
-/// failure known to have happened before commit. Stable request identifiers
-/// must therefore be allocated before calling this function.
+/// The body may be replayed after a conflict, after a failure proven to have
+/// happened before commit, or after admission saturation. Each replay runs
+/// under a *new* attempt: the previous one is proven not to have committed, so
+/// reusing its identity would buy nothing.
+///
+/// # Budget
+///
+/// One absolute deadline is established on entry and covers everything after
+/// it: reservations, the body, the commit, waits, and backoff. It bounds *this*
+/// call and nothing wider: a caller that calls back in starts a new operation
+/// with a new budget.
+///
+/// That is deliberate rather than an oversight, and it is why the bound on a
+/// recovery loop has to live in the caller. Re-entering after an attempt was
+/// *proven* not to have committed is a genuinely new operation and should get a
+/// full budget; re-entering to keep pushing at the same one would spend budgets
+/// without limit, so a caller that replays counts its own replays and stops.
+/// See `MAX_PROVEN_UNCOMMITTED_REPLAYS` in the catalog attachment repository
+/// for the shape that is expected of such a loop.
 ///
 /// # Cancellation safety
 ///
-/// If the future returned by this function is cancelled or dropped, the caller
-/// must treat the operation as possibly committed. The caller must not restart
-/// it with a new [`OperationId`]. Recovery must instead derive or resolve the
-/// known attempt [`TransactionId`] values from the same `OperationId`, for every
-/// attempt up to the store's configured `runner_max_attempts` limit, or perform
-/// an authoritative re-read that establishes the operation's effect.
-///
-/// While the future remains polled, an ordinary commit timeout returns
-/// [`RunFailure::CommitUnknown`] with the active `TransactionId`; the same
-/// recovery rule applies.
+/// If the returned future is dropped, the caller must treat the operation as
+/// possibly committed. Recovery is to resolve the observation for the attempt
+/// in flight, or to perform an authoritative read that establishes the effect.
+/// A dropped future is not evidence that nothing happened.
 pub async fn run_side_effect_free<T, F>(
     store: &dyn StateStore,
     metrics: &StateStoreMetrics,
-    operation_id: OperationId,
+    policy: StateStoreRunPolicy,
     purpose: &str,
     mut operation: F,
 ) -> Result<RunSuccess<T>, RunFailure>
 where
     F: for<'a> FnMut(&'a mut dyn WriteTransaction) -> BoxFuture<'a, Result<T, StateStoreError>>,
 {
-    let deadline = Instant::now() + store.limits().transaction_deadline;
-    let max_attempts = store.limits().runner_max_attempts.min(MAX_RUNNER_ATTEMPTS);
+    let deadline = Instant::now() + policy.operation_timeout();
+    let mut attempts_spent = 0_usize;
 
-    for attempt in 1..=max_attempts {
-        let transaction_id = derive_transaction_id(operation_id, attempt);
+    loop {
+        // Reserving touches no storage, so saturation costs no attempt. It is
+        // still bounded, by the same deadline as everything else.
+        let (write_attempt, observation) = match store.attempts().reserve() {
+            Ok(reserved) => reserved,
+            Err(error) if error.kind() == StateStoreErrorKind::Saturated => {
+                metrics.record_saturated_retry();
+                if !wait_for_retry(deadline, policy.backoff_after(attempts_spent + 1)).await {
+                    return Err(deadline_exceeded(metrics));
+                }
+                continue;
+            }
+            Err(error) => return Err(RunFailure::Begin(error)),
+        };
+
+        attempts_spent += 1;
+
         let mut transaction =
-            match timeout_at(deadline, store.begin_write(transaction_id, purpose)).await {
+            match timeout_at(deadline, store.begin_write(write_attempt, purpose)).await {
                 Ok(Ok(transaction)) => transaction,
                 Ok(Err(error)) => return Err(RunFailure::Begin(error)),
                 Err(_) => return Err(deadline_exceeded(metrics)),
@@ -141,12 +144,17 @@ where
         let outcome = match timeout_at(deadline, transaction.commit()).await {
             Ok(outcome) => outcome,
             Err(_) => {
+                // The commit was dispatched and we stopped watching. That is
+                // exactly the case the observation exists for. Both counters
+                // fire: one says the budget ran out, the other says this
+                // operation ended with nothing proven either way.
                 metrics.record_deadline();
+                metrics.record_unresolved();
                 return Err(RunFailure::CommitUnknown {
-                    transaction_id,
+                    observation,
                     error: StateStoreError::new(
                         StateStoreErrorKind::DeadlineExceeded,
-                        "state store commit exceeded the runner deadline",
+                        "state store commit exceeded the operation budget",
                     ),
                 });
             }
@@ -159,26 +167,28 @@ where
                 return Err(RunFailure::DefiniteFailure(error));
             }
             CommitOutcome::CommitUnknown(error) => {
-                return Err(RunFailure::CommitUnknown {
-                    transaction_id,
-                    error,
-                });
+                metrics.record_unresolved();
+                return Err(RunFailure::CommitUnknown { observation, error });
             }
         };
 
-        if attempt == max_attempts {
+        if attempts_spent >= policy.max_attempts() {
             return Err(RunFailure::RetryExhausted(retry_error));
         }
 
         metrics.record_retry();
-        let wake_at = (Instant::now() + RETRY_BACKOFFS[attempt - 1]).min(deadline);
-        sleep_until(wake_at).await;
-        if Instant::now() >= deadline {
+        if !wait_for_retry(deadline, policy.backoff_after(attempts_spent)).await {
             return Err(deadline_exceeded(metrics));
         }
     }
+}
 
-    unreachable!("state store limits require at least one runner attempt")
+/// Sleeps for the backoff, clamped to the deadline. Returns false when the
+/// budget is spent, so a backoff can never extend an operation.
+async fn wait_for_retry(deadline: Instant, backoff: std::time::Duration) -> bool {
+    let wake_at = (Instant::now() + backoff).min(deadline);
+    sleep_until(wake_at).await;
+    Instant::now() < deadline
 }
 
 fn deadline_exceeded(metrics: &StateStoreMetrics) -> RunFailure {

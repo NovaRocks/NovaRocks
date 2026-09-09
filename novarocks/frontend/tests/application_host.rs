@@ -33,7 +33,7 @@ use novarocks_parser::{
     printer::print_query,
 };
 use novarocks_secret::SecretValue;
-use novarocks_state_store_api::{CommitOutcome, Key, Precondition, TransactionId, Value};
+use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
 use std::sync::Arc;
 use std::time::Duration;
 mod common;
@@ -402,11 +402,10 @@ async fn legacy_maintenance_and_gc_observation_records_do_not_block_host_open() 
         .await
         .expect("configured host must open");
     let store = host.state_store().expect("configured host state store");
+    // Identity is issued by the open instance, never minted by the caller.
+    let (attempt, _observation) = store.attempts().reserve().expect("reserve a write attempt");
     let mut transaction = store
-        .begin_write(
-            TransactionId::from(Uuid::now_v7()),
-            "seed legacy frontend table-maintenance records",
-        )
+        .begin_write(attempt, "seed legacy frontend table-maintenance records")
         .await
         .expect("begin corrupt record write");
     transaction

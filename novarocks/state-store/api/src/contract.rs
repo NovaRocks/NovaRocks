@@ -18,10 +18,10 @@
 use bytes::Bytes;
 use uuid::Uuid;
 
+use super::attempt::{AttemptId, AttemptSupervisor, WriteAttempt};
 use super::error::{StateStoreError, StateStoreErrorKind};
 use super::limits::{MAX_KEY_BYTES, MAX_VALUE_BYTES, StateStoreLimits};
-use super::metrics::StateStoreMetricsSnapshot;
-use super::range::{ChangeCursor, ContinuationToken, RangeRequest};
+use super::range::{ContinuationToken, RangeRequest};
 
 macro_rules! opaque_bytes {
     ($name:ident, $validate:expr) => {
@@ -94,21 +94,6 @@ fn validate_non_empty(bytes: &Bytes, message: &'static str) -> Result<(), StateS
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TransactionId(Uuid);
-
-impl TransactionId {
-    pub const fn as_uuid(&self) -> &Uuid {
-        &self.0
-    }
-}
-
-impl From<Uuid> for TransactionId {
-    fn from(value: Uuid) -> Self {
-        Self(value)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateRecord {
     pub key: Key,
@@ -138,15 +123,8 @@ pub struct StoreIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitReceipt {
-    pub transaction_id: TransactionId,
+    pub attempt: AttemptId,
     pub revision: StoreRevision,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CommitResolution {
-    Committed(CommitReceipt),
-    NotCommitted,
-    Unresolved,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,32 +134,6 @@ pub enum CommitOutcome {
     TransientBeforeCommit(StateStoreError),
     DefiniteFailure(StateStoreError),
     CommitUnknown(StateStoreError),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChangeHint {
-    pub revision: StoreRevision,
-    pub key: Key,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChangePollRequest {
-    pub after: Option<ChangeCursor>,
-    pub page_size: usize,
-}
-
-impl ChangePollRequest {
-    pub fn validate(&self, limits: &StateStoreLimits) -> Result<(), StateStoreError> {
-        validate_page_size(self.page_size, limits.max_page_size)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChangePage {
-    pub hints: Vec<ChangeHint>,
-    pub next_cursor: ChangeCursor,
-    pub high_watermark: StoreRevision,
-    pub resync_required: bool,
 }
 
 pub(crate) fn validate_page_size(page_size: usize, maximum: usize) -> Result<(), StateStoreError> {
@@ -203,7 +155,7 @@ pub trait ReadTransaction: Send {
 
 #[async_trait::async_trait]
 pub trait WriteTransaction: ReadTransaction {
-    fn transaction_id(&self) -> &TransactionId;
+    fn attempt(&self) -> AttemptId;
     async fn put(
         &mut self,
         key: Key,
@@ -218,20 +170,27 @@ pub trait WriteTransaction: ReadTransaction {
 #[async_trait::async_trait]
 pub trait StateStore: Send + Sync {
     fn limits(&self) -> &StateStoreLimits;
-    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot;
+
+    /// Issues write attempts and accounts for their capacity.
+    ///
+    /// A caller reserves here before it may begin a write, so responsibility
+    /// exists before any work does. Observation of an attempt's outcome also
+    /// goes through the handle this hands back, which is why the store itself
+    /// has no "ask about an arbitrary id" method any more.
+    fn attempts(&self) -> &AttemptSupervisor;
+
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError>;
+
+    /// Begins the one write this attempt authorises.
+    ///
+    /// The attempt is consumed: a reservation buys exactly one transaction
+    /// body. Failing before anything is dispatched leaves the attempt provably
+    /// without effect.
     async fn begin_write(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
         purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError>;
-    async fn poll_changes(
-        &self,
-        request: &ChangePollRequest,
-    ) -> Result<ChangePage, StateStoreError>;
+
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError>;
-    async fn resolve_commit(
-        &self,
-        transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError>;
 }

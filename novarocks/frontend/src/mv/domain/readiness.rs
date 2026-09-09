@@ -24,10 +24,24 @@ use crate::mv::domain::repository::{
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
 use crate::mv::process_runtime::{MvTargetReadiness, ProcessRuntime};
 
+/// The synchronous face of an asynchronous MV projection store.
+///
+/// The repository contract is async because its work is durable I/O. Almost
+/// every reader of MV readiness, though, sits inside the `spawn_blocking`
+/// closure that runs SQL statements, or on one of the two dedicated maintenance
+/// threads. Propagating `await` through them would not remove the bridge — it
+/// would move it onto a thread that has to block anyway — and would further
+/// require restructuring statement admission, which belongs to the
+/// query-application and query-preparation work lines rather than here.
+///
+/// So the adaptation lives in this one type, whose job is adaptation, and in no
+/// domain contract. It is a single place to delete once those work lines lift
+/// the surrounding boundaries.
 pub struct MvReadinessPort {
     repository: Arc<dyn MvRepository>,
     projector: MvAcceleratorProjector,
     runtime: Arc<ProcessRuntime>,
+    handle: tokio::runtime::Handle,
 }
 
 /// RAII ownership of the one current-process publication for a target.
@@ -46,11 +60,25 @@ impl Drop for MvRuntimePublicationLease {
 }
 
 impl MvReadinessPort {
-    pub(crate) fn new(repository: Arc<dyn MvRepository>, runtime: Arc<ProcessRuntime>) -> Self {
+    pub(crate) fn new(
+        repository: Arc<dyn MvRepository>,
+        runtime: Arc<ProcessRuntime>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             projector: MvAcceleratorProjector::new(Arc::clone(&repository)),
             repository,
             runtime,
+            handle,
+        }
+    }
+
+    /// Drives one durable MV operation from a synchronous caller. Confined to
+    /// this type on purpose; see the type-level note.
+    fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| self.handle.block_on(future)),
+            Err(_) => self.handle.block_on(future),
         }
     }
 
@@ -60,7 +88,7 @@ impl MvReadinessPort {
         package: &MvLakePackageObservation,
     ) -> Result<(), MvRepositoryError> {
         let target = canonical_target(package);
-        match self.projector.project_once(operation_id, package) {
+        match self.block_on(self.projector.project_once(operation_id, package)) {
             Ok(()) => {
                 self.runtime.set_ready(target);
                 Ok(())
@@ -84,7 +112,7 @@ impl MvReadinessPort {
         catalog: &str,
         reason: String,
     ) -> Result<(), MvRepositoryError> {
-        for projection in self.repository.list_projections()? {
+        for projection in self.block_on(self.repository.list_projections())? {
             let definition = projection.definition;
             if !definition
                 .target_catalog
@@ -118,7 +146,7 @@ impl MvReadinessPort {
                 format!("MV target is unavailable: {reason}"),
             ));
         }
-        self.repository.find_by_target(target)
+        self.block_on(self.repository.find_by_target(target))
     }
 
     /// Enumerate only projections whose current-process readiness permits
@@ -129,8 +157,7 @@ impl MvReadinessPort {
         &self,
     ) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
         let projections = self
-            .repository
-            .list_projections()?
+            .block_on(self.repository.list_projections())?
             .into_iter()
             .filter(|projection| {
                 let target = MvTarget {
@@ -188,8 +215,10 @@ impl MvReadinessPort {
             ));
         }
         let _ = self.load_ready(&target)?;
-        self.repository
-            .list_dependencies_by_downstream(projection.definition.mv_id)
+        self.block_on(
+            self.repository
+                .list_dependencies_by_downstream(projection.definition.mv_id),
+        )
     }
 
     /// Reject a mutation only when a currently consumable downstream MV
@@ -237,14 +266,14 @@ impl MvReadinessPort {
         let Some(loaded) = self.load_ready(target)? else {
             return Ok(false);
         };
-        self.repository.delete_projection(
+        self.block_on(self.repository.delete_projection(
             operation_id,
             DeleteMvProjectionRequest {
                 mv_id: loaded.definition.mv_id,
                 expected_version: loaded.version,
                 expected_source_revision: loaded.definition.source_revision,
             },
-        )
+        ))
     }
 
     pub(crate) fn begin_publication(
@@ -277,6 +306,28 @@ impl MvReadinessPort {
             ));
         }
         Ok(())
+    }
+
+    /// Test/harness-only wipe of the whole current Accelerator family.
+    ///
+    /// Process readiness is deliberately left untouched: the wipe procedure's
+    /// contract is that the runner restarts this FE immediately afterwards, and
+    /// startup observation is the only permitted rebuild path.
+    pub(crate) fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvRepositoryError> {
+        self.block_on(self.repository.wipe_accelerator(operation_id))
+    }
+
+    /// Test/harness-only wipe of one target's rebuildable projection, used by
+    /// the stateless-rebuild round-trip to prove the lake alone can restore it.
+    pub(crate) fn wipe_projection(
+        &self,
+        operation_id: Uuid,
+        target: &MvTarget,
+    ) -> Result<bool, MvRepositoryError> {
+        self.block_on(
+            self.repository
+                .wipe_projection_by_target(operation_id, target),
+        )
     }
 }
 

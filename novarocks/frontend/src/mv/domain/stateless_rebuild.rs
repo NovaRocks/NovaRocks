@@ -42,7 +42,7 @@
 //! W4 lights up the `full` level: instead of only *reading* the lake, the
 //! procedure proves SQLite is a rebuildable cache by clearing the MV's SQLite
 //! records (`drop_by_target`) and rebuilding them purely from the lake
-//! (`rebuild_one_lake_package_if_missing`), confirming the definition
+//! (`rebuild_one_lake_package_if_missing_verified`), confirming the definition
 //! reappears. It then reports `AvailableLevel = full`, `RebuildSource = lake`,
 //! with the descriptor/provenance/waterline hashes derived from the rebuilt
 //! state. Because the clear is destructive, `full` is reached only when the
@@ -55,7 +55,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
-use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvLakePublishedProjection,
 };
@@ -239,8 +239,7 @@ fn split_table_reference(table: &str, current_database: &str) -> Result<(String,
 pub fn execute_typed_novarocks_imv_stateless_rebuild(
     connector_control: &dyn ConnectorControlResolver,
     mv_storage_observation: &dyn MvStorageObservationPort,
-    mv_repository: &dyn MvRepository,
-    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    readiness: &MvReadinessPort,
     statement: &CallStatement,
     current_database: &str,
     connector_context: ConnectorRequestContext,
@@ -258,7 +257,7 @@ pub fn execute_typed_novarocks_imv_stateless_rebuild(
     execute_request_with_context(
         connector_control,
         mv_storage_observation,
-        mv_repository,
+        readiness,
         &req,
         connector_context,
     )
@@ -276,7 +275,7 @@ pub fn execute_typed_novarocks_imv_stateless_rebuild(
 pub(crate) fn execute_request(
     connector_control: &dyn ConnectorControlResolver,
     mv_storage_observation: &dyn MvStorageObservationPort,
-    mv_repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     req: &ImvStatelessRebuildRequest,
 ) -> Result<StatementResult, String> {
     let context =
@@ -284,7 +283,7 @@ pub(crate) fn execute_request(
     execute_request_with_context(
         connector_control,
         mv_storage_observation,
-        mv_repository,
+        readiness,
         req,
         context,
     )
@@ -293,7 +292,7 @@ pub(crate) fn execute_request(
 fn execute_request_with_context(
     connector_control: &dyn ConnectorControlResolver,
     mv_storage_observation: &dyn MvStorageObservationPort,
-    mv_repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     req: &ImvStatelessRebuildRequest,
     connector_context: ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
@@ -336,7 +335,7 @@ fn execute_request_with_context(
     // returns while the old FE remains alive. The runner must then kill/restart
     // that FE; startup observation is the only permitted rebuild path.
     if req.required_level == StatelessLevel::Wipe {
-        mv_repository
+        readiness
             .wipe_accelerator(uuid::Uuid::now_v7())
             .map_err(|error| format!("wipe MV Accelerator family: {error}"))?;
         return Ok(StatementResult::Query(build_rebuild_result(
@@ -360,7 +359,7 @@ fn execute_request_with_context(
         let source_revision = package
             .source_revision()
             .map_err(|error| format!("derive stateless rebuild source revision: {error}"))?;
-        clear_sqlite_and_rebuild_from_lake(mv_repository, &package)?;
+        clear_sqlite_and_rebuild_from_lake(readiness, &package)?;
         let reloaded_table = crate::connector::metadata_load_connector_table_with_planning_lease(
             &exact_lease,
             connector_context.clone(),
@@ -419,11 +418,11 @@ fn execute_request_with_context(
 /// unproven and we fail loud.
 ///
 /// The rebuild is *targeted* at the single observed lake package
-/// (`rebuild_one_lake_package_if_missing`) rather than sweeping every
+/// (`rebuild_one_lake_package_if_missing_verified`) rather than sweeping every
 /// registered catalog via `rebuild_imv_cache_from_lake`, so the probe touches
 /// only its own target.
 fn clear_sqlite_and_rebuild_from_lake(
-    mv_repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     package: &MvLakePackageObservation,
 ) -> Result<(), String> {
     // 1. Confirm the SQLite definition currently exists; the round-trip is only
@@ -433,8 +432,8 @@ fn clear_sqlite_and_rebuild_from_lake(
         database: package.table.namespace.to_string(),
         name: package.table.table.to_string(),
     };
-    let existing = mv_repository
-        .find_by_target(&target)
+    let existing = readiness
+        .load_ready(&target)
         .map_err(|e| format!("look up MV definition before full rebuild failed: {e}"))?;
     let Some(existing) = existing else {
         return Err(format!(
@@ -452,8 +451,8 @@ fn clear_sqlite_and_rebuild_from_lake(
     // records remain intact, and the repository rejects an active refresh.
     // The lake MV table is untouched — exactly the "SQLite forgot, lake
     // remembers" state.
-    let dropped = mv_repository
-        .wipe_projection_by_target(uuid::Uuid::now_v7(), &target)
+    let dropped = readiness
+        .wipe_projection(uuid::Uuid::now_v7(), &target)
         .map_err(|e| format!("clear MV repository definition for full rebuild failed: {e}"))?;
     if !dropped {
         return Err(format!(
@@ -465,15 +464,14 @@ fn clear_sqlite_and_rebuild_from_lake(
     }
 
     // 3. Rebuild the single target MV purely from the lake package.
-    crate::mv::domain::lake_rebuild::rebuild_one_lake_package_if_missing_with_repository(
-        mv_repository,
-        package,
+    crate::mv::domain::lake_rebuild::rebuild_one_lake_package_if_missing_verified(
+        readiness, package,
     )?;
 
     // 4. Confirm the definition reappeared. If it did not, statelessness failed:
     //    the lake package did not carry enough to reconstruct the SQLite record.
-    let rebuilt = mv_repository
-        .find_by_target(&target)
+    let rebuilt = readiness
+        .load_ready(&target)
         .map_err(|e| format!("verify MV definition after full rebuild failed: {e}"))?;
     let Some(rebuilt) = rebuilt else {
         return Err(format!(

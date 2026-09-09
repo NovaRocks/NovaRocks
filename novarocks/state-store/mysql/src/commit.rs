@@ -15,23 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use mysql_async::prelude::Queryable;
 #[cfg(feature = "state-store-test-hooks")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 #[cfg(feature = "state-store-test-hooks")]
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 use tokio::time::{Duration, Instant, timeout_at};
+#[cfg(feature = "state-store-test-hooks")]
 use uuid::Uuid;
 
 use super::client::{MysqlPoolConnection, PoolLifecycle, checkout_hygienic_connection};
-use super::codec::{DurableCommitState, MysqlCodec};
+use super::codec::{
+    COMMIT_STATE_NOT_COMMITTED, COMMIT_STATE_PENDING, DurableCommitState, MysqlCodec,
+    encode_attempt_id,
+};
+use super::runtime::MysqlOperationLease;
 use novarocks_state_store_api::{
-    CommitReceipt, CommitResolution, StateStoreError, StateStoreErrorKind, StoreRevision,
-    TransactionId,
+    AttemptId, AttemptOutcome, CommitReceipt, InDoubtAdjudicator, StateStoreError,
+    StateStoreErrorKind, StoreRevision,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,9 +93,6 @@ static NEXT_COMMIT_HOOK: OnceLock<Mutex<Option<Arc<CommitHook>>>> = OnceLock::ne
 static DELAY_NEXT_RESERVATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "state-store-test-hooks")]
-static DELAY_NEXT_RESOLUTION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "state-store-test-hooks")]
 static FAIL_NEXT_RESERVATION_PREPARE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "state-store-test-hooks")]
@@ -102,22 +104,6 @@ static NEXT_CLEANUP_HOOK: OnceLock<Mutex<Option<Arc<CommitHook>>>> = OnceLock::n
 static NEXT_TERMINALIZE_QUERY_HOOK: OnceLock<Mutex<Option<Arc<CommitHook>>>> = OnceLock::new();
 #[cfg(feature = "state-store-test-hooks")]
 const TERMINALIZE_QUERY_DEADLINE_LAG: Duration = Duration::from_millis(250);
-#[cfg(feature = "state-store-test-hooks")]
-static NEXT_RESOLVE_RESERVATION_RACE_HOOK: OnceLock<
-    Mutex<Option<Arc<ResolveReservationRaceHook>>>,
-> = OnceLock::new();
-
-#[cfg(feature = "state-store-test-hooks")]
-struct ResolveReservationRaceHook {
-    observed: std::sync::atomic::AtomicUsize,
-    both_observed: Notify,
-    release: Semaphore,
-}
-
-#[cfg(feature = "state-store-test-hooks")]
-pub(super) struct ResolveReservationRaceControl {
-    hook: Arc<ResolveReservationRaceHook>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ReservationDecision {
@@ -125,11 +111,18 @@ pub(super) enum ReservationDecision {
     Committed(CommitReceipt),
 }
 
+/// What closing an attempt's reservation proved.
+///
+/// There is deliberately no "unresolved" arm. That arm existed to describe a
+/// pending row bearing somebody else's reservation token; under an issued,
+/// instance-scoped attempt identity no other writer can reach this row, so a
+/// pending row is always this attempt's own and is always closable. A cleanup
+/// that could not read stays an `Err`, which is a different thing and is
+/// classified as an unknown commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum TerminalizeDecision {
     NotCommitted,
     Committed(CommitReceipt),
-    Unresolved,
 }
 
 impl NativeCommitDispatcher for MysqlNativeCommitDispatcher {
@@ -263,11 +256,19 @@ impl NativeCommitDispatcher for MysqlNativeCommitDispatcher {
     }
 }
 
+/// Records that this attempt is about to write, on its own committed
+/// connection.
+///
+/// The ledger row is the attempt's evidence: it exists from here until the
+/// attempt's terminal outcome is published and the evidence is released.
+/// Because an [`AttemptId`] is minted by one open instance and authorises
+/// exactly one transaction body, this row can only ever be written by this
+/// attempt -- there is no second writer to fence out, which is why the
+/// reservation carries no ownership token beyond the primary key itself.
 pub(super) async fn reserve_commit(
     pool: Arc<dyn PoolLifecycle>,
     codec: &MysqlCodec,
-    transaction_id: TransactionId,
-    reservation_token: [u8; 16],
+    attempt: AttemptId,
     deadline: Instant,
 ) -> Result<ReservationDecision, StateStoreError> {
     #[cfg(feature = "state-store-test-hooks")]
@@ -276,7 +277,7 @@ pub(super) async fn reserve_commit(
         return Err(deadline_error());
     }
     let mut connection = begin_serializable(pool.clone(), deadline).await?;
-    let transaction_bytes = codec.encode_uuid(*transaction_id.as_uuid()).to_vec();
+    let attempt_bytes = encode_attempt_id(attempt);
     let decision = async {
         #[cfg(feature = "state-store-test-hooks")]
         if FAIL_NEXT_RESERVATION_PREPARE.swap(false, std::sync::atomic::Ordering::AcqRel) {
@@ -285,41 +286,29 @@ pub(super) async fn reserve_commit(
                 "injected MySQL reservation prepare failure",
             ));
         }
-        let row =
-            read_ledger_for_update(&mut connection, transaction_bytes.clone(), deadline).await?;
+        let row = read_ledger_for_update(&mut connection, attempt_bytes.clone(), deadline).await?;
         match decode_ledger(codec, row)? {
             None => {
-                #[cfg(feature = "state-store-test-hooks")]
-                wait_at_resolve_reservation_race().await;
                 execute(&mut connection, deadline, move |connection| {
                     Box::pin(connection.exec_drop(
                         "INSERT INTO state_store_commits
-                            (transaction_id, state, reservation_token, revision, updated_at_ms)
-                         VALUES (?, ?, ?, NULL, ?)",
-                        (
-                            transaction_bytes,
-                            1_u8,
-                            reservation_token.to_vec(),
-                            now_ms(),
-                        ),
+                            (attempt_id, state, revision, updated_at_ms)
+                         VALUES (?, ?, NULL, ?)",
+                        (attempt_bytes, COMMIT_STATE_PENDING, now_ms()),
                     ))
                 })
                 .await?;
                 Ok(ReservationDecision::Reserved)
             }
-            Some(DurableCommitState::Pending(token)) if token == reservation_token => {
-                Ok(ReservationDecision::Reserved)
+            // A row already under this attempt can only be one this attempt
+            // wrote, so a repeated reservation is the same reservation.
+            Some(DurableCommitState::Pending) => Ok(ReservationDecision::Reserved),
+            Some(DurableCommitState::Committed(revision)) => {
+                Ok(ReservationDecision::Committed(receipt(attempt, revision)?))
             }
-            Some(DurableCommitState::Pending(_)) => Err(StateStoreError::new(
-                StateStoreErrorKind::Conflict,
-                "MySQL commit transaction identifier is already pending",
-            )),
-            Some(DurableCommitState::Committed(revision)) => Ok(ReservationDecision::Committed(
-                receipt(transaction_id, revision)?,
-            )),
             Some(DurableCommitState::NotCommitted) => Err(StateStoreError::new(
                 StateStoreErrorKind::Conflict,
-                "MySQL commit transaction identifier was already terminalized",
+                "MySQL commit attempt was already terminalized",
             )),
         }
     }
@@ -336,15 +325,7 @@ pub(super) async fn reserve_commit(
     let dispatch = dispatch_auxiliary_commit(connection, deadline).await;
     match dispatch.result {
         Ok(()) => Ok(decision),
-        Err(_) => match authoritative_reservation_reload(
-            pool,
-            codec,
-            transaction_id,
-            reservation_token,
-            deadline,
-        )
-        .await
-        {
+        Err(_) => match authoritative_reservation_reload(pool, codec, attempt, deadline).await {
             Ok(decision) => Ok(decision),
             Err(_) => Err(commit_unknown()),
         },
@@ -354,33 +335,31 @@ pub(super) async fn reserve_commit(
 async fn authoritative_reservation_reload(
     pool: Arc<dyn PoolLifecycle>,
     codec: &MysqlCodec,
-    transaction_id: TransactionId,
-    reservation_token: [u8; 16],
+    attempt: AttemptId,
     deadline: Instant,
 ) -> Result<ReservationDecision, StateStoreError> {
-    match read_ledger(
-        pool,
-        codec,
-        codec.encode_uuid(*transaction_id.as_uuid()).to_vec(),
-        deadline,
-    )
-    .await?
-    {
-        Some(DurableCommitState::Pending(token)) if token == reservation_token => {
-            Ok(ReservationDecision::Reserved)
+    match read_ledger(pool, codec, encode_attempt_id(attempt), deadline).await? {
+        Some(DurableCommitState::Pending) => Ok(ReservationDecision::Reserved),
+        Some(DurableCommitState::Committed(revision)) => {
+            Ok(ReservationDecision::Committed(receipt(attempt, revision)?))
         }
-        Some(DurableCommitState::Committed(revision)) => Ok(ReservationDecision::Committed(
-            receipt(transaction_id, revision)?,
-        )),
         _ => Err(commit_unknown()),
     }
 }
 
+/// Closes an attempt's reservation once its data transaction provably never
+/// dispatched.
+///
+/// An absent row means the reservation itself never became durable, so the
+/// attempt left no trace at all; that is a proven denial and, deliberately,
+/// nothing is written for it. The old code inserted a tombstone here so a
+/// later caller could ask about an arbitrary identifier; no such caller can
+/// exist now, and writing a row only to delete it again would grow the ledger
+/// for nobody's benefit.
 pub(super) async fn terminalize_undispatched(
     pool: Arc<dyn PoolLifecycle>,
     codec: &MysqlCodec,
-    transaction_id: TransactionId,
-    reservation_token: [u8; 16],
+    attempt: AttemptId,
     deadline: Instant,
 ) -> Result<TerminalizeDecision, StateStoreError> {
     #[cfg(feature = "state-store-test-hooks")]
@@ -391,44 +370,30 @@ pub(super) async fn terminalize_undispatched(
         }
     }
     let mut connection = begin_serializable(pool, deadline).await?;
-    let transaction_bytes = codec.encode_uuid(*transaction_id.as_uuid()).to_vec();
+    let attempt_bytes = encode_attempt_id(attempt);
     let apply: Result<(TerminalizeDecision, bool), StateStoreError> = async {
-        let row =
-            read_ledger_for_update(&mut connection, transaction_bytes.clone(), deadline).await?;
+        let row = read_ledger_for_update(&mut connection, attempt_bytes.clone(), deadline).await?;
         let decision = match decode_ledger(codec, row)? {
-            None => {
-                execute(&mut connection, deadline, move |connection| {
-                    Box::pin(connection.exec_drop(
-                        "INSERT INTO state_store_commits
-                            (transaction_id, state, reservation_token, revision, updated_at_ms)
-                         VALUES (?, ?, NULL, NULL, ?)",
-                        (transaction_bytes, 3_u8, now_ms()),
-                    ))
-                })
-                .await?;
-                (TerminalizeDecision::NotCommitted, true)
-            }
-            Some(DurableCommitState::Pending(token)) if token == reservation_token => {
+            None => (TerminalizeDecision::NotCommitted, false),
+            Some(DurableCommitState::Pending) => {
                 execute(&mut connection, deadline, move |connection| {
                     Box::pin(connection.exec_drop(
                         "UPDATE state_store_commits
-                         SET state = ?, reservation_token = NULL, revision = NULL, updated_at_ms = ?
-                         WHERE transaction_id = ? AND state = ? AND reservation_token = ?",
+                         SET state = ?, revision = NULL, updated_at_ms = ?
+                         WHERE attempt_id = ? AND state = ?",
                         (
-                            3_u8,
+                            COMMIT_STATE_NOT_COMMITTED,
                             now_ms(),
-                            transaction_bytes,
-                            1_u8,
-                            reservation_token.to_vec(),
+                            attempt_bytes,
+                            COMMIT_STATE_PENDING,
                         ),
                     ))
                 })
                 .await?;
                 (TerminalizeDecision::NotCommitted, true)
             }
-            Some(DurableCommitState::Pending(_)) => (TerminalizeDecision::Unresolved, false),
             Some(DurableCommitState::Committed(revision)) => (
-                TerminalizeDecision::Committed(receipt(transaction_id, revision)?),
+                TerminalizeDecision::Committed(receipt(attempt, revision)?),
                 false,
             ),
             Some(DurableCommitState::NotCommitted) => (TerminalizeDecision::NotCommitted, false),
@@ -452,6 +417,27 @@ pub(super) async fn terminalize_undispatched(
     }
 }
 
+/// Deletes one attempt's evidence.
+///
+/// This is the only statement that shrinks the ledger. Without it the commit
+/// table is append-only for the life of the database, which is exactly what
+/// the previous design left behind.
+async fn delete_evidence(
+    pool: Arc<dyn PoolLifecycle>,
+    attempt: AttemptId,
+    deadline: Instant,
+) -> Result<(), StateStoreError> {
+    let attempt_bytes = encode_attempt_id(attempt);
+    let mut connection = checkout_hygienic_connection(pool, deadline).await?;
+    execute(&mut connection, deadline, move |connection| {
+        Box::pin(connection.exec_drop(
+            "DELETE FROM state_store_commits WHERE attempt_id = ?",
+            (attempt_bytes,),
+        ))
+    })
+    .await
+}
+
 #[cfg(feature = "state-store-test-hooks")]
 fn take_cleanup_hook() -> Option<Arc<CommitHook>> {
     NEXT_CLEANUP_HOOK
@@ -461,82 +447,26 @@ fn take_cleanup_hook() -> Option<Arc<CommitHook>> {
         .take()
 }
 
-pub(super) async fn resolve_commit(
-    pool: Arc<dyn PoolLifecycle>,
+pub(super) fn decode_ledger(
     codec: &MysqlCodec,
-    transaction_id: &TransactionId,
-    deadline: Instant,
-) -> Result<CommitResolution, StateStoreError> {
-    #[cfg(feature = "state-store-test-hooks")]
-    if DELAY_NEXT_RESOLUTION.swap(false, std::sync::atomic::Ordering::AcqRel) {
-        tokio::time::sleep_until(deadline + Duration::from_millis(10)).await;
-        return Err(deadline_error());
-    }
-    let transaction_bytes = codec.encode_uuid(*transaction_id.as_uuid()).to_vec();
-    if let Some(state) =
-        read_ledger(pool.clone(), codec, transaction_bytes.clone(), deadline).await?
-    {
-        return resolution(*transaction_id, state);
-    }
-
-    let mut connection = begin_serializable(pool, deadline).await?;
-    let state: Result<DurableCommitState, StateStoreError> = async {
-        let row =
-            read_ledger_for_update(&mut connection, transaction_bytes.clone(), deadline).await?;
-        match decode_ledger(codec, row)? {
-            Some(state) => Ok(state),
-            None => {
-                #[cfg(feature = "state-store-test-hooks")]
-                wait_at_resolve_reservation_race().await;
-                execute(&mut connection, deadline, move |connection| {
-                    Box::pin(connection.exec_drop(
-                        "INSERT INTO state_store_commits
-                            (transaction_id, state, reservation_token, revision, updated_at_ms)
-                         VALUES (?, ?, NULL, NULL, ?)",
-                        (transaction_bytes, 3_u8, now_ms()),
-                    ))
-                })
-                .await?;
-                Ok(DurableCommitState::NotCommitted)
-            }
-        }
-    }
-    .await;
-    let state = match state {
-        Ok(state) => state,
-        Err(error) => {
-            if error.kind() == StateStoreErrorKind::DeadlineExceeded {
-                return Err(error);
-            }
-            return Err(dispose_active_error(connection, deadline, error).await);
-        }
-    };
-    dispatch_auxiliary_commit(connection, deadline)
-        .await
-        .result?;
-    resolution(*transaction_id, state)
-}
-
-fn decode_ledger(
-    codec: &MysqlCodec,
-    row: Option<(u8, Option<Vec<u8>>, Option<u64>)>,
+    row: Option<(u8, Option<u64>)>,
 ) -> Result<Option<DurableCommitState>, StateStoreError> {
-    row.map(|(state, token, revision)| codec.decode_commit_state(state, token.as_deref(), revision))
+    row.map(|(state, revision)| codec.decode_commit_state(state, revision))
         .transpose()
 }
 
 async fn read_ledger(
     pool: Arc<dyn PoolLifecycle>,
     codec: &MysqlCodec,
-    transaction_bytes: Vec<u8>,
+    attempt_bytes: Vec<u8>,
     deadline: Instant,
 ) -> Result<Option<DurableCommitState>, StateStoreError> {
     let mut connection = checkout_hygienic_connection(pool, deadline).await?;
     let row = execute(&mut connection, deadline, move |connection| {
         Box::pin(connection.exec_first(
-            "SELECT state, reservation_token, revision
-             FROM state_store_commits WHERE transaction_id = ?",
-            (transaction_bytes,),
+            "SELECT state, revision
+             FROM state_store_commits WHERE attempt_id = ?",
+            (attempt_bytes,),
         ))
     })
     .await?;
@@ -545,9 +475,9 @@ async fn read_ledger(
 
 async fn read_ledger_for_update(
     connection: &mut MysqlPoolConnection,
-    transaction_bytes: Vec<u8>,
+    attempt_bytes: Vec<u8>,
     deadline: Instant,
-) -> Result<Option<(u8, Option<Vec<u8>>, Option<u64>)>, StateStoreError> {
+) -> Result<Option<(u8, Option<u64>)>, StateStoreError> {
     #[cfg(feature = "state-store-test-hooks")]
     let terminalize_query_hook = take_terminalize_query_hook();
     #[cfg(feature = "state-store-test-hooks")]
@@ -583,9 +513,9 @@ async fn read_ledger_for_update(
             }
             connection
                 .exec_first(
-                    "SELECT state, reservation_token, revision
-                     FROM state_store_commits WHERE transaction_id = ? FOR UPDATE",
-                    (transaction_bytes,),
+                    "SELECT state, revision
+                     FROM state_store_commits WHERE attempt_id = ? FOR UPDATE",
+                    (attempt_bytes,),
                 )
                 .await
         })
@@ -692,23 +622,9 @@ async fn dispose_active_error(
     }
 }
 
-fn resolution(
-    transaction_id: TransactionId,
-    state: DurableCommitState,
-) -> Result<CommitResolution, StateStoreError> {
-    match state {
-        DurableCommitState::Pending(_) => Ok(CommitResolution::Unresolved),
-        DurableCommitState::Committed(revision) => Ok(CommitResolution::Committed(receipt(
-            transaction_id,
-            revision,
-        )?)),
-        DurableCommitState::NotCommitted => Ok(CommitResolution::NotCommitted),
-    }
-}
-
-fn receipt(transaction_id: TransactionId, revision: u64) -> Result<CommitReceipt, StateStoreError> {
+pub(super) fn receipt(attempt: AttemptId, revision: u64) -> Result<CommitReceipt, StateStoreError> {
     Ok(CommitReceipt {
-        transaction_id,
+        attempt,
         revision: StoreRevision::try_from(bytes::Bytes::copy_from_slice(&revision.to_be_bytes()))?,
     })
 }
@@ -720,10 +636,6 @@ fn now_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
-}
-
-pub(super) fn new_reservation_token() -> [u8; 16] {
-    *Uuid::new_v4().as_bytes()
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -762,19 +674,14 @@ pub(super) async fn auxiliary_native_error_rolls_back_for_test(
     .await?
     .ok_or_else(corruption)?;
     let marker = Uuid::new_v4();
-    let revision = u64::from_be_bytes(
-        marker.as_bytes()[..8]
-            .try_into()
-            .map_err(|_| corruption())?,
-    );
     let marker_bytes = marker.as_bytes().to_vec();
     execute(&mut connection, deadline, {
         let marker_bytes = marker_bytes.clone();
         move |connection| {
             Box::pin(connection.exec_drop(
-                "INSERT INTO state_store_changes (revision, sequence, key_bytes)
+                "INSERT INTO state_store_kv (key_bytes, value_bytes, version_bytes)
                  VALUES (?, ?, ?)",
-                (revision, 0_u32, marker_bytes),
+                (marker_bytes, b"rollback-probe".to_vec(), vec![0_u8; 12]),
             ))
         }
     })
@@ -792,7 +699,7 @@ pub(super) async fn auxiliary_native_error_rolls_back_for_test(
     let state: Option<(u64, u64)> = execute(&mut connection, deadline, move |connection| {
         Box::pin(connection.exec_first(
             "SELECT CONNECTION_ID(), COUNT(*)
-             FROM state_store_changes WHERE key_bytes = ?",
+             FROM state_store_kv WHERE key_bytes = ?",
             (marker_bytes,),
         ))
     })
@@ -831,11 +738,6 @@ fn take_commit_hook() -> Option<Arc<CommitHook>> {
 #[cfg(feature = "state-store-test-hooks")]
 pub(super) fn delay_next_reservation() {
     DELAY_NEXT_RESERVATION.store(true, std::sync::atomic::Ordering::Release);
-}
-
-#[cfg(feature = "state-store-test-hooks")]
-pub(super) fn delay_next_resolution() {
-    DELAY_NEXT_RESOLUTION.store(true, std::sync::atomic::Ordering::Release);
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -892,16 +794,15 @@ fn take_terminalize_query_hook() -> Option<Arc<CommitHook>> {
 #[cfg(feature = "state-store-test-hooks")]
 pub(super) async fn hold_ledger_lock_for_test(
     pool: Arc<dyn PoolLifecycle>,
-    transaction_id: TransactionId,
+    attempt_bytes: Vec<u8>,
     deadline: Instant,
 ) -> Result<MysqlPoolConnection, StateStoreError> {
     let mut connection = begin_serializable(pool, deadline).await?;
-    let transaction_bytes = transaction_id.as_uuid().as_bytes().to_vec();
     let row: Option<u8> = execute(&mut connection, deadline, move |connection| {
         Box::pin(connection.exec_first(
             "SELECT state FROM state_store_commits
-             WHERE transaction_id = ? FOR UPDATE",
-            (transaction_bytes,),
+             WHERE attempt_id = ? FOR UPDATE",
+            (attempt_bytes,),
         ))
     })
     .await?;
@@ -920,79 +821,6 @@ pub(super) async fn release_ledger_lock_for_test(
     deadline: Instant,
 ) -> Result<(), StateStoreError> {
     rollback_connection(connection, deadline).await
-}
-
-#[cfg(feature = "state-store-test-hooks")]
-pub(super) fn arm_resolve_reservation_race() -> ResolveReservationRaceControl {
-    let hook = Arc::new(ResolveReservationRaceHook {
-        observed: std::sync::atomic::AtomicUsize::new(0),
-        both_observed: Notify::new(),
-        release: Semaphore::new(0),
-    });
-    *NEXT_RESOLVE_RESERVATION_RACE_HOOK
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&hook));
-    ResolveReservationRaceControl { hook }
-}
-
-#[cfg(feature = "state-store-test-hooks")]
-async fn wait_at_resolve_reservation_race() {
-    let hook = NEXT_RESOLVE_RESERVATION_RACE_HOOK
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    let Some(hook) = hook else {
-        return;
-    };
-    if hook
-        .observed
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-        == 1
-    {
-        hook.both_observed.notify_one();
-    }
-    let permit = hook
-        .release
-        .acquire()
-        .await
-        .expect("resolve/reservation race semaphore must stay open");
-    permit.forget();
-}
-
-#[cfg(feature = "state-store-test-hooks")]
-impl ResolveReservationRaceControl {
-    pub(super) async fn wait_both_observed(&self) {
-        while self
-            .hook
-            .observed
-            .load(std::sync::atomic::Ordering::Acquire)
-            < 2
-        {
-            self.hook.both_observed.notified().await;
-        }
-    }
-
-    pub(super) fn release(&self) {
-        self.hook.release.add_permits(2);
-    }
-}
-
-#[cfg(feature = "state-store-test-hooks")]
-impl Drop for ResolveReservationRaceControl {
-    fn drop(&mut self) {
-        let mut armed = NEXT_RESOLVE_RESERVATION_RACE_HOOK
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if armed
-            .as_ref()
-            .is_some_and(|armed| Arc::ptr_eq(armed, &self.hook))
-        {
-            *armed = None;
-        }
-    }
 }
 
 #[cfg(feature = "state-store-test-hooks")]
@@ -1061,4 +889,168 @@ const fn corruption() -> StateStoreError {
         StateStoreErrorKind::Corruption,
         "MySQL durable commit state is malformed",
     )
+}
+
+/// Bound on how many evidence rows may wait for a retried delete before the
+/// oldest is abandoned. A dropped entry leaks one row; it never affects a
+/// verdict, because a verdict is published before its evidence is released.
+const MAX_DEFERRED_EVIDENCE_RELEASES: usize = 256;
+
+/// MySQL's in-doubt callback and evidence owner.
+///
+/// The ledger row for an attempt *is* the evidence. This type is the only
+/// thing that reads it on behalf of the supervisor and the only thing that
+/// deletes it.
+///
+/// # Why absence is never a denial
+///
+/// A row is missing when the reservation never became durable, when the
+/// evidence was already released, or when this instance simply cannot read
+/// right now. None of those prove the write did not land, so every one of them
+/// answers [`AttemptOutcome::Unresolved`]. Only a durable `Committed` or
+/// `NotCommitted` row is proof. The provider used to answer `NotCommitted` for
+/// an unknown identifier -- and write a tombstone to make that answer
+/// self-fulfilling -- which is precisely the lie the attempt contract exists
+/// to prevent.
+pub(super) struct MysqlEvidence {
+    pool: Arc<dyn PoolLifecycle>,
+    operations: MysqlOperationLease,
+    codec: MysqlCodec,
+    deadline_budget: Duration,
+    /// Releases that failed, plus terminals decided by adjudication whose
+    /// evidence the supervisor will never ask about again. Drained on the next
+    /// evidence operation, which is strictly after the decision that queued
+    /// them was published.
+    deferred: Mutex<std::collections::VecDeque<AttemptId>>,
+}
+
+impl MysqlEvidence {
+    pub(super) fn new(
+        pool: Arc<dyn PoolLifecycle>,
+        operations: MysqlOperationLease,
+        codec: MysqlCodec,
+        deadline_budget: Duration,
+    ) -> Self {
+        Self {
+            pool,
+            operations,
+            codec,
+            deadline_budget,
+            deferred: Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        Instant::now() + self.deadline_budget
+    }
+
+    fn defer(&self, attempt: AttemptId) {
+        let mut deferred = self
+            .deferred
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if deferred.len() >= MAX_DEFERRED_EVIDENCE_RELEASES {
+            let abandoned = deferred.pop_front();
+            tracing::warn!(
+                provider = "mysql",
+                abandoned = abandoned.map(|attempt| attempt.to_string()),
+                "MySQL evidence release backlog is full; one commit ledger row is left behind"
+            );
+        }
+        deferred.push_back(attempt);
+    }
+
+    fn take_deferred(&self) -> Option<AttemptId> {
+        self.deferred
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+    }
+
+    /// Best-effort retry of releases that could not be completed earlier.
+    ///
+    /// Stops at the first failure and re-queues, so a store whose database is
+    /// unreachable does not spin.
+    async fn drain_deferred(&self) {
+        while let Some(attempt) = self.take_deferred() {
+            if delete_evidence(Arc::clone(&self.pool), attempt, self.deadline())
+                .await
+                .is_err()
+            {
+                self.defer(attempt);
+                return;
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl InDoubtAdjudicator for MysqlEvidence {
+    async fn adjudicate(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+        let Ok(_operation) = self.operations.acquire() else {
+            // A stopping runtime cannot read, and cannot therefore deny.
+            return Ok(AttemptOutcome::Unresolved);
+        };
+        self.drain_deferred().await;
+        let state = match read_ledger(
+            Arc::clone(&self.pool),
+            &self.codec,
+            encode_attempt_id(attempt),
+            self.deadline(),
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::debug!(
+                    provider = "mysql",
+                    %error,
+                    "MySQL could not read commit evidence; the attempt stays unresolved"
+                );
+                return Ok(AttemptOutcome::Unresolved);
+            }
+        };
+        match state {
+            // Released, or never reserved. Either way this store can prove
+            // nothing about the attempt.
+            None => Ok(AttemptOutcome::Unresolved),
+            // The data transaction may still be in flight on another
+            // connection.
+            Some(DurableCommitState::Pending) => Ok(AttemptOutcome::Unresolved),
+            Some(DurableCommitState::Committed(revision)) => {
+                let receipt = receipt(attempt, revision)?;
+                self.defer(attempt);
+                Ok(AttemptOutcome::Committed(receipt))
+            }
+            Some(DurableCommitState::NotCommitted) => {
+                self.defer(attempt);
+                Ok(AttemptOutcome::NotCommitted)
+            }
+        }
+    }
+
+    async fn release_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
+        let _operation = self.operations.acquire()?;
+        self.drain_deferred().await;
+        delete_evidence(Arc::clone(&self.pool), attempt, self.deadline()).await
+    }
+}
+
+/// Releases an attempt's evidence from the path that witnessed its terminal.
+///
+/// The supervisor only drives [`InDoubtAdjudicator::release_evidence`] for
+/// attempts that were abandoned mid-flight, so a provider that waits for it
+/// grows its ledger without bound. Every witnessed terminal releases here
+/// instead, immediately after the outcome is published.
+pub(super) async fn release_witnessed_evidence(evidence: &MysqlEvidence, attempt: AttemptId) {
+    if let Err(error) = evidence.release_evidence(attempt).await {
+        // The verdict is already published, so this is garbage rather than a
+        // correctness problem: retry it on the next evidence operation.
+        tracing::warn!(
+            provider = "mysql",
+            %error,
+            "MySQL could not release commit evidence; the row is queued for retry"
+        );
+        evidence.defer(attempt);
+    }
 }

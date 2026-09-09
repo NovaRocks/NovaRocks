@@ -58,7 +58,7 @@ use uuid::Uuid;
 
 use crate::catalog_attachment::{
     CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
-    CatalogAttachmentRepository,
+    CatalogAttachmentRepository, CatalogAttachmentWakeupSignal,
 };
 use crate::connector::ConnectorControlHost;
 
@@ -267,6 +267,17 @@ impl FrontendCatalogApplicationPort {
                 "this frontend has no configured catalog desired-state source",
             )
         })
+    }
+
+    /// A signal that fires when this process commits a desired-state write.
+    ///
+    /// `None` when the configured source has no writes of ours to announce
+    /// (see [`CatalogDesiredStateSource::attachment_wakeup_signal`]) or when
+    /// this frontend has no source at all. The reconciler that consumes it
+    /// owns a periodic sweep either way, so `None` costs latency, never
+    /// correctness.
+    pub(crate) fn attachment_wakeup_signal(&self) -> Option<CatalogAttachmentWakeupSignal> {
+        self.source.as_ref()?.attachment_wakeup_signal()
     }
 
     /// A complete desired-state projection plus every still-draining local
@@ -1521,6 +1532,147 @@ mod tests {
             .expect("same permanent key remains suppressed");
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Counts materializations and hands back a live control binding.
+    struct CountingRoleFactory {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl novarocks_spi::connector::ConnectorControlRoleBindingFactory for CountingRoleFactory {
+        fn provider_id(&self) -> novarocks_spi::connector::ConnectorProviderId {
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static provider ID")
+        }
+
+        fn normalize_and_validate(
+            &self,
+            properties: novarocks_spi::connector::CatalogProperties,
+        ) -> Result<
+            NormalizedCatalogProperties,
+            novarocks_spi::connector::ConnectorMaterializationError,
+        > {
+            NormalizedCatalogProperties::try_new(properties).map_err(|detail| {
+                novarocks_spi::connector::ConnectorMaterializationError::new(
+                    novarocks_spi::connector::ConnectorMaterializationErrorClass::InvalidDefinition,
+                    ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    detail,
+                )
+            })
+        }
+
+        fn materialize(
+            &self,
+            properties: NormalizedCatalogProperties,
+            _context: MaterializationContext,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<
+                novarocks_spi::connector::ConnectorControlRoleBinding,
+                novarocks_spi::connector::ConnectorMaterializationError,
+            >,
+        > {
+            use futures::FutureExt;
+
+            // Distinct per call: reusing an incarnation would trip the
+            // retired-generation guard and hide a resubmission behind an
+            // unrelated failure.
+            let incarnation = u8::try_from(self.calls.fetch_add(1, Ordering::SeqCst) % 250)
+                .expect("incarnation")
+                + 1;
+            async move {
+                let control = crate::connector::control_host::tests::test_control_binding_for(
+                    properties.handle().catalog_name().clone(),
+                    incarnation,
+                )
+                .with_catalog_properties(properties.as_catalog_properties().clone())
+                .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
+                novarocks_spi::connector::ConnectorControlRoleBinding::try_new(
+                    properties,
+                    Arc::new(control),
+                    None,
+                    None,
+                )
+                .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)
+            }
+            .boxed()
+        }
+    }
+
+    /// A reconcile that finds the catalog it already serves must do nothing.
+    ///
+    /// Every reconcile round is a complete enumeration now, and the periodic
+    /// sweep runs one whether or not anything changed. Without this short
+    /// circuit each sweep would resubmit every catalog to its provider and
+    /// mint a fresh control generation for it — a provider call per catalog
+    /// per round, for no change, and a generation churn that briefly makes
+    /// healthy catalogs unavailable.
+    ///
+    /// The guard has to stay conditional, so the second half asserts the case
+    /// it must *not* suppress: once the projection is gone, the same entry is
+    /// materialized again.
+    #[tokio::test]
+    async fn re_materializing_an_already_serving_catalog_is_a_no_op() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let control = Arc::new(
+            ConnectorControlHost::with_role_factories(vec![Arc::new(CountingRoleFactory {
+                calls: Arc::clone(&calls),
+            })])
+            .expect("role factory host"),
+        );
+        let port = Arc::new(FrontendCatalogApplicationPort::unavailable(
+            Arc::clone(&control),
+            crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
+            tokio::runtime::Handle::current(),
+        ));
+        let entry = scheduler_entry("catalog.steady");
+        let instance_id = entry.config().instance_id().clone();
+
+        port.materialize_entry(
+            entry.clone(),
+            CatalogDesiredStateSourceMode::DynamicStateStore,
+        );
+        // `observation` rather than `admit_catalog`: the latter refuses first
+        // on "this frontend has no configured desired-state source", which is
+        // a property of this source-free fixture and not of the projection
+        // state the suppression guard actually reads.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(port.observation(&instance_id), CatalogAdmission::Ready(_)) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the first materialization installs a Ready projection");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        for _ in 0..5 {
+            port.materialize_entry(
+                entry.clone(),
+                CatalogDesiredStateSourceMode::DynamicStateStore,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an unchanged, already-serving catalog must not be resubmitted once per round"
+        );
+        assert!(
+            matches!(port.observation(&instance_id), CatalogAdmission::Ready(_)),
+            "and it must still be serving"
+        );
+
+        // The suppression is a function of what is installed, not of what has
+        // been seen: with the projection retired, the same entry materializes.
+        port.retire_projection(&instance_id);
+        port.materialize_entry(entry, CatalogDesiredStateSourceMode::DynamicStateStore);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a retired projection must be materialized again");
     }
 
     #[test]

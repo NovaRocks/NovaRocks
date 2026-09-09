@@ -201,7 +201,7 @@ fn decode_record(
     Ok(StateRecord {
         key: Key::try_from(Bytes::copy_from_slice(logical_key))?,
         value: Value::try_from(Bytes::from(decoded.payload))?,
-        version: VersionToken::try_from(Bytes::copy_from_slice(&decoded.transaction_id))?,
+        version: VersionToken::try_from(Bytes::copy_from_slice(&decoded.attempt_tag))?,
     })
 }
 
@@ -268,6 +268,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::codec::ATTEMPT_TAG_BYTES;
     use novarocks_state_store_api::{KeyRange, Precondition};
 
     fn key(value: &'static [u8]) -> Key {
@@ -312,12 +313,14 @@ mod tests {
 
     #[test]
     fn physical_record_decoder_preserves_arbitrary_binary() {
-        let codec = KeyspaceCodec::new(Uuid::from_bytes([0x33; 16]));
+        let codec = KeyspaceCodec::new(Uuid::from_bytes([0x33; 16]), Uuid::from_bytes([0x44; 16]));
         let logical = [0x00, 0xff, 0x01];
-        let value = codec.record_value([0x44; 16], &[0xff, 0x00]);
+        let attempt_tag = [0x44; ATTEMPT_TAG_BYTES];
+        let value = codec.record_value(attempt_tag, &[0xff, 0x00]);
         let record = decode_record(&codec, &codec.record_key(&logical), &value).expect("record");
         assert_eq!(record.key.as_bytes(), logical);
         assert_eq!(record.value.as_bytes(), [0xff, 0x00]);
-        assert_eq!(record.version.as_bytes(), [0x44; 16]);
+        // A persisted version is the writing attempt's tag, nothing else.
+        assert_eq!(record.version.as_bytes(), attempt_tag);
     }
 }

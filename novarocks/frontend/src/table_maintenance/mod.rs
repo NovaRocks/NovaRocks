@@ -39,6 +39,7 @@ use crate::query_execution::maintenance::{
     MaintenanceStatementResult, OptimizeSubmission, TableMaintenanceEngine,
     TableMaintenanceService,
 };
+use crate::state_store::StateStoreRunPolicy;
 use crate::workload_lifecycle::FrontendServingLifecycle;
 
 use self::activity::{MaintenanceActivityFamily, TableMaintenanceActivity};
@@ -81,17 +82,24 @@ pub struct FrontendTableMaintenanceService {
 }
 
 impl FrontendTableMaintenanceService {
-    pub async fn open(store: Option<Arc<dyn StateStore>>, runtime: Handle) -> Result<Self, String> {
-        Self::open_inner(store, runtime).await
+    /// Opens the service.
+    ///
+    /// The store and the policy that governs its use arrive together, so a
+    /// half-configured owner holding one without the other cannot be built.
+    pub async fn open(
+        durable: Option<(Arc<dyn StateStore>, StateStoreRunPolicy)>,
+        runtime: Handle,
+    ) -> Result<Self, String> {
+        Self::open_inner(durable, runtime).await
     }
 
     async fn open_inner(
-        store: Option<Arc<dyn StateStore>>,
+        durable: Option<(Arc<dyn StateStore>, StateStoreRunPolicy)>,
         runtime: Handle,
     ) -> Result<Self, String> {
-        let gc_observations = match store {
-            Some(store) => Some(Arc::new(
-                GcOwnedRefObservationAccelerator::open(store)
+        let gc_observations = match durable {
+            Some((store, policy)) => Some(Arc::new(
+                GcOwnedRefObservationAccelerator::open(store, policy)
                     .await
                     .map_err(|error| {
                         format!(
@@ -134,7 +142,7 @@ impl FrontendTableMaintenanceService {
         }
     }
 
-    fn execute_user_action(
+    async fn execute_user_action(
         &self,
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
@@ -144,7 +152,7 @@ impl FrontendTableMaintenanceService {
         engine.reject_user_action_on_mv(&target)?;
         let outcome = match action {
             ParsedMaintenanceAction::RemoveOrphanFiles { older_than_ms } => {
-                self.execute_cleanup(engine, target, older_than_ms)?
+                self.execute_cleanup(engine, target, older_than_ms).await?
             }
             ParsedMaintenanceAction::RewriteDataFiles { .. } => {
                 let _permit = self
@@ -211,7 +219,7 @@ impl FrontendTableMaintenanceService {
         Ok((now_ms, safe_age_ms))
     }
 
-    fn execute_cleanup(
+    async fn execute_cleanup(
         &self,
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
@@ -242,8 +250,9 @@ impl FrontendTableMaintenanceService {
             return Err("cleanup discovery mixed owned-ref and object candidates".to_string());
         }
         let session = if owned {
-            let selection =
-                self.observe_mature_owned_refs(observations, &candidates, now_ms, safe_age_ms)?;
+            let selection = self
+                .observe_mature_owned_refs(observations, &candidates, now_ms, safe_age_ms)
+                .await?;
             if let Err(error) = engine.finalize_cleanup_terminal(&discovery) {
                 tracing::warn!(%error, "orphan cleanup discovery finalization failed");
             }
@@ -286,7 +295,7 @@ impl FrontendTableMaintenanceService {
         })
     }
 
-    fn observe_mature_owned_refs(
+    async fn observe_mature_owned_refs(
         &self,
         observations: &GcOwnedRefObservationAccelerator,
         candidates: &[ConnectorCleanupCandidate],
@@ -315,8 +324,9 @@ impl FrontendTableMaintenanceService {
                 now_ms,
             )
             .map_err(|error| format!("build GC owned-ref observation failed: {error}"))?;
-            match self
-                .block_on(observations.observe(observation, now_ms, safe_gc_age_ms))
+            match observations
+                .observe(observation, now_ms, safe_gc_age_ms)
+                .await
                 .map_err(|error| format!("record GC owned-ref observation failed: {error}"))?
             {
                 GcOwnedRefObservationDecision::Mature { .. } => {
@@ -581,6 +591,7 @@ fn rewrite_position_delete_intent(
     })
 }
 
+#[async_trait::async_trait]
 impl TableMaintenanceService for FrontendTableMaintenanceService {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
         let mut lifecycle = self
@@ -611,7 +622,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         }
     }
 
-    fn handle_typed_statement(
+    async fn handle_typed_statement(
         &self,
         engine: &dyn TableMaintenanceEngine,
         statement: ParsedMaintenanceStatement,
@@ -619,12 +630,15 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceStatementResult, String> {
         match statement {
-            ParsedMaintenanceStatement::Execute { name_parts, action } => self.execute_user_action(
-                engine,
-                engine.resolve_target(&name_parts, context)?,
-                action,
-                spark_procedure,
-            ),
+            ParsedMaintenanceStatement::Execute { name_parts, action } => {
+                self.execute_user_action(
+                    engine,
+                    engine.resolve_target(&name_parts, context)?,
+                    action,
+                    spark_procedure,
+                )
+                .await
+            }
             ParsedMaintenanceStatement::SubmitOptimize { name_parts } => {
                 engine.reject_user_action_on_mv(&engine.resolve_target(&name_parts, context)?)?;
                 self.submit_optimize(engine, engine.resolve_target(&name_parts, context)?)
@@ -644,7 +658,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         self.show_optimize(statement, context)
     }
 
-    fn execute_automatic_action(
+    async fn execute_automatic_action(
         &self,
         engine: &dyn TableMaintenanceEngine,
         request: MaintenanceActionRequest,
@@ -669,7 +683,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             MaintenanceActionRequest::RemoveOrphanFiles {
                 target,
                 older_than_ms,
-            } => self.execute_cleanup(engine, target, older_than_ms),
+            } => self.execute_cleanup(engine, target, older_than_ms).await,
             request => {
                 let target = match &request {
                     MaintenanceActionRequest::RewriteManifests { target, .. }

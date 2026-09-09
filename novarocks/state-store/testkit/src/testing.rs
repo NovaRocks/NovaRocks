@@ -15,10 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Test-only in-memory StateStore support. This module is deliberately gated
-//! test-only crate and is not a production provider.
+//! Test-only in-memory StateStore support. It lives in a test-only crate and
+//! is not a production provider.
+//!
+//! # Evidence, and why absence proves nothing
+//!
+//! The fake keeps one private map from [`AttemptId`] to [`AttemptOutcome`].
+//! That map is *evidence*, not an answer sheet: an entry is written when a
+//! write attempt begins, replaced by a terminal outcome once one is proven,
+//! and removed only when the supervisor says the terminal is safely published.
+//!
+//! A missing entry therefore means "this store cannot prove anything", which
+//! adjudicates to [`AttemptOutcome::Unresolved`] and never to
+//! [`AttemptOutcome::NotCommitted`]. The fake is held to the same rule as a
+//! real provider on purpose: it and the SQLite provider run the same basic and
+//! attempt suites, so a reference store that answered denials from absence
+//! would quietly license every provider to do the same.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -28,24 +43,21 @@ use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
 use novarocks_state_store_api::{
-    ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt,
-    CommitResolution, Direction, Key, Precondition, RangePage, RangeRequest, ReadTransaction,
-    StateRecord, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
-    StateStoreMetrics, StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
-    StoreIdentity, StoreRevision, TransactionId, Value, VersionToken, WriteTransaction,
+    AttemptId, AttemptOutcome, AttemptSupervisor, CommitOutcome, CommitReceipt,
+    DEFAULT_MAX_OUTSTANDING_ATTEMPTS, Direction, InDoubtAdjudicator, Key, Precondition, RangePage,
+    RangeRequest, ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
+    StateStoreLimits, StoreIdentity, StoreRevision, Value, VersionToken, WriteAttempt,
+    WriteTransaction,
 };
 use novarocks_state_store_api::{
     StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
     StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 
-const IN_MEMORY_PROVIDER_ID: novarocks_state_store_api::StateStoreProviderId =
-    novarocks_state_store_api::StateStoreProviderId::new("in-memory-test");
-
 /// A deterministic, serializable reference implementation for consumer tests.
 pub struct InMemoryStateStore {
     limits: StateStoreLimits,
-    metrics: Arc<StateStoreMetrics>,
+    attempts: AttemptSupervisor,
     inner: Arc<Mutex<Inner>>,
     post_dispatch_hold: Arc<Mutex<Option<Arc<InMemoryCommitHold>>>>,
 }
@@ -54,15 +66,45 @@ struct Inner {
     identity: StoreIdentity,
     revision: u64,
     records: BTreeMap<Key, StateRecord>,
-    changes: Vec<Change>,
-    commits: HashMap<TransactionId, CommitResolution>,
+    /// Private commit evidence, keyed by the attempt that produced it. Only
+    /// this store reads it, and its absence is deliberately not a verdict.
+    commits: HashMap<AttemptId, AttemptOutcome>,
 }
 
-#[derive(Clone)]
-struct Change {
-    revision: u64,
-    sequence: u32,
-    key: Key,
+/// The store's in-doubt callback.
+///
+/// It is a separate object because [`AttemptSupervisor`] needs the adjudicator
+/// at construction time while the adjudicator needs the same state the store
+/// mutates; both therefore share [`Inner`] rather than one owning the other.
+struct InMemoryEvidence {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[async_trait]
+impl InDoubtAdjudicator for InMemoryEvidence {
+    async fn adjudicate(&self, attempt: AttemptId) -> Result<AttemptOutcome, StateStoreError> {
+        // A read that cannot be performed is not proof that nothing happened.
+        let Ok(inner) = self.inner.lock() else {
+            return Ok(AttemptOutcome::Unresolved);
+        };
+        // Neither is a missing record. Only a recorded terminal decides.
+        Ok(inner
+            .commits
+            .get(&attempt)
+            .cloned()
+            .unwrap_or(AttemptOutcome::Unresolved))
+    }
+
+    async fn release_evidence(&self, attempt: AttemptId) -> Result<(), StateStoreError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            StateStoreError::new(
+                StateStoreErrorKind::Internal,
+                "in-memory state store lock is poisoned",
+            )
+        })?;
+        inner.commits.remove(&attempt);
+        Ok(())
+    }
 }
 
 struct InMemoryCommitHold {
@@ -109,19 +151,35 @@ impl InMemoryStateStore {
     }
 
     pub fn with_limits(cluster_id: impl Into<String>, limits: StateStoreLimits) -> Self {
+        Self::with_limits_and_capacity(cluster_id, limits, default_attempt_capacity())
+    }
+
+    /// Builds a store whose instance admits at most `outstanding_attempts`
+    /// charged attempts at once.
+    ///
+    /// Tests that exercise saturation want a small ceiling; nothing else does,
+    /// which is why the ordinary constructors keep the contract default.
+    pub fn with_limits_and_capacity(
+        cluster_id: impl Into<String>,
+        limits: StateStoreLimits,
+        outstanding_attempts: NonZeroUsize,
+    ) -> Self {
+        let inner = Arc::new(Mutex::new(Inner {
+            identity: StoreIdentity {
+                store_id: Uuid::now_v7(),
+                cluster_id: cluster_id.into(),
+            },
+            revision: 0,
+            records: BTreeMap::new(),
+            commits: HashMap::new(),
+        }));
+        let adjudicator: Arc<dyn InDoubtAdjudicator> = Arc::new(InMemoryEvidence {
+            inner: Arc::clone(&inner),
+        });
         Self {
             limits,
-            metrics: Arc::new(StateStoreMetrics::new(IN_MEMORY_PROVIDER_ID)),
-            inner: Arc::new(Mutex::new(Inner {
-                identity: StoreIdentity {
-                    store_id: Uuid::now_v7(),
-                    cluster_id: cluster_id.into(),
-                },
-                revision: 0,
-                records: BTreeMap::new(),
-                changes: Vec::new(),
-                commits: HashMap::new(),
-            })),
+            attempts: AttemptSupervisor::new(outstanding_attempts, adjudicator),
+            inner,
             post_dispatch_hold: Arc::new(Mutex::new(None)),
         }
     }
@@ -142,8 +200,12 @@ impl InMemoryStateStore {
     }
 }
 
+fn default_attempt_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_MAX_OUTSTANDING_ATTEMPTS).expect("default attempt capacity")
+}
+
 /// Test-only provider adapter for Frontend consumer tests. It deliberately
-/// lives with the SPI reference store so consumer crates never depend on a
+/// lives with the reference store so consumer crates never depend on a
 /// concrete production provider merely to exercise host lifecycle behavior.
 pub struct InMemoryStateStoreProviderFactory {
     descriptor: StateStoreProviderDescriptor,
@@ -216,45 +278,37 @@ impl StateStore for InMemoryStateStore {
         &self.limits
     }
 
-    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-        self.metrics.snapshot()
+    fn attempts(&self) -> &AttemptSupervisor {
+        &self.attempts
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
-        let started = std::time::Instant::now();
-        self.metrics.record_operation(
-            StateStoreOperation::Begin,
-            StateStoreOutcome::Success,
-            started.elapsed(),
-        );
         Ok(Box::new(InMemoryReadTransaction {
             snapshot: None,
             limits: self.limits.clone(),
-            metrics: Arc::clone(&self.metrics),
             inner: Arc::clone(&self.inner),
         }))
     }
 
     async fn begin_write(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
         _purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-        let started = std::time::Instant::now();
+        // Refuse a capability another instance issued before registering
+        // anything, so a handle held across a reopen cannot address this store.
+        // The attempt is simply dropped: it never reached storage here, and
+        // this store is in no position to make statements about it.
+        attempt.require_scope(self.attempts.scope())?;
         let (base_revision, snapshot) = self.begin_snapshot();
-        let mut inner = self.inner.lock().expect("in-memory state store");
-        inner
+        self.inner
+            .lock()
+            .expect("in-memory state store")
             .commits
-            .entry(transaction_id)
-            .or_insert(CommitResolution::Unresolved);
-        drop(inner);
-        self.metrics.record_operation(
-            StateStoreOperation::Begin,
-            StateStoreOutcome::Success,
-            started.elapsed(),
-        );
+            .entry(attempt.id())
+            .or_insert(AttemptOutcome::Unresolved);
         Ok(Box::new(InMemoryWriteTransaction {
-            transaction_id,
+            attempt,
             base_revision,
             snapshot,
             mutations: Vec::new(),
@@ -262,71 +316,9 @@ impl StateStore for InMemoryStateStore {
             range_frozen: false,
             completed: false,
             limits: self.limits.clone(),
-            metrics: Arc::clone(&self.metrics),
             inner: Arc::clone(&self.inner),
             post_dispatch_hold: Arc::clone(&self.post_dispatch_hold),
         }))
-    }
-
-    async fn poll_changes(
-        &self,
-        request: &ChangePollRequest,
-    ) -> Result<ChangePage, StateStoreError> {
-        let started = std::time::Instant::now();
-        request.validate(&self.limits)?;
-        let inner = self.inner.lock().expect("in-memory state store");
-        let after = request
-            .after
-            .as_ref()
-            .map(|cursor| cursor.decode(inner.identity.store_id))
-            .transpose()?;
-        let (after_revision, after_sequence) = after
-            .as_ref()
-            .map(|(revision, sequence)| (parse_revision(revision), *sequence))
-            .unwrap_or((0, 0));
-        let selected = inner
-            .changes
-            .iter()
-            .filter(|change| {
-                change.revision > after_revision
-                    || (change.revision == after_revision && change.sequence > after_sequence)
-            })
-            .take(request.page_size)
-            .cloned()
-            .collect::<Vec<_>>();
-        let revision = revision_token(inner.revision);
-        let next_cursor = match selected.last() {
-            Some(change) => ChangeCursor::new(
-                inner.identity.store_id,
-                revision_token(change.revision),
-                change.sequence,
-            )?,
-            None => ChangeCursor::new(inner.identity.store_id, revision, 0)?,
-        };
-        let hints = selected
-            .iter()
-            .map(|change| ChangeHint {
-                revision: revision_token(change.revision),
-                key: change.key.clone(),
-            })
-            .collect::<Vec<_>>();
-        let bytes = hints.iter().fold(0_u64, |total, hint| {
-            total
-                .saturating_add((hint.key.as_bytes().len() + hint.revision.as_bytes().len()) as u64)
-        });
-        self.metrics.record_page_records(hints.len() as u64);
-        self.metrics.record_bytes_read(bytes);
-        self.metrics.record_operation(
-            StateStoreOperation::Range,
-            StateStoreOutcome::Success,
-            started.elapsed(),
-        );
-        Ok(ChangePage {
-            hints,
-            next_cursor,
-            high_watermark: revision_token(inner.revision),
-            resync_required: false,
-        })
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
@@ -337,26 +329,11 @@ impl StateStore for InMemoryStateStore {
             .identity
             .clone())
     }
-
-    async fn resolve_commit(
-        &self,
-        transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("in-memory state store")
-            .commits
-            .get(transaction_id)
-            .cloned()
-            .unwrap_or(CommitResolution::NotCommitted))
-    }
 }
 
 struct InMemoryReadTransaction {
     snapshot: Option<BTreeMap<Key, StateRecord>>,
     limits: StateStoreLimits,
-    metrics: Arc<StateStoreMetrics>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -375,27 +352,14 @@ impl InMemoryReadTransaction {
 #[async_trait]
 impl ReadTransaction for InMemoryReadTransaction {
     async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
-        let started = std::time::Instant::now();
         validate_store_value(&self.limits, key, None)?;
-        let result = self.snapshot().get(key).cloned();
-        self.metrics.record_bytes_read(
-            result
-                .as_ref()
-                .map(|record| record.key.as_bytes().len() + record.value.as_bytes().len())
-                .unwrap_or_default() as u64,
-        );
-        self.metrics.record_operation(
-            StateStoreOperation::Get,
-            StateStoreOutcome::Success,
-            started.elapsed(),
-        );
-        Ok(result)
+        Ok(self.snapshot().get(key).cloned())
     }
 
     async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
         request.validate(&self.limits)?;
         let snapshot = self.snapshot().clone();
-        range_page(&snapshot, &self.limits, request, &self.metrics)
+        range_page(&snapshot, &self.limits, request)
     }
 
     async fn abort(self: Box<Self>) -> Result<(), StateStoreError> {
@@ -404,7 +368,7 @@ impl ReadTransaction for InMemoryReadTransaction {
 }
 
 struct InMemoryWriteTransaction {
-    transaction_id: TransactionId,
+    attempt: WriteAttempt,
     base_revision: u64,
     snapshot: BTreeMap<Key, StateRecord>,
     mutations: Vec<Mutation>,
@@ -412,7 +376,6 @@ struct InMemoryWriteTransaction {
     range_frozen: bool,
     completed: bool,
     limits: StateStoreLimits,
-    metrics: Arc<StateStoreMetrics>,
     inner: Arc<Mutex<Inner>>,
     post_dispatch_hold: Arc<Mutex<Option<Arc<InMemoryCommitHold>>>>,
 }
@@ -479,53 +442,40 @@ impl Drop for InMemoryWriteTransaction {
         if self.completed {
             return;
         }
-        let mut inner = self.inner.lock().expect("in-memory state store");
-        if matches!(
-            inner.commits.get(&self.transaction_id),
-            Some(CommitResolution::Unresolved)
-        ) {
-            inner
-                .commits
-                .insert(self.transaction_id, CommitResolution::NotCommitted);
-        }
+        // Never dispatched: the attempt is provably free of write effect, and
+        // saying so is what lets the supervisor reclaim its slot. If it was
+        // dispatched this call fails and is ignored -- an abandoned dispatch is
+        // decided by evidence below, not by the handle going away.
+        let _ = self.attempt.cancel_before_dispatch();
+        abandon_evidence(&self.inner, self.attempt.id());
     }
 }
 
 #[async_trait]
 impl ReadTransaction for InMemoryWriteTransaction {
     async fn get(&mut self, key: &Key) -> Result<Option<StateRecord>, StateStoreError> {
-        let started = std::time::Instant::now();
         validate_store_value(&self.limits, key, None)?;
-        let result = self.staged_records().get(key).cloned();
-        self.metrics.record_operation(
-            StateStoreOperation::Get,
-            StateStoreOutcome::Success,
-            started.elapsed(),
-        );
-        Ok(result)
+        Ok(self.staged_records().get(key).cloned())
     }
 
     async fn range(&mut self, request: &RangeRequest) -> Result<RangePage, StateStoreError> {
-        let page = range_page(&self.staged_records(), &self.limits, request, &self.metrics)?;
+        let page = range_page(&self.staged_records(), &self.limits, request)?;
         self.range_frozen |= page.continuation.is_some();
         Ok(page)
     }
 
     async fn abort(mut self: Box<Self>) -> Result<(), StateStoreError> {
         self.completed = true;
-        self.inner
-            .lock()
-            .expect("in-memory state store")
-            .commits
-            .insert(self.transaction_id, CommitResolution::NotCommitted);
+        let _ = self.attempt.cancel_before_dispatch();
+        abandon_evidence(&self.inner, self.attempt.id());
         Ok(())
     }
 }
 
 #[async_trait]
 impl WriteTransaction for InMemoryWriteTransaction {
-    fn transaction_id(&self) -> &TransactionId {
-        &self.transaction_id
+    fn attempt(&self) -> AttemptId {
+        self.attempt.id()
     }
 
     async fn put(
@@ -534,22 +484,11 @@ impl WriteTransaction for InMemoryWriteTransaction {
         value: Value,
         precondition: Precondition,
     ) -> Result<(), StateStoreError> {
-        let started = std::time::Instant::now();
-        let result = self.stage(Mutation::Put {
+        self.stage(Mutation::Put {
             key,
             value,
             precondition,
-        });
-        self.metrics.record_operation(
-            StateStoreOperation::Put,
-            if result.is_ok() {
-                StateStoreOutcome::Success
-            } else {
-                StateStoreOutcome::Error
-            },
-            started.elapsed(),
-        );
-        result
+        })
     }
 
     async fn delete(
@@ -557,68 +496,56 @@ impl WriteTransaction for InMemoryWriteTransaction {
         key: Key,
         precondition: Precondition,
     ) -> Result<(), StateStoreError> {
-        let started = std::time::Instant::now();
-        let result = self.stage(Mutation::Delete { key, precondition });
-        self.metrics.record_operation(
-            StateStoreOperation::Delete,
-            if result.is_ok() {
-                StateStoreOutcome::Success
-            } else {
-                StateStoreOutcome::Error
-            },
-            started.elapsed(),
-        );
-        result
+        self.stage(Mutation::Delete { key, precondition })
     }
 
     async fn commit(mut self: Box<Self>) -> CommitOutcome {
-        let started = std::time::Instant::now();
         let hold = self
             .post_dispatch_hold
             .lock()
             .expect("in-memory post-dispatch hold")
             .take();
+        // Dispatch is recorded before anything can touch storage: from here a
+        // dropped handle is a cleanup debt, not a free slot.
+        if let Err(error) = self.attempt.mark_dispatched() {
+            return CommitOutcome::DefiniteFailure(error);
+        }
         let outcome = if let Some(hold) = hold {
             self.commit_after_post_dispatch(hold).await
         } else {
             let mut inner = self.inner.lock().expect("in-memory state store");
             apply_commit(
                 &mut inner,
-                self.transaction_id,
+                self.attempt.id(),
                 self.base_revision,
                 &self.mutations,
             )
         };
         self.completed = true;
-        let metric_outcome = match &outcome {
-            CommitOutcome::Committed(_) => StateStoreOutcome::Success,
-            CommitOutcome::Conflict(_) => StateStoreOutcome::Conflict,
-            CommitOutcome::TransientBeforeCommit(_) => StateStoreOutcome::TransientBeforeCommit,
-            CommitOutcome::DefiniteFailure(_) => StateStoreOutcome::DefiniteFailure,
-            CommitOutcome::CommitUnknown(_) => StateStoreOutcome::CommitUnknown,
-        };
-        self.metrics.record_operation(
-            StateStoreOperation::Commit,
-            metric_outcome,
-            started.elapsed(),
-        );
+        publish_witnessed_outcome(&self.inner, &self.attempt, &outcome);
         outcome
     }
 }
 
 impl InMemoryWriteTransaction {
+    /// Applies the commit on a worker the caller does not own.
+    ///
+    /// The worker writes evidence; only the caller-facing future publishes a
+    /// verdict. That split is the whole point: if the caller is cancelled or
+    /// its answer is lost, the attempt stays in doubt and has to be adjudicated
+    /// from evidence, exactly as it would across a real connection.
     async fn commit_after_post_dispatch(&self, hold: Arc<InMemoryCommitHold>) -> CommitOutcome {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut guard = CommitAbandonGuard {
             cancelled: Arc::clone(&cancelled),
             inner: Arc::clone(&self.inner),
-            transaction_id: self.transaction_id,
+            attempt: self.attempt.id(),
             armed: true,
         };
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let inner = Arc::clone(&self.inner);
         let mutations = self.mutations.clone();
-        let transaction_id = self.transaction_id;
+        let attempt = self.attempt.id();
         let base_revision = self.base_revision;
         tokio::spawn(async move {
             hold.wait_for_progress().await;
@@ -627,7 +554,7 @@ impl InMemoryWriteTransaction {
             }
             let outcome = {
                 let mut inner = inner.lock().expect("in-memory state store");
-                apply_commit(&mut inner, transaction_id, base_revision, &mutations)
+                apply_commit(&mut inner, attempt, base_revision, &mutations)
             };
             let _ = outcome_tx.send(outcome);
         });
@@ -642,10 +569,59 @@ impl InMemoryWriteTransaction {
     }
 }
 
+/// Publishes the terminal the caller actually witnessed, then drops the
+/// evidence that terminal was derived from.
+///
+/// Order matters and is the contract: the proof is published first, so a later
+/// reader reads a recorded verdict rather than re-deriving one from evidence
+/// that is on its way out. Releasing here rather than leaving it to
+/// `AttemptSupervisor::drain_abandoned_attempts` is what keeps a provider's
+/// private evidence bounded — abandonment is the exception, not the norm, and a
+/// provider that only cleans up on abandonment grows forever.
+///
+/// [`CommitOutcome::CommitUnknown`] publishes nothing on purpose: an ambiguous
+/// answer is not a verdict, and the attempt is resolved later from evidence,
+/// which therefore must survive.
+fn publish_witnessed_outcome(
+    inner: &Mutex<Inner>,
+    attempt: &WriteAttempt,
+    outcome: &CommitOutcome,
+) {
+    let verdict = match outcome {
+        CommitOutcome::Committed(receipt) => AttemptOutcome::Committed(receipt.clone()),
+        // All three are statements that the write can no longer land: the
+        // in-memory commit path either never applied or refused the mutation.
+        CommitOutcome::Conflict(_)
+        | CommitOutcome::TransientBeforeCommit(_)
+        | CommitOutcome::DefiniteFailure(_) => AttemptOutcome::NotCommitted,
+        CommitOutcome::CommitUnknown(_) => return,
+    };
+    attempt
+        .settle(verdict)
+        .expect("in-memory attempt settles its witnessed outcome exactly once");
+    inner
+        .lock()
+        .expect("in-memory state store")
+        .commits
+        .remove(&attempt.id());
+}
+
+/// Records that an attempt can no longer commit, without ever overwriting a
+/// proof that it already did.
+fn abandon_evidence(inner: &Mutex<Inner>, attempt: AttemptId) {
+    let mut inner = inner.lock().expect("in-memory state store");
+    match inner.commits.get(&attempt) {
+        Some(AttemptOutcome::Committed(_)) => {}
+        _ => {
+            inner.commits.insert(attempt, AttemptOutcome::NotCommitted);
+        }
+    }
+}
+
 struct CommitAbandonGuard {
     cancelled: Arc<AtomicBool>,
     inner: Arc<Mutex<Inner>>,
-    transaction_id: TransactionId,
+    attempt: AttemptId,
     armed: bool,
 }
 
@@ -654,50 +630,49 @@ impl Drop for CommitAbandonGuard {
         if !self.armed {
             return;
         }
+        // Order matters only in one direction: whoever takes the lock first
+        // wins, and `apply_commit` refuses to apply over a recorded denial, so
+        // the worker cannot resurrect an abandoned attempt.
         self.cancelled.store(true, Ordering::Release);
         let mut inner = self.inner.lock().expect("in-memory state store");
         if matches!(
-            inner.commits.get(&self.transaction_id),
-            Some(CommitResolution::Unresolved)
+            inner.commits.get(&self.attempt),
+            Some(AttemptOutcome::Unresolved)
         ) {
             inner
                 .commits
-                .insert(self.transaction_id, CommitResolution::NotCommitted);
+                .insert(self.attempt, AttemptOutcome::NotCommitted);
         }
     }
 }
 
 fn apply_commit(
     inner: &mut Inner,
-    transaction_id: TransactionId,
+    attempt: AttemptId,
     base_revision: u64,
     mutations: &[Mutation],
 ) -> CommitOutcome {
-    match inner.commits.get(&transaction_id) {
-        Some(CommitResolution::Committed(receipt)) => {
+    match inner.commits.get(&attempt) {
+        Some(AttemptOutcome::Committed(receipt)) => {
             return CommitOutcome::Committed(receipt.clone());
         }
-        Some(CommitResolution::NotCommitted) => {
+        Some(AttemptOutcome::NotCommitted) => {
             return CommitOutcome::DefiniteFailure(StateStoreError::new(
                 StateStoreErrorKind::InvalidRequest,
-                "transaction id is terminally not committed",
+                "write attempt is terminally not committed",
             ));
         }
-        Some(CommitResolution::Unresolved) | None => {}
+        Some(AttemptOutcome::Unresolved) | None => {}
     }
     if inner.revision != base_revision {
-        inner
-            .commits
-            .insert(transaction_id, CommitResolution::NotCommitted);
+        inner.commits.insert(attempt, AttemptOutcome::NotCommitted);
         return CommitOutcome::Conflict(StateStoreError::new(
             StateStoreErrorKind::Conflict,
             "in-memory state store snapshot conflict",
         ));
     }
     if !preconditions_hold(&inner.records, mutations) {
-        inner
-            .commits
-            .insert(transaction_id, CommitResolution::NotCommitted);
+        inner.commits.insert(attempt, AttemptOutcome::NotCommitted);
         return CommitOutcome::Conflict(StateStoreError::new(
             StateStoreErrorKind::PreconditionFailed,
             "in-memory state store precondition failed",
@@ -706,8 +681,8 @@ fn apply_commit(
     inner.revision = inner.revision.saturating_add(1);
     let revision = revision_token(inner.revision);
     let revision_number = inner.revision;
-    for (index, mutation) in mutations.iter().enumerate() {
-        let key = match mutation {
+    for mutation in mutations {
+        match mutation {
             Mutation::Put { key, value, .. } => {
                 inner.records.insert(
                     key.clone(),
@@ -717,26 +692,16 @@ fn apply_commit(
                         version: version_token(revision_number),
                     },
                 );
-                key.clone()
             }
             Mutation::Delete { key, .. } => {
                 inner.records.remove(key);
-                key.clone()
             }
-        };
-        inner.changes.push(Change {
-            revision: revision_number,
-            sequence: u32::try_from(index + 1).unwrap_or(u32::MAX),
-            key,
-        });
+        }
     }
-    let receipt = CommitReceipt {
-        transaction_id,
-        revision,
-    };
+    let receipt = CommitReceipt { attempt, revision };
     inner
         .commits
-        .insert(transaction_id, CommitResolution::Committed(receipt.clone()));
+        .insert(attempt, AttemptOutcome::Committed(receipt.clone()));
     CommitOutcome::Committed(receipt)
 }
 
@@ -744,9 +709,7 @@ fn range_page(
     records: &BTreeMap<Key, StateRecord>,
     limits: &StateStoreLimits,
     request: &RangeRequest,
-    metrics: &StateStoreMetrics,
 ) -> Result<RangePage, StateStoreError> {
-    let started = std::time::Instant::now();
     request.validate(limits)?;
     let resume_after = request
         .continuation
@@ -775,16 +738,6 @@ fn range_page(
     } else {
         None
     };
-    let bytes = selected.iter().fold(0_u64, |total, record| {
-        total.saturating_add((record.key.as_bytes().len() + record.value.as_bytes().len()) as u64)
-    });
-    metrics.record_bytes_read(bytes);
-    metrics.record_page_records(selected.len() as u64);
-    metrics.record_operation(
-        StateStoreOperation::Range,
-        StateStoreOutcome::Success,
-        started.elapsed(),
-    );
     Ok(RangePage {
         records: selected,
         continuation,
@@ -857,24 +810,20 @@ fn version_token(revision: u64) -> VersionToken {
         .expect("in-memory version token")
 }
 
-fn parse_revision(revision: &StoreRevision) -> u64 {
-    std::str::from_utf8(revision.as_bytes())
-        .ok()
-        .and_then(|value| value.strip_prefix('r'))
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
 
     use super::*;
     use crate::conformance::{
-        FaultGate, FaultInjectingStateStore, PostDispatchControl, PostDispatchController,
-        PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
-        run_state_store_conformance,
+        FaultGate, FaultInjectingStateStore, FaultStateStoreFactory, PostDispatchControl,
+        PostDispatchController, PostDispatchScenario, StateStoreFactory, StateStoreFaultFixture,
+        run_attempt_suite, run_basic_suite, run_fault_suite,
     };
+
+    /// Small on purpose: the attempt suite fills the instance to its ceiling,
+    /// and a 1024-slot default would say nothing about the accounting.
+    const CONFORMANCE_ATTEMPT_CAPACITY: usize = 4;
 
     struct InMemoryPostDispatchController {
         fault: Arc<FaultInjectingStateStore>,
@@ -927,20 +876,38 @@ mod tests {
         }
     }
 
+    fn conformance_limits() -> StateStoreLimits {
+        StateStoreLimits {
+            max_key_bytes: 64,
+            max_value_bytes: 64,
+            max_page_size: 10,
+            max_transaction_operations: 8,
+            max_transaction_bytes: 300,
+            ..StateStoreLimits::default()
+        }
+    }
+
+    fn reference_store() -> Arc<InMemoryStateStore> {
+        Arc::new(InMemoryStateStore::with_limits_and_capacity(
+            "test-cluster",
+            conformance_limits(),
+            NonZeroUsize::new(CONFORMANCE_ATTEMPT_CAPACITY).expect("conformance capacity"),
+        ))
+    }
+
     fn factory() -> StateStoreFactory {
         Rc::new(|| {
             Box::pin(async {
-                let in_memory = Arc::new(InMemoryStateStore::with_limits(
-                    "test-cluster",
-                    StateStoreLimits {
-                        max_key_bytes: 64,
-                        max_value_bytes: 64,
-                        max_page_size: 10,
-                        max_transaction_operations: 8,
-                        max_transaction_bytes: 300,
-                        ..StateStoreLimits::default()
-                    },
-                ));
+                let store: Arc<dyn StateStore> = reference_store();
+                Ok(store)
+            })
+        })
+    }
+
+    fn fault_factory() -> FaultStateStoreFactory {
+        Rc::new(|| {
+            Box::pin(async {
+                let in_memory = reference_store();
                 let store: Arc<dyn StateStore> = in_memory.clone();
                 let fault = FaultInjectingStateStore::new(store);
                 let controller: Arc<dyn PostDispatchController> =
@@ -948,19 +915,120 @@ mod tests {
                         fault: Arc::clone(&fault),
                         store: in_memory,
                     });
-                Ok(StateStoreConformanceFixture::new(fault, controller))
+                Ok(StateStoreFaultFixture::new(fault, controller))
             })
         })
     }
 
     #[tokio::test]
-    async fn reference_store_conforms_to_the_spi_contract() {
-        run_state_store_conformance(factory()).await;
+    async fn reference_store_satisfies_the_basic_suite() {
+        run_basic_suite(&factory()).await;
+    }
+
+    #[tokio::test]
+    async fn reference_store_satisfies_the_attempt_suite() {
+        run_attempt_suite(&factory()).await;
+    }
+
+    #[tokio::test]
+    async fn reference_store_satisfies_the_fault_suite() {
+        run_fault_suite(&fault_factory()).await;
     }
 
     #[test]
     fn default_limits_are_not_relaxed() {
         let store = InMemoryStateStore::new("test-cluster");
         assert_eq!(store.limits(), &StateStoreLimits::default());
+        assert_eq!(
+            store.attempts().capacity(),
+            DEFAULT_MAX_OUTSTANDING_ATTEMPTS
+        );
+    }
+
+    /// The invariant the public surface cannot reach: once evidence is gone, an
+    /// adjudicator must go back to saying it does not know.
+    ///
+    /// `release_evidence` only ever runs after every handle for an attempt is
+    /// dropped, so no `CommitObservation` can be alive to ask afterwards. The
+    /// rule is still real -- a provider that answers a denial from a missing
+    /// row is wrong -- so it is pinned here, directly against the callback.
+    /// A settled attempt must not leave evidence behind. Cleaning up only on
+    /// abandonment would let the private evidence table grow for the entire
+    /// life of an instance, which is one of the things this contract exists to
+    /// stop.
+    #[tokio::test]
+    async fn a_settled_attempt_leaves_no_evidence_behind() {
+        let store = InMemoryStateStore::new("evidence-bound");
+        for _ in 0..8 {
+            let (attempt, observation) = store.attempts().reserve().expect("reserve");
+            let mut transaction = store
+                .begin_write(attempt, "bounded evidence")
+                .await
+                .expect("begin");
+            transaction
+                .put(
+                    Key::try_from(Bytes::from_static(b"k")).expect("key"),
+                    Value::try_from(Bytes::from_static(b"v")).expect("value"),
+                    Precondition::Any,
+                )
+                .await
+                .expect("put");
+            assert!(matches!(
+                transaction.commit().await,
+                CommitOutcome::Committed(_)
+            ));
+            assert!(observation.peek().expect("peek").is_some());
+        }
+        assert_eq!(
+            store.inner.lock().expect("inner").commits.len(),
+            0,
+            "settled attempts must release their evidence rather than accumulate it"
+        );
+        assert_eq!(store.attempts().abandoned(), 0);
+    }
+
+    #[tokio::test]
+    async fn absent_evidence_adjudicates_unresolved_never_not_committed() {
+        let store = InMemoryStateStore::new("evidence-cluster");
+        let evidence = InMemoryEvidence {
+            inner: Arc::clone(&store.inner),
+        };
+        let (attempt, _observation) = store.attempts().reserve().expect("reserve");
+        let id = attempt.id();
+
+        // Never registered: nothing is known, and nothing may be claimed.
+        assert_eq!(
+            evidence.adjudicate(id).await.expect("adjudicate unknown"),
+            AttemptOutcome::Unresolved
+        );
+
+        // Registered but undecided is still not a denial.
+        let transaction = store
+            .begin_write(attempt, "evidence probe")
+            .await
+            .expect("begin write");
+        assert_eq!(transaction.attempt(), id);
+        assert_eq!(
+            evidence
+                .adjudicate(id)
+                .await
+                .expect("adjudicate registered"),
+            AttemptOutcome::Unresolved
+        );
+
+        // Aborting proves the denial, so now it may be stated.
+        transaction.abort().await.expect("abort");
+        assert_eq!(
+            evidence.adjudicate(id).await.expect("adjudicate aborted"),
+            AttemptOutcome::NotCommitted
+        );
+
+        // And releasing the proof takes the statement away again rather than
+        // leaving a denial behind for the next reader to trust.
+        evidence.release_evidence(id).await.expect("release");
+        assert_eq!(
+            evidence.adjudicate(id).await.expect("adjudicate released"),
+            AttemptOutcome::Unresolved
+        );
     }
 }

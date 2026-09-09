@@ -200,7 +200,6 @@ impl MvCommandExecutor {
         execute_typed_novarocks_imv_stateless_rebuild(
             self.ports.connector_control(),
             self.storage_observation.as_ref(),
-            self.ports.repository().as_ref(),
             self.ports.readiness().as_ref(),
             statement,
             current_database,

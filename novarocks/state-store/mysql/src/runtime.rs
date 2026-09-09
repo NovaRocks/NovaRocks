@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "state-store-test-hooks")]
@@ -155,8 +156,10 @@ impl MysqlRuntime {
         &self,
         database: String,
         request: StateStoreOpenRequest,
+        outstanding_attempts: NonZeroUsize,
     ) -> Result<Arc<dyn StateStore>, StateStoreError> {
-        let mut opening = self.start_open_store(database, request)?;
+        let mut opening =
+            self.start_open_store_with_capacity(database, request, outstanding_attempts)?;
         let result = (&mut opening.future).await;
         opening.complete();
         result
@@ -166,6 +169,20 @@ impl MysqlRuntime {
         &self,
         database: String,
         request: StateStoreOpenRequest,
+    ) -> Result<MysqlProviderOpen, StateStoreError> {
+        self.start_open_store_with_capacity(database, request, crate::default_attempt_capacity())
+    }
+
+    /// Opens with an explicit outstanding-attempt ceiling.
+    ///
+    /// The ceiling is a provider resource bound, not part of the open request,
+    /// so only this crate's own tests -- which need to reach saturation -- pass
+    /// anything but the contract default.
+    fn start_open_store_with_capacity(
+        &self,
+        database: String,
+        request: StateStoreOpenRequest,
+        outstanding_attempts: NonZeroUsize,
     ) -> Result<MysqlProviderOpen, StateStoreError> {
         self.validate_process_and_context()?;
         let opening = self.acquire_operation()?;
@@ -187,6 +204,7 @@ impl MysqlRuntime {
                 database,
                 cluster_id,
                 limits,
+                outstanding_attempts,
                 deadline,
                 task_cancellation,
                 opening,
@@ -215,6 +233,7 @@ impl MysqlRuntime {
         database: String,
         cluster_id: String,
         limits: StateStoreLimits,
+        outstanding_attempts: NonZeroUsize,
         deadline: Instant,
         cancellation: MysqlOpenCancellation,
         _opening: MysqlRuntimeGuard,
@@ -223,9 +242,16 @@ impl MysqlRuntime {
         mysql_active_readiness(Arc::clone(&pool), deadline).await?;
         cancellation.check()?;
         let lease = MysqlProviderHandle::new(shared, pool)?;
-        let store =
-            MysqlStateStore::open(lease, database, cluster_id, limits, deadline, cancellation)
-                .await?;
+        let store = MysqlStateStore::open(
+            lease,
+            database,
+            cluster_id,
+            limits,
+            outstanding_attempts,
+            deadline,
+            cancellation,
+        )
+        .await?;
         Ok(Arc::new(store))
     }
 
@@ -686,6 +712,32 @@ impl MysqlProviderHandle {
             Arc::clone(&self._provider.shared),
             MysqlGuardKind::Operation,
         )
+    }
+
+    /// Hands out the right to charge operations against this runtime without
+    /// holding the provider handle itself.
+    ///
+    /// Commit evidence outlives a single transaction: the attempt supervisor
+    /// may ask about an attempt after the transaction that ran it is gone. The
+    /// evidence owner therefore needs its own way to register work so a
+    /// shutdown drain still waits for it.
+    pub(super) fn operations(&self) -> MysqlOperationLease {
+        MysqlOperationLease {
+            shared: Arc::clone(&self._provider.shared),
+        }
+    }
+}
+
+#[cfg(feature = "mysql-state-store-provider")]
+#[derive(Clone)]
+pub(super) struct MysqlOperationLease {
+    shared: Arc<MysqlRuntimeShared>,
+}
+
+#[cfg(feature = "mysql-state-store-provider")]
+impl MysqlOperationLease {
+    pub(super) fn acquire(&self) -> Result<MysqlRuntimeGuard, StateStoreError> {
+        MysqlRuntimeGuard::acquire(Arc::clone(&self.shared), MysqlGuardKind::Operation)
     }
 }
 

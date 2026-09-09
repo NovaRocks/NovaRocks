@@ -34,16 +34,19 @@ use super::budget::TransactionBudget;
 use super::client::{
     MysqlPoolConnection, PoolLifecycle, checkout_hygienic_connection, execute_owned_with_deadline,
 };
-use super::codec::MysqlCodec;
+use super::codec::{
+    COMMIT_STATE_COMMITTED, COMMIT_STATE_PENDING, DurableCommitState, MysqlCodec, encode_attempt_id,
+};
+use super::commit::{MysqlEvidence, release_witnessed_evidence};
 use super::error::{MysqlNativeError, MysqlReadStatementError, MysqlTransactionDisposition};
+use super::metrics::{StateStoreMetrics, StateStoreOperation, StateStoreOutcome};
 use super::range::{decode_record, read_range_page};
 use super::runtime::MysqlRuntimeGuard;
-use novarocks_state_store_api::StateStoreMetrics;
 use novarocks_state_store_api::{
-    CommitOutcome, CommitReceipt, ContinuationToken, Direction, Key, Precondition, RangePage,
-    RangeRequest, ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind,
-    StateStoreLimits, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value,
-    VersionToken, WriteTransaction,
+    AttemptId, AttemptOutcome, CommitOutcome, CommitReceipt, ContinuationToken, Direction, Key,
+    Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord, StateStoreError,
+    StateStoreErrorKind, StateStoreLimits, StoreRevision, Value, VersionToken, WriteAttempt,
+    WriteTransaction,
 };
 
 const PROVISIONAL_VERSION_TAG: &[u8] = b"mysql-provisional-v1\0";
@@ -108,7 +111,7 @@ impl Mutation {
 
 pub(super) struct MysqlWriteTransaction {
     commands: Option<mpsc::Sender<WriteCommand>>,
-    transaction_id: TransactionId,
+    attempt: AttemptId,
     limits: StateStoreLimits,
     metrics: Arc<StateStoreMetrics>,
     issued_continuations: HashSet<ContinuationToken>,
@@ -119,7 +122,12 @@ struct MysqlWriteActorState {
     transaction: Option<OwnedMysqlTransaction>,
     codec: MysqlCodec,
     limits: StateStoreLimits,
-    transaction_id: TransactionId,
+    /// The one attempt this transaction body was authorised by. The actor owns
+    /// it because the actor -- not the caller's future -- is what learns the
+    /// commit's outcome, and a terminal has to be published by whoever
+    /// witnessed it even if the caller has gone away.
+    attempt: WriteAttempt,
+    evidence: Arc<MysqlEvidence>,
     base_revision: u64,
     point_observations: BTreeMap<Key, PointObservation>,
     range_observed: bool,
@@ -241,12 +249,14 @@ pub(super) async fn begin_read(
 pub(super) async fn begin_write(
     pool: Arc<dyn PoolLifecycle>,
     operation: MysqlRuntimeGuard,
-    transaction_id: TransactionId,
+    attempt: WriteAttempt,
+    evidence: Arc<MysqlEvidence>,
     limits: StateStoreLimits,
     metrics: Arc<StateStoreMetrics>,
 ) -> Result<MysqlWriteTransaction, StateStoreError> {
     let started = StdInstant::now();
     let deadline = Instant::now() + limits.transaction_deadline;
+    let attempt_id = attempt.id();
     let (commands, receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
     let actor_limits = limits.clone();
@@ -254,7 +264,8 @@ pub(super) async fn begin_write(
         write_actor(
             pool,
             operation,
-            transaction_id,
+            attempt,
+            evidence,
             actor_limits,
             deadline,
             receiver,
@@ -267,35 +278,46 @@ pub(super) async fn begin_write(
     result?;
     Ok(MysqlWriteTransaction {
         commands: Some(commands),
-        transaction_id,
+        attempt: attempt_id,
         limits,
         metrics,
         issued_continuations: HashSet::new(),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_actor(
     pool: Arc<dyn PoolLifecycle>,
     operation: MysqlRuntimeGuard,
-    transaction_id: TransactionId,
+    attempt: WriteAttempt,
+    evidence: Arc<MysqlEvidence>,
     limits: StateStoreLimits,
     deadline: Instant,
     mut commands: mpsc::Receiver<WriteCommand>,
     ready: oneshot::Sender<Result<(), StateStoreError>>,
 ) {
-    let result = initialize_write_actor(pool, operation, transaction_id, limits, deadline).await;
+    let result = initialize_write_actor(pool, operation, attempt, evidence, limits, deadline).await;
     let mut state = match result {
         Ok(state) => {
             if ready.send(Ok(())).is_err() {
+                // Nobody is left to drive this transaction. Nothing was
+                // dispatched, so the attempt is provably effect-free.
+                state.cancel_attempt_before_dispatch();
                 return;
             }
             state
         }
-        Err(error) => {
+        Err((attempt, error)) => {
+            let _ = attempt.cancel_before_dispatch();
             let _ = ready.send(Err(error));
             return;
         }
     };
+    // Every exit below is reached before `commit_inner` runs, and `commit_inner`
+    // owns the only `mark_dispatched` call, so each of them closes the attempt
+    // as provably effect-free rather than leaving `Slot::drop` to infer it.
+    // Stating it here is what keeps the claim true if the dispatch point ever
+    // moves: an already-dispatched attempt makes these calls fail loudly.
     while let Some(command) = commands.recv().await {
         match command {
             WriteCommand::Get { key, response } => {
@@ -303,6 +325,7 @@ async fn write_actor(
                 let terminal = !state.transaction_active();
                 let _ = response.send(result);
                 if terminal {
+                    state.cancel_attempt_before_dispatch();
                     return;
                 }
             }
@@ -311,6 +334,7 @@ async fn write_actor(
                 let terminal = !state.transaction_active();
                 let _ = response.send(result);
                 if terminal {
+                    state.cancel_attempt_before_dispatch();
                     return;
                 }
             }
@@ -334,25 +358,82 @@ async fn write_actor(
                     Ok(transaction) => transaction.rollback().await,
                     Err(error) => Err(error),
                 };
+                // An abort never reserves and never writes, so the attempt is
+                // closed as having had no effect rather than settled from
+                // evidence there is none of.
+                state.cancel_attempt_before_dispatch();
                 let _ = response.send(result);
                 return;
             }
             WriteCommand::Commit { response } => {
                 let outcome = state.commit_inner().await;
+                // Publish first, release second, and do both before the caller
+                // is answered: a caller that goes away mid-commit must not be
+                // able to leave a terminal unpublished or its evidence behind.
+                state.publish_witnessed_outcome(&outcome).await;
                 let _ = response.send(outcome);
                 return;
             }
         }
     }
+    // The caller dropped the transaction without committing or aborting.
+    state.cancel_attempt_before_dispatch();
 }
 
 async fn initialize_write_actor(
     pool: Arc<dyn PoolLifecycle>,
     operation: MysqlRuntimeGuard,
-    transaction_id: TransactionId,
+    attempt: WriteAttempt,
+    evidence: Arc<MysqlEvidence>,
     limits: StateStoreLimits,
     deadline: Instant,
-) -> Result<MysqlWriteActorState, StateStoreError> {
+) -> Result<MysqlWriteActorState, (WriteAttempt, StateStoreError)> {
+    match initialize_write_actor_inner(pool, operation, limits, deadline).await {
+        Ok(parts) => Ok(parts.into_state(attempt, evidence)),
+        Err(error) => Err((attempt, error)),
+    }
+}
+
+struct WriteActorParts {
+    pool: Arc<dyn PoolLifecycle>,
+    transaction: OwnedMysqlTransaction,
+    codec: MysqlCodec,
+    limits: StateStoreLimits,
+    base_revision: u64,
+    budget: TransactionBudget,
+}
+
+impl WriteActorParts {
+    fn into_state(
+        self,
+        attempt: WriteAttempt,
+        evidence: Arc<MysqlEvidence>,
+    ) -> MysqlWriteActorState {
+        MysqlWriteActorState {
+            pool: self.pool,
+            transaction: Some(self.transaction),
+            codec: self.codec,
+            limits: self.limits,
+            attempt,
+            evidence,
+            base_revision: self.base_revision,
+            point_observations: BTreeMap::new(),
+            range_observed: false,
+            mutations: Vec::new(),
+            overlay: BTreeMap::new(),
+            budget: self.budget,
+            range_frozen: false,
+            issued_continuations: HashSet::new(),
+        }
+    }
+}
+
+async fn initialize_write_actor_inner(
+    pool: Arc<dyn PoolLifecycle>,
+    operation: MysqlRuntimeGuard,
+    limits: StateStoreLimits,
+    deadline: Instant,
+) -> Result<WriteActorParts, StateStoreError> {
     let budget = TransactionBudget::new(limits.clone())?;
     let mut transaction =
         OwnedMysqlTransaction::begin(Arc::clone(&pool), operation, deadline).await?;
@@ -377,20 +458,13 @@ async fn initialize_write_actor(
     let codec = MysqlCodec::new(limits.max_key_bytes)?;
     let base_revision =
         codec.decode_revision(revision_bytes.as_deref().ok_or_else(persisted_corruption)?)?;
-    Ok(MysqlWriteActorState {
+    Ok(WriteActorParts {
         pool,
-        transaction: Some(transaction),
+        transaction,
         codec,
-        limits: limits.clone(),
-        transaction_id,
+        limits,
         base_revision,
-        point_observations: BTreeMap::new(),
-        range_observed: false,
-        mutations: Vec::new(),
-        overlay: BTreeMap::new(),
         budget,
-        range_frozen: false,
-        issued_continuations: HashSet::new(),
     })
 }
 
@@ -1218,7 +1292,7 @@ impl MysqlWriteActorState {
         let operation = self
             .budget
             .stage_put(key.as_bytes(), value.as_bytes(), &precondition)?;
-        let provisional_version = provisional_version(self.transaction_id, operation);
+        let provisional_version = provisional_version(self.attempt.id(), operation);
         let bytes = key.as_bytes().len().saturating_add(value.as_bytes().len());
         let mutation = Mutation::Put {
             value,
@@ -1315,8 +1389,8 @@ impl MysqlWriteTransaction {
 
 #[async_trait]
 impl WriteTransaction for MysqlWriteTransaction {
-    fn transaction_id(&self) -> &TransactionId {
-        &self.transaction_id
+    fn attempt(&self) -> AttemptId {
+        self.attempt
     }
 
     async fn put(
@@ -1404,8 +1478,47 @@ impl WriteTransaction for MysqlWriteTransaction {
 }
 
 impl MysqlWriteActorState {
+    /// Closes the attempt with the terminal this actor actually witnessed,
+    /// then drops the evidence that terminal was derived from.
+    ///
+    /// The order is the contract: the proof is published first, so a later
+    /// reader reads a recorded verdict rather than re-deriving one from a row
+    /// that is on its way out. [`CommitOutcome::CommitUnknown`] publishes
+    /// nothing and releases nothing on purpose -- an ambiguous answer is not a
+    /// verdict, and the ledger row is the only thing that can still resolve it.
+    async fn publish_witnessed_outcome(&mut self, outcome: &CommitOutcome) {
+        let verdict = match outcome {
+            CommitOutcome::Committed(receipt) => AttemptOutcome::Committed(receipt.clone()),
+            // All three say the write can no longer land, and each of them is
+            // reached only after the durable ledger agreed.
+            CommitOutcome::Conflict(_)
+            | CommitOutcome::TransientBeforeCommit(_)
+            | CommitOutcome::DefiniteFailure(_) => AttemptOutcome::NotCommitted,
+            CommitOutcome::CommitUnknown(_) => return,
+        };
+        if let Err(error) = self.attempt.settle(verdict) {
+            tracing::warn!(
+                provider = "mysql",
+                %error,
+                "MySQL could not publish a witnessed commit outcome"
+            );
+            return;
+        }
+        release_witnessed_evidence(&self.evidence, self.attempt.id()).await;
+    }
+
+    /// Records that this attempt never reached storage.
+    fn cancel_attempt_before_dispatch(&self) {
+        if let Err(error) = self.attempt.cancel_before_dispatch() {
+            tracing::warn!(
+                provider = "mysql",
+                %error,
+                "MySQL could not close an undispatched write attempt"
+            );
+        }
+    }
+
     async fn commit_inner(&mut self) -> CommitOutcome {
-        let reservation_token = super::commit::new_reservation_token();
         let deadline = match self.transaction() {
             Ok(transaction) => transaction.deadline,
             Err(error) => return CommitOutcome::DefiniteFailure(error),
@@ -1418,31 +1531,26 @@ impl MysqlWriteActorState {
             Err(error) => return CommitOutcome::DefiniteFailure(error),
         };
         let _operation = operation;
-        let reservation = super::commit::reserve_commit(
-            Arc::clone(&self.pool),
-            &self.codec,
-            self.transaction_id,
-            reservation_token,
-            deadline,
-        )
-        .await;
+        // Everything above this line is reads and rollbacks: the reservation
+        // below is the first statement that can leave a trace a later reader
+        // might see, so the attempt is marked dispatched before it, not before
+        // the data commit.
+        if let Err(error) = self.attempt.mark_dispatched() {
+            return CommitOutcome::DefiniteFailure(error);
+        }
+        let attempt = self.attempt.id();
+        let reservation =
+            super::commit::reserve_commit(Arc::clone(&self.pool), &self.codec, attempt, deadline)
+                .await;
         match reservation {
             Ok(super::commit::ReservationDecision::Committed(receipt)) => {
                 return CommitOutcome::Committed(receipt);
             }
             Ok(super::commit::ReservationDecision::Reserved) => {}
             Err(error) => {
-                let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
                 return classify_terminalized_prepare(
                     error,
-                    super::commit::terminalize_undispatched(
-                        Arc::clone(&self.pool),
-                        &self.codec,
-                        self.transaction_id,
-                        reservation_token,
-                        cleanup_deadline,
-                    )
-                    .await,
+                    self.terminalize_undispatched(attempt).await,
                 );
             }
         }
@@ -1453,22 +1561,14 @@ impl MysqlWriteActorState {
             {
                 Ok(transaction) => transaction,
                 Err(error) => {
-                    let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
                     return classify_terminalized_prepare(
                         error,
-                        super::commit::terminalize_undispatched(
-                            Arc::clone(&self.pool),
-                            &self.codec,
-                            self.transaction_id,
-                            reservation_token,
-                            cleanup_deadline,
-                        )
-                        .await,
+                        self.terminalize_undispatched(attempt).await,
                     );
                 }
             };
         self.transaction = Some(transaction);
-        let result = self.prepare_and_apply_commit(reservation_token).await;
+        let result = self.prepare_and_apply_commit().await;
         match result {
             Ok(revision) => {
                 let transaction = match self.take_transaction() {
@@ -1476,88 +1576,94 @@ impl MysqlWriteActorState {
                     Err(error) => return CommitOutcome::DefiniteFailure(error),
                 };
                 match transaction.commit_native().await {
-                    NativeDataCommitOutcome::Committed => CommitOutcome::Committed(CommitReceipt {
-                        transaction_id: self.transaction_id,
-                        revision,
-                    }),
+                    NativeDataCommitOutcome::Committed => {
+                        CommitOutcome::Committed(CommitReceipt { attempt, revision })
+                    }
                     NativeDataCommitOutcome::BeforeDispatchFailure(error) => {
-                        let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
                         classify_terminalized_prepare(
                             error,
-                            super::commit::terminalize_undispatched(
-                                Arc::clone(&self.pool),
-                                &self.codec,
-                                self.transaction_id,
-                                reservation_token,
-                                cleanup_deadline,
-                            )
-                            .await,
+                            self.terminalize_undispatched(attempt).await,
                         )
                     }
                     NativeDataCommitOutcome::Unknown(error) => CommitOutcome::CommitUnknown(error),
                 }
             }
-            Err(error) => {
-                self.terminalize_failed_prepare(reservation_token, error)
-                    .await
-            }
+            Err(error) => self.terminalize_failed_prepare(error).await,
         }
+    }
+
+    async fn terminalize_undispatched(
+        &self,
+        attempt: AttemptId,
+    ) -> Result<super::commit::TerminalizeDecision, StateStoreError> {
+        let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
+        super::commit::terminalize_undispatched(
+            Arc::clone(&self.pool),
+            &self.codec,
+            attempt,
+            cleanup_deadline,
+        )
+        .await
     }
 
     async fn terminalize_failed_prepare(
         &mut self,
-        reservation_token: [u8; 16],
         prepare_error: StateStoreError,
     ) -> CommitOutcome {
         if let Ok(transaction) = self.take_transaction() {
             let _ = transaction.rollback().await;
         }
-        let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(2);
-        let terminalization = super::commit::terminalize_undispatched(
-            Arc::clone(&self.pool),
-            &self.codec,
-            self.transaction_id,
-            reservation_token,
-            cleanup_deadline,
-        )
-        .await;
+        let terminalization = self.terminalize_undispatched(self.attempt.id()).await;
         classify_prepare_failure(PrepareFailureEvidence {
             prepare_error,
             terminalization,
         })
     }
 
-    async fn prepare_and_apply_commit(
-        &mut self,
-        reservation_token: [u8; 16],
-    ) -> Result<StoreRevision, StateStoreError> {
-        let transaction_bytes = self
-            .codec
-            .encode_uuid(*self.transaction_id.as_uuid())
-            .to_vec();
-        let ledger: Option<(u8, Option<Vec<u8>>, Option<u64>)> = self
+    /// Locks the reservation, validates the transaction's observations, and
+    /// stages every mutation plus the ledger's flip to committed.
+    ///
+    /// # Why there is no reservation token any more
+    ///
+    /// This used to insert a random 16-byte token with the reservation and
+    /// re-check it here. The token did two jobs. The first was telling *my*
+    /// pending row apart from a pending row some other process had written
+    /// under the same caller-minted transaction UUID; that job is gone, because
+    /// an [`AttemptId`] carries an instance scope minted at open, never
+    /// persisted and impossible to build from bytes, so no second writer can
+    /// address this row at all. The second job -- proving the row about to be
+    /// flipped is still the live reservation this attempt made -- is *not*
+    /// gone, and is kept: the read below takes the row `FOR UPDATE` and refuses
+    /// anything but `Pending`, and the flip at the end of this function stays a
+    /// compare-and-swap on that same state. Dropping the guard along with the
+    /// token would let a row that had already been terminalized be quietly
+    /// rewritten to committed, which is the one thing the attempt contract says
+    /// can never happen.
+    async fn prepare_and_apply_commit(&mut self) -> Result<StoreRevision, StateStoreError> {
+        let attempt_bytes = encode_attempt_id(self.attempt.id());
+        let ledger: Option<(u8, Option<u64>)> = self
             .transaction()?
             .run({
-                let transaction_bytes = transaction_bytes.clone();
+                let attempt_bytes = attempt_bytes.clone();
                 move |connection| {
                     Box::pin(connection.exec_first(
-                        "SELECT state, reservation_token, revision
-                         FROM state_store_commits WHERE transaction_id = ? FOR UPDATE",
-                        (transaction_bytes,),
+                        "SELECT state, revision
+                         FROM state_store_commits WHERE attempt_id = ? FOR UPDATE",
+                        (attempt_bytes,),
                     ))
                 }
             })
             .await?;
+        // The reservation committed on its own connection just before this, so
+        // an absent row is not "no reservation" -- it is a row that vanished
+        // under a live attempt, which is corruption rather than a conflict.
         let state = ledger
-            .map(|(state, token, revision)| {
-                self.codec
-                    .decode_commit_state(state, token.as_deref(), revision)
-            })
+            .map(|(state, revision)| self.codec.decode_commit_state(state, revision))
             .transpose()?
             .ok_or_else(persisted_corruption)?;
-        if state != super::codec::DurableCommitState::Pending(reservation_token) {
+        if state != DurableCommitState::Pending {
             return Err(conflict(
-                "MySQL commit reservation is not owned by this transaction",
+                "MySQL commit reservation is no longer pending for this attempt",
             ));
         }
         #[cfg(feature = "state-store-test-hooks")]
@@ -1713,16 +1819,6 @@ impl MysqlWriteActorState {
                         .await?;
                 }
             }
-            let key_bytes = key.as_bytes().to_vec();
-            self.transaction()?
-                .run(move |connection| {
-                    Box::pin(connection.exec_drop(
-                        "INSERT INTO state_store_changes (revision, sequence, key_bytes)
-                         VALUES (?, ?, ?)",
-                        (next_revision, sequence, key_bytes),
-                    ))
-                })
-                .await?;
         }
         self.transaction()?
             .run(move |connection| {
@@ -1736,6 +1832,10 @@ impl MysqlWriteActorState {
                 ))
             })
             .await?;
+        // Compare-and-swap, not a blind write: the row must still be the
+        // pending reservation this attempt made. Anything else -- released,
+        // already terminalized -- affects no row and fails the commit here,
+        // before the data transaction is allowed to become durable.
         let ledger_updates = self
             .transaction()?
             .run(move |connection| {
@@ -1743,16 +1843,14 @@ impl MysqlWriteActorState {
                     connection
                         .exec_drop(
                             "UPDATE state_store_commits
-                             SET state = ?, reservation_token = NULL, revision = ?,
-                                 updated_at_ms = ?
-                             WHERE transaction_id = ? AND state = ? AND reservation_token = ?",
+                             SET state = ?, revision = ?, updated_at_ms = ?
+                             WHERE attempt_id = ? AND state = ?",
                             (
-                                2_u8,
+                                COMMIT_STATE_COMMITTED,
                                 next_revision,
                                 current_time_ms(),
-                                transaction_bytes,
-                                1_u8,
-                                reservation_token.to_vec(),
+                                attempt_bytes,
+                                COMMIT_STATE_PENDING,
                             ),
                         )
                         .await?;
@@ -1829,11 +1927,12 @@ fn precondition_matches(precondition: &Precondition, current: Option<&StateRecor
     }
 }
 
-fn provisional_version(transaction_id: TransactionId, operation: u64) -> VersionToken {
+fn provisional_version(attempt: AttemptId, operation: u64) -> VersionToken {
     VersionToken::try_from(bytes::Bytes::from(
         [
             PROVISIONAL_VERSION_TAG,
-            transaction_id.as_uuid().as_bytes(),
+            attempt.to_string().as_bytes(),
+            b"\0",
             &operation.to_be_bytes(),
         ]
         .concat(),
@@ -1972,12 +2071,6 @@ fn classify_prepare_failure(evidence: PrepareFailureEvidence) -> CommitOutcome {
         }
         Ok(super::commit::TerminalizeDecision::NotCommitted) => {
             classify_prepare_error(prepare_error)
-        }
-        Ok(super::commit::TerminalizeDecision::Unresolved) => {
-            CommitOutcome::CommitUnknown(StateStoreError::new(
-                StateStoreErrorKind::ProviderUnavailable,
-                "MySQL commit cleanup found an unresolved durable reservation",
-            ))
         }
         Err(cleanup_error) => CommitOutcome::CommitUnknown(cleanup_error),
     }

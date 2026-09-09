@@ -19,16 +19,46 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use novarocks_state_store_api::{Key, StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_api::{AttemptId, Key, StateStoreError, StateStoreErrorKind};
 
-use crate::MYSQL_MAX_KEY_BYTES;
+use crate::{MYSQL_MAX_ATTEMPT_ID_BYTES, MYSQL_MAX_KEY_BYTES, MYSQL_SCHEMA_VERSION};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// What the durable ledger says about one write attempt.
+///
+/// The row exists only between the attempt's reservation and the release of
+/// its evidence. `Pending` therefore means "this attempt may still be
+/// committing", not "this attempt failed": only `Committed` and `NotCommitted`
+/// are proof, and an absent row is no state at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DurableCommitState {
-    Pending([u8; 16]),
+    Pending,
     Committed(u64),
     NotCommitted,
 }
+
+pub(super) const COMMIT_STATE_PENDING: u8 = 1;
+pub(super) const COMMIT_STATE_COMMITTED: u8 = 2;
+pub(super) const COMMIT_STATE_NOT_COMMITTED: u8 = 3;
+
+/// Renders the ledger key for one attempt.
+///
+/// [`AttemptId`] exposes neither its instance scope's bytes nor a constructor
+/// from bytes, so the contract's own [`AttemptId::storage_key`] is the key.
+/// Deliberately not `Display`: that form leaves the sequence unpadded, so the
+/// key width would vary with the counter, and the contract warns against
+/// building durable keys or byte accounting on it. It is never decoded back --
+/// the store is only ever asked about an identity the running instance issued,
+/// and it looks that identity up by re-rendering it.
+pub(super) fn encode_attempt_id(attempt: AttemptId) -> Vec<u8> {
+    attempt.storage_key().into_bytes()
+}
+
+/// The ledger key column has to admit every attempt key, at compile time.
+///
+/// A runtime assertion here would only fire on a sequence long enough to
+/// overflow, which no test reaches. Fixed-width keys make the check static
+/// instead, so a narrowed column fails the build.
+const _: () = assert!(AttemptId::STORAGE_KEY_BYTES <= MYSQL_MAX_ATTEMPT_ID_BYTES);
 
 #[derive(Clone, Debug)]
 pub(super) struct MysqlCodec {
@@ -67,31 +97,22 @@ impl MysqlCodec {
         decode_revision_sequence(bytes)
     }
 
-    pub(super) fn encode_cursor(&self, revision: u64, sequence: u32) -> [u8; 12] {
-        encode_revision_sequence(revision, sequence)
-    }
-
-    pub(super) fn decode_cursor(&self, bytes: &[u8]) -> Result<(u64, u32), StateStoreError> {
-        decode_revision_sequence(bytes)
-    }
-
     pub(super) fn decode_commit_state(
         &self,
         state: u8,
-        reservation_token: Option<&[u8]>,
         revision: Option<u64>,
     ) -> Result<DurableCommitState, StateStoreError> {
-        match (state, reservation_token, revision) {
-            (1, Some(token), None) => Ok(DurableCommitState::Pending(copy_array(token)?)),
-            (2, None, Some(revision)) => Ok(DurableCommitState::Committed(revision)),
-            (3, None, None) => Ok(DurableCommitState::NotCommitted),
+        match (state, revision) {
+            (COMMIT_STATE_PENDING, None) => Ok(DurableCommitState::Pending),
+            (COMMIT_STATE_COMMITTED, Some(revision)) => Ok(DurableCommitState::Committed(revision)),
+            (COMMIT_STATE_NOT_COMMITTED, None) => Ok(DurableCommitState::NotCommitted),
             _ => Err(corruption()),
         }
     }
 
     pub(super) fn decode_schema_version(&self, bytes: &[u8]) -> Result<u32, StateStoreError> {
         let version = u32::from_be_bytes(copy_array(bytes)?);
-        if version != 1 {
+        if version != MYSQL_SCHEMA_VERSION {
             return Err(corruption());
         }
         Ok(version)
@@ -167,7 +188,11 @@ const fn corruption() -> StateStoreError {
 mod tests {
     use uuid::Uuid;
 
-    use super::{DurableCommitState, MysqlCodec, redacted_identity_hash};
+    use super::{
+        COMMIT_STATE_COMMITTED, COMMIT_STATE_NOT_COMMITTED, COMMIT_STATE_PENDING,
+        DurableCommitState, MYSQL_MAX_ATTEMPT_ID_BYTES, MYSQL_SCHEMA_VERSION, MysqlCodec,
+        encode_attempt_id, redacted_identity_hash,
+    };
     use novarocks_state_store_api::StateStoreErrorKind;
 
     fn assert_corruption<T: std::fmt::Debug>(
@@ -182,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn mysql_codec_round_trips_uuid_revision_version_and_cursor() {
+    fn mysql_codec_round_trips_uuid_revision_and_version() {
         let codec = MysqlCodec::new(3072).expect("codec");
         let uuid = Uuid::from_bytes([
             0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x32, 0x54, 0x76, 0x98, 0xba,
@@ -212,51 +237,85 @@ mod tests {
             codec.decode_version(&version).expect("version"),
             (revision, 0x1122_3344)
         );
-
-        let cursor = codec.encode_cursor(revision, u32::MAX);
-        assert_eq!(
-            codec.decode_cursor(&cursor).expect("cursor"),
-            (revision, u32::MAX)
-        );
     }
 
     #[test]
     fn mysql_codec_rejects_illegal_commit_state_combinations() {
         let codec = MysqlCodec::new(3072).expect("codec");
-        let token = [0x5a; 16];
 
         assert_eq!(
             codec
-                .decode_commit_state(1, Some(&token), None)
+                .decode_commit_state(COMMIT_STATE_PENDING, None)
                 .expect("pending"),
-            DurableCommitState::Pending(token)
+            DurableCommitState::Pending
         );
         assert_eq!(
             codec
-                .decode_commit_state(2, None, Some(7))
+                .decode_commit_state(COMMIT_STATE_COMMITTED, Some(7))
                 .expect("committed"),
             DurableCommitState::Committed(7)
         );
         assert_eq!(
             codec
-                .decode_commit_state(3, None, None)
+                .decode_commit_state(COMMIT_STATE_NOT_COMMITTED, None)
                 .expect("not committed"),
             DurableCommitState::NotCommitted
         );
 
+        // A revision only ever accompanies a committed row, and a committed row
+        // is meaningless without one. Neither half is guessed.
         for result in [
-            codec.decode_commit_state(0, None, None),
-            codec.decode_commit_state(1, None, None),
-            codec.decode_commit_state(1, Some(&token), Some(1)),
-            codec.decode_commit_state(2, Some(&token), Some(1)),
-            codec.decode_commit_state(2, None, None),
-            codec.decode_commit_state(3, Some(&token), None),
-            codec.decode_commit_state(3, None, Some(1)),
-            codec.decode_commit_state(4, None, None),
+            codec.decode_commit_state(0, None),
+            codec.decode_commit_state(COMMIT_STATE_PENDING, Some(1)),
+            codec.decode_commit_state(COMMIT_STATE_COMMITTED, None),
+            codec.decode_commit_state(COMMIT_STATE_NOT_COMMITTED, Some(1)),
+            codec.decode_commit_state(4, None),
         ] {
             assert_corruption(result);
         }
-        assert_corruption(codec.decode_commit_state(1, Some(&token[..15]), None));
+    }
+
+    /// The ledger key is the contract's fixed-width form, not `Display`.
+    #[test]
+    fn mysql_attempt_ledger_key_is_fixed_width_and_fits_the_commits_column() {
+        use novarocks_state_store_api::{
+            AttemptId, AttemptSupervisor, InDoubtAdjudicator, StateStoreError as ApiError,
+        };
+        use std::num::NonZeroUsize;
+        use std::sync::Arc;
+
+        struct NeverAsked;
+
+        #[async_trait::async_trait]
+        impl InDoubtAdjudicator for NeverAsked {
+            async fn adjudicate(
+                &self,
+                _: novarocks_state_store_api::AttemptId,
+            ) -> Result<novarocks_state_store_api::AttemptOutcome, ApiError> {
+                unreachable!("codec test never adjudicates")
+            }
+
+            async fn release_evidence(
+                &self,
+                _: novarocks_state_store_api::AttemptId,
+            ) -> Result<(), ApiError> {
+                unreachable!("codec test never releases")
+            }
+        }
+
+        let supervisor = AttemptSupervisor::new(
+            NonZeroUsize::new(1).expect("capacity"),
+            Arc::new(NeverAsked) as Arc<dyn InDoubtAdjudicator>,
+        );
+        let (attempt, _observation) = supervisor.reserve().expect("reserve");
+        let encoded = encode_attempt_id(attempt.id());
+        assert_eq!(encoded.len(), AttemptId::STORAGE_KEY_BYTES);
+        assert!(encoded.len() <= MYSQL_MAX_ATTEMPT_ID_BYTES);
+        assert_eq!(encoded, attempt.id().storage_key().into_bytes());
+        // The distinction this provider depends on: `Display` leaves the
+        // sequence unpadded, so a key built from it would be one width for
+        // attempt 1 and another for attempt 10.
+        assert_ne!(encoded, attempt.id().to_string().into_bytes());
     }
 
     #[test]
@@ -265,9 +324,9 @@ mod tests {
 
         assert_eq!(
             codec
-                .decode_schema_version(&1_u32.to_be_bytes())
+                .decode_schema_version(&MYSQL_SCHEMA_VERSION.to_be_bytes())
                 .expect("schema version"),
-            1
+            MYSQL_SCHEMA_VERSION
         );
         assert_eq!(
             codec
@@ -286,11 +345,12 @@ mod tests {
         assert_corruption(codec.decode_revision(&[0; 9]));
         assert_corruption(codec.decode_version(&[0; 11]));
         assert_corruption(codec.decode_version(&[0; 13]));
-        assert_corruption(codec.decode_cursor(&[0; 11]));
-        assert_corruption(codec.decode_cursor(&[0; 13]));
         assert_corruption(codec.decode_schema_version(&[0, 0, 0, 0]));
-        assert_corruption(codec.decode_schema_version(&[0, 0, 0, 2]));
-        assert_corruption(codec.decode_schema_version(&[0, 0, 0, 1, 0]));
+        // Neither the generation this replaced nor the next one is accepted:
+        // an older store is refused rather than migrated.
+        assert_corruption(codec.decode_schema_version(&[0, 0, 0, 1]));
+        assert_corruption(codec.decode_schema_version(&[0, 0, 0, 3]));
+        assert_corruption(codec.decode_schema_version(&[0, 0, 0, 2, 0]));
         assert_corruption(codec.decode_initial_incarnation(&0_u64.to_be_bytes()));
         assert_corruption(codec.decode_initial_incarnation(&2_u64.to_be_bytes()));
         assert_corruption(codec.checked_next_revision(u64::MAX));

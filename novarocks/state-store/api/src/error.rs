@@ -22,7 +22,14 @@ pub enum StateStoreErrorKind {
     InvalidRequest,
     InvalidConfiguration,
     UnsupportedFormat,
+    /// The request itself is outside a fixed storage limit. Permanent:
+    /// retrying the same request cannot succeed.
     LimitExceeded,
+    /// The instance is at its outstanding-attempt ceiling. Transient and
+    /// free of write effect, so a caller may back off and retry inside its
+    /// own budget. Deliberately distinct from `LimitExceeded`, which is a
+    /// permanent property of the request.
+    Saturated,
     DeadlineExceeded,
     PreconditionFailed,
     Conflict,

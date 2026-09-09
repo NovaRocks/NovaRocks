@@ -137,8 +137,9 @@ impl InMemoryMvRepository {
     }
 }
 
+#[async_trait::async_trait]
 impl MvRepository for InMemoryMvRepository {
-    fn create_projection(
+    async fn create_projection(
         &self,
         _operation_id: Uuid,
         projection: MvProjectionRequest,
@@ -175,7 +176,7 @@ impl MvRepository for InMemoryMvRepository {
         })
     }
 
-    fn replace_projection(
+    async fn replace_projection(
         &self,
         _operation_id: Uuid,
         request: ReplaceMvProjectionRequest,
@@ -215,12 +216,15 @@ impl MvRepository for InMemoryMvRepository {
         })
     }
 
-    fn load_by_id(&self, mv_id: i64) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+    async fn load_by_id(
+        &self,
+        mv_id: i64,
+    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
         let state = self.state()?;
         Ok(Self::loaded(&state, mv_id))
     }
 
-    fn find_by_target(
+    async fn find_by_target(
         &self,
         target: &MvTarget,
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
@@ -232,7 +236,7 @@ impl MvRepository for InMemoryMvRepository {
             .and_then(|(mv_id, _)| Self::loaded(&state, *mv_id)))
     }
 
-    fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
+    async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
         let state = self.state()?;
         Ok(state
             .projections
@@ -241,7 +245,7 @@ impl MvRepository for InMemoryMvRepository {
             .collect())
     }
 
-    fn delete_projection(
+    async fn delete_projection(
         &self,
         _operation_id: Uuid,
         request: DeleteMvProjectionRequest,
@@ -264,12 +268,12 @@ impl MvRepository for InMemoryMvRepository {
         Ok(true)
     }
 
-    fn wipe_projection_by_target(
+    async fn wipe_projection_by_target(
         &self,
         operation_id: Uuid,
         target: &MvTarget,
     ) -> Result<bool, MvRepositoryError> {
-        let Some(loaded) = self.find_by_target(target)? else {
+        let Some(loaded) = self.find_by_target(target).await? else {
             return Ok(false);
         };
         self.delete_projection(
@@ -280,15 +284,16 @@ impl MvRepository for InMemoryMvRepository {
                 expected_source_revision: loaded.definition.source_revision,
             },
         )
+        .await
     }
 
-    fn wipe_accelerator(&self, _operation_id: Uuid) -> Result<(), MvRepositoryError> {
+    async fn wipe_accelerator(&self, _operation_id: Uuid) -> Result<(), MvRepositoryError> {
         let mut state = self.state()?;
         *state = State::default();
         Ok(())
     }
 
-    fn list_dependencies_by_downstream(
+    async fn list_dependencies_by_downstream(
         &self,
         mv_id: i64,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
@@ -300,7 +305,7 @@ impl MvRepository for InMemoryMvRepository {
             .unwrap_or_default())
     }
 
-    fn list_downstream_dependencies(
+    async fn list_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectRef,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
@@ -314,11 +319,15 @@ impl MvRepository for InMemoryMvRepository {
             .collect())
     }
 
-    fn ensure_no_downstream_dependencies(
+    async fn ensure_no_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectRef,
     ) -> Result<(), MvRepositoryError> {
-        if self.list_downstream_dependencies(upstream)?.is_empty() {
+        if self
+            .list_downstream_dependencies(upstream)
+            .await?
+            .is_empty()
+        {
             Ok(())
         } else {
             Err(MvRepositoryError::new(

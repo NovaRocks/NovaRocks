@@ -203,10 +203,6 @@ impl IcebergMvCorePorts {
         &self.functions
     }
 
-    pub(crate) fn repository(&self) -> &Arc<dyn MvRepository> {
-        &self.repository
-    }
-
     pub(crate) fn readiness(&self) -> &Arc<MvReadinessPort> {
         &self.readiness
     }
@@ -1939,12 +1935,13 @@ pub fn reobserve_and_project_iceberg_mv_with_ports(
     )
     .map_err(|error| error.to_string())?
     .ok_or_else(|| "Iceberg MV target is missing its lake descriptor after mutation".to_string())?;
-    crate::mv::domain::projector::project_observed_repository(
-        ports.repository.as_ref(),
-        uuid::Uuid::now_v7(),
-        &package,
-    )
-    .map_err(|error| error.to_string())
+    // The readiness port is the one place that adapts the async projection
+    // store for this synchronous statement thread, and it is also what marks
+    // the target consumable again once the post-commit observation lands.
+    ports
+        .readiness
+        .project_observed(uuid::Uuid::now_v7(), &package)
+        .map_err(|error| error.to_string())
 }
 
 /// Peel any top-level `BranchScoped` wrapper, returning the per-row inner

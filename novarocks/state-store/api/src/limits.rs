@@ -23,7 +23,6 @@ pub const MAX_PAGE_SIZE: usize = 1_000;
 pub const MAX_TRANSACTION_OPERATIONS: usize = 10_000;
 pub const MAX_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_TRANSACTION_DEADLINE: Duration = Duration::from_secs(4);
-pub const MAX_RUNNER_ATTEMPTS: usize = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateStoreLimits {
@@ -32,8 +31,9 @@ pub struct StateStoreLimits {
     pub max_page_size: usize,
     pub max_transaction_operations: usize,
     pub max_transaction_bytes: usize,
+    /// Ceiling on one physical transaction. It is a storage property and
+    /// says nothing about how many attempts an application may make.
     pub transaction_deadline: Duration,
-    pub runner_max_attempts: usize,
 }
 
 impl Default for StateStoreLimits {
@@ -45,7 +45,6 @@ impl Default for StateStoreLimits {
             max_transaction_operations: MAX_TRANSACTION_OPERATIONS,
             max_transaction_bytes: MAX_TRANSACTION_BYTES,
             transaction_deadline: DEFAULT_TRANSACTION_DEADLINE,
-            runner_max_attempts: MAX_RUNNER_ATTEMPTS,
         }
     }
 }

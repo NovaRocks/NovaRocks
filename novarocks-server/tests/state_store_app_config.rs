@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_server::app_config::NovaRocksConfig;
+use novarocks_frontend::StateStoreRunPolicy;
+use novarocks_server::app_config::{ApplicationConfig, NovaRocksConfig};
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
-use novarocks_state_store_sqlite::SqliteHistoryRetentionConfig;
 use novarocks_types::ClusterRole;
 use std::process::Command;
+use std::time::Duration;
 
 #[test]
 fn server_load_resolves_environment_references_once_without_secret_diagnostics()
@@ -158,61 +159,6 @@ fn assert_error_category(result: anyhow::Result<NovaRocksConfig>, expected: &str
 }
 
 #[test]
-fn sqlite_config_loads_defaults_and_explicit_retention() -> anyhow::Result<()> {
-    let config_path = tempfile::NamedTempFile::new()?;
-    std::fs::write(
-        config_path.path(),
-        r#"
-[state_store]
-provider = "sqlite"
-cluster_id = "production-cluster"
-path = "meta/frontend-state.sqlite"
-
-[state_store.history_retention]
-max_age_secs = 3600
-max_change_rows = 2000000
-max_commit_receipts = 3000000
-maintenance_interval_commits = 512
-incremental_vacuum_pages = 2048
-"#,
-    )?;
-
-    let loaded = NovaRocksConfig::load_from_file(config_path.path())?;
-    let state_store = loaded.state_store.expect("state store config").store;
-    assert_eq!(state_store.cluster_id, "production-cluster");
-    assert_eq!(
-        state_store.path,
-        std::path::PathBuf::from("meta/frontend-state.sqlite")
-    );
-    assert_eq!(state_store.history_retention.max_age_secs, 3600);
-    assert_eq!(state_store.history_retention.max_change_rows, 2_000_000);
-    assert_eq!(state_store.history_retention.max_commit_receipts, 3_000_000);
-    assert_eq!(
-        state_store.history_retention.maintenance_interval_commits,
-        512
-    );
-    assert_eq!(state_store.history_retention.incremental_vacuum_pages, 2048);
-
-    let defaults_path = tempfile::NamedTempFile::new()?;
-    std::fs::write(
-        defaults_path.path(),
-        r#"
-[state_store]
-provider = "sqlite"
-cluster_id = "production-cluster"
-path = "meta/frontend-state.sqlite"
-"#,
-    )?;
-    let defaults = NovaRocksConfig::load_from_file(defaults_path.path())?
-        .state_store
-        .expect("state store config")
-        .store
-        .history_retention;
-    assert_eq!(defaults, SqliteHistoryRetentionConfig::default());
-    Ok(())
-}
-
-#[test]
 fn sqlite_config_rejects_remote_provider_and_unknown_remote_arguments() -> anyhow::Result<()> {
     for config in [
         r#"
@@ -250,17 +196,13 @@ disable_multi_version_client = true
 }
 
 #[test]
-fn sqlite_config_rejects_invalid_history_retention_before_opening() -> anyhow::Result<()> {
-    for config in [
-        r#"
-[state_store]
-provider = "sqlite"
-cluster_id = "production-cluster"
-path = "meta/frontend-state.sqlite"
-
-[state_store.history_retention]
-max_age_secs = 0
-"#,
+fn storage_limits_and_application_policy_are_configured_apart() -> anyhow::Result<()> {
+    // What the provider enforces and what the application is willing to spend
+    // are two decisions with two owners, so they live in two sections. They
+    // used to share one, which let a storage file dictate retry behaviour.
+    let config_path = tempfile::NamedTempFile::new()?;
+    std::fs::write(
+        config_path.path(),
         r#"
 [state_store]
 provider = "sqlite"
@@ -269,20 +211,126 @@ path = "meta/frontend-state.sqlite"
 
 [state_store.limits]
 max_transaction_operations = 100
+transaction_timeout_ms = 1500
 
-[state_store.history_retention]
-max_change_rows = 99
+[application.state_store_policy]
+max_attempts = 2
+operation_timeout_ms = 900
+"#,
+    )?;
+
+    let loaded = NovaRocksConfig::load_from_file(config_path.path())?;
+    let state_store = loaded.state_store.expect("state store config").store;
+    assert_eq!(state_store.cluster_id, "production-cluster");
+    assert_eq!(
+        state_store.path,
+        std::path::PathBuf::from("meta/frontend-state.sqlite")
+    );
+    assert_eq!(state_store.limits.max_transaction_operations, Some(100));
+    assert_eq!(state_store.limits.transaction_timeout_ms, Some(1500));
+
+    let policy = loaded.application.state_store_policy.resolve()?;
+    assert_eq!(policy.max_attempts(), 2);
+    assert_eq!(policy.operation_timeout(), Duration::from_millis(900));
+    Ok(())
+}
+
+#[test]
+fn an_absent_application_section_means_the_built_in_policy() -> anyhow::Result<()> {
+    let config_path = tempfile::NamedTempFile::new()?;
+    std::fs::write(
+        config_path.path(),
+        r#"
+[state_store]
+provider = "sqlite"
+cluster_id = "production-cluster"
+path = "meta/frontend-state.sqlite"
+"#,
+    )?;
+    let loaded = NovaRocksConfig::load_from_file(config_path.path())?;
+    assert_eq!(loaded.application, ApplicationConfig::default());
+    assert_eq!(
+        loaded.application.state_store_policy.resolve()?,
+        StateStoreRunPolicy::default()
+    );
+    Ok(())
+}
+
+#[test]
+fn an_application_policy_may_tighten_but_never_relax() -> anyhow::Result<()> {
+    // Refused at load, not at first use: a file nothing can honour should fail
+    // where it is written.
+    for config in [
+        r#"
+[application.state_store_policy]
+max_attempts = 0
+"#,
+        r#"
+[application.state_store_policy]
+max_attempts = 99
+"#,
+        r#"
+[application.state_store_policy]
+operation_timeout_ms = 0
+"#,
+        r#"
+[application.state_store_policy]
+operation_timeout_ms = 60000
 "#,
     ] {
         let config_path = tempfile::NamedTempFile::new()?;
         std::fs::write(config_path.path(), config)?;
         let error = match NovaRocksConfig::load_from_file(config_path.path()) {
-            Ok(_) => panic!("invalid retention configuration must fail before opening"),
+            Ok(_) => panic!("a relaxed application policy must fail before startup: {config}"),
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("InvalidStateStoreConfig"),
+            format!("{error:#}").contains("InvalidApplicationConfig"),
             "unexpected error: {error:#}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn the_retired_history_and_runner_settings_are_refused_not_ignored() -> anyhow::Result<()> {
+    // These named a change feed and a provider-dictated attempt ceiling that no
+    // longer exist. Silently accepting them would leave an operator believing a
+    // setting still applies.
+    for config in [
+        r#"
+[state_store]
+provider = "sqlite"
+cluster_id = "production-cluster"
+path = "meta/frontend-state.sqlite"
+
+[state_store.history_retention]
+max_age_secs = 3600
+"#,
+        r#"
+[state_store]
+provider = "sqlite"
+cluster_id = "production-cluster"
+path = "meta/frontend-state.sqlite"
+
+[state_store.limits]
+runner_max_attempts = 3
+"#,
+        r#"
+[state_store]
+provider = "sqlite"
+cluster_id = "production-cluster"
+path = "meta/frontend-state.sqlite"
+
+[state_store.limits]
+transaction_deadline_ms = 1500
+"#,
+    ] {
+        let config_path = tempfile::NamedTempFile::new()?;
+        std::fs::write(config_path.path(), config)?;
+        assert!(
+            NovaRocksConfig::load_from_file(config_path.path()).is_err(),
+            "a retired setting must be rejected: {config}"
         );
     }
     Ok(())

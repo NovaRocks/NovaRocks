@@ -77,9 +77,6 @@ pub fn foundationdb_provider_factory(
 #[path = "foundationdb/budget.rs"]
 mod budget;
 #[cfg(feature = "foundationdb-provider")]
-#[path = "foundationdb/changes.rs"]
-mod changes;
-#[cfg(feature = "foundationdb-provider")]
 #[path = "foundationdb/codec.rs"]
 mod codec;
 #[cfg(feature = "foundationdb-provider")]
@@ -88,6 +85,9 @@ mod commit;
 #[cfg(feature = "foundationdb-provider")]
 #[path = "foundationdb/identity.rs"]
 mod identity;
+#[cfg(feature = "foundationdb-provider")]
+#[path = "foundationdb/metrics.rs"]
+mod metrics;
 #[cfg(feature = "foundationdb-provider")]
 #[path = "foundationdb/provider.rs"]
 pub mod provider;
@@ -160,6 +160,8 @@ use async_trait::async_trait;
 #[cfg(feature = "foundationdb-provider")]
 use foundationdb::FdbError;
 #[cfg(feature = "foundationdb-provider")]
+use std::num::NonZeroUsize;
+#[cfg(feature = "foundationdb-provider")]
 use std::sync::Arc;
 #[cfg(feature = "foundationdb-provider")]
 use uuid::Uuid;
@@ -167,26 +169,31 @@ use uuid::Uuid;
 #[cfg(feature = "foundationdb-provider")]
 use self::codec::KeyspaceCodec;
 #[cfg(feature = "foundationdb-provider")]
+use self::commit::FoundationDbEvidence;
+#[cfg(feature = "foundationdb-provider")]
 use self::identity::open_identity;
 #[cfg(feature = "foundationdb-provider")]
+use self::metrics::ProviderMetrics;
+#[cfg(feature = "foundationdb-provider")]
 use novarocks_state_store_api::{
-    ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
-    WriteTransaction,
+    AttemptSupervisor, DEFAULT_MAX_OUTSTANDING_ATTEMPTS, InDoubtAdjudicator, ReadTransaction,
+    StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity,
+    WriteAttempt, WriteTransaction,
 };
 
 #[cfg(feature = "foundationdb-provider")]
 use self::runtime::ProviderHandle;
-#[cfg(feature = "foundationdb-provider")]
-use novarocks_state_store_api::StateStoreMetrics;
 
 #[cfg(feature = "foundationdb-provider")]
 pub(crate) struct FoundationDbStateStore {
-    lease: ProviderHandle,
+    /// Shared with the adjudicator, which has to outlive any single request in
+    /// order to answer for an attempt whose caller is already gone.
+    lease: Arc<ProviderHandle>,
     codec: KeyspaceCodec,
     identity: StoreIdentity,
     limits: StateStoreLimits,
-    metrics: Arc<StateStoreMetrics>,
+    metrics: Arc<ProviderMetrics>,
+    attempts: AttemptSupervisor,
 }
 
 #[cfg(feature = "foundationdb-provider")]
@@ -208,7 +215,7 @@ fn provider_error_metric_event(error: &StateStoreError) -> Option<ProviderErrorM
 }
 
 #[cfg(feature = "foundationdb-provider")]
-fn record_provider_error_metric(metrics: &StateStoreMetrics, error: &StateStoreError) {
+fn record_provider_error_metric(metrics: &ProviderMetrics, error: &StateStoreError) {
     match provider_error_metric_event(error) {
         Some(ProviderErrorMetricEvent::Deadline) => metrics.record_deadline(),
         Some(ProviderErrorMetricEvent::BlockingFailure) => metrics.record_blocking_failure(),
@@ -239,25 +246,44 @@ impl FoundationDbStateStore {
         cluster_id: String,
         keyspace_id: Uuid,
     ) -> Result<Self, StateStoreError> {
+        let lease = Arc::new(lease);
         let database = lease.database()?;
-        let codec = KeyspaceCodec::new(keyspace_id);
-        let identity = open_identity(database.as_ref(), &codec, &cluster_id)
-            .await?
-            .identity;
+        // One tag per open. An attempt identity is deliberately not convertible
+        // to bytes, so this is what keeps two live opens of one keyspace from
+        // addressing each other's commit-state keys.
+        let codec = KeyspaceCodec::new(keyspace_id, Uuid::new_v4());
+        let identity = open_identity(database.as_ref(), &codec, &cluster_id).await?;
         tracing::info!(
             provider = "foundationdb",
             client_status = "ready",
             keyspace_hash = %codec.keyspace_hash(),
             "FoundationDB state store client is ready"
         );
+        let metrics = Arc::new(ProviderMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID));
+        let evidence = Arc::new(FoundationDbEvidence::new(
+            Arc::clone(&lease),
+            codec.clone(),
+            limits.clone(),
+            Arc::clone(&metrics),
+        ));
+        let attempts = AttemptSupervisor::new(
+            default_attempt_capacity(),
+            evidence as Arc<dyn InDoubtAdjudicator>,
+        );
         Ok(Self {
             lease,
             codec,
             identity,
             limits,
-            metrics: Arc::new(StateStoreMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID)),
+            metrics,
+            attempts,
         })
     }
+}
+
+#[cfg(feature = "foundationdb-provider")]
+fn default_attempt_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_MAX_OUTSTANDING_ATTEMPTS).expect("default attempt capacity")
 }
 
 #[cfg(feature = "foundationdb-provider")]
@@ -267,8 +293,8 @@ impl StateStore for FoundationDbStateStore {
         &self.limits
     }
 
-    fn metrics_snapshot(&self) -> StateStoreMetricsSnapshot {
-        self.metrics.snapshot()
+    fn attempts(&self) -> &AttemptSupervisor {
+        &self.attempts
     }
 
     async fn begin_read(&self) -> Result<Box<dyn ReadTransaction>, StateStoreError> {
@@ -277,66 +303,27 @@ impl StateStore for FoundationDbStateStore {
 
     async fn begin_write(
         &self,
-        transaction_id: TransactionId,
+        attempt: WriteAttempt,
         _purpose: &str,
     ) -> Result<Box<dyn WriteTransaction>, StateStoreError> {
-        Ok(Box::new(self.begin_write_transaction(transaction_id)?))
-    }
-
-    async fn poll_changes(
-        &self,
-        request: &ChangePollRequest,
-    ) -> Result<ChangePage, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
-        let database = self.lease.database()?;
-        let result = changes::poll_changes(
-            database.as_ref(),
-            &self.codec,
-            &self.identity,
-            &self.limits,
-            self.metrics.as_ref(),
-            request,
-        )
-        .await;
-        if let Ok(page) = &result {
-            self.metrics.record_page_records(page.hints.len() as u64);
-            let bytes = page.hints.iter().fold(0_u64, |total, hint| {
-                total.saturating_add(
-                    u64::try_from(hint.key.as_bytes().len() + hint.revision.as_bytes().len())
-                        .unwrap_or(u64::MAX),
-                )
-            });
-            self.metrics.record_bytes_read(bytes);
-        }
-        result
+        // A capability another instance issued is refused before anything is
+        // acquired. The attempt is then simply dropped: it never reached this
+        // keyspace, so this store is in no position to say anything about it.
+        attempt.require_scope(self.attempts.scope())?;
+        Ok(Box::new(self.begin_write_transaction(attempt)?))
     }
 
     async fn identity(&self) -> Result<StoreIdentity, StateStoreError> {
         let _operation = self.lease.acquire_operation()?;
         Ok(self.identity.clone())
     }
-
-    async fn resolve_commit(
-        &self,
-        transaction_id: &TransactionId,
-    ) -> Result<CommitResolution, StateStoreError> {
-        let _operation = self.lease.acquire_operation()?;
-        let database = self.lease.database()?;
-        commit::resolve_commit(
-            database.as_ref(),
-            &self.codec,
-            &self.limits,
-            *transaction_id,
-            self.metrics.as_ref(),
-        )
-        .await
-    }
 }
 
 #[cfg(all(test, feature = "foundationdb-provider"))]
 mod tests {
+    use self::metrics::ProviderOperation;
     use super::*;
-    use novarocks_state_store_api::{StateStoreErrorKind, StateStoreOperation};
+    use novarocks_state_store_api::StateStoreErrorKind;
 
     #[test]
     fn provider_error_metrics_count_each_blocker_without_public_operation_duplication() {
@@ -362,7 +349,7 @@ mod tests {
             None
         );
 
-        let metrics = StateStoreMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID);
+        let metrics = ProviderMetrics::new(FOUNDATIONDB_STATE_STORE_PROVIDER_ID);
         record_provider_error_metric(
             &metrics,
             &StateStoreError::new(StateStoreErrorKind::DeadlineExceeded, "deadline"),
@@ -376,7 +363,7 @@ mod tests {
         assert_eq!(snapshot.blocking_failure_count, 1);
         assert_eq!(snapshot.commit_count, 0);
         assert_eq!(
-            snapshot.operation_duration_observations(StateStoreOperation::Commit),
+            snapshot.operation_duration_observations(ProviderOperation::Commit),
             0
         );
     }

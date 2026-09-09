@@ -26,23 +26,21 @@ use novarocks_state_store_api::{
     StateStoreProviderLifecycle,
 };
 
-use super::{SQLITE_STATE_STORE_PROVIDER_ID, SqliteHistoryRetentionConfig, SqliteStateStore};
+use super::{SQLITE_STATE_STORE_PROVIDER_ID, SqliteStateStore};
 
 pub struct SqliteStateStoreProviderFactory {
     descriptor: StateStoreProviderDescriptor,
     path: PathBuf,
-    history_retention: SqliteHistoryRetentionConfig,
 }
 
 impl SqliteStateStoreProviderFactory {
-    pub fn new(path: PathBuf, history_retention: SqliteHistoryRetentionConfig) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         Self {
             descriptor: StateStoreProviderDescriptor::new(
                 SQLITE_STATE_STORE_PROVIDER_ID,
                 MAX_KEY_BYTES,
             ),
             path,
-            history_retention,
         }
     }
 }
@@ -60,8 +58,7 @@ impl StateStoreProviderFactory for SqliteStateStoreProviderFactory {
         if Instant::now() >= request.deadline {
             return Err(deadline_error());
         }
-        let store =
-            SqliteStateStore::open(self.path, self.history_retention, request.clone()).await?;
+        let store = SqliteStateStore::open(self.path, request.clone()).await?;
         if Instant::now() >= request.deadline {
             drop(store);
             return Err(deadline_error());
@@ -158,7 +155,6 @@ mod tests {
     ) -> Box<dyn StateStoreProviderInstance> {
         Box::new(SqliteStateStoreProviderFactory::new(
             temp.path().join("state-store.sqlite"),
-            SqliteHistoryRetentionConfig::default(),
         ))
         .open(request(deadline))
         .await

@@ -35,9 +35,9 @@ use crate::{
 };
 use novarocks_secret::SecretValue;
 use novarocks_state_store_api::{
-    ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, ContinuationToken,
+    AttemptOutcome, CommitObservation, CommitOutcome, ContinuationToken,
     Direction as StoreDirection, Key, KeyRange, Precondition as StorePrecondition, RangeRequest,
-    StateRecord, StateStore, StateStoreError, TransactionId, Value, VersionToken, WriteTransaction,
+    StateRecord, StateStore, StateStoreError, Value, VersionToken, WriteTransaction,
 };
 
 const MAX_LINE_BYTES: usize = 160 * 1024;
@@ -83,17 +83,17 @@ enum Request {
     },
     Begin {
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         description: String,
     },
     Get {
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         key: String,
     },
     Range {
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         start: String,
         end: String,
         direction: Direction,
@@ -103,32 +103,26 @@ enum Request {
     },
     Put {
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         key: String,
         value: String,
         precondition: RawPrecondition,
     },
     Delete {
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         key: String,
         precondition: RawPrecondition,
     },
     Commit {
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         #[serde(default)]
         lose_response: bool,
     },
     Resolve {
         id: u64,
-        transaction_id: Uuid,
-    },
-    Poll {
-        id: u64,
-        #[serde(default)]
-        after: Option<String>,
-        page_size: usize,
+        handle: Uuid,
     },
     Shutdown {
         id: u64,
@@ -146,7 +140,6 @@ impl Request {
             | Self::Delete { id, .. }
             | Self::Commit { id, .. }
             | Self::Resolve { id, .. }
-            | Self::Poll { id, .. }
             | Self::Shutdown { id } => *id,
         }
     }
@@ -204,14 +197,6 @@ struct Response {
     records: Vec<RecordResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     continuation: Option<String>,
-    #[serde(default)]
-    hints: Vec<HintResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cursor: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    high_watermark: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resync_required: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -219,12 +204,6 @@ struct RecordResponse {
     key: String,
     value: String,
     version: String,
-}
-
-#[derive(Debug, Serialize)]
-struct HintResponse {
-    revision: String,
-    key: String,
 }
 
 impl Response {
@@ -243,10 +222,6 @@ impl Response {
             record: None,
             records: Vec::new(),
             continuation: None,
-            hints: Vec::new(),
-            cursor: None,
-            high_watermark: None,
-            resync_required: None,
         }
     }
 
@@ -265,10 +240,6 @@ impl Response {
             record: None,
             records: Vec::new(),
             continuation: None,
-            hints: Vec::new(),
-            cursor: None,
-            high_watermark: None,
-            resync_required: None,
         }
     }
 }
@@ -277,7 +248,19 @@ impl Response {
 struct HelperState {
     runtime: Option<MysqlProviderTestHarness>,
     store: Option<Arc<dyn StateStore>>,
+    /// Live write transactions, addressed by a name the driver picked.
+    ///
+    /// The name is a protocol handle and nothing more. It used to be the
+    /// store's transaction identity, which is what let a driver ask any
+    /// process about any identifier it liked; the store now issues its own
+    /// attempt identity and the helper never sees a caller-supplied one.
     transactions: HashMap<Uuid, Box<dyn WriteTransaction>>,
+    /// Kept past commit so a lost response can still be resolved.
+    ///
+    /// This is the only thing that can resolve an attempt: the identity is
+    /// scoped to this process's open instance, so a second helper has nothing
+    /// to look up and is not asked to.
+    observations: HashMap<Uuid, CommitObservation>,
     next_id: u64,
 }
 
@@ -310,17 +293,13 @@ impl HelperState {
         match request {
             Request::Open { cluster_id, .. } => self.open(id, cluster_id).await,
             Request::Begin {
-                transaction_id,
+                handle,
                 description,
                 ..
-            } => self.begin(id, transaction_id, description).await,
-            Request::Get {
-                transaction_id,
-                key,
-                ..
-            } => self.get(id, transaction_id, key).await,
+            } => self.begin(id, handle, description).await,
+            Request::Get { handle, key, .. } => self.get(id, handle, key).await,
             Request::Range {
-                transaction_id,
+                handle,
                 start,
                 end,
                 direction,
@@ -328,39 +307,28 @@ impl HelperState {
                 continuation,
                 ..
             } => {
-                self.range(
-                    id,
-                    transaction_id,
-                    start,
-                    end,
-                    direction,
-                    page_size,
-                    continuation,
-                )
-                .await
+                self.range(id, handle, start, end, direction, page_size, continuation)
+                    .await
             }
             Request::Put {
-                transaction_id,
+                handle,
                 key,
                 value,
                 precondition,
                 ..
-            } => self.put(id, transaction_id, key, value, precondition).await,
+            } => self.put(id, handle, key, value, precondition).await,
             Request::Delete {
-                transaction_id,
+                handle,
                 key,
                 precondition,
                 ..
-            } => self.delete(id, transaction_id, key, precondition).await,
+            } => self.delete(id, handle, key, precondition).await,
             Request::Commit {
-                transaction_id,
+                handle,
                 lose_response,
                 ..
-            } => self.commit(id, transaction_id, lose_response).await,
-            Request::Resolve { transaction_id, .. } => self.resolve(id, transaction_id).await,
-            Request::Poll {
-                after, page_size, ..
-            } => self.poll(id, after, page_size).await,
+            } => self.commit(id, handle, lose_response).await,
+            Request::Resolve { handle, .. } => self.resolve(id, handle).await,
             Request::Shutdown { .. } => self.shutdown(id).await,
         }
     }
@@ -379,6 +347,7 @@ impl HelperState {
                     cluster_id,
                     limits: MysqlTestLimitOverrides::default(),
                     provider: MysqlTestProviderConfig::Mysql { database },
+                    outstanding_attempts: None,
                 },
                 Instant::now() + COMMAND_DEADLINE,
             )
@@ -407,34 +376,39 @@ impl HelperState {
     async fn begin(
         &mut self,
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         description: String,
     ) -> Result<Response, ProtocolError> {
-        if self.transactions.contains_key(&transaction_id) {
+        if self.transactions.contains_key(&handle) {
             return Err(ProtocolError::new(
                 id,
                 "DuplicateTransaction",
-                "transaction identifier is already active",
+                "transaction handle is already active",
             ));
         }
-        let transaction = self
-            .store(id)?
-            .begin_write(transaction_id.into(), &description)
+        let store = self.store(id)?;
+        let (attempt, observation) = store
+            .attempts()
+            .reserve()
+            .map_err(|error| ProtocolError::state_store(id, "BeginFailed", &error))?;
+        let transaction = store
+            .begin_write(attempt, &description)
             .await
             .map_err(|error| ProtocolError::state_store(id, "BeginFailed", &error))?;
-        self.transactions.insert(transaction_id, transaction);
+        self.transactions.insert(handle, transaction);
+        self.observations.insert(handle, observation);
         Ok(Response::success(id, "Begun"))
     }
 
     async fn get(
         &mut self,
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         raw_key: String,
     ) -> Result<Response, ProtocolError> {
         let key = store_key(id, &raw_key)?;
         let record = self
-            .transaction_mut(id, transaction_id)?
+            .transaction_mut(id, handle)?
             .get(&key)
             .await
             .map_err(|error| ProtocolError::state_store(id, "GetFailed", &error))?;
@@ -447,7 +421,7 @@ impl HelperState {
     async fn range(
         &mut self,
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         raw_start: String,
         raw_end: String,
         direction: Direction,
@@ -473,7 +447,7 @@ impl HelperState {
             continuation,
         };
         let page = self
-            .transaction_mut(id, transaction_id)?
+            .transaction_mut(id, handle)?
             .range(&request)
             .await
             .map_err(|error| ProtocolError::state_store(id, "RangeFailed", &error))?;
@@ -488,7 +462,7 @@ impl HelperState {
     async fn put(
         &mut self,
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         raw_key: String,
         raw_value: String,
         raw_precondition: RawPrecondition,
@@ -502,7 +476,7 @@ impl HelperState {
         )?))
         .map_err(|error| ProtocolError::state_store(id, "InvalidPayload", &error))?;
         let precondition = precondition(id, raw_precondition)?;
-        self.transaction_mut(id, transaction_id)?
+        self.transaction_mut(id, handle)?
             .put(key, value, precondition)
             .await
             .map_err(|error| ProtocolError::state_store(id, "PutFailed", &error))?;
@@ -512,13 +486,13 @@ impl HelperState {
     async fn delete(
         &mut self,
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         raw_key: String,
         raw_precondition: RawPrecondition,
     ) -> Result<Response, ProtocolError> {
         let key = store_key(id, &raw_key)?;
         let precondition = precondition(id, raw_precondition)?;
-        self.transaction_mut(id, transaction_id)?
+        self.transaction_mut(id, handle)?
             .delete(key, precondition)
             .await
             .map_err(|error| ProtocolError::state_store(id, "DeleteFailed", &error))?;
@@ -528,12 +502,12 @@ impl HelperState {
     async fn commit(
         &mut self,
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
         lose_response: bool,
     ) -> Result<Response, ProtocolError> {
         let transaction = self
             .transactions
-            .remove(&transaction_id)
+            .remove(&handle)
             .ok_or_else(|| invalid_order(id))?;
         let outcome = if lose_response {
             let control = MysqlCommitTestApi::arm_shared_post_dispatch(true);
@@ -571,50 +545,29 @@ impl HelperState {
         Ok(commit_response(id, outcome))
     }
 
-    async fn resolve(&self, id: u64, transaction_id: Uuid) -> Result<Response, ProtocolError> {
-        let resolution = self
-            .store(id)?
-            .resolve_commit(&TransactionId::from(transaction_id))
+    /// Answers for an attempt *this* helper issued.
+    ///
+    /// An unknown handle is a protocol error rather than a verdict. There is
+    /// no longer any way to ask a store about an identity it did not issue, so
+    /// the honest reply to "resolve something I never began" is that the
+    /// question is malformed -- not "not committed".
+    async fn resolve(&self, id: u64, handle: Uuid) -> Result<Response, ProtocolError> {
+        let observation = self.observations.get(&handle).ok_or_else(|| {
+            ProtocolError::new(
+                id,
+                "UnknownAttempt",
+                "this helper issued no write attempt under that handle",
+            )
+        })?;
+        let outcome = observation
+            .outcome()
             .await
             .map_err(|error| ProtocolError::state_store(id, "ResolveFailed", &error))?;
-        Ok(resolution_response(id, resolution))
-    }
-
-    async fn poll(
-        &self,
-        id: u64,
-        raw_after: Option<String>,
-        page_size: usize,
-    ) -> Result<Response, ProtocolError> {
-        let after = raw_after
-            .map(|encoded| {
-                decode_hex(id, "change cursor", &encoded, MAX_TOKEN_HEX_BYTES).and_then(|raw| {
-                    ChangeCursor::try_from(Bytes::from(raw))
-                        .map_err(|error| ProtocolError::state_store(id, "InvalidPayload", &error))
-                })
-            })
-            .transpose()?;
-        let page = self
-            .store(id)?
-            .poll_changes(&ChangePollRequest { after, page_size })
-            .await
-            .map_err(|error| ProtocolError::state_store(id, "PollFailed", &error))?;
-        let mut response = Response::success(id, "Poll");
-        response.hints = page
-            .hints
-            .into_iter()
-            .map(|hint| HintResponse {
-                revision: hex::encode(hint.revision.as_bytes()),
-                key: hex::encode(hint.key.as_bytes()),
-            })
-            .collect();
-        response.cursor = Some(hex::encode(page.next_cursor.as_bytes()));
-        response.high_watermark = Some(hex::encode(page.high_watermark.as_bytes()));
-        response.resync_required = Some(page.resync_required);
-        Ok(response)
+        Ok(resolution_response(id, outcome))
     }
 
     async fn shutdown(&mut self, id: u64) -> Result<Response, ProtocolError> {
+        self.observations.clear();
         let transactions = std::mem::take(&mut self.transactions);
         for (_, transaction) in transactions {
             transaction
@@ -639,10 +592,10 @@ impl HelperState {
     fn transaction_mut(
         &mut self,
         id: u64,
-        transaction_id: Uuid,
+        handle: Uuid,
     ) -> Result<&mut Box<dyn WriteTransaction>, ProtocolError> {
         self.transactions
-            .get_mut(&transaction_id)
+            .get_mut(&handle)
             .ok_or_else(|| invalid_order(id))
     }
 }
@@ -767,15 +720,15 @@ fn commit_response(id: u64, outcome: CommitOutcome) -> Response {
     response
 }
 
-fn resolution_response(id: u64, resolution: CommitResolution) -> Response {
+fn resolution_response(id: u64, outcome: AttemptOutcome) -> Response {
     let mut response = Response::success(id, "Resolve");
-    match resolution {
-        CommitResolution::Committed(receipt) => {
+    match outcome {
+        AttemptOutcome::Committed(receipt) => {
             response.resolution = Some("Committed");
             response.revision = Some(hex::encode(receipt.revision.as_bytes()));
         }
-        CommitResolution::NotCommitted => response.resolution = Some("NotCommitted"),
-        CommitResolution::Unresolved => response.resolution = Some("Pending"),
+        AttemptOutcome::NotCommitted => response.resolution = Some("NotCommitted"),
+        AttemptOutcome::Unresolved => response.resolution = Some("Unresolved"),
     }
     response
 }
