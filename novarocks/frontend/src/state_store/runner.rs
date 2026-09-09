@@ -66,7 +66,15 @@ pub enum RunFailure {
         observation: CommitObservation,
         error: StateStoreError,
     },
-    /// The operation budget ran out.
+    /// The operation budget ran out, and no write landed.
+    ///
+    /// This is a proof, not a hedge. Every place that produces it is before a
+    /// commit was dispatched or after one was proven not to have committed:
+    /// waiting for admission, opening the transaction, running the body, and
+    /// backing off after a conflict. A commit that *was* dispatched and then
+    /// timed out is [`Self::CommitUnknown`] instead, because that one really is
+    /// unknown. A consumer that reports this as an unknown outcome sends an
+    /// operator looking for an in-doubt write that cannot exist.
     DeadlineExceeded,
 }
 

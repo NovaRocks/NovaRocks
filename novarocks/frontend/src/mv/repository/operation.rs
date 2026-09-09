@@ -36,7 +36,11 @@ pub(crate) fn state_store_error(error: StateStoreError) -> MvRepositoryError {
             MvRepositoryErrorKind::Conflict
         }
         StateStoreErrorKind::Corruption => MvRepositoryErrorKind::Corruption,
-        StateStoreErrorKind::DeadlineExceeded => MvRepositoryErrorKind::CommitUnknown,
+        // Reachable only from `Begin`, `Operation` and `DefiniteFailure`, none
+        // of which has dispatched a commit that could still land. Calling that
+        // unknown would be conservative in the wrong direction: it is provably
+        // clean, and saying otherwise blocks the caller from simply retrying.
+        StateStoreErrorKind::DeadlineExceeded => MvRepositoryErrorKind::Unavailable,
         StateStoreErrorKind::InvalidConfiguration
         | StateStoreErrorKind::UnsupportedFormat
         | StateStoreErrorKind::Saturated
@@ -67,9 +71,13 @@ pub(crate) fn run_failure(error: RunFailure) -> MvRepositoryError {
             ),
         ),
         RunFailure::Begin(error) | RunFailure::DefiniteFailure(error) => state_store_error(error),
+        // The budget ran out before any commit was dispatched, so nothing
+        // landed and there is nothing in doubt. Catalog and GC already report
+        // this as an ordinary unavailability; MV used to be alone in calling it
+        // unknown, which is the one answer that forbids a caller from retrying.
         RunFailure::DeadlineExceeded => MvRepositoryError::new(
-            MvRepositoryErrorKind::CommitUnknown,
-            "MV StateStore transaction deadline exceeded",
+            MvRepositoryErrorKind::Unavailable,
+            "MV StateStore operation budget expired before any commit was dispatched",
         ),
     }
 }
