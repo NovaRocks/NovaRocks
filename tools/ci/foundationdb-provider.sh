@@ -56,12 +56,18 @@ test -x "$NOVA_FDB_FDBCLI"
 cd "$WORKSPACE_ROOT"
 
 cargo fmt --all -- --check
-cargo test -p novarocks-spi
-cargo check -p novarocks-spi --no-default-features
-"$SCRIPT_DIR/check-spi-dependency-boundary.py" \
+# The contract this provider implements, and the boundary that contract keeps.
+# Both left novarocks-spi, which is connector-only now, so gating a StateStore
+# provider on the connector SPI was checking a package it no longer touches.
+cargo test -p novarocks-state-store-api -p novarocks-state-store-testkit
+"$SCRIPT_DIR/check-state-store-dependency-boundary.py" \
   --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
 cargo check -p novarocks-state-store-foundationdb --all-targets
 cargo check -p novarocks-state-store-foundationdb --features foundationdb-provider,state-store-test-hooks --all-targets
+# The provider lifecycle tests live behind their own feature. Without this line
+# nothing compiles them, which is how a test module quietly stops being code.
+cargo check -p novarocks-state-store-foundationdb --features foundationdb-provider,provider-internal-tests --all-targets
+cargo test -p novarocks-state-store-foundationdb --features foundationdb-provider,state-store-test-hooks --lib -- --nocapture --test-threads=1
 cargo test -p novarocks-state-store-foundationdb --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb_runtime foundationdb_runtime_lifecycle -- --nocapture --test-threads=1
 cargo test -p novarocks-state-store-foundationdb --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb foundationdb_suite -- --nocapture --test-threads=1
 cargo test -p novarocks-state-store-foundationdb --features foundationdb-provider,state-store-test-hooks --test state_store_foundationdb_cross_process -- --nocapture --test-threads=1
