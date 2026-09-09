@@ -40,8 +40,8 @@ use novarocks_execution_contract::task_execution::operation::{
     CreateTask, CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters,
     GetFinalTaskInfo, MaxWait, OperationEnvelope, OperationKind, OperationOutcome,
     QueryContextAdmissionTicketReceipt, QueryContextDomainReceipt, QueryContextReceipt,
-    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, ResultPacketSequence,
-    TaskDomainReceipt, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, ResultByteLimit,
+    ResultPacketSequence, TaskDomainReceipt, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_proto_models::novarocks;
@@ -64,6 +64,18 @@ pub const ESTABLISH_FILTER_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.initial_runtime_filter.v1";
 pub const ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.query_options.v1";
+
+/// Process-wide decoded-message ceiling configured on the Native FE client.
+pub const NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Largest root-result payload the current Native gRPC envelope can carry.
+///
+/// Both Native client and server configure a 64 MiB decoded-message ceiling.
+/// The payload stays below it by a fixed envelope reserve so protobuf tags,
+/// lengths, sequence and status fields cannot turn a legal payload into an
+/// oversized decoded message.
+pub const MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES: u64 =
+    (NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES - 1024) as u64;
 use crate::identity::{
     decode_admission_ticket_id, decode_query_context_ref, decode_task_operation_id,
     encode_admission_ticket_id, encode_query_context_ref, encode_task_operation_id,
@@ -1087,7 +1099,15 @@ pub fn decode_get_final_task_info(
 pub fn decode_fetch_task_result(
     src: &novarocks::FetchTaskResultRequest,
     path: FieldPath,
-) -> Result<(TaskIdentity, Duration, Option<ResultPacketSequence>), ProtocolError> {
+) -> Result<
+    (
+        TaskIdentity,
+        Duration,
+        Option<ResultPacketSequence>,
+        ResultByteLimit,
+    ),
+    ProtocolError,
+> {
     let root = src.root_task.as_ref().ok_or_else(|| {
         missing(
             path.clone().field("root_task"),
@@ -1097,13 +1117,25 @@ pub fn decode_fetch_task_result(
     let root = crate::identity::decode_task_identity(root, path.clone().field("root_task"))?;
     let max_wait = decode_duration_millis(
         src.max_wait_millis,
-        path.field("max_wait_millis"),
+        path.clone().field("max_wait_millis"),
         MaxWait::MAX_REPRESENTABLE,
     )?;
     let acknowledged = src
         .acknowledged_packet_sequence
         .map(ResultPacketSequence::new);
-    Ok((root, max_wait, acknowledged))
+    let max_result_bytes = ResultByteLimit::new(src.max_result_bytes)
+        .map_err(|error| invalid(path.clone().field("max_result_bytes"), error.to_string()))?;
+    if max_result_bytes.get() > MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES {
+        return Err(out_of_range(
+            path.field("max_result_bytes"),
+            format!(
+                "max_result_bytes {} exceeds the Native payload limit {}",
+                max_result_bytes.get(),
+                MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
+            ),
+        ));
+    }
+    Ok((root, max_wait, acknowledged, max_result_bytes))
 }
 
 /// Decodes one server-reported operation outcome.
@@ -1144,13 +1176,19 @@ pub fn encode_fetch_task_result(
     root_task: TaskIdentity,
     max_wait: MaxWait,
     acknowledged: Option<ResultPacketSequence>,
+    max_result_bytes: ResultByteLimit,
 ) -> novarocks::FetchTaskResultRequest {
+    assert!(
+        max_result_bytes.get() <= MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES,
+        "root result byte limit must fit the Native gRPC response"
+    );
     novarocks::FetchTaskResultRequest {
         root_task: Some(crate::identity::encode_task_identity(root_task)),
         // `MaxWait` is already bounded by `MAX_REPRESENTABLE`, so this cannot
         // narrow a wait the caller asked for.
         max_wait_millis: u64::try_from(max_wait.get().as_millis()).unwrap_or(u64::MAX),
         acknowledged_packet_sequence: acknowledged.map(ResultPacketSequence::get),
+        max_result_bytes: max_result_bytes.get(),
     }
 }
 

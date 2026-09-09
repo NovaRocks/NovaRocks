@@ -2330,6 +2330,20 @@ fn poll_root_result_after(
     identity: TaskIdentity,
     acknowledged_packet_sequence: Option<u64>,
 ) -> novarocks_proto_models::novarocks::FetchResultResponse {
+    poll_root_result_after_with_limit(
+        registry,
+        identity,
+        acknowledged_packet_sequence,
+        16 * 1024 * 1024,
+    )
+}
+
+fn poll_root_result_after_with_limit(
+    registry: &TaskExecutionRegistry,
+    identity: TaskIdentity,
+    acknowledged_packet_sequence: Option<u64>,
+    max_result_bytes: u64,
+) -> novarocks_proto_models::novarocks::FetchResultResponse {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -2342,9 +2356,38 @@ fn poll_root_result_after(
                 )),
                 max_wait_millis: 1,
                 acknowledged_packet_sequence,
+                max_result_bytes,
             },
         ))
         .expect("a poll that reaches a decision is answered in band")
+}
+
+#[test]
+fn a_root_result_above_the_requested_cap_is_not_delivered_or_acknowledged() {
+    use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+
+    let fixture = Fixture::new();
+    fixture.establish(79);
+    let root = fixture.identity(79, 79, 1);
+    let reporter = fixture.create(root, 5);
+    assert!(matches!(reporter.running(), StatusAdvance::Published(_)));
+    crate::runtime::result_buffer::create_task_typed_sender(root);
+    crate::runtime::result_buffer::insert_task_typed(root, vec![1, 2, 3, 4])
+        .expect("one retained payload");
+
+    let refused = poll_root_result_after_with_limit(&fixture.registry, root, None, 3);
+    assert_eq!(fetch_status(&refused), FetchStatus::Error);
+    assert!(refused.message.contains("exceeding the requested limit 3"));
+    assert!(refused.result_arrow_ipc.is_empty());
+
+    let not_acknowledged = poll_root_result_after_with_limit(&fixture.registry, root, Some(0), 4);
+    assert_eq!(fetch_status(&not_acknowledged), FetchStatus::Error);
+
+    let delivered = poll_root_result_after_with_limit(&fixture.registry, root, None, 4);
+    assert_eq!(fetch_status(&delivered), FetchStatus::Ready);
+    assert_eq!(delivered.packet_seq, 0);
+    assert_eq!(delivered.result_arrow_ipc.as_ref(), &[1, 2, 3, 4]);
+    crate::runtime::result_buffer::discard_task(root);
 }
 
 fn fetch_status(

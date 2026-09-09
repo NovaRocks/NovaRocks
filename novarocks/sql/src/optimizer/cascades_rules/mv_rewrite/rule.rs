@@ -43,6 +43,7 @@ use crate::optimizer::scalar::{
     ColumnDisplay, HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
 };
 use crate::optimizer::scalar_expr;
+use crate::planner::payload::MvRewriteSelection;
 
 use super::aggregate_rollup::{RollupKind, plan_rollup};
 use super::column_mapping::{MvColumnMap, NormExpr, normalize};
@@ -232,6 +233,10 @@ fn try_rewrite(
     }
 
     // 5. Build the operator chain bottom-up.
+    let rewrite_selection = match &cand.selection {
+        Some(selection) => selected_candidate_marker(&cand.mv_name, query, selection)?,
+        None => MvRewriteSelection::unverified(cand.mv_name.clone()),
+    };
     let scan_group = memo.new_group(MExpr {
         id: memo.next_expr_id(),
         op: Operator::LogicalScan(ScanOp {
@@ -243,7 +248,7 @@ fn try_rewrite(
             predicates: vec![],
             required_columns: None,
             variant_columns: vec![],
-            mv_rewritten_from: Some(cand.mv_name.clone()),
+            mv_rewritten_from: Some(rewrite_selection),
         }),
         children: vec![],
     });
@@ -510,6 +515,31 @@ fn try_rewrite(
             }
         }
     }
+}
+
+fn selected_candidate_marker(
+    mv_name: &str,
+    query: &SpjgDescriptor,
+    selection: &crate::compiler::SqlMvRewriteSelectionFacts,
+) -> Option<MvRewriteSelection> {
+    use crate::planner::table::ScanSource;
+
+    let ScanSource::Sql(source) = &query.table.source;
+    let query_fqn = format!(
+        "{}.{}.{}",
+        source.table.catalog, source.table.namespace, source.table.table
+    );
+    if selection.publication_inputs() != [query_fqn] {
+        return None;
+    }
+    let occurrence =
+        crate::planner::payload::SqlScanOccurrence::from_scan(source.binding, &query.scan_columns)?;
+    Some(MvRewriteSelection::selected(
+        mv_name.to_string(),
+        selection.publication_id(),
+        selection.definition_fingerprint(),
+        vec![(occurrence, 0)],
+    ))
 }
 
 fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId {
@@ -955,6 +985,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "agg_mv", &["a", "b", "s"]),
             target_stats_ref: stats_ref_for_test(700),
+            selection: None,
         }
     }
 
@@ -986,6 +1017,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "direct_agg_mv", &["a", "s"]),
             target_stats_ref: stats_ref_for_test(703),
+            selection: None,
         }
     }
 
@@ -1369,6 +1401,14 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "spj_mv", &["a", "b", "v"]),
             target_stats_ref: stats_ref_for_test(701),
+            selection: Some(
+                crate::compiler::SqlMvRewriteSelectionFacts::try_new(
+                    [7; 16],
+                    [9; 32],
+                    vec!["cat.ns.t".to_string()],
+                )
+                .unwrap(),
+            ),
         };
 
         // SPJ query: SELECT a, b FROM t WHERE a >= 10. (top = Filter(Scan))
@@ -1406,6 +1446,12 @@ mod tests {
         assert_eq!(scan.table.name, "spj_mv");
         assert_eq!(scan.stats_ref, Some(stats_ref_for_test(701)));
         assert_eq!(scan.mv_rewritten_from.as_deref(), Some("spj_mv"));
+        let selection = scan.mv_rewritten_from.as_ref().unwrap();
+        assert_eq!(selection.publication_id(), Some([7; 16]));
+        assert_eq!(selection.definition_fingerprint(), Some([9; 32]));
+        assert_eq!(selection.input_mapping().len(), 1);
+        assert_eq!(selection.input_mapping()[0].binding(), test_binding());
+        assert_eq!(selection.input_mapping()[0].publication_input_ordinal(), 0);
     }
 
     #[test]
@@ -1429,6 +1475,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "wide_spj_mv", &["a", "b", "v"]),
             target_stats_ref: stats_ref_for_test(704),
+            selection: None,
         };
 
         // Query only needs a,b; the injected MV scan must not cost/read v.
@@ -1480,6 +1527,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "or_mv", &["a", "b", "v"]),
             target_stats_ref: stats_ref_for_test(705),
+            selection: None,
         };
 
         // Query uses the same OR arms in the opposite order; normalization must
@@ -1538,6 +1586,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "or_mv", &["a", "b", "v"]),
             target_stats_ref: stats_ref_for_test(706),
+            selection: None,
         };
 
         let a = col(1, "a");
@@ -1606,6 +1655,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "cnt_mv", &["a", "c"]),
             target_stats_ref: stats_ref_for_test(702),
+            selection: None,
         };
 
         let a = col(1, "a");

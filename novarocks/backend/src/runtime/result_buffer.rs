@@ -28,6 +28,7 @@ use novarocks_execution::runtime::fragment::io::{
 use novarocks_execution::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use novarocks_execution::runtime::observable::Observable;
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::operation::ResultByteLimit;
 use novarocks_types::UniqueId;
 use tokio::sync::Notify;
 
@@ -1032,6 +1033,7 @@ fn try_fetch_typed_inner(
     guard: &mut HashMap<ResultBufferKey, BufferControlBlock>,
     key: ResultBufferKey,
     acknowledged_packet_seq: Option<i64>,
+    max_result_bytes: ResultByteLimit,
 ) -> TryFetchTypedResult {
     let Some(block) = guard.get_mut(&key) else {
         return TryFetchTypedResult::Error(FetchError {
@@ -1113,6 +1115,17 @@ fn try_fetch_typed_inner(
     }
 
     if let Some(result) = block.typed_queue.front() {
+        let payload_bytes = u64::try_from(result.result.payload.len()).unwrap_or(u64::MAX);
+        if payload_bytes > max_result_bytes.get() {
+            return TryFetchTypedResult::Error(FetchError {
+                kind: FetchErrorKind::Failed,
+                message: format!(
+                    "retained result packet {} has {payload_bytes} payload bytes, exceeding the requested limit {}",
+                    result.result.packet_seq,
+                    max_result_bytes.get()
+                ),
+            });
+        }
         let result = result.result.clone();
         block.last_delivered_typed_packet = Some(result.packet_seq);
         return TryFetchTypedResult::Ready(result);
@@ -1251,6 +1264,7 @@ async fn wait_fetch_typed_for_key(
     key: ResultBufferKey,
     acknowledged_packet_seq: Option<i64>,
     max_wait: Duration,
+    max_result_bytes: ResultByteLimit,
 ) -> TryFetchTypedResult {
     let deadline = tokio::time::Instant::now() + max_wait;
     loop {
@@ -1259,7 +1273,7 @@ async fn wait_fetch_typed_for_key(
             let mut guard = c.mu.lock().expect("ctx lock");
             let change = guard.get(&key).map(|block| Arc::clone(&block.typed_change));
             (
-                try_fetch_typed_inner(&mut guard, key, acknowledged_packet_seq),
+                try_fetch_typed_inner(&mut guard, key, acknowledged_packet_seq, max_result_bytes),
                 change,
             )
         };
@@ -1286,11 +1300,13 @@ pub(crate) async fn wait_fetch_task_typed(
     identity: TaskIdentity,
     acknowledged_packet_seq: Option<i64>,
     max_wait: Duration,
+    max_result_bytes: ResultByteLimit,
 ) -> TryFetchTypedResult {
     wait_fetch_typed_for_key(
         ResultBufferKey::Task(identity),
         acknowledged_packet_seq,
         max_wait,
+        max_result_bytes,
     )
     .await
 }
@@ -1305,6 +1321,7 @@ async fn wait_fetch_typed(
         ResultBufferKey::LegacyFragment(finst_id),
         acknowledged_packet_seq,
         max_wait,
+        ResultByteLimit::new(u64::MAX).expect("the test fetch limit is nonzero"),
     )
     .await
 }
@@ -1376,6 +1393,10 @@ mod tests {
 
     fn test_result_cap() -> NonZeroUsize {
         NonZeroUsize::new(1024 * 1024).expect("nonzero test result cap")
+    }
+
+    fn test_fetch_limit() -> ResultByteLimit {
+        ResultByteLimit::new(test_result_cap().get() as u64).expect("nonzero test fetch limit")
     }
 
     fn test_result_budget() -> Arc<ResultRetainedBudget> {
@@ -1830,20 +1851,32 @@ mod tests {
         handle.finish().expect("finish task result");
 
         let TryFetchTypedResult::Ready(eos) =
-            wait_fetch_task_typed(identity, None, Duration::ZERO).await
+            wait_fetch_task_typed(identity, None, Duration::ZERO, test_fetch_limit()).await
         else {
             panic!("finished task publishes eos");
         };
         assert!(eos.eos);
         assert!(matches!(
-            wait_fetch_task_typed(identity, Some(eos.packet_seq), Duration::ZERO).await,
+            wait_fetch_task_typed(
+                identity,
+                Some(eos.packet_seq),
+                Duration::ZERO,
+                test_fetch_limit(),
+            )
+            .await,
             TryFetchTypedResult::EndAcknowledged
         ));
         assert!(replays_task_terminal_ack(identity, Some(eos.packet_seq)));
 
         assert_eq!(retire_task_result(identity), ResultPublication::NoChange);
         assert!(matches!(
-            wait_fetch_task_typed(identity, Some(eos.packet_seq), Duration::ZERO).await,
+            wait_fetch_task_typed(
+                identity,
+                Some(eos.packet_seq),
+                Duration::ZERO,
+                test_fetch_limit(),
+            )
+            .await,
             TryFetchTypedResult::EndAcknowledged
         ));
 
@@ -1875,12 +1908,59 @@ mod tests {
         assert_eq!(retire_task_result(identity), ResultPublication::Removed);
         assert_eq!(handle.retained_bytes(), 0);
         assert!(matches!(
-            wait_fetch_task_typed(identity, None, Duration::ZERO).await,
+            wait_fetch_task_typed(identity, None, Duration::ZERO, test_fetch_limit()).await,
             TryFetchTypedResult::Error(FetchError {
                 kind: FetchErrorKind::NotFound,
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn task_fetch_limit_refuses_without_delivering_or_releasing_the_retained_packet() {
+        let identity = test_task_identity(723);
+        let retained_cap = NonZeroUsize::new(8).expect("nonzero cap");
+        let handle = ResultBufferWriteHandle::open(
+            ResultBufferKey::Task(identity),
+            true,
+            retained_cap,
+            ResultRetainedBudget::new(retained_cap),
+            None,
+        )
+        .expect("open task result");
+        let ResultWriteAdmission::Granted(credit) = handle.try_acquire(8).expect("reserve") else {
+            panic!("task owns its result capacity");
+        };
+        handle
+            .write_typed_bytes_with_credit_for_test(Bytes::from_static(b"12345678"), credit)
+            .expect("retain task result");
+
+        let small = ResultByteLimit::new(7).expect("small positive limit");
+        assert!(matches!(
+            wait_fetch_task_typed(identity, None, Duration::ZERO, small).await,
+            TryFetchTypedResult::Error(FetchError {
+                kind: FetchErrorKind::Failed,
+                ..
+            })
+        ));
+        assert_eq!(handle.retained_bytes(), 8);
+        assert!(matches!(
+            wait_fetch_task_typed(identity, Some(0), Duration::ZERO, test_fetch_limit()).await,
+            TryFetchTypedResult::Error(FetchError {
+                kind: FetchErrorKind::Failed,
+                ..
+            })
+        ));
+
+        let TryFetchTypedResult::Ready(packet) =
+            wait_fetch_task_typed(identity, None, Duration::ZERO, test_fetch_limit()).await
+        else {
+            panic!("a sufficient limit receives the retained packet");
+        };
+        assert_eq!(packet.packet_seq, 0);
+        assert_eq!(packet.payload.as_ref(), b"12345678");
+        assert_eq!(handle.retained_bytes(), 8);
+        discard_task(identity);
     }
 
     #[tokio::test]

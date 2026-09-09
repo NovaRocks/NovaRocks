@@ -1357,6 +1357,7 @@ mod is_known_rule_name_tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "or_mv", &["a", "b", "v"]),
             target_stats_ref: StatsRef::new(1),
+            selection: None,
         };
 
         let mut stats = QueryStatsSnapshot::empty();

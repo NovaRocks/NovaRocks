@@ -1296,4 +1296,8 @@ message FetchTaskResultRequest {
   // backend retains and exactly replays one unacknowledged packet; gaps and
   // future acknowledgements fail closed.
   optional uint64 acknowledged_packet_sequence = 3;
+  // Positive payload-byte credit for this response. The Native codec also
+  // caps this below the process-wide gRPC decode limit so the response
+  // envelope cannot make a legal payload exceed that transport limit.
+  uint64 max_result_bytes = 4;
 }

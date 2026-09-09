@@ -475,6 +475,47 @@ impl QueryContextOwner {
         Some(OperationIntent::AbortQueryContext(request))
     }
 
+    /// Rolls back a lifecycle request that never crossed process queue
+    /// admission.
+    ///
+    /// Replayable requests keep their immutable payload and first-send time;
+    /// only the in-flight marker is released. An unsent abort is cleared
+    /// because no remote effect can exist and a later cleanup turn may mint it
+    /// again.
+    pub(crate) fn rollback_unsent(&mut self, operation_id: TaskOperationId) {
+        if let Some(released) = &mut self.admission
+            && released.request.envelope().operation_id() == operation_id
+        {
+            released.awaiting_outcome = false;
+            return;
+        }
+        if let Some(released) = &mut self.establish
+            && Self::request_id(&released.request) == operation_id
+        {
+            released.awaiting_outcome = false;
+            return;
+        }
+        if let Some(released) = &mut self.renewal
+            && Self::request_id(&released.request) == operation_id
+        {
+            released.awaiting_outcome = false;
+            return;
+        }
+        if self
+            .release
+            .is_some_and(|request| request.envelope().operation_id() == operation_id)
+        {
+            self.release_in_flight = false;
+            return;
+        }
+        if self
+            .abort
+            .is_some_and(|request| request.envelope().operation_id() == operation_id)
+        {
+            self.abort = None;
+        }
+    }
+
     /// Whether no legal create can follow.
     pub const fn creates_closed(&self) -> bool {
         self.acknowledged_creates >= self.expected_creates

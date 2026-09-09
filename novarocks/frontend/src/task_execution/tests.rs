@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ use novarocks_execution::task_execution::{
     PhysicalFragmentPlan, PlanNodeId, PlanNodeSplitReceipt, QueryContextAdmissionTicketReceipt,
     QueryContextReceipt, QueryContextRef, QueryContextState, ReleaseOutcome, SplitAssignmentIntent,
     SplitOffer, SplitSequence, SplitWatermark, TaskDomainReceipt, TaskDomainUpdate, TaskIdentity,
-    TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
+    TaskOperationId, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
     UpdateQueryContext, UpdateTaskReceipt,
 };
 use novarocks_query_application::coordination::{
@@ -57,13 +58,14 @@ use super::context_owner::{
 };
 use super::dispatch::OperationDispatcher;
 use super::error::{CapacityBound, TaskExecutionError};
-use super::execution::QueryTaskExecution;
+use super::execution::{AbortSubmission, QueryTaskExecution};
 use super::graph::{
     FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, build_task_graph,
 };
 use super::intent::{
     AckPayload, DispatchBatch, OPERATION_FIXED_BYTES, OperationAcknowledgement, OperationIntent,
-    TaskOperationSink,
+    TaskOperationQueueAdmission, TaskOperationQueueRequest, TaskOperationSink, TaskOperationSubmit,
+    test_queue_permit,
 };
 use super::remote_task::{RemoteTaskState, UpdateAdmission};
 use super::split_domain::{assignment_targets, delivery_action};
@@ -243,11 +245,77 @@ impl RecordingSink {
 }
 
 impl TaskOperationSink for RecordingSink {
-    fn submit(&self, batch: &DispatchBatch) {
+    fn try_reserve_queue(
+        &self,
+        _request: TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        TaskOperationQueueAdmission::Admitted(test_queue_permit())
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+        let lane = batch.lane();
+        let operations = batch.into_operations();
         self.batches
             .lock()
             .expect("recording sink")
-            .push((batch.lane(), batch.operations().to_vec()));
+            .push((lane, operations));
+        TaskOperationSubmit::Accepted
+    }
+}
+
+#[derive(Debug, Default)]
+struct BackpressureOnceSink {
+    attempts: AtomicUsize,
+    refused: Mutex<Vec<TaskOperationId>>,
+    accepted: Mutex<Vec<Vec<TaskOperationId>>>,
+}
+
+#[derive(Debug, Default)]
+struct QueueBackpressureOnceSink {
+    reserve_attempts: AtomicUsize,
+    submitted_operations: AtomicUsize,
+}
+
+impl TaskOperationSink for QueueBackpressureOnceSink {
+    fn try_reserve_queue(
+        &self,
+        _request: TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        if self.reserve_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            TaskOperationQueueAdmission::Backpressured
+        } else {
+            TaskOperationQueueAdmission::Admitted(test_queue_permit())
+        }
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+        self.submitted_operations
+            .fetch_add(batch.operations().len(), Ordering::SeqCst);
+        TaskOperationSubmit::Accepted
+    }
+}
+
+impl TaskOperationSink for BackpressureOnceSink {
+    fn try_reserve_queue(
+        &self,
+        _request: TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        TaskOperationQueueAdmission::Admitted(test_queue_permit())
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+        let ids = batch
+            .operations()
+            .iter()
+            .map(OperationIntent::operation_id)
+            .collect::<Vec<_>>();
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            *self.refused.lock().expect("refused batch") = ids;
+            TaskOperationSubmit::Backpressured(batch)
+        } else {
+            self.accepted.lock().expect("accepted batches").push(ids);
+            TaskOperationSubmit::Accepted
+        }
     }
 }
 
@@ -1987,6 +2055,151 @@ fn a_create_burst_never_starves_a_lifecycle_operation() {
 }
 
 #[test]
+fn process_backpressure_restores_the_exact_batch_without_in_flight_or_spin() {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 512).expect("legal graph");
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(BackpressureOnceSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let mut execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::DEFAULT,
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::new(ManualClock::new()),
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        intake,
+    )
+    .expect("compose execution");
+
+    let first = execution.pump(&FakeEstablish).expect("first pump");
+    assert_eq!(first.operations, 0);
+    assert_eq!(sink.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(execution.dispatcher().in_flight_operations(), 0);
+    assert!(execution.dispatcher().queued_items() > 0);
+
+    let second = execution.pump(&FakeEstablish).expect("capacity wake turn");
+    assert!(second.operations > 0);
+    let refused = sink.refused.lock().expect("refused batch").clone();
+    let accepted = sink.accepted.lock().expect("accepted batches");
+    assert!(
+        accepted.iter().any(|ids| ids == &refused),
+        "the refused batch must later be accepted with the same operation ids and order"
+    );
+    assert!(execution.dispatcher().in_flight_operations() > 0);
+}
+
+#[test]
+fn process_queue_backpressure_rolls_back_every_unadmitted_owner_transition() {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 512).expect("legal graph");
+    let stage_ids = graph
+        .stages()
+        .map(|stage| stage.stage_id())
+        .collect::<Vec<_>>();
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(QueueBackpressureOnceSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let mut execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::DEFAULT,
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::new(ManualClock::new()),
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        intake,
+    )
+    .expect("compose execution");
+
+    let first = execution
+        .pump(&FakeEstablish)
+        .expect("queue backpressure is a retryable local admission result");
+    assert_eq!(first.operations, 0);
+    assert_eq!(execution.dispatcher().queued_items(), 0);
+    assert_eq!(execution.dispatcher().in_flight_operations(), 0);
+    for stage_id in stage_ids {
+        assert!(
+            execution
+                .stage(stage_id)
+                .expect("the stage is owned")
+                .tasks()
+                .all(|(_, task)| !task.has_released_operation()),
+            "no task may retain create/update/cancel state before process admission"
+        );
+    }
+
+    let second = execution
+        .pump(&FakeEstablish)
+        .expect("the capacity-change turn can release the same owner work");
+    assert!(second.operations > 0);
+    assert!(sink.submitted_operations.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn task_update_process_rejection_precedes_remote_task_retention() {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let graph = build_graph(&schedule, &chain_edges(), &processes, 512).expect("legal graph");
+    let leaf = graph
+        .tasks()
+        .find(|task| task.stage_id() == StageId::new(1).expect("stage one"))
+        .map(|task| task.task_id())
+        .expect("the graph has one leaf task");
+    let admission_epochs = graph
+        .contexts()
+        .map(|context| (context.backend_process_id(), admission_epoch()))
+        .collect::<BTreeMap<_, _>>();
+    let sink = Arc::new(QueueBackpressureOnceSink::default());
+    let wake = Arc::new(CountingWake::default());
+    let intake = StatusIntake::new(64, Arc::clone(&wake) as Arc<dyn StatusIntakeWake>);
+    let mut execution = QueryTaskExecution::new(
+        graph,
+        DispatchBudget::DEFAULT,
+        TransportBudget::DEFAULT,
+        NativeCompatibilityId::new([0x41; 32]),
+        &admission_epochs,
+        Arc::new(ManualClock::new()),
+        Arc::clone(&sink) as Arc<dyn TaskOperationSink>,
+        intake,
+    )
+    .expect("compose execution");
+
+    let error = execution
+        .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
+        .expect_err("the first process reservation is refused");
+    assert!(matches!(
+        error,
+        TaskExecutionError::Capacity(CapacityBound::ProcessTransportQueue { .. })
+    ));
+    assert_eq!(
+        execution
+            .task(leaf)
+            .expect("the task is owned")
+            .pending_updates(),
+        0,
+        "a rejected process reservation must leave no per-attempt payload"
+    );
+    assert_eq!(
+        execution
+            .enqueue_task_update(leaf, split_update(SCAN_NODE, 1, false))
+            .expect("the unchanged domain update can be admitted later"),
+        UpdateAdmission::Queued
+    );
+}
+
+#[test]
 fn an_abort_jumps_the_queue_without_preempting_a_released_operation() {
     let leaves = (0..64).map(|_| 0_usize).collect::<Vec<_>>();
     let mut harness = Harness::new(&leaves, &[0], 512);
@@ -2003,17 +2216,18 @@ fn an_abort_jumps_the_queue_without_preempting_a_released_operation() {
         .contexts()
         .next()
         .expect("the attempt has a context");
-    let batch = harness
+    let submission = harness
         .execution
         .abort_context(context, AbortCause::QueryFailed)
-        .expect("an abort is admitted")
-        .expect("the abort is released immediately");
-    assert_eq!(batch.lane(), DispatchLane::Lifecycle);
-    assert_eq!(batch.operations().len(), 1);
-    assert_eq!(
-        batch.operations()[0].kind(),
-        OperationKind::AbortQueryContext
-    );
+        .expect("an abort is admitted");
+    assert_eq!(submission, AbortSubmission::Accepted);
+    let batches = harness.sink.take();
+    let [(lane, operations)] = batches.as_slice() else {
+        panic!("the accepted abort must reach exactly one transport batch");
+    };
+    assert_eq!(*lane, DispatchLane::Lifecycle);
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].kind(), OperationKind::AbortQueryContext);
 
     // Nothing already released was withdrawn: it is still tracked in flight.
     assert!(
@@ -2149,6 +2363,42 @@ fn an_establish_accounts_for_its_query_options_payload() {
 }
 
 #[test]
+fn one_operation_cannot_exceed_the_queue_side_carrier_bound() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x42; 32]),
+        admission_epoch(),
+    );
+    grant_admission(&mut owner, MonotonicInstant::ORIGIN);
+    let intent = owner
+        .establish_intent(
+            FakeEstablish
+                .facts_for(context)
+                .expect("the fake source has facts"),
+            MonotonicInstant::ORIGIN,
+        )
+        .expect("an establish is produced")
+        .expect("the establish intent exists");
+    let transport = TransportBudget::new(1, 255, 1, 1, 255, 2, 1020, 1, 2, Duration::from_secs(1))
+        .expect("the process has one ordinary and one control retained window");
+    let mut dispatcher = OperationDispatcher::new(DispatchBudget::DEFAULT, transport);
+    let actual = intent.queued_bytes();
+    let error = dispatcher
+        .enqueue(intent, MonotonicInstant::ORIGIN)
+        .expect_err("an oversized queue-side carrier must fail before it can become head-of-line");
+    assert_eq!(
+        error,
+        TaskExecutionError::Capacity(CapacityBound::OperationBytes { limit: 255, actual })
+    );
+}
+
+#[test]
 fn a_queued_byte_bound_fails_closed_instead_of_being_exceeded() {
     // Each descriptor carries a payload at the descriptor bound, so a
     // moderate fan-out reaches the queued-byte bound rather than exceeding it.
@@ -2169,15 +2419,8 @@ fn a_queued_byte_bound_fails_closed_instead_of_being_exceeded() {
     );
 }
 
-/// Not a defect: this expiry is observational on purpose.
-///
-/// Refusing here instead -- on the reasoning that a dropped queue entry is
-/// unrecoverable -- was measured as `distributed-resilience` 16/16 -> 4/16.
-/// The owner that minted the operation is still waiting for its outcome and
-/// re-mints it on its own retry, and a fault that deliberately drops an
-/// acknowledgement is exactly the case whose recovery is that replay.
 #[test]
-fn an_operation_that_outlives_the_queue_residence_bound_is_reported_not_sent_late() {
+fn an_operation_that_outlives_queue_residence_fails_typed_and_rolls_back_its_owner() {
     let leaves = (0..64).map(|_| 0_usize).collect::<Vec<_>>();
     let mut harness = Harness::new(&leaves, &[0], 512);
     let released = harness.pump();
@@ -2188,20 +2431,20 @@ fn an_operation_that_outlives_the_queue_residence_bound_is_reported_not_sent_lat
     harness
         .clock
         .advance(TransportBudget::DEFAULT.frontend_queue_residence());
-    let report = harness
+    let error = harness
         .execution
         .pump(&FakeEstablish)
-        .expect("an expired queue entry is reported, not a failure of the attempt");
-    assert!(
-        !report.expired.is_empty(),
-        "a queue-resident operation is reported rather than sent late"
-    );
-    assert!(
-        report
-            .expired
-            .iter()
-            .all(|expired| expired.waited >= TransportBudget::DEFAULT.frontend_queue_residence())
-    );
+        .expect_err("queue expiry is a typed local failure, not a silent drop");
+    let TaskExecutionError::QueueResidenceExpired { kind, waited, .. } = error else {
+        panic!("expected a queue-expiry receipt, got {error:?}");
+    };
+    assert_eq!(kind, OperationKind::CreateTask);
+    assert!(waited >= TransportBudget::DEFAULT.frontend_queue_residence());
+    harness
+        .execution
+        .pump(&FakeEstablish)
+        .expect("every expired owner marker was rolled back before failure returned");
+    assert!(harness.execution.dispatcher().queued_items() > 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -31,6 +31,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use novarocks_query_application::observation::PreparationBudget;
+use novarocks_query_application::preparation::{NegotiatedScanReceipt, ScanNegotiationSession};
 use novarocks_spi::connector::ConnectorControlReadBinding;
 use novarocks_spi::connector::ConnectorPinnedFileSet;
 use novarocks_spi::connector::read_stack::{
@@ -41,6 +43,7 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_sql::plan_read::PlanScanNode;
 
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::query_execution::connector_domain::{
     CatalogHandle, DynamicFilterBinding, TableHandle, TableScanNode,
 };
@@ -144,6 +147,9 @@ pub(crate) struct PreparedTypedScan {
     /// connector's own answer sets this; an absent or declined limit leaves it
     /// false so the engine keeps its own limit operator.
     pub(crate) limit_guaranteed: bool,
+    /// Typed proof of the filter/projection/limit result that final query
+    /// description freezing must consume.
+    pub(crate) negotiation_receipt: NegotiatedScanReceipt,
     /// The scan output column each dynamic filter was bound to, keyed by the
     /// runtime filter's id.
     ///
@@ -172,6 +178,7 @@ impl std::fmt::Debug for PreparedTypedScan {
             .field("constraint", &self.constraint)
             .field("residual_ordinals", &self.residual_ordinals)
             .field("limit_guaranteed", &self.limit_guaranteed)
+            .field("negotiation_receipt", &self.negotiation_receipt)
             .field("dynamic_filter_outputs", &self.dynamic_filter_outputs)
             .finish_non_exhaustive()
     }
@@ -203,7 +210,10 @@ pub(crate) fn prepare_typed_scan(
     relation: &SchemaTableName,
     freeze: TypedRelationFreeze<'_>,
     limit: Option<u64>,
+    scan_contract: novarocks_sql::planning::query_execution::SealedScanContract,
     dynamic_filters: &[(u32, String)],
+    preparation_budget: &PreparationBudget,
+    query_table_bindings: &QueryTableBindingStore,
 ) -> Result<PreparedTypedScan, String> {
     let relation_kind = freeze.relation_kind();
     let metadata = request_control.metadata();
@@ -216,9 +226,9 @@ pub(crate) fn prepare_typed_scan(
     //    How this scan's work reaches a backend is decided here too, because
     //    only the connector knows it: a system relation it resolves to one
     //    task has no split at all.
-    let (mut handle, work_source) = match freeze {
+    let (handle, work_source) = match freeze {
         TypedRelationFreeze::Table { version, reference } => {
-            let handle = observe_provider_negotiation(&relation_name, "get_table_handle", || {
+            let handle = observe_provider_negotiation(preparation_budget, &relation_name, "get_table_handle", || {
                 metadata.get_table_handle(session, relation, version, reference)
             })
                 .map_err(|error| {
@@ -233,6 +243,7 @@ pub(crate) fn prepare_typed_scan(
         }
         TypedRelationFreeze::PinnedFileSet(pinned) => {
             let handle = observe_provider_negotiation(
+                preparation_budget,
                 &relation_name,
                 "get_pinned_file_set_handle",
                 || metadata.get_pinned_file_set_handle(session, relation, pinned),
@@ -253,6 +264,7 @@ pub(crate) fn prepare_typed_scan(
         }
         TypedRelationFreeze::ChangeWindow(window) => {
             let handle = observe_provider_negotiation(
+                preparation_budget,
                 &relation_name,
                 "get_change_window_plan",
                 || metadata.get_change_window_plan(session, relation, window),
@@ -275,6 +287,7 @@ pub(crate) fn prepare_typed_scan(
         }
         TypedRelationFreeze::TableExecute(procedure) => {
             let handle = observe_provider_negotiation(
+                preparation_budget,
                 &relation_name,
                 "get_table_execute_plan",
                 || metadata.get_table_execute_plan(session, relation, procedure),
@@ -293,6 +306,7 @@ pub(crate) fn prepare_typed_scan(
         }
         TypedRelationFreeze::SystemTable => {
             let plan = observe_provider_negotiation(
+                preparation_budget,
                 &relation_name,
                 "get_system_table_plan",
                 || metadata.get_system_table_plan(session, relation),
@@ -319,13 +333,15 @@ pub(crate) fn prepare_typed_scan(
     };
 
     // 2. Resolve the relation's columns.
-    let column_bindings =
-        observe_provider_negotiation(&relation_name, "get_column_bindings", || {
-            metadata.get_column_bindings(session, &handle)
-        })
-        .map_err(|error| {
-            format!("typed scan cannot read the columns of relation {relation_name}: {error}")
-        })?;
+    let column_bindings = observe_provider_negotiation(
+        preparation_budget,
+        &relation_name,
+        "get_column_bindings",
+        || metadata.get_column_bindings(session, &handle),
+    )
+    .map_err(|error| {
+        format!("typed scan cannot read the columns of relation {relation_name}: {error}")
+    })?;
 
     // 3. Build the ordered assignments. `scan.columns` order is the output
     //    authority, and the connector produces exactly its physical subset, so
@@ -401,83 +417,78 @@ pub(crate) fn prepare_typed_scan(
     // 4. Lower the scan's own conjuncts into the offered summary.
     let mut lowered = lower_scan_predicates(scan, &columns_by_name, &value_types_by_name);
     let constraint = ConnectorReadConstraint::of_summary(lowered.summary.clone());
+    if scan_contract.node_id() != plan_node_id {
+        return Err(format!(
+            "typed scan node {plan_node_id} received sealed contract for node {}",
+            scan_contract.node_id()
+        ));
+    }
+    let admitted_scan = query_table_bindings.admit_scan_handle(scan_contract, handle)?;
+    let mut negotiation = ScanNegotiationSession::begin(
+        admitted_scan,
+        lowered.residual_ordinals.clone(),
+        metadata.as_ref(),
+        session,
+        preparation_budget,
+        &relation_name,
+    )?;
 
     // 5. Offer the filter. Whatever the connector hands back stays the
     //    reader's own work: `unenforced_predicate` is applied by the backend
     //    scan, `enforced_predicate` records only what the connector took.
-    let (enforced_predicate, unenforced_predicate, remaining_expression) =
-        match observe_provider_negotiation(&relation_name, "apply_filter", || {
-            metadata.apply_filter(session, &handle, &constraint)
-        })
-        .map_err(|error| {
-            format!("typed scan filter pushdown on relation {relation_name} failed: {error}")
-        })? {
-            // Nothing was accepted, so the engine keeps the whole predicate — and
-            // keeping it means evaluating it, not handing it to the reader.
-            //
-            // An unenforced predicate is the reader's own work by contract. A
-            // relation the connector declines outright may have no reader that
-            // applies one: a system relation read whole by a single backend opens
-            // its page source with no constraint at all, so a predicate parked
-            // there is applied by nobody and the query silently returns rows it
-            // must not see.
-            None => {
-                lowered.residual_ordinals = (0..scan.predicates.len()).collect();
-                (TupleDomain::all(), TupleDomain::all(), None)
-            }
-            Some(application) => {
-                let unenforced = application.remaining_constraint().summary().clone();
-                let remaining_expression = application
-                    .remaining_expression()
-                    .filter(|expression| !expression.is_constant_true())
-                    .cloned();
-                // Enforcement is claimed only for a column the connector kept
-                // whole. A column it handed back partially is covered by its own
-                // guarantee for the complement, and by the reader for the rest.
-                let enforced = lowered
-                    .summary
-                    .filter_columns(|column| unenforced.domain_for(column).is_none());
-                handle = application.into_handle();
-                (enforced, unenforced, remaining_expression)
-            }
-        };
+    let filter_application = negotiation.apply_filter(&constraint)?;
+    let (enforced_predicate, unenforced_predicate, remaining_expression) = match filter_application
+    {
+        // Nothing was accepted, so the engine keeps the whole predicate — and
+        // keeping it means evaluating it, not handing it to the reader.
+        //
+        // An unenforced predicate is the reader's own work by contract. A
+        // relation the connector declines outright may have no reader that
+        // applies one: a system relation read whole by a single backend opens
+        // its page source with no constraint at all, so a predicate parked
+        // there is applied by nobody and the query silently returns rows it
+        // must not see.
+        None => {
+            lowered.residual_ordinals = (0..scan.predicates.len()).collect();
+            (TupleDomain::all(), TupleDomain::all(), None)
+        }
+        Some(application) => {
+            let unenforced = application.remaining_constraint().summary().clone();
+            let remaining_expression = application
+                .remaining_expression()
+                .filter(|expression| !expression.is_constant_true())
+                .cloned();
+            // Enforcement is claimed only for a column the connector kept
+            // whole. A column it handed back partially is covered by its own
+            // guarantee for the complement, and by the reader for the rest.
+            let enforced = lowered
+                .summary
+                .filter_columns(|column| unenforced.domain_for(column).is_none());
+            (enforced, unenforced, remaining_expression)
+        }
+    };
 
     // 6. Offer the projection. A narrowed handle is a pushdown fact; the
     //    ordered assignments above remain the output authority either way.
-    if let Some(narrowed) = observe_provider_negotiation(&relation_name, "apply_projection", || {
-        metadata.apply_projection(session, &handle, &assignments)
-    })
-    .map_err(|error| {
-        format!("typed scan projection pushdown on relation {relation_name} failed: {error}")
-    })? {
-        handle = narrowed;
-    }
+    negotiation.apply_projection(&assignments)?;
 
     // 7. Offer the limit. Only the connector's own answer may drop the
     //    engine's limit operator.
-    let mut limit_guaranteed = false;
-    if let Some(limit) = limit
-        && let Some(application) =
-            observe_provider_negotiation(&relation_name, "apply_limit", || {
-                metadata.apply_limit(session, &handle, limit)
-            })
-            .map_err(|error| {
-                format!("typed scan limit pushdown on relation {relation_name} failed: {error}")
-            })?
-    {
-        limit_guaranteed = application.limit_guaranteed();
-        handle = application.into_handle();
-    }
+    let limit_guaranteed = negotiation.apply_limit(limit)?;
+
+    let negotiation_receipt = negotiation.finish()?;
 
     // 8. Bind dynamic filters and freeze the exact relation.  The metadata
     // service alone can pair the opaque table with its installed transaction;
     // frontend code never sees or constructs the transaction payload.
     let (dynamic_filter_bindings, dynamic_filter_outputs) =
         bind_dynamic_filters(dynamic_filters, &variables_by_name, &relation_name)?;
-    let relation = observe_provider_negotiation(&relation_name, "relation", || {
-        metadata.relation(relation_kind, handle)
-    })
-    .map_err(|error| format!("typed scan cannot freeze relation {relation_name}: {error}"))?;
+    let final_handle = negotiation_receipt.final_handle()?.clone();
+    let relation =
+        observe_provider_negotiation(preparation_budget, &relation_name, "relation", || {
+            metadata.relation(relation_kind, final_handle)
+        })
+        .map_err(|error| format!("typed scan cannot freeze relation {relation_name}: {error}"))?;
     let table_scan = TableScanNode::new(
         plan_node_id,
         TableHandle::new(catalog, relation),
@@ -500,22 +511,45 @@ pub(crate) fn prepare_typed_scan(
         constraint,
         residual_ordinals: lowered.residual_ordinals,
         limit_guaranteed,
+        negotiation_receipt,
         dynamic_filter_outputs,
     })
 }
 
-fn observe_provider_negotiation<R, E>(
+fn observe_provider_negotiation<R, E: std::fmt::Display>(
+    budget: &PreparationBudget,
     relation_name: &str,
     operation: &str,
     call: impl FnOnce() -> Result<R, E>,
-) -> Result<R, E> {
-    crate::preparation_diagnostics::observe_result_lazy(
+) -> Result<R, String> {
+    budget
+        .begin_negotiation(operation.len().saturating_add(relation_name.len()))
+        .map_err(|error| error.to_string())?;
+    let result = crate::preparation_diagnostics::observe_result_lazy(
         "connector_planning_negotiation",
         || format!("{operation}:{relation_name}"),
         "not-applicable",
         None,
         call,
-    )
+    );
+    match result {
+        Ok(value) => {
+            // The legacy synchronous Connector surface cannot report the heap
+            // footprint of opaque handles. Charge its configured observation
+            // weight; this is post-call accounting, not a memory reservation.
+            budget
+                .charge_unmeasured_response_weight()
+                .map_err(|error| error.to_string())?;
+            Ok(value)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            budget
+                .record_response(message.len())
+                .map_err(|budget_error| budget_error.to_string())?;
+            Err(message)
+        }
+    }
 }
 
 /// The one connector column an output column names.

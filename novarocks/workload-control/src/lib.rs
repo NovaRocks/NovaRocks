@@ -48,7 +48,8 @@ pub use observation::{
 };
 pub use resource::{
     AllocationCharge, LocalResourceAuthority, Reservation, ResourceClass, ResourceConfig,
-    ResourceSnapshot,
+    ResourceSnapshot, ResultCredit, ResultCreditReservationError, ResultCreditSnapshot,
+    ResultCreditStage,
 };
 pub use scope::{
     BusinessPermit, RootWork, ServingState, WorkClass, WorkId, WorkOwner, WorkRequest, WorkScope,
@@ -72,6 +73,10 @@ pub enum WorkError {
     Conflict,
     OwnerStillPresent,
     ArithmeticOverflow,
+    InvalidResultCreditTransition {
+        from: ResultCreditStage,
+        requested: ResultCreditStage,
+    },
 }
 
 impl std::fmt::Display for WorkError {
@@ -92,6 +97,12 @@ impl std::fmt::Display for WorkError {
             Self::Conflict => f.write_str("Work identity has conflicting facts"),
             Self::OwnerStillPresent => f.write_str("Work still has an active owner"),
             Self::ArithmeticOverflow => f.write_str("Work accounting overflow"),
+            Self::InvalidResultCreditTransition { from, requested } => {
+                write!(
+                    f,
+                    "Invalid result-credit transition from {from:?} to {requested:?}"
+                )
+            }
         }
     }
 }

@@ -44,7 +44,9 @@ use novarocks_query_application::coordination::{
 };
 
 use super::error::{CapacityBound, TaskExecutionError};
-use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
+use super::intent::{
+    AckPayload, OperationAcknowledgement, OperationIntent, TaskOperationQueuePermit,
+};
 
 /// The three states of one remote task.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -111,10 +113,11 @@ struct ReleasedUpdate {
     awaiting_outcome: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PendingUpdate {
     update: TaskDomainUpdate,
     expected_receipt: TaskDomainReceiptExpectation,
+    queue_permit: Box<dyn TaskOperationQueuePermit>,
 }
 
 /// The frontend's owner of one remote task.
@@ -294,6 +297,7 @@ impl RemoteTask {
     pub fn enqueue_update(
         &mut self,
         update: TaskDomainUpdate,
+        queue_permit: Box<dyn TaskOperationQueuePermit>,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
         if matches!(self.state, RemoteTaskState::Terminal) || self.awaiting_terminal_status {
             return Ok(UpdateAdmission::DiscardedTerminal);
@@ -302,6 +306,7 @@ impl RemoteTask {
         self.pending.push_back(PendingUpdate {
             update,
             expected_receipt,
+            queue_permit,
         });
         Ok(UpdateAdmission::Queued)
     }
@@ -316,20 +321,17 @@ impl RemoteTask {
     /// creation. Giving every one of those decisions the first version would
     /// replay that version with a different edge set, which is
     /// `SameTokenDifferentContent` and fails the whole attempt.
-    pub fn enqueue_edge_open(
-        &mut self,
+    pub fn prepare_edge_open(
+        &self,
         edge: ExchangeEdgeId,
-    ) -> Result<UpdateAdmission, TaskExecutionError> {
-        if matches!(self.state, RemoteTaskState::Terminal) || self.awaiting_terminal_status {
-            return Ok(UpdateAdmission::DiscardedTerminal);
-        }
+    ) -> Result<TaskDomainUpdate, TaskExecutionError> {
         let version = self
             .domains
             .next_edge_open_version()
             .ok_or(TaskExecutionError::Capacity(
                 CapacityBound::EdgeOpenVersions { limit: u32::MAX },
             ))?;
-        self.enqueue_update(TaskDomainUpdate::OpenExchangeEdges {
+        Ok(TaskDomainUpdate::OpenExchangeEdges {
             version,
             edges: vec![edge],
         })
@@ -424,7 +426,12 @@ impl RemoteTask {
     /// One domain change per request and at most one request in flight. That
     /// keeps a receipt attributable to exactly one domain and keeps a slow
     /// task from accumulating unacknowledged work.
-    pub fn next_update_intent(&mut self) -> Result<Option<OperationIntent>, TaskExecutionError> {
+    pub fn next_update_intent(
+        &mut self,
+    ) -> Result<
+        Option<(OperationIntent, Option<Box<dyn TaskOperationQueuePermit>>)>,
+        TaskExecutionError,
+    > {
         if !matches!(self.state, RemoteTaskState::Created) || self.awaiting_terminal_status {
             return Ok(None);
         }
@@ -433,9 +440,10 @@ impl RemoteTask {
                 return Ok(None);
             }
             released.awaiting_outcome = true;
-            return Ok(Some(OperationIntent::UpdateTask(Arc::clone(
-                &released.request,
-            ))));
+            return Ok(Some((
+                OperationIntent::UpdateTask(Arc::clone(&released.request)),
+                None,
+            )));
         }
         let Some(pending) = self.pending.pop_front() else {
             return Ok(None);
@@ -452,7 +460,32 @@ impl RemoteTask {
             expected_receipt: pending.expected_receipt,
             awaiting_outcome: true,
         });
-        Ok(Some(OperationIntent::UpdateTask(request)))
+        Ok(Some((
+            OperationIntent::UpdateTask(request),
+            Some(pending.queue_permit),
+        )))
+    }
+
+    /// Rolls back a request that never crossed process queue admission.
+    ///
+    /// The immutable request remains retained for exact re-release. The only
+    /// exception is cancellation: an unsent cancellation has no remote effect,
+    /// so clearing its local marker lets the stage mint a fresh request later.
+    pub(crate) fn rollback_unsent(&mut self, operation_id: TaskOperationId) {
+        if self.create_in_flight == Some(operation_id) {
+            self.create_in_flight = None;
+            return;
+        }
+        if let Some(released) = &mut self.released_update
+            && released.operation_id == operation_id
+        {
+            released.awaiting_outcome = false;
+            return;
+        }
+        if self.cancel_in_flight == Some(operation_id) {
+            self.cancel_in_flight = None;
+            self.cancel_requested = false;
+        }
     }
 
     /// Stands this task down normally, once.

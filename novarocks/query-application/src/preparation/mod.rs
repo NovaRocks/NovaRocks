@@ -15,20 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Query application ownership and consumer-facing contracts.
-//!
-//! Product services depend on this crate. The query application never depends
-//! on their implementations; role composition supplies the consumer ports.
+//! Bounded observation/compile/negotiation and the immutable attempt handoff.
 
-pub mod api;
+mod description;
+mod driver;
+mod mv_proof;
 
-/// Query-scoped acquisition of immutable metadata and optional optimization facts.
-pub mod observation;
-
-/// Pure, topology-free preparation and its immutable execution handoff.
-pub mod preparation;
-
-// These policies are query-coordination decisions, not worker protocol. T08
-// wires them into the coordinator before this migration-only allowance goes.
-#[doc(hidden)]
-pub mod coordination;
+pub use description::*;
+pub use driver::*;
+pub use mv_proof::*;

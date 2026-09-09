@@ -180,6 +180,7 @@ pub(crate) struct Node {
     pub resource_waiters: usize,
     pub reserved_bytes: u64,
     pub used_bytes: u64,
+    pub result_credit: crate::ResultCreditSnapshot,
     pub control_pending: ControlIntents,
     pub cancellation_signalled: bool,
     pub control_queued: bool,
@@ -212,6 +213,7 @@ impl Node {
             resource_waiters: 0,
             reserved_bytes: 0,
             used_bytes: 0,
+            result_credit: crate::ResultCreditSnapshot::default(),
             control_pending: ControlIntents::empty(),
             cancellation_signalled: false,
             control_queued: false,
@@ -257,6 +259,7 @@ pub(crate) struct State {
     pub control_reserved: u64,
     pub control_used: u64,
     pub peak_held_bytes: u64,
+    pub result_credit: crate::ResultCreditSnapshot,
     pub peak_waiting: usize,
     pub peak_waiting_records: usize,
     pub peak_waiting_bytes: u64,
@@ -325,6 +328,17 @@ impl Inner {
         let result = f(&mut self.state.lock().unwrap());
         self.changed.notify_waiters();
         result
+    }
+
+    /// Mutate accounting facts that cannot make a capacity waiter runnable.
+    /// Result packet state transitions use this path while capacity is held or
+    /// reduced, avoiding a process-wide waiter wakeup for every packet step.
+    pub(crate) fn update_facts_silent<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        f(&mut self.state.lock().unwrap())
+    }
+
+    pub(crate) fn notify_capacity_available(&self) {
+        self.changed.notify_waiters();
     }
 
     pub(crate) fn update<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {

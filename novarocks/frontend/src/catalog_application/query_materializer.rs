@@ -692,9 +692,10 @@ mod tests {
 
     fn binding_id(scope: u64, ordinal: u32) -> SqlTableBindingId {
         let ordinal = NonZeroU32::new(ordinal).expect("non-zero ordinal");
-        let mut allocator =
-            SqlTableBindingAllocator::try_new(NonZeroU64::new(scope).expect("non-zero scope"))
-                .expect("test binding allocator");
+        let mut allocator = SqlTableBindingAllocator::try_new_for_test(
+            NonZeroU64::new(scope).expect("non-zero scope"),
+        )
+        .expect("test binding allocator");
         for _ in 1..ordinal.get() {
             allocator.allocate().expect("non-zero test binding ordinal");
         }

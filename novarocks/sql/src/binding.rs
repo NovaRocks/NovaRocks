@@ -21,7 +21,10 @@
 //! binding is meaningful only in the application-owned store that allocated
 //! its scope, so forwarding it across a request/process boundary is invalid.
 
-use std::num::{NonZeroU32, NonZeroU64};
+use std::{
+    num::{NonZeroU32, NonZeroU64},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 /// Process-local identity of one application binding store.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -64,7 +67,7 @@ impl SqlTableBindingId {
     #[cfg(test)]
     pub(crate) fn new_for_test(ordinal: u32) -> Self {
         let ordinal = NonZeroU32::new(ordinal).expect("test binding ordinal is nonzero");
-        let mut allocator = SqlTableBindingAllocator::try_new(
+        let mut allocator = SqlTableBindingAllocator::try_new_for_test(
             NonZeroU64::new(1).expect("test binding scope is nonzero"),
         )
         .expect("test binding allocator must be valid");
@@ -91,10 +94,29 @@ pub struct SqlTableBindingAllocator {
 }
 
 impl SqlTableBindingAllocator {
-    /// Start one request-local allocator from an application-allocated unique
-    /// nonzero seed. A duplicate seed is rejected later by the application
-    /// binding store's scope check; SQL never serializes this identity.
-    pub fn try_new(scope_seed: NonZeroU64) -> Result<Self, String> {
+    /// Mint one process-unique request-local scope.
+    ///
+    /// Callers cannot choose the scope value, so observing a binding token
+    /// does not provide a way to recreate its mint authority.
+    pub fn new_unique() -> Result<Self, String> {
+        static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
+        let scope = NEXT_SCOPE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| "SQL table binding scope space is exhausted".to_string())?;
+        let scope = NonZeroU64::new(scope)
+            .ok_or_else(|| "SQL table binding scope space is exhausted".to_string())?;
+        Ok(Self {
+            scope: SqlTableBindingScopeId::new(scope),
+            next_ordinal: 0,
+        })
+    }
+
+    /// Construct a named scope only for cross-crate fixtures whose sealed SQL
+    /// plan already contains deterministic binding tokens.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn try_new_for_test(scope_seed: NonZeroU64) -> Result<Self, String> {
         Ok(Self {
             scope: SqlTableBindingScopeId::new(scope_seed),
             next_ordinal: 0,
@@ -125,9 +147,9 @@ mod tests {
 
     #[test]
     fn sqlx2_binding_token_is_scoped_and_nonzero() {
-        let mut first = SqlTableBindingAllocator::try_new(NonZeroU64::new(17).unwrap())
+        let mut first = SqlTableBindingAllocator::try_new_for_test(NonZeroU64::new(17).unwrap())
             .expect("first allocator");
-        let second = SqlTableBindingAllocator::try_new(NonZeroU64::new(18).unwrap())
+        let second = SqlTableBindingAllocator::try_new_for_test(NonZeroU64::new(18).unwrap())
             .expect("second allocator");
         let first_scope = first.scope();
         let second_scope = second.scope();

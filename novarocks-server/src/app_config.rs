@@ -1099,6 +1099,8 @@ pub struct RuntimeConfig {
     pub task_dispatch_update_permits: usize,
     #[serde(default = "default_task_dispatch_lifecycle_permits")]
     pub task_dispatch_lifecycle_permits: usize,
+    #[serde(default = "default_task_dispatch_control_permits")]
+    pub task_dispatch_control_permits: usize,
     #[serde(default = "default_task_operation_max_batch_items")]
     pub task_operation_max_batch_items: usize,
     #[serde(default = "default_task_operation_max_batch_encoded_bytes")]
@@ -1380,6 +1382,10 @@ fn default_task_dispatch_lifecycle_permits() -> usize {
     DispatchBudget::DEFAULT.lifecycle_permits()
 }
 
+fn default_task_dispatch_control_permits() -> usize {
+    DispatchBudget::DEFAULT.control_permits()
+}
+
 fn default_task_operation_max_batch_items() -> usize {
     TransportBudget::DEFAULT.max_batch_items()
 }
@@ -1454,8 +1460,10 @@ fn duration_millis(value: Duration) -> u64 {
 ///
 /// Every count and every duration must be positive, and every paired bound
 /// must be ordered: a per-query bound cannot exceed its per-process total, a
-/// descriptor cannot be larger than the batch that would carry it, and a lease
-/// range cannot be inverted.
+/// descriptor cannot be larger than the batch that would carry it, the
+/// process transport can retain one maximum ordinary and one maximum control
+/// batch in both queue-side and encoded form, and a lease range cannot be
+/// inverted.
 fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
     let nonzero_counts = [
         (
@@ -1469,6 +1477,10 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
         (
             "runtime.task_dispatch_lifecycle_permits",
             runtime.task_dispatch_lifecycle_permits,
+        ),
+        (
+            "runtime.task_dispatch_control_permits",
+            runtime.task_dispatch_control_permits,
         ),
         (
             "runtime.task_operation_max_batch_items",
@@ -1561,6 +1573,26 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
             "runtime.task_query_backend_max_queued_bytes must not exceed runtime.task_backend_max_queued_bytes"
         );
     }
+    let minimum_process_items = runtime
+        .task_operation_max_batch_items
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("runtime.task_operation_max_batch_items overflows"))?;
+    if minimum_process_items > runtime.task_backend_max_queued_operations {
+        bail!(
+            "runtime.task_backend_max_queued_operations must fit one maximum ordinary batch and one maximum control batch"
+        );
+    }
+    let minimum_process_retained_bytes = runtime
+        .task_operation_max_batch_encoded_bytes
+        .checked_mul(4)
+        .ok_or_else(|| {
+            anyhow::anyhow!("runtime.task_operation_max_batch_encoded_bytes overflows retention")
+        })?;
+    if minimum_process_retained_bytes > runtime.task_backend_max_queued_bytes {
+        bail!(
+            "runtime.task_backend_max_queued_bytes must retain queued and encoded forms of one maximum ordinary batch and one maximum control batch"
+        );
+    }
     let wait_ceiling = duration_millis(MaxWait::MAX_REPRESENTABLE);
     if runtime.task_operation_create_wait_cap_ms > wait_ceiling
         || runtime.task_operation_update_wait_cap_ms > wait_ceiling
@@ -1579,9 +1611,17 @@ fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
         runtime.result_retained_bytes_per_root,
         runtime.result_retained_bytes_per_process,
     )
-    .map(|_| ())
     .map_err(anyhow::Error::msg)
-    .context("validate native result retained-byte limits")
+    .context("validate native result retained-byte limits")?;
+    let per_root = u64::try_from(runtime.result_retained_bytes_per_root)
+        .context("runtime.result_retained_bytes_per_root exceeds u64")?;
+    if per_root > novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES {
+        bail!(
+            "runtime.result_retained_bytes_per_root {per_root} exceeds the Native root-result payload limit {}",
+            novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
+        );
+    }
+    Ok(())
 }
 
 fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
@@ -1911,6 +1951,7 @@ impl Default for RuntimeConfig {
             task_dispatch_create_permits: default_task_dispatch_create_permits(),
             task_dispatch_update_permits: default_task_dispatch_update_permits(),
             task_dispatch_lifecycle_permits: default_task_dispatch_lifecycle_permits(),
+            task_dispatch_control_permits: default_task_dispatch_control_permits(),
             task_operation_max_batch_items: default_task_operation_max_batch_items(),
             task_operation_max_batch_encoded_bytes: default_task_operation_max_batch_encoded_bytes(
             ),
@@ -2561,6 +2602,10 @@ access_key_secret = ""
             DispatchBudget::DEFAULT.lifecycle_permits()
         );
         assert_eq!(
+            runtime.task_dispatch_control_permits,
+            DispatchBudget::DEFAULT.control_permits()
+        );
+        assert_eq!(
             runtime.task_operation_max_batch_items,
             frozen.max_batch_items()
         );
@@ -2648,6 +2693,19 @@ access_key_secret = ""
         let error = validate_result_retained_config(&runtime)
             .expect_err("a per-root cap above the process cap must fail");
         assert!(format!("{error:#}").contains("must not exceed"));
+
+        let above_wire = usize::try_from(
+            novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES + 1,
+        )
+        .expect("the Native wire bound fits usize");
+        runtime = RuntimeConfig {
+            result_retained_bytes_per_root: above_wire,
+            result_retained_bytes_per_process: above_wire,
+            ..Default::default()
+        };
+        let error = validate_result_retained_config(&runtime)
+            .expect_err("a root payload above the Native decode envelope must fail");
+        assert!(format!("{error:#}").contains("Native root-result payload limit"));
     }
 
     #[test]
@@ -2656,7 +2714,7 @@ access_key_secret = ""
         reason = "The table-driven validation fixture keeps each field mutator explicit."
     )]
     fn task_execution_config_rejects_zero_values() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 18] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 19] = [
             ("task_dispatch_create_permits", |runtime| {
                 runtime.task_dispatch_create_permits = 0;
             }),
@@ -2665,6 +2723,9 @@ access_key_secret = ""
             }),
             ("task_dispatch_lifecycle_permits", |runtime| {
                 runtime.task_dispatch_lifecycle_permits = 0;
+            }),
+            ("task_dispatch_control_permits", |runtime| {
+                runtime.task_dispatch_control_permits = 0;
             }),
             ("task_operation_max_batch_items", |runtime| {
                 runtime.task_operation_max_batch_items = 0;
@@ -2731,7 +2792,7 @@ access_key_secret = ""
         reason = "The table-driven validation fixture keeps each inverted pair explicit."
     )]
     fn task_execution_config_rejects_inverted_bounds() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 5] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 7] = [
             ("task_lease_max_ms", |runtime| {
                 runtime.task_lease_min_ms = 30_000;
                 runtime.task_lease_max_ms = 29_999;
@@ -2747,6 +2808,18 @@ access_key_secret = ""
             ("task_query_backend_max_queued_operations", |runtime| {
                 runtime.task_backend_max_queued_operations =
                     runtime.task_query_backend_max_queued_operations - 1;
+            }),
+            ("task_backend_max_queued_operations", |runtime| {
+                runtime.task_query_backend_max_queued_operations =
+                    runtime.task_operation_max_batch_items;
+                runtime.task_backend_max_queued_operations =
+                    runtime.task_operation_max_batch_items * 2 - 1;
+            }),
+            ("task_backend_max_queued_bytes", |runtime| {
+                runtime.task_query_backend_max_queued_bytes =
+                    runtime.task_operation_max_batch_encoded_bytes;
+                runtime.task_backend_max_queued_bytes =
+                    runtime.task_operation_max_batch_encoded_bytes * 4 - 1;
             }),
             ("task_lease_max_ms", |runtime| {
                 runtime.task_lease_max_ms =

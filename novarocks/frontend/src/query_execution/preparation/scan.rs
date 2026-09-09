@@ -332,12 +332,28 @@ impl ResolvedScanBinding {
 
 #[derive(Default)]
 pub(crate) struct ScanExecutionBindings {
+    sealed_plan: Option<novarocks_sql::planning::query_execution::SealedPreparationPlan>,
     by_node_id: BTreeMap<i32, ResolvedScanBinding>,
     scan_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<ScanRangeParams>>>,
     typed_scans: BTreeMap<(FragmentId, i32), PreparedTypedConnectorScan>,
 }
 
 impl ScanExecutionBindings {
+    pub(crate) fn for_sealed_plan(
+        sealed_plan: novarocks_sql::planning::query_execution::SealedPreparationPlan,
+    ) -> Self {
+        Self {
+            sealed_plan: Some(sealed_plan),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn sealed_plan(
+        &self,
+    ) -> Option<&novarocks_sql::planning::query_execution::SealedPreparationPlan> {
+        self.sealed_plan.as_ref()
+    }
+
     pub(crate) fn insert_binding(&mut self, binding: ResolvedScanBinding) -> Result<(), String> {
         if self.by_node_id.contains_key(&binding.node_id) {
             return Err(format!(
@@ -452,6 +468,18 @@ impl ScanExecutionBindings {
         self.typed_scans
             .iter()
             .map(|(&(fragment_id, node_id), scan)| (fragment_id, node_id, scan))
+    }
+
+    /// Actual typed Connector negotiation proofs for final immutable query
+    /// description freezing. No caller reconstructs residual or projection
+    /// responsibility from the encoded scan.
+    pub(crate) fn negotiation_receipts(
+        &self,
+    ) -> impl Iterator<Item = &novarocks_query_application::preparation::NegotiatedScanReceipt>
+    {
+        self.typed_scans
+            .values()
+            .map(|scan| &scan.prepared.negotiation_receipt)
     }
 }
 

@@ -15,22 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod actor_state;
 mod completion;
 mod conclusion;
 mod context;
+mod delivery;
 mod dispatch;
 mod domain_tracker;
 mod lease;
 mod operation;
+mod recovery;
 mod result;
 mod status;
 
+pub use actor_state::*;
 pub use completion::*;
 pub use conclusion::*;
 pub use context::*;
+pub use delivery::*;
 pub use dispatch::*;
 pub use domain_tracker::*;
 pub use lease::*;
 pub use operation::*;
+pub use recovery::*;
 pub use result::*;
 pub use status::*;

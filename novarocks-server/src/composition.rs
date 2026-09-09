@@ -471,6 +471,20 @@ pub fn compose_frontend_server_config(
         .ok_or_else(|| anyhow::anyhow!("compose frontend server without catalog source preflight"))?
         .input()?;
     let task_execution_budgets = compose_task_execution_budgets(config)?;
+    let result_fetch_byte_limit = novarocks_execution_contract::ResultByteLimit::new(
+        u64::try_from(runtime_config.result_retained_bytes_per_root)
+            .map_err(|_| anyhow::anyhow!("runtime.result_retained_bytes_per_root exceeds u64"))?,
+    )
+    .map_err(|error| anyhow::anyhow!("construct result fetch byte limit: {error}"))?;
+    if result_fetch_byte_limit.get()
+        > novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
+    {
+        anyhow::bail!(
+            "runtime.result_retained_bytes_per_root {} exceeds the Native root-result payload limit {}",
+            result_fetch_byte_limit.get(),
+            novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
+        );
+    }
     let mut execution = FrontendExecutionConfig::new(
         native_trust.advertised_endpoint().host().to_string(),
         native_trust.advertised_endpoint().port(),
@@ -529,7 +543,8 @@ pub fn compose_frontend_server_config(
     .with_task_execution_budgets(
         task_execution_budgets.coordination,
         task_execution_budgets.transport,
-    );
+    )
+    .with_result_fetch_byte_limit(result_fetch_byte_limit);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
         execution =
@@ -626,6 +641,7 @@ fn compose_task_execution_budgets(
         runtime.task_dispatch_create_permits,
         runtime.task_dispatch_update_permits,
         runtime.task_dispatch_lifecycle_permits,
+        runtime.task_dispatch_control_permits,
     )
     .ok_or_else(|| anyhow::anyhow!("construct task dispatch budget: permits must be nonzero"))?;
     let wait_caps = OperationWaitCaps::new(
@@ -657,7 +673,7 @@ fn compose_task_execution_budgets(
     .ok_or_else(|| {
         anyhow::anyhow!(
             "construct task transport budget: a descriptor must fit in a batch, a batch in one \
-             query's queue, and that queue in the process's"
+             query's queue, and the process must retain one maximum ordinary and control batch"
         )
     })?;
     Ok(ComposedTaskExecutionBudgets {
@@ -901,6 +917,26 @@ mod tests {
         assert!(
             compose_task_execution_budgets(&zeroed).is_err(),
             "a zero bound is not a disabled bound"
+        );
+
+        let mut byte_starved = crate::app_config::NovaRocksConfig::default();
+        let batch_bytes = byte_starved.runtime.task_operation_max_batch_encoded_bytes;
+        byte_starved.runtime.task_query_backend_max_queued_bytes = batch_bytes;
+        byte_starved.runtime.task_backend_max_queued_bytes = batch_bytes * 4 - 1;
+        assert!(
+            compose_task_execution_budgets(&byte_starved).is_err(),
+            "the process byte bound must retain queued and encoded forms of ordinary and control batches"
+        );
+
+        let mut item_starved = crate::app_config::NovaRocksConfig::default();
+        let batch_items = item_starved.runtime.task_operation_max_batch_items;
+        item_starved
+            .runtime
+            .task_query_backend_max_queued_operations = batch_items;
+        item_starved.runtime.task_backend_max_queued_operations = batch_items * 2 - 1;
+        assert!(
+            compose_task_execution_budgets(&item_starved).is_err(),
+            "the process item bound must retain one ordinary and one control batch"
         );
     }
 

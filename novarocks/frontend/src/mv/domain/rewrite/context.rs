@@ -1451,7 +1451,7 @@ mod tests {
         )
         .expect("unpartitioned schema contract must build rewrite context");
 
-        let mut bindings = SqlTableBindingAllocator::try_new(
+        let mut bindings = SqlTableBindingAllocator::try_new_for_test(
             NonZeroU64::new(1).expect("test binding scope must be nonzero"),
         )
         .expect("test binding allocator must be valid");

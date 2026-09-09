@@ -5,4 +5,12 @@ edition = "2024"
 
 [dependencies]
 novarocks-execution-contract = { path = "../execution-contract" }
+novarocks-spi = { path = "../spi" }
+novarocks-sql = { path = "../sql" }
+novarocks-types = { path = "../types" }
 novarocks-workload-control = { path = "../workload-control" }
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+novarocks-sql = { path = "../sql", features = ["test-support"] }

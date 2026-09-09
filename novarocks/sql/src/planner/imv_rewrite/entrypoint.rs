@@ -1595,7 +1595,9 @@ pub(crate) mod tests {
         let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
             panic!("expected scan plan");
         };
-        scan.mv_rewritten_from = Some("mv_b".to_string());
+        scan.mv_rewritten_from = Some(crate::planner::payload::MvRewriteSelection::unverified(
+            "mv_b".to_string(),
+        ));
 
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan,

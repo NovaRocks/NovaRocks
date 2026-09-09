@@ -19,28 +19,30 @@ use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
 use novarocks_workload_control::WorkOwner;
 
+use crate::preparation::FrozenExecutionDescription;
+
 /// A product-independent query operation.
 ///
-/// T07 adds the frozen, topology-free description behind this opaque request.
-/// Its representation deliberately does not expose planning or native types.
+/// The request directly owns SQL's typed, topology-free distributed plan and
+/// its validated application contracts. Attempts read those values without a
+/// serialization or decoding layer.
 pub struct QueryExecutionRequest {
-    kind: QueryExecutionKind,
-    _private: RequestPrivate,
+    description: FrozenExecutionDescription,
 }
-
-struct RequestPrivate;
 
 impl QueryExecutionRequest {
     pub const fn kind(&self) -> QueryExecutionKind {
-        self.kind
+        self.description.kind()
     }
 
-    #[allow(dead_code)]
-    pub(crate) const fn new(kind: QueryExecutionKind) -> Self {
-        Self {
-            kind,
-            _private: RequestPrivate,
-        }
+    /// Consume a fully frozen semantic description. Execution may instantiate
+    /// attempts from it, but has no callback into observation or compilation.
+    pub fn from_frozen_description(description: FrozenExecutionDescription) -> Self {
+        Self { description }
+    }
+
+    pub const fn description(&self) -> &FrozenExecutionDescription {
+        &self.description
     }
 }
 

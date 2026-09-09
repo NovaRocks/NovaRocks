@@ -78,9 +78,9 @@ mod tests {
         encode_lease_receipt,
     };
     use super::operation::{
-        DecodedOperation, DecodedUpdateQueryContext, decode_fetch_task_result,
-        decode_get_final_task_info, decode_operation_batch, decode_operation_outcome,
-        decode_query_context_admission_ticket_ack, decode_receipt_batch,
+        DecodedOperation, DecodedUpdateQueryContext, MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES,
+        decode_fetch_task_result, decode_get_final_task_info, decode_operation_batch,
+        decode_operation_outcome, decode_query_context_admission_ticket_ack, decode_receipt_batch,
         encode_acquire_query_context_admission_ticket, encode_fetch_task_result,
         encode_get_final_task_info, encode_operation_outcome,
         encode_query_context_admission_ticket_ack, encode_query_context_state,
@@ -97,7 +97,7 @@ mod tests {
     };
     use novarocks_execution_contract::task_execution::operation::{
         AcquireQueryContextAdmissionTicket, MaxWait, OperationKind, OperationOutcome,
-        QueryContextAdmissionTicketReceipt, ReleaseOutcome, ResultPacketSequence,
+        QueryContextAdmissionTicketReceipt, ReleaseOutcome, ResultByteLimit, ResultPacketSequence,
     };
     use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
@@ -878,16 +878,19 @@ mod tests {
         let root = identity(4, 7, process);
 
         let acknowledged = ResultPacketSequence::new(19);
+        let max_result_bytes = ResultByteLimit::new(4096).expect("result byte limit");
         let poll = encode_fetch_task_result(
             root,
             MaxWait::default_for(OperationKind::CancelTask),
             Some(acknowledged),
+            max_result_bytes,
         );
-        let (decoded, max_wait, decoded_acknowledged) =
+        let (decoded, max_wait, decoded_acknowledged, decoded_max_result_bytes) =
             decode_fetch_task_result(&poll, FieldPath::root("fetch")).expect("a legal poll");
         assert_eq!(decoded, root);
         assert_eq!(max_wait, MaxWait::DEFAULT_UPDATE);
         assert_eq!(decoded_acknowledged, Some(acknowledged));
+        assert_eq!(decoded_max_result_bytes, max_result_bytes);
 
         // A poll that names no task cannot be answered from "the" result
         // buffer, because the address is the only thing that says which one.
@@ -895,6 +898,7 @@ mod tests {
             root_task: None,
             max_wait_millis: 1_000,
             acknowledged_packet_sequence: None,
+            max_result_bytes: 4096,
         };
         assert_eq!(
             decode_fetch_task_result(&anonymous, FieldPath::root("fetch"))
@@ -908,8 +912,35 @@ mod tests {
             root_task: Some(encode_task_identity(root)),
             max_wait_millis: 0,
             acknowledged_packet_sequence: None,
+            max_result_bytes: 4096,
         };
         assert!(decode_fetch_task_result(&zero, FieldPath::root("fetch")).is_err());
+
+        let zero_bytes = novarocks::FetchTaskResultRequest {
+            root_task: Some(encode_task_identity(root)),
+            max_wait_millis: 1_000,
+            acknowledged_packet_sequence: None,
+            max_result_bytes: 0,
+        };
+        assert_eq!(
+            decode_fetch_task_result(&zero_bytes, FieldPath::root("fetch"))
+                .expect_err("zero is not a payload credit")
+                .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+
+        let oversized = novarocks::FetchTaskResultRequest {
+            root_task: Some(encode_task_identity(root)),
+            max_wait_millis: 1_000,
+            acknowledged_packet_sequence: None,
+            max_result_bytes: MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES + 1,
+        };
+        assert_eq!(
+            decode_fetch_task_result(&oversized, FieldPath::root("fetch"))
+                .expect_err("the request must fit the Native response envelope")
+                .kind(),
+            ProtocolErrorKind::OutOfRange
+        );
 
         let read = encode_get_final_task_info(root);
         let operation = TaskOperationId::new_v7();

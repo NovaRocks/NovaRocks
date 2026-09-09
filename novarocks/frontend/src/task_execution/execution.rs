@@ -24,7 +24,7 @@
 //! `acknowledge` settles one released operation, and `apply_status` applies
 //! what the intake queued. Nothing here opens a connection.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
@@ -33,7 +33,7 @@ use novarocks_execution::task_execution::{
     UpdateQueryContext,
 };
 use novarocks_query_application::coordination::{
-    AttemptDrainFacts, DispatchBudget, GoneObservation, LatchOutcome, StageState,
+    AttemptDrainFacts, DispatchBudget, DispatchLane, GoneObservation, LatchOutcome, StageState,
     StatusObservation, TerminationLatch, parent_released_children,
 };
 use novarocks_task_codec::TransportBudget;
@@ -46,10 +46,13 @@ use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContribution
 use novarocks_types::identity::BackendProcessId;
 
 use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
-use super::dispatch::{ExpiredOperation, OperationDispatcher};
-use super::error::TaskExecutionError;
+use super::dispatch::OperationDispatcher;
+use super::error::{CapacityBound, TaskExecutionError};
 use super::graph::TaskGraph;
-use super::intent::{DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationSink};
+use super::intent::{
+    OperationAcknowledgement, OperationIntent, TaskOperationQueueAdmission,
+    TaskOperationQueuePermit, TaskOperationQueueRequest, TaskOperationSink, TaskOperationSubmit,
+};
 use super::remote_task::{
     CreateSettlement, RemoteTask, TaskTerminalReport, UpdateAdmission, UpdateSettlement,
 };
@@ -76,23 +79,45 @@ enum OperationTarget {
     ContextDomain(QueryContextRef),
 }
 
+/// One owner transition waiting to become a dispatcher entry.
+///
+/// A task-domain update may already carry the process reservation acquired
+/// before it entered `RemoteTask::pending`; every other candidate obtains its
+/// reservation in the same transaction that releases its owner marker.
+#[derive(Debug)]
+struct DispatchCandidate {
+    target: OperationTarget,
+    intent: OperationIntent,
+    queue_permit: Option<Box<dyn TaskOperationQueuePermit>>,
+}
+
+impl DispatchCandidate {
+    fn new(target: OperationTarget, intent: OperationIntent) -> Self {
+        Self {
+            target,
+            intent,
+            queue_permit: None,
+        }
+    }
+
+    fn with_queue_permit(
+        target: OperationTarget,
+        intent: OperationIntent,
+        queue_permit: Option<Box<dyn TaskOperationQueuePermit>>,
+    ) -> Self {
+        Self {
+            target,
+            intent,
+            queue_permit,
+        }
+    }
+}
+
 /// What one pump released.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct PumpReport {
     pub batches: usize,
     pub operations: usize,
-    /// Operations the dispatcher dropped for outliving their queue residence
-    /// bound.
-    ///
-    /// Deliberately observational, and deliberately without a consumer that
-    /// decides anything. It reads like an unread verdict -- it is not: the
-    /// owner that minted the operation is still waiting for its outcome and
-    /// re-mints it on its own retry, so dropping the queued copy is what gives
-    /// that retry a clean slot. Failing the attempt here instead was measured
-    /// as `distributed-resilience` 16/16 -> 4/16, because an acknowledgement
-    /// deliberately dropped by a fault is exactly the case whose recovery is a
-    /// replay of a queued operation.
-    pub expired: Vec<ExpiredOperation>,
 }
 
 /// What applying intake changed.
@@ -155,6 +180,19 @@ pub struct QueryTaskExecution {
     drained_tasks: BTreeSet<TaskId>,
     released_outputs: BTreeSet<TaskId>,
     released_children_of: BTreeSet<StageId>,
+}
+
+/// What happened when an urgent context abort reached transport admission.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AbortSubmission {
+    /// The context owner had already minted or completed its abort.
+    NoIntent,
+    /// The transport owns this abort and will publish its acknowledgement.
+    Accepted,
+    /// The abort never entered an owner or dispatcher queue. The
+    /// process-level transport supervisor owns the capacity-change wake that
+    /// will schedule its next turn.
+    Backpressured,
 }
 
 impl QueryTaskExecution {
@@ -324,24 +362,50 @@ impl QueryTaskExecution {
         establish: &dyn ContextEstablishSource,
     ) -> Result<PumpReport, TaskExecutionError> {
         let now = self.clock.now();
-        let mut report = PumpReport {
-            expired: self.dispatcher.drain_expired(now),
-            ..PumpReport::default()
-        };
+        let expired = self.dispatcher.drain_expired(now);
+        let mut first_expiry = None;
+        for expired in expired {
+            let operation_id = expired.operation_id();
+            let kind = expired.kind();
+            let waited = expired.waited();
+            let target = self
+                .operation_targets
+                .remove(&operation_id)
+                .ok_or(TaskExecutionError::UnknownOperation)?;
+            // The dispatcher never accepted this operation, so no remote
+            // effect is possible. Roll back its owner marker before failing
+            // the attempt; cleanup can then mint the cancellation it owes.
+            self.rollback_unsent(target, operation_id);
+            first_expiry.get_or_insert(TaskExecutionError::QueueResidenceExpired {
+                operation_id,
+                kind,
+                waited,
+            });
+        }
+        if let Some(error) = first_expiry {
+            return Err(error);
+        }
+        let mut report = PumpReport::default();
 
-        let mut lifecycle = Vec::<(OperationTarget, OperationIntent)>::new();
+        let mut lifecycle = Vec::<DispatchCandidate>::new();
         for (&context, owner) in &mut self.owners {
             if let Some(intent) = owner.admission_intent(now)? {
-                lifecycle.push((OperationTarget::Context(context), intent));
+                lifecycle.push(DispatchCandidate::new(
+                    OperationTarget::Context(context),
+                    intent,
+                ));
             }
             if !owner.needs_establish() {
                 continue;
             }
             if let Some(intent) = owner.establish_intent(establish.facts_for(context)?, now)? {
-                lifecycle.push((OperationTarget::Context(context), intent));
+                lifecycle.push(DispatchCandidate::new(
+                    OperationTarget::Context(context),
+                    intent,
+                ));
             }
         }
-        let mut work = Vec::<(OperationTarget, OperationIntent)>::new();
+        let mut work = Vec::<DispatchCandidate>::new();
         for (&stage_id, stage) in &mut self.stages {
             for (&task_id, task) in stage.tasks_mut() {
                 let target = OperationTarget::Task {
@@ -349,33 +413,54 @@ impl QueryTaskExecution {
                     task: task_id,
                 };
                 if let Some(intent) = task.create_intent() {
-                    work.push((target, intent));
+                    work.push(DispatchCandidate::new(target, intent));
                 }
-                if let Some(intent) = task.next_update_intent()? {
-                    work.push((target, intent));
+                if let Some((intent, queue_permit)) = task.next_update_intent()? {
+                    work.push(DispatchCandidate::with_queue_permit(
+                        target,
+                        intent,
+                        queue_permit,
+                    ));
                 }
             }
         }
         for (&context, owner) in &mut self.owners {
             if let Some(intent) = owner.renew_intent(now)? {
-                lifecycle.push((OperationTarget::Context(context), intent));
+                lifecycle.push(DispatchCandidate::new(
+                    OperationTarget::Context(context),
+                    intent,
+                ));
             }
             if let Some(intent) = owner.release_intent(now) {
-                lifecycle.push((OperationTarget::Context(context), intent));
+                lifecycle.push(DispatchCandidate::new(
+                    OperationTarget::Context(context),
+                    intent,
+                ));
             }
         }
 
         // Lifecycle intents are admitted first so a create burst cannot fill
         // the shared queue bound ahead of a renewal or a release.
-        for (target, intent) in lifecycle.into_iter().chain(work) {
-            self.operation_targets.insert(intent.operation_id(), target);
-            self.dispatcher.enqueue(intent, now)?;
-        }
+        let candidates = lifecycle.into_iter().chain(work).collect::<VecDeque<_>>();
+        self.enqueue_candidates(candidates, now)?;
 
         while let Some(batch) = self.dispatcher.take_batch() {
-            report.batches += 1;
-            report.operations += batch.operations().len();
-            self.sink.submit(&batch);
+            let acceptance = batch.acceptance();
+            let operations = batch.operations().len();
+            match self.sink.try_submit(batch) {
+                TaskOperationSubmit::Accepted => {
+                    self.dispatcher.accept(acceptance)?;
+                    report.batches += 1;
+                    report.operations += operations;
+                }
+                TaskOperationSubmit::Backpressured(batch) => {
+                    self.dispatcher.restore_backpressured(batch);
+                    // A process-level supervisor wake will schedule another
+                    // turn when capacity changes. Retrying in this turn would
+                    // only rediscover the same full hard bound and spin.
+                    break;
+                }
+            }
         }
         Ok(report)
     }
@@ -394,10 +479,19 @@ impl QueryTaskExecution {
             .get(&task_id)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         self.stages
+            .get(&stage_id)
+            .and_then(|stage| stage.task(task_id))
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        let request = TaskOperationQueueRequest::task_update(&update);
+        self.dispatcher.validate_queue_request(request)?;
+        let queue_permit = self
+            .reserve_process_request(request)
+            .ok_or_else(|| Self::process_queue_backpressure(request))?;
+        self.stages
             .get_mut(&stage_id)
             .and_then(|stage| stage.task_mut(task_id))
             .ok_or(TaskExecutionError::UnknownOperation)?
-            .enqueue_update(update)
+            .enqueue_update(update, queue_permit)
     }
 
     /// Releases one shared-domain advance an attempt-local owner minted.
@@ -425,10 +519,14 @@ impl QueryTaskExecution {
         }
         let operation_id = advance.envelope().operation_id();
         let now = self.clock.now();
+        let intent = OperationIntent::UpdateQueryContext(Arc::new(request));
+        let queue_permit = self
+            .reserve_process_queue(&intent)?
+            .ok_or_else(|| Self::process_queue_backpressure(intent.queue_request()))?;
+        self.dispatcher
+            .enqueue_reserved(intent, now, queue_permit)?;
         self.operation_targets
             .insert(operation_id, OperationTarget::ContextDomain(context));
-        self.dispatcher
-            .enqueue(OperationIntent::UpdateQueryContext(Arc::new(request)), now)?;
         Ok(operation_id)
     }
 
@@ -437,23 +535,46 @@ impl QueryTaskExecution {
         &mut self,
         context: QueryContextRef,
         cause: AbortCause,
-    ) -> Result<Option<DispatchBatch>, TaskExecutionError> {
+    ) -> Result<AbortSubmission, TaskExecutionError> {
         let now = self.clock.now();
         let Some(intent) = self
             .owners
             .get_mut(&context)
             .and_then(|owner| owner.abort_intent(cause))
         else {
-            return Ok(None);
+            return Ok(AbortSubmission::NoIntent);
         };
-        self.operation_targets
-            .insert(intent.operation_id(), OperationTarget::Context(context));
-        self.dispatcher.enqueue_priority(intent, now)?;
-        let batch = self.dispatcher.take_batch();
-        if let Some(batch) = &batch {
-            self.sink.submit(batch);
+        let operation_id = intent.operation_id();
+        let Some(queue_permit) = self.reserve_process_queue(&intent)? else {
+            self.rollback_unsent(OperationTarget::Context(context), operation_id);
+            return Ok(AbortSubmission::Backpressured);
+        };
+        if let Err(error) = self
+            .dispatcher
+            .enqueue_priority_reserved(intent, now, queue_permit)
+        {
+            self.rollback_unsent(OperationTarget::Context(context), operation_id);
+            return Err(error);
         }
-        Ok(batch)
+        self.operation_targets
+            .insert(operation_id, OperationTarget::Context(context));
+        let Some(batch) = self
+            .dispatcher
+            .take_priority_lane_batch(context.backend_process_id(), DispatchLane::Lifecycle)
+        else {
+            return Ok(AbortSubmission::Backpressured);
+        };
+        let acceptance = batch.acceptance();
+        match self.sink.try_submit(batch) {
+            TaskOperationSubmit::Accepted => {
+                self.dispatcher.accept(acceptance)?;
+                Ok(AbortSubmission::Accepted)
+            }
+            TaskOperationSubmit::Backpressured(batch) => {
+                self.dispatcher.restore_backpressured(batch);
+                Ok(AbortSubmission::Backpressured)
+            }
+        }
     }
 
     /// Settles one released operation.
@@ -585,7 +706,7 @@ impl QueryTaskExecution {
                 // and its sink then waits for permission for the rest of the
                 // query. Losing that silently is what makes the resulting hang
                 // unattributable, so each miss is reported.
-                let Some(stage) = self.stages.get_mut(&producer.stage_id()) else {
+                let Some(stage) = self.stages.get(&producer.stage_id()) else {
                     tracing::warn!(
                         edge = %edge_id,
                         producer = %producer,
@@ -593,7 +714,7 @@ impl QueryTaskExecution {
                     );
                     continue;
                 };
-                let Some(task) = stage.task_mut(producer.task_id()) else {
+                let Some(task) = stage.task(producer.task_id()) else {
                     tracing::warn!(
                         edge = %edge_id,
                         producer = %producer,
@@ -601,7 +722,8 @@ impl QueryTaskExecution {
                     );
                     continue;
                 };
-                task.enqueue_edge_open(edge_id)?;
+                let update = task.prepare_edge_open(edge_id)?;
+                self.enqueue_task_update(producer.task_id(), update)?;
                 tracing::debug!(
                     edge = %edge_id,
                     producer = %producer,
@@ -728,8 +850,8 @@ impl QueryTaskExecution {
             .collect::<Vec<_>>();
         let now = self.clock.now();
         for stage_id in released {
-            self.released_children_of.insert(stage_id);
             let children = self.graph.producer_stages(stage_id).collect::<Vec<_>>();
+            let mut candidates = VecDeque::new();
             for child in children {
                 let Some(stage) = self.stages.get_mut(&child) else {
                     continue;
@@ -740,12 +862,14 @@ impl QueryTaskExecution {
                         OperationIntent::CancelTask(request) => request.identity().task_id(),
                         _ => continue,
                     };
-                    self.operation_targets.insert(
-                        intent.operation_id(),
+                    candidates.push_back(DispatchCandidate::new(
                         OperationTarget::Task { stage: child, task },
-                    );
-                    self.dispatcher.enqueue(intent, now)?;
+                        intent,
+                    ));
                 }
+            }
+            if self.enqueue_candidates(candidates, now)? {
+                self.released_children_of.insert(stage_id);
             }
         }
         Ok(())
@@ -831,6 +955,104 @@ impl QueryTaskExecution {
     /// The first termination cause of this attempt, if one was latched.
     pub fn failure_cause(&self) -> Option<&TerminationDetail> {
         self.failure.cause()
+    }
+
+    fn enqueue_candidates(
+        &mut self,
+        mut candidates: VecDeque<DispatchCandidate>,
+        now: novarocks_query_application::coordination::MonotonicInstant,
+    ) -> Result<bool, TaskExecutionError> {
+        while let Some(mut candidate) = candidates.pop_front() {
+            let operation_id = candidate.intent.operation_id();
+            let target = candidate.target;
+            let queue_permit = if let Some(permit) = candidate.queue_permit.take() {
+                if let Err(error) = self
+                    .dispatcher
+                    .validate_operation_carrier(&candidate.intent)
+                {
+                    self.rollback_unsent(target, operation_id);
+                    self.rollback_candidates(candidates);
+                    return Err(error);
+                }
+                permit
+            } else {
+                match self.reserve_process_queue(&candidate.intent) {
+                    Err(error) => {
+                        self.rollback_unsent(target, operation_id);
+                        self.rollback_candidates(candidates);
+                        return Err(error);
+                    }
+                    Ok(Some(permit)) => permit,
+                    Ok(None) => {
+                        self.rollback_unsent(target, operation_id);
+                        self.rollback_candidates(candidates);
+                        return Ok(false);
+                    }
+                }
+            };
+            if let Err(error) =
+                self.dispatcher
+                    .enqueue_reserved(candidate.intent, now, queue_permit)
+            {
+                self.rollback_unsent(target, operation_id);
+                self.rollback_candidates(candidates);
+                return Err(error);
+            }
+            self.operation_targets.insert(operation_id, target);
+        }
+        Ok(true)
+    }
+
+    fn rollback_candidates(&mut self, candidates: VecDeque<DispatchCandidate>) {
+        for candidate in candidates {
+            self.rollback_unsent(candidate.target, candidate.intent.operation_id());
+        }
+    }
+
+    fn rollback_unsent(&mut self, target: OperationTarget, operation_id: TaskOperationId) {
+        match target {
+            OperationTarget::Task { stage, task } => {
+                if let Some(task) = self
+                    .stages
+                    .get_mut(&stage)
+                    .and_then(|stage| stage.task_mut(task))
+                {
+                    task.rollback_unsent(operation_id);
+                }
+            }
+            OperationTarget::Context(context) => {
+                if let Some(owner) = self.owners.get_mut(&context) {
+                    owner.rollback_unsent(operation_id);
+                }
+            }
+            OperationTarget::ContextDomain(_) => {}
+        }
+    }
+
+    fn reserve_process_queue(
+        &self,
+        intent: &OperationIntent,
+    ) -> Result<Option<Box<dyn TaskOperationQueuePermit>>, TaskExecutionError> {
+        self.dispatcher.validate_operation_carrier(intent)?;
+        Ok(self.reserve_process_request(intent.queue_request()))
+    }
+
+    fn reserve_process_request(
+        &self,
+        request: TaskOperationQueueRequest,
+    ) -> Option<Box<dyn TaskOperationQueuePermit>> {
+        match self.sink.try_reserve_queue(request) {
+            TaskOperationQueueAdmission::Admitted(permit) => Some(permit),
+            TaskOperationQueueAdmission::Backpressured => None,
+        }
+    }
+
+    fn process_queue_backpressure(request: TaskOperationQueueRequest) -> TaskExecutionError {
+        CapacityBound::ProcessTransportQueue {
+            lane: request.lane(),
+            bytes: request.queued_bytes(),
+        }
+        .into()
     }
 
     fn locate(&self, identity: TaskIdentity) -> Option<(StageId, TaskId)> {

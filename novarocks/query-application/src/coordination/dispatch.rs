@@ -22,6 +22,7 @@ pub struct DispatchBudget {
     create_permits: usize,
     update_permits: usize,
     lifecycle_permits: usize,
+    control_permits: usize,
 }
 
 impl DispatchBudget {
@@ -29,16 +30,23 @@ impl DispatchBudget {
         create_permits: 16,
         update_permits: 12,
         lifecycle_permits: 4,
+        control_permits: 4,
     };
 
-    pub const fn new(create: usize, update: usize, lifecycle: usize) -> Option<Self> {
-        if create == 0 || update == 0 || lifecycle == 0 {
+    pub const fn new(
+        create: usize,
+        update: usize,
+        lifecycle: usize,
+        control: usize,
+    ) -> Option<Self> {
+        if create == 0 || update == 0 || lifecycle == 0 || control == 0 {
             None
         } else {
             Some(Self {
                 create_permits: create,
                 update_permits: update,
                 lifecycle_permits: lifecycle,
+                control_permits: control,
             })
         }
     }
@@ -52,12 +60,17 @@ impl DispatchBudget {
     pub const fn lifecycle_permits(self) -> usize {
         self.lifecycle_permits
     }
+    pub const fn control_permits(self) -> usize {
+        self.control_permits
+    }
     pub const fn total_permits(self) -> usize {
-        self.create_permits + self.update_permits + self.lifecycle_permits
+        self.create_permits + self.update_permits + self.lifecycle_permits + self.control_permits
     }
 
     pub const fn lane_of(kind: OperationKind) -> DispatchLane {
-        if matches!(
+        if matches!(kind, OperationKind::CancelTask) {
+            DispatchLane::Control
+        } else if matches!(
             kind,
             OperationKind::AcquireQueryContextAdmissionTicket
                 | OperationKind::UpdateQueryContext
@@ -77,6 +90,7 @@ impl DispatchBudget {
             DispatchLane::Create => self.create_permits,
             DispatchLane::Update => self.update_permits,
             DispatchLane::Lifecycle => self.lifecycle_permits,
+            DispatchLane::Control => self.control_permits,
         }
     }
 }
@@ -86,6 +100,7 @@ pub enum DispatchLane {
     Create,
     Update,
     Lifecycle,
+    Control,
 }
 
 /// Budgets whose authority belongs to query coordination.
@@ -120,6 +135,10 @@ mod tests {
         assert_ne!(
             DispatchBudget::lane_of(OperationKind::CreateTask),
             DispatchLane::Lifecycle
+        );
+        assert_eq!(
+            DispatchBudget::lane_of(OperationKind::CancelTask),
+            DispatchLane::Control
         );
     }
 }

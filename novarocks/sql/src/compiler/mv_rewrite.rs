@@ -34,6 +34,51 @@ use crate::optimizer::cascades_rules::mv_rewrite::{
     MvRewriteCandidate, descriptor::SpjgDescriptor,
 };
 use crate::planner::logical::LogicalPlanNode;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvRewriteSelectionFacts {
+    publication_id: [u8; 16],
+    definition_fingerprint: [u8; 32],
+    publication_inputs: Vec<String>,
+}
+
+impl SqlMvRewriteSelectionFacts {
+    pub fn try_new(
+        publication_id: [u8; 16],
+        definition_fingerprint: [u8; 32],
+        publication_inputs: Vec<String>,
+    ) -> Result<Self, String> {
+        if publication_id == [0; 16] || definition_fingerprint == [0; 32] {
+            return Err("MV rewrite selection identity cannot be zero".to_string());
+        }
+        if publication_inputs.is_empty() || publication_inputs.iter().any(|input| input.is_empty())
+        {
+            return Err("MV rewrite selection must name every publication input".to_string());
+        }
+        let mut unique = publication_inputs.clone();
+        unique.sort_unstable();
+        if unique.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err("MV rewrite selection repeats a publication input".to_string());
+        }
+        Ok(Self {
+            publication_id,
+            definition_fingerprint,
+            publication_inputs,
+        })
+    }
+
+    pub(crate) const fn publication_id(&self) -> [u8; 16] {
+        self.publication_id
+    }
+
+    pub(crate) const fn definition_fingerprint(&self) -> [u8; 32] {
+        self.definition_fingerprint
+    }
+
+    pub(crate) fn publication_inputs(&self) -> &[String] {
+        &self.publication_inputs
+    }
+}
 use crate::planner::table::ScanSource;
 
 use super::{SqlFunctionCatalog, SqlStatisticsPlan, SqlStatisticsSnapshot};
@@ -2083,6 +2128,7 @@ pub struct SqlMvRewriteDefinitionFacts {
     last_refresh_snapshots: BTreeMap<String, i64>,
     last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     base_table_states: BTreeMap<String, SqlMvRewriteBaseTableFacts>,
+    selection: Option<SqlMvRewriteSelectionFacts>,
 }
 
 impl SqlMvRewriteDefinitionFacts {
@@ -2116,7 +2162,13 @@ impl SqlMvRewriteDefinitionFacts {
             last_refresh_snapshots,
             last_refresh_table_object_ids,
             base_table_states,
+            selection: None,
         })
+    }
+
+    pub fn with_selection_facts(mut self, selection: SqlMvRewriteSelectionFacts) -> Self {
+        self.selection = Some(selection);
+        self
     }
 
     fn into_definition(self) -> MvRewriteDefinition {
@@ -2135,6 +2187,7 @@ impl SqlMvRewriteDefinitionFacts {
                 .into_iter()
                 .map(|(fqn, state)| (fqn, state.into_state()))
                 .collect(),
+            selection: self.selection,
         }
     }
 }
@@ -2169,6 +2222,7 @@ pub(crate) struct MvRewriteDefinition {
         reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
     )]
     pub(crate) base_table_states: BTreeMap<String, MvRewriteBaseTableState>,
+    pub(crate) selection: Option<SqlMvRewriteSelectionFacts>,
 }
 
 /// Repository-order-preserving MV definition snapshot for one compiler request.
@@ -2199,6 +2253,7 @@ struct AnalyzedMvRewriteCandidate {
     target_database: String,
     target_table: crate::planner::table::TableDef,
     factory_after_analysis: ColumnRefFactory,
+    selection: Option<SqlMvRewriteSelectionFacts>,
 }
 
 #[expect(
@@ -2329,6 +2384,7 @@ pub(crate) fn attach_candidate_statistics(
                     target_database: candidate.target_database,
                     target_table: candidate.target_table,
                     target_stats_ref,
+                    selection: candidate.selection,
                 });
             }
             SqlMvRewriteAnalysisEntry::Diagnostic(diagnostic) => diagnostics.push(diagnostic),
@@ -2409,6 +2465,7 @@ fn build_candidate(
         target_database: namespace.to_string(),
         target_table,
         factory_after_analysis: returned,
+        selection: definition.selection.clone(),
     }))
 }
 

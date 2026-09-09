@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
+use novarocks_execution_contract::ResultByteLimit;
 use novarocks_query_application::coordination::CoordinationBudgets;
 use novarocks_task_codec::TransportBudget;
 
@@ -222,6 +223,8 @@ pub struct FrontendExecutionConfig {
     /// one that configuration failed to supply.
     coordination_budgets: CoordinationBudgets,
     transport_budget: TransportBudget,
+    /// Positive root-result payload credit placed on every Native fetch.
+    result_fetch_byte_limit: ResultByteLimit,
     /// Connector split enumeration's bounded, server-owned initial feedback
     /// wait. This is frozen at startup and deliberately has no SQL override.
     connector_split_initial_dynamic_filter_wait_cap: Duration,
@@ -259,6 +262,8 @@ impl FrontendExecutionConfig {
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
             coordination_budgets: CoordinationBudgets::DEFAULT,
             transport_budget: TransportBudget::DEFAULT,
+            result_fetch_byte_limit: ResultByteLimit::new(16 * 1024 * 1024)
+                .expect("the test result fetch byte limit is nonzero"),
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             lake_publication_runtime_policy: LakePublicationRuntimePolicy::try_new(
@@ -311,6 +316,11 @@ impl FrontendExecutionConfig {
     ) -> Self {
         self.coordination_budgets = coordination;
         self.transport_budget = transport;
+        self
+    }
+
+    pub fn with_result_fetch_byte_limit(mut self, limit: ResultByteLimit) -> Self {
+        self.result_fetch_byte_limit = limit;
         self
     }
 
@@ -475,7 +485,11 @@ impl FrontendApplicationHost {
             data_runtime,
             native_trust,
             native_transport,
-        );
+            execution.transport_budget,
+        )
+        .map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
+        })?;
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
@@ -1142,6 +1156,7 @@ impl FrontendApplicationHost {
                 execution.connector_split_initial_dynamic_filter_wait_cap,
                 execution.coordination_budgets,
                 execution.transport_budget,
+                execution.result_fetch_byte_limit,
                 self.backend_topology_port(),
                 self.data_runtime.clone(),
             )

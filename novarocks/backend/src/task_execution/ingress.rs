@@ -1400,6 +1400,7 @@ mod tests {
                 root_task: Some(encode_task_identity(foreign)),
                 max_wait_millis: 60_000,
                 acknowledged_packet_sequence: None,
+                max_result_bytes: 16 * 1024 * 1024,
             })
             .await
             .expect("a fenced poll is answered, not errored");
@@ -1491,6 +1492,7 @@ mod tests {
                 root_task: Some(encode_task_identity(producer)),
                 max_wait_millis: 60_000,
                 acknowledged_packet_sequence: None,
+                max_result_bytes: 16 * 1024 * 1024,
             })
             .await
             .expect("a fenced poll is answered, not errored");

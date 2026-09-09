@@ -39,7 +39,8 @@ use tower::service_fn;
 use super::runtime::BackendDataRuntime;
 use super::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
-const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const GRPC_MAX_MESSAGE_BYTES: usize =
+    novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 
 type AuthenticatedNovaRocksGrpcClient =
     NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;

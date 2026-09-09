@@ -58,7 +58,10 @@ impl TransportBudget {
     /// what make the bounds a hierarchy rather than ten unrelated numbers: a
     /// descriptor has to fit in a batch, a batch in one query's queue, and
     /// that queue in the process's, or the smaller bound makes the larger one
-    /// unreachable. The task counts nest for the same reason — a
+    /// unreachable. The process window also retains one queued carrier and
+    /// one encoded request for both an ordinary batch and its control reserve,
+    /// so it must fit two maximum retained batches. The task counts nest for
+    /// the same reason — a
     /// `QueryContextRef` names one query on one backend, so one context's
     /// tasks are a subset of that backend's.
     #[expect(
@@ -90,12 +93,17 @@ impl TransportBudget {
         {
             return None;
         }
+        let max_retained_batch_bytes = max_batch_encoded_bytes.checked_mul(2)?;
+        let minimum_process_retained_bytes = max_retained_batch_bytes.checked_mul(2)?;
+        let minimum_process_items = max_batch_items.checked_mul(2)?;
         if max_descriptor_encoded_bytes > max_batch_encoded_bytes
             || max_batch_encoded_bytes > max_query_backend_queued_bytes
             || max_query_backend_queued_bytes > max_backend_queued_bytes
             || max_batch_items > max_query_backend_queued_operations
             || max_query_backend_queued_operations > max_backend_queued_operations
             || max_tasks_per_context > max_active_tasks_per_backend
+            || minimum_process_items > max_backend_queued_operations
+            || minimum_process_retained_bytes > max_backend_queued_bytes
         {
             return None;
         }
@@ -119,6 +127,19 @@ impl TransportBudget {
 
     pub const fn max_batch_encoded_bytes(self) -> usize {
         self.max_batch_encoded_bytes
+    }
+
+    /// Largest retained queue-side carrier for one operation.
+    ///
+    /// The dispatcher enforces this before enqueueing. This closes the
+    /// otherwise unbounded first-item exception when it forms a batch.
+    pub const fn max_operation_queued_bytes(self) -> usize {
+        self.max_batch_encoded_bytes
+    }
+
+    /// Largest queued carrier plus encoded request retained by one batch.
+    pub const fn max_retained_batch_bytes(self) -> usize {
+        self.max_batch_encoded_bytes.saturating_mul(2)
     }
 
     pub const fn max_descriptor_encoded_bytes(self) -> usize {
@@ -163,6 +184,8 @@ impl TransportBudget {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::TransportBudget;
 
     #[test]
@@ -172,5 +195,20 @@ mod tests {
         assert!(!budget.batch_fits(0, 0));
         assert!(!budget.batch_fits(budget.max_batch_items() + 1, 1));
         assert!(!budget.batch_fits(1, budget.max_batch_encoded_bytes() + 1));
+    }
+
+    #[test]
+    fn process_window_must_fit_one_ordinary_batch_and_one_control_batch() {
+        assert!(
+            TransportBudget::new(2, 10, 5, 2, 20, 4, 40, 1, 2, Duration::from_secs(1)).is_some()
+        );
+        assert!(
+            TransportBudget::new(2, 10, 5, 2, 20, 3, 40, 1, 2, Duration::from_secs(1)).is_none(),
+            "three process items cannot hold two ordinary and two control items"
+        );
+        assert!(
+            TransportBudget::new(2, 10, 5, 2, 20, 4, 39, 1, 2, Duration::from_secs(1)).is_none(),
+            "the process byte window retains queued and encoded forms of both batches"
+        );
     }
 }

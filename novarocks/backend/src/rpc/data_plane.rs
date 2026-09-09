@@ -191,7 +191,7 @@ pub async fn fetch_task_result(
 ) -> Result<proto::novarocks::FetchResultResponse, tonic::Status> {
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
 
-    let (identity, max_wait, acknowledged) =
+    let (identity, max_wait, acknowledged, max_result_bytes) =
         decode_fetch_task_result(&request, FieldPath::root("fetch_task_result"))
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
     let acknowledged = acknowledged
@@ -256,7 +256,7 @@ pub async fn fetch_task_result(
         }
     };
     Ok(
-        match wait_fetch_task_typed(identity, acknowledged, max_wait).await {
+        match wait_fetch_task_typed(identity, acknowledged, max_wait, max_result_bytes).await {
             TryFetchTypedResult::Ready(result) => {
                 emit_typed_fetch_marker(
                     FetchMarkerIdentity::Task(identity),
@@ -402,8 +402,16 @@ fn typed_fetch_marker(
 
 #[cfg(test)]
 mod tests {
-    use super::{FetchMarkerIdentity, proto, should_emit_typed_fetch_marker, typed_fetch_marker};
+    use prost::Message;
+
+    use super::{
+        FetchMarkerIdentity, fetch_response, proto, should_emit_typed_fetch_marker,
+        typed_fetch_marker,
+    };
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_task_codec::operation::{
+        MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES, NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+    };
     use novarocks_types::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId, UniqueId,
     };
@@ -459,5 +467,24 @@ mod tests {
             0,
             false
         ));
+    }
+
+    #[test]
+    fn maximum_legal_root_result_fits_the_actual_grpc_response_envelope() {
+        let payload_bytes = usize::try_from(MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES)
+            .expect("the Native result ceiling fits usize");
+        let response = fetch_response(
+            FetchStatus::Ready,
+            String::new(),
+            i64::MAX,
+            true,
+            vec![0_u8; payload_bytes],
+        );
+        let encoded_bytes = response.encoded_len();
+        assert!(
+            encoded_bytes <= NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+            "the maximum legal payload produces a {encoded_bytes}-byte response above the {}-byte decode ceiling",
+            NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
+        );
     }
 }

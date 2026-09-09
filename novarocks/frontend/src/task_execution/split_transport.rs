@@ -75,7 +75,8 @@ use novarocks_types::identity::TaskId;
 use super::error::TaskExecutionError;
 use super::graph::TaskGraph;
 use super::intent::{
-    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationSink,
+    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
+    TaskOperationQueueAdmission, TaskOperationQueueRequest, TaskOperationSink, TaskOperationSubmit,
 };
 use super::remote_task::UpdateAdmission;
 use crate::query_execution::connector_domain::TaskUpdateRequest;
@@ -398,21 +399,9 @@ impl SplitDeliveryBridge {
         self.settled.notify_all();
     }
 
-    fn note_released(&self, batch: &DispatchBatch) {
+    fn note_released(&self, released: &[(TaskOperationId, TaskId)]) {
         let mut state = self.lock();
-        for operation in batch.operations() {
-            let OperationIntent::UpdateTask(request) = operation else {
-                continue;
-            };
-            if !request
-                .domains()
-                .iter()
-                .any(|domain| matches!(domain, TaskDomainUpdate::SplitAssignment(_)))
-            {
-                continue;
-            }
-            let task = request.identity().task_id();
-            let operation_id = request.envelope().operation_id();
+        for &(operation_id, task) in released {
             match state.by_task.get(&task).copied() {
                 Some(delivery) => {
                     // A replayed release repeats its own operation id, so this
@@ -615,12 +604,44 @@ struct SplitDeliverySink {
 }
 
 impl TaskOperationSink for SplitDeliverySink {
-    fn submit(&self, batch: &DispatchBatch) {
-        // Bind before forwarding: the acknowledgement of a request this batch
-        // puts on the wire may reach `settle` on another thread before
-        // `submit` returns.
-        self.bridge.note_released(batch);
-        self.inner.submit(batch);
+    fn try_reserve_queue(&self, request: TaskOperationQueueRequest) -> TaskOperationQueueAdmission {
+        self.inner.try_reserve_queue(request)
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
+        // This scratch vector is capped by `max_batch_items`, and every item
+        // already owns a process queue permit. It carries only operation/task
+        // identities; protobuf payload allocation happens under the encoding
+        // reservation in the inner Native sink.
+        let released = batch
+            .operations()
+            .iter()
+            .filter_map(|operation| {
+                let OperationIntent::UpdateTask(request) = operation else {
+                    return None;
+                };
+                request
+                    .domains()
+                    .iter()
+                    .any(|domain| matches!(domain, TaskDomainUpdate::SplitAssignment(_)))
+                    .then(|| {
+                        (
+                            request.envelope().operation_id(),
+                            request.identity().task_id(),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        match self.inner.try_submit(batch) {
+            TaskOperationSubmit::Accepted => {
+                // Acknowledgements are drained later by the serial runner, so
+                // this binding still precedes settlement without claiming a
+                // batch the inner transport refused.
+                self.bridge.note_released(&released);
+                TaskOperationSubmit::Accepted
+            }
+            TaskOperationSubmit::Backpressured(batch) => TaskOperationSubmit::Backpressured(batch),
+        }
     }
 }
 
@@ -802,8 +823,16 @@ mod tests {
     }
 
     impl TaskOperationSink for CountingSink {
-        fn submit(&self, _batch: &DispatchBatch) {
+        fn try_reserve_queue(
+            &self,
+            _request: TaskOperationQueueRequest,
+        ) -> TaskOperationQueueAdmission {
+            TaskOperationQueueAdmission::Admitted(crate::task_execution::intent::test_queue_permit())
+        }
+
+        fn try_submit(&self, _batch: DispatchBatch) -> TaskOperationSubmit {
             self.batches.fetch_add(1, Ordering::SeqCst);
+            TaskOperationSubmit::Accepted
         }
     }
 
@@ -942,11 +971,14 @@ mod tests {
         )
         .expect("a legal task update");
         let sink = bridge.sink(Arc::new(CountingSink::default()));
-        sink.submit(&DispatchBatch::new(
-            identity().backend_process_id(),
-            DispatchLane::Update,
-            vec![OperationIntent::UpdateTask(Arc::new(request))],
-            0,
+        assert!(matches!(
+            sink.try_submit(DispatchBatch::test_fixture(
+                identity().backend_process_id(),
+                DispatchLane::Update,
+                vec![OperationIntent::UpdateTask(Arc::new(request))],
+                0,
+            )),
+            TaskOperationSubmit::Accepted
         ));
         operation_id
     }

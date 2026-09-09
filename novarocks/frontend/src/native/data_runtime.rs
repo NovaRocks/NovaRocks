@@ -5,11 +5,13 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use novarocks_native_trust::NativeTrust;
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
 
 use super::transport::FrontendNativeTransport;
+use super::transport_supervisor::NativeTransportSupervisor;
 
 /// The Frontend role's explicitly composed Tokio runtime capability.
 ///
@@ -22,6 +24,7 @@ pub(crate) struct FrontendDataRuntime {
     native_trust: Arc<NativeTrust>,
     native_transport: FrontendNativeTransport,
     channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
+    task_transport_supervisor: NativeTransportSupervisor,
 }
 
 impl FrontendDataRuntime {
@@ -29,13 +32,17 @@ impl FrontendDataRuntime {
         handle: Handle,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
-    ) -> Self {
-        Self {
+        task_transport_budget: TransportBudget,
+    ) -> Result<Self, String> {
+        Ok(Self {
             handle,
             native_trust,
             native_transport,
             channels: Arc::new(Mutex::new(HashMap::new())),
-        }
+            task_transport_supervisor: NativeTransportSupervisor::from_transport(
+                task_transport_budget,
+            )?,
+        })
     }
 
     #[cfg(test)]
@@ -56,7 +63,9 @@ impl FrontendDataRuntime {
             handle,
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
+            TransportBudget::DEFAULT,
         )
+        .expect("the default task transport budget is valid")
     }
 
     pub(crate) fn native_trust(&self) -> &Arc<NativeTrust> {
@@ -65,6 +74,10 @@ impl FrontendDataRuntime {
 
     pub(crate) fn native_transport(&self) -> &FrontendNativeTransport {
         &self.native_transport
+    }
+
+    pub(crate) fn task_transport_supervisor(&self) -> &NativeTransportSupervisor {
+        &self.task_transport_supervisor
     }
 
     pub(crate) fn block_on<F>(&self, future: F) -> Result<F::Output, String>
@@ -117,6 +130,7 @@ mod tests {
         DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
     };
     use novarocks_secret::SecretValue;
+    use novarocks_task_codec::TransportBudget;
     use novarocks_types::NativeEndpoint;
 
     use super::FrontendDataRuntime;
@@ -134,7 +148,9 @@ mod tests {
             handle,
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
+            TransportBudget::DEFAULT,
         )
+        .expect("the default task transport budget is valid")
     }
 
     #[test]

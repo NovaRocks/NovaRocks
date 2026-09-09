@@ -134,6 +134,21 @@ fn fixture_control_role_host(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
 ) -> Arc<crate::connector::ConnectorControlHost> {
+    fixture_control_role_host_with_foreign_provider(plan, controls, false)
+}
+
+fn foreign_fixture_control_role_host(
+    plan: &DistributedPlan,
+    controls: &crate::connector::FixtureControlResolver,
+) -> Arc<crate::connector::ConnectorControlHost> {
+    fixture_control_role_host_with_foreign_provider(plan, controls, true)
+}
+
+fn fixture_control_role_host_with_foreign_provider(
+    plan: &DistributedPlan,
+    controls: &crate::connector::FixtureControlResolver,
+    foreign_provider: bool,
+) -> Arc<crate::connector::ConnectorControlHost> {
     use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
 
     let registry = Arc::new(crate::connector::ConnectorControlHost::new());
@@ -166,7 +181,18 @@ fn fixture_control_role_host(
             .catalog_handle()
             .expect("fixture control binding has a catalog handle")
             .clone();
-        let control = Arc::new(FixtureTypedControl::new(catalog_handle.clone()));
+        let descriptor = if foreign_provider {
+            novarocks_spi::connector::ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse(
+                    "foreign-fixture",
+                )
+                .expect("foreign fixture provider ID"),
+                instance_id: catalog_handle.catalog_name().clone(),
+            }
+        } else {
+            lease.binding().descriptor().clone()
+        };
+        let control = Arc::new(FixtureTypedControl::new(descriptor, catalog_handle.clone()));
         let adapter = Arc::new(
             novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter::new(Arc::clone(
                 &control,
@@ -247,13 +273,12 @@ impl FixtureTypedControl {
         "__change_op",
     ];
 
-    fn new(catalog_handle: novarocks_spi::connector::CatalogHandle) -> Self {
+    fn new(
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        catalog_handle: novarocks_spi::connector::CatalogHandle,
+    ) -> Self {
         Self {
-            descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor {
-                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("fixture")
-                    .expect("fixture provider ID"),
-                instance_id: catalog_handle.catalog_name().clone(),
-            },
+            descriptor,
             catalog_handle,
             pinned_requests: std::sync::Mutex::new(Vec::new()),
         }

@@ -67,13 +67,15 @@ pub use credential::{CredentialRefreshOwner, RefreshRefusal, RefreshTiming, refr
 pub use dispatch::{ExpiredOperation, OperationDispatcher};
 pub use error::{CapacityBound, TaskExecutionError};
 pub use execution::{
-    PumpReport, QueryTaskExecution, ReleasedRuntimeFilterContributions, StatusReport,
+    AbortSubmission, PumpReport, QueryTaskExecution, ReleasedRuntimeFilterContributions,
+    StatusReport,
 };
 pub use graph::{
     FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, build_task_graph,
 };
 pub use intent::{
-    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationSink,
+    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
+    TaskOperationQueueRequest, TaskOperationSink, TaskOperationSubmit,
 };
 pub use remote_task::{
     CreateSettlement, RemoteTask, RemoteTaskState, TaskTerminalReport, UpdateAdmission,

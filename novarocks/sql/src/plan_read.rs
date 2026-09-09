@@ -761,7 +761,10 @@ pub fn physical_plan_read(src: &PhysicalPlanKind) -> SqlPhysicalPlanRead {
             predicates: node.predicates.clone(),
             required_columns: node.required_columns.clone(),
             variant_columns: node.variant_columns.clone(),
-            mv_rewritten_from: node.mv_rewritten_from.clone(),
+            mv_rewritten_from: node
+                .mv_rewritten_from
+                .as_ref()
+                .map(|selection| selection.name().to_string()),
         }),
         Node::Filter(node) => SqlPhysicalPlanRead::Filter {
             predicate: node.predicate.clone(),

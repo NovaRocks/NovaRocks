@@ -1305,6 +1305,16 @@ fn the_root_result_poll_is_addressed_by_task_identity() {
         request.get_field_by_name("max_wait_millis").is_some(),
         "the poll budget is a duration the backend times itself"
     );
+    assert!(
+        matches!(
+            request
+                .get_field_by_name("max_result_bytes")
+                .expect("result payload byte credit")
+                .kind(),
+            prost_reflect::Kind::Uint64
+        ),
+        "the root result poll carries a positive payload-byte credit"
+    );
 }
 
 /// A credential rotation keeps its non-secret descriptors and its confidential

@@ -33,7 +33,8 @@ use novarocks_types::{BackendProcessId, NativeEndpoint, UniqueId};
 use super::data_runtime::FrontendDataRuntime;
 use super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
-const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MESSAGE_BYTES: usize =
+    novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 
 /// One best-effort response from a Backend catalog reachability prune.
 #[derive(Clone, Debug, Eq, PartialEq)]

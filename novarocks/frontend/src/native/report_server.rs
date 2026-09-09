@@ -36,7 +36,8 @@ use super::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServe
 use super::transport::FrontendNativeTransport;
 use novarocks_native_trust::{BoxedNativeIo, NativeServerAdmission, NativeTrust};
 
-const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const GRPC_MAX_MESSAGE_BYTES: usize =
+    novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 
 /// Role-local wrapper supplying the connection marker Tonic requires after
 /// the trust adapter has selected plaintext or completed TLS.

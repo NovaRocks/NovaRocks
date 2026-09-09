@@ -91,9 +91,12 @@ use crate::task_execution::round::{TaskRound, TurnReport};
 use crate::task_execution::split_transport::SplitDeliveryBridge;
 use crate::task_execution::status_intake::{CondvarWake, StatusIntakeWake};
 use novarocks_execution::task_execution::{
-    AbortCause, FinalTaskInfo, MaxWait, OperationKind, ResultPacketSequence, TaskIdentity,
-    TaskState, TerminationDetail,
+    AbortCause, FinalTaskInfo, MaxWait, OperationKind, ResultByteLimit, ResultPacketSequence,
+    TaskIdentity, TaskState, TerminationDetail,
 };
+
+#[cfg(test)]
+const TEST_RESULT_FETCH_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> Result<QueryId, DistributedQueryError>;
@@ -315,6 +318,7 @@ pub struct FrontendDistributedQueryCoordinator {
     /// while the process runs.
     coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
     transport_budget: novarocks_task_codec::TransportBudget,
+    result_fetch_byte_limit: ResultByteLimit,
     /// This frontend process's own identity, minted once per process.
     ///
     /// It is half of every query context reference, so a backend can tell one
@@ -370,6 +374,7 @@ impl FrontendDistributedQueryCoordinator {
         connector_split_initial_dynamic_filter_wait_cap: Duration,
         coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
         transport_budget: novarocks_task_codec::TransportBudget,
+        result_fetch_byte_limit: ResultByteLimit,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, DistributedQueryError> {
@@ -396,6 +401,7 @@ impl FrontendDistributedQueryCoordinator {
             data_runtime,
             coordination_budgets,
             transport_budget,
+            result_fetch_byte_limit,
             frontend_process_id: FrontendProcessId::new_v7(),
             task_update_retry_policy,
             connector_split_initial_dynamic_filter_wait_cap,
@@ -449,6 +455,8 @@ impl FrontendDistributedQueryCoordinator {
             coordination_budgets:
                 novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
             transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
+            result_fetch_byte_limit: ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
+                .expect("the test result byte limit is nonzero"),
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
             backend_services: Some(BackendServicesSource::Fixed {
@@ -514,6 +522,8 @@ impl FrontendDistributedQueryCoordinator {
             coordination_budgets:
                 novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
             transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
+            result_fetch_byte_limit: ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
+                .expect("the test result byte limit is nonzero"),
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
             backend_services: Some(BackendServicesSource::Sequence {
@@ -1228,6 +1238,7 @@ impl FrontendDistributedQueryCoordinator {
                     root_task,
                     Arc::clone(&root_output_schema),
                     statement_deadline,
+                    self.result_fetch_byte_limit,
                     Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
                 ) {
                     Ok(polls) => {
@@ -2488,9 +2499,10 @@ mod tests {
 
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
-        QueryIdSource, ResultPacketSequence, StatisticsTaskCompletionFact, UniqueQueryIdSource,
-        distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
-        pre_ready_topology_validation_error, statistics_all_success_failure_message,
+        QueryIdSource, ResultByteLimit, ResultPacketSequence, StatisticsTaskCompletionFact,
+        TEST_RESULT_FETCH_BYTE_LIMIT, UniqueQueryIdSource, distributed_write_phase_marker,
+        fail_closed_one_shot_topology_retry, pre_ready_topology_validation_error,
+        statistics_all_success_failure_message,
     };
     use crate::common::backend_topology::{
         BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
@@ -3368,6 +3380,7 @@ mod tests {
             _root_task: TaskIdentity,
             _max_wait: MaxWait,
             acknowledged: Option<ResultPacketSequence>,
+            _max_result_bytes: ResultByteLimit,
             _expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
         ) -> Result<RootResultOutcome, String> {
             self.releases
@@ -3471,6 +3484,8 @@ mod tests {
             root_task_for_test(),
             Arc::new(novarocks_execution::exec::chunk::ChunkSchema::empty()),
             Instant::now() + Duration::from_secs(60),
+            ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
+                .expect("the test result byte limit is nonzero"),
             Arc::clone(&wake) as Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
         )
         .expect("the poller starts");
@@ -3936,6 +3951,7 @@ impl RootResultPolls {
         root_task: TaskIdentity,
         expected_output_schema: novarocks_execution::exec::chunk::ChunkSchemaRef,
         statement_deadline: Instant,
+        max_result_bytes: ResultByteLimit,
         wake: Arc<dyn StatusIntakeWake>,
     ) -> Result<Self, String> {
         // One answer of slack, so the next poll may already be in flight
@@ -3955,6 +3971,7 @@ impl RootResultPolls {
                         root_task,
                         max_root_result_wait(now, statement_deadline),
                         acknowledged,
+                        max_result_bytes,
                         Some(ExpectedOutputSchemaView::new(&expected_output_schema)),
                     );
                     if let Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) = &answer {

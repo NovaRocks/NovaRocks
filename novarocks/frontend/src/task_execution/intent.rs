@@ -34,7 +34,7 @@ use novarocks_execution::task_execution::{
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::{
-    DispatchBudget, DispatchLane, OperationDispatchResult, WorkerReceiptOutcome,
+    DispatchBudget, DispatchLane, MonotonicInstant, OperationDispatchResult, WorkerReceiptOutcome,
 };
 use novarocks_types::identity::BackendProcessId;
 
@@ -93,6 +93,22 @@ impl OperationIntent {
         DispatchBudget::lane_of(self.kind())
     }
 
+    /// Whether this operation must retain progress when ordinary Native I/O
+    /// is saturated.
+    ///
+    /// Lifecycle operations and `CancelTask` consume the process transport's
+    /// control reserve even though they retain independent dispatcher lanes.
+    pub(crate) const fn requires_control_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::AcquireQueryContextAdmissionTicket(_)
+                | Self::UpdateQueryContext(_)
+                | Self::CancelTask(_)
+                | Self::AbortQueryContext(_)
+                | Self::ReleaseQueryContext(_)
+        )
+    }
+
     /// The backend process this request is addressed to.
     pub fn backend_process_id(&self) -> BackendProcessId {
         match self {
@@ -147,6 +163,16 @@ impl OperationIntent {
         };
         payload.saturating_add(OPERATION_FIXED_BYTES)
     }
+
+    /// The process reservation this exact operation needs before any owner
+    /// retains it as queued or in flight.
+    pub fn queue_request(&self) -> TaskOperationQueueRequest {
+        TaskOperationQueueRequest {
+            lane: self.lane(),
+            control_progress: self.requires_control_progress(),
+            queued_bytes: self.queued_bytes(),
+        }
+    }
 }
 
 fn task_domain_bytes(domain: &TaskDomainUpdate) -> usize {
@@ -162,6 +188,42 @@ fn context_domain_bytes(domain: &QueryContextDomainUpdate) -> usize {
         QueryContextDomainUpdate::CatalogBinding { payload, .. }
         | QueryContextDomainUpdate::SharedDynamicFilter { payload, .. } => payload.encoded_len(),
         QueryContextDomainUpdate::Credential(update) => update.material().encoded_len(),
+    }
+}
+
+/// One process-wide queue reservation request.
+///
+/// This deliberately carries no attempt-owned request. Producers can reserve
+/// capacity from a bounded description before they mutate a `RemoteTask` or a
+/// context owner, which makes process admission the first retention point.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaskOperationQueueRequest {
+    lane: DispatchLane,
+    control_progress: bool,
+    queued_bytes: usize,
+}
+
+impl TaskOperationQueueRequest {
+    /// The reservation for one task-domain update before it enters a
+    /// `RemoteTask`'s pending queue.
+    pub(crate) fn task_update(update: &TaskDomainUpdate) -> Self {
+        Self {
+            lane: DispatchLane::Update,
+            control_progress: false,
+            queued_bytes: task_domain_bytes(update).saturating_add(OPERATION_FIXED_BYTES),
+        }
+    }
+
+    pub const fn lane(self) -> DispatchLane {
+        self.lane
+    }
+
+    pub const fn requires_control_progress(self) -> bool {
+        self.control_progress
+    }
+
+    pub const fn queued_bytes(self) -> usize {
+        self.queued_bytes
     }
 }
 
@@ -301,26 +363,63 @@ impl OperationAcknowledgement {
 }
 
 /// One batch of intents the dispatcher released for one backend and lane.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DispatchBatch {
     backend: BackendProcessId,
     lane: DispatchLane,
     operations: Vec<OperationIntent>,
+    queue_permits: Vec<Box<dyn TaskOperationQueuePermit>>,
     queued_bytes: usize,
+    /// The oldest residence timestamp of any operation in this batch.
+    ///
+    /// A transport refusal restores every operation with this timestamp. That
+    /// is deliberately conservative: backpressure must not reset queue age
+    /// and let an operation evade the residence deadline indefinitely.
+    queued_at: MonotonicInstant,
 }
 
 impl DispatchBatch {
-    pub(super) const fn new(
+    #[cfg(test)]
+    pub(super) fn test_fixture(
         backend: BackendProcessId,
         lane: DispatchLane,
         operations: Vec<OperationIntent>,
         queued_bytes: usize,
     ) -> Self {
+        let queue_permits = operations
+            .iter()
+            .map(|_| Box::new(TestQueuePermit) as Box<dyn TaskOperationQueuePermit>)
+            .collect();
+        Self::with_queued_at(
+            backend,
+            lane,
+            operations,
+            queue_permits,
+            queued_bytes,
+            MonotonicInstant::ORIGIN,
+        )
+    }
+
+    pub(super) fn with_queued_at(
+        backend: BackendProcessId,
+        lane: DispatchLane,
+        operations: Vec<OperationIntent>,
+        queue_permits: Vec<Box<dyn TaskOperationQueuePermit>>,
+        queued_bytes: usize,
+        queued_at: MonotonicInstant,
+    ) -> Self {
+        assert_eq!(
+            operations.len(),
+            queue_permits.len(),
+            "every queued operation must retain one process reservation"
+        );
         Self {
             backend,
             lane,
             operations,
+            queue_permits,
             queued_bytes,
+            queued_at,
         }
     }
 
@@ -339,6 +438,96 @@ impl DispatchBatch {
     pub const fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }
+
+    pub(super) const fn queued_at(&self) -> MonotonicInstant {
+        self.queued_at
+    }
+
+    pub fn into_operations(self) -> Vec<OperationIntent> {
+        self.operations
+    }
+
+    pub(super) fn into_queue_parts(
+        self,
+    ) -> (Vec<OperationIntent>, Vec<Box<dyn TaskOperationQueuePermit>>) {
+        (self.operations, self.queue_permits)
+    }
+
+    /// Transfers every queue reservation into accepted Native I/O ownership.
+    pub(crate) fn commit_queue_permits(mut self) -> Vec<Box<dyn TaskOperationQueuePermit>> {
+        for permit in &mut self.queue_permits {
+            permit.mark_in_flight();
+        }
+        std::mem::take(&mut self.queue_permits)
+    }
+
+    pub(crate) fn acceptance(&self) -> DispatchAcceptance {
+        // This allocation is bounded by `TransportBudget::max_batch_items`.
+        // Every element already owns a process queue permit; the later
+        // encoding permit covers the potentially large protobuf request.
+        DispatchAcceptance {
+            backend: self.backend,
+            lane: self.lane,
+            operation_ids: self
+                .operations
+                .iter()
+                .map(OperationIntent::operation_id)
+                .collect(),
+        }
+    }
+}
+
+/// The immutable identity of a batch the transport accepted.
+///
+/// Payload ownership remains with the transport. The dispatcher needs only
+/// these ids to move its local permits from queued to in-flight after, and
+/// only after, acceptance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DispatchAcceptance {
+    pub(super) backend: BackendProcessId,
+    pub(super) lane: DispatchLane,
+    pub(super) operation_ids: Vec<TaskOperationId>,
+}
+
+/// The result of one non-blocking transport admission attempt.
+#[derive(Debug)]
+pub enum TaskOperationSubmit {
+    /// The transport owns the batch and will settle every operation.
+    Accepted,
+    /// No transport capacity was consumed; the caller still owns the exact
+    /// batch and may restore it without recreating any intent.
+    Backpressured(DispatchBatch),
+}
+
+/// One process-level reservation attached to an operation while it is queued.
+///
+/// The reservation moves with the exact operation through dequeue, transport
+/// backpressure and replay. Once the transport accepts the batch it becomes an
+/// in-flight reservation and remains held until that send settles or drops.
+pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
+    fn mark_in_flight(&mut self);
+}
+
+/// Result of reserving process capacity before an operation enters an attempt
+/// queue.
+#[derive(Debug)]
+pub enum TaskOperationQueueAdmission {
+    Admitted(Box<dyn TaskOperationQueuePermit>),
+    Backpressured,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestQueuePermit;
+
+#[cfg(test)]
+impl TaskOperationQueuePermit for TestQueuePermit {
+    fn mark_in_flight(&mut self) {}
+}
+
+#[cfg(test)]
+pub(super) fn test_queue_permit() -> Box<dyn TaskOperationQueuePermit> {
+    Box::new(TestQueuePermit)
 }
 
 /// The seam a later transport owner implements.
@@ -346,5 +535,7 @@ impl DispatchBatch {
 /// A submission must not block on a wire round trip: acknowledgements come
 /// back separately, which is what lets the frontend keep one serial runner.
 pub trait TaskOperationSink: std::fmt::Debug + Send + Sync {
-    fn submit(&self, batch: &DispatchBatch);
+    fn try_reserve_queue(&self, request: TaskOperationQueueRequest) -> TaskOperationQueueAdmission;
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit;
 }

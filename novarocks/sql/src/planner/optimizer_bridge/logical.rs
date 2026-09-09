@@ -656,7 +656,9 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 variant_columns: vec![],
-                mv_rewritten_from: Some("mv_t1".to_string()),
+                mv_rewritten_from: Some(crate::planner::payload::MvRewriteSelection::unverified(
+                    "mv_t1".to_string(),
+                )),
             }),
             vec![],
             None,

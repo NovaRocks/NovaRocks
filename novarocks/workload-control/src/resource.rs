@@ -62,6 +62,72 @@ pub struct ResourceSnapshot {
     pub control_reserved_bytes: u64,
     pub control_used_bytes: u64,
     pub peak_held_bytes: u64,
+    pub result_credit: ResultCreditSnapshot,
+}
+
+/// Current result-delivery holdings. These are a breakdown of the ordinary
+/// data reserved/used ledger, not an additional capacity authority.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResultCreditSnapshot {
+    pub reserved_before_fetch_bytes: u64,
+    pub in_flight_raw_bytes: u64,
+    pub raw_retained_bytes: u64,
+    /// Raw input plus its concurrently reserved decoded output.
+    pub decode_reserved_bytes: u64,
+    pub decoded_queued_bytes: u64,
+    /// Decoded input plus concurrently reserved protocol output.
+    pub protocol_reserved_bytes: u64,
+    pub protocol_writing_bytes: u64,
+}
+
+impl ResultCreditSnapshot {
+    pub fn held_bytes(&self) -> u64 {
+        self.reserved_before_fetch_bytes
+            + self.in_flight_raw_bytes
+            + self.raw_retained_bytes
+            + self.decode_reserved_bytes
+            + self.decoded_queued_bytes
+            + self.protocol_reserved_bytes
+            + self.protocol_writing_bytes
+    }
+
+    fn bytes(&self, stage: ResultCreditStage) -> u64 {
+        match stage {
+            ResultCreditStage::ReservedBeforeFetch => self.reserved_before_fetch_bytes,
+            ResultCreditStage::InFlightRaw => self.in_flight_raw_bytes,
+            ResultCreditStage::RawRetained => self.raw_retained_bytes,
+            ResultCreditStage::DecodeReserved => self.decode_reserved_bytes,
+            ResultCreditStage::DecodedQueued => self.decoded_queued_bytes,
+            ResultCreditStage::ProtocolReserved => self.protocol_reserved_bytes,
+            ResultCreditStage::ProtocolWriting => self.protocol_writing_bytes,
+            ResultCreditStage::Consumed => 0,
+        }
+    }
+
+    fn set_bytes(&mut self, stage: ResultCreditStage, bytes: u64) {
+        match stage {
+            ResultCreditStage::ReservedBeforeFetch => self.reserved_before_fetch_bytes = bytes,
+            ResultCreditStage::InFlightRaw => self.in_flight_raw_bytes = bytes,
+            ResultCreditStage::RawRetained => self.raw_retained_bytes = bytes,
+            ResultCreditStage::DecodeReserved => self.decode_reserved_bytes = bytes,
+            ResultCreditStage::DecodedQueued => self.decoded_queued_bytes = bytes,
+            ResultCreditStage::ProtocolReserved => self.protocol_reserved_bytes = bytes,
+            ResultCreditStage::ProtocolWriting => self.protocol_writing_bytes = bytes,
+            ResultCreditStage::Consumed => debug_assert_eq!(bytes, 0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultCreditStage {
+    ReservedBeforeFetch,
+    InFlightRaw,
+    RawRetained,
+    DecodeReserved,
+    DecodedQueued,
+    ProtocolReserved,
+    ProtocolWriting,
+    Consumed,
 }
 
 impl ResourceSnapshot {
@@ -201,7 +267,7 @@ impl LocalResourceAuthority {
         if bytes == 0 {
             return Err(WorkError::Capacity("zero-byte reservation"));
         }
-        self.inner.update_facts(|state| {
+        self.inner.update_facts_silent(|state| {
             check_capacity(state, &self.inner.resource_config, scope.id, bytes, class)?;
             let node = state.nodes.get_mut(&scope.id).unwrap();
             node.resource_holders = node
@@ -226,7 +292,68 @@ impl LocalResourceAuthority {
             control_reserved_bytes: state.control_reserved,
             control_used_bytes: state.control_used,
             peak_held_bytes: state.peak_held_bytes,
+            result_credit: state.result_credit,
         }
+    }
+
+    /// Reserve data capacity before asking a Worker for a result batch.
+    pub fn reserve_result_credit(
+        &self,
+        scope: &WorkScope,
+        bytes: u64,
+    ) -> Result<ResultCredit, WorkError> {
+        if !Arc::ptr_eq(&self.inner, &scope.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        if bytes == 0 {
+            return Err(WorkError::Capacity("zero-byte result credit"));
+        }
+        self.inner.update_facts_silent(|state| {
+            check_capacity(
+                state,
+                &self.inner.resource_config,
+                scope.id,
+                bytes,
+                ResourceClass::Data,
+            )?;
+            let node = state.nodes.get(&scope.id).unwrap();
+            let holders = node
+                .resource_holders
+                .checked_add(1)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            checked_result_stage_add(
+                state,
+                scope.id,
+                ResultCreditStage::ReservedBeforeFetch,
+                bytes,
+            )?;
+
+            state.nodes.get_mut(&scope.id).unwrap().resource_holders = holders;
+            reserve_bytes(state, scope.id, bytes, ResourceClass::Data);
+            add_result_stage(
+                state,
+                scope.id,
+                ResultCreditStage::ReservedBeforeFetch,
+                bytes,
+            );
+            Ok(ResultCredit {
+                scope: scope.clone(),
+                stage: ResultCreditStage::ReservedBeforeFetch,
+                primary_bytes: bytes,
+                secondary_bytes: 0,
+            })
+        })
+    }
+
+    /// Wait for a capacity-change hint. The caller must then retry the atomic
+    /// reservation because another scope may win the race.
+    pub async fn wait_for_result_credit(
+        &self,
+        scope: &WorkScope,
+        bytes: u64,
+    ) -> Result<(), WorkError> {
+        self.wait_for_capacity(scope, bytes, ResourceClass::Data)
+            .await
     }
 
     /// Wait for a capacity hint; callers retry reserve to acquire the capacity.
@@ -299,6 +426,486 @@ impl LocalResourceAuthority {
                 }
             }
         }
+    }
+}
+
+fn checked_result_stage_add(
+    state: &State,
+    id: WorkId,
+    stage: ResultCreditStage,
+    bytes: u64,
+) -> Result<(), WorkError> {
+    state
+        .result_credit
+        .bytes(stage)
+        .checked_add(bytes)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    state
+        .nodes
+        .get(&id)
+        .ok_or(WorkError::Released)?
+        .result_credit
+        .bytes(stage)
+        .checked_add(bytes)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    Ok(())
+}
+
+fn add_result_stage(state: &mut State, id: WorkId, stage: ResultCreditStage, bytes: u64) {
+    let process = state.result_credit.bytes(stage) + bytes;
+    state.result_credit.set_bytes(stage, process);
+    let scope = &mut state.nodes.get_mut(&id).unwrap().result_credit;
+    scope.set_bytes(stage, scope.bytes(stage) + bytes);
+}
+
+fn remove_result_stage(state: &mut State, id: WorkId, stage: ResultCreditStage, bytes: u64) {
+    state
+        .result_credit
+        .set_bytes(stage, state.result_credit.bytes(stage) - bytes);
+    let scope = &mut state.nodes.get_mut(&id).unwrap().result_credit;
+    scope.set_bytes(stage, scope.bytes(stage) - bytes);
+}
+
+/// Move-only ownership of one result batch's local memory budget. A failed
+/// transition consumes the token and its Drop returns all remaining capacity.
+pub struct ResultCredit {
+    scope: WorkScope,
+    stage: ResultCreditStage,
+    /// Reserved or retained bytes, depending on the current stage.
+    primary_bytes: u64,
+    /// Decoded-output reservation held concurrently with raw bytes.
+    secondary_bytes: u64,
+}
+
+/// A capacity or authority refusal that preserves the existing credit. The
+/// caller may wait and retry without dropping the still-accounted payload.
+pub struct ResultCreditReservationError {
+    error: WorkError,
+    credit: ResultCredit,
+}
+
+impl ResultCreditReservationError {
+    pub const fn error(&self) -> &WorkError {
+        &self.error
+    }
+
+    pub fn into_parts(self) -> (WorkError, ResultCredit) {
+        (self.error, self.credit)
+    }
+}
+
+impl std::fmt::Debug for ResultCreditReservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResultCreditReservationError")
+            .field("error", &self.error)
+            .field("stage", &self.credit.stage)
+            .finish()
+    }
+}
+
+impl ResultCredit {
+    pub fn stage(&self) -> ResultCreditStage {
+        self.stage
+    }
+
+    pub fn held_bytes(&self) -> u64 {
+        self.primary_bytes + self.secondary_bytes
+    }
+
+    fn require(
+        &self,
+        expected: ResultCreditStage,
+        requested: ResultCreditStage,
+    ) -> Result<(), WorkError> {
+        if self.stage != expected {
+            return Err(WorkError::InvalidResultCreditTransition {
+                from: self.stage,
+                requested,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn begin_fetch(mut self) -> Result<Self, WorkError> {
+        self.require(
+            ResultCreditStage::ReservedBeforeFetch,
+            ResultCreditStage::InFlightRaw,
+        )?;
+        self.scope.check()?;
+        self.move_stage(ResultCreditStage::InFlightRaw)?;
+        Ok(self)
+    }
+
+    /// Record the exact bytes returned by the Worker. Unused fetch capacity is
+    /// released only after the fetch completes.
+    pub fn retain_raw(mut self, actual_bytes: u64) -> Result<Self, WorkError> {
+        self.require(
+            ResultCreditStage::InFlightRaw,
+            ResultCreditStage::RawRetained,
+        )?;
+        if actual_bytes == 0 || actual_bytes > self.primary_bytes {
+            return Err(WorkError::Capacity("invalid raw result bytes"));
+        }
+        let reserved = self.primary_bytes;
+        self.scope.inner.update_facts_silent(|state| {
+            checked_result_stage_add(
+                state,
+                self.scope.id,
+                ResultCreditStage::RawRetained,
+                actual_bytes,
+            )?;
+            state
+                .data_used
+                .checked_add(actual_bytes)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            state
+                .nodes
+                .get(&self.scope.id)
+                .unwrap()
+                .used_bytes
+                .checked_add(actual_bytes)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+
+            remove_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::InFlightRaw,
+                reserved,
+            );
+            release_reserved(state, self.scope.id, reserved, ResourceClass::Data);
+            state.nodes.get_mut(&self.scope.id).unwrap().used_bytes += actual_bytes;
+            state.data_used += actual_bytes;
+            add_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::RawRetained,
+                actual_bytes,
+            );
+            Ok(())
+        })?;
+        if actual_bytes < reserved {
+            self.scope.inner.notify_capacity_available();
+        }
+        self.stage = ResultCreditStage::RawRetained;
+        self.primary_bytes = actual_bytes;
+        Ok(self)
+    }
+
+    /// Reserve decoded output while raw input remains retained. Requiring the
+    /// authority here prevents a foreign authority from growing the token.
+    pub fn reserve_decode(
+        mut self,
+        authority: &LocalResourceAuthority,
+        bytes: u64,
+    ) -> Result<Self, ResultCreditReservationError> {
+        if let Err(error) = self.require(
+            ResultCreditStage::RawRetained,
+            ResultCreditStage::DecodeReserved,
+        ) {
+            return Err(Self::reservation_error(error, self));
+        }
+        if !Arc::ptr_eq(&authority.inner, &self.scope.inner) {
+            return Err(Self::reservation_error(WorkError::ForeignAuthority, self));
+        }
+        if bytes == 0 {
+            return Err(Self::reservation_error(
+                WorkError::Capacity("zero-byte decode reservation"),
+                self,
+            ));
+        }
+        let Some(combined) = self.primary_bytes.checked_add(bytes) else {
+            return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
+        };
+        let result = self.scope.inner.update_facts_silent(|state| {
+            check_capacity(
+                state,
+                &self.scope.inner.resource_config,
+                self.scope.id,
+                bytes,
+                ResourceClass::Data,
+            )?;
+            checked_result_stage_add(
+                state,
+                self.scope.id,
+                ResultCreditStage::DecodeReserved,
+                combined,
+            )?;
+
+            remove_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::RawRetained,
+                self.primary_bytes,
+            );
+            reserve_bytes(state, self.scope.id, bytes, ResourceClass::Data);
+            add_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::DecodeReserved,
+                combined,
+            );
+            Ok(())
+        });
+        if let Err(error) = result {
+            return Err(Self::reservation_error(error, self));
+        }
+        self.stage = ResultCreditStage::DecodeReserved;
+        self.secondary_bytes = bytes;
+        Ok(self)
+    }
+
+    /// Publish decoded output and release its raw predecessor in one ledger
+    /// update.
+    pub fn queue_decoded(mut self, actual_bytes: u64) -> Result<Self, WorkError> {
+        self.require(
+            ResultCreditStage::DecodeReserved,
+            ResultCreditStage::DecodedQueued,
+        )?;
+        if actual_bytes == 0 || actual_bytes > self.secondary_bytes {
+            return Err(WorkError::Capacity("invalid decoded result bytes"));
+        }
+        let raw = self.primary_bytes;
+        let reserved = self.secondary_bytes;
+        let combined = raw + reserved;
+        self.scope.inner.update_facts_silent(|state| {
+            checked_result_stage_add(
+                state,
+                self.scope.id,
+                ResultCreditStage::DecodedQueued,
+                actual_bytes,
+            )?;
+            let next_process_used = state
+                .data_used
+                .checked_sub(raw)
+                .and_then(|used| used.checked_add(actual_bytes))
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            let node = state.nodes.get(&self.scope.id).unwrap();
+            let next_scope_used = node
+                .used_bytes
+                .checked_sub(raw)
+                .and_then(|used| used.checked_add(actual_bytes))
+                .ok_or(WorkError::ArithmeticOverflow)?;
+
+            remove_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::DecodeReserved,
+                combined,
+            );
+            release_reserved(state, self.scope.id, reserved, ResourceClass::Data);
+            state.nodes.get_mut(&self.scope.id).unwrap().used_bytes = next_scope_used;
+            state.data_used = next_process_used;
+            add_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::DecodedQueued,
+                actual_bytes,
+            );
+            Ok(())
+        })?;
+        self.scope.inner.notify_capacity_available();
+        self.stage = ResultCreditStage::DecodedQueued;
+        self.primary_bytes = actual_bytes;
+        self.secondary_bytes = 0;
+        Ok(self)
+    }
+
+    /// Reserve protocol output while the decoded batch remains live. The
+    /// adapter performs this before allocating an encoded packet or row buffer.
+    pub fn reserve_protocol(
+        mut self,
+        authority: &LocalResourceAuthority,
+        bytes: u64,
+    ) -> Result<Self, ResultCreditReservationError> {
+        if let Err(error) = self.require(
+            ResultCreditStage::DecodedQueued,
+            ResultCreditStage::ProtocolReserved,
+        ) {
+            return Err(Self::reservation_error(error, self));
+        }
+        if let Err(error) = self.scope.check() {
+            return Err(Self::reservation_error(error, self));
+        }
+        if !Arc::ptr_eq(&authority.inner, &self.scope.inner) {
+            return Err(Self::reservation_error(WorkError::ForeignAuthority, self));
+        }
+        if bytes == 0 {
+            return Err(Self::reservation_error(
+                WorkError::Capacity("zero-byte protocol reservation"),
+                self,
+            ));
+        }
+        let Some(combined) = self.primary_bytes.checked_add(bytes) else {
+            return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
+        };
+        let result = self.scope.inner.update_facts_silent(|state| {
+            check_capacity(
+                state,
+                &self.scope.inner.resource_config,
+                self.scope.id,
+                bytes,
+                ResourceClass::Data,
+            )?;
+            checked_result_stage_add(
+                state,
+                self.scope.id,
+                ResultCreditStage::ProtocolReserved,
+                combined,
+            )?;
+            remove_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::DecodedQueued,
+                self.primary_bytes,
+            );
+            reserve_bytes(state, self.scope.id, bytes, ResourceClass::Data);
+            add_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::ProtocolReserved,
+                combined,
+            );
+            Ok(())
+        });
+        if let Err(error) = result {
+            return Err(Self::reservation_error(error, self));
+        }
+        self.stage = ResultCreditStage::ProtocolReserved;
+        self.secondary_bytes = bytes;
+        Ok(self)
+    }
+
+    /// Convert the protocol reservation to its retained bytes without
+    /// releasing the decoded batch that the writer may still reference.
+    pub fn begin_protocol_write(mut self, actual_bytes: u64) -> Result<Self, WorkError> {
+        self.require(
+            ResultCreditStage::ProtocolReserved,
+            ResultCreditStage::ProtocolWriting,
+        )?;
+        self.scope.check()?;
+        if actual_bytes == 0 || actual_bytes > self.secondary_bytes {
+            return Err(WorkError::Capacity("invalid protocol result bytes"));
+        }
+        let decoded = self.primary_bytes;
+        let reserved = self.secondary_bytes;
+        let retained = decoded
+            .checked_add(actual_bytes)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        self.scope.inner.update_facts_silent(|state| {
+            checked_result_stage_add(
+                state,
+                self.scope.id,
+                ResultCreditStage::ProtocolWriting,
+                retained,
+            )?;
+            let next_process_used = state
+                .data_used
+                .checked_add(actual_bytes)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            let next_scope_used = state
+                .nodes
+                .get(&self.scope.id)
+                .ok_or(WorkError::Released)?
+                .used_bytes
+                .checked_add(actual_bytes)
+                .ok_or(WorkError::ArithmeticOverflow)?;
+            remove_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::ProtocolReserved,
+                decoded + reserved,
+            );
+            release_reserved(state, self.scope.id, reserved, ResourceClass::Data);
+            state.nodes.get_mut(&self.scope.id).unwrap().used_bytes = next_scope_used;
+            state.data_used = next_process_used;
+            add_result_stage(
+                state,
+                self.scope.id,
+                ResultCreditStage::ProtocolWriting,
+                retained,
+            );
+            Ok(())
+        })?;
+        if actual_bytes < reserved {
+            self.scope.inner.notify_capacity_available();
+        }
+        self.stage = ResultCreditStage::ProtocolWriting;
+        self.secondary_bytes = actual_bytes;
+        Ok(self)
+    }
+
+    /// The protocol owner calls this only after actual consumer acceptance.
+    pub fn consume(mut self) -> Result<(), WorkError> {
+        self.require(
+            ResultCreditStage::ProtocolWriting,
+            ResultCreditStage::Consumed,
+        )?;
+        self.release_current();
+        self.stage = ResultCreditStage::Consumed;
+        Ok(())
+    }
+
+    fn move_stage(&mut self, next: ResultCreditStage) -> Result<(), WorkError> {
+        let bytes = self.held_bytes();
+        self.scope.inner.update_facts_silent(|state| {
+            checked_result_stage_add(state, self.scope.id, next, bytes)?;
+            remove_result_stage(state, self.scope.id, self.stage, bytes);
+            add_result_stage(state, self.scope.id, next, bytes);
+            Ok(())
+        })?;
+        self.stage = next;
+        Ok(())
+    }
+
+    fn reservation_error(error: WorkError, credit: Self) -> ResultCreditReservationError {
+        ResultCreditReservationError { error, credit }
+    }
+
+    fn release_current(&mut self) {
+        if self.stage == ResultCreditStage::Consumed {
+            return;
+        }
+        let stage = self.stage;
+        let primary = self.primary_bytes;
+        let secondary = self.secondary_bytes;
+        self.scope.inner.update_facts_silent(|state| {
+            remove_result_stage(state, self.scope.id, stage, primary + secondary);
+            match stage {
+                ResultCreditStage::ReservedBeforeFetch | ResultCreditStage::InFlightRaw => {
+                    release_reserved(state, self.scope.id, primary, ResourceClass::Data);
+                }
+                ResultCreditStage::RawRetained | ResultCreditStage::DecodedQueued => {
+                    state.nodes.get_mut(&self.scope.id).unwrap().used_bytes -= primary;
+                    state.data_used -= primary;
+                }
+                ResultCreditStage::DecodeReserved | ResultCreditStage::ProtocolReserved => {
+                    release_reserved(state, self.scope.id, secondary, ResourceClass::Data);
+                    state.nodes.get_mut(&self.scope.id).unwrap().used_bytes -= primary;
+                    state.data_used -= primary;
+                }
+                ResultCreditStage::ProtocolWriting => {
+                    state.nodes.get_mut(&self.scope.id).unwrap().used_bytes -= primary + secondary;
+                    state.data_used -= primary + secondary;
+                }
+                ResultCreditStage::Consumed => unreachable!(),
+            }
+            state
+                .nodes
+                .get_mut(&self.scope.id)
+                .unwrap()
+                .resource_holders -= 1;
+            state.collect(self.scope.id);
+        });
+        self.scope.inner.notify_capacity_available();
+        self.primary_bytes = 0;
+        self.secondary_bytes = 0;
+    }
+}
+
+impl Drop for ResultCredit {
+    fn drop(&mut self) {
+        self.release_current();
     }
 }
 

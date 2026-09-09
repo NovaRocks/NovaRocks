@@ -23,7 +23,13 @@
 //! physical planner tree to Core: callers retain only an opaque scan program
 //! until a SQL-owned terminal-planning entry consumes it.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use arrow::datatypes::SchemaRef;
 
@@ -32,6 +38,8 @@ use crate::binding::SqlTableBindingId;
 use crate::catalog::ResolvedAnalyzerTable;
 use crate::column_id::ColumnRefFactory;
 use crate::plan_read::{BoundaryContract, DistributedPlan, FragmentId, PlanScanNode};
+pub use crate::planner::payload::SqlScanOccurrence;
+use crate::planner::payload::{MvRewriteInputSelection, MvRewriteSelection};
 use novarocks_spi::connector::ConnectorReadPurpose;
 
 mod pruning;
@@ -90,6 +98,275 @@ pub fn project_execution_preparation_facts(plan: &DistributedPlan) -> SqlExecuti
         producer_fragment_ids: topology.producer_fragment_ids().to_vec(),
         boundary_contracts: plan.boundaries().contracts().to_vec(),
     }
+}
+
+/// Validate a Connector negotiation result against the exact sealed scan it
+/// describes. Query preparation uses this to seal residual responsibility
+/// without exposing or reconstructing the planner tree.
+pub fn scan_predicate_count(plan: &DistributedPlan, node_id: i32) -> Result<usize, String> {
+    fn find(node: &crate::plan_read::DistributedNode, node_id: i32) -> Option<usize> {
+        if node.node_id == node_id {
+            return match &node.payload {
+                crate::plan_read::DistributedNodeKind::Scan(scan) => Some(scan.predicates.len()),
+                _ => None,
+            };
+        }
+        node.children.iter().find_map(|child| find(child, node_id))
+    }
+
+    let mut found = plan
+        .fragments()
+        .iter()
+        .filter_map(|fragment| find(&fragment.root, node_id));
+    let count = found
+        .next()
+        .ok_or_else(|| format!("sealed distributed plan has no scan node {node_id}"))?;
+    if found.next().is_some() {
+        return Err(format!(
+            "sealed distributed plan repeats scan node {node_id}"
+        ));
+    }
+    Ok(count)
+}
+
+/// Typed SQL facts that preparation must cover for one sealed scan.
+///
+/// The application uses this projection to prove that bindings and Connector
+/// negotiation outcomes form a complete, exact cover of the plan. It exposes
+/// no provider handle or executable callback.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SealedPreparationPlanId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SealedScanIdentity {
+    plan: SealedPreparationPlanId,
+    node_id: i32,
+}
+
+impl SealedScanIdentity {
+    pub const fn node_id(self) -> i32 {
+        self.node_id
+    }
+
+    pub const fn plan(self) -> SealedPreparationPlanId {
+        self.plan
+    }
+}
+
+/// Query-local seal around one immutable distributed plan.
+///
+/// The opaque seal distinguishes two independently prepared queries even when
+/// their node ids and scan shapes are identical. Clones retain the same seal so
+/// observation, Connector negotiation, and final freezing can compare exact
+/// scan occurrences without exposing a forgeable numeric occurrence id.
+#[derive(Clone, Debug)]
+pub struct SealedPreparationPlan {
+    id: SealedPreparationPlanId,
+    plan: Arc<DistributedPlan>,
+}
+
+impl SealedPreparationPlan {
+    pub fn seal(plan: DistributedPlan) -> Self {
+        static NEXT_PLAN_SEAL: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_PLAN_SEAL.fetch_add(1, Ordering::Relaxed);
+        assert!(id != 0, "sealed preparation plan identity exhausted");
+        Self {
+            id: SealedPreparationPlanId(id),
+            plan: Arc::new(plan),
+        }
+    }
+
+    pub const fn id(&self) -> SealedPreparationPlanId {
+        self.id
+    }
+
+    pub fn plan(&self) -> &DistributedPlan {
+        &self.plan
+    }
+
+    pub fn scan_contracts(&self) -> Result<Vec<SealedScanContract>, String> {
+        sealed_scan_contracts(self)
+    }
+
+    pub fn scan_contract(&self, node_id: i32) -> Result<SealedScanContract, String> {
+        self.scan_contracts()?
+            .into_iter()
+            .find(|scan| scan.node_id() == node_id)
+            .ok_or_else(|| format!("sealed distributed plan has no scan node {node_id}"))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SealedScanContract {
+    identity: SealedScanIdentity,
+    node_id: i32,
+    binding: SqlTableBindingId,
+    sql_occurrence: SqlScanOccurrence,
+    catalog: String,
+    namespace: String,
+    table: String,
+    predicates: usize,
+    projected_columns: Vec<OutputColumn>,
+    offered_limit: bool,
+    mv_rewritten_from: Option<MvRewriteSelection>,
+}
+
+fn sealed_scan_contract(
+    plan: SealedPreparationPlanId,
+    node_id: i32,
+    scan: &PlanScanNode,
+    offered_limit: bool,
+) -> SealedScanContract {
+    let facts = scan_preparation_facts(scan);
+    let sql_occurrence = SqlScanOccurrence::from_scan(facts.binding(), &scan.columns)
+        .expect("sealed SQL scan must retain at least one non-sentinel output column");
+    SealedScanContract {
+        identity: SealedScanIdentity { plan, node_id },
+        node_id,
+        binding: facts.binding(),
+        sql_occurrence,
+        catalog: facts.identity().catalog().to_string(),
+        namespace: facts.identity().namespace().to_string(),
+        table: facts.identity().table().to_string(),
+        predicates: scan.predicates.len(),
+        projected_columns: scan.columns.clone(),
+        offered_limit,
+        mv_rewritten_from: scan.mv_rewritten_from.clone(),
+    }
+}
+
+impl SealedScanContract {
+    pub const fn identity(&self) -> SealedScanIdentity {
+        self.identity
+    }
+
+    pub const fn node_id(&self) -> i32 {
+        self.node_id
+    }
+
+    pub const fn predicate_count(&self) -> usize {
+        self.predicates
+    }
+
+    pub const fn binding(&self) -> SqlTableBindingId {
+        self.binding
+    }
+
+    pub const fn sql_occurrence(&self) -> SqlScanOccurrence {
+        self.sql_occurrence
+    }
+
+    pub fn catalog(&self) -> &str {
+        &self.catalog
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    pub fn projected_columns(&self) -> &[OutputColumn] {
+        &self.projected_columns
+    }
+
+    pub const fn offered_limit(&self) -> bool {
+        self.offered_limit
+    }
+
+    /// Return the optimizer-emitted MV rewrite marker for this exact final
+    /// scan. The marker is useful only together with this scan's opaque plan
+    /// identity; its text alone is not rewrite evidence.
+    pub fn mv_rewrite_action(&self) -> Option<SealedMvRewriteAction> {
+        self.mv_rewritten_from.as_ref().and_then(|selection| {
+            Some(SealedMvRewriteAction {
+                target: self.identity,
+                source: selection.name().to_string(),
+                publication_id: selection.publication_id()?,
+                definition_fingerprint: selection.definition_fingerprint()?,
+                input_mapping: selection.input_mapping().to_vec(),
+            })
+        })
+    }
+
+    pub const fn was_mv_rewritten(&self) -> bool {
+        self.mv_rewritten_from.is_some()
+    }
+}
+
+/// SQL-owned marker projected from an actual scan in the final optimizer
+/// output. Construction is private so application code cannot attach an MV
+/// rewrite marker to an arbitrary node or plan seal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedMvRewriteAction {
+    target: SealedScanIdentity,
+    source: String,
+    publication_id: [u8; 16],
+    definition_fingerprint: [u8; 32],
+    input_mapping: Vec<MvRewriteInputSelection>,
+}
+
+impl SealedMvRewriteAction {
+    pub const fn target(&self) -> SealedScanIdentity {
+        self.target
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub const fn publication_id(&self) -> [u8; 16] {
+        self.publication_id
+    }
+
+    pub const fn definition_fingerprint(&self) -> [u8; 32] {
+        self.definition_fingerprint
+    }
+
+    pub fn input_mapping(&self) -> &[MvRewriteInputSelection] {
+        &self.input_mapping
+    }
+}
+
+/// Enumerate every scan occurrence exactly once in sealed plan order.
+pub fn sealed_scan_contracts(
+    plan: &SealedPreparationPlan,
+) -> Result<Vec<SealedScanContract>, String> {
+    fn collect(
+        plan: SealedPreparationPlanId,
+        node: &crate::plan_read::DistributedNode,
+        output: &mut Vec<SealedScanContract>,
+    ) {
+        if let crate::plan_read::DistributedNodeKind::Scan(scan) = &node.payload {
+            output.push(sealed_scan_contract(
+                plan,
+                node.node_id,
+                scan,
+                node.limit >= 0,
+            ));
+        }
+        for child in &node.children {
+            collect(plan, child, output);
+        }
+    }
+
+    let mut output = Vec::new();
+    for fragment in plan.plan().fragments() {
+        collect(plan.id(), &fragment.root, &mut output);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(duplicate) = output
+        .iter()
+        .map(SealedScanContract::node_id)
+        .find(|node_id| !seen.insert(*node_id))
+    {
+        return Err(format!(
+            "sealed distributed plan repeats scan node {duplicate}"
+        ));
+    }
+    Ok(output)
 }
 
 /// Immutable SQL identity for a synthetic, application-admitted connector

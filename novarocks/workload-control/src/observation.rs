@@ -81,6 +81,7 @@ pub struct ScopeSnapshot {
     pub restarts: usize,
     pub reserved_bytes: u64,
     pub used_bytes: u64,
+    pub result_credit: crate::ResultCreditSnapshot,
     pub resource_holders: usize,
     pub resource_waiters: usize,
     pub obligations: Vec<ObligationSnapshot>,
@@ -179,6 +180,7 @@ impl WorkloadControl {
                     restarts: node.restarts,
                     reserved_bytes: node.reserved_bytes,
                     used_bytes: node.used_bytes,
+                    result_credit: node.result_credit,
                     resource_holders: node.resource_holders,
                     resource_waiters: node.resource_waiters,
                     obligations: node

@@ -103,6 +103,39 @@ impl fmt::Display for MaxWaitError {
 
 impl std::error::Error for MaxWaitError {}
 
+/// Why a requested result payload byte limit is not representable.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ResultByteLimitError;
+
+impl fmt::Display for ResultByteLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("max_result_bytes must be greater than zero")
+    }
+}
+
+impl std::error::Error for ResultByteLimitError {}
+
+/// Positive payload bytes one root-result poll is willing to receive.
+///
+/// This value is transport-neutral. A concrete transport may impose a lower
+/// ceiling to leave room for its response envelope and framing.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ResultByteLimit(u64);
+
+impl ResultByteLimit {
+    pub const fn new(value: u64) -> Result<Self, ResultByteLimitError> {
+        if value == 0 {
+            Err(ResultByteLimitError)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Zero-based sequence of one root result packet.
 ///
 /// Acknowledgements use this type so the absence of an acknowledgement stays
@@ -1202,7 +1235,7 @@ impl GetFinalTaskInfo {
 mod tests {
     use super::{
         MaxWait, MaxWaitError, OperationEnvelope, OperationKind, PlanNodeSplitReceipt,
-        TaskDomainReceipt,
+        ResultByteLimit, ResultByteLimitError, TaskDomainReceipt,
     };
     use crate::TaskOperationId;
     use crate::{DomainProgression, PlanNodeId, SplitSequence, SplitWatermark, TaskDomainKind};
@@ -1217,6 +1250,13 @@ mod tests {
         assert_eq!(envelope.kind(), OperationKind::CancelTask);
         assert_eq!(envelope.max_wait().get(), Duration::from_secs(5));
         assert_eq!(MaxWait::new(Duration::ZERO), Err(MaxWaitError::Zero));
+        assert_eq!(ResultByteLimit::new(0), Err(ResultByteLimitError));
+        assert_eq!(
+            ResultByteLimit::new(17)
+                .expect("positive result byte limit")
+                .get(),
+            17
+        );
     }
 
     #[test]

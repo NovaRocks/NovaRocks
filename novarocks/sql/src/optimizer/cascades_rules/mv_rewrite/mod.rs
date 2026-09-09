@@ -26,6 +26,7 @@ pub(crate) mod descriptor;
 pub(crate) mod predicate_split;
 pub(crate) mod rule;
 
+use crate::compiler::SqlMvRewriteSelectionFacts;
 use crate::optimizer::scalar::ScalarArena;
 use crate::optimizer::stats_input::StatsRef;
 use crate::planner::table::TableDef;
@@ -52,4 +53,5 @@ pub(crate) struct MvRewriteCandidate {
     pub target_table: TableDef,
     /// Query-scoped statistics ref for the MV target scan injected by the rule.
     pub target_stats_ref: StatsRef,
+    pub selection: Option<SqlMvRewriteSelectionFacts>,
 }

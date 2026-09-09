@@ -61,7 +61,8 @@ use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
 
-const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const GRPC_MAX_MESSAGE_BYTES: usize =
+    novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
 
 /// What a rejected catalog prune is allowed to say on the wire.
 ///

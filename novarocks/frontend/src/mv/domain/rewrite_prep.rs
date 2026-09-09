@@ -28,6 +28,7 @@ use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
     MvRewriteDefinitionIndex, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
+    SqlMvRewriteSelectionFacts,
 };
 
 /// Freeze rewrite candidates from the caller's leaf ports.  The frozen index
@@ -57,6 +58,8 @@ fn freeze_mv_rewrite_definition(
     storage_observation: &dyn MvStorageObservationPort,
     definition: crate::mv::domain::persistence::definition::StoredMvDefinition,
 ) -> Result<SqlMvRewriteDefinitionFacts, String> {
+    let selection =
+        freeze_mv_rewrite_selection(connector_control, storage_observation, &definition).ok();
     let mut base_table_states = std::collections::BTreeMap::new();
     if definition.storage_engine == "iceberg" {
         for fqn in &definition.base_table_refs {
@@ -66,7 +69,7 @@ fn freeze_mv_rewrite_definition(
         }
     }
 
-    SqlMvRewriteDefinitionFacts::try_new(
+    let facts = SqlMvRewriteDefinitionFacts::try_new(
         definition.mv_id,
         parse_mv_select_query(&definition.query_definition.raw_query_source)?,
         definition.base_table_refs,
@@ -77,6 +80,72 @@ fn freeze_mv_rewrite_definition(
         definition.last_refresh_snapshots,
         definition.last_refresh_table_object_ids,
         base_table_states,
+    )?;
+    Ok(match selection {
+        Some(selection) => facts.with_selection_facts(selection),
+        None => facts,
+    })
+}
+
+fn freeze_mv_rewrite_selection(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    storage_observation: &dyn MvStorageObservationPort,
+    definition: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+) -> Result<SqlMvRewriteSelectionFacts, String> {
+    let (Some(catalog), Some(namespace), Some(table)) = (
+        definition.target_catalog.as_deref(),
+        definition.target_namespace.as_deref(),
+        definition.target_table.as_deref(),
+    ) else {
+        return Err("MV rewrite target identity is incomplete".to_string());
+    };
+    let context = crate::connector::connector_request_context(
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
+    let lease = crate::connector::acquire_metadata_planning_lease(connector_control, catalog)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &lease,
+        context.clone(),
+        namespace,
+        table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?;
+    let package = storage_observation
+        .observe_lake_package(&lease, &metadata, context)
+        .map_err(|error| format!("observe MV rewrite publication: {error}"))?
+        .ok_or_else(|| "MV rewrite target has no lake publication package".to_string())?;
+    let novarocks_spi::connector::MvLakePublicationObservation::Published(publication) =
+        package.publication()
+    else {
+        return Err("MV rewrite target has no published version".to_string());
+    };
+    if package
+        .current_target_snapshot()
+        .map(|snapshot| snapshot.snapshot_id())
+        != Some(publication.target_snapshot_id)
+    {
+        return Err("MV rewrite publication is not the current target snapshot".to_string());
+    }
+    let expected_fingerprint = crate::mv::domain::refresh::definition::mv_definition_fingerprint(
+        &definition.query_definition.raw_query_source,
+    );
+    if publication.definition_fingerprint != expected_fingerprint {
+        return Err("MV rewrite publication definition fingerprint is stale".to_string());
+    }
+    let fingerprint = hex::decode(&publication.definition_fingerprint)
+        .map_err(|error| format!("decode MV rewrite definition fingerprint: {error}"))?;
+    let fingerprint: [u8; 32] = fingerprint
+        .try_into()
+        .map_err(|_| "MV rewrite definition fingerprint must be 32 bytes".to_string())?;
+    SqlMvRewriteSelectionFacts::try_new(
+        *publication.publication_id.as_uuid().as_bytes(),
+        fingerprint,
+        publication
+            .bases
+            .iter()
+            .map(|base| base.table_fqn.clone())
+            .collect(),
     )
 }
 

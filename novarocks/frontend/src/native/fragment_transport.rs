@@ -33,13 +33,14 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::domain::DomainVersion;
 use novarocks_execution::task_execution::operation::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
-    FinalTaskInfo, MaxWait, OperationOutcome, ResultPacketSequence, TaskIdentity, TaskOperationId,
+    FinalTaskInfo, MaxWait, OperationOutcome, ResultByteLimit, ResultPacketSequence, TaskIdentity,
+    TaskOperationId,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
 use novarocks_task_codec::operation::{
-    decode_operation_outcome, encode_fetch_dynamic_filters, encode_fetch_task_result,
-    encode_get_final_task_info,
+    MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES, decode_operation_outcome, encode_fetch_dynamic_filters,
+    encode_fetch_task_result, encode_get_final_task_info,
 };
 use novarocks_task_codec::status::decode_final_task_info;
 use novarocks_types::UniqueId;
@@ -315,6 +316,7 @@ pub trait TaskResultTransport: Send + Sync + 'static {
         root_task: TaskIdentity,
         max_wait: MaxWait,
         acknowledged: Option<ResultPacketSequence>,
+        max_result_bytes: ResultByteLimit,
         expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
     ) -> Result<RootResultOutcome, String>;
 
@@ -401,10 +403,12 @@ impl TaskResultTransport for NativeTaskResultTransport {
         root_task: TaskIdentity,
         max_wait: MaxWait,
         acknowledged: Option<ResultPacketSequence>,
+        max_result_bytes: ResultByteLimit,
         expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
     ) -> Result<RootResultOutcome, String> {
         let (client, address) = self.client_of(root_task)?;
-        let request = encode_fetch_task_result(root_task, max_wait, acknowledged);
+        validate_native_result_byte_limit(max_result_bytes)?;
+        let request = encode_fetch_task_result(root_task, max_wait, acknowledged, max_result_bytes);
         let wait = max_wait.get();
         let deadline = self.grace.deadline_for(wait);
         let response = self.data_runtime.block_on(async {
@@ -432,6 +436,7 @@ impl TaskResultTransport for NativeTaskResultTransport {
                 .map(tonic::Response::into_inner)
                 .map_err(|error| format!("fetch_task_result rpc failed: {error}"))
         })??;
+        validate_result_payload_size(&address, response.result_arrow_ipc.len(), max_result_bytes)?;
         let status = FetchStatus::try_from(response.status).map_err(|_| {
             format!(
                 "{address}: root result poll returned unknown status {}",
@@ -616,6 +621,36 @@ impl TaskResultTransport for NativeTaskResultTransport {
     }
 }
 
+fn validate_native_result_byte_limit(limit: ResultByteLimit) -> Result<(), String> {
+    if limit.get() > MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES {
+        return Err(format!(
+            "root result byte limit {} exceeds the Native payload limit {}",
+            limit.get(),
+            MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_result_payload_size(
+    address: &str,
+    payload_bytes: usize,
+    limit: ResultByteLimit,
+) -> Result<(), String> {
+    let payload_bytes = u64::try_from(payload_bytes)
+        .map_err(|_| format!("{address}: root result payload length is not representable"))?;
+    if payload_bytes > limit.get() {
+        // Tonic has already applied the process-wide 64 MiB decoded-message
+        // ceiling. This check prevents Arrow decode and enforces the request
+        // credit, but it is not a per-request allocation reserve.
+        return Err(format!(
+            "{address}: root result payload has {payload_bytes} bytes, exceeding the requested limit {}",
+            limit.get()
+        ));
+    }
+    Ok(())
+}
+
 /// Classifies one dynamic filter read failure by type.
 ///
 /// A status that leaves the read unfinished is `Unavailable`, and the next turn
@@ -638,7 +673,12 @@ fn classify_dynamic_filter_status(address: &str, status: &tonic::Status) -> Dyna
 
 #[cfg(test)]
 mod tests {
-    use super::decode_fetched_query_batch;
+    use novarocks_execution::task_execution::ResultByteLimit;
+    use novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
+
+    use super::{
+        decode_fetched_query_batch, validate_native_result_byte_limit, validate_result_payload_size,
+    };
 
     #[test]
     fn opaque_fetch_decode_requires_exactly_one_chunk() {
@@ -646,5 +686,20 @@ mod tests {
             panic!("empty payload is not a batch");
         };
         assert_eq!(error, "typed root result decoded 0 chunks, expected 1");
+    }
+
+    #[test]
+    fn native_result_limit_must_fit_the_global_decode_envelope() {
+        let limit = ResultByteLimit::new(MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES + 1)
+            .expect("the oversized limit is still positive");
+        assert!(validate_native_result_byte_limit(limit).is_err());
+    }
+
+    #[test]
+    fn response_payload_is_checked_before_arrow_decode() {
+        let limit = ResultByteLimit::new(3).expect("positive limit");
+        let error = validate_result_payload_size("backend", 4, limit)
+            .expect_err("the payload exceeds its request credit");
+        assert!(error.contains("exceeding the requested limit 3"));
     }
 }

@@ -36,6 +36,9 @@ use crate::query_execution::preparation::scan::{
     ResolvedScanColumn, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use crate::query_execution::preparation::typed_scan::{TypedRelationFreeze, prepare_typed_scan};
+use novarocks_query_application::observation::{
+    PreparationBudget, PreparationByteLimits, PreparationCountLimits, PreparationLimits,
+};
 use novarocks_spi::connector::read_stack::{
     ConnectorReadChangeWindow, ConnectorReadFrozenRewriteGroup, ConnectorReadRelationKind,
     ConnectorReadRelationVersion, ConnectorReadTableExecuteProcedure, ConnectorSession,
@@ -45,8 +48,8 @@ use novarocks_spi::connector::{CatalogProperties, ConnectorReadSelector};
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId};
 use novarocks_sql::planning::query_execution::{
-    SqlRuntimeFilterSourceScanRequest, SqlScanPreparationCategory, SqlScanPreparationFacts,
-    scan_preparation_facts,
+    SealedPreparationPlan, SqlRuntimeFilterSourceScanRequest, SqlScanPreparationCategory,
+    SqlScanPreparationFacts, scan_preparation_facts,
 };
 
 mod projection;
@@ -104,6 +107,11 @@ pub(crate) struct ScanPreparationOptions {
     /// composition root has not threaded it through this call path; a scan
     /// that needs it then fails closed rather than reaching a fallback.
     typed: Option<TypedScanPreparation>,
+    /// One statement-wide budget shared by every Connector planning call.
+    /// It is attached only inside `prepare_scan_bindings`, from the admitted
+    /// request deadline, so construction sites cannot accidentally create an
+    /// independent per-scan allowance.
+    preparation_budget: Option<PreparationBudget>,
 }
 
 impl ScanPreparationOptions {
@@ -117,6 +125,7 @@ impl ScanPreparationOptions {
             connector_target_parallelism,
             connector_max_split_bytes,
             typed: None,
+            preparation_budget: None,
         }
     }
 
@@ -134,6 +143,18 @@ impl ScanPreparationOptions {
         self.typed.as_ref().ok_or_else(|| {
             "typed connector scan preparation requires the statement's typed control registry \
              and connector session; neither has a default"
+                .to_string()
+        })
+    }
+
+    fn with_preparation_budget(mut self, budget: PreparationBudget) -> Self {
+        self.preparation_budget = Some(budget);
+        self
+    }
+
+    fn preparation_budget(&self) -> Result<&PreparationBudget, String> {
+        self.preparation_budget.as_ref().ok_or_else(|| {
+            "typed connector scan preparation requires one statement-wide preparation budget"
                 .to_string()
         })
     }
@@ -158,7 +179,35 @@ pub(super) fn prepare_scan_bindings(
     options: &ScanPreparationOptions,
     runtime_filter_scans: &[SqlRuntimeFilterSourceScanRequest],
 ) -> Result<ScanExecutionBindings, String> {
-    let mut bindings = ScanExecutionBindings::default();
+    // This legacy synchronous path can only account for responses after each
+    // Connector call returns. These weights bound retained preparation facts
+    // and diagnostics; they are not a memory reservation or a process hard
+    // limit. The generic PreparationDriver acquires the statement WorkScope,
+    // while the production cutover must move this adapter under that driver.
+    let limits = PreparationLimits::new(
+        PreparationCountLimits::new(
+            std::num::NonZeroU32::new(64).expect("preparation rounds are non-zero"),
+            std::num::NonZeroUsize::new(1024).expect("observation limit is non-zero"),
+            std::num::NonZeroUsize::new(1024).expect("negotiation limit is non-zero"),
+            std::num::NonZeroUsize::new(1024).expect("diagnostic limit is non-zero"),
+        ),
+        PreparationByteLimits::new(
+            std::num::NonZeroUsize::new(256 * 1024)
+                .expect("preparation response accounting weight is non-zero"),
+            std::num::NonZeroUsize::new(4096).expect("preparation diagnostic limit is non-zero"),
+            std::num::NonZeroUsize::new(256 * 1024 * 1024)
+                .expect("preparation observed-byte accounting ceiling is non-zero"),
+        ),
+        context.deadline(),
+    );
+    let options = options
+        .clone()
+        .with_preparation_budget(PreparationBudget::new(limits));
+    if let Some(store) = query_table_bindings {
+        store.seal_for_topology_replan();
+    }
+    let sealed_plan = SealedPreparationPlan::seal(plan.clone());
+    let mut bindings = ScanExecutionBindings::for_sealed_plan(sealed_plan.clone());
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
     for fragment in plan.fragments() {
         collect_scan_bindings(
@@ -168,7 +217,8 @@ pub(super) fn prepare_scan_bindings(
             context,
             query_table_bindings,
             resolver,
-            options,
+            &options,
+            &sealed_plan,
             runtime_filter_scans,
             &mut seen_scan_node_ids,
             &mut bindings,
@@ -193,6 +243,7 @@ fn collect_scan_bindings(
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
     options: &ScanPreparationOptions,
+    sealed_plan: &SealedPreparationPlan,
     runtime_filter_scans: &[SqlRuntimeFilterSourceScanRequest],
     seen_scan_node_ids: &mut std::collections::BTreeSet<i32>,
     bindings: &mut ScanExecutionBindings,
@@ -210,6 +261,7 @@ fn collect_scan_bindings(
             query_table_bindings,
             resolver,
             options,
+            sealed_plan,
             runtime_filter_scans,
             bindings,
         )?;
@@ -224,6 +276,7 @@ fn collect_scan_bindings(
                 query_table_bindings,
                 resolver,
                 options,
+                sealed_plan,
                 runtime_filter_scans,
                 seen_scan_node_ids,
                 bindings,
@@ -246,10 +299,12 @@ fn prepare_scan_node(
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
     options: &ScanPreparationOptions,
+    sealed_plan: &SealedPreparationPlan,
     runtime_filter_scans: &[SqlRuntimeFilterSourceScanRequest],
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
     let facts = scan_preparation_facts(scan);
+    let scan_contract = sealed_plan.scan_contract(node_id)?;
     let execution = match facts.category() {
         SqlScanPreparationCategory::AdmittedData
         | SqlScanPreparationCategory::AdmittedFrozenCurrent => {
@@ -370,6 +425,9 @@ fn prepare_scan_node(
         }
     };
     validate_resolved_execution_kind(node_id, &facts, &execution)?;
+    let query_table_bindings = query_table_bindings.ok_or_else(|| {
+        format!("typed scan node_id={node_id} has no query-local exact binding receipt authority")
+    })?;
     // The connector produces exactly the scan's physical columns. A synthetic
     // output — a VARIANT path column — is deliberately not one of them: the
     // backend materializes those on top of the physical read slots, so
@@ -395,6 +453,7 @@ fn prepare_scan_node(
                 node_id,
                 node_limit,
                 scan,
+                &scan_contract,
                 &physical_columns,
                 &facts,
                 materialization,
@@ -402,6 +461,7 @@ fn prepare_scan_node(
                 context,
                 options,
                 dynamic_filters,
+                query_table_bindings,
             )?;
             (Vec::new(), Vec::new(), prepared)
         }
@@ -415,6 +475,7 @@ fn prepare_scan_node(
                 node_id,
                 node_limit,
                 scan,
+                &scan_contract,
                 &physical_columns,
                 &facts,
                 materialization,
@@ -425,6 +486,7 @@ fn prepare_scan_node(
                 context,
                 options,
                 dynamic_filters,
+                query_table_bindings,
             )?;
             (Vec::new(), Vec::new(), prepared)
         }
@@ -434,6 +496,7 @@ fn prepare_scan_node(
                 node_id,
                 node_limit,
                 scan,
+                &scan_contract,
                 &physical_columns,
                 &facts,
                 materialization,
@@ -444,6 +507,7 @@ fn prepare_scan_node(
                 context,
                 options,
                 dynamic_filters,
+                query_table_bindings,
             )?;
             (Vec::new(), Vec::new(), prepared)
         }
@@ -452,12 +516,14 @@ fn prepare_scan_node(
                 node_id,
                 node_limit,
                 scan,
+                &scan_contract,
                 &physical_columns,
                 &facts,
                 read,
                 context,
                 options,
                 dynamic_filters,
+                query_table_bindings,
             )?;
             (Vec::new(), Vec::new(), prepared)
         }
@@ -466,12 +532,14 @@ fn prepare_scan_node(
                 node_id,
                 node_limit,
                 scan,
+                &scan_contract,
                 &physical_columns,
                 &facts,
                 read,
                 context,
                 options,
                 dynamic_filters,
+                query_table_bindings,
             )?;
             (Vec::new(), Vec::new(), prepared)
         }
@@ -502,6 +570,7 @@ fn prepare_typed_connector_scan(
     node_id: i32,
     node_limit: i64,
     scan: &PlanScanNode,
+    scan_contract: &novarocks_sql::planning::query_execution::SealedScanContract,
     physical_columns: &[ResolvedScanColumn],
     facts: &SqlScanPreparationFacts,
     materialization: &QueryScanMaterialization,
@@ -509,6 +578,7 @@ fn prepare_typed_connector_scan(
     context: &novarocks_spi::connector::ConnectorRequestContext,
     options: &ScanPreparationOptions,
     dynamic_filters: &[(u32, String)],
+    query_table_bindings: &QueryTableBindingStore,
 ) -> Result<PreparedTypedConnectorScan, String> {
     let relation_name = typed_relation_name(node_id, facts, freeze.clone())?;
     let relation = SchemaTableName::try_new(facts.identity().namespace(), &relation_name).map_err(
@@ -539,6 +609,7 @@ fn prepare_typed_connector_scan(
         node_id,
         node_limit,
         scan,
+        scan_contract,
         physical_columns,
         facts,
         &materialization.planning_lease,
@@ -553,6 +624,7 @@ fn prepare_typed_connector_scan(
         context,
         options,
         dynamic_filters,
+        query_table_bindings,
     )
 }
 
@@ -569,12 +641,14 @@ fn prepare_typed_pinned_file_set_scan(
     node_id: i32,
     node_limit: i64,
     scan: &PlanScanNode,
+    scan_contract: &novarocks_sql::planning::query_execution::SealedScanContract,
     physical_columns: &[ResolvedScanColumn],
     facts: &SqlScanPreparationFacts,
     read: &QueryPinnedFileSetRead,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     options: &ScanPreparationOptions,
     dynamic_filters: &[(u32, String)],
+    query_table_bindings: &QueryTableBindingStore,
 ) -> Result<PreparedTypedConnectorScan, String> {
     let relation = SchemaTableName::try_new(read.pinned.namespace(), read.pinned.table())
         .map_err(|error| {
@@ -588,6 +662,7 @@ fn prepare_typed_pinned_file_set_scan(
         node_id,
         node_limit,
         scan,
+        scan_contract,
         physical_columns,
         facts,
         &read.planning_lease,
@@ -601,6 +676,7 @@ fn prepare_typed_pinned_file_set_scan(
         context,
         options,
         dynamic_filters,
+        query_table_bindings,
     )
 }
 
@@ -617,12 +693,14 @@ fn prepare_typed_table_execute_scan(
     node_id: i32,
     node_limit: i64,
     scan: &PlanScanNode,
+    scan_contract: &novarocks_sql::planning::query_execution::SealedScanContract,
     physical_columns: &[ResolvedScanColumn],
     facts: &SqlScanPreparationFacts,
     read: &QueryRewriteGroupRead,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     options: &ScanPreparationOptions,
     dynamic_filters: &[(u32, String)],
+    query_table_bindings: &QueryTableBindingStore,
 ) -> Result<PreparedTypedConnectorScan, String> {
     let relation = SchemaTableName::try_new(read.group.schema_name(), read.group.table_name())
         .map_err(|error| {
@@ -638,6 +716,7 @@ fn prepare_typed_table_execute_scan(
         node_id,
         node_limit,
         scan,
+        scan_contract,
         physical_columns,
         facts,
         &read.planning_lease,
@@ -659,6 +738,7 @@ fn prepare_typed_table_execute_scan(
         context,
         options,
         dynamic_filters,
+        query_table_bindings,
     )
 }
 
@@ -699,6 +779,7 @@ fn prepare_typed_relation_scan(
     node_id: i32,
     node_limit: i64,
     scan: &PlanScanNode,
+    scan_contract: &novarocks_sql::planning::query_execution::SealedScanContract,
     physical_columns: &[ResolvedScanColumn],
     facts: &SqlScanPreparationFacts,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -709,6 +790,7 @@ fn prepare_typed_relation_scan(
     context: &novarocks_spi::connector::ConnectorRequestContext,
     options: &ScanPreparationOptions,
     dynamic_filters: &[(u32, String)],
+    query_table_bindings: &QueryTableBindingStore,
 ) -> Result<PreparedTypedConnectorScan, String> {
     let typed = options.typed()?;
     let binding = planning_lease.binding();
@@ -775,7 +857,10 @@ fn prepare_typed_relation_scan(
         relation,
         freeze.clone(),
         node_scan_limit(node_limit),
+        scan_contract.clone(),
         dynamic_filters,
+        options.preparation_budget()?,
+        query_table_bindings,
     )
     .map_err(|error| format!("scan preparation node_id={node_id}: {error}"))?;
     // The relation family the connector actually froze must be the family this

@@ -42,7 +42,7 @@
     reason = "The native task protocol is not routed into production yet; the coordinator cutover constructs this carrier."
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -81,12 +81,17 @@ use novarocks_types::identity::BackendProcessId;
 use novarocks_execution::task_execution::operation::QueryContextReceipt;
 
 use crate::task_execution::intent::{
-    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent, TaskOperationSink,
+    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
+    TaskOperationQueueAdmission, TaskOperationQueuePermit, TaskOperationSink, TaskOperationSubmit,
 };
 use crate::task_execution::status_intake::{StatusEvent, StatusIntakeHandle, StatusIntakeWake};
 
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::{ChannelAcquisitionError, Client};
+use super::transport_supervisor::{
+    NativeTransportEncodingPermit, NativeTransportLane, NativeTransportReadyWake,
+    NativeTransportWaiter,
+};
 
 /// How long a lost subscription waits before its next attempt, per failure in
 /// the current run.
@@ -437,6 +442,12 @@ impl TaskAckIntakeHandle {
     }
 }
 
+impl NativeTransportReadyWake for TaskAckIntakeHandle {
+    fn wake(&self) {
+        self.inner.wake.wake();
+    }
+}
+
 /// The runner side of the acknowledgement intake.
 #[derive(Debug)]
 pub(crate) struct TaskAckIntake {
@@ -577,6 +588,7 @@ pub(crate) struct NativeTaskOperationSink {
     attempt: AttemptWireFacts,
     acks: TaskAckIntakeHandle,
     data_runtime: FrontendDataRuntime,
+    transport_waiter: NativeTransportWaiter,
 }
 
 impl fmt::Debug for NativeTaskOperationSink {
@@ -596,12 +608,24 @@ impl NativeTaskOperationSink {
         acks: TaskAckIntakeHandle,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, String> {
+        if !data_runtime
+            .task_transport_supervisor()
+            .accepts_transport_budget(transport)
+        {
+            return Err(
+                "attempt task transport budget differs from the process supervisor".to_owned(),
+            );
+        }
+        let transport_waiter = data_runtime
+            .task_transport_supervisor()
+            .register_waiter(Arc::new(acks.clone()))?;
         Ok(Self {
             targets: freeze_targets(backends, &data_runtime)?,
             transport,
             attempt,
             acks,
             data_runtime,
+            transport_waiter,
         })
     }
 
@@ -636,17 +660,37 @@ impl NativeTaskOperationSink {
 }
 
 impl TaskOperationSink for NativeTaskOperationSink {
-    fn submit(&self, batch: &DispatchBatch) {
+    fn try_reserve_queue(
+        &self,
+        request: crate::task_execution::TaskOperationQueueRequest,
+    ) -> TaskOperationQueueAdmission {
+        let lane = if request.requires_control_progress() {
+            NativeTransportLane::Control
+        } else {
+            NativeTransportLane::Ordinary
+        };
+        match self
+            .data_runtime
+            .task_transport_supervisor()
+            .try_reserve_queue(&self.transport_waiter, lane, 1, request.queued_bytes())
+        {
+            Ok(permit) => TaskOperationQueueAdmission::Admitted(Box::new(permit)),
+            Err(_) => TaskOperationQueueAdmission::Backpressured,
+        }
+    }
+
+    fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
         let backend = batch.backend();
         let Some(target) = self.targets.get(&backend) else {
             // The batch addresses a process this attempt never froze, so no
             // endpoint could legally answer it.
             self.settle_batch_locally(
-                batch,
+                &batch,
                 OperationOutcome::IdentityMismatch,
                 REFUSAL_UNKNOWN_BACKEND,
             );
-            return;
+            drop(batch.commit_queue_permits());
+            return TaskOperationSubmit::Accepted;
         };
         if let Some(intent) = batch
             .operations()
@@ -662,15 +706,27 @@ impl TaskOperationSink for NativeTaskOperationSink {
                 "task operation batch mixes backend processes"
             );
             self.settle_batch_locally(
-                batch,
+                &batch,
                 OperationOutcome::IdentityMismatch,
                 REFUSAL_PROCESS_MISMATCH,
             );
-            return;
+            drop(batch.commit_queue_permits());
+            return TaskOperationSubmit::Accepted;
         }
+        let target = target.clone();
+        let supervisor_lane = supervisor_lane(&batch);
+        let mut encoding_permit = match self
+            .data_runtime
+            .task_transport_supervisor()
+            .try_reserve_encoding(&self.transport_waiter, supervisor_lane)
+        {
+            Ok(permit) => permit,
+            Err(_) => return TaskOperationSubmit::Backpressured(batch),
+        };
 
         let mut operations = Vec::with_capacity(batch.operations().len());
         let mut sent = Vec::with_capacity(batch.operations().len());
+        let mut unencodable = Vec::new();
         for intent in batch.operations() {
             let encoded = encode_operation(intent, &self.attempt);
             match encoded {
@@ -684,26 +740,22 @@ impl TaskOperationSink for NativeTaskOperationSink {
                     });
                 }
                 Err(detail) => {
-                    // One item that cannot be expressed on the wire is that
-                    // item's own failure. Every other item keeps its own
-                    // receipt, which is the only property a batch has.
-                    tracing::warn!(
-                        kind = intent.kind().as_str(),
-                        detail,
-                        "task operation cannot be encoded"
-                    );
-                    observe_refusal(REFUSAL_UNENCODABLE, 1);
-                    self.settle_locally(
+                    // Do not settle this item until the sendable part of the
+                    // batch has passed process admission. On backpressure the
+                    // dispatcher must receive the whole exact batch back.
+                    unencodable.push((
                         intent.operation_id(),
                         intent.kind(),
                         is_lease_renewal(intent),
-                        OperationOutcome::InvalidStateOrRequest,
-                    );
+                        detail,
+                    ));
                 }
             }
         }
         if operations.is_empty() {
-            return;
+            settle_unencodable(self, unencodable);
+            drop(batch.commit_queue_permits());
+            return TaskOperationSubmit::Accepted;
         }
 
         let deadline = operations
@@ -734,10 +786,16 @@ impl TaskOperationSink for NativeTaskOperationSink {
                         OperationOutcome::ResourceExhausted,
                     );
                 }
-                return;
+                settle_unencodable(self, unencodable);
+                drop(batch.commit_queue_permits());
+                return TaskOperationSubmit::Accepted;
             }
         };
-        observe_batch(batch.lane(), items, prost::Message::encoded_len(&request));
+        let encoded_bytes = prost::Message::encoded_len(&request);
+        encoding_permit.shrink_to(encoded_bytes);
+        settle_unencodable(self, unencodable);
+        observe_batch(batch.lane(), items, encoded_bytes);
+        let queue_permits = batch.commit_queue_permits();
 
         let client = target.client.clone();
         let endpoint = target.endpoint.clone();
@@ -752,14 +810,56 @@ impl TaskOperationSink for NativeTaskOperationSink {
                     client,
                     endpoint,
                     data_runtime,
-                    acks,
+                    receipts: AcceptedOperationReceipts::new(acks, sent),
+                    _queue_permits: queue_permits,
+                    _encoding_permit: encoding_permit,
                 },
                 request,
-                sent,
                 deadline,
             )
             .await;
         });
+        TaskOperationSubmit::Accepted
+    }
+}
+
+fn supervisor_lane(batch: &DispatchBatch) -> NativeTransportLane {
+    if batch
+        .operations()
+        .iter()
+        .any(OperationIntent::requires_control_progress)
+    {
+        NativeTransportLane::Control
+    } else {
+        NativeTransportLane::Ordinary
+    }
+}
+
+fn supervisor_lane_for_intent(intent: &OperationIntent) -> NativeTransportLane {
+    if intent.requires_control_progress() {
+        NativeTransportLane::Control
+    } else {
+        NativeTransportLane::Ordinary
+    }
+}
+
+fn settle_unencodable(
+    sink: &NativeTaskOperationSink,
+    items: Vec<(TaskOperationId, OperationKind, bool, String)>,
+) {
+    for (operation_id, kind, lease_renewal, detail) in items {
+        tracing::warn!(
+            kind = kind.as_str(),
+            detail,
+            "task operation cannot be encoded"
+        );
+        observe_refusal(REFUSAL_UNENCODABLE, 1);
+        sink.settle_locally(
+            operation_id,
+            kind,
+            lease_renewal,
+            OperationOutcome::InvalidStateOrRequest,
+        );
     }
 }
 
@@ -768,14 +868,81 @@ struct ApplySend {
     client: Client,
     endpoint: NativeEndpoint,
     data_runtime: FrontendDataRuntime,
+    receipts: AcceptedOperationReceipts,
+    _queue_permits: Vec<Box<dyn TaskOperationQueuePermit>>,
+    _encoding_permit: NativeTransportEncodingPermit,
+}
+
+/// First-wins settlement for every operation an accepted send owns.
+///
+/// Dropping the send future is an unknown transport outcome, including runtime
+/// shutdown and task abort. The guard publishes that fact for every operation
+/// not already settled before releasing the process reservations, so an owner
+/// can never remain in flight merely because its transport future disappeared.
+struct AcceptedOperationReceipts {
     acks: TaskAckIntakeHandle,
+    pending: VecDeque<SentOperation>,
+}
+
+impl AcceptedOperationReceipts {
+    fn new(acks: TaskAckIntakeHandle, sent: Vec<SentOperation>) -> Self {
+        Self {
+            acks,
+            pending: sent.into(),
+        }
+    }
+
+    fn ids(&self) -> Vec<TaskOperationId> {
+        self.pending.iter().map(|item| item.operation_id).collect()
+    }
+
+    fn front(&self) -> Option<SentOperation> {
+        self.pending.front().copied()
+    }
+
+    fn publish_next(&mut self, ack: OperationAcknowledgement) {
+        let item = self
+            .pending
+            .pop_front()
+            .expect("an accepted response cannot outnumber its request");
+        assert_eq!(
+            item.operation_id,
+            ack.operation_id(),
+            "an accepted response must settle the request at the queue head"
+        );
+        self.acks.publish(ack);
+    }
+
+    fn publish_uniform(&mut self, result: OperationDispatchResult) {
+        while let Some(item) = self.pending.pop_front() {
+            observe_dispatch_result(item.kind, item.lease_renewal, result);
+            self.acks
+                .publish(OperationAcknowledgement::from_dispatch_result(
+                    item.operation_id,
+                    item.kind,
+                    result,
+                    AckPayload::None,
+                ));
+        }
+    }
+}
+
+impl Drop for AcceptedOperationReceipts {
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            tracing::warn!(
+                operations = self.pending.len(),
+                "accepted task operation send dropped before settlement"
+            );
+            self.publish_uniform(OperationDispatchResult::TransportUnknown);
+        }
+    }
 }
 
 /// Sends one batch and publishes one acknowledgement per request item.
 async fn apply_operations(
-    send: ApplySend,
+    mut send: ApplySend,
     request: proto::ApplyTaskOperationsRequest,
-    sent: Vec<SentOperation>,
     deadline: Duration,
 ) {
     let response = match send_operations(&send.client, request, deadline).await {
@@ -788,15 +955,12 @@ async fn apply_operations(
                 // cache.
                 send.data_runtime.invalidate_channel(&send.endpoint);
             }
-            publish_uniform(&send.acks, &sent, result);
+            send.receipts.publish_uniform(result);
             return;
         }
     };
 
-    let ids = sent
-        .iter()
-        .map(|item| item.operation_id)
-        .collect::<Vec<_>>();
+    let ids = send.receipts.ids();
     let headers = match decode_receipt_batch(
         &response,
         &ids,
@@ -810,38 +974,20 @@ async fn apply_operations(
             // never applied, and resending is not allowed once an answer has
             // been received.
             tracing::warn!(detail = %error, "task operation batch response is unusable");
-            observe_refusal(REFUSAL_UNUSABLE_RESPONSE, sent.len());
-            publish_uniform(
-                &send.acks,
-                &sent,
-                worker_result(OperationOutcome::InvalidStateOrRequest),
-            );
+            observe_refusal(REFUSAL_UNUSABLE_RESPONSE, ids.len());
+            send.receipts
+                .publish_uniform(worker_result(OperationOutcome::InvalidStateOrRequest));
             return;
         }
     };
 
-    for (item, (header, receipt)) in sent
-        .iter()
-        .zip(headers.iter().zip(response.receipts.iter()))
-    {
-        send.acks.publish(acknowledgement(item, header, receipt));
-    }
-}
-
-fn publish_uniform(
-    acks: &TaskAckIntakeHandle,
-    sent: &[SentOperation],
-    result: OperationDispatchResult,
-) {
-    for item in sent {
-        observe_dispatch_result(item.kind, item.lease_renewal, result);
-        let acknowledgement = OperationAcknowledgement::from_dispatch_result(
-            item.operation_id,
-            item.kind,
-            result,
-            AckPayload::None,
-        );
-        acks.publish(acknowledgement);
+    for (header, receipt) in headers.iter().zip(response.receipts.iter()) {
+        let item = send
+            .receipts
+            .front()
+            .expect("validated receipt count matches the accepted request");
+        let ack = acknowledgement(&item, header, receipt);
+        send.receipts.publish_next(ack);
     }
 }
 
@@ -1275,6 +1421,7 @@ const fn lane_name(lane: DispatchLane) -> &'static str {
         DispatchLane::Create => "create",
         DispatchLane::Update => "update",
         DispatchLane::Lifecycle => "lifecycle",
+        DispatchLane::Control => "control",
     }
 }
 
@@ -1533,8 +1680,9 @@ mod tests {
 
     use novarocks_execution::task_execution::{
         AdmissionTicketId, CancelReason, CancelTask, CreateTaskReceipt, CredentialEpoch,
-        CredentialLeaseId, CredentialUpdate, EstablishQueryContext, FetchTaskDynamicFilters,
-        LeaseSequence, LeaseValidFor, RenewQueryExecutionLease, TaskStatus, TaskStatusVersion,
+        CredentialLeaseId, CredentialUpdate, DomainVersion, EstablishQueryContext,
+        FetchTaskDynamicFilters, LeaseSequence, LeaseValidFor, RenewQueryExecutionLease,
+        TaskDomainUpdate, TaskStatus, TaskStatusVersion, UpdateTask,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter};
@@ -1552,6 +1700,7 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use crate::native::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
+    use crate::native::transport_supervisor::NativeTransportSupervisor;
     use crate::task_execution::dispatch::OperationDispatcher;
     use crate::task_execution::status_intake::{CountingWake, StatusIntake};
     use novarocks_query_application::coordination::{DispatchBudget, MonotonicInstant};
@@ -1588,6 +1737,23 @@ mod tests {
             TaskOperationId::new_v7(),
             identity(task, backend),
             CancelReason::UpstreamNoLongerNeeded,
+        ))
+    }
+
+    fn update_intent(task: u32, backend: BackendProcessId, version: u64) -> OperationIntent {
+        OperationIntent::UpdateTask(Arc::new(
+            UpdateTask::try_new(
+                TaskOperationId::new_v7(),
+                identity(task, backend),
+                vec![TaskDomainUpdate::TaskDynamicFilter {
+                    version: DomainVersion::new(version).expect("a positive domain version"),
+                    payload: Arc::new(WireContent::new(
+                        b"novarocks.test.task_dynamic_filter.v1",
+                        filter::RuntimeFilterEnvelope::default(),
+                    )),
+                }],
+            )
+            .expect("one domain is an update"),
         ))
     }
 
@@ -2018,6 +2184,13 @@ mod tests {
         );
     }
 
+    fn submit_batch(sink: &NativeTaskOperationSink, batch: DispatchBatch) {
+        assert!(matches!(
+            sink.try_submit(batch),
+            TaskOperationSubmit::Accepted
+        ));
+    }
+
     async fn subscribe_requests(
         peer: &TaskWirePeer,
         count: usize,
@@ -2038,6 +2211,139 @@ mod tests {
     // -----------------------------------------------------------------------
     // The operation sink
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_cancel_uses_the_process_control_reserve() {
+        let backend = BackendProcessId::new_v7();
+        let batch = released_batch(backend, vec![cancel_intent(1, backend)]);
+        assert_eq!(supervisor_lane(&batch), NativeTransportLane::Control);
+    }
+
+    #[test]
+    fn dropping_an_accepted_send_settles_only_its_remaining_items_as_unknown() {
+        let intake = TaskAckIntake::new(Arc::new(CountingWake::default()));
+        let backend = BackendProcessId::new_v7();
+        let intents = [update_intent(1, backend, 1), cancel_intent(2, backend)];
+        let sent = intents
+            .iter()
+            .map(|intent| SentOperation {
+                operation_id: intent.operation_id(),
+                kind: intent.kind(),
+                lease_renewal: is_lease_renewal(intent),
+                address: AckAddress::of(intent),
+            })
+            .collect::<Vec<_>>();
+        let ids = sent
+            .iter()
+            .map(|item| item.operation_id)
+            .collect::<Vec<_>>();
+        let mut receipts = AcceptedOperationReceipts::new(intake.handle(), sent);
+        receipts.publish_next(OperationAcknowledgement::transport_unknown(
+            ids[0],
+            intents[0].kind(),
+        ));
+
+        drop(receipts);
+
+        let acknowledgements = intake.drain();
+        assert_eq!(acknowledgements.len(), 2);
+        assert_eq!(
+            acknowledgements
+                .iter()
+                .map(OperationAcknowledgement::operation_id)
+                .collect::<Vec<_>>(),
+            ids,
+            "drop settlement preserves request order and never republishes a settled item"
+        );
+        assert!(acknowledgements.iter().all(|ack| matches!(
+            ack.dispatch_result(),
+            OperationDispatchResult::TransportUnknown
+        )));
+    }
+
+    #[test]
+    fn task_cancel_leaves_update_backlog_first_and_reaches_control_capacity() {
+        let backend = BackendProcessId::new_v7();
+        let transport =
+            TransportBudget::new(2, 1024, 512, 4, 4096, 4, 4096, 1, 2, Duration::from_secs(1))
+                .expect("one ordinary and one control batch fit");
+        let dispatch = DispatchBudget::new(1, 1, 1, 1).expect("nonzero lane permits");
+        let mut dispatcher = OperationDispatcher::new(dispatch, transport);
+        dispatcher
+            .register_task(backend)
+            .expect("one task fits the backend");
+        dispatcher
+            .enqueue(update_intent(1, backend, 1), MonotonicInstant::ORIGIN)
+            .expect("first ordinary update");
+        let released_update = dispatcher
+            .take_batch()
+            .expect("the first update reaches transport");
+        let update_acceptance = released_update.acceptance();
+        dispatcher
+            .accept(update_acceptance)
+            .expect("the first update saturates its only permit");
+        assert_eq!(dispatcher.lane_in_flight(backend, DispatchLane::Update), 1);
+        dispatcher
+            .enqueue(update_intent(1, backend, 2), MonotonicInstant::ORIGIN)
+            .expect("second ordinary update");
+        dispatcher
+            .enqueue(cancel_intent(1, backend), MonotonicInstant::ORIGIN)
+            .expect("task cancellation");
+
+        let cancel = dispatcher
+            .take_batch()
+            .expect("control is selected before the update backlog");
+        assert_eq!(cancel.operations().len(), 1);
+        assert_eq!(cancel.operations()[0].kind(), OperationKind::CancelTask);
+        assert_eq!(
+            cancel.lane(),
+            DispatchLane::Control,
+            "task cancellation has an independent dispatch permit"
+        );
+        assert_eq!(supervisor_lane(&cancel), NativeTransportLane::Control);
+
+        let supervisor = NativeTransportSupervisor::from_transport(transport)
+            .expect("the process windows were validated");
+        let intake = TaskAckIntake::new(Arc::new(CountingWake::default()));
+        let waiter = supervisor
+            .register_waiter(Arc::new(intake.handle()))
+            .expect("register the attempt");
+        let mut ordinary_queue = supervisor
+            .try_reserve_queue(
+                &waiter,
+                NativeTransportLane::Ordinary,
+                transport.max_batch_items(),
+                transport.max_operation_queued_bytes(),
+            )
+            .expect("fill the ordinary queue window exactly");
+        let ordinary_encoding = supervisor
+            .try_reserve_encoding(&waiter, NativeTransportLane::Ordinary)
+            .expect("ordinary head can always reserve its encoding window");
+        ordinary_queue.mark_in_flight();
+        let mut control_queue = supervisor
+            .try_reserve_queue(
+                &waiter,
+                supervisor_lane(&cancel),
+                cancel.operations().len(),
+                cancel.queued_bytes(),
+            )
+            .expect("the cancellation directly consumes the reserved control queue");
+        let mut control_encoding = supervisor
+            .try_reserve_encoding(&waiter, supervisor_lane(&cancel))
+            .expect("the cancellation can reserve encoding beside ordinary I/O");
+        control_encoding.shrink_to(1);
+        control_queue.mark_in_flight();
+        drop(control_encoding);
+        drop(control_queue);
+        drop(ordinary_encoding);
+        drop(ordinary_queue);
+
+        assert_eq!(dispatcher.lane_queued(backend, DispatchLane::Update), 1);
+        assert!(
+            dispatcher.take_batch().is_none(),
+            "the queued update remains blocked by its saturated permit"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_partial_batch_failure_is_settled_per_item_in_request_order() {
@@ -2065,7 +2371,7 @@ mod tests {
                 OperationOutcome::Idempotent,
             ]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 3).await;
 
         assert_eq!(
@@ -2109,7 +2415,7 @@ mod tests {
                 OperationOutcome::TerminalRejected,
             ]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 2).await;
 
         for ack in &acks {
@@ -2136,7 +2442,7 @@ mod tests {
                 OperationOutcome::Accepted,
             ]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 2).await;
 
         assert!(
@@ -2150,13 +2456,14 @@ mod tests {
     async fn an_unknown_transport_outcome_is_retryable_and_resends_the_identical_request() {
         let backend = BackendProcessId::new_v7();
         let fixture = sink_fixture(Loopback::start().await, backend);
-        let batch = released_batch(backend, vec![cancel_intent(1, backend)]);
+        let intent = cancel_intent(1, backend);
+        let batch = released_batch(backend, vec![intent.clone()]);
         fixture
             .loopback
             .peer
             .expect_apply(ApplyAnswer::Reject(tonic::Code::Unavailable));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, released_batch(backend, vec![intent]));
         let first = settled(&fixture.acks, 1).await;
         assert_eq!(
             first[0].dispatch_result(),
@@ -2165,7 +2472,7 @@ mod tests {
 
         // The owner replays the same immutable intent, so the same bytes go
         // back out under the same operation id.
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let second = settled(&fixture.acks, 1).await;
         assert_eq!(second[0].worker_outcome(), Some(OperationOutcome::Accepted));
         assert_eq!(second[0].operation_id(), first[0].operation_id());
@@ -2188,7 +2495,7 @@ mod tests {
             .peer
             .expect_apply(ApplyAnswer::Reject(tonic::Code::InvalidArgument));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
 
         assert_eq!(
@@ -2204,7 +2511,7 @@ mod tests {
         let fixture = sink_fixture(Loopback::start().await, frozen);
         let batch = released_batch(replacement, vec![cancel_intent(1, replacement)]);
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
 
         assert_eq!(
@@ -2228,7 +2535,7 @@ mod tests {
             )],
         );
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
 
         assert_eq!(acks[0].kind(), OperationKind::FetchTaskDynamicFilters);
@@ -2693,7 +3000,7 @@ mod tests {
                 )),
             )]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
         assert_eq!(
             acks[0].worker_outcome(),
@@ -2722,7 +3029,7 @@ mod tests {
                 )),
             )]));
 
-        fixture.sink.submit(&batch);
+        submit_batch(&fixture.sink, batch);
         let acks = settled(&fixture.acks, 1).await;
         assert_eq!(acks[0].worker_outcome(), Some(OperationOutcome::Accepted));
         assert_eq!(*acks[0].payload(), AckPayload::None);
