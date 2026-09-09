@@ -100,6 +100,14 @@ owner，要么就不要保留它的接口形状。
 不可能再提交、物理 worker 或连接已收尾、且证据在裁决时**确实可读**，provider 才能返回它。读失败、证据已释放、
 工作仍在飞行，一律只能答 `Unresolved`。
 
+**二之补、询问一个尚未 dispatch 的 attempt 是决定性的，不是一次读。** 观察到 `Reserved` 就地把它 settle 成
+`NotCommitted`，与读在同一把锁内完成。原因是 provider 的提交可能跑在调用方不拥有的任务上（MySQL 与 SQLite 都如此），
+「读到 `Reserved`」并不证明「此后仍是 `Reserved`」：先答 `NotCommitted` 再让 attempt 落盘，下一次询问就会答
+`Unresolved`，终态被翻转。settle 之后，迟到的 `mark_dispatched` 会失败，而三个 provider 本来就把该失败当作
+`DefiniteFailure` 而不写入。**这条不是实现细节**：它把 `mark_dispatched` 的排序规则从「provider 自觉遵守的约定」
+变成「谁先到谁赢、输的一方被明确告知」的互斥。这个缺陷是共享 attempt suite 跑在真实 MySQL 上才暴露的——内存 fake
+的裁决器答案恒定，跑不出这个交错。
+
 **三、attempt 状态机是 API 提供的一个具体类型，不是每个 provider 各写一遍的接口。** `AttemptSupervisor` 拥有签发、
 容量记账、终态发布与放弃债务；provider 只实现物理事务与 `InDoubtAdjudicator` 两个回调（`adjudicate` /
 `release_evidence`）。三个 provider 与 testkit 的 fake 复用同一份实现，因此第六条执行事实里的「规则微妙不同」在结构上
