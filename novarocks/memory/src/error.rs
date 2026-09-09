@@ -200,6 +200,33 @@ impl CapacityError {
         }
     }
 
+    /// Returns the same refusal, reported against the amount the caller
+    /// actually asked for.
+    ///
+    /// A request served from local slack may walk up the tree and be refused
+    /// there for a larger, quantised top-up. The constraint that refused and
+    /// what it could offer are facts of that level and are kept; the request
+    /// size is the caller's and would otherwise be reported as a number the
+    /// caller never asked for.
+    pub fn for_original_request(self, requested_bytes: u64) -> Self {
+        match self {
+            Self::Denied {
+                scope,
+                constraint,
+                available,
+                version,
+                requested: _,
+            } => Self::Denied {
+                scope,
+                constraint,
+                requested: requested_bytes,
+                available,
+                version,
+            },
+            other => other,
+        }
+    }
+
     /// Reports whether waiting for capacity could plausibly change the
     /// outcome.
     ///

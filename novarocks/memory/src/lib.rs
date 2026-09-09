@@ -75,13 +75,35 @@ pub mod reclaim;
 pub mod snapshot;
 pub mod wait;
 
+pub use account::{AccountHandle, ShrinkOutcome, TopUpPolicy};
+pub use authority::{AuthorityConfig, MemoryAuthority};
+pub use bound::{ConvertError, ExternalBound, SetRelation};
+pub use budget::{BoundedSlots, MetadataBudget};
+pub use charge::{Charge, ChargeState};
 pub use error::{
     CapacityError, ConfigError, ConstraintKind, FulfilError, MetadataRegistryLabel, TransferError,
 };
+pub use grant::CapacityGrant;
 pub use ids::{
     AccountId, AccountKind, ConfigVersion, ExternalRef, GrantId, HolderId, PinId, PolicyVersion,
     ReclaimTicketId, ReclaimerId, WaitTicketId,
 };
+pub use policy::{LimitDimension, LimitUnit, PolicyInstallOutcome, PolicyLimit};
 pub use snapshot::{
     AccountSnapshot, AuthoritySnapshot, EventBatch, EventRing, MemoryEvent, MemoryEventKind,
 };
+
+// The holder and reclaim registries, the wait and pressure contracts and the
+// observation tier keep their module paths at the root. `holder::Pin` would
+// read as a second `std::pin::Pin` here, the pressure and coverage vocabularies
+// are deliberately two different things, and a caller reaching for the
+// observation tier benefits from saying so:
+//
+// ```text
+// novarocks_memory::holder::{HolderRegistry, Pin, RetentionLease}
+// novarocks_memory::reclaim::{Reclaimer, ReclaimRegistry, ReclaimOutcome}
+// novarocks_memory::wait::{WaitTicket, WaitState}
+// novarocks_memory::pressure::{PressureSample, PressureLevel}
+// novarocks_memory::observe::{CountingAllocator, AllocatorSnapshot, CoverageDescriptor}
+// ```
+pub use observe::{AllocatorSnapshot, CountingAllocator, CoverageDescriptor};

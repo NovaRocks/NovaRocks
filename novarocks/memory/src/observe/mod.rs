@@ -20,6 +20,20 @@
 //! The observation tier measures what hard governance cannot cover. It reports
 //! what it covers and what it cannot see, so a difference against known `L` is
 //! a diagnostic rather than an attribution.
+//!
+//! The tier is two modules and no policy:
+//!
+//! - [`allocator`] wraps the selected Rust global allocator and counts the
+//!   requests that pass through it, without attributing a byte to any work.
+//! - [`coverage`] states, as typed data, what such a count includes and the
+//!   sources it structurally cannot include.
+//!
+//! Nothing here grants, refuses, waits or reclaims. A reading is evidence for
+//! the headroom budget in the governance tier — never a substitute for the
+//! accounts that own `L`, `F` and `O`.
 
 pub mod allocator;
 pub mod coverage;
+
+pub use allocator::{AllocatorSnapshot, CountingAllocator, SHARD_COUNT};
+pub use coverage::{BlindSpot, CoverageDescriptor, CoverageReport, MeasuredSource, SourceReading};

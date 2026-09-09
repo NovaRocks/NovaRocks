@@ -54,7 +54,15 @@ pub struct AccountSnapshot {
     /// Third-party remaining upper bound `O`: authorised coverage that cannot
     /// yet be expressed as known `L`. This is not measured usage.
     pub bounded_bytes: u64,
-    /// Total commitment `C = L + F + O`.
+    /// Total commitment `C`, as the account itself maintains it.
+    ///
+    /// This is the authoritative number, and the one every bound is enforced
+    /// on: it changes only when capacity crosses the account's own boundary.
+    /// `L + F + O` above is a walk of the subtree taken without a global
+    /// lock, so the two agree at quiescent points and the decomposition can
+    /// transiently read higher while a top-up's optimistic claim is in
+    /// flight. A consumer judging a limit uses this field; a consumer
+    /// explaining where the bytes went uses the decomposition.
     pub committed_bytes: u64,
     /// Capacity this account keeps for a progressable unit, which ordinary
     /// competition may not revoke. The floor is a lower bound on retention,
@@ -76,12 +84,16 @@ pub struct AccountSnapshot {
 }
 
 impl AccountSnapshot {
-    /// Reports whether `C` equals `L + F + O`.
+    /// Reports whether the subtree decomposition `L + F + O` matches the
+    /// maintained `C`.
     ///
-    /// Counters are read without a global lock, so a snapshot taken while
-    /// another thread is mid-transition can be internally inconsistent. Tests
-    /// assert this at quiescent points; production consumers treat a false
-    /// result as "re-read", not as a bug.
+    /// Counters are read without a global lock, so this is transiently false
+    /// while another thread is mid-transition: an in-flight top-up has
+    /// already raised a child's commitment before the parent has handed the
+    /// capacity over, and a sponsor transfer deliberately leaves the common
+    /// ancestor inconsistent for its duration. Tests assert this at quiescent
+    /// points; production consumers treat a false result as "re-read", not as
+    /// a bug.
     pub const fn is_internally_consistent(&self) -> bool {
         match self.live_bytes.checked_add(self.granted_bytes) {
             Some(partial) => match partial.checked_add(self.bounded_bytes) {
@@ -133,8 +145,23 @@ impl AuthoritySnapshot {
     }
 
     /// Reports whether the hard guarantee `C <= B` holds in this reading.
+    ///
+    /// This is judged on the root's maintained commitment, which is where the
+    /// bound is actually enforced, and not on the subtree decomposition. The
+    /// decomposition is a lock-free walk and can read higher than `B` while a
+    /// top-up's optimistic claim is in flight; treating that as a broken
+    /// bound would report a violation that never existed.
     pub const fn honours_capacity_bound(&self) -> bool {
         self.root.committed_bytes <= self.capacity_bytes
+    }
+
+    /// Returns the subtree decomposition's own total, for a consumer that
+    /// wants to compare it against the maintained commitment.
+    pub const fn decomposed_committed_bytes(&self) -> u64 {
+        self.root
+            .live_bytes
+            .saturating_add(self.root.granted_bytes)
+            .saturating_add(self.root.bounded_bytes)
     }
 }
 
