@@ -9,10 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 novarocks-backend = { path = "../novarocks/backend" }
-novarocks-connector-binding = { path = "../novarocks/connector-binding" }
 novarocks-connector-iceberg = { path = "../novarocks/connector/iceberg" }
+novarocks-connector-paimon = { path = "../novarocks/connector/paimon" }
 novarocks-connector-iceberg-functions = { path = "../novarocks/connector/iceberg-functions" }
-novarocks-connector-starrocks = { path = "../novarocks/connector/starrocks" }
 novarocks-execution = { path = "../novarocks/execution" }
 novarocks-failpoint = { path = "../novarocks/failpoint", default-features = false }
 novarocks-frontend = { path = "../novarocks/frontend" }

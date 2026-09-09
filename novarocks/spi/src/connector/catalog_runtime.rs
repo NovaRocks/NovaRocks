@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use super::{CatalogHandle, CatalogProperties, CatalogProviderKind, ConnectorError};
+use super::{CatalogHandle, CatalogProperties, ConnectorError, ConnectorProviderId};
 
 /// One exact backend-local catalog materialization.
 ///
@@ -35,7 +35,7 @@ use super::{CatalogHandle, CatalogProperties, CatalogProviderKind, ConnectorErro
 pub trait CatalogRuntime: Send + Sync {
     fn handle(&self) -> &CatalogHandle;
 
-    fn provider_kind(&self) -> CatalogProviderKind;
+    fn provider_id(&self) -> ConnectorProviderId;
 }
 
 /// Startup-composed provider materializer for one catalog kind.
@@ -43,7 +43,7 @@ pub trait CatalogRuntime: Send + Sync {
 /// Implementations must reject a mismatched provider kind and must not obtain
 /// catalog properties from any source other than the supplied immutable value.
 pub trait CatalogRuntimeMaterializer: Send + Sync {
-    fn provider_kind(&self) -> CatalogProviderKind;
+    fn provider_id(&self) -> ConnectorProviderId;
 
     fn materialize(
         &self,

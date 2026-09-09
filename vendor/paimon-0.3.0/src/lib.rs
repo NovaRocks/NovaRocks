@@ -1,0 +1,60 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+mod error;
+pub use error::Error;
+pub use error::Result;
+
+pub mod common;
+pub use common::{CatalogOptions, Options};
+
+pub mod api;
+pub use api::rest_api::RESTApi;
+
+pub mod arrow;
+pub mod btree;
+pub mod catalog;
+mod deletion_vector;
+pub mod file_index;
+#[cfg(feature = "fulltext")]
+pub mod ftindex;
+#[cfg(feature = "fulltext")]
+pub mod full_text;
+pub mod io;
+pub mod lumina;
+mod predicate_stats;
+pub mod spec;
+pub mod table;
+pub mod variant;
+pub mod vector_search;
+pub mod vindex;
+
+pub use catalog::Catalog;
+pub use catalog::CatalogFactory;
+pub use catalog::FileSystemCatalog;
+
+pub use table::{
+    CommitMessage, DataEvolutionDeleteWriter, DataEvolutionWriter, DataSplit, DataSplitBuilder,
+    DeletionFile, IncrementalPlan, IncrementalScan, IncrementalScanMode, IncrementalSplit,
+    PartitionBucket, Plan, RESTEnv, RESTSnapshotCommit, ReadBuilder, RenamingSnapshotCommit,
+    RowRange, ScanTrace, SnapshotCommit, SnapshotManager, Table, TableCommit, TableRead, TableScan,
+    TableUpdate, TableWrite, TagManager, WriteBuilder,
+};
+
+pub use table::{
+    HybridSearchBuilder, HybridSearchRanker, HybridSearchRoute, HybridSearchRouteKind,
+};

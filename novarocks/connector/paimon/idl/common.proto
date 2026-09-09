@@ -1,0 +1,65 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.connector.paimon;
+
+enum PaimonTypeKind {
+  PAIMON_TYPE_KIND_UNSPECIFIED = 0;
+  PAIMON_TYPE_KIND_BOOLEAN = 1;
+  PAIMON_TYPE_KIND_INT8 = 2;
+  PAIMON_TYPE_KIND_INT16 = 3;
+  PAIMON_TYPE_KIND_INT32 = 4;
+  PAIMON_TYPE_KIND_INT64 = 5;
+  PAIMON_TYPE_KIND_FLOAT32 = 6;
+  PAIMON_TYPE_KIND_FLOAT64 = 7;
+  PAIMON_TYPE_KIND_DECIMAL128 = 8;
+  PAIMON_TYPE_KIND_UTF8 = 9;
+  PAIMON_TYPE_KIND_BINARY = 10;
+  PAIMON_TYPE_KIND_DATE32 = 11;
+  PAIMON_TYPE_KIND_TIMESTAMP_MILLIS = 12;
+  PAIMON_TYPE_KIND_TIMESTAMP_MICROS = 13;
+}
+
+message PaimonDataTypePayload {
+  PaimonTypeKind kind = 1;
+  optional uint32 decimal_precision = 2;
+  optional uint32 decimal_scale = 3;
+  optional uint32 timestamp_precision = 4;
+}
+
+enum PaimonMergeEngine {
+  PAIMON_MERGE_ENGINE_UNSPECIFIED = 0;
+  PAIMON_MERGE_ENGINE_APPEND_ONLY = 1;
+  PAIMON_MERGE_ENGINE_DEDUPLICATE = 2;
+}
+
+enum PaimonBucketMode {
+  PAIMON_BUCKET_MODE_UNSPECIFIED = 0;
+  PAIMON_BUCKET_MODE_UNBUCKETED = 1;
+  PAIMON_BUCKET_MODE_FIXED = 2;
+  PAIMON_BUCKET_MODE_DYNAMIC = 3;
+}
+
+enum PaimonDataCompression {
+  PAIMON_DATA_COMPRESSION_UNSPECIFIED = 0;
+  PAIMON_DATA_COMPRESSION_UNCOMPRESSED = 1;
+  PAIMON_DATA_COMPRESSION_SNAPPY = 2;
+  PAIMON_DATA_COMPRESSION_ZSTD = 3;
+  PAIMON_DATA_COMPRESSION_LZ4_RAW = 4;
+}

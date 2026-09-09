@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{ObjectStoreConfig, SecretValue};
+use crate::{ObjectStoreConfig, ObjectStoreEndpointConfig, SecretValue};
 
 /// AWS S3 properties that affect an [`ObjectStoreConfig`].
 ///
@@ -146,6 +146,59 @@ pub fn object_store_config_from_aws_s3_catalog_property_pairs(
     )
 }
 
+/// Builds non-secret object-store endpoint settings from catalog properties.
+///
+/// Credential material is deliberately absent: callers must resolve the exact
+/// role-local credential binding before constructing an object-store provider.
+pub fn object_store_endpoint_config_from_aws_s3_catalog_property_pairs(
+    properties: &[(String, String)],
+) -> Result<Option<ObjectStoreEndpointConfig>, String> {
+    let properties = normalize_aws_s3_catalog_properties(
+        &properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    );
+    let endpoint = first_nonempty_property(&properties, ENDPOINT_KEYS);
+    let Some(endpoint) = endpoint else {
+        return Ok(None);
+    };
+    let enable_path_style_access = optional_bool_property(
+        &properties,
+        PATH_STYLE_KEYS,
+        "aws.s3.enable_path_style_access",
+    )?;
+    let parse_usize = |keys: &[&str], label: &str| {
+        first_nonempty_property(&properties, keys)
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid {label} value"))
+            })
+            .transpose()
+    };
+    let parse_u64 = |keys: &[&str], label: &str| {
+        first_nonempty_property(&properties, keys)
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid {label} value"))
+            })
+            .transpose()
+    };
+
+    Ok(Some(ObjectStoreEndpointConfig {
+        endpoint: endpoint.to_string(),
+        enable_path_style_access,
+        region: first_nonempty_property(&properties, REGION_KEYS).map(str::to_string),
+        retry_max_times: parse_usize(RETRY_MAX_TIMES_KEYS, "aws.s3.max_retries")?,
+        retry_min_delay_ms: parse_u64(RETRY_MIN_DELAY_MS_KEYS, "aws.s3.retry_min_delay_ms")?,
+        retry_max_delay_ms: parse_u64(RETRY_MAX_DELAY_MS_KEYS, "aws.s3.retry_max_delay_ms")?,
+        timeout_ms: parse_u64(REQUEST_TIMEOUT_MS_KEYS, "aws.s3.request_timeout_ms")?,
+        io_timeout_ms: parse_u64(IO_TIMEOUT_MS_KEYS, "aws.s3.io_timeout_ms")?,
+    }))
+}
+
 fn first_nonempty_property<'a>(
     properties: &'a BTreeMap<String, String>,
     keys: &[&str],
@@ -186,6 +239,7 @@ mod tests {
     use super::{
         normalize_aws_s3_catalog_properties, object_store_config_from_aws_s3_catalog_properties,
         object_store_config_from_aws_s3_catalog_property_pairs,
+        object_store_endpoint_config_from_aws_s3_catalog_property_pairs,
     };
     use crate::SecretValue;
     use std::collections::BTreeMap;
@@ -249,6 +303,27 @@ mod tests {
         assert_eq!(config.retry_max_delay_ms, Some(34));
         assert_eq!(config.timeout_ms, Some(56));
         assert_eq!(config.io_timeout_ms, Some(78));
+    }
+
+    #[test]
+    fn parses_non_secret_endpoint_without_catalog_credentials() {
+        let config = object_store_endpoint_config_from_aws_s3_catalog_property_pairs(&[
+            (
+                "aws.s3.endpoint".to_string(),
+                "http://127.0.0.1:9000".to_string(),
+            ),
+            ("aws.s3.region".to_string(), "us-east-1".to_string()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "true".to_string(),
+            ),
+        ])
+        .expect("parse endpoint")
+        .expect("endpoint config");
+
+        assert_eq!(config.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(config.region.as_deref(), Some("us-east-1"));
+        assert_eq!(config.enable_path_style_access, Some(true));
     }
 
     #[test]

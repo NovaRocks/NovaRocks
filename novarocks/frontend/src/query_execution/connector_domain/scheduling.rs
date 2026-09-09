@@ -29,6 +29,7 @@ use std::fmt;
 
 use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
 use novarocks_proto_models::connector_read as dto;
+use novarocks_spi::connector::ConnectorReadWireEncoder;
 use novarocks_types::UniqueId;
 
 use super::handle::Split;
@@ -129,7 +130,7 @@ impl ScheduledSplit {
     /// exact provider binding.
     pub(crate) fn to_proto(
         &self,
-        encoder: &dyn ConnectorReadEncoder,
+        encoder: &dyn ConnectorReadWireEncoder,
     ) -> Result<dto::ScheduledSplit, String> {
         encoder
             .encode_scheduled_split(self.sequence_id, self.plan_node_id, self.split.split())
@@ -143,7 +144,7 @@ pub(crate) struct SplitAssignment {
     plan_node_id: i32,
     splits: Vec<ScheduledSplit>,
     no_more_splits: bool,
-    encoder: std::sync::Arc<dyn ConnectorReadEncoder>,
+    encoder: std::sync::Arc<dyn ConnectorReadWireEncoder>,
 }
 
 impl std::fmt::Debug for SplitAssignment {
@@ -218,7 +219,7 @@ impl PlanNodeAssignmentState {
         plan_node_id: i32,
         splits: Vec<Split>,
         no_more_splits: bool,
-        encoder: std::sync::Arc<dyn ConnectorReadEncoder>,
+        encoder: std::sync::Arc<dyn ConnectorReadWireEncoder>,
     ) -> Result<SplitAssignment, SplitAssignmentError> {
         if self.is_terminal(plan_node_id) {
             return Err(SplitAssignmentError::AlreadyTerminal { plan_node_id });

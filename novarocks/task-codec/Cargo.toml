@@ -1,0 +1,19 @@
+[package]
+name = "novarocks-task-codec"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+novarocks-execution = { path = "../execution" }
+novarocks-proto-codec = { path = "../proto-codec" }
+novarocks-proto-models = { path = "../proto-models" }
+novarocks-spi = { path = "../spi" }
+novarocks-types = { path = "../types" }
+prost = "0.13"
+sha2 = "0.10"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

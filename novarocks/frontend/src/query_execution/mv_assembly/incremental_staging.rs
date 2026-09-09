@@ -288,7 +288,8 @@ fn bind_incremental_write_dataflow(
     write_session: &Arc<ConnectorWriteSession>,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
     let target = crate::catalog_application::resolver::TargetBackend {
-        backend_name: "iceberg",
+        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+            .expect("static Iceberg provider ID"),
         catalog: request.target_catalog.clone(),
         namespace: request.target_namespace.clone(),
         table: request.target_name.clone(),

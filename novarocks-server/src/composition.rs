@@ -23,21 +23,12 @@ use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
 use novarocks_backend::BackendServerConfig;
-use novarocks_connector_binding::{
-    ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBindingFactory,
-};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::resources::{IcebergExecutionResources, IcebergMetadataResources};
+use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication,
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
-};
-use novarocks_connector_iceberg::{
-    IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory,
-};
-use novarocks_connector_starrocks::{
-    StarRocksControlRoleBindingFactory, StarRocksExecutionRoleBindingFactory,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -71,6 +62,9 @@ use novarocks_spi::connector::{
 use novarocks_spi::state_store::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
 use novarocks_types::{ClusterRole, NativeCompatibilityId};
+
+use crate::paimon_access::ServerPaimonRoleFileIoFactory;
+use crate::provider_manifest::ServerProviderManifest;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergMvStorageObservationAdapter {
@@ -380,20 +374,6 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
     }
 }
 
-pub fn compose_backend_execution_role_binding_factories(
-    config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
-) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorExecutionRoleBindingFactory>>> {
-    let iceberg_resources = compose_iceberg_execution_resources(config, runtime)?;
-    Ok(vec![
-        std::sync::Arc::new(IcebergExecutionRoleBindingFactory::new(
-            iceberg_resources,
-            novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget(),
-        )),
-        std::sync::Arc::new(StarRocksExecutionRoleBindingFactory::new()),
-    ])
-}
-
 /// Resolve the BE-owned startup facts from the application wire configuration.
 ///
 /// This is intentionally the only Server-to-Backend projection: Backend
@@ -404,6 +384,7 @@ pub fn compose_backend_server_config(
     native_trust: &NativeTrustSnapshot,
     native_compatibility_id: NativeCompatibilityId,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
+    provider_manifest: std::sync::Arc<ServerProviderManifest>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<BackendServerConfig> {
     let runtime_config = &config.runtime;
@@ -457,9 +438,8 @@ pub fn compose_backend_server_config(
                     runtime_config.catalog_bind_provider_min_interval_ms,
                 ),
             },
-        execution_role_binding_factories: compose_backend_execution_role_binding_factories(
-            config, runtime,
-        )?,
+        execution_role_binding_factories: provider_manifest
+            .compose_execution_factories(config, runtime)?,
     })
 }
 
@@ -470,6 +450,7 @@ pub fn compose_frontend_server_config(
     port_override: Option<u16>,
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
+    provider_manifest: std::sync::Arc<ServerProviderManifest>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FrontendServerConfig> {
     let runtime_config = &config.runtime;
@@ -601,7 +582,8 @@ pub fn compose_frontend_server_config(
         frontend_drain_timeout: Duration::from_millis(config.server.frontend_drain_timeout_ms),
         frontend_cleanup_timeout: Duration::from_millis(config.server.frontend_cleanup_timeout_ms),
         mysql_listener,
-        connector_control_role_factories: compose_frontend_control_role_factories(config, runtime)?,
+        connector_control_role_factories: provider_manifest
+            .compose_control_factories(config, runtime)?,
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
         state_store_input,
         state_store_provider_registry,
@@ -750,31 +732,6 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
     }
 }
 
-pub fn compose_frontend_control_role_factories(
-    config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
-) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlRoleBindingFactory>>> {
-    // Design: ADR-0132 (docs/adr/ADR-0132-provider-owned-role-binding-factories.md)
-    // Server owns FE-local resource construction; the StarRocks provider owns
-    // the role-binding factory and catalog definitions retain only an exact
-    // local-binding reference, never endpoints or credentials.
-    let starrocks_resources = config
-        .connector
-        .starrocks_role_binding_resources(ClusterRole::Fe)
-        .map_err(|error| anyhow::anyhow!("construct StarRocks FE-local bindings: {error}"))?;
-    let iceberg_binding =
-        compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Fe)?;
-    Ok(vec![
-        std::sync::Arc::new(IcebergControlRoleBindingFactory::new(
-            IcebergMetadataResources::new(iceberg_binding, runtime),
-            NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight).ok_or_else(
-                || anyhow::anyhow!("catalog materialization max inflight must be nonzero"),
-            )?,
-        )),
-        std::sync::Arc::new(StarRocksControlRoleBindingFactory::new(starrocks_resources)),
-    ])
-}
-
 pub fn compose_iceberg_execution_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
@@ -786,7 +743,7 @@ pub fn compose_iceberg_execution_resources(
 /// Build one process-local, credential-aware Iceberg access template. The
 /// template itself cannot perform I/O; every provider surface must bind it to
 /// the immutable credential-free `CatalogProperties` before accessing storage.
-fn compose_iceberg_access_template(
+pub(crate) fn compose_iceberg_access_template(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
     role: ClusterRole,
@@ -803,6 +760,22 @@ fn compose_iceberg_access_template(
     Ok(IcebergReadBinding::with_static_credential_resolver(
         resources, resolver,
     ))
+}
+
+pub(crate) fn compose_paimon_access_factory(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+    role: ClusterRole,
+) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
+    let credentials = config
+        .connector
+        .credential_registry(role)
+        .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?;
+    let resources = compose_connector_file_planning_resources(config, runtime)?;
+    Ok(std::sync::Arc::new(ServerPaimonRoleFileIoFactory::new(
+        resources,
+        credentials,
+    )))
 }
 
 pub fn compose_connector_file_planning_resources(
@@ -855,12 +828,10 @@ pub fn state_store_provider_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        IcebergStorageLakeTargetSnapshotObservation,
-        compose_backend_execution_role_binding_factories, compose_frontend_control_role_factories,
-        compose_task_execution_budgets, mv_lake_target_snapshot_observation,
+        IcebergStorageLakeTargetSnapshotObservation, compose_task_execution_budgets,
+        mv_lake_target_snapshot_observation,
     };
     use novarocks_execution::task_execution::{DispatchBudget, LeaseBounds, TransportBudget};
-    use novarocks_spi::connector::CatalogProviderKind;
     use std::time::Duration;
 
     #[test]
@@ -876,36 +847,6 @@ mod tests {
 
         assert_eq!(observed.snapshot_id(), 42);
         assert_eq!(observed.timestamp_ms(), 1_700_000_042_000);
-    }
-
-    #[test]
-    fn frontend_and_backend_compose_each_provider_role_capability_once() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let config = crate::app_config::NovaRocksConfig::default();
-        let factories = compose_frontend_control_role_factories(&config, runtime.handle().clone())
-            .expect("frontend factories");
-        let factories_on_backend =
-            compose_backend_execution_role_binding_factories(&config, runtime.handle().clone())
-                .expect("backend factories");
-
-        for provider in [CatalogProviderKind::Iceberg, CatalogProviderKind::StarRocks] {
-            assert_eq!(
-                factories
-                    .iter()
-                    .filter(|factory| factory.provider_kind() == provider)
-                    .count(),
-                1,
-                "frontend must compose {provider:?} exactly once"
-            );
-            assert_eq!(
-                factories_on_backend
-                    .iter()
-                    .filter(|factory| factory.provider_kind() == provider)
-                    .count(),
-                1,
-                "backend must compose {provider:?} exactly once"
-            );
-        }
     }
 
     #[test]

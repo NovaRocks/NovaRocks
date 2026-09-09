@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod binding;
 mod catalog;
 mod catalog_runtime;
 mod cleanup_maintenance;
+mod codec;
 mod context;
 mod control;
 mod credential;
@@ -35,10 +37,12 @@ mod metadata_maintenance;
 mod mutation;
 mod mv_storage_observation;
 mod predicate;
+pub mod provider;
 mod provider_binding;
 mod publication;
 mod read;
 mod read_session;
+mod resources;
 mod row_mutation;
 mod scalar;
 mod staged_create;
@@ -50,11 +54,17 @@ pub mod conformance;
 pub mod read_stack;
 pub mod write_stack;
 
+pub use binding::{
+    ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlWriteBinding,
+    ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
+    ConnectorMaterializationError, ConnectorMaterializationErrorClass,
+    ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
+};
 pub use catalog::{
-    CATALOG_VERSION_BYTES, CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind,
-    CatalogVersion, ConnectorControlRuntimeId, MAX_CATALOG_PROPERTIES,
-    MAX_CATALOG_PROPERTY_KEY_BYTES, MAX_CATALOG_PROPERTY_VALUE_BYTES, MAX_CATALOG_SET_BYTES,
-    MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES, MAX_REACHABLE_CATALOGS_PER_PRUNE,
+    CATALOG_VERSION_BYTES, CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion,
+    ConnectorControlRuntimeId, MAX_CATALOG_PROPERTIES, MAX_CATALOG_PROPERTY_KEY_BYTES,
+    MAX_CATALOG_PROPERTY_VALUE_BYTES, MAX_CATALOG_SET_BYTES, MAX_CATALOGS_PER_QUERY,
+    MAX_PRUNE_CATALOG_SET_BYTES, MAX_REACHABLE_CATALOGS_PER_PRUNE,
 };
 pub use catalog_runtime::{CatalogRuntime, CatalogRuntimeMaterializer};
 pub use cleanup_maintenance::{
@@ -69,6 +79,18 @@ pub use cleanup_maintenance::{
     MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
     MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
     PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
+};
+pub use codec::{
+    ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
+    ConnectorDecodeCheckpoint, ConnectorDecodeContext, ConnectorDecodeDepthGuard,
+    ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload, ConnectorEnvelopeHeader,
+    ConnectorFieldPath, ConnectorFieldPathSegment, ConnectorPrivateDecoder,
+    ConnectorPrivateEncoder, ConnectorReadRelationPayload, ConnectorReadSplitCategory,
+    ConnectorReadSplitPayload, ConnectorReadWireDecoder, ConnectorReadWireEncoder,
+    ConnectorWriteFragmentWireDecoder, ConnectorWriteFragmentWireEncoder,
+    ConnectorWriteHandleWireDecoder, ConnectorWriteHandleWireEncoder,
+    MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES, MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES,
+    MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
 };
 pub use context::{
     ConnectorCancellation, ConnectorRequestContext, ConnectorRequestScope,
@@ -213,10 +235,15 @@ pub use predicate::{
     MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES, normalize_predicate_dispositions,
     validate_static_predicates,
 };
-pub use provider_binding::{
-    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderBindingKind,
-    ConnectorProviderBindingProvider,
+pub use provider::{
+    ProviderControlRoleFactory as ConnectorControlRoleBindingFactory,
+    ProviderExecutionRoleFactory as ConnectorExecutionRoleBindingFactory,
 };
+pub use provider::{
+    ProviderControlRoleFactory, ProviderExecutionRoleFactory, ProviderRoleDefinition,
+    SealedProviderRoleRegistry,
+};
+pub use provider_binding::{ConnectorProviderBinding, ConnectorProviderBindingKey};
 pub use publication::{
     LakePublicationDisposition, LakePublicationFamily, LakePublicationId,
     LakePublicationMarkerHeader, LakePublicationNextAction, LakePublicationStatementTag,
@@ -235,6 +262,11 @@ pub use read::{
 pub use read_session::{
     ConnectorReadSession, ConnectorReadSessionFinalizationContext, ConnectorReadSessionLease,
     ConnectorReadSessionOutcome,
+};
+pub use resources::{
+    ConnectorOutputMemoryToken, ConnectorRequestResources, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    ConnectorResourceReservation,
 };
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,

@@ -238,7 +238,10 @@ pub(crate) struct AsyncWriterReservation<O: Send + 'static> {
 }
 
 impl<O: Send + 'static> AsyncWriterReservation<O> {
-    pub(crate) fn send(mut self, batch: RecordBatch) {
+    pub(crate) fn send(mut self, batch: RecordBatch) -> Result<(), String> {
+        if let Some(accounting) = self.transferred_accounting.as_mut() {
+            accounting.release_unshared_connector_bytes()?;
+        }
         let command = WriterCommand::Append(AppendCommand {
             batch,
             rows: self.rows,
@@ -251,6 +254,7 @@ impl<O: Send + 'static> AsyncWriterReservation<O> {
             .expect("async writer reservation permit")
             .send(command);
         self.committed = true;
+        Ok(())
     }
 }
 
@@ -378,7 +382,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
 
     #[cfg(test)]
     pub(crate) fn enqueue(&self, batch: RecordBatch, retained_bytes: usize) -> Result<(), String> {
-        self.enqueue_with_accounting(batch, retained_bytes, None, retained_bytes)
+        self.enqueue_with_accounting(batch, retained_bytes, None, 0, retained_bytes)
     }
 
     #[cfg(test)]
@@ -387,16 +391,17 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         batch: RecordBatch,
         retained_bytes: usize,
         inherited_accounting: Option<ChunkMemoryLease>,
+        connector_retained_bytes: usize,
         additional_bytes: usize,
     ) -> Result<(), String> {
         let reservation = self.try_reserve_input(
             batch.num_rows(),
             retained_bytes,
             inherited_accounting,
+            connector_retained_bytes,
             additional_bytes,
         )?;
-        reservation.send(batch);
-        Ok(())
+        reservation.send(batch)
     }
 
     pub(crate) fn try_reserve_input(
@@ -404,6 +409,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
         rows: usize,
         retained_bytes: usize,
         inherited_accounting: Option<ChunkMemoryLease>,
+        connector_retained_bytes: usize,
         additional_bytes: usize,
     ) -> Result<AsyncWriterReservation<O>, String> {
         if rows > self.config.max_batch_rows {
@@ -449,12 +455,19 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
             .lock()
             .expect("async writer queue tracker lock")
             .clone();
-        let tracker =
-            queue_tracker.or_else(|| inherited_accounting.as_ref().map(ChunkMemoryLease::tracker));
+        let tracker = queue_tracker.or_else(|| {
+            inherited_accounting
+                .as_ref()
+                .and_then(ChunkMemoryLease::tracker)
+        });
         let shared_projected_bytes = retained_bytes - additional_bytes;
-        let transferred_accounting = match (inherited_accounting.as_ref(), tracker.as_ref()) {
-            (Some(accounting), Some(tracker)) => {
-                match accounting.try_split_to(tracker, shared_projected_bytes) {
+        let transferred_accounting = match inherited_accounting.as_ref() {
+            Some(accounting) => {
+                match accounting.try_split_to(
+                    tracker.as_ref(),
+                    shared_projected_bytes,
+                    connector_retained_bytes,
+                ) {
                     Ok(accounting) => accounting,
                     Err(error) => {
                         self.shared.release_append(rows, retained_bytes);
@@ -462,7 +475,7 @@ impl<O: Send + 'static> AsyncWriterOwner<O> {
                     }
                 }
             }
-            _ => None,
+            None => None,
         };
         // An exclusive source lease transfers only buffers shared with the
         // projection. A non-exclusive lease falls back to per-batch Scheme S:
@@ -830,13 +843,17 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::array::{Array, ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_spi::connector::write_stack::{
         ConnectorBatchWriter, ConnectorCommitFragment, ConnectorOpenWriterRequest,
         ConnectorWriteExecution,
     };
-    use novarocks_spi::connector::{CatalogHandle, ConnectorError, ConnectorErrorKind};
+    use novarocks_spi::connector::{
+        CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorRequestResources,
+        ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
+        ConnectorResourceLedger,
+    };
 
     use super::*;
     use crate::exec::operators::table_writer::tests::{
@@ -859,6 +876,127 @@ mod tests {
         append_gate: Option<Arc<Notify>>,
         fail_append: bool,
         fail_abort: bool,
+    }
+
+    struct TrackerLedger {
+        tracker: Arc<MemTracker>,
+    }
+
+    impl ConnectorResourceLedger for TrackerLedger {
+        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+            Ok(ConnectorResourceCheckpoint::new(0))
+        }
+
+        fn try_reserve(
+            &self,
+            class: ConnectorResourceClass,
+            bytes: u64,
+        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+            assert_eq!(class, ConnectorResourceClass::ReaderOutput);
+            let bytes = i64::try_from(bytes).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "test connector reservation exceeds i64",
+                )
+            })?;
+            if let Err(error) = self.tracker.consume_and_check_limit(bytes) {
+                self.tracker.release(bytes);
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    error,
+                ));
+            }
+            Ok(Box::new(TrackerLease {
+                tracker: Arc::clone(&self.tracker),
+                bytes,
+            }))
+        }
+    }
+
+    struct TrackerLease {
+        tracker: Arc<MemTracker>,
+        bytes: i64,
+    }
+
+    impl ConnectorResourceLease for TrackerLease {
+        fn bytes(&self) -> u64 {
+            u64::try_from(self.bytes).expect("non-negative test reservation")
+        }
+
+        fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+            let additional = i64::try_from(additional).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "test connector growth exceeds i64",
+                )
+            })?;
+            if let Err(error) = self.tracker.consume_and_check_limit(additional) {
+                self.tracker.release(additional);
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    error,
+                ));
+            }
+            self.bytes += additional;
+            Ok(())
+        }
+
+        fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+            let bytes = i64::try_from(bytes).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "test connector shrink target exceeds i64",
+                )
+            })?;
+            if bytes > self.bytes {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "test connector lease cannot grow through shrink",
+                ));
+            }
+            self.tracker.release(self.bytes - bytes);
+            self.bytes = bytes;
+            Ok(())
+        }
+    }
+
+    impl Drop for TrackerLease {
+        fn drop(&mut self) {
+            self.tracker.release(self.bytes);
+        }
+    }
+
+    fn connector_accounted_chunk(
+        batch: RecordBatch,
+        tracker: &Arc<MemTracker>,
+    ) -> (crate::exec::chunk::Chunk, usize) {
+        let reserved_bytes = batch
+            .columns()
+            .iter()
+            .map(|column| column.get_array_memory_size())
+            .sum::<usize>();
+        let resources = ConnectorRequestResources::new(Arc::new(TrackerLedger {
+            tracker: Arc::clone(tracker),
+        }));
+        let output_memory = resources
+            .try_reserve(
+                ConnectorResourceClass::ReaderOutput,
+                u64::try_from(reserved_bytes).expect("test reservation fits u64"),
+            )
+            .expect("reserve connector output")
+            .into_output(u64::try_from(reserved_bytes).expect("test reservation fits u64"))
+            .expect("freeze connector output reservation");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[novarocks_types::SlotId(1)],
+        )
+        .expect("connector chunk schema");
+        let mut chunk = crate::exec::chunk::Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+            .expect("connector chunk");
+        chunk
+            .attach_connector_output_memory(output_memory)
+            .expect("attach connector output owner");
+        (chunk, reserved_bytes)
     }
 
     #[async_trait::async_trait]
@@ -1213,7 +1351,7 @@ mod tests {
         let accounting = chunk.take_memory_lease();
 
         owner
-            .enqueue_with_accounting(input, bytes, accounting, 0)
+            .enqueue_with_accounting(input, bytes, accounting, bytes, 0)
             .expect("the existing Arrow charge transfers into the writer queue");
         drop(chunk);
         assert_eq!(tracker.current(), i64::try_from(bytes).unwrap());
@@ -1225,6 +1363,230 @@ mod tests {
         owner.request_finish().unwrap();
         wait_until(|| owner.has_output());
         assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn connector_output_owner_moves_into_writer_queue_without_false_oom() {
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, error, tracker, _runtime) =
+            owner(calls, Some(Arc::clone(&gate)), false, false, config);
+        let input = batch(3);
+        let retained_bytes = crate::exec::chunk::record_batch_bytes(&input);
+        let reserved_bytes = input
+            .columns()
+            .iter()
+            .map(|column| column.get_array_memory_size())
+            .sum::<usize>();
+        tracker
+            .install_limit_once(i64::try_from(reserved_bytes).unwrap())
+            .expect("install exact connector output limit");
+        let (mut chunk, actual_reserved_bytes) = connector_accounted_chunk(input.clone(), &tracker);
+        assert_eq!(actual_reserved_bytes, reserved_bytes);
+        assert_eq!(tracker.current(), i64::try_from(reserved_bytes).unwrap());
+        let accounting = chunk.take_memory_lease();
+
+        owner
+            .enqueue_with_accounting(input, retained_bytes, accounting, retained_bytes, 0)
+            .expect("the connector output owner moves without a second charge");
+        drop(chunk);
+        assert_eq!(tracker.current(), i64::try_from(retained_bytes).unwrap());
+        assert_eq!(tracker.peak(), i64::try_from(reserved_bytes).unwrap());
+
+        gate.notify_one();
+        wait_until(|| owner.queued_usage() == (0, 0));
+        assert_eq!(tracker.current(), 0);
+        owner.request_finish().unwrap();
+        wait_until(|| owner.has_output());
+        assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn connector_projection_releases_dead_source_charge_before_later_reservations() {
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, error, tracker, _runtime) =
+            owner(calls, Some(Arc::clone(&gate)), false, false, config);
+        let source = batch(3);
+        let projection = batch(3);
+        let retained_bytes = crate::exec::chunk::record_batch_bytes(&projection);
+        let additional_bytes =
+            crate::exec::chunk::record_batch_additional_bytes(&projection, &source);
+        assert_eq!(additional_bytes, retained_bytes);
+        let source_reserved_bytes = source
+            .columns()
+            .iter()
+            .map(|column| column.get_array_memory_size())
+            .sum::<usize>();
+        let peak_bytes = source_reserved_bytes
+            .checked_add(retained_bytes)
+            .expect("test peak fits usize");
+        tracker
+            .install_limit_once(i64::try_from(peak_bytes).unwrap())
+            .expect("install real projection peak limit");
+        let (mut source_chunk, actual_reserved_bytes) = connector_accounted_chunk(source, &tracker);
+        assert_eq!(actual_reserved_bytes, source_reserved_bytes);
+
+        let accounting = source_chunk.take_memory_lease();
+        let reservation = owner
+            .try_reserve_input(
+                projection.num_rows(),
+                retained_bytes,
+                accounting,
+                0,
+                additional_bytes,
+            )
+            .expect("admit the real source plus projection peak");
+        assert_eq!(tracker.current(), i64::try_from(peak_bytes).unwrap());
+        drop(source_chunk);
+        reservation
+            .send(projection)
+            .expect("retire dead source bytes before enqueue");
+        assert_eq!(tracker.current(), i64::try_from(retained_bytes).unwrap());
+
+        let later_resources = ConnectorRequestResources::new(Arc::new(TrackerLedger {
+            tracker: Arc::clone(&tracker),
+        }));
+        let later = later_resources
+            .try_reserve(
+                ConnectorResourceClass::ReaderOutput,
+                u64::try_from(source_reserved_bytes).unwrap(),
+            )
+            .expect("dead source charge must not cause a later false OOM");
+        assert_eq!(tracker.current(), i64::try_from(peak_bytes).unwrap());
+        drop(later);
+
+        gate.notify_one();
+        wait_until(|| owner.queued_usage() == (0, 0));
+        assert_eq!(tracker.current(), 0);
+        owner.request_finish().unwrap();
+        wait_until(|| owner.has_output());
+        assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn connector_cast_retains_only_shared_null_bitmap_and_new_values() {
+        let calls = Arc::new(Calls::default());
+        let gate = Arc::new(Notify::new());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, error, tracker, _runtime) =
+            owner(calls, Some(Arc::clone(&gate)), false, false, config);
+        let source_values = Arc::new(arrow::array::Int32Array::from(vec![Some(1), None, Some(3)]));
+        let source = RecordBatch::try_from_iter(vec![(
+            "value",
+            source_values.clone() as Arc<dyn arrow::array::Array>,
+        )])
+        .unwrap();
+        let projection_values = Arc::new(arrow::array::Int64Array::new(
+            vec![1_i64, 0, 3].into(),
+            source_values.nulls().cloned(),
+        )) as Arc<dyn arrow::array::Array>;
+        let projection = RecordBatch::try_from_iter(vec![("value", projection_values)]).unwrap();
+        let retained_bytes = crate::exec::chunk::record_batch_bytes(&projection);
+        let additional_bytes =
+            crate::exec::chunk::record_batch_additional_bytes(&projection, &source);
+        let shared_source_bytes =
+            crate::exec::chunk::record_batch_shared_owner_bytes(&projection, &source);
+        assert!(shared_source_bytes > 0);
+        assert_eq!(shared_source_bytes + additional_bytes, retained_bytes);
+        let source_reserved_bytes = source
+            .columns()
+            .iter()
+            .map(|column| column.get_array_memory_size())
+            .sum::<usize>();
+        let peak_bytes = source_reserved_bytes + additional_bytes;
+        tracker
+            .install_limit_once(i64::try_from(peak_bytes).unwrap())
+            .expect("install exact mixed-projection peak limit");
+        let (mut source_chunk, _) = connector_accounted_chunk(source, &tracker);
+
+        let accounting = source_chunk.take_memory_lease();
+        let reservation = owner
+            .try_reserve_input(
+                projection.num_rows(),
+                retained_bytes,
+                accounting,
+                shared_source_bytes,
+                additional_bytes,
+            )
+            .expect("admit shared null bitmap plus new values");
+        assert_eq!(tracker.current(), i64::try_from(peak_bytes).unwrap());
+        drop(source_chunk);
+        reservation
+            .send(projection)
+            .expect("enqueue mixed projection");
+        assert_eq!(tracker.current(), i64::try_from(retained_bytes).unwrap());
+
+        let released_source_bytes = source_reserved_bytes - shared_source_bytes;
+        let later_resources = ConnectorRequestResources::new(Arc::new(TrackerLedger {
+            tracker: Arc::clone(&tracker),
+        }));
+        let later = later_resources
+            .try_reserve(
+                ConnectorResourceClass::ReaderOutput,
+                u64::try_from(released_source_bytes).unwrap(),
+            )
+            .expect("dead source values must not cause a later false OOM");
+        assert_eq!(tracker.current(), i64::try_from(peak_bytes).unwrap());
+        drop(later);
+
+        gate.notify_one();
+        wait_until(|| owner.queued_usage() == (0, 0));
+        assert_eq!(tracker.current(), 0);
+        owner.request_finish().unwrap();
+        wait_until(|| owner.has_output());
+        assert!(error.error().is_none());
+    }
+
+    #[test]
+    fn rejected_writer_enqueue_releases_moved_connector_output_owner() {
+        let calls = Arc::new(Calls::default());
+        let config = AsyncWriterQueueConfig {
+            max_batches: 1,
+            max_rows: 4,
+            max_bytes: 1024,
+            max_batch_rows: 4,
+            max_batch_bytes: 1024,
+            abort_timeout: Duration::from_secs(1),
+        };
+        let (mut owner, _error, tracker, _runtime) = owner(calls, None, false, false, config);
+        let input = batch(3);
+        let retained_bytes = crate::exec::chunk::record_batch_bytes(&input);
+        let (mut chunk, reserved_bytes) = connector_accounted_chunk(input.clone(), &tracker);
+        assert_eq!(tracker.current(), i64::try_from(reserved_bytes).unwrap());
+        let accounting = chunk.take_memory_lease();
+        owner.request_finish().unwrap();
+
+        let error = owner
+            .enqueue_with_accounting(input, retained_bytes, accounting, reserved_bytes, 0)
+            .expect_err("terminal writer must reject connector-owned input");
+        assert!(error.contains("terminal transition"), "{error}");
+        drop(chunk);
+        assert_eq!(tracker.current(), 0);
+        assert_eq!(tracker.allocated(), tracker.deallocated());
     }
 
     #[test]
@@ -1263,7 +1625,7 @@ mod tests {
         let accounting = chunk.take_memory_lease();
 
         owner
-            .enqueue_with_accounting(projection, projected_bytes, accounting, 0)
+            .enqueue_with_accounting(projection, projected_bytes, accounting, projected_bytes, 0)
             .expect("split projected accounting into writer queue");
         drop(chunk);
 
@@ -1315,10 +1677,13 @@ mod tests {
         owner.request_finish().unwrap();
 
         let error = owner
-            .enqueue_with_accounting(input, bytes, Some(lease.clone()), 0)
+            .enqueue_with_accounting(input, bytes, Some(lease.clone()), bytes, 0)
             .expect_err("terminal writer must reject append");
         assert!(error.contains("terminal transition"), "{error}");
-        assert!(Arc::ptr_eq(&lease.tracker(), &input_tracker));
+        assert!(Arc::ptr_eq(
+            &lease.tracker().expect("native input tracker"),
+            &input_tracker
+        ));
         assert_eq!(input_tracker.current(), i64::try_from(bytes).unwrap());
 
         drop(chunk);
@@ -1368,7 +1733,7 @@ mod tests {
         let accounting = chunk.take_memory_lease();
 
         let error = owner
-            .enqueue_with_accounting(input, bytes, accounting, 0)
+            .enqueue_with_accounting(input, bytes, accounting, bytes, 0)
             .expect_err("full writer mailbox must reject append");
         assert!(error.contains("connector writer enqueue failed"), "{error}");
         assert_eq!(owner.queued_usage(), (0, 0));

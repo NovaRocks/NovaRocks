@@ -344,6 +344,10 @@ fn connector_membership_probe<'a>(
             Ok(MembershipProbe::Date32(*value))
         }
         (
+            ConnectorScalarValue::TimestampMillis(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+        )
+        | (
             ConnectorScalarValue::TimestampMicros(value),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         )
@@ -412,6 +416,10 @@ fn connector_ordered_scalar(
             Ok(OrderedScalar::Date32(*value))
         }
         (
+            ConnectorScalarValue::TimestampMillis(value),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+        )
+        | (
             ConnectorScalarValue::TimestampMicros(value),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         )

@@ -38,13 +38,13 @@ use novarocks_execution::task_execution::operation::CredentialUpdate;
 use novarocks_execution::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::catalog::CatalogSet;
-use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
-use novarocks_proto_codec::task_execution::domain::{
-    WireCredential, encode_task_dynamic_filter_domain, stored_credential, stored_message,
-};
-use novarocks_proto_codec::task_execution::identity::encode_task_identity;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::CatalogProperties;
+use novarocks_task_codec::descriptor::WireFragmentPlan;
+use novarocks_task_codec::domain::{
+    WireCredential, encode_task_dynamic_filter_domain, stored_credential, stored_message,
+};
+use novarocks_task_codec::identity::encode_task_identity;
 
 use super::host::{HostRejection, TaskDynamicFilterRead};
 
@@ -173,8 +173,8 @@ mod tests {
     use novarocks_execution::task_execution::identity::TaskIdentity;
     use novarocks_execution::task_execution::operation::CredentialUpdate;
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_codec::task_execution::domain::{WireContent, WireCredential};
     use novarocks_proto_models::{catalog, filter, novarocks as proto};
+    use novarocks_task_codec::domain::{WireContent, WireCredential};
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
@@ -312,8 +312,8 @@ mod tests {
         };
         use novarocks_execution::task_execution::descriptor::PhysicalFragmentPlan;
         use novarocks_execution::task_execution::domain::ContentFingerprint;
-        use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
         use novarocks_proto_models::plan;
+        use novarocks_task_codec::descriptor::WireFragmentPlan;
 
         let wire = WireFragmentPlan::parse(
             proto::TaskFragmentPlan {

@@ -171,6 +171,14 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             .controls
             .acquire_current(&instance_id)
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
+        if lease.binding().statistics().is_none() {
+            return Err(StatisticsApplicationError::from_connector_error(
+                ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                    "connector control generation has no statistics capability",
+                ),
+            ));
+        }
         let captured = lease
             .binding()
             .metadata()

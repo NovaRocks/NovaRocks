@@ -92,10 +92,10 @@ pub(crate) fn prepare_delete_statement(
     // 1. Resolve target.
     let target =
         resolve_existing_table_target(state, table_name, current_catalog, current_database)?;
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         return Err(format!(
             "phase 1 DELETE only supports iceberg backends, got `{}`",
-            target.backend_name
+            target.provider_id.as_str()
         ));
     }
     let target_binding = crate::connector::write_target::load_write_target_binding(
@@ -904,7 +904,8 @@ mod tests {
     #[test]
     fn delete_position_sink_query_projects_row_identity_and_partition_sources() {
         let target = crate::catalog_application::resolver::TargetBackend {
-            backend_name: "iceberg",
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static Iceberg provider ID"),
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "orders".to_string(),
@@ -931,7 +932,8 @@ mod tests {
     #[test]
     fn delete_position_sink_query_pins_branch_read_snapshot() {
         let target = crate::catalog_application::resolver::TargetBackend {
-            backend_name: "iceberg",
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static Iceberg provider ID"),
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "orders".to_string(),

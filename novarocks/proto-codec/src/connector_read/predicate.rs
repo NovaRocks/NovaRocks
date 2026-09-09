@@ -13,6 +13,7 @@ use novarocks_spi::connector::read_stack::{
     Bound, ConnectorExpression, ConnectorFunctionName, ConnectorValueType, Domain, Range,
     TupleDomain, ValueSet,
 };
+use novarocks_spi::connector::{ConnectorCodecCategory, ConnectorEncodedPayload};
 use prost::Message;
 
 use crate::{FieldPath, ProtocolError};
@@ -31,22 +32,24 @@ use super::{
 #[derive(Clone, Debug)]
 pub struct ValidatedColumnHandle {
     raw: dto::ColumnHandle,
+    provider_payload: ConnectorEncodedPayload,
     canonical: Arc<[u8]>,
 }
 
 impl ValidatedColumnHandle {
     pub fn parse(raw: dto::ColumnHandle, path: FieldPath) -> Result<Self, ProtocolError> {
-        let handle = raw
-            .handle
-            .as_ref()
-            .ok_or_else(|| missing(path.clone(), "column handle variant must be present"))?;
-        match handle {
-            dto::column_handle::Handle::Iceberg(iceberg) => {
-                validate_iceberg_column_handle(iceberg, path.field("iceberg"))?;
-            }
-        }
+        let provider_payload = crate::connector_common::decode_embedded_connector_payload(
+            raw.provider_payload.as_ref(),
+            ConnectorCodecCategory::ReadColumn,
+            super::MAX_SPLIT_ENCODED_BYTES,
+            path.field("provider_payload"),
+        )?;
         let canonical = Arc::from(raw.encode_to_vec());
-        Ok(Self { raw, canonical })
+        Ok(Self {
+            raw,
+            provider_payload,
+            canonical,
+        })
     }
 
     pub const fn as_proto(&self) -> &dto::ColumnHandle {
@@ -60,6 +63,10 @@ impl ValidatedColumnHandle {
     /// The canonical bytes used for ordering and same-message comparison.
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical
+    }
+
+    pub const fn provider_payload(&self) -> &ConnectorEncodedPayload {
+        &self.provider_payload
     }
 }
 
@@ -81,87 +88,6 @@ impl Ord for ValidatedColumnHandle {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.canonical.cmp(&other.canonical)
     }
-}
-
-fn validate_iceberg_column_handle(
-    raw: &dto::IcebergColumnHandle,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    let identity = raw.base_column_identity.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("base_column_identity"),
-            "iceberg column handle requires a base column identity",
-        )
-    })?;
-    validate_column_identity(identity, path.clone().field("base_column_identity"), 0)?;
-    bounded_text(
-        &raw.base_type_json,
-        super::MAX_JSON_BYTES,
-        path.clone().field("base_type_json"),
-        false,
-    )?;
-    bounded_text(
-        &raw.type_json,
-        super::MAX_JSON_BYTES,
-        path.clone().field("type_json"),
-        false,
-    )?;
-    if raw.field_id_path.len() > MAX_COLUMN_PATH_DEPTH {
-        return Err(out_of_range(
-            path.clone().field("field_id_path"),
-            "iceberg column dereference path is too deep",
-        ));
-    }
-    if let Some(comment) = &raw.comment {
-        bounded_text(comment, super::MAX_JSON_BYTES, path.field("comment"), true)?;
-    }
-    Ok(())
-}
-
-const MAX_COLUMN_PATH_DEPTH: usize = 64;
-const MAX_COLUMN_IDENTITY_CHILDREN: usize = 4096;
-
-fn validate_column_identity(
-    raw: &dto::ColumnIdentity,
-    path: FieldPath,
-    depth: usize,
-) -> Result<(), ProtocolError> {
-    if depth > MAX_COLUMN_PATH_DEPTH {
-        return Err(out_of_range(path, "column identity nesting is too deep"));
-    }
-    let category = dto::ColumnIdentityCategory::try_from(raw.category).map_err(|_| {
-        invalid_enum(
-            path.clone().field("category"),
-            "unknown column identity category",
-        )
-    })?;
-    if category == dto::ColumnIdentityCategory::Unspecified {
-        return Err(invalid_enum(
-            path.clone().field("category"),
-            "column identity category must be specified",
-        ));
-    }
-    bounded_text(&raw.name, MAX_NAME_BYTES, path.clone().field("name"), false)?;
-    if raw.children.len() > MAX_COLUMN_IDENTITY_CHILDREN {
-        return Err(out_of_range(
-            path.clone().field("children"),
-            "column identity child count exceeds the hard limit",
-        ));
-    }
-    if category == dto::ColumnIdentityCategory::Primitive && !raw.children.is_empty() {
-        return Err(inconsistent(
-            path.clone().field("children"),
-            "a primitive column identity must have no children",
-        ));
-    }
-    for (index, child) in raw.children.iter().enumerate() {
-        validate_column_identity(
-            child,
-            path.clone().field("children").index(index),
-            depth + 1,
-        )?;
-    }
-    Ok(())
 }
 
 fn decode_bound(
@@ -544,7 +470,12 @@ pub fn encode_connector_expression(expression: &ConnectorExpression) -> dto::Con
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use novarocks_spi::connector::read_stack::ConnectorValue;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorCodecRevision, ConnectorEnvelopeHeader,
+        ConnectorInstanceId, ConnectorProviderId,
+    };
 
     use super::*;
 
@@ -553,21 +484,21 @@ mod tests {
     }
 
     fn column(field_id: i32) -> dto::ColumnHandle {
+        let payload = ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                CatalogHandle::new(
+                    ConnectorInstanceId::try_from_canonical("lake").unwrap(),
+                    CatalogVersion::from_bytes([7; 32]),
+                ),
+                ConnectorCodecCategory::ReadColumn,
+                ConnectorCodecRevision::try_new(1).unwrap(),
+            ),
+            Bytes::copy_from_slice(&field_id.to_be_bytes()),
+        );
         dto::ColumnHandle {
-            handle: Some(dto::column_handle::Handle::Iceberg(
-                dto::IcebergColumnHandle {
-                    base_column_identity: Some(dto::ColumnIdentity {
-                        field_id,
-                        name: format!("c{field_id}"),
-                        category: dto::ColumnIdentityCategory::Primitive as i32,
-                        children: Vec::new(),
-                    }),
-                    base_type_json: "\"long\"".to_owned(),
-                    field_id_path: Vec::new(),
-                    type_json: "\"long\"".to_owned(),
-                    nullable: true,
-                    comment: None,
-                },
+            provider_payload: Some(crate::connector_common::encode_connector_payload_message(
+                &payload,
             )),
         }
     }
@@ -670,36 +601,14 @@ mod tests {
 
     #[test]
     fn an_absent_column_handle_variant_is_a_missing_field() {
-        let empty = dto::ColumnHandle { handle: None };
+        let empty = dto::ColumnHandle {
+            provider_payload: None,
+        };
         assert_eq!(
             ValidatedColumnHandle::parse(empty, root())
                 .expect_err("absent")
                 .kind(),
             crate::ProtocolErrorKind::MissingField
-        );
-    }
-
-    #[test]
-    fn a_primitive_column_identity_must_have_no_children() {
-        let mut handle = column(1);
-        if let Some(dto::column_handle::Handle::Iceberg(iceberg)) = handle.handle.as_mut() {
-            iceberg
-                .base_column_identity
-                .as_mut()
-                .expect("identity")
-                .children
-                .push(dto::ColumnIdentity {
-                    field_id: 2,
-                    name: "child".to_owned(),
-                    category: dto::ColumnIdentityCategory::Primitive as i32,
-                    children: Vec::new(),
-                });
-        }
-        assert_eq!(
-            ValidatedColumnHandle::parse(handle, root())
-                .expect_err("children")
-                .kind(),
-            crate::ProtocolErrorKind::InconsistentFields
         );
     }
 

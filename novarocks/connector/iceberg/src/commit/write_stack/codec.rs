@@ -17,10 +17,10 @@
 
 //! Iceberg's four directional connector-write codec facets.
 //!
-//! This is the only Iceberg module that turns a central-IDL write carrier into
-//! an Iceberg write domain value, or the reverse. Each facet holds the
-//! provider-private [`IcebergWriteAdapter`] of one exact catalog generation and
-//! nothing else, so:
+//! This is the only Iceberg module that turns the provider-private write wire
+//! payload into an Iceberg write domain value, or the reverse. Each facet holds
+//! the [`IcebergWriteAdapter`] of one exact catalog generation and nothing else,
+//! so:
 //!
 //! * an **encoder** can only start from a neutral value its own generation
 //!   minted — the adapter refuses every other one — and it has no method that
@@ -29,30 +29,37 @@
 //!   binding, so a decoded value is usable only by that generation.
 //!
 //! Two layers of validation meet here and neither substitutes for the other.
-//! `novarocks-proto-codec` proves a carrier is canonical, in bounds, and
-//! structurally an Iceberg write carrier; it deliberately knows nothing about
-//! Iceberg's cross-field rules. Those live in the domain constructors, so every
-//! decode below routes through `try_new*` rather than assembling a struct
-//! field by field. Building one by hand would let a wire value exist that the
-//! provider's own rules would have rejected — for example a Puffin writer
-//! carrying a Parquet row-group size, or a merge target frozen against another
-//! snapshot — and nothing downstream would ever catch it.
+//! [`crate::wire::write`] proves a payload is canonical, in bounds, and
+//! structurally an Iceberg write value. Iceberg's deeper cross-field rules live
+//! in the domain constructors, so every decode below routes through `try_new*`
+//! rather than assembling a struct field by field. Building one by hand would
+//! let a wire value exist that the provider's own rules would have rejected —
+//! for example a Puffin writer carrying a Parquet row-group size, or a merge
+//! target frozen against another snapshot — and nothing downstream would ever
+//! catch it.
 //!
 //! Where a domain fact has no faithful carrier the answer is an error carrying
 //! the real field path, never a default and never a silent narrowing.
 
 use std::sync::Arc;
 
-use novarocks_proto_codec::connector_write::{
-    ConnectorWriteCodecError, ConnectorWriteFragmentDecoder, ConnectorWriteFragmentEncoder,
-    ConnectorWriteHandleDecoder, ConnectorWriteHandleEncoder, ValidatedCommitFragment,
-    ValidatedWriterHandle,
-};
+use bytes::Bytes;
+use novarocks_proto_codec::connector_write::ConnectorWriteCodecError;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
-use novarocks_proto_models::connector_write as dto;
-use novarocks_spi::connector::write_stack::{ConnectorCommitFragment, ConnectorWriterHandle};
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::write_stack::{
+    ConnectorCommitFragment, ConnectorWriterHandle, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES,
+    MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+};
+use novarocks_spi::connector::{
+    ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
+    ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload,
+    ConnectorEnvelopeHeader, ConnectorError, ConnectorErrorKind, ConnectorFieldPath,
+    ConnectorPrivateDecoder, ConnectorPrivateEncoder, ConnectorWriteFragmentWireDecoder,
+    ConnectorWriteFragmentWireEncoder, ConnectorWriteHandleWireDecoder,
+    ConnectorWriteHandleWireEncoder,
+};
 use parquet::basic::{Compression, GzipLevel, ZstdLevel};
+use prost::Message;
 
 use crate::commit::report::IcebergColumnStats;
 use crate::commit::write_stack::domain::{
@@ -69,6 +76,7 @@ use crate::commit::write_stack::old_delete::{
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::delete_file::{IcebergFileContent, IcebergFileFormat};
 use crate::scan_model::IcebergSchemaDef;
+use crate::wire::dto;
 use crate::write_descriptor::{IcebergPartitionDescriptor, IcebergPartitionValueDescriptor};
 
 /// The shared half of all four facets: one exact generation's adapter and the
@@ -125,6 +133,44 @@ impl IcebergWriteCodec {
         )
     }
 
+    fn validate_private_header(
+        &self,
+        context: &ConnectorDecodeContext<'_>,
+        category: ConnectorCodecCategory,
+    ) -> Result<(), ConnectorCodecError> {
+        let binding = self.adapter.binding();
+        context.expected_header().validate_expected(
+            &binding.descriptor().provider_id,
+            binding.catalog_handle(),
+            category,
+            ConnectorCodecRevision::try_new(crate::wire::write::WRITE_CODEC_REVISION)
+                .expect("Iceberg write codec revision is non-zero"),
+        )
+    }
+
+    fn envelope(
+        &self,
+        category: ConnectorCodecCategory,
+        payload: Bytes,
+    ) -> ConnectorEncodedPayload {
+        let binding = self.adapter.binding();
+        ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                binding.descriptor().provider_id.clone(),
+                binding.catalog_handle().clone(),
+                category,
+                ConnectorCodecRevision::try_new(crate::wire::write::WRITE_CODEC_REVISION)
+                    .expect("Iceberg write codec revision is non-zero"),
+            ),
+            payload,
+        )
+    }
+
+    fn decode_limits(max_bytes: usize) -> ConnectorDecodeLimits {
+        ConnectorDecodeLimits::try_new(max_bytes, max_bytes, max_bytes, 1_000_000, 64)
+            .expect("Iceberg write decode limits are finite and non-zero")
+    }
+
     // -- enums ------------------------------------------------------------
 
     fn encode_file_format(
@@ -133,8 +179,8 @@ impl IcebergWriteCodec {
         path: FieldPath,
     ) -> Result<i32, ConnectorWriteCodecError> {
         match format {
-            IcebergFileFormat::Parquet => Ok(dto::IcebergFileFormat::Parquet as i32),
-            IcebergFileFormat::Puffin => Ok(dto::IcebergFileFormat::Puffin as i32),
+            IcebergFileFormat::Parquet => Ok(dto::IcebergWriteFileFormat::Parquet as i32),
+            IcebergFileFormat::Puffin => Ok(dto::IcebergWriteFileFormat::Puffin as i32),
             IcebergFileFormat::Unknown => Err(self.invalid(
                 path,
                 "an Iceberg write carrier requires an exact file format",
@@ -147,10 +193,10 @@ impl IcebergWriteCodec {
         value: i32,
         path: FieldPath,
     ) -> Result<IcebergFileFormat, ConnectorWriteCodecError> {
-        match dto::IcebergFileFormat::try_from(value) {
-            Ok(dto::IcebergFileFormat::Parquet) => Ok(IcebergFileFormat::Parquet),
-            Ok(dto::IcebergFileFormat::Puffin) => Ok(IcebergFileFormat::Puffin),
-            Ok(dto::IcebergFileFormat::Unspecified) | Err(_) => Err(self.invalid(
+        match dto::IcebergWriteFileFormat::try_from(value) {
+            Ok(dto::IcebergWriteFileFormat::Parquet) => Ok(IcebergFileFormat::Parquet),
+            Ok(dto::IcebergWriteFileFormat::Puffin) => Ok(IcebergFileFormat::Puffin),
+            Ok(dto::IcebergWriteFileFormat::Unspecified) | Err(_) => Err(self.invalid(
                 path,
                 "an Iceberg write carrier requires a named file format",
             )),
@@ -576,11 +622,9 @@ impl IcebergWriteCodec {
             file_format: self
                 .encode_file_format(reference.file_format(), path.field("file_format"))?,
             file_size_in_bytes: reference.file_size_in_bytes(),
-            // The wire field is not optional and the domain cannot hold a known
-            // count of zero, so zero means exactly what `None` means: the frozen
-            // manifest projection did not surface a count. The mapping is
-            // therefore total in both directions with nothing invented.
-            record_count: reference.record_count().unwrap_or(0),
+            // Presence is semantic. A missing manifest count stays unknown;
+            // zero, when a future source can prove it, remains a known zero.
+            record_count: reference.record_count(),
             content_range: reference
                 .content_range()
                 .map(|range| self.encode_content_range(range)),
@@ -609,7 +653,7 @@ impl IcebergWriteCodec {
             self.decode_file_content(reference.content, path.field("content"))?,
             self.decode_file_format(reference.file_format, path.field("file_format"))?,
             reference.file_size_in_bytes,
-            (reference.record_count > 0).then_some(reference.record_count),
+            reference.record_count,
             content_range,
             reference.referenced_data_file.clone(),
             reference.data_sequence_number,
@@ -717,7 +761,7 @@ impl IcebergWriteCodec {
     fn encode_writer_handle_value(
         &self,
         handle: &IcebergWriterHandle,
-    ) -> Result<dto::ConnectorWriterHandle, ConnectorWriteCodecError> {
+    ) -> Result<dto::IcebergWriterHandle, ConnectorWriteCodecError> {
         let path = FieldPath::root("writer_handle").field("iceberg");
         let mut old_deletes = std::collections::BTreeMap::new();
         for (key, target) in handle.old_deletes() {
@@ -730,28 +774,23 @@ impl IcebergWriteCodec {
             .data()
             .map(|recipe| self.encode_recipe(recipe, path.field("data")))
             .transpose()?;
-        Ok(dto::ConnectorWriterHandle {
-            handle: Some(dto::connector_writer_handle::Handle::Iceberg(
-                dto::IcebergWriterHandle {
-                    branch: self.encode_branch(handle.branch()),
-                    table: Some(self.encode_table(handle.table())),
-                    output: Some(self.encode_output(handle.output(), path.field("output"))?),
-                    data,
-                    old_deletes,
-                    equality: handle
-                        .equality()
-                        .map(|recipe| self.encode_equality_recipe(recipe)),
-                },
-            )),
+        Ok(dto::IcebergWriterHandle {
+            branch: self.encode_branch(handle.branch()),
+            table: Some(self.encode_table(handle.table())),
+            output: Some(self.encode_output(handle.output(), path.field("output"))?),
+            data,
+            old_deletes,
+            equality: handle
+                .equality()
+                .map(|recipe| self.encode_equality_recipe(recipe)),
         })
     }
 
     fn decode_writer_handle_value(
         &self,
-        handle: &ValidatedWriterHandle,
+        iceberg: &dto::IcebergWriterHandle,
     ) -> Result<IcebergWriterHandle, ConnectorWriteCodecError> {
         let path = FieldPath::root("writer_handle").field("iceberg");
-        let iceberg = handle.iceberg();
         let branch = self.decode_branch(iceberg.branch, path.field("branch"))?;
         let table = self.decode_table(iceberg.table.as_ref(), path.field("table"))?;
         let output = self.decode_output(iceberg.output.as_ref(), path.field("output"))?;
@@ -792,7 +831,7 @@ impl IcebergWriteCodec {
     fn encode_commit_fragment_value(
         &self,
         fragment: &IcebergCommitFragment,
-    ) -> Result<dto::ConnectorCommitFragment, ConnectorWriteCodecError> {
+    ) -> Result<dto::IcebergCommitFragment, ConnectorWriteCodecError> {
         let path = FieldPath::root("commit_fragment").field("iceberg");
         let artifact = match fragment.artifact() {
             IcebergCommitArtifact::DataFile(file) => {
@@ -841,21 +880,17 @@ impl IcebergWriteCodec {
                 )
             }
         };
-        Ok(dto::ConnectorCommitFragment {
-            fragment: Some(dto::connector_commit_fragment::Fragment::Iceberg(
-                dto::IcebergCommitFragment {
-                    artifact: Some(artifact),
-                },
-            )),
+        Ok(dto::IcebergCommitFragment {
+            artifact: Some(artifact),
         })
     }
 
     fn decode_commit_fragment_value(
         &self,
-        fragment: &ValidatedCommitFragment,
+        fragment: &dto::IcebergCommitFragment,
     ) -> Result<IcebergCommitFragment, ConnectorWriteCodecError> {
         let path = FieldPath::root("commit_fragment").field("iceberg");
-        let artifact = fragment.iceberg().artifact.as_ref().ok_or_else(|| {
+        let artifact = fragment.artifact.as_ref().ok_or_else(|| {
             self.missing(
                 path.clone(),
                 "an Iceberg commit fragment describes exactly one artifact",
@@ -933,25 +968,44 @@ impl IcebergWriteHandleEncoder {
     }
 }
 
-impl ConnectorWriteHandleEncoder for IcebergWriteHandleEncoder {
+impl ConnectorWriteHandleWireEncoder for IcebergWriteHandleEncoder {
     fn owner(&self) -> &str {
         &self.0.owner
     }
 
-    fn encode_writer_handle(
+    fn encode_writer_handle_payload(
         &self,
         handle: &ConnectorWriterHandle,
-    ) -> Result<dto::ConnectorWriterHandle, ConnectorWriteCodecError> {
+    ) -> Result<ConnectorEncodedPayload, ConnectorCodecError> {
         // The adapter is the only door to the domain value, and it is bound to
         // this exact generation: a handle another generation minted cannot be
         // encoded here, so a frontend cannot launder a foreign recipe onto the
         // wire under this catalog's name.
-        let handle = self
+        let handle = self.0.adapter.writer_handle(handle).map_err(|error| {
+            spi_codec_error(self.0.rejected(FieldPath::root("writer_handle"), &error))
+        })?;
+        let private = self.encode_private(handle)?;
+        Ok(self
             .0
-            .adapter
-            .writer_handle(handle)
-            .map_err(|error| self.0.rejected(FieldPath::root("writer_handle"), &error))?;
-        self.0.encode_writer_handle_value(handle)
+            .envelope(ConnectorCodecCategory::WriteHandle, private))
+    }
+}
+
+impl ConnectorPrivateEncoder<IcebergWriterHandle> for IcebergWriteHandleEncoder {
+    fn encode_private(&self, handle: &IcebergWriterHandle) -> Result<Bytes, ConnectorCodecError> {
+        let bytes = self
+            .0
+            .encode_writer_handle_value(handle)
+            .map(|value| Bytes::from(value.encode_to_vec()))
+            .map_err(spi_codec_error)?;
+        if bytes.len() > MAX_CONNECTOR_WRITER_HANDLE_BYTES {
+            return Err(ConnectorCodecError::new(
+                ConnectorFieldPath::root("writer_handle").field("iceberg"),
+                ConnectorCodecErrorKind::Capacity,
+                "Iceberg writer handle exceeds its hard byte limit",
+            ));
+        }
+        Ok(bytes)
     }
 }
 
@@ -964,19 +1018,38 @@ impl IcebergWriteHandleDecoder {
     }
 }
 
-impl ConnectorWriteHandleDecoder for IcebergWriteHandleDecoder {
+impl ConnectorWriteHandleWireDecoder for IcebergWriteHandleDecoder {
     fn owner(&self) -> &str {
         &self.0.owner
     }
 
-    fn decode_writer_handle(
+    fn decode_writer_handle_payload(
         &self,
-        handle: &ValidatedWriterHandle,
-    ) -> Result<ConnectorWriterHandle, ConnectorWriteCodecError> {
-        let value = self.0.decode_writer_handle_value(handle)?;
+        envelope: &ConnectorEncodedPayload,
+    ) -> Result<ConnectorWriterHandle, ConnectorCodecError> {
+        let mut ledger = ConnectorDecodeLedger::new(IcebergWriteCodec::decode_limits(
+            MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+        ));
+        let mut context = ConnectorDecodeContext::new(envelope.header(), &mut ledger);
+        let value = self.decode_private(envelope.payload(), &mut context)?;
         // The result is rewrapped with this decoder's own binding, so only this
         // generation's writer factory can open a writer for it.
         Ok(self.0.adapter.wrap_writer_handle(value))
+    }
+}
+
+impl ConnectorPrivateDecoder<IcebergWriterHandle> for IcebergWriteHandleDecoder {
+    fn decode_private(
+        &self,
+        payload: &[u8],
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<IcebergWriterHandle, ConnectorCodecError> {
+        self.0
+            .validate_private_header(context, ConnectorCodecCategory::WriteHandle)?;
+        let value = crate::wire::write::decode_writer_handle(payload, context)?;
+        self.0
+            .decode_writer_handle_value(&value)
+            .map_err(spi_codec_error)
     }
 }
 
@@ -989,21 +1062,43 @@ impl IcebergWriteFragmentEncoder {
     }
 }
 
-impl ConnectorWriteFragmentEncoder for IcebergWriteFragmentEncoder {
+impl ConnectorWriteFragmentWireEncoder for IcebergWriteFragmentEncoder {
     fn owner(&self) -> &str {
         &self.0.owner
     }
 
-    fn encode_commit_fragment(
+    fn encode_commit_fragment_payload(
         &self,
         fragment: &ConnectorCommitFragment,
-    ) -> Result<dto::ConnectorCommitFragment, ConnectorWriteCodecError> {
-        let fragment = self
+    ) -> Result<ConnectorEncodedPayload, ConnectorCodecError> {
+        let fragment = self.0.adapter.commit_fragment(fragment).map_err(|error| {
+            spi_codec_error(self.0.rejected(FieldPath::root("commit_fragment"), &error))
+        })?;
+        let private = self.encode_private(fragment)?;
+        Ok(self
             .0
-            .adapter
-            .commit_fragment(fragment)
-            .map_err(|error| self.0.rejected(FieldPath::root("commit_fragment"), &error))?;
-        self.0.encode_commit_fragment_value(fragment)
+            .envelope(ConnectorCodecCategory::CommitFragment, private))
+    }
+}
+
+impl ConnectorPrivateEncoder<IcebergCommitFragment> for IcebergWriteFragmentEncoder {
+    fn encode_private(
+        &self,
+        fragment: &IcebergCommitFragment,
+    ) -> Result<Bytes, ConnectorCodecError> {
+        let bytes = self
+            .0
+            .encode_commit_fragment_value(fragment)
+            .map(|value| Bytes::from(value.encode_to_vec()))
+            .map_err(spi_codec_error)?;
+        if bytes.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
+            return Err(ConnectorCodecError::new(
+                ConnectorFieldPath::root("commit_fragment").field("iceberg"),
+                ConnectorCodecErrorKind::Capacity,
+                "Iceberg commit fragment exceeds its hard byte limit",
+            ));
+        }
+        Ok(bytes)
     }
 }
 
@@ -1016,30 +1111,85 @@ impl IcebergWriteFragmentDecoder {
     }
 }
 
-impl ConnectorWriteFragmentDecoder for IcebergWriteFragmentDecoder {
+impl ConnectorWriteFragmentWireDecoder for IcebergWriteFragmentDecoder {
     fn owner(&self) -> &str {
         &self.0.owner
     }
 
-    fn decode_commit_fragment(
+    fn decode_commit_fragment_payload(
         &self,
-        fragment: &ValidatedCommitFragment,
-    ) -> Result<ConnectorCommitFragment, ConnectorWriteCodecError> {
-        let value = self.0.decode_commit_fragment_value(fragment)?;
+        envelope: &ConnectorEncodedPayload,
+    ) -> Result<ConnectorCommitFragment, ConnectorCodecError> {
+        let mut ledger = ConnectorDecodeLedger::new(IcebergWriteCodec::decode_limits(
+            MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES,
+        ));
+        let mut context = ConnectorDecodeContext::new(envelope.header(), &mut ledger);
+        let value = self.decode_private(envelope.payload(), &mut context)?;
         Ok(self.0.adapter.wrap_commit_fragment(value))
     }
+}
+
+impl ConnectorPrivateDecoder<IcebergCommitFragment> for IcebergWriteFragmentDecoder {
+    fn decode_private(
+        &self,
+        payload: &[u8],
+        context: &mut ConnectorDecodeContext<'_>,
+    ) -> Result<IcebergCommitFragment, ConnectorCodecError> {
+        self.0
+            .validate_private_header(context, ConnectorCodecCategory::CommitFragment)?;
+        let value = crate::wire::write::decode_commit_fragment(payload, context)?;
+        self.0
+            .decode_commit_fragment_value(&value)
+            .map_err(spi_codec_error)
+    }
+}
+
+fn spi_codec_error(error: ConnectorWriteCodecError) -> ConnectorCodecError {
+    let protocol = error.protocol();
+    let mut segments = protocol.path().segments().iter();
+    let first = match segments.next() {
+        Some(novarocks_proto_codec::FieldPathSegment::Field(value)) => *value,
+        _ => "connector_payload",
+    };
+    let mut path = ConnectorFieldPath::root(first);
+    for segment in segments {
+        path = match segment {
+            novarocks_proto_codec::FieldPathSegment::Field(value) => path.field(*value),
+            novarocks_proto_codec::FieldPathSegment::Index(value) => path.index(*value),
+            novarocks_proto_codec::FieldPathSegment::MapKey(value) => path.map_key(value),
+        };
+    }
+    let kind = match protocol.kind() {
+        ProtocolErrorKind::MissingField => ConnectorCodecErrorKind::MissingField,
+        ProtocolErrorKind::InvalidEnum => ConnectorCodecErrorKind::InvalidEnum,
+        ProtocolErrorKind::DuplicateField => ConnectorCodecErrorKind::DuplicateField,
+        ProtocolErrorKind::InconsistentFields | ProtocolErrorKind::Conflict => {
+            ConnectorCodecErrorKind::InconsistentFields
+        }
+        ProtocolErrorKind::Unsupported => ConnectorCodecErrorKind::Unsupported,
+        ProtocolErrorKind::Capacity | ProtocolErrorKind::OutOfRange => {
+            ConnectorCodecErrorKind::Capacity
+        }
+        ProtocolErrorKind::VersionMismatch => ConnectorCodecErrorKind::VersionMismatch,
+        ProtocolErrorKind::InvalidValue => ConnectorCodecErrorKind::InvalidValue,
+    };
+    ConnectorCodecError::new(path, kind, protocol.detail())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use novarocks_proto_codec::ProtocolErrorKind;
+    use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_proto_codec::connector_write::{
-        MAX_COMMIT_FRAGMENT_ENCODED_BYTES, MAX_WRITER_HANDLE_ENCODED_BYTES,
+        ConnectorWriteFragmentDecoder, ConnectorWriteFragmentEncoder, ConnectorWriteHandleDecoder,
+        ConnectorWriteHandleEncoder, ValidatedCommitFragment, ValidatedWriterHandle,
     };
+    use novarocks_proto_models::connector_write as public_dto;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorProviderId,
+        CatalogHandle, CatalogVersion, ConnectorDecodeContext, ConnectorDecodeLedger,
+        ConnectorDecodeLimits, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorProviderId,
     };
 
     use crate::commit::write_stack::runtime::build_write_adapter;
@@ -1077,6 +1227,86 @@ mod tests {
             fragment_decoder: IcebergWriteFragmentDecoder::new(adapter.clone()),
             adapter,
         }
+    }
+
+    fn private_header(
+        catalog: &str,
+        version: u8,
+        category: ConnectorCodecCategory,
+    ) -> ConnectorEnvelopeHeader {
+        ConnectorEnvelopeHeader::new(
+            ConnectorProviderId::parse(crate::PROVIDER_ID).expect("provider id"),
+            CatalogHandle::new(
+                ConnectorInstanceId::parse(catalog).expect("catalog id"),
+                CatalogVersion::from_bytes([version; 32]),
+            ),
+            category,
+            ConnectorCodecRevision::try_new(crate::wire::write::WRITE_CODEC_REVISION)
+                .expect("revision"),
+        )
+    }
+
+    fn private_limits() -> ConnectorDecodeLimits {
+        ConnectorDecodeLimits::try_new(
+            MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+            MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+            MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+            1_000_000,
+            64,
+        )
+        .expect("private codec limits")
+    }
+
+    fn decode_private_handle(
+        facets: &Facets,
+        payload: &[u8],
+        limits: ConnectorDecodeLimits,
+    ) -> Result<IcebergWriterHandle, ConnectorCodecError> {
+        let header = private_header("catalog.iceberg", 1, ConnectorCodecCategory::WriteHandle);
+        let mut ledger = ConnectorDecodeLedger::new(limits);
+        let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+        facets.handle_decoder.decode_private(payload, &mut context)
+    }
+
+    fn decode_private_fragment(
+        facets: &Facets,
+        payload: &[u8],
+    ) -> Result<IcebergCommitFragment, ConnectorCodecError> {
+        let header = private_header("catalog.iceberg", 1, ConnectorCodecCategory::CommitFragment);
+        let mut ledger = ConnectorDecodeLedger::new(private_limits());
+        let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+        facets
+            .fragment_decoder
+            .decode_private(payload, &mut context)
+    }
+
+    fn push_varint(bytes: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let next = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                bytes.push(next);
+                return;
+            }
+            bytes.push(next | 0x80);
+        }
+    }
+
+    fn push_length_delimited(bytes: &mut Vec<u8>, field: u32, value: &[u8]) {
+        push_varint(bytes, u64::from((field << 3) | 2));
+        push_varint(bytes, value.len() as u64);
+        bytes.extend_from_slice(value);
+    }
+
+    fn writer_with_raw_table(handle: &IcebergWriterHandle, table: Vec<u8>) -> Vec<u8> {
+        let codec = IcebergWriteCodec::new(adapter("catalog.iceberg", 1));
+        let mut private = codec
+            .encode_writer_handle_value(handle)
+            .expect("private handle");
+        private.table = None;
+        let mut bytes = private.encode_to_vec();
+        push_length_delimited(&mut bytes, 2, &table);
+        bytes
     }
 
     fn generation() -> Facets {
@@ -1223,14 +1453,44 @@ mod tests {
         )
     }
 
-    fn parse_handle(raw: dto::ConnectorWriterHandle) -> ValidatedWriterHandle {
+    fn parse_handle(raw: public_dto::ConnectorWriterHandle) -> ValidatedWriterHandle {
         ValidatedWriterHandle::parse(raw, FieldPath::root("writer_handle"))
             .expect("the encoder produces a structurally valid carrier")
     }
 
-    fn parse_fragment(raw: dto::ConnectorCommitFragment) -> ValidatedCommitFragment {
+    fn parse_fragment(raw: public_dto::ConnectorCommitFragment) -> ValidatedCommitFragment {
         ValidatedCommitFragment::parse(raw, FieldPath::root("commit_fragment"))
             .expect("the encoder produces a structurally valid carrier")
+    }
+
+    fn mutate_private_handle(
+        raw: public_dto::ConnectorWriterHandle,
+        mutate: impl FnOnce(&mut dto::IcebergWriterHandle),
+    ) -> public_dto::ConnectorWriterHandle {
+        let envelope = parse_handle(raw).into_provider_payload();
+        let (header, payload) = envelope.into_parts();
+        let mut private = dto::IcebergWriterHandle::decode(payload).expect("private handle");
+        mutate(&mut private);
+        public_dto::ConnectorWriterHandle {
+            provider_payload: Some(encode_connector_payload_message(
+                &ConnectorEncodedPayload::new(header, Bytes::from(private.encode_to_vec())),
+            )),
+        }
+    }
+
+    fn mutate_private_fragment(
+        raw: public_dto::ConnectorCommitFragment,
+        mutate: impl FnOnce(&mut dto::IcebergCommitFragment),
+    ) -> public_dto::ConnectorCommitFragment {
+        let envelope = parse_fragment(raw).into_provider_payload();
+        let (header, payload) = envelope.into_parts();
+        let mut private = dto::IcebergCommitFragment::decode(payload).expect("private fragment");
+        mutate(&mut private);
+        public_dto::ConnectorCommitFragment {
+            provider_payload: Some(encode_connector_payload_message(
+                &ConnectorEncodedPayload::new(header, Bytes::from(private.encode_to_vec())),
+            )),
+        }
     }
 
     fn assert_same_handle(left: &IcebergWriterHandle, right: &IcebergWriterHandle) {
@@ -1284,8 +1544,23 @@ mod tests {
                 assert_eq!(left.content_range(), right.content_range());
                 assert_eq!(left.cardinality(), right.cardinality());
             }
+            (
+                IcebergCommitArtifact::EqualityDeleteFile(left),
+                IcebergCommitArtifact::EqualityDeleteFile(right),
+            ) => {
+                assert_eq!(left.equality_field_ids(), right.equality_field_ids());
+            }
             _ => panic!("the recovered fragment describes another artifact kind"),
         }
+    }
+
+    fn assert_public_provider_error_path(error: &ConnectorWriteCodecError, private_path: &str) {
+        assert_eq!(error.protocol().path().to_string(), "provider_payload");
+        assert!(
+            error.protocol().detail().contains(private_path),
+            "public provider_payload error must retain private path `{private_path}` in its detail: {}",
+            error.protocol().detail()
+        );
     }
 
     /// Encode, validate, decode, and prove the recovered value is the original.
@@ -1351,10 +1626,266 @@ mod tests {
     #[test]
     fn every_facet_names_its_own_generation_as_the_owner() {
         let facets = generation();
-        assert_eq!(facets.handle_encoder.owner(), "catalog.iceberg");
-        assert_eq!(facets.handle_decoder.owner(), "catalog.iceberg");
-        assert_eq!(facets.fragment_encoder.owner(), "catalog.iceberg");
-        assert_eq!(facets.fragment_decoder.owner(), "catalog.iceberg");
+        assert_eq!(
+            ConnectorWriteHandleWireEncoder::owner(&facets.handle_encoder),
+            "catalog.iceberg"
+        );
+        assert_eq!(
+            ConnectorWriteHandleWireDecoder::owner(&facets.handle_decoder),
+            "catalog.iceberg"
+        );
+        assert_eq!(
+            ConnectorWriteFragmentWireEncoder::owner(&facets.fragment_encoder),
+            "catalog.iceberg"
+        );
+        assert_eq!(
+            ConnectorWriteFragmentWireDecoder::owner(&facets.fragment_decoder),
+            "catalog.iceberg"
+        );
+    }
+
+    #[test]
+    fn provider_private_four_direction_facets_cover_every_recipe_and_artifact() {
+        let facets = generation();
+        for handle in [
+            data_handle(),
+            delete_handle(IcebergWriteBranch::PositionDelete),
+            delete_handle(IcebergWriteBranch::DeletionVector),
+            IcebergWriterHandle::try_new_equality_delete(
+                table_facts(),
+                IcebergWriterOutput::try_new(IcebergFileFormat::Parquet, Compression::SNAPPY, None)
+                    .expect("output"),
+                equality_delete_recipe(),
+            )
+            .expect("equality-delete handle"),
+        ] {
+            let bytes = facets
+                .handle_encoder
+                .encode_private(&handle)
+                .expect("private FE -> BE encoding");
+            let recovered = decode_private_handle(&facets, &bytes, private_limits())
+                .expect("private BE decode");
+            assert_same_handle(&handle, &recovered);
+        }
+
+        let equality = IcebergCommitFragment::equality_delete_file(
+            IcebergEqualityDeleteFileArtifact::try_new(
+                "s3://b/wh/db/t/data/_staging/eq-private.parquet".to_string(),
+                unpartitioned(),
+                sample_metrics(3, 128),
+                vec![1, 4],
+            )
+            .expect("equality artifact"),
+        );
+        for fragment in [
+            data_file_fragment(),
+            position_delete_fragment(),
+            deletion_vector_fragment(),
+            equality,
+        ] {
+            let bytes = facets
+                .fragment_encoder
+                .encode_private(&fragment)
+                .expect("private BE -> FE encoding");
+            let recovered = decode_private_fragment(&facets, &bytes).expect("private FE decode");
+            assert_same_fragment(&fragment, &recovered);
+        }
+    }
+
+    #[test]
+    fn private_decoder_rejects_wrong_binding_category_and_revision_before_payload_walk() {
+        let facets = generation();
+        let bytes = facets
+            .handle_encoder
+            .encode_private(&data_handle())
+            .expect("private handle");
+        for header in [
+            private_header("catalog.other", 1, ConnectorCodecCategory::WriteHandle),
+            private_header("catalog.iceberg", 1, ConnectorCodecCategory::CommitFragment),
+            ConnectorEnvelopeHeader::new(
+                ConnectorProviderId::parse(crate::PROVIDER_ID).expect("provider"),
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("catalog.iceberg").expect("catalog"),
+                    CatalogVersion::from_bytes([1; 32]),
+                ),
+                ConnectorCodecCategory::WriteHandle,
+                ConnectorCodecRevision::try_new(2).expect("revision"),
+            ),
+        ] {
+            let mut ledger = ConnectorDecodeLedger::new(private_limits());
+            let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+            assert!(
+                facets
+                    .handle_decoder
+                    .decode_private(&bytes, &mut context)
+                    .is_err()
+            );
+            assert_eq!(ledger.raw_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn private_raw_scan_rejects_root_and_nested_shape_loss_before_prost_decode() {
+        let facets = generation();
+        let valid = facets
+            .handle_encoder
+            .encode_private(&data_handle())
+            .expect("private handle");
+
+        let mut unknown_root = valid.to_vec();
+        push_varint(&mut unknown_root, 7 << 3);
+        push_varint(&mut unknown_root, 0);
+        assert_eq!(
+            decode_private_handle(&facets, &unknown_root, private_limits())
+                .expect_err("unknown root field")
+                .kind(),
+            ConnectorCodecErrorKind::UnknownField
+        );
+
+        let codec = IcebergWriteCodec::new(adapter("catalog.iceberg", 1));
+        let table = codec.encode_table(data_handle().table());
+
+        let mut duplicate_nested = table.encode_to_vec();
+        push_length_delimited(&mut duplicate_nested, 1, b"duplicate-uuid");
+        assert_eq!(
+            decode_private_handle(
+                &facets,
+                &writer_with_raw_table(&data_handle(), duplicate_nested),
+                private_limits(),
+            )
+            .expect_err("duplicate nested singular")
+            .kind(),
+            ConnectorCodecErrorKind::DuplicateField
+        );
+
+        let mut unknown_nested = table.encode_to_vec();
+        push_varint(&mut unknown_nested, 12 << 3);
+        push_varint(&mut unknown_nested, 0);
+        assert_eq!(
+            decode_private_handle(
+                &facets,
+                &writer_with_raw_table(&data_handle(), unknown_nested),
+                private_limits(),
+            )
+            .expect_err("unknown nested field")
+            .kind(),
+            ConnectorCodecErrorKind::UnknownField
+        );
+
+        let mut wrong_wire = table.encode_to_vec();
+        push_varint(&mut wrong_wire, 1 << 3);
+        push_varint(&mut wrong_wire, 7);
+        assert_eq!(
+            decode_private_handle(
+                &facets,
+                &writer_with_raw_table(&data_handle(), wrong_wire),
+                private_limits(),
+            )
+            .expect_err("wrong nested wire type")
+            .kind(),
+            ConnectorCodecErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
+    fn private_decode_budgets_are_independent() {
+        let facets = generation();
+        let bytes = facets
+            .handle_encoder
+            .encode_private(&data_handle())
+            .expect("private handle");
+        let cases = [
+            ConnectorDecodeLimits::try_new(bytes.len() - 1, usize::MAX, usize::MAX, usize::MAX, 64)
+                .expect("raw"),
+            ConnectorDecodeLimits::try_new(bytes.len(), 1, usize::MAX, usize::MAX, 64)
+                .expect("retained"),
+            ConnectorDecodeLimits::try_new(bytes.len(), usize::MAX, 1, usize::MAX, 64)
+                .expect("scalar"),
+            ConnectorDecodeLimits::try_new(bytes.len(), usize::MAX, usize::MAX, 1, 64)
+                .expect("items"),
+            ConnectorDecodeLimits::try_new(bytes.len(), usize::MAX, usize::MAX, usize::MAX, 1)
+                .expect("depth"),
+        ];
+        for limits in cases {
+            assert_eq!(
+                decode_private_handle(&facets, &bytes, limits)
+                    .expect_err("one independent budget must reject")
+                    .kind(),
+                ConnectorCodecErrorKind::Capacity
+            );
+        }
+    }
+
+    #[test]
+    fn optional_old_delete_record_count_preserves_presence_before_domain_validation() {
+        let facets = generation();
+        let codec = IcebergWriteCodec::new(adapter("catalog.iceberg", 1));
+        let mut private = codec
+            .encode_writer_handle_value(&delete_handle(IcebergWriteBranch::PositionDelete))
+            .expect("private handle");
+        private
+            .old_deletes
+            .values_mut()
+            .next()
+            .expect("target")
+            .references
+            .first_mut()
+            .expect("reference")
+            .record_count = None;
+        let none_bytes = private.encode_to_vec();
+        let header = private_header("catalog.iceberg", 1, ConnectorCodecCategory::WriteHandle);
+        let mut ledger = ConnectorDecodeLedger::new(private_limits());
+        let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+        let parsed = crate::wire::write::decode_writer_handle(&none_bytes, &mut context)
+            .expect("unknown count remains legal");
+        assert_eq!(
+            parsed.old_deletes.values().next().unwrap().references[0].record_count,
+            None
+        );
+
+        private
+            .old_deletes
+            .values_mut()
+            .next()
+            .expect("target")
+            .references
+            .first_mut()
+            .expect("reference")
+            .record_count = Some(0);
+        let zero_bytes = private.encode_to_vec();
+        let mut ledger = ConnectorDecodeLedger::new(private_limits());
+        let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+        let parsed = crate::wire::write::decode_writer_handle(&zero_bytes, &mut context)
+            .expect("protobuf presence preserves a claimed zero");
+        assert_eq!(
+            parsed.old_deletes.values().next().unwrap().references[0].record_count,
+            Some(0)
+        );
+        let error = decode_private_handle(&facets, &zero_bytes, private_limits())
+            .expect_err("the existing domain invariant rejects a claimed zero");
+        assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        assert!(error.detail().contains("must be positive"));
+    }
+
+    #[test]
+    fn private_descriptor_contains_write_types_under_the_iceberg_namespace() {
+        for name in [
+            b"IcebergWriterHandle".as_slice(),
+            b"IcebergCommitFragment".as_slice(),
+        ] {
+            assert!(
+                crate::wire::FILE_DESCRIPTOR_SET
+                    .windows(name.len())
+                    .any(|window| window == name),
+                "private descriptor is missing {}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        assert!(
+            !crate::wire::FILE_DESCRIPTOR_SET
+                .windows(b"novarocks.connector_write".len())
+                .any(|window| window == b"novarocks.connector_write")
+        );
     }
 
     #[test]
@@ -1420,7 +1951,7 @@ mod tests {
             .encode_writer_handle(&handle)
             .expect_err("a foreign generation's handle");
         assert_eq!(error.owner(), "catalog.iceberg");
-        assert_eq!(error.protocol().path().to_string(), "writer_handle");
+        assert_public_provider_error_path(&error, "writer_handle");
         assert!(
             error
                 .protocol()
@@ -1433,24 +1964,27 @@ mod tests {
             .fragment_encoder
             .encode_commit_fragment(&fragment)
             .expect_err("a foreign generation's fragment");
-        assert_eq!(error.protocol().path().to_string(), "commit_fragment");
+        assert_public_provider_error_path(&error, "commit_fragment");
     }
 
     #[test]
-    fn a_decoded_value_belongs_only_to_the_generation_that_decoded_it() {
+    fn a_carrier_can_only_be_decoded_by_the_generation_that_encoded_it() {
         let mine = generation();
         let theirs = facets("catalog.iceberg", 2);
         let raw = mine
             .handle_encoder
             .encode_writer_handle(&mine.adapter.wrap_writer_handle(data_handle()))
             .expect("encode");
-        let decoded = theirs
+        let error = theirs
             .handle_decoder
             .decode_writer_handle(&parse_handle(raw))
-            .expect("another generation may decode the same canonical carrier");
-
-        assert!(theirs.adapter.writer_handle(&decoded).is_ok());
-        assert!(mine.adapter.writer_handle(&decoded).is_err());
+            .expect_err("another generation must reject the envelope");
+        assert_eq!(
+            error.protocol().kind(),
+            ProtocolErrorKind::InconsistentFields
+        );
+        assert_public_provider_error_path(&error, "header.catalog");
+        assert!(error.protocol().detail().contains("catalog"));
     }
 
     #[test]
@@ -1460,7 +1994,7 @@ mod tests {
         // A Puffin writer carrying a Parquet row-group size: the carrier can
         // state both, and only `IcebergWriterOutput::try_new` knows the pairing
         // is a contradiction.
-        let mut raw = facets
+        let raw = facets
             .handle_encoder
             .encode_writer_handle(
                 &facets
@@ -1468,22 +2002,19 @@ mod tests {
                     .wrap_writer_handle(delete_handle(IcebergWriteBranch::DeletionVector)),
             )
             .expect("encode");
-        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-            raw.handle.as_mut().expect("variant");
-        iceberg
-            .output
-            .as_mut()
-            .expect("output")
-            .parquet_row_group_size_bytes = Some(4096);
+        let raw = mutate_private_handle(raw, |iceberg| {
+            iceberg
+                .output
+                .as_mut()
+                .expect("output")
+                .parquet_row_group_size_bytes = Some(4096);
+        });
         let error = facets
             .handle_decoder
             .decode_writer_handle(&parse_handle(raw))
             .expect_err("a Puffin writer with a Parquet row group size");
         assert_eq!(error.protocol().kind(), ProtocolErrorKind::InvalidValue);
-        assert_eq!(
-            error.protocol().path().to_string(),
-            "writer_handle.iceberg.output"
-        );
+        assert_public_provider_error_path(&error, "writer_handle.iceberg.output");
         assert!(
             error
                 .protocol()
@@ -1492,7 +2023,7 @@ mod tests {
         );
 
         // A merge target frozen against a snapshot the session is not based on.
-        let mut raw = facets
+        let raw = facets
             .handle_encoder
             .encode_writer_handle(
                 &facets
@@ -1500,18 +2031,18 @@ mod tests {
                     .wrap_writer_handle(delete_handle(IcebergWriteBranch::PositionDelete)),
             )
             .expect("encode");
-        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
-            raw.handle.as_mut().expect("variant");
-        iceberg
-            .old_deletes
-            .get_mut("s3://b/wh/db/t/data/a.parquet")
-            .expect("target")
-            .base_snapshot_id = 78;
+        let raw = mutate_private_handle(raw, |iceberg| {
+            iceberg
+                .old_deletes
+                .get_mut("s3://b/wh/db/t/data/a.parquet")
+                .expect("target")
+                .base_snapshot_id = 78;
+        });
         let error = facets
             .handle_decoder
             .decode_writer_handle(&parse_handle(raw))
             .expect_err("a target frozen against another snapshot");
-        assert_eq!(error.protocol().path().to_string(), "writer_handle.iceberg");
+        assert_public_provider_error_path(&error, "writer_handle.iceberg");
         assert!(
             error
                 .protocol()
@@ -1520,7 +2051,7 @@ mod tests {
         );
 
         // A deletion vector whose cardinality disagrees with its record count.
-        let mut raw = facets
+        let raw = facets
             .fragment_encoder
             .encode_commit_fragment(
                 &facets
@@ -1528,23 +2059,23 @@ mod tests {
                     .wrap_commit_fragment(deletion_vector_fragment()),
             )
             .expect("encode");
-        let dto::connector_commit_fragment::Fragment::Iceberg(iceberg) =
-            raw.fragment.as_mut().expect("variant");
-        let Some(dto::iceberg_commit_fragment::Artifact::DeletionVector(vector)) =
-            iceberg.artifact.as_mut()
-        else {
-            unreachable!("deletion vector fixture")
-        };
-        vector.cardinality = 2;
+        let raw = mutate_private_fragment(raw, |iceberg| {
+            let Some(dto::iceberg_commit_fragment::Artifact::DeletionVector(vector)) =
+                iceberg.artifact.as_mut()
+            else {
+                unreachable!("deletion vector fixture")
+            };
+            vector.cardinality = 2;
+        });
         let error = facets
             .fragment_decoder
             .decode_commit_fragment(&parse_fragment(raw))
             .expect_err("a deletion vector that disagrees with itself");
-        assert_eq!(error.protocol().kind(), ProtocolErrorKind::Conflict);
         assert_eq!(
-            error.protocol().path().to_string(),
-            "commit_fragment.iceberg.deletion_vector"
+            error.protocol().kind(),
+            ProtocolErrorKind::InconsistentFields
         );
+        assert_public_provider_error_path(&error, "commit_fragment.iceberg.deletion_vector");
         assert!(
             error
                 .protocol()
@@ -1572,10 +2103,7 @@ mod tests {
             .handle_encoder
             .encode_writer_handle(&facets.adapter.wrap_writer_handle(handle))
             .expect_err("a non-default gzip level");
-        assert_eq!(
-            error.protocol().path().to_string(),
-            "writer_handle.iceberg.output.compression"
-        );
+        assert_public_provider_error_path(&error, "writer_handle.iceberg.output.compression");
         assert!(error.protocol().detail().contains("cannot express"));
     }
 
@@ -1594,19 +2122,12 @@ mod tests {
         )
         .expect("handle");
         let neutral = facets.adapter.wrap_writer_handle(handle);
-        let bytes = facets
-            .handle_encoder
-            .canonical_writer_handle_bytes(&neutral)
-            .expect("encode");
-        assert!(bytes.len() > MAX_WRITER_HANDLE_ENCODED_BYTES);
-        let raw = facets
+        let error = facets
             .handle_encoder
             .encode_writer_handle(&neutral)
-            .expect("encode");
-        let error = ValidatedWriterHandle::parse(raw, FieldPath::root("writer_handle"))
             .expect_err("an oversized writer handle");
-        assert_eq!(error.kind(), ProtocolErrorKind::OutOfRange);
-        assert_eq!(error.path().to_string(), "writer_handle");
+        assert_eq!(error.protocol().kind(), ProtocolErrorKind::Capacity);
+        assert_public_provider_error_path(&error, "writer_handle.iceberg");
 
         // One path past the 1 MiB commit-fragment bound.
         let huge = format!("/wh/db/t/data/{}.parquet", "x".repeat(1024 * 1024 + 16));
@@ -1621,19 +2142,12 @@ mod tests {
             .expect("data file"),
         );
         let neutral = facets.adapter.wrap_commit_fragment(fragment);
-        let bytes = facets
-            .fragment_encoder
-            .canonical_commit_fragment_bytes(&neutral)
-            .expect("encode");
-        assert!(bytes.len() > MAX_COMMIT_FRAGMENT_ENCODED_BYTES);
-        let raw = facets
+        let error = facets
             .fragment_encoder
             .encode_commit_fragment(&neutral)
-            .expect("encode");
-        let error = ValidatedCommitFragment::parse(raw, FieldPath::root("commit_fragment"))
             .expect_err("an oversized commit fragment");
-        assert_eq!(error.kind(), ProtocolErrorKind::OutOfRange);
-        assert_eq!(error.path().to_string(), "commit_fragment");
+        assert_eq!(error.protocol().kind(), ProtocolErrorKind::Capacity);
+        assert_public_provider_error_path(&error, "commit_fragment.iceberg");
     }
     fn unpartitioned() -> IcebergArtifactPartition {
         IcebergArtifactPartition::try_new(

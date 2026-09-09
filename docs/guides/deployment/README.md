@@ -56,10 +56,10 @@ application role 或生产拓扑。
 
 ## standalone部署
 
-all-in-one 部署使用单个 NovaRocks 进程并发运行完整 native FE/BE role runner。它适合快速验证 external Iceberg catalog、SQL 功能和本地测试环境；它不提供内部 StarRocks 表类型，也不绕过 Native gRPC、StateStore、topology 或 listener 路径。
+all-in-one 部署使用单个 NovaRocks 进程并发运行完整 native FE/BE role runner。它适合快速验证 external Iceberg/Paimon catalog、SQL 功能和本地测试环境；它不绕过 Native gRPC、StateStore、topology 或 listener 路径。
 
 阅读：[standalone部署](standalone.md)
 
-## StarRocks 外部 Connector
+## Connector provider
 
-StarRocks 不是 NovaRocks 的 server 角色。它以只读 external Connector 接入：RPC 读取支持所有 StarRocks 拓扑，direct 读取永久只支持 shared-data。Connector 的 control 与 execution binding 由 native FE/BE host 装配，不需要 StarRocks FE、BE 兼容协议或 thirdparty 工具链。
+当前二进制的封闭 provider 集合只有 Iceberg 与 Paimon。Iceberg 保留现有读写能力；Paimon 首期只读，支持 Filesystem Catalog 上的 append-only 与 `deduplicate` 主键表快照。StarRocks 已废弃，没有 active read capability；部署中出现旧 `[connector.starrocks]` 配置会在 Server 解析阶段明确失败，不会被静默忽略。Paimon 的详细范围与外部 snapshot 保留前提见 [Paimon 只读 Connector](../connectors/paimon.md)。

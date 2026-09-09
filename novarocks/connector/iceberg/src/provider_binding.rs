@@ -148,10 +148,7 @@ mod tests {
                 .declaration(&context)
                 .expect("provider binding");
 
-        assert_eq!(
-            binding.provider_kind(),
-            novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg
-        );
+        assert_eq!(binding.provider_id().as_str(), "iceberg");
         assert_eq!(
             prepare_iceberg_execution_binding(&binding)
                 .expect("typed provider binding")

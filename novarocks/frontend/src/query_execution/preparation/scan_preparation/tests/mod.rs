@@ -172,7 +172,7 @@ fn fixture_control_role_host(
                 &control,
             )),
         );
-        let properties = novarocks_connector_binding::NormalizedCatalogProperties::try_new(
+        let properties = novarocks_spi::connector::NormalizedCatalogProperties::try_new(
             lease
                 .binding()
                 .catalog_properties()
@@ -180,17 +180,15 @@ fn fixture_control_role_host(
                 .clone(),
         )
         .expect("fixture normalized properties");
-        let role = novarocks_connector_binding::ConnectorControlRoleBinding::try_new(
+        let role = novarocks_spi::connector::ConnectorControlRoleBinding::try_new(
             properties,
             Arc::clone(lease.binding()),
-            Some(
-                novarocks_connector_binding::ConnectorControlReadBinding::new(
-                    Arc::clone(&adapter) as _,
-                    adapter as _,
-                    None,
-                    Arc::new(FixtureReadCodec),
-                ),
-            ),
+            Some(novarocks_spi::connector::ConnectorControlReadBinding::new(
+                Arc::clone(&adapter) as _,
+                adapter as _,
+                None,
+                Arc::new(FixtureReadCodec),
+            )),
             None,
         )
         .expect("fixture control role binding");
@@ -470,47 +468,47 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
 /// must never invoke a codec before native egress.
 struct FixtureReadCodec;
 
-impl novarocks_proto_codec::connector_read::ConnectorReadEncoder for FixtureReadCodec {
+impl novarocks_spi::connector::ConnectorReadWireEncoder for FixtureReadCodec {
     fn owner(&self) -> &str {
         "fixture"
     }
 
-    fn encode_relation(
+    fn encode_relation_payload(
         &self,
         _relation: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
     ) -> Result<
-        novarocks_proto_models::connector_read::CatalogTableHandle,
-        novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        novarocks_spi::connector::ConnectorReadRelationPayload,
+        novarocks_spi::connector::ConnectorCodecError,
     > {
         unreachable!("scan preparation fixture must not encode wire relations")
     }
 
-    fn encode_column(
+    fn encode_column_payload(
         &self,
         _column: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
     ) -> Result<
-        novarocks_proto_models::connector_read::ColumnHandle,
-        novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        novarocks_spi::connector::ConnectorEncodedPayload,
+        novarocks_spi::connector::ConnectorCodecError,
     > {
         unreachable!("scan preparation fixture must not encode wire columns")
     }
 
-    fn encode_transaction(
+    fn encode_transaction_payload(
         &self,
         _transaction: &novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
     ) -> Result<
-        novarocks_proto_models::connector_read::ConnectorTransactionHandle,
-        novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        novarocks_spi::connector::ConnectorEncodedPayload,
+        novarocks_spi::connector::ConnectorCodecError,
     > {
         unreachable!("scan preparation fixture must not encode wire transactions")
     }
 
-    fn encode_split(
+    fn encode_split_payload(
         &self,
         _split: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
     ) -> Result<
-        novarocks_proto_models::connector_read::ConnectorSplit,
-        novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        novarocks_spi::connector::ConnectorReadSplitPayload,
+        novarocks_spi::connector::ConnectorCodecError,
     > {
         unreachable!("scan preparation fixture must not encode wire splits")
     }

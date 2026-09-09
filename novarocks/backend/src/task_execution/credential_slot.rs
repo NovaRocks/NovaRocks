@@ -44,12 +44,12 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use novarocks_execution::task_execution::status::TaskFailureCategory;
-use novarocks_proto_codec::task_execution::domain::{VendedCredentialLease, WireCredential};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorStorageResolver, CredentialLeaseDescriptor,
     CredentialLeaseId, CredentialLeaseProvider, CredentialLeaseSecretEnvelope,
     ResolvedVendedS3Access, StorageAccessRequest, StorageCredentialScopePrefix,
 };
+use novarocks_task_codec::domain::{VendedCredentialLease, WireCredential};
 
 use super::host::HostRejection;
 
@@ -270,13 +270,13 @@ mod tests {
         CredentialLeaseSecretEnvelope, encode_credential_lease_descriptor,
         encode_credential_lease_secret_envelope,
     };
-    use novarocks_proto_codec::task_execution::domain::WireCredential;
     use novarocks_proto_models::novarocks as proto;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
         CredentialLeaseId, CredentialLeaseProvider, StorageAccessDomainId, StorageAccessRequest,
         StorageCredentialScopePrefix,
     };
+    use novarocks_task_codec::domain::WireCredential;
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 

@@ -38,9 +38,9 @@ use std::time::Instant;
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-    RecordBatch, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
-    TimestampNanosecondArray, UInt64Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, RecordBatch, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::datatypes::{Field, FieldRef, Schema as ArrowSchema};
 use novarocks_fs::{
@@ -184,10 +184,12 @@ fn file_predicate_value(value: &ConnectorValue) -> Option<MinMaxPredicateValue> 
         ConnectorValue::Date(value) => Some(MinMaxPredicateValue::Int32(*value)),
         ConnectorValue::TimeMicros(value)
         | ConnectorValue::TimestampMicros(value)
+        | ConnectorValue::TimestampMillis(value)
         | ConnectorValue::TimestampTzMicros(value)
         | ConnectorValue::TimestampNanos(value)
         | ConnectorValue::TimestampTzNanos(value) => Some(MinMaxPredicateValue::Int64(*value)),
         ConnectorValue::TinyInt(_)
+        | ConnectorValue::SmallInt(_)
         | ConnectorValue::Real(_)
         | ConnectorValue::Double(_)
         | ConnectorValue::Decimal { .. }
@@ -1867,6 +1869,9 @@ fn connector_value_at(
                 "iceberg predicate column of {path} is eight-bit, which no iceberg field is"
             )));
         }
+        ConnectorValueType::SmallInt => {
+            ConnectorValue::SmallInt(downcast::<Int16Array>(column, path)?.value(row))
+        }
         ConnectorValueType::Integer => {
             ConnectorValue::Integer(downcast::<Int32Array>(column, path)?.value(row))
         }
@@ -1892,6 +1897,9 @@ fn connector_value_at(
         }
         ConnectorValueType::TimestampMicros => ConnectorValue::TimestampMicros(
             downcast::<TimestampMicrosecondArray>(column, path)?.value(row),
+        ),
+        ConnectorValueType::TimestampMillis => ConnectorValue::TimestampMillis(
+            downcast::<TimestampMillisecondArray>(column, path)?.value(row),
         ),
         ConnectorValueType::TimestampTzMicros => ConnectorValue::TimestampTzMicros(
             downcast::<TimestampMicrosecondArray>(column, path)?.value(row),
@@ -3247,5 +3255,39 @@ mod tests {
             .page_source(&split, &handle, &id_column(&schema))
             .expect("page source");
         let _ = drain_ids(&mut source);
+    }
+
+    #[test]
+    fn row_predicate_values_preserve_int16_and_timestamp_milliseconds() {
+        let small: ArrayRef = Arc::new(Int16Array::from(vec![-32_768, 32_767]));
+        assert_eq!(
+            connector_value_at(&small, ConnectorValueType::SmallInt, 0, "small")
+                .expect("smallint value"),
+            ConnectorValue::SmallInt(i16::MIN)
+        );
+
+        let millis: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![
+            -1_704_067_200_123,
+            1_704_067_200_123,
+        ]));
+        assert_eq!(
+            connector_value_at(
+                &millis,
+                ConnectorValueType::TimestampMillis,
+                1,
+                "created_at",
+            )
+            .expect("millisecond value"),
+            ConnectorValue::TimestampMillis(1_704_067_200_123)
+        );
+        assert!(
+            connector_value_at(
+                &millis,
+                ConnectorValueType::TimestampMicros,
+                0,
+                "created_at",
+            )
+            .is_err()
+        );
     }
 }

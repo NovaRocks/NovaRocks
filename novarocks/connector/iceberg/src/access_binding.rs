@@ -31,9 +31,9 @@ use novarocks_fs::{
 };
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
-    CatalogProviderKind, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
-    ConnectorError, ConnectorErrorKind, ConnectorProviderId, ConnectorRequestContext,
-    StaticCredentialReference, StorageAccessDomainId, StorageAccessRequest,
+    CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind, ConnectorError,
+    ConnectorErrorKind, ConnectorProviderId, ConnectorRequestContext, StaticCredentialReference,
+    StorageAccessDomainId, StorageAccessRequest,
 };
 
 /// Role-local resolver for one exact static object-store credential reference.
@@ -141,7 +141,7 @@ impl IcebergReadBinding {
         credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
         properties: &CatalogProperties,
     ) -> Result<Self, ConnectorError> {
-        if properties.provider_kind() != CatalogProviderKind::Iceberg {
+        if properties.provider_id().as_str() != "iceberg" {
             return Err(invalid(
                 "Iceberg access binding received another provider kind",
             ));
@@ -654,9 +654,9 @@ mod tests {
     use novarocks_fs::{FileCancellation, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
-        ConnectorCancellation, ConnectorInstanceId, ConnectorStorageResolver,
-        CredentialConsumerRole, ResolvedVendedS3Access, StorageAccessRequest,
+        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCancellation,
+        ConnectorInstanceId, ConnectorProviderId, ConnectorStorageResolver, CredentialConsumerRole,
+        ResolvedVendedS3Access, StorageAccessRequest,
     };
 
     struct NeverCancelled;
@@ -692,7 +692,7 @@ mod tests {
                 ConnectorInstanceId::parse("vended-test").expect("catalog"),
                 CatalogVersion::from_bytes([0x61; 32]),
             ),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             vec![
                 CatalogProperty::new("aws.s3.endpoint", "http://minio:9000")

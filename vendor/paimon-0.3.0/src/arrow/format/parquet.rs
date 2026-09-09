@@ -1,0 +1,4392 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::shredding::PhysicalFormatWriterFactory;
+use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
+use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
+use crate::arrow::shredding::map::MapShreddingReadPlan;
+use crate::arrow::shredding::ShreddingReadPlan;
+use crate::arrow::{RowFilter, RowFilterContext};
+use crate::io::{FileRead, OutputFile, ReadControl, ReadReservation};
+use crate::spec::stats::BinaryTableStats;
+use crate::spec::{
+    BinaryRowBuilder, CoreOptions, DataField, DataType, Datum, MetadataStatsMode, Predicate,
+    PredicateOperator,
+};
+use crate::table::{ArrowRecordBatchStream, RowRange};
+use crate::Error;
+use arrow_array::{BooleanArray, RecordBatch};
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter as ParquetRowFilter,
+    RowSelection, RowSelector,
+};
+use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
+use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::metadata::{
+    KeyValue, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::properties::WriterProperties;
+use parquet::file::statistics::Statistics as ParquetStatistics;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::ops::Range;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+pub(crate) struct ParquetFormatReader;
+
+/// Conservative copies charged for one Parquet row-group decode unit: decoded
+/// page workspace, decoder materialization, and the emitted Arrow arrays.
+const PARQUET_DECODE_WORKING_COPIES: u64 = 3;
+/// Per projected value allowance for validity, offsets and decoder bookkeeping.
+const PARQUET_DECODE_VALUE_OVERHEAD: u64 = 16;
+
+fn parquet_decode_unit_bytes(
+    metadata: &ParquetMetaData,
+    projected_columns: usize,
+) -> crate::Result<u64> {
+    let projected_columns = u64::try_from(projected_columns.max(1)).unwrap_or(u64::MAX);
+    metadata
+        .row_groups()
+        .iter()
+        .map(|row_group| {
+            let uncompressed =
+                u64::try_from(row_group.total_byte_size()).map_err(|_| Error::DataInvalid {
+                    message: "Parquet row group declares a negative uncompressed size".to_string(),
+                    source: None,
+                })?;
+            let rows = u64::try_from(row_group.num_rows()).map_err(|_| Error::DataInvalid {
+                message: "Parquet row group declares a negative row count".to_string(),
+                source: None,
+            })?;
+            let page_and_output = uncompressed
+                .checked_mul(PARQUET_DECODE_WORKING_COPIES)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "Parquet decode-unit byte estimate overflow".to_string(),
+                    source: None,
+                })?;
+            let value_overhead = rows
+                .checked_mul(projected_columns)
+                .and_then(|value_count| value_count.checked_mul(PARQUET_DECODE_VALUE_OVERHEAD))
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "Parquet decode-unit value estimate overflow".to_string(),
+                    source: None,
+                })?;
+            page_and_output
+                .checked_add(value_overhead)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "Parquet decode-unit retained estimate overflow".to_string(),
+                    source: None,
+                })
+        })
+        .try_fold(1_u64, |maximum, estimate| {
+            estimate.map(|estimate| maximum.max(estimate.max(1)))
+        })
+}
+
+struct ControlledParquetStream<S> {
+    inner: S,
+    control: Arc<dyn ReadControl>,
+    _decode_unit_reservation: Box<dyn ReadReservation>,
+    terminated: bool,
+}
+
+impl<S> futures::Stream for ControlledParquetStream<S>
+where
+    S: futures::Stream<Item = parquet::errors::Result<RecordBatch>> + Unpin,
+{
+    type Item = parquet::errors::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.terminated {
+            return Poll::Ready(None);
+        }
+        if let Err(error) = this.control.checkpoint() {
+            this.terminated = true;
+            return Poll::Ready(Some(Err(parquet::errors::ParquetError::External(
+                Box::new(error),
+            ))));
+        }
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => match this.control.checkpoint() {
+                Ok(()) => Poll::Ready(Some(Ok(batch))),
+                Err(error) => {
+                    this.terminated = true;
+                    Poll::Ready(Some(Err(parquet::errors::ParquetError::External(
+                        Box::new(error),
+                    ))))
+                }
+            },
+            other => other,
+        }
+    }
+}
+
+struct ParquetRowFilterPredicate {
+    inner: Box<dyn RowFilter>,
+    projection: ProjectionMask,
+}
+
+impl ArrowPredicate for ParquetRowFilterPredicate {
+    fn projection(&self) -> &ProjectionMask {
+        &self.projection
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, arrow_schema::ArrowError> {
+        self.inner.evaluate(batch)
+    }
+}
+
+fn row_filter_required_bytes(
+    projection: &ProjectionMask,
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    metadata: &ParquetMetaData,
+) -> usize {
+    (0..parquet_schema.num_columns())
+        .filter(|leaf_index| projection.leaf_included(*leaf_index))
+        .flat_map(|leaf_index| {
+            metadata
+                .row_groups()
+                .iter()
+                .map(move |row_group| row_group.column(leaf_index).compressed_size())
+        })
+        .filter_map(|size| usize::try_from(size).ok())
+        .fold(0, usize::saturating_add)
+}
+
+/// Parquet implementation of [`FormatFileWriter`].
+/// Streams data directly to storage via `AsyncArrowWriter` + opendal.
+pub(crate) struct ParquetFormatWriter {
+    inner: AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>,
+    /// Physical Arrow schema the writer was created with; re-encoded with the
+    /// shredding field metadata at close time.
+    schema: arrow_schema::SchemaRef,
+    write_fields: Option<Vec<DataField>>,
+    stats_modes: Option<Vec<MetadataStatsMode>>,
+    stats_dense_store: bool,
+}
+
+pub(crate) struct ParquetPhysicalWriterFactory {
+    output: OutputFile,
+    compression: String,
+    zstd_level: i32,
+    format_options: HashMap<String, String>,
+}
+
+impl ParquetPhysicalWriterFactory {
+    pub(crate) fn new(
+        output: &OutputFile,
+        compression: &str,
+        zstd_level: i32,
+        format_options: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            output: output.clone(),
+            compression: compression.to_string(),
+            zstd_level,
+            format_options,
+        }
+    }
+}
+
+#[async_trait]
+impl PhysicalFormatWriterFactory for ParquetPhysicalWriterFactory {
+    async fn create_writer(
+        &mut self,
+        schema: arrow_schema::SchemaRef,
+        write_fields: Option<&[DataField]>,
+    ) -> crate::Result<Box<dyn FormatFileWriter>> {
+        Ok(Box::new(
+            ParquetFormatWriter::new(
+                &self.output,
+                schema,
+                &self.compression,
+                self.zstd_level,
+                write_fields,
+                &self.format_options,
+            )
+            .await?,
+        ))
+    }
+}
+
+impl ParquetFormatWriter {
+    pub(crate) async fn new(
+        output: &OutputFile,
+        schema: arrow_schema::SchemaRef,
+        compression: &str,
+        zstd_level: i32,
+        write_fields: Option<&[DataField]>,
+        format_options: &HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        let async_write = output.async_writer().await?;
+        let codec = parse_compression(compression, zstd_level);
+        let inner = create_parquet_arrow_writer(async_write, schema.clone(), codec)?;
+        let core_options = CoreOptions::new(format_options);
+        let stats_modes = write_fields
+            .map(|fields| core_options.metadata_stats_modes(fields.iter().map(DataField::name)))
+            .transpose()?;
+        Ok(Self {
+            inner,
+            schema,
+            write_fields: write_fields.map(|fields| fields.to_vec()),
+            stats_modes,
+            stats_dense_store: core_options.metadata_stats_dense_store(),
+        })
+    }
+}
+
+fn create_parquet_arrow_writer(
+    async_write: Box<dyn crate::io::AsyncFileWrite>,
+    schema: arrow_schema::SchemaRef,
+    codec: Compression,
+) -> crate::Result<AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>> {
+    let props = WriterProperties::builder().set_compression(codec).build();
+    AsyncArrowWriter::try_new(async_write, schema, Some(props)).map_err(|e| {
+        crate::Error::DataInvalid {
+            message: format!("Failed to create parquet writer: {e}"),
+            source: None,
+        }
+    })
+}
+
+/// Map Paimon `file.compression` value to parquet [`Compression`].
+fn parse_compression(codec: &str, zstd_level: i32) -> Compression {
+    match codec.to_ascii_lowercase().as_str() {
+        "zstd" => {
+            let level = ZstdLevel::try_new(zstd_level).unwrap_or_default();
+            Compression::ZSTD(level)
+        }
+        "lz4" => Compression::LZ4_RAW,
+        "snappy" => Compression::SNAPPY,
+        "gzip" | "gz" => Compression::GZIP(Default::default()),
+        "none" | "uncompressed" => Compression::UNCOMPRESSED,
+        _ => Compression::UNCOMPRESSED,
+    }
+}
+
+#[async_trait]
+impl FormatFileWriter for ParquetFormatWriter {
+    async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+        self.inner
+            .write(batch)
+            .await
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to write parquet batch: {e}"),
+                source: None,
+            })
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.inner.bytes_written() + self.inner.in_progress_size()
+    }
+
+    fn in_progress_size(&self) -> usize {
+        self.inner.in_progress_size()
+    }
+
+    async fn flush(&mut self) -> crate::Result<()> {
+        self.inner
+            .flush()
+            .await
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to flush parquet writer: {e}"),
+                source: None,
+            })
+    }
+
+    fn commit_field_metadata(
+        &mut self,
+        field_metadata: &crate::arrow::shredding::FieldMetadata,
+    ) -> crate::Result<()> {
+        // Re-encode the physical Arrow schema with the shredding metadata
+        // injected into the top-level fields, mirroring Java's
+        // `FormatMetadataUtils.buildArrowSchemaMetadata`: metadata already on
+        // the field (e.g. PARQUET:field_id) wins on key conflict. The updated
+        // schema is appended as a second ARROW:schema entry; readers resolve
+        // duplicate footer keys last-wins (both arrow-rs and parquet-mr), so
+        // it overrides the construction-time schema.
+        let fields: Vec<arrow_schema::FieldRef> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let Some(extra) = field_metadata.get(field.name()) else {
+                    return field.clone();
+                };
+                let mut metadata = extra.clone();
+                metadata.extend(
+                    field
+                        .metadata()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+                Arc::new(field.as_ref().clone().with_metadata(metadata))
+            })
+            .collect();
+        let new_schema =
+            arrow_schema::Schema::new_with_metadata(fields, self.schema.metadata().clone());
+        let encoded = parquet::arrow::encode_arrow_schema(&new_schema);
+        self.inner.append_key_value_metadata(KeyValue::new(
+            parquet::arrow::ARROW_SCHEMA_META_KEY.to_string(),
+            encoded,
+        ));
+        Ok(())
+    }
+
+    async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
+        let metadata = self
+            .inner
+            .finish()
+            .await
+            .map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to close parquet writer: {e}"),
+                source: None,
+            })?;
+        let file_size = self.inner.bytes_written() as u64;
+        if let (Some(write_fields), Some(stats_modes)) = (&self.write_fields, &self.stats_modes) {
+            let (value_stats, value_stats_cols) =
+                extract_value_stats(&metadata, write_fields, stats_modes, self.stats_dense_store);
+            Ok(FormatWriteResult::with_value_stats(
+                file_size,
+                value_stats,
+                value_stats_cols,
+            ))
+        } else {
+            Ok(FormatWriteResult::new(file_size))
+        }
+    }
+}
+
+#[async_trait]
+impl FormatFileReader for ParquetFormatReader {
+    async fn read_batch_stream(
+        &self,
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        read_fields: &[DataField],
+        predicates: Option<&FilePredicates>,
+        batch_size: Option<usize>,
+        row_selection: Option<Vec<RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let arrow_file_reader = ArrowFileReader::new(file_size, reader);
+        let read_control = arrow_file_reader.control.clone();
+
+        let empty_predicates = Vec::new();
+        let (preds, file_fields): (&[Predicate], &[DataField]) = match predicates {
+            Some(fp) => (&fp.predicates, &fp.file_fields),
+            None => (&empty_predicates, &[]),
+        };
+        let row_filter_factory = predicates.and_then(|fp| fp.row_filter_factory.as_deref());
+
+        // Predicates need both indexes for page-stat pruning. Row selection only
+        // needs OffsetIndex so arrow-rs can avoid fetching unselected pages.
+        let mut arrow_options = ArrowReaderOptions::new();
+        if !preds.is_empty() {
+            arrow_options = arrow_options.with_column_index_policy(PageIndexPolicy::Optional);
+        }
+        if !preds.is_empty() || row_selection.is_some() {
+            arrow_options = arrow_options.with_offset_index_policy(PageIndexPolicy::Optional);
+        }
+        let mut batch_stream_builder =
+            ParquetRecordBatchStreamBuilder::new_with_options(arrow_file_reader, arrow_options)
+                .await?;
+
+        let parquet_schema = batch_stream_builder.parquet_schema().clone();
+
+        // Determine whether the Arrow row filter enforces every pushed-down
+        // predicate exactly. It only accepts top-level supported leaves; `Or`,
+        // `Not`, and unsupported leaves fall through to conservative pruning
+        // only, which is NOT exact. When any predicate is not fully enforced we
+        // add a row-level residual backstop over the decoded batch.
+        //
+        // Fast path (the common case, including all-AND-of-simple-leaves): every
+        // predicate is fully enforced, so we decode exactly `read_fields`, skip
+        // the residual pass entirely, and return the stream as before — zero
+        // added overhead.
+        let all_enforced = preds
+            .iter()
+            .all(|p| predicate_fully_enforced_by_row_filter(&parquet_schema, p, file_fields));
+
+        // Residual branch must decode the predicate columns too, or the residual
+        // pass could not see a predicate on a non-projected column (Gap A). The
+        // projection MASK here (which columns to DECODE) is distinct from
+        // `DataFileReader`'s by-name output projection applied downstream.
+        let scan_fields: Vec<DataField> = if all_enforced {
+            read_fields.to_vec()
+        } else {
+            crate::arrow::residual::widen_scan_fields(read_fields, predicates)
+        };
+
+        let root_schema = parquet_schema.root_schema();
+        let root_indices: Vec<usize> = scan_fields
+            .iter()
+            .filter_map(|f| {
+                root_schema
+                    .get_fields()
+                    .iter()
+                    .position(|pf| pf.name() == f.name())
+            })
+            .collect();
+
+        let mask = ProjectionMask::roots(&parquet_schema, root_indices);
+        batch_stream_builder = batch_stream_builder.with_projection(mask);
+
+        let mut decoder_predicates = build_parquet_row_filter(&parquet_schema, preds, file_fields)?
+            .map(ParquetRowFilter::into_predicates)
+            .unwrap_or_default();
+
+        if let Some(factory) = row_filter_factory {
+            let file_schema = batch_stream_builder.schema();
+            match factory.create(RowFilterContext { file_schema }) {
+                Ok(filters) => {
+                    let mut external_predicates = Vec::with_capacity(filters.len());
+                    for filter in filters {
+                        let root_indices = filter
+                            .projection()
+                            .fields()
+                            .iter()
+                            .map(|field| file_schema.index_of(field.name()))
+                            .collect::<Result<Vec<_>, _>>();
+                        let mut root_indices = match root_indices {
+                            Ok(indices) => indices,
+                            Err(error) => {
+                                log::warn!(
+                                    "external row-filter projection does not match Parquet schema: {error}"
+                                );
+                                continue;
+                            }
+                        };
+                        root_indices.sort_unstable();
+                        root_indices.dedup();
+                        let projection = ProjectionMask::roots(&parquet_schema, root_indices);
+                        let required_bytes = row_filter_required_bytes(
+                            &projection,
+                            &parquet_schema,
+                            batch_stream_builder.metadata(),
+                        );
+                        external_predicates.push((
+                            required_bytes,
+                            ParquetRowFilterPredicate {
+                                inner: filter,
+                                projection,
+                            },
+                        ));
+                    }
+                    external_predicates.sort_by_key(|(required_bytes, _)| *required_bytes);
+                    decoder_predicates.extend(
+                        external_predicates
+                            .into_iter()
+                            .map(|(_, predicate)| Box::new(predicate) as Box<dyn ArrowPredicate>),
+                    );
+                }
+                Err(error) => {
+                    // The hook is an optimization. The integration keeps its
+                    // exact post-filter, so a per-file adaptation failure is
+                    // safe to fall back from.
+                    log::warn!("failed to build external Parquet row filter: {error}");
+                }
+            }
+        }
+
+        if !decoder_predicates.is_empty() {
+            batch_stream_builder =
+                batch_stream_builder.with_row_filter(ParquetRowFilter::new(decoder_predicates));
+        }
+
+        let predicate_row_selection = build_predicate_row_selection(
+            batch_stream_builder.metadata().row_groups(),
+            preds,
+            file_fields,
+        )?;
+        let mut combined_selection = predicate_row_selection;
+
+        // Page-level selection. Returns `None` when ColumnIndex / OffsetIndex are
+        // absent (page index not loaded, older files, writer without page index)
+        // or when no page could be skipped, so intersecting is a no-op then.
+        let page_selection =
+            build_predicate_page_selection(batch_stream_builder.metadata(), preds, file_fields)?;
+        combined_selection = intersect_optional_row_selections(combined_selection, page_selection);
+
+        if let Some(ref ranges) = row_selection {
+            let range_selection =
+                build_row_ranges_selection(batch_stream_builder.metadata().row_groups(), ranges);
+            combined_selection =
+                intersect_optional_row_selections(combined_selection, Some(range_selection));
+        }
+        if let Some(sel) = combined_selection {
+            batch_stream_builder = batch_stream_builder.with_row_selection(sel);
+        }
+        if let Some(size) = batch_size {
+            batch_stream_builder = batch_stream_builder.with_batch_size(size);
+        }
+
+        // MAP shared-shredding read plan, built from the per-field metadata
+        // committed into the file footer at write time. `None` when no scanned
+        // field is shared-shredded. Assembly must happen before any residual
+        // predicate evaluation so predicates see logical MAP columns.
+        let map_read_plan =
+            MapShreddingReadPlan::create(&scan_fields, batch_stream_builder.schema())?
+                .map(Arc::new);
+
+        let decode_unit_reservation = match &read_control {
+            Some(control) => {
+                control.checkpoint()?;
+                let bytes = parquet_decode_unit_bytes(
+                    batch_stream_builder.metadata(),
+                    parquet_schema.num_columns(),
+                )?;
+                Some(control.try_reserve(bytes)?)
+            }
+            None => None,
+        };
+        let batch_stream = batch_stream_builder.build()?;
+        let batch_stream = match (read_control, decode_unit_reservation) {
+            (Some(control), Some(reservation)) => ControlledParquetStream {
+                inner: batch_stream,
+                control,
+                _decode_unit_reservation: reservation,
+                terminated: false,
+            }
+            .boxed(),
+            _ => batch_stream.boxed(),
+        };
+
+        if all_enforced {
+            // Fast path: the row filter enforced every predicate exactly during
+            // decode. Return the stream directly — no residual pass.
+            let stream = batch_stream.map(|r| r.map_err(Error::from));
+            return Ok(match &map_read_plan {
+                Some(plan) => {
+                    let plan = plan.clone();
+                    stream
+                        .map(move |r| r.and_then(|batch| plan.assemble_batch(&batch)))
+                        .boxed()
+                }
+                None => stream.boxed(),
+            });
+        }
+
+        // Residual backstop: at least one predicate (`Or`/`Not`/unsupported leaf)
+        // was not fully enforced by the row filter, so apply the exact residual
+        // filter per batch over the widened `scan_fields`. The row filter (for
+        // whatever leaves it accepted) still ran during decode for I/O pruning;
+        // double-filtering an accepted leaf is idempotent. `DataFileReader`
+        // projects the filtered batch to `read_fields` by name.
+        let residual_predicates = FilePredicates {
+            predicates: preds.to_vec(),
+            row_filter_factory: None,
+            file_fields: file_fields.to_vec(),
+        };
+        let stream = batch_stream.map(move |result| {
+            let batch = result.map_err(Error::from)?;
+            let batch = match &map_read_plan {
+                Some(plan) => plan.assemble_batch(&batch)?,
+                None => batch,
+            };
+            crate::arrow::residual::filter_record_batch_by_predicates(
+                batch,
+                &residual_predicates,
+                &scan_fields,
+            )
+        });
+        Ok(stream.boxed())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parquet row-filter helpers
+// ---------------------------------------------------------------------------
+
+fn build_parquet_row_filter(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    predicates: &[Predicate],
+    file_fields: &[DataField],
+) -> crate::Result<Option<ParquetRowFilter>> {
+    if predicates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut filters: Vec<Box<dyn ArrowPredicate>> = Vec::new();
+
+    for predicate in predicates {
+        if let Some(filter) = build_parquet_arrow_predicate(parquet_schema, predicate, file_fields)?
+        {
+            filters.push(filter);
+        }
+    }
+
+    if filters.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ParquetRowFilter::new(filters)))
+    }
+}
+
+fn build_parquet_arrow_predicate(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    predicate: &Predicate,
+    file_fields: &[DataField],
+) -> crate::Result<Option<Box<dyn ArrowPredicate>>> {
+    if !parquet_predicate_row_filter_accepted(parquet_schema, predicate, file_fields)? {
+        return Ok(None);
+    }
+
+    if let Predicate::Leaf {
+        index,
+        op,
+        literals,
+        ..
+    } = predicate
+    {
+        // Keep the allocation-minimal single-column fast path for a leaf.
+        let file_field = &file_fields[*index];
+        let root_index = parquet_root_index(parquet_schema, file_field.name())
+            .expect("root index resolvable for accepted leaf");
+        let projection = ProjectionMask::roots(parquet_schema, [root_index]);
+        let op = *op;
+        let data_type = file_field.data_type().clone();
+        let literals = literals.to_vec();
+        return Ok(Some(Box::new(ArrowPredicateFn::new(
+            projection,
+            move |batch: RecordBatch| {
+                let Some(column) = batch.columns().first() else {
+                    return Ok(BooleanArray::new_null(batch.num_rows()));
+                };
+                crate::arrow::residual::evaluate_exact_leaf_predicate(
+                    column, &data_type, op, &literals,
+                )
+            },
+        ))));
+    }
+
+    // Evaluate a compound predicate as one decoder predicate. Its projection is
+    // the union of referenced Parquet roots, ordered exactly as the projected
+    // RecordBatch. This preserves OR/NOT semantics; splitting it into leaf
+    // RowFilters would incorrectly turn the expression into a conjunction.
+    let mut field_indices = Vec::new();
+    crate::arrow::residual::collect_predicate_field_indices(predicate, &mut field_indices);
+    let mut projected = field_indices
+        .into_iter()
+        .filter_map(|index| {
+            let field = file_fields.get(index)?;
+            parquet_root_index(parquet_schema, field.name()).map(|root| (root, field.clone()))
+        })
+        .collect::<Vec<_>>();
+    projected.sort_unstable_by_key(|(root, _)| *root);
+    projected.dedup_by_key(|(root, _)| *root);
+
+    let projection = ProjectionMask::roots(parquet_schema, projected.iter().map(|(root, _)| *root));
+    let scan_fields = projected
+        .into_iter()
+        .map(|(_, field)| field)
+        .collect::<Vec<_>>();
+    let predicate = predicate.clone();
+    let file_fields = file_fields.to_vec();
+    Ok(Some(Box::new(ArrowPredicateFn::new(
+        projection,
+        move |batch: RecordBatch| {
+            let mask = crate::arrow::residual::evaluate_predicates_mask(
+                &batch,
+                std::slice::from_ref(&predicate),
+                &file_fields,
+                &scan_fields,
+            )
+            .map_err(|e| arrow_schema::ArrowError::ComputeError(e.to_string()))?;
+            Ok(mask.unwrap_or_else(|| BooleanArray::from(vec![true; batch.num_rows()])))
+        },
+    ))))
+}
+
+/// `true` iff [`build_parquet_arrow_predicate`] would return `Some` for
+/// `predicate` — i.e. it is a `Leaf` with a supported operator, resolvable
+/// column, and a literal set the Arrow row filter can enforce. Such a predicate
+/// is applied exactly during decode by the [`RowFilter`], so it needs no
+/// residual backstop.
+///
+/// Shares the recursive acceptance test with `build_parquet_arrow_predicate` so
+/// the two cannot drift: a compound expression is exact only when all leaves
+/// can be evaluated by the decoder predicate.
+fn predicate_fully_enforced_by_row_filter(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    predicate: &Predicate,
+    file_fields: &[DataField],
+) -> bool {
+    parquet_predicate_row_filter_accepted(parquet_schema, predicate, file_fields).unwrap_or(false)
+}
+
+fn parquet_predicate_row_filter_accepted(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    predicate: &Predicate,
+    file_fields: &[DataField],
+) -> crate::Result<bool> {
+    match predicate {
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => Ok(true),
+        Predicate::Leaf {
+            index,
+            op,
+            literals,
+            ..
+        } => parquet_leaf_row_filter_accepted(parquet_schema, *index, *op, literals, file_fields),
+        Predicate::And(children) | Predicate::Or(children) => {
+            for child in children {
+                if !parquet_predicate_row_filter_accepted(parquet_schema, child, file_fields)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Predicate::Not(inner) => {
+            parquet_predicate_row_filter_accepted(parquet_schema, inner, file_fields)
+        }
+    }
+}
+
+/// Shared leaf-acceptance test for the Parquet Arrow row filter: a leaf is
+/// accepted iff its operator is supported, its column resolves to a root parquet
+/// column, and its literals are representable for the Arrow filter.
+///
+/// Returning an error only propagates a genuine failure from literal conversion;
+/// an unsupported (but well-formed) leaf yields `Ok(false)`.
+fn parquet_leaf_row_filter_accepted(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    index: usize,
+    op: PredicateOperator,
+    literals: &[Datum],
+    file_fields: &[DataField],
+) -> crate::Result<bool> {
+    if !predicate_supported_for_parquet_row_filter(op) {
+        return Ok(false);
+    }
+    let Some(file_field) = file_fields.get(index) else {
+        return Ok(false);
+    };
+    if parquet_root_index(parquet_schema, file_field.name()).is_none() {
+        return Ok(false);
+    }
+    parquet_row_filter_literals_supported(op, literals, file_field.data_type())
+}
+
+fn predicate_supported_for_parquet_row_filter(op: PredicateOperator) -> bool {
+    matches!(
+        op,
+        PredicateOperator::IsNull
+            | PredicateOperator::IsNotNull
+            | PredicateOperator::Eq
+            | PredicateOperator::NotEq
+            | PredicateOperator::Lt
+            | PredicateOperator::LtEq
+            | PredicateOperator::Gt
+            | PredicateOperator::GtEq
+            | PredicateOperator::In
+            | PredicateOperator::NotIn
+            | PredicateOperator::StartsWith
+            | PredicateOperator::EndsWith
+            | PredicateOperator::Contains
+            | PredicateOperator::Like
+            | PredicateOperator::Between
+            | PredicateOperator::NotBetween
+    )
+}
+
+fn parquet_row_filter_literals_supported(
+    op: PredicateOperator,
+    literals: &[Datum],
+    file_data_type: &DataType,
+) -> crate::Result<bool> {
+    match op {
+        PredicateOperator::IsNull | PredicateOperator::IsNotNull => Ok(true),
+        PredicateOperator::Eq
+        | PredicateOperator::NotEq
+        | PredicateOperator::Lt
+        | PredicateOperator::LtEq
+        | PredicateOperator::Gt
+        | PredicateOperator::GtEq => {
+            let Some(literal) = literals.first() else {
+                return Ok(false);
+            };
+            Ok(
+                crate::arrow::residual::literal_scalar_for_arrow_filter(literal, file_data_type)?
+                    .is_some(),
+            )
+        }
+        PredicateOperator::In | PredicateOperator::NotIn => {
+            for literal in literals {
+                if crate::arrow::residual::literal_scalar_for_arrow_filter(literal, file_data_type)?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        PredicateOperator::StartsWith
+        | PredicateOperator::EndsWith
+        | PredicateOperator::Contains
+        | PredicateOperator::Like => {
+            // Substring kernels only run against string-typed columns; reject
+            // non-string file types early so the filter falls back to stats
+            // pruning + residual evaluation.
+            if !matches!(file_data_type, DataType::Char(_) | DataType::VarChar(_)) {
+                return Ok(false);
+            }
+            let Some(literal) = literals.first() else {
+                return Ok(false);
+            };
+            Ok(
+                crate::arrow::residual::literal_scalar_for_arrow_filter(literal, file_data_type)?
+                    .is_some(),
+            )
+        }
+        PredicateOperator::Between | PredicateOperator::NotBetween => {
+            if literals.len() != 2 {
+                return Ok(false);
+            }
+            for literal in literals {
+                if crate::arrow::residual::literal_scalar_for_arrow_filter(literal, file_data_type)?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn parquet_root_index(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    root_name: &str,
+) -> Option<usize> {
+    parquet_schema
+        .root_schema()
+        .get_fields()
+        .iter()
+        .position(|field| field.name() == root_name)
+}
+
+// ---------------------------------------------------------------------------
+// Row-group statistics pruning
+// ---------------------------------------------------------------------------
+
+struct ParquetRowGroupStats<'a> {
+    row_group: &'a RowGroupMetaData,
+    column_indices: &'a [Option<usize>],
+}
+
+impl StatsAccessor for ParquetRowGroupStats<'_> {
+    fn row_count(&self) -> i64 {
+        self.row_group.num_rows()
+    }
+
+    fn null_count(&self, index: usize) -> Option<i64> {
+        let _ = index;
+        None
+    }
+
+    fn min_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        let column_index = self.column_indices.get(index).copied().flatten()?;
+        parquet_stats_to_datum(
+            self.row_group.column(column_index).statistics()?,
+            data_type,
+            true,
+        )
+    }
+
+    fn max_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        let column_index = self.column_indices.get(index).copied().flatten()?;
+        parquet_stats_to_datum(
+            self.row_group.column(column_index).statistics()?,
+            data_type,
+            false,
+        )
+    }
+}
+
+fn build_predicate_row_selection(
+    row_groups: &[RowGroupMetaData],
+    predicates: &[Predicate],
+    file_fields: &[DataField],
+) -> crate::Result<Option<RowSelection>> {
+    if predicates.is_empty() || row_groups.is_empty() {
+        return Ok(None);
+    }
+
+    // Predicates have already been remapped to file-level indices by the caller
+    // (remap_predicates_to_file in reader.rs), so we use an identity mapping here.
+    let identity_mapping: Vec<Option<usize>> = (0..file_fields.len()).map(Some).collect();
+    let column_indices = build_row_group_column_indices(row_groups[0].columns(), file_fields);
+    let mut selectors = Vec::with_capacity(row_groups.len());
+    let mut all_selected = true;
+
+    for row_group in row_groups {
+        let stats = ParquetRowGroupStats {
+            row_group,
+            column_indices: &column_indices,
+        };
+        let may_match =
+            predicates_may_match_with_schema(predicates, &stats, &identity_mapping, file_fields);
+        if !may_match {
+            all_selected = false;
+        }
+        selectors.push(if may_match {
+            RowSelector::select(row_group.num_rows() as usize)
+        } else {
+            RowSelector::skip(row_group.num_rows() as usize)
+        });
+    }
+
+    if all_selected {
+        Ok(None)
+    } else {
+        Ok(Some(selectors.into()))
+    }
+}
+
+fn build_row_group_column_indices(
+    columns: &[parquet::file::metadata::ColumnChunkMetaData],
+    file_fields: &[DataField],
+) -> Vec<Option<usize>> {
+    let mut by_root_name: HashMap<&str, Option<usize>> = HashMap::new();
+    for (column_index, column) in columns.iter().enumerate() {
+        let Some(root_name) = column.column_path().parts().first() else {
+            continue;
+        };
+        let entry = by_root_name
+            .entry(root_name.as_str())
+            .or_insert(Some(column_index));
+        if entry.is_some() && *entry != Some(column_index) {
+            *entry = None;
+        }
+    }
+
+    file_fields
+        .iter()
+        .map(|field| by_root_name.get(field.name()).copied().flatten())
+        .collect()
+}
+
+fn extract_value_stats(
+    metadata: &ParquetMetaData,
+    write_fields: &[DataField],
+    stats_modes: &[MetadataStatsMode],
+    stats_dense_store: bool,
+) -> (BinaryTableStats, Option<Vec<String>>) {
+    debug_assert_eq!(write_fields.len(), stats_modes.len());
+    let row_groups = metadata.row_groups();
+    let column_indices = row_groups
+        .first()
+        .map(|row_group| build_row_group_column_indices(row_group.columns(), write_fields))
+        .unwrap_or_else(|| vec![None; write_fields.len()]);
+    let mut column_names = Vec::new();
+    let mut column_types = Vec::new();
+    let mut min_datums = Vec::new();
+    let mut max_datums = Vec::new();
+    let mut null_counts = Vec::new();
+
+    for (field_idx, field) in write_fields.iter().enumerate() {
+        let mode = stats_modes
+            .get(field_idx)
+            .copied()
+            .unwrap_or(MetadataStatsMode::None);
+        let column_stats = if mode == MetadataStatsMode::None {
+            None
+        } else {
+            column_indices
+                .get(field_idx)
+                .copied()
+                .flatten()
+                .and_then(|column_idx| {
+                    extract_column_value_stats(row_groups, column_idx, field.data_type(), mode)
+                })
+        };
+
+        // Non-dense stats stay aligned with write_fields, including unavailable stats.
+        match column_stats {
+            Some((min_datum, max_datum, null_count)) => {
+                if stats_dense_store {
+                    column_names.push(field.name().to_string());
+                }
+                column_types.push(field.data_type().clone());
+                min_datums.push(min_datum);
+                max_datums.push(max_datum);
+                null_counts.push(null_count);
+            }
+            None if !stats_dense_store => {
+                column_types.push(field.data_type().clone());
+                min_datums.push(None);
+                max_datums.push(None);
+                null_counts.push(None);
+            }
+            None => {}
+        }
+    }
+
+    let stats = if column_types.is_empty() {
+        BinaryTableStats::empty()
+    } else {
+        binary_table_stats_from_datums(&column_types, &min_datums, &max_datums, null_counts)
+    };
+    // Java omits the dense mapping when stats already cover every write field.
+    let value_stats_cols = if stats_dense_store && column_types.len() != write_fields.len() {
+        Some(column_names)
+    } else {
+        None
+    };
+    (stats, value_stats_cols)
+}
+
+fn extract_column_value_stats(
+    row_groups: &[RowGroupMetaData],
+    column_idx: usize,
+    data_type: &DataType,
+    mode: MetadataStatsMode,
+) -> Option<(Option<Datum>, Option<Datum>, Option<i64>)> {
+    let collect_min_max = matches!(
+        mode,
+        MetadataStatsMode::Full | MetadataStatsMode::Truncate(_)
+    ) && supports_manifest_min_max(data_type);
+    let mut min_datum: Option<Datum> = None;
+    let mut max_datum: Option<Datum> = None;
+    let mut min_complete = true;
+    let mut max_complete = true;
+    let mut null_count = Some(0_i64);
+    let mut has_stats = false;
+
+    for row_group in row_groups {
+        let Some(stats) = row_group.column(column_idx).statistics() else {
+            min_complete = false;
+            max_complete = false;
+            null_count = None;
+            continue;
+        };
+        has_stats = true;
+
+        match stats
+            .null_count_opt()
+            .and_then(|count| i64::try_from(count).ok())
+        {
+            Some(count) => {
+                if let Some(total) = null_count.as_mut() {
+                    *total += count;
+                }
+            }
+            None => null_count = None,
+        }
+
+        let row_group_all_null = stats.null_count_opt() == Some(row_group.num_rows().max(0) as u64);
+        if !collect_min_max || row_group_all_null {
+            continue;
+        }
+
+        match parquet_stats_to_datum(stats, data_type, true) {
+            Some(candidate) => {
+                if let Some(current) = &min_datum {
+                    match candidate.partial_cmp(current) {
+                        Some(Ordering::Less) => min_datum = Some(candidate),
+                        Some(Ordering::Equal | Ordering::Greater) => {}
+                        None => min_complete = false,
+                    }
+                } else {
+                    min_datum = Some(candidate);
+                }
+            }
+            None => min_complete = false,
+        }
+
+        match parquet_stats_to_datum(stats, data_type, false) {
+            Some(candidate) => {
+                if let Some(current) = &max_datum {
+                    match candidate.partial_cmp(current) {
+                        Some(Ordering::Greater) => max_datum = Some(candidate),
+                        Some(Ordering::Less | Ordering::Equal) => {}
+                        None => max_complete = false,
+                    }
+                } else {
+                    max_datum = Some(candidate);
+                }
+            }
+            None => max_complete = false,
+        }
+    }
+
+    if !has_stats {
+        return None;
+    }
+    if !min_complete {
+        min_datum = None;
+    }
+    if !max_complete {
+        max_datum = None;
+    }
+    let (min_datum, max_datum) = apply_stats_mode(data_type, mode, min_datum, max_datum);
+    if min_datum.is_none() && max_datum.is_none() && null_count.is_none() {
+        None
+    } else {
+        Some((min_datum, max_datum, null_count))
+    }
+}
+
+fn supports_manifest_min_max(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean(_)
+            | DataType::TinyInt(_)
+            | DataType::SmallInt(_)
+            | DataType::Int(_)
+            | DataType::BigInt(_)
+            | DataType::Char(_)
+            | DataType::VarChar(_)
+            | DataType::Decimal(_)
+            | DataType::Double(_)
+            | DataType::Float(_)
+            | DataType::Date(_)
+            | DataType::Time(_)
+            | DataType::LocalZonedTimestamp(_)
+            | DataType::Timestamp(_)
+    )
+}
+
+fn apply_stats_mode(
+    data_type: &DataType,
+    mode: MetadataStatsMode,
+    min_datum: Option<Datum>,
+    max_datum: Option<Datum>,
+) -> (Option<Datum>, Option<Datum>) {
+    let MetadataStatsMode::Truncate(length) = mode else {
+        return (min_datum, max_datum);
+    };
+    match data_type {
+        DataType::Char(_) | DataType::VarChar(_) => {
+            let min = min_datum.map(|datum| truncate_string_min_datum(datum, length));
+            let max = match max_datum {
+                Some(datum) => match truncate_string_max_datum(datum, length) {
+                    Some(max) => Some(max),
+                    None => return (None, None),
+                },
+                None => None,
+            };
+            (min, max)
+        }
+        _ => (min_datum, max_datum),
+    }
+}
+
+fn truncate_string_min_datum(datum: Datum, length: usize) -> Datum {
+    match datum {
+        Datum::String(value) => Datum::String(truncate_string_min(&value, length)),
+        other => other,
+    }
+}
+
+fn truncate_string_max_datum(datum: Datum, length: usize) -> Option<Datum> {
+    match datum {
+        Datum::String(value) => truncate_string_max(&value, length).map(Datum::String),
+        other => Some(other),
+    }
+}
+
+fn truncate_string_min(value: &str, length: usize) -> String {
+    value.chars().take(length).collect()
+}
+
+fn truncate_string_max(value: &str, length: usize) -> Option<String> {
+    let char_count = value.chars().count();
+    if char_count <= length {
+        return Some(value.to_string());
+    }
+
+    let mut chars: Vec<char> = value.chars().take(length).collect();
+    for idx in (0..chars.len()).rev() {
+        if let Some(next) = char::from_u32(chars[idx] as u32 + 1) {
+            chars.truncate(idx);
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+fn binary_table_stats_from_datums(
+    column_types: &[DataType],
+    min_datums: &[Option<Datum>],
+    max_datums: &[Option<Datum>],
+    null_counts: Vec<Option<i64>>,
+) -> BinaryTableStats {
+    let mut min_builder = BinaryRowBuilder::new(column_types.len() as i32);
+    let mut max_builder = BinaryRowBuilder::new(column_types.len() as i32);
+    for (pos, data_type) in column_types.iter().enumerate() {
+        match &min_datums[pos] {
+            Some(datum) => min_builder.write_datum(pos, datum, data_type),
+            None => min_builder.set_null_at(pos),
+        }
+        match &max_datums[pos] {
+            Some(datum) => max_builder.write_datum(pos, datum, data_type),
+            None => max_builder.set_null_at(pos),
+        }
+    }
+    BinaryTableStats::new(
+        min_builder.build_serialized(),
+        max_builder.build_serialized(),
+        null_counts,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Page-index (ColumnIndex / OffsetIndex) pruning
+// ---------------------------------------------------------------------------
+
+/// Stats view over one data page of a **single** column, backed by the Parquet
+/// ColumnIndex. Plugs into the same [`StatsAccessor`] evaluator as row-group
+/// pruning so both layers share identical fail-open semantics.
+///
+/// Only `target_index` is exposed; every other column reports no stats so its
+/// leaves fail open. Parquet pages are laid out per column chunk (different
+/// columns may have different page counts and boundaries), so each column must
+/// be pruned against its own page layout — see [`build_predicate_page_selection`].
+struct ParquetPageStats<'a> {
+    /// File-field index this page belongs to.
+    target_index: usize,
+    /// ColumnIndex of the target column for the current row group.
+    column_index: &'a ColumnIndexMetaData,
+    page_idx: usize,
+    page_row_count: i64,
+}
+
+impl StatsAccessor for ParquetPageStats<'_> {
+    fn row_count(&self) -> i64 {
+        self.page_row_count
+    }
+
+    fn null_count(&self, index: usize) -> Option<i64> {
+        if index != self.target_index {
+            return None;
+        }
+        self.column_index.null_count(self.page_idx)
+    }
+
+    fn min_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        if index != self.target_index {
+            return None;
+        }
+        page_index_value_to_datum(self.column_index, self.page_idx, data_type, true)
+    }
+
+    fn max_value(&self, index: usize, data_type: &DataType) -> Option<Datum> {
+        if index != self.target_index {
+            return None;
+        }
+        page_index_value_to_datum(self.column_index, self.page_idx, data_type, false)
+    }
+}
+
+/// Decode a per-page min/max from a [`ColumnIndexMetaData`] into a [`Datum`].
+///
+/// Returns `None` (fail-open: keep the page) for null pages, missing values, or
+/// any type that the footer-side path also excludes (decimals, sub-millisecond
+/// timestamps).
+fn page_index_value_to_datum(
+    column_index: &ColumnIndexMetaData,
+    page_idx: usize,
+    data_type: &DataType,
+    is_min: bool,
+) -> Option<Datum> {
+    if column_index.is_null_page(page_idx) {
+        return None;
+    }
+    macro_rules! primitive {
+        ($idx:expr) => {
+            if is_min {
+                $idx.min_values().get(page_idx)
+            } else {
+                $idx.max_values().get(page_idx)
+            }
+        };
+    }
+    macro_rules! bytes {
+        ($idx:expr) => {
+            if is_min {
+                $idx.min_value(page_idx)
+            } else {
+                $idx.max_value(page_idx)
+            }
+        };
+    }
+    match (column_index, data_type) {
+        (ColumnIndexMetaData::BOOLEAN(idx), DataType::Boolean(_)) => {
+            primitive!(idx).copied().map(Datum::Bool)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::TinyInt(_)) => primitive!(idx)
+            .and_then(|v| i8::try_from(*v).ok())
+            .map(Datum::TinyInt),
+        (ColumnIndexMetaData::INT32(idx), DataType::SmallInt(_)) => primitive!(idx)
+            .and_then(|v| i16::try_from(*v).ok())
+            .map(Datum::SmallInt),
+        (ColumnIndexMetaData::INT32(idx), DataType::Int(_)) => {
+            primitive!(idx).copied().map(Datum::Int)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::Date(_)) => {
+            primitive!(idx).copied().map(Datum::Date)
+        }
+        (ColumnIndexMetaData::INT32(idx), DataType::Time(_)) => {
+            primitive!(idx).copied().map(Datum::Time)
+        }
+        (ColumnIndexMetaData::INT64(idx), DataType::BigInt(_)) => {
+            primitive!(idx).copied().map(Datum::Long)
+        }
+        (ColumnIndexMetaData::INT64(idx), DataType::Timestamp(ts)) if ts.precision() <= 3 => {
+            primitive!(idx)
+                .copied()
+                .map(|millis| Datum::Timestamp { millis, nanos: 0 })
+        }
+        (ColumnIndexMetaData::INT64(idx), DataType::LocalZonedTimestamp(ts))
+            if ts.precision() <= 3 =>
+        {
+            primitive!(idx)
+                .copied()
+                .map(|millis| Datum::LocalZonedTimestamp { millis, nanos: 0 })
+        }
+        (ColumnIndexMetaData::FLOAT(idx), DataType::Float(_)) => {
+            primitive!(idx).copied().map(Datum::Float)
+        }
+        (ColumnIndexMetaData::DOUBLE(idx), DataType::Double(_)) => {
+            primitive!(idx).copied().map(Datum::Double)
+        }
+        (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::Char(_))
+        | (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::VarChar(_)) => bytes!(idx)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(|s| Datum::String(s.to_string())),
+        (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::Binary(_))
+        | (ColumnIndexMetaData::BYTE_ARRAY(idx), DataType::VarBinary(_)) => {
+            bytes!(idx).map(|bytes| Datum::Bytes(bytes.to_vec()))
+        }
+        (ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx), DataType::Binary(_))
+        | (ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(idx), DataType::VarBinary(_)) => {
+            bytes!(idx).map(|bytes| Datum::Bytes(bytes.to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// Build a page-granular [`RowSelection`] from the Parquet ColumnIndex /
+/// OffsetIndex by pruning each predicate column against **its own** page layout,
+/// then intersecting the per-column selections.
+///
+/// Parquet splits pages per column chunk, so different columns in a row group
+/// may have different page counts and boundaries. Each column is therefore
+/// evaluated over its own `OffsetIndex` pages, exposing only that column to the
+/// stats evaluator (every other column fails open). Because the top-level
+/// predicate list is a conjunction, intersecting the per-column selections is
+/// sound.
+///
+/// Returns `None` when the page index is absent or when no page could be skipped
+/// (so the caller leaves the coarser row-group selection untouched). A page is
+/// kept whenever its stats are unavailable or the predicate cannot be decided
+/// from them — pruning never drops a page it is unsure about.
+fn build_predicate_page_selection(
+    metadata: &ParquetMetaData,
+    predicates: &[Predicate],
+    file_fields: &[DataField],
+) -> crate::Result<Option<RowSelection>> {
+    if predicates.is_empty() {
+        return Ok(None);
+    }
+    let (Some(column_index), Some(offset_index)) =
+        (metadata.column_index(), metadata.offset_index())
+    else {
+        return Ok(None);
+    };
+    let row_groups = metadata.row_groups();
+    if row_groups.is_empty() {
+        return Ok(None);
+    }
+
+    // Predicates are already remapped to file-level indices by the caller, so an
+    // identity mapping suffices (same convention as row-group pruning).
+    let identity_mapping: Vec<Option<usize>> = (0..file_fields.len()).map(Some).collect();
+    let column_lookup = build_row_group_column_indices(row_groups[0].columns(), file_fields);
+    let total_rows: usize = row_groups.iter().map(|rg| rg.num_rows() as usize).sum();
+
+    let mut referenced_fields = Vec::new();
+    for predicate in predicates {
+        collect_leaf_field_indices(predicate, &mut referenced_fields);
+    }
+    referenced_fields.sort_unstable();
+    referenced_fields.dedup();
+
+    let mut combined: Option<RowSelection> = None;
+    for field_index in referenced_fields {
+        // The column must resolve to a single parquet column present in the file.
+        let Some(parquet_col) = column_lookup.get(field_index).copied().flatten() else {
+            continue;
+        };
+
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        let mut rg_base = 0usize;
+        let mut any_skipped = false;
+
+        for (rg_idx, row_group) in row_groups.iter().enumerate() {
+            let rg_rows = row_group.num_rows() as usize;
+            let base = rg_base;
+            rg_base += rg_rows;
+
+            // Missing page index for this column/row group: keep the whole group
+            // (row-group pruning still applied).
+            let (Some(col_index), Some(col_offset)) = (
+                column_index.get(rg_idx).and_then(|rg| rg.get(parquet_col)),
+                offset_index.get(rg_idx).and_then(|rg| rg.get(parquet_col)),
+            ) else {
+                ranges.push(base..base + rg_rows);
+                continue;
+            };
+            let pages = col_offset.page_locations();
+            // Fail open when the column index is absent for this chunk
+            // (`ColumnIndexMetaData::NONE` — its accessors panic rather than
+            // return `None`), when the two indexes disagree on the page count,
+            // or when the page row boundaries are malformed. Either way we
+            // cannot safely map page stats to row ranges.
+            if pages.is_empty()
+                || matches!(col_index, ColumnIndexMetaData::NONE)
+                || col_index.num_pages() as usize != pages.len()
+                || !page_boundaries_valid(pages, rg_rows)
+            {
+                ranges.push(base..base + rg_rows);
+                continue;
+            }
+
+            for (page_idx, page) in pages.iter().enumerate() {
+                let page_start = page.first_row_index as usize;
+                let page_end = pages
+                    .get(page_idx + 1)
+                    .map_or(rg_rows, |next| next.first_row_index as usize);
+                if page_end <= page_start {
+                    continue;
+                }
+                let stats = ParquetPageStats {
+                    target_index: field_index,
+                    column_index: col_index,
+                    page_idx,
+                    page_row_count: (page_end - page_start) as i64,
+                };
+                if predicates_may_match_with_schema(
+                    predicates,
+                    &stats,
+                    &identity_mapping,
+                    file_fields,
+                ) {
+                    ranges.push(base + page_start..base + page_end);
+                } else {
+                    any_skipped = true;
+                }
+            }
+        }
+
+        if !any_skipped {
+            continue;
+        }
+        let selection = RowSelection::from_consecutive_ranges(ranges.into_iter(), total_rows);
+        combined = Some(match combined {
+            Some(prev) => prev.intersection(&selection),
+            None => selection,
+        });
+    }
+
+    Ok(combined)
+}
+
+/// Collect the file-field indices referenced by leaf predicates (recursing
+/// through compound nodes). Indices are already file-level (see caller).
+fn collect_leaf_field_indices(predicate: &Predicate, out: &mut Vec<usize>) {
+    match predicate {
+        Predicate::Leaf { index, .. } => out.push(*index),
+        Predicate::And(children) | Predicate::Or(children) => {
+            for child in children {
+                collect_leaf_field_indices(child, out);
+            }
+        }
+        Predicate::Not(child) => collect_leaf_field_indices(child, out),
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+    }
+}
+
+/// Validate that an OffsetIndex's page row boundaries are well-formed for a row
+/// group of `rg_rows` rows: the first page starts at row 0, `first_row_index`
+/// is strictly increasing, and every value stays within `[0, rg_rows]`.
+///
+/// Malformed metadata (negative, non-monotonic, or out-of-range boundaries)
+/// would otherwise produce invalid row ranges — huge values from `i64 as usize`
+/// underflow, or ranges past the row group — that panic
+/// `RowSelection::from_consecutive_ranges`. Callers fail open when this returns
+/// `false`.
+fn page_boundaries_valid(
+    pages: &[parquet::file::page_index::offset_index::PageLocation],
+    rg_rows: usize,
+) -> bool {
+    let rg_rows = rg_rows as i64;
+    let mut prev: i64 = -1;
+    for (page_idx, page) in pages.iter().enumerate() {
+        let first_row = page.first_row_index;
+        if page_idx == 0 && first_row != 0 {
+            return false;
+        }
+        if first_row <= prev || first_row > rg_rows {
+            return false;
+        }
+        prev = first_row;
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Parquet statistics → Datum conversion
+// ---------------------------------------------------------------------------
+
+fn parquet_stats_to_datum(
+    stats: &ParquetStatistics,
+    data_type: &DataType,
+    is_min: bool,
+) -> Option<Datum> {
+    let exact = if is_min {
+        stats.min_is_exact()
+    } else {
+        stats.max_is_exact()
+    };
+    if !exact {
+        return None;
+    }
+
+    match (stats, data_type) {
+        (ParquetStatistics::Boolean(stats), DataType::Boolean(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .map(Datum::Bool)
+        }
+        (ParquetStatistics::Int32(stats), DataType::TinyInt(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .and_then(|value| i8::try_from(*value).ok())
+                .map(Datum::TinyInt)
+        }
+        (ParquetStatistics::Int32(stats), DataType::SmallInt(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .and_then(|value| i16::try_from(*value).ok())
+                .map(Datum::SmallInt)
+        }
+        (ParquetStatistics::Int32(stats), DataType::Int(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .map(Datum::Int)
+        }
+        (ParquetStatistics::Int32(stats), DataType::Date(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .map(Datum::Date)
+        }
+        (ParquetStatistics::Int32(stats), DataType::Time(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .map(Datum::Time)
+        }
+        (ParquetStatistics::Int64(stats), DataType::BigInt(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .map(Datum::Long)
+        }
+        (ParquetStatistics::Int32(stats), DataType::Decimal(d)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .map(|unscaled| Datum::Decimal {
+                    unscaled: unscaled as i128,
+                    precision: d.precision(),
+                    scale: d.scale(),
+                })
+        }
+        (ParquetStatistics::Int64(stats), DataType::Decimal(d)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .map(|unscaled| Datum::Decimal {
+                    unscaled: unscaled as i128,
+                    precision: d.precision(),
+                    scale: d.scale(),
+                })
+        }
+        (ParquetStatistics::Int64(stats), DataType::Timestamp(ts)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .and_then(|value| timestamp_datum_from_parquet_i64(value, ts.precision(), false))
+        }
+        (ParquetStatistics::Int64(stats), DataType::LocalZonedTimestamp(ts)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .and_then(|value| timestamp_datum_from_parquet_i64(value, ts.precision(), true))
+        }
+        (ParquetStatistics::Float(stats), DataType::Float(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .map(Datum::Float)
+        }
+        (ParquetStatistics::Double(stats), DataType::Double(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .copied()
+                .map(Datum::Double)
+        }
+        (ParquetStatistics::ByteArray(stats), DataType::Char(_))
+        | (ParquetStatistics::ByteArray(stats), DataType::VarChar(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .and_then(|value| std::str::from_utf8(value.data()).ok())
+                .map(|value| Datum::String(value.to_string()))
+        }
+        (ParquetStatistics::ByteArray(stats), DataType::Binary(_))
+        | (ParquetStatistics::ByteArray(stats), DataType::VarBinary(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .map(|value| Datum::Bytes(value.data().to_vec()))
+        }
+        (ParquetStatistics::FixedLenByteArray(stats), DataType::Binary(_))
+        | (ParquetStatistics::FixedLenByteArray(stats), DataType::VarBinary(_)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .map(|value| Datum::Bytes(value.data().to_vec()))
+        }
+        (ParquetStatistics::ByteArray(stats), DataType::Decimal(d)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .and_then(|value| signed_be_bytes_to_i128(value.data()))
+                .map(|unscaled| Datum::Decimal {
+                    unscaled,
+                    precision: d.precision(),
+                    scale: d.scale(),
+                })
+        }
+        (ParquetStatistics::FixedLenByteArray(stats), DataType::Decimal(d)) => {
+            exact_parquet_value(is_min, stats.min_opt(), stats.max_opt())
+                .and_then(|value| signed_be_bytes_to_i128(value.data()))
+                .map(|unscaled| Datum::Decimal {
+                    unscaled,
+                    precision: d.precision(),
+                    scale: d.scale(),
+                })
+        }
+        _ => None,
+    }
+}
+
+fn timestamp_datum_from_parquet_i64(
+    value: i64,
+    precision: u32,
+    local_zoned: bool,
+) -> Option<Datum> {
+    let (millis, nanos) = match precision {
+        0..=3 => (value, 0),
+        4..=6 => (
+            value.div_euclid(1_000),
+            (value.rem_euclid(1_000) * 1_000) as i32,
+        ),
+        _ => return None,
+    };
+    if local_zoned {
+        Some(Datum::LocalZonedTimestamp { millis, nanos })
+    } else {
+        Some(Datum::Timestamp { millis, nanos })
+    }
+}
+
+fn signed_be_bytes_to_i128(bytes: &[u8]) -> Option<i128> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let sign_extend = if bytes[0] & 0x80 == 0 { 0 } else { 0xff };
+    let mut padded = [sign_extend; 16];
+    padded[16 - bytes.len()..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(padded))
+}
+
+fn exact_parquet_value<'a, T>(
+    is_min: bool,
+    min: Option<&'a T>,
+    max: Option<&'a T>,
+) -> Option<&'a T> {
+    if is_min {
+        min
+    } else {
+        max
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Row selection helpers (DV, row ranges)
+// ---------------------------------------------------------------------------
+
+fn intersect_optional_row_selections(
+    left: Option<RowSelection>,
+    right: Option<RowSelection>,
+) -> Option<RowSelection> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.intersection(&right)),
+        (Some(selection), None) | (None, Some(selection)) => Some(selection),
+        (None, None) => None,
+    }
+}
+
+/// Build a Parquet [RowSelection] from inclusive `[from, to]` file-local row ranges (0-based).
+fn build_row_ranges_selection(
+    row_group_metadata_list: &[RowGroupMetaData],
+    row_ranges: &[RowRange],
+) -> RowSelection {
+    let total_rows: i64 = row_group_metadata_list.iter().map(|rg| rg.num_rows()).sum();
+    if total_rows == 0 {
+        return vec![].into();
+    }
+
+    let file_end = total_rows - 1;
+    let mut local_ranges: Vec<(usize, usize)> = row_ranges
+        .iter()
+        .filter_map(|r| {
+            if r.to() < 0 || r.from() > file_end {
+                return None;
+            }
+            let local_start = r.from().max(0) as usize;
+            let local_end = (r.to().min(file_end) + 1) as usize;
+            Some((local_start, local_end))
+        })
+        .collect();
+    local_ranges.sort_by_key(|&(s, _)| s);
+
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    let mut cursor: usize = 0;
+    for (start, end) in &local_ranges {
+        if *start > cursor {
+            selectors.push(RowSelector::skip(*start - cursor));
+        }
+        let select_start = (*start).max(cursor);
+        if *end > select_start {
+            selectors.push(RowSelector::select(*end - select_start));
+        }
+        cursor = cursor.max(*end);
+    }
+    let total = total_rows as usize;
+    if cursor < total {
+        selectors.push(RowSelector::skip(total - cursor));
+    }
+    selectors.into()
+}
+
+// ---------------------------------------------------------------------------
+// ArrowFileReader — async Parquet IO adapter
+// ---------------------------------------------------------------------------
+
+/// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
+///
+/// # TODO
+///
+/// [ParquetObjectReader](https://docs.rs/parquet/latest/src/parquet/arrow/async_reader/store.rs.html#64)
+/// contains the following hints to speed up metadata loading, similar to iceberg, we can consider adding them to this struct:
+///
+/// - `metadata_size_hint`: Provide a hint as to the size of the parquet file's footer.
+/// - `preload_column_index`: Load the Column Index  as part of [`Self::get_metadata`].
+/// - `preload_offset_index`: Load the Offset Index as part of [`Self::get_metadata`].
+struct ArrowFileReader {
+    file_size: u64,
+    r: Box<dyn FileRead>,
+    control: Option<Arc<dyn crate::io::ReadControl>>,
+}
+
+/// coalesce threshold: 1 MiB.
+const RANGE_COALESCE_BYTES: u64 = 1024 * 1024;
+/// concurrent range fetches.
+const RANGE_FETCH_CONCURRENCY: usize = 10;
+/// metadata prefetch hint: 512 KiB.
+const METADATA_SIZE_HINT: usize = 512 * 1024;
+/// Minimum range size for splitting: 4 MiB.
+/// The block size used for split alignment and as the minimum split
+/// granularity.  Ranges smaller than this will not be split further to
+/// avoid excessive small IO requests whose per-request overhead dominates.
+const IO_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
+
+impl ArrowFileReader {
+    fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
+        let control = r.read_control();
+        Self {
+            file_size,
+            r,
+            control,
+        }
+    }
+
+    fn read_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        Box::pin(
+            self.r
+                .read(range.start..range.end)
+                .map_err(|err| parquet::errors::ParquetError::External(Box::new(err))),
+        )
+    }
+}
+
+impl MetadataFetch for ArrowFileReader {
+    fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        self.read_bytes(range)
+    }
+}
+
+impl AsyncFileReader for ArrowFileReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        self.read_bytes(range)
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+        let coalesce_bytes = RANGE_COALESCE_BYTES;
+        let concurrency = RANGE_FETCH_CONCURRENCY;
+
+        async move {
+            if ranges.is_empty() {
+                return Ok(vec![]);
+            }
+
+            // Two-phase range optimization:
+            // Phase 1: Merge nearby ranges based on coalesce threshold.
+            let coalesced = merge_byte_ranges(&ranges, coalesce_bytes);
+            // Phase 2: Split large merged ranges to utilize concurrency,
+            // but only at original range boundaries.
+            let fetch_ranges = split_ranges_for_concurrency(coalesced, concurrency);
+
+            // Fetch merged ranges concurrently.
+            let r = &self.r;
+            let fetched: Vec<Bytes> = if fetch_ranges.len() <= concurrency {
+                // All ranges fit within the concurrency limit — fire them all at once.
+                futures::future::try_join_all(fetch_ranges.iter().map(|range| {
+                    r.read(range.clone())
+                        .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+                }))
+                .await?
+            } else {
+                // More ranges than concurrency slots — use buffered stream.
+                futures::stream::iter(fetch_ranges.iter().cloned())
+                    .map(|range| async move {
+                        r.read(range)
+                            .await
+                            .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+                    })
+                    .buffered(concurrency)
+                    .try_collect()
+                    .await?
+            };
+
+            // Slice the fetched data back into the originally requested
+            // ranges.  A single original range may span multiple fetch
+            // chunks, so we copy from as many chunks as needed.
+            let result: parquet::errors::Result<Vec<Bytes>> = ranges
+                .iter()
+                .map(|range| {
+                    // Find the first fetch chunk whose end is past range.start.
+                    let first = fetch_ranges.partition_point(|v| v.end <= range.start);
+                    if first >= fetch_ranges.len() {
+                        return Err(parquet::errors::ParquetError::General(format!(
+                            "No fetch range covers requested range {}..{}",
+                            range.start, range.end
+                        )));
+                    }
+
+                    let need = range
+                        .end
+                        .checked_sub(range.start)
+                        .and_then(|length| usize::try_from(length).ok())
+                        .ok_or_else(|| {
+                            parquet::errors::ParquetError::General(format!(
+                                "Invalid or unrepresentable requested range {}..{}",
+                                range.start, range.end
+                            ))
+                        })?;
+
+                    // Fast path: the original range fits entirely within one
+                    // fetch chunk — zero-copy slice.
+                    let fr = &fetch_ranges[first];
+                    if range.end <= fr.end {
+                        let start = (range.start - fr.start) as usize;
+                        let end = (range.end - fr.start) as usize;
+                        return Ok(fetched[first].slice(start..end));
+                    }
+
+                    // Slow path: the original range spans multiple fetch
+                    // chunks — copy pieces into a new buffer (mirrors Java's
+                    // copyMultiBytesToBytes).
+                    let reservation = self
+                        .control
+                        .as_ref()
+                        .map(|control| {
+                            control.checkpoint()?;
+                            control.try_reserve(u64::try_from(need).unwrap_or(u64::MAX).max(1))
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            parquet::errors::ParquetError::External(Box::new(error))
+                        })?;
+                    let mut buf = Vec::new();
+                    buf.try_reserve_exact(need).map_err(|error| {
+                        parquet::errors::ParquetError::External(Box::new(error))
+                    })?;
+                    let mut pos = range.start;
+                    for i in first..fetch_ranges.len() {
+                        if pos >= range.end {
+                            break;
+                        }
+                        let fr = &fetch_ranges[i];
+                        let chunk = &fetched[i];
+                        if let Some(control) = &self.control {
+                            control.checkpoint().map_err(|error| {
+                                parquet::errors::ParquetError::External(Box::new(error))
+                            })?;
+                        }
+                        let src_start = (pos - fr.start) as usize;
+                        let src_end = ((range.end.min(fr.end)) - fr.start) as usize;
+                        if src_end > chunk.len() {
+                            return Err(parquet::errors::ParquetError::General(format!(
+                                "Fetched data too short for range {}..{}: \
+                                 chunk {}..{} has {} bytes, need up to offset {}",
+                                range.start,
+                                range.end,
+                                fr.start,
+                                fr.end,
+                                chunk.len(),
+                                src_end,
+                            )));
+                        }
+                        buf.extend_from_slice(&chunk[src_start..src_end]);
+                        pos = fr.end;
+                    }
+                    if buf.len() != need {
+                        return Err(parquet::errors::ParquetError::General(format!(
+                            "Assembled {} bytes for range {}..{}, expected {}",
+                            buf.len(),
+                            range.start,
+                            range.end,
+                            need,
+                        )));
+                    }
+                    let bytes = Bytes::from(buf);
+                    Ok(match reservation {
+                        Some(reservation) => crate::io::retain_bytes(bytes, reservation),
+                        None => bytes,
+                    })
+                })
+                .collect();
+            result
+        }
+        .boxed()
+    }
+
+    fn get_metadata(
+        &mut self,
+        options: Option<&ArrowReaderOptions>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        let metadata_opts = options.map(|o| o.metadata_options().clone());
+        // The page-index policies live on `ArrowReaderOptions` directly, not
+        // inside `metadata_options`, so they must be forwarded explicitly (the
+        // upstream default `AsyncFileReader::get_metadata` does the same).
+        // Without this, `with_page_index_policy` would silently no-op here and
+        // no page index would ever be loaded.
+        let column_index_policy = options.map(|o| o.column_index_policy());
+        let offset_index_policy = options.map(|o| o.offset_index_policy());
+        let prefetch_hint = Some(METADATA_SIZE_HINT);
+        Box::pin(async move {
+            let file_size = self.file_size;
+            let mut reader = ParquetMetaDataReader::new()
+                .with_prefetch_hint(prefetch_hint)
+                .with_metadata_options(metadata_opts);
+            if let Some(policy) = column_index_policy {
+                reader = reader.with_column_index_policy(policy);
+            }
+            if let Some(policy) = offset_index_policy {
+                reader = reader.with_offset_index_policy(policy);
+            }
+            let metadata = reader.load_and_finish(self, file_size).await?;
+            Ok(Arc::new(metadata))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Range coalescing
+// ---------------------------------------------------------------------------
+
+/// Merge nearby byte ranges to reduce the number of requests.
+///
+/// Ranges whose gap is ≤ `coalesce` bytes are merged into a single range.
+/// The input does not need to be sorted.
+fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
+    if ranges.is_empty() {
+        return vec![];
+    }
+
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|r| r.start);
+
+    let mut merged = Vec::with_capacity(sorted.len());
+    let mut start_idx = 0;
+    let mut end_idx = 1;
+
+    while start_idx != sorted.len() {
+        let mut range_end = sorted[start_idx].end;
+
+        while end_idx != sorted.len()
+            && sorted[end_idx]
+                .start
+                .checked_sub(range_end)
+                .map(|delta| delta <= coalesce)
+                .unwrap_or(true)
+        {
+            range_end = range_end.max(sorted[end_idx].end);
+            end_idx += 1;
+        }
+
+        merged.push(sorted[start_idx].start..range_end);
+        start_idx = end_idx;
+        end_idx += 1;
+    }
+
+    merged
+}
+
+/// Split merged ranges into fixed-size batches to utilize concurrency,
+/// Each merged range is divided into chunks of `expected_size`,
+/// with the last chunk taking whatever remains.
+/// Ranges smaller than `2 * IO_BLOCK_SIZE` are kept as-is to
+/// avoid excessive small IO requests.
+fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> Vec<Range<u64>> {
+    if merged.is_empty() || concurrency <= 1 {
+        return merged;
+    }
+
+    let mut result = Vec::with_capacity(merged.len());
+
+    for range in &merged {
+        let length = range.end - range.start;
+        let raw_size = IO_BLOCK_SIZE.max(length.div_ceil(concurrency as u64));
+        // Round up to the nearest multiple of IO_BLOCK_SIZE (4 MB) so that
+        // every split boundary is 4 MB-aligned relative to the range start.
+        let expected_size = raw_size.div_ceil(IO_BLOCK_SIZE) * IO_BLOCK_SIZE;
+        let min_tail_size = expected_size.max(IO_BLOCK_SIZE * 2);
+
+        let mut offset = range.start;
+        let end = range.end;
+
+        // Align the first split boundary: if `offset` is not 4 MB-aligned,
+        // emit a short head chunk so that all subsequent chunks start on a
+        // 4 MB boundary.
+        let misalign = offset % IO_BLOCK_SIZE;
+        if misalign != 0 {
+            let first_end = (offset - misalign + IO_BLOCK_SIZE).min(end);
+            result.push(offset..first_end);
+            offset = first_end;
+        }
+
+        loop {
+            if offset >= end {
+                break;
+            }
+            if end - offset < min_tail_size {
+                result.push(offset..end);
+                break;
+            } else {
+                result.push(offset..offset + expected_size);
+                offset += expected_size;
+            }
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::type_complexity)] // test row literals use nested Option<Vec<(&str, Option<i64>)>>
+mod tests {
+    use super::build_parquet_row_filter;
+    use super::{
+        AsyncArrowWriter, Bytes, PageIndexPolicy, ParquetMetaDataReader, Predicate,
+        PredicateOperator, RowSelection,
+    };
+    use super::{FilePredicates, ParquetFormatReader, ParquetFormatWriter};
+    use crate::arrow::format::{
+        create_format_reader, create_format_writer, FormatFileReader, FormatFileWriter,
+    };
+    use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
+    use crate::io::FileIOBuilder;
+    use crate::io::{ReadControl, ReadReservation};
+    use crate::spec::{
+        ArrayType, BigIntType, DataField, DataType, Datum, IntType, MapType, PredicateBuilder,
+        VarCharType, VariantType,
+    };
+    use crate::table::RowRange;
+    use crate::variant::GenericVariant;
+    use arrow_array::{
+        Array, BinaryArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
+    };
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::TryStreamExt;
+    use parquet::arrow::async_reader::AsyncFileReader;
+    use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
+    use std::collections::HashMap;
+    use std::fmt::{Display, Formatter};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct HostReadMarker;
+
+    impl Display for HostReadMarker {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("host read marker")
+        }
+    }
+
+    impl std::error::Error for HostReadMarker {}
+
+    struct FailingFileRead;
+
+    #[async_trait::async_trait]
+    impl crate::io::FileRead for FailingFileRead {
+        async fn read(&self, _range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            Err(crate::Error::UnexpectedError {
+                message: "host read failed".to_string(),
+                source: Some(Box::new(HostReadMarker)),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parquet_adapter_preserves_typed_host_read_error() {
+        let mut reader = super::ArrowFileReader::new(16, Box::new(FailingFileRead));
+        let error = reader.get_bytes(0..1).await.unwrap_err();
+        let parquet::errors::ParquetError::External(source) = error else {
+            panic!("expected external Parquet error");
+        };
+        let sdk_error = source
+            .downcast_ref::<crate::Error>()
+            .expect("typed SDK error must be retained");
+        let crate::Error::UnexpectedError {
+            source: Some(source),
+            ..
+        } = sdk_error
+        else {
+            panic!("expected typed host source");
+        };
+        assert!(source.downcast_ref::<HostReadMarker>().is_some());
+    }
+
+    #[derive(Debug)]
+    struct RangeReservation {
+        bytes: u64,
+        retained: Arc<AtomicU64>,
+    }
+
+    impl Drop for RangeReservation {
+        fn drop(&mut self) {
+            self.retained.fetch_sub(self.bytes, Ordering::SeqCst);
+        }
+    }
+
+    impl ReadReservation for RangeReservation {
+        fn bytes(&self) -> u64 {
+            self.bytes
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct RangeControl {
+        retained: Arc<AtomicU64>,
+        limit: Option<u64>,
+    }
+
+    impl ReadControl for RangeControl {
+        fn check_active(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn checkpoint(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
+            let old = self.retained.fetch_add(bytes, Ordering::SeqCst);
+            if self
+                .limit
+                .is_some_and(|limit| old.saturating_add(bytes) > limit)
+            {
+                self.retained.fetch_sub(bytes, Ordering::SeqCst);
+                return Err(crate::Error::UnexpectedError {
+                    message: "test read budget exhausted".to_string(),
+                    source: None,
+                });
+            }
+            Ok(Box::new(RangeReservation {
+                bytes,
+                retained: self.retained.clone(),
+            }))
+        }
+    }
+
+    struct ControlledBytesRead {
+        data: Bytes,
+        control: Arc<RangeControl>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::FileRead for ControlledBytesRead {
+        async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
+
+        fn read_control(&self) -> Option<Arc<dyn ReadControl>> {
+            Some(self.control.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_fetch_range_concatenation_retains_host_reservation() {
+        let length = 9 * 1024 * 1024;
+        let retained = Arc::new(AtomicU64::new(0));
+        let control = Arc::new(RangeControl {
+            retained: retained.clone(),
+            limit: None,
+        });
+        let file = ControlledBytesRead {
+            data: Bytes::from(vec![7u8; length]),
+            control,
+        };
+        let mut reader = super::ArrowFileReader::new(length as u64, Box::new(file));
+        let result = reader
+            .get_byte_ranges(vec![0..length as u64])
+            .await
+            .unwrap();
+        assert_eq!(result[0].len(), length);
+        assert_eq!(retained.load(Ordering::SeqCst), length as u64);
+        drop(result);
+        assert_eq!(retained.load(Ordering::SeqCst), 0);
+    }
+
+    fn controlled_parquet_fixture(
+        limit: Option<u64>,
+    ) -> (Vec<DataField>, ControlledBytesRead, Arc<AtomicU64>) {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let retained = Arc::new(AtomicU64::new(0));
+        let control = Arc::new(RangeControl {
+            retained: retained.clone(),
+            limit,
+        });
+        (
+            vec![DataField::new(
+                0,
+                "id".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            ControlledBytesRead {
+                data: Bytes::from(bytes),
+                control,
+            },
+            retained,
+        )
+    }
+
+    #[tokio::test]
+    async fn parquet_decode_unit_is_reserved_before_poll_and_released_with_stream() {
+        let (fields, file, retained) = controlled_parquet_fixture(None);
+        let file_size = file.data.len() as u64;
+        let stream = ParquetFormatReader
+            .read_batch_stream(Box::new(file), file_size, &fields, None, Some(2), None)
+            .await
+            .unwrap();
+
+        assert!(retained.load(Ordering::SeqCst) > 0);
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+        assert_eq!(retained.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn parquet_decode_unit_budget_is_checked_before_decode() {
+        let (fields, file, retained) = controlled_parquet_fixture(Some(1));
+        let file_size = file.data.len() as u64;
+        let result = ParquetFormatReader
+            .read_batch_stream(Box::new(file), file_size, &fields, None, Some(2), None)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("decode-unit reservation must exceed the one-byte budget"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(error, crate::Error::UnexpectedError { message, .. }
+            if message.contains("budget exhausted"))
+        );
+        assert_eq!(retained.load(Ordering::SeqCst), 0);
+    }
+
+    fn test_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "score".to_string(), DataType::Int(IntType::new())),
+        ]
+    }
+
+    fn test_parquet_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(Arc::new(
+            parse_message_type(
+                "
+                message test_schema {
+                  OPTIONAL INT32 id;
+                  OPTIONAL INT32 score;
+                }
+                ",
+            )
+            .expect("test schema should parse"),
+        ))
+    }
+
+    #[test]
+    fn test_build_parquet_row_filter_supports_null_and_membership_predicates() {
+        let fields = test_fields();
+        let builder = PredicateBuilder::new(&fields);
+        let predicates = vec![
+            builder
+                .is_null("id")
+                .expect("is null predicate should build"),
+            builder
+                .is_in("score", vec![Datum::Int(7)])
+                .expect("in predicate should build"),
+            builder
+                .is_not_in("score", vec![Datum::Int(9)])
+                .expect("not in predicate should build"),
+        ];
+
+        let row_filter = build_parquet_row_filter(&test_parquet_schema(), &predicates, &fields)
+            .expect("parquet row filter should build");
+
+        assert!(row_filter.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // String predicate tests (StartsWith / EndsWith / Contains)
+    // -----------------------------------------------------------------------
+
+    fn run_string_op(
+        op: super::PredicateOperator,
+        column: arrow_array::ArrayRef,
+        pattern: &str,
+    ) -> arrow_array::BooleanArray {
+        use crate::spec::VarCharType;
+        let dt = DataType::VarChar(VarCharType::default());
+        crate::arrow::residual::evaluate_exact_leaf_predicate(
+            &column,
+            &dt,
+            op,
+            &[Datum::String(pattern.to_string())],
+        )
+        .expect("string op should evaluate")
+    }
+
+    #[test]
+    fn test_evaluate_starts_with_string_array() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![
+            Some("foo"),
+            Some("foobar"),
+            Some("baz"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::StartsWith, arr, "foo");
+        let expected = arrow_array::BooleanArray::from(vec![true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_ends_with_large_string_array() {
+        use arrow_array::LargeStringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(LargeStringArray::from(vec![
+            Some("hello"),
+            Some("world"),
+            Some("ello"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::EndsWith, arr, "ello");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_contains_string_view_array() {
+        use arrow_array::StringViewArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("apple pie"),
+            Some("banana"),
+            Some("crab apple"),
+            None,
+        ]));
+        let mask = run_string_op(super::PredicateOperator::Contains, arr, "apple");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, true, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_string_view_comparison_families() {
+        use crate::spec::VarCharType;
+        use arrow_array::{ArrayRef, BooleanArray, StringViewArray};
+
+        let column: ArrayRef = Arc::new(StringViewArray::from(vec![
+            Some("a"),
+            Some("b"),
+            Some("c"),
+            None,
+        ]));
+        let data_type = DataType::VarChar(VarCharType::default());
+        let cases = [
+            (
+                super::PredicateOperator::Eq,
+                vec![Datum::String("b".to_string())],
+                vec![false, true, false, false],
+            ),
+            (
+                super::PredicateOperator::NotEq,
+                vec![Datum::String("b".to_string())],
+                vec![true, false, true, false],
+            ),
+            (
+                super::PredicateOperator::Lt,
+                vec![Datum::String("b".to_string())],
+                vec![true, false, false, false],
+            ),
+            (
+                super::PredicateOperator::LtEq,
+                vec![Datum::String("b".to_string())],
+                vec![true, true, false, false],
+            ),
+            (
+                super::PredicateOperator::Gt,
+                vec![Datum::String("b".to_string())],
+                vec![false, false, true, false],
+            ),
+            (
+                super::PredicateOperator::GtEq,
+                vec![Datum::String("b".to_string())],
+                vec![false, true, true, false],
+            ),
+            (
+                super::PredicateOperator::In,
+                vec![
+                    Datum::String("a".to_string()),
+                    Datum::String("c".to_string()),
+                ],
+                vec![true, false, true, false],
+            ),
+            (
+                super::PredicateOperator::NotIn,
+                vec![
+                    Datum::String("a".to_string()),
+                    Datum::String("c".to_string()),
+                ],
+                vec![false, true, false, false],
+            ),
+            (
+                super::PredicateOperator::Between,
+                vec![
+                    Datum::String("a".to_string()),
+                    Datum::String("b".to_string()),
+                ],
+                vec![true, true, false, false],
+            ),
+            (
+                super::PredicateOperator::NotBetween,
+                vec![
+                    Datum::String("a".to_string()),
+                    Datum::String("b".to_string()),
+                ],
+                vec![false, false, true, false],
+            ),
+        ];
+
+        for (op, literals, expected) in cases {
+            let mask = crate::arrow::residual::evaluate_exact_leaf_predicate(
+                &column, &data_type, op, &literals,
+            )
+            .unwrap_or_else(|error| panic!("{op:?} should evaluate: {error}"));
+            assert_eq!(mask, BooleanArray::from(expected), "operator {op:?}");
+        }
+    }
+
+    #[test]
+    fn test_evaluate_like_pattern_with_underscore_and_percent() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![
+            Some("foobar"),
+            Some("foox"),
+            Some("zoobar"),
+            None,
+        ]));
+        // f_o% matches "foobar" (f-o-o then anything) and "foox" (f-o-o then x)
+        // but not "zoobar".
+        let mask = run_string_op(super::PredicateOperator::Like, arr, "f_o%");
+        let expected = arrow_array::BooleanArray::from(vec![true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_like_escaped_percent_treated_literally() {
+        use arrow_array::StringArray;
+        let arr: arrow_array::ArrayRef =
+            Arc::new(StringArray::from(vec![Some("100%"), Some("1000"), None]));
+        let mask = run_string_op(super::PredicateOperator::Like, arr, r"100\%");
+        let expected = arrow_array::BooleanArray::from(vec![true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // BETWEEN / NOT BETWEEN row-filter tests
+    // -----------------------------------------------------------------------
+
+    fn run_between(
+        op: super::PredicateOperator,
+        column: arrow_array::ArrayRef,
+        low: i32,
+        high: i32,
+    ) -> arrow_array::BooleanArray {
+        let dt = DataType::Int(IntType::new());
+        crate::arrow::residual::evaluate_exact_leaf_predicate(
+            &column,
+            &dt,
+            op,
+            &[Datum::Int(low), Datum::Int(high)],
+        )
+        .expect("BETWEEN should evaluate")
+    }
+
+    #[test]
+    fn test_evaluate_between_int_array() {
+        let arr: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(5),
+            Some(10),
+            Some(11),
+            None,
+        ]));
+        let mask = run_between(super::PredicateOperator::Between, arr, 5, 10);
+        let expected = arrow_array::BooleanArray::from(vec![false, true, true, false, false]);
+        assert_eq!(mask, expected);
+    }
+
+    #[test]
+    fn test_evaluate_not_between_treats_null_as_false() {
+        let arr: arrow_array::ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            Some(5),
+            Some(10),
+            Some(11),
+            None,
+        ]));
+        let mask = run_between(super::PredicateOperator::NotBetween, arr, 5, 10);
+        // NULL → false (residual filter convention; matches sanitize_filter_mask).
+        let expected = arrow_array::BooleanArray::from(vec![true, false, false, true, false]);
+        assert_eq!(mask, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_byte_ranges tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_byte_ranges_empty() {
+        assert_eq!(
+            super::merge_byte_ranges(&[], 1024),
+            Vec::<std::ops::Range<u64>>::new()
+        );
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_no_coalesce() {
+        // Ranges far apart should not be merged
+        let ranges = vec![0..100, 1_000_000..1_000_100];
+        let merged = super::merge_byte_ranges(&ranges, 1024);
+        assert_eq!(merged, vec![0..100, 1_000_000..1_000_100]);
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_coalesce() {
+        // Ranges within the gap threshold should be merged
+        let ranges = vec![0..100, 200..300, 500..600];
+        let merged = super::merge_byte_ranges(&ranges, 1024);
+        assert_eq!(merged, vec![0..600]);
+    }
+
+    #[test]
+    fn test_merge_byte_ranges_zero_coalesce_gap() {
+        // With coalesce=0, ranges with a 1-byte gap should NOT merge
+        let ranges = vec![0..100, 101..200];
+        let merged = super::merge_byte_ranges(&ranges, 0);
+        assert_eq!(merged, vec![0..100, 101..200]);
+    }
+
+    // -----------------------------------------------------------------------
+    // split_ranges_for_concurrency tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_split_aligned_range_0_to_20mb() {
+        // 0..20MB, concurrency=4:
+        //   raw_size = max(4MB, 5MB+1) = 5MB+1
+        //   expected_size = ceil((5MB+1)/4MB)*4MB = 8MB
+        //   min_tail_size = max(8MB, 8MB) = 8MB
+        //   No misalign. Chunks: [0..8, 8..16, 16..20]
+        let mb = 1024 * 1024u64;
+        #[allow(clippy::single_range_in_vec_init)]
+        let merged = vec![0..20 * mb];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert_eq!(result, vec![0..8 * mb, 8 * mb..16 * mb, 16 * mb..20 * mb]);
+    }
+
+    #[test]
+    fn test_split_unaligned_start_6_to_14mb() {
+        // 6MB..14MB, concurrency=4:
+        //   raw_size = max(4MB, 2MB+1) = 4MB
+        //   expected_size = 4MB, min_tail_size = 8MB
+        //   Head: 6..8MB. Loop: 8+8=16 > 14 → tail 8..14.
+        //   Result: [6..8, 8..14]
+        let mb = 1024 * 1024u64;
+        #[allow(clippy::single_range_in_vec_init)]
+        let merged = vec![6 * mb..14 * mb];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert_eq!(result, vec![6 * mb..8 * mb, 8 * mb..14 * mb]);
+    }
+
+    #[test]
+    fn test_split_unaligned_start_6_to_22mb() {
+        // 6MB..22MB, concurrency=4:
+        //   raw_size = max(4MB, ceil(16MB/4)) = 4MB
+        //   expected_size = ceil(4MB/4MB)*4MB = 4MB
+        //   min_tail_size = max(4MB, 8MB) = 8MB
+        //   Head: 6..8MB (misalign=2MB).
+        //   Loop: 22-8=14≥8 → 8..12; 22-12=10≥8 → 12..16; 22-16=6<8 → tail 16..22.
+        //   Result: [6..8, 8..12, 12..16, 16..22]
+        let mb = 1024 * 1024u64;
+        #[allow(clippy::single_range_in_vec_init)]
+        let merged = vec![6 * mb..22 * mb];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert_eq!(
+            result,
+            vec![
+                6 * mb..8 * mb,
+                8 * mb..12 * mb,
+                12 * mb..16 * mb,
+                16 * mb..22 * mb,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_already_aligned_8_to_24mb() {
+        // 8MB..24MB, concurrency=4:
+        //   raw_size = max(4MB, ceil(16MB/4)) = 4MB
+        //   expected_size = 4MB, min_tail_size = 8MB
+        //   No misalign.
+        //   Loop: 24-8=16≥8 → 8..12; 24-12=12≥8 → 12..16; 24-16=8≥8 → 16..20; 24-20=4<8 → tail 20..24.
+        //   Result: [8..12, 12..16, 16..20, 20..24]
+        let mb = 1024 * 1024u64;
+        #[allow(clippy::single_range_in_vec_init)]
+        let merged = vec![8 * mb..24 * mb];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert_eq!(
+            result,
+            vec![
+                8 * mb..12 * mb,
+                12 * mb..16 * mb,
+                16 * mb..20 * mb,
+                20 * mb..24 * mb,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_multiple_ranges() {
+        // [0..20MB, 24..44MB], concurrency=4:
+        //   Range 0..20MB → [0..8, 8..16, 16..20] (same as test above)
+        //   Range 24..44MB (20MB): expected_size=8MB, min_tail_size=8MB, no misalign.
+        //     24+8=32 ≤ 44 → 24..32; 32+8=40 ≤ 44 → 32..40; 40+8=48 > 44 → tail 40..44.
+        //   Result: [0..8, 8..16, 16..20, 24..32, 32..40, 40..44]
+        let mb = 1024 * 1024u64;
+        let merged = vec![0..20 * mb, 24 * mb..44 * mb];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert_eq!(
+            result,
+            vec![
+                0..8 * mb,
+                8 * mb..16 * mb,
+                16 * mb..20 * mb,
+                24 * mb..32 * mb,
+                32 * mb..40 * mb,
+                40 * mb..44 * mb,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_empty() {
+        let merged: Vec<std::ops::Range<u64>> = vec![];
+        let result = super::split_ranges_for_concurrency(merged, 4);
+        assert!(result.is_empty());
+    }
+
+    fn writer_arrow_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+        ]))
+    }
+
+    fn writer_test_batch(
+        schema: &Arc<ArrowSchema>,
+        ids: Vec<i32>,
+        values: Vec<i32>,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_write_and_close() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_writer_write_close.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let schema = writer_arrow_schema();
+
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1, None, &HashMap::new())
+                .await
+                .unwrap(),
+        );
+
+        let batch = writer_test_batch(&schema, vec![1, 2, 3], vec![10, 20, 30]);
+        writer.write(&batch).await.unwrap();
+        let _ = writer.close().await.unwrap();
+
+        // Verify valid parquet by reading back
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
+        let total_rows: usize = reader.into_iter().map(|r| r.unwrap().num_rows()).sum();
+        assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_multiple_batches() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_writer_multi.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let schema = writer_arrow_schema();
+
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1, None, &HashMap::new())
+                .await
+                .unwrap(),
+        );
+
+        writer
+            .write(&writer_test_batch(&schema, vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        writer
+            .write(&writer_test_batch(&schema, vec![3, 4, 5], vec![30, 40, 50]))
+            .await
+            .unwrap();
+        let _ = writer.close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
+        let total_rows: usize = reader.into_iter().map(|r| r.unwrap().num_rows()).sum();
+        assert_eq!(total_rows, 5);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_inline_fixed_size_list_roundtrip() {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+
+        // Build a FixedSizeList<Float32, 2> column: row 0 = [1.0, 2.0], row 1 = null.
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(Arc::new(
+            ArrowField::new("element", ArrowDataType::Float32, true),
+        ));
+        builder.values().append_value(1.0);
+        builder.values().append_value(2.0);
+        builder.append(true);
+        builder.values().append_value(0.0);
+        builder.values().append_value(0.0);
+        builder.append(false); // null vector row
+        let vec_array = builder.finish();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "embedding",
+            ArrowDataType::FixedSizeList(
+                Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                2,
+            ),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vec_array)]).unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_inline_vector.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(&output, schema.clone(), "zstd", 1, None, &HashMap::new())
+                .await
+                .unwrap(),
+        );
+        writer.write(&batch).await.unwrap();
+        let _ = writer.close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
+        let batches: Vec<RecordBatch> = reader.into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+        let col = batches[0].column(0);
+        let fsl = col
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("column should be FixedSizeListArray");
+        assert_eq!(fsl.value_length(), 2);
+        assert!(fsl.is_valid(0));
+        assert!(fsl.is_null(1)); // null vector row preserved
+
+        let row0 = fsl.value(0);
+        let floats = row0
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("child should be Float32Array");
+        assert_eq!(floats.values(), &[1.0, 2.0]);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_variant_shredding_write_read_roundtrip() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "v".to_string(), DataType::Variant(VariantType::new())),
+        ];
+        let options = HashMap::from([(
+            "parquet.variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"age","type":"BIGINT"},{"name":"city","type":"STRING"}]}}]}"#.to_string(),
+        )]);
+        let variants = [
+            GenericVariant::parse_json(r#"{"age":27,"city":"Beijing"}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"age":27}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"city":"Beijing","other":"xxx"}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"age":"27"}"#).unwrap(),
+        ];
+        let value_items = variants
+            .iter()
+            .map(|variant| Some(variant.value()))
+            .collect::<Vec<_>>();
+        let metadata_items = variants
+            .iter()
+            .map(|variant| Some(variant.metadata()))
+            .collect::<Vec<_>>();
+        let variant_fields = match variant_arrow_type() {
+            arrow_schema::DataType::Struct(fields) => fields,
+            _ => unreachable!("variant_arrow_type is a struct"),
+        };
+        let variant_column = StructArray::try_new(
+            variant_fields,
+            vec![
+                Arc::new(BinaryArray::from(value_items)),
+                Arc::new(BinaryArray::from(metadata_items)),
+            ],
+            None,
+        )
+        .unwrap();
+        let logical_schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            logical_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(variant_column),
+            ],
+        )
+        .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!("memory:/variant_shredding_{}.parquet", uuid::Uuid::new_v4());
+        let output = file_io.new_output(&path).unwrap();
+        let mut writer = create_format_writer(
+            &output,
+            logical_schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
+
+        let raw_bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+        let raw_batches =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(raw_bytes, 1024)
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+        let raw_variant_column = raw_batches[0].column_by_name("v").unwrap();
+        let arrow_schema::DataType::Struct(raw_variant_fields) = raw_variant_column.data_type()
+        else {
+            panic!("expected physical variant column to be a struct");
+        };
+        assert!(raw_variant_fields
+            .iter()
+            .any(|field| field.name() == "typed_value"));
+
+        let input = file_io.new_input(&path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let reader = create_format_reader(&path, false, &fields).unwrap();
+        let batches = reader
+            .read_batch_stream(Box::new(file_reader), file_size, &fields, None, None, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let payload = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let values = payload
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let metadata = payload
+            .column_by_name("metadata")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        for (idx, expected) in variants.iter().enumerate() {
+            let actual = GenericVariant::from_parts(
+                values.value(idx).to_vec(),
+                metadata.value(idx).to_vec(),
+            )
+            .unwrap();
+            assert_eq!(actual.to_json().unwrap(), expected.to_json().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_variant_infer_shredding_write_read_roundtrip() {
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "v".to_string(), DataType::Variant(VariantType::new())),
+        ];
+        let options = HashMap::from([
+            (
+                "variant.inferShreddingSchema".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "variant.shredding.maxInferBufferRow".to_string(),
+                "2".to_string(),
+            ),
+        ]);
+        let first_variants = vec![
+            GenericVariant::parse_json(r#"{"age":27,"city":"Beijing"}"#).unwrap(),
+            GenericVariant::parse_json(r#"{"age":28,"city":"Hangzhou"}"#).unwrap(),
+        ];
+        let late_variants =
+            vec![GenericVariant::parse_json(r#"{"age":"old","city":"Shanghai"}"#).unwrap()];
+        let logical_schema = build_target_arrow_schema(&fields).unwrap();
+        let make_batch = |ids: Vec<i32>, variants: &[GenericVariant]| {
+            let value_items = variants
+                .iter()
+                .map(|variant| Some(variant.value()))
+                .collect::<Vec<_>>();
+            let metadata_items = variants
+                .iter()
+                .map(|variant| Some(variant.metadata()))
+                .collect::<Vec<_>>();
+            let variant_fields = match variant_arrow_type() {
+                arrow_schema::DataType::Struct(fields) => fields,
+                _ => unreachable!("variant_arrow_type is a struct"),
+            };
+            let variant_column = StructArray::try_new(
+                variant_fields,
+                vec![
+                    Arc::new(BinaryArray::from(value_items)),
+                    Arc::new(BinaryArray::from(metadata_items)),
+                ],
+                None,
+            )
+            .unwrap();
+            RecordBatch::try_new(
+                logical_schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(variant_column)],
+            )
+            .unwrap()
+        };
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!(
+            "memory:/variant_infer_shredding_{}.parquet",
+            uuid::Uuid::new_v4()
+        );
+        let output = file_io.new_output(&path).unwrap();
+        let mut writer = create_format_writer(
+            &output,
+            logical_schema.clone(),
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer
+            .write(&make_batch(vec![1, 2], &first_variants))
+            .await
+            .unwrap();
+        writer
+            .write(&make_batch(vec![3], &late_variants))
+            .await
+            .unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
+
+        let raw_bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+        let raw_batches =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(raw_bytes, 1024)
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+        let raw_variant_column = raw_batches[0].column_by_name("v").unwrap();
+        let arrow_schema::DataType::Struct(raw_variant_fields) = raw_variant_column.data_type()
+        else {
+            panic!("expected physical variant column to be a struct");
+        };
+        assert!(raw_variant_fields
+            .iter()
+            .any(|field| field.name() == "typed_value"));
+
+        let input = file_io.new_input(&path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let reader = create_format_reader(&path, false, &fields).unwrap();
+        let batches = reader
+            .read_batch_stream(Box::new(file_reader), file_size, &fields, None, None, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let payload = batches[0]
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let values = payload
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let metadata = payload
+            .column_by_name("metadata")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let expected = first_variants
+            .iter()
+            .chain(late_variants.iter())
+            .collect::<Vec<_>>();
+        for (idx, expected) in expected.iter().enumerate() {
+            let actual = GenericVariant::from_parts(
+                values.value(idx).to_vec(),
+                metadata.value(idx).to_vec(),
+            )
+            .unwrap();
+            assert_eq!(actual.to_json().unwrap(), expected.to_json().unwrap());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Page-index (ColumnIndex / OffsetIndex) pruning
+    // -----------------------------------------------------------------------
+
+    /// Write a single row group split into `total_rows / page_row_limit` data
+    /// pages. `id` runs 0..total_rows so page `p` covers ids
+    /// `[p*page_row_limit, (p+1)*page_row_limit)`.
+    async fn write_multi_page_parquet(page_row_limit: usize, total_rows: i32) -> Vec<u8> {
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_data_page_row_count_limit(page_row_limit)
+            .set_write_batch_size(page_row_limit)
+            .set_max_row_group_row_count(Some(total_rows as usize))
+            .build();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            let ids: Vec<i32> = (0..total_rows).collect();
+            let values: Vec<i32> = ids.iter().map(|v| v * 10).collect();
+            writer
+                .write(&writer_test_batch(&schema, ids, values))
+                .await
+                .unwrap();
+            let _ = writer.close().await.unwrap();
+        }
+        buf
+    }
+
+    #[derive(Clone)]
+    struct TrackingFileRead {
+        data: Bytes,
+        ranges: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
+    }
+
+    impl TrackingFileRead {
+        fn new(data: Bytes) -> Self {
+            Self {
+                data,
+                ranges: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn bytes_read(&self) -> u64 {
+            self.ranges
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum()
+        }
+
+        fn reset(&self) {
+            self.ranges.lock().unwrap().clear();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::io::FileRead for TrackingFileRead {
+        async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            self.ranges.lock().unwrap().push(range.clone());
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    async fn write_nested_multi_page_parquet() -> Vec<u8> {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+
+        const ROWS: usize = 1024;
+        const VALUES_PER_ROW: usize = 1024;
+
+        let element = Arc::new(ArrowField::new("element", ArrowDataType::Int32, false));
+        let mut values = ListBuilder::new(Int32Builder::new()).with_field(element.clone());
+        for row in 0..ROWS {
+            for value in 0..VALUES_PER_ROW {
+                values
+                    .values()
+                    .append_value((row * VALUES_PER_ROW + value) as i32);
+            }
+            values.append(true);
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "items",
+            ArrowDataType::List(element),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values.finish())]).unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_data_page_row_count_limit(128)
+            .set_write_batch_size(128)
+            .set_max_row_group_row_count(Some(ROWS))
+            .set_dictionary_enabled(false)
+            .build();
+
+        let mut buf = Vec::new();
+        let mut writer = AsyncArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        buf
+    }
+
+    async fn read_nested_rows(data: Bytes, row_selection: Option<Vec<RowRange>>) -> (usize, u64) {
+        let file_size = data.len() as u64;
+        let file_read = TrackingFileRead::new(data);
+        let tracker = file_read.clone();
+        let fields = vec![DataField::new(
+            0,
+            "items".to_string(),
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        )];
+        let stream = ParquetFormatReader
+            .read_batch_stream(
+                Box::new(file_read),
+                file_size,
+                &fields,
+                None,
+                Some(128),
+                row_selection,
+            )
+            .await
+            .unwrap();
+        tracker.reset();
+        let rows = stream
+            .try_fold(
+                0usize,
+                |rows, batch| async move { Ok(rows + batch.num_rows()) },
+            )
+            .await
+            .unwrap();
+        (rows, tracker.bytes_read())
+    }
+
+    #[tokio::test]
+    async fn test_row_selection_prunes_nested_page_io() {
+        let data = Bytes::from(write_nested_multi_page_parquet().await);
+        let (all_rows, all_bytes) = read_nested_rows(data.clone(), None).await;
+        let (selected_rows, selected_bytes) =
+            read_nested_rows(data, Some(vec![RowRange::new(0, 0)])).await;
+
+        assert_eq!(all_rows, 1024);
+        assert_eq!(selected_rows, 1);
+        assert!(
+            selected_bytes * 2 < all_bytes,
+            "selected read used {selected_bytes} bytes; full read used {all_bytes} bytes"
+        );
+    }
+
+    /// Parse metadata from in-memory parquet bytes, optionally loading the page
+    /// index — mirrors what the reader does via `with_page_index_policy`.
+    fn load_metadata_with_page_index(
+        bytes: &[u8],
+        page_index: bool,
+    ) -> Arc<parquet::file::metadata::ParquetMetaData> {
+        let mut reader = ParquetMetaDataReader::new();
+        if page_index {
+            reader = reader
+                .with_column_index_policy(PageIndexPolicy::Optional)
+                .with_offset_index_policy(PageIndexPolicy::Optional);
+        }
+        let owned: bytes::Bytes = bytes.to_vec().into();
+        Arc::new(reader.parse_and_finish(&owned).unwrap())
+    }
+
+    fn int_field(name: &str) -> DataField {
+        DataField::new(0, name.to_string(), DataType::Int(IntType::new()))
+    }
+
+    fn id_leaf(op: PredicateOperator, literals: Vec<Datum>) -> Predicate {
+        Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: DataType::Int(IntType::new()),
+            op,
+            literals,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_eq_keeps_only_matching_page() {
+        // 80 rows / 10 per page = 8 pages; page p covers ids [p*10, p*10+10).
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // Eq(35) falls only in page 3 ([30, 40)).
+        let predicates = vec![id_leaf(PredicateOperator::Eq, vec![Datum::Int(35)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("a page should be skipped");
+        assert_eq!(sel.row_count(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_eq_outside_all_pages_skips_everything() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // 1000 is past every page's max (79).
+        let predicates = vec![id_leaf(PredicateOperator::Eq, vec![Datum::Int(1000)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("all pages should be skipped");
+        assert_eq!(sel.row_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_range_keeps_overlapping_pages() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // Lt(25) overlaps pages 0 ([0,10)), 1 ([10,20)), 2 ([20,30)) — 30 rows.
+        let predicates = vec![id_leaf(PredicateOperator::Lt, vec![Datum::Int(25)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("some pages should be skipped");
+        assert_eq!(sel.row_count(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_neq_falls_open() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // NotEq is conservative under stats: every page holds other values, so
+        // no page can be excluded → helper returns None (selection unchanged).
+        let predicates = vec![id_leaf(PredicateOperator::NotEq, vec![Datum::Int(35)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields).unwrap();
+        assert!(sel.is_none(), "NotEq must not skip any page (got {sel:?})");
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_returns_none_without_page_index() {
+        let bytes = write_multi_page_parquet(10, 80).await;
+        // Metadata parsed without the page index → helper must fall open.
+        let metadata = load_metadata_with_page_index(&bytes, false);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        let predicates = vec![id_leaf(PredicateOperator::Eq, vec![Datum::Int(35)])];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields).unwrap();
+        assert!(
+            sel.is_none(),
+            "missing page index must fall open (got {sel:?})"
+        );
+    }
+
+    /// Expand a [`RowSelection`] into the set of selected 0-based row indices.
+    fn selected_rows(sel: &RowSelection) -> Vec<usize> {
+        let mut rows = Vec::new();
+        let mut pos = 0usize;
+        for selector in sel.iter() {
+            if !selector.skip {
+                rows.extend(pos..pos + selector.row_count);
+            }
+            pos += selector.row_count;
+        }
+        rows
+    }
+
+    /// Write two columns whose page layouts differ: `id` is a single page while
+    /// `value` is forced into ~10-row pages via a per-column byte-size limit.
+    /// This is the layout that exposes the "borrow another column's page rows"
+    /// bug — the driver column's pages must not be reused for `value`'s stats.
+    async fn write_divergent_page_layout_parquet(total_rows: i32) -> Vec<u8> {
+        use parquet::schema::types::ColumnPath;
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            // `value` (4 bytes/row): ~40-byte pages ≈ 10 rows per page.
+            .set_column_data_page_size_limit(ColumnPath::from("value"), 40)
+            .set_write_batch_size(10)
+            // `id` keeps the default large page limit → a single page.
+            .set_max_row_group_row_count(Some(total_rows as usize))
+            .build();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            let ids: Vec<i32> = (0..total_rows).collect();
+            let values: Vec<i32> = ids.iter().map(|v| v * 10).collect();
+            writer
+                .write(&writer_test_batch(&schema, ids, values))
+                .await
+                .unwrap();
+            let _ = writer.close().await.unwrap();
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_predicate_on_non_driver_column() {
+        // Regression: pruning must use each column's own page boundaries. Here
+        // `value` has many pages while `id` has one; a predicate on `value`
+        // must never drop rows that actually match.
+        let bytes = write_divergent_page_layout_parquet(80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // value == 350 (i.e. id == 35). Predicate is on the second field.
+        let predicates = vec![Predicate::Leaf {
+            column: "value".to_string(),
+            index: 1,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(350)],
+        }];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields)
+            .unwrap()
+            .expect("value pages should be prunable");
+
+        // The matching row (index 35) must survive; pruning is still effective
+        // (not every row is kept).
+        let rows = selected_rows(&sel);
+        assert!(rows.contains(&35), "matching row 35 must be kept: {rows:?}");
+        assert!(
+            sel.row_count() < 80,
+            "some non-matching pages should be skipped (kept {} rows)",
+            sel.row_count()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_page_selection_fails_open_on_missing_column_index() {
+        // A column with only chunk-level statistics has no ColumnIndex
+        // (`ColumnIndexMetaData::NONE`) but still gets an OffsetIndex. Its
+        // accessors panic rather than return None, so pruning must fail open
+        // for that column instead of touching the index.
+        use parquet::file::properties::EnabledStatistics;
+        use parquet::schema::types::ColumnPath;
+
+        let schema = writer_arrow_schema();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .set_max_row_group_row_count(Some(80))
+            // `value` keeps chunk stats only → no column index, but an offset
+            // index is still written.
+            .set_column_statistics_enabled(ColumnPath::from("value"), EnabledStatistics::Chunk)
+            .build();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            let ids: Vec<i32> = (0..80).collect();
+            let values: Vec<i32> = ids.iter().map(|v| v * 10).collect();
+            writer
+                .write(&writer_test_batch(&schema, ids, values))
+                .await
+                .unwrap();
+            let _ = writer.close().await.unwrap();
+        }
+        let metadata = load_metadata_with_page_index(&buf, true);
+        let fields = vec![int_field("id"), int_field("value")];
+
+        // Predicate on the column without a column index must not panic; it
+        // falls open (kept whole), so no page is skipped for it.
+        let predicates = vec![Predicate::Leaf {
+            column: "value".to_string(),
+            index: 1,
+            data_type: DataType::Int(IntType::new()),
+            op: PredicateOperator::Eq,
+            literals: vec![Datum::Int(350)],
+        }];
+        let sel = super::build_predicate_page_selection(&metadata, &predicates, &fields).unwrap();
+        assert!(
+            sel.is_none(),
+            "column without a ColumnIndex must fall open (got {sel:?})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Residual backstop for compound / unsupported-leaf predicates (Gap B)
+    // -----------------------------------------------------------------------
+
+    /// Write a single-row-group parquet file with columns `(id, name, age)`:
+    /// `id=[1..=5]`, `name=[a,b,c,d,e]`, `age=[10,20,30,40,50]`. One row group so
+    /// row-group / page pruning cannot exclude the non-matching rows — the only
+    /// way to return exact rows is the row-level residual filter.
+    async fn write_id_name_age_parquet() -> Vec<u8> {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+            ArrowField::new("age", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(arrow_array::StringArray::from(vec![
+                    "a", "b", "c", "d", "e",
+                ])),
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .unwrap();
+
+        // Single row group covering every row so no row-group pruning is possible.
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(5))
+            .build();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            writer.write(&batch).await.unwrap();
+            let _ = writer.close().await.unwrap();
+        }
+        buf
+    }
+
+    fn residual_test_field(index: i32, name: &str, data_type: DataType) -> DataField {
+        DataField::new(index, name.to_string(), data_type)
+    }
+
+    fn residual_leaf(
+        column: &str,
+        index: usize,
+        data_type: DataType,
+        op: PredicateOperator,
+        literals: Vec<Datum>,
+    ) -> Predicate {
+        Predicate::Leaf {
+            column: column.to_string(),
+            index,
+            data_type,
+            op,
+            literals,
+        }
+    }
+
+    /// File-level schema `(id, name, age)` used to resolve predicate indices.
+    fn id_name_age_file_fields() -> Vec<DataField> {
+        use crate::spec::VarCharType;
+        vec![
+            residual_test_field(0, "id", DataType::Int(IntType::new())),
+            residual_test_field(1, "name", DataType::VarChar(VarCharType::string_type())),
+            residual_test_field(2, "age", DataType::Int(IntType::new())),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_external_row_filter_projection_failure_falls_back() {
+        #[derive(Debug)]
+        struct InvalidProjectionFactory;
+
+        struct InvalidProjectionFilter {
+            projection: Arc<ArrowSchema>,
+        }
+
+        impl crate::arrow::RowFilter for InvalidProjectionFilter {
+            fn projection(&self) -> &Arc<ArrowSchema> {
+                &self.projection
+            }
+
+            fn evaluate(
+                &mut self,
+                batch: RecordBatch,
+            ) -> Result<arrow_array::BooleanArray, arrow_schema::ArrowError> {
+                Ok(arrow_array::BooleanArray::from(vec![
+                    true;
+                    batch.num_rows()
+                ]))
+            }
+        }
+
+        impl crate::arrow::RowFilterFactory for InvalidProjectionFactory {
+            fn create(
+                &self,
+                _context: crate::arrow::RowFilterContext<'_>,
+            ) -> crate::Result<Vec<Box<dyn crate::arrow::RowFilter>>> {
+                Ok(vec![Box::new(InvalidProjectionFilter {
+                    projection: Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                        "missing",
+                        ArrowDataType::Int32,
+                        true,
+                    )])),
+                })])
+            }
+        }
+
+        let bytes = write_id_name_age_parquet().await;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_invalid_external_row_filter_projection.parquet";
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(bytes))
+            .await
+            .unwrap();
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let fields = id_name_age_file_fields();
+        let predicates = FilePredicates {
+            predicates: Vec::new(),
+            row_filter_factory: Some(Arc::new(InvalidProjectionFactory)),
+            file_fields: fields.clone(),
+        };
+
+        let batches = ParquetFormatReader
+            .read_batch_stream(
+                Box::new(input.reader().await.unwrap()),
+                file_size,
+                &fields[..1],
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_external_row_filters_are_ordered_by_parquet_cost() {
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct RecordingFactory {
+            order: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        struct RecordingFilter {
+            name: &'static str,
+            order: Arc<Mutex<Vec<&'static str>>>,
+            projection: Arc<ArrowSchema>,
+        }
+
+        impl crate::arrow::RowFilter for RecordingFilter {
+            fn projection(&self) -> &Arc<ArrowSchema> {
+                &self.projection
+            }
+
+            fn evaluate(
+                &mut self,
+                batch: RecordBatch,
+            ) -> Result<arrow_array::BooleanArray, arrow_schema::ArrowError> {
+                self.order.lock().unwrap().push(self.name);
+                Ok(arrow_array::BooleanArray::from(vec![
+                    true;
+                    batch.num_rows()
+                ]))
+            }
+        }
+
+        impl crate::arrow::RowFilterFactory for RecordingFactory {
+            fn create(
+                &self,
+                context: crate::arrow::RowFilterContext<'_>,
+            ) -> crate::Result<Vec<Box<dyn crate::arrow::RowFilter>>> {
+                let filter = |name, index| {
+                    Box::new(RecordingFilter {
+                        name,
+                        order: Arc::clone(&self.order),
+                        projection: Arc::new(context.file_schema.project(&[index]).unwrap()),
+                    }) as Box<dyn crate::arrow::RowFilter>
+                };
+                Ok(vec![filter("large", 1), filter("small", 0)])
+            }
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("small", ArrowDataType::Int32, false),
+            ArrowField::new("large", ArrowDataType::Utf8, false),
+        ]));
+        let large_values = (0..32)
+            .map(|index| format!("{index:04}-{}", "x".repeat(4096)))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..32)),
+                Arc::new(StringArray::from(large_values)),
+            ],
+        )
+        .unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+            .build();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                AsyncArrowWriter::try_new(&mut bytes, Arc::clone(&schema), Some(props)).unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.close().await.unwrap();
+        }
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_external_row_filter_cost_order.parquet";
+        file_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(bytes))
+            .await
+            .unwrap();
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let fields = vec![
+            residual_test_field(0, "small", DataType::Int(IntType::new())),
+            residual_test_field(1, "large", DataType::VarChar(VarCharType::string_type())),
+        ];
+        let predicates = FilePredicates {
+            predicates: Vec::new(),
+            row_filter_factory: Some(Arc::new(RecordingFactory {
+                order: Arc::clone(&order),
+            })),
+            file_fields: fields.clone(),
+        };
+
+        ParquetFormatReader
+            .read_batch_stream(
+                Box::new(input.reader().await.unwrap()),
+                file_size,
+                &fields[..1],
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec!["small", "large"]);
+    }
+
+    /// Read `[name]` from the `(id, name, age)` parquet file under `predicates`
+    /// and collect the surviving `name` values in row order. The reader-level
+    /// batch may include extra (predicate) columns — we look `name` up by name.
+    async fn read_names_under_predicate(
+        read_fields: &[DataField],
+        predicate: Predicate,
+    ) -> Vec<String> {
+        use crate::io::FileIOBuilder;
+        use futures::StreamExt;
+
+        let bytes = write_id_name_age_parquet().await;
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_residual_backstop.parquet";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from(bytes)).await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let reader_input = input.reader().await.unwrap();
+
+        let predicates = FilePredicates {
+            predicates: vec![predicate],
+            row_filter_factory: None,
+            file_fields: id_name_age_file_fields(),
+        };
+
+        let reader = ParquetFormatReader;
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(reader_input),
+                file_size,
+                read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut names: Vec<String> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            let name_idx = batch.schema().index_of("name").unwrap();
+            let col = batch
+                .column(name_idx)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            names.extend((0..col.len()).map(|i| col.value(i).to_string()));
+        }
+        names
+    }
+
+    #[tokio::test]
+    async fn test_parquet_or_predicate_returns_exact_rows() {
+        use crate::spec::VarCharType;
+        // Read only [name]; predicate `age > 25 OR name = 'a'`.
+        // age>25 -> c,d,e (rows 3,4,5); name='a' -> a (row 1). Union: a,c,d,e.
+        // Or is not accepted by the row filter, so before the fix it falls
+        // through to pruning only (single row group -> all 5 rows returned).
+        let read_fields = vec![residual_test_field(
+            1,
+            "name",
+            DataType::VarChar(VarCharType::string_type()),
+        )];
+        let predicate = Predicate::Or(vec![
+            residual_leaf(
+                "age",
+                2,
+                DataType::Int(IntType::new()),
+                PredicateOperator::Gt,
+                vec![Datum::Int(25)],
+            ),
+            residual_leaf(
+                "name",
+                1,
+                DataType::VarChar(VarCharType::string_type()),
+                PredicateOperator::Eq,
+                vec![Datum::String("a".to_string())],
+            ),
+        ]);
+        let names = read_names_under_predicate(&read_fields, predicate).await;
+        assert_eq!(names, vec!["a", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_not_predicate_returns_exact_complement() {
+        use crate::spec::VarCharType;
+        // `NOT (age > 25)` -> age <= 25 -> a,b (rows 1,2).
+        let read_fields = vec![residual_test_field(
+            1,
+            "name",
+            DataType::VarChar(VarCharType::string_type()),
+        )];
+        let predicate = Predicate::Not(Box::new(residual_leaf(
+            "age",
+            2,
+            DataType::Int(IntType::new()),
+            PredicateOperator::Gt,
+            vec![Datum::Int(25)],
+        )));
+        let names = read_names_under_predicate(&read_fields, predicate).await;
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_supported_compound_predicate_is_enforced_by_row_filter() {
+        let parquet_schema = SchemaDescriptor::new(Arc::new(
+            parse_message_type(
+                "
+                message test_schema {
+                  OPTIONAL INT32 id;
+                  OPTIONAL BYTE_ARRAY name (UTF8);
+                  OPTIONAL INT32 age;
+                }
+                ",
+            )
+            .expect("test schema should parse"),
+        ));
+        let file_fields = id_name_age_file_fields();
+        let predicate = Predicate::Or(vec![
+            residual_leaf(
+                "age",
+                2,
+                DataType::Int(IntType::new()),
+                PredicateOperator::Gt,
+                vec![Datum::Int(25)],
+            ),
+            Predicate::Not(Box::new(residual_leaf(
+                "id",
+                0,
+                DataType::Int(IntType::new()),
+                PredicateOperator::Eq,
+                vec![Datum::Int(2)],
+            ))),
+        ]);
+
+        assert!(super::predicate_fully_enforced_by_row_filter(
+            &parquet_schema,
+            &predicate,
+            &file_fields,
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_parquet_and_of_supported_leaves_takes_fast_path() {
+        use crate::spec::VarCharType;
+        // Fast-path guard: a top-level AND of two supported leaves stays on the
+        // row-filter fast path (no residual pass) and still returns exact rows.
+        // `age > 15 AND age < 45` -> b,c,d (rows 2,3,4).
+        let read_fields = vec![residual_test_field(
+            1,
+            "name",
+            DataType::VarChar(VarCharType::string_type()),
+        )];
+
+        // Both leaves must be fully enforced by the row filter -> fast path taken.
+        let parquet_schema = SchemaDescriptor::new(Arc::new(
+            parse_message_type(
+                "
+                message test_schema {
+                  OPTIONAL INT32 id;
+                  OPTIONAL BYTE_ARRAY name (UTF8);
+                  OPTIONAL INT32 age;
+                }
+                ",
+            )
+            .expect("test schema should parse"),
+        ));
+        let file_fields = id_name_age_file_fields();
+        let leaf_gt = residual_leaf(
+            "age",
+            2,
+            DataType::Int(IntType::new()),
+            PredicateOperator::Gt,
+            vec![Datum::Int(15)],
+        );
+        let leaf_lt = residual_leaf(
+            "age",
+            2,
+            DataType::Int(IntType::new()),
+            PredicateOperator::Lt,
+            vec![Datum::Int(45)],
+        );
+        assert!(super::predicate_fully_enforced_by_row_filter(
+            &parquet_schema,
+            &leaf_gt,
+            &file_fields
+        ));
+        assert!(super::predicate_fully_enforced_by_row_filter(
+            &parquet_schema,
+            &leaf_lt,
+            &file_fields
+        ));
+        // A supported OR is evaluated as one decoder predicate, preserving its
+        // compound semantics without a residual pass.
+        let or_pred = Predicate::Or(vec![leaf_gt.clone(), leaf_lt.clone()]);
+        assert!(super::predicate_fully_enforced_by_row_filter(
+            &parquet_schema,
+            &or_pred,
+            &file_fields
+        ));
+
+        // Both leaves reach the reader split into the top-level predicate list
+        // (split_and flattens AND), so we pass them as two separate predicates.
+        use crate::io::FileIOBuilder;
+        use futures::StreamExt;
+        let bytes = write_id_name_age_parquet().await;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_fast_path_and.parquet";
+        let output = file_io.new_output(path).unwrap();
+        output.write(Bytes::from(bytes)).await.unwrap();
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let reader_input = input.reader().await.unwrap();
+        let predicates = FilePredicates {
+            predicates: vec![leaf_gt, leaf_lt],
+            row_filter_factory: None,
+            file_fields,
+        };
+        let reader = ParquetFormatReader;
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(reader_input),
+                file_size,
+                &read_fields,
+                Some(&predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut names: Vec<String> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let batch = result.unwrap();
+            let name_idx = batch.schema().index_of("name").unwrap();
+            let col = batch
+                .column(name_idx)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            names.extend((0..col.len()).map(|i| col.value(i).to_string()));
+        }
+        assert_eq!(names, vec!["b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_page_boundaries_valid() {
+        use parquet::file::page_index::offset_index::PageLocation;
+        let page = |first_row_index: i64| PageLocation {
+            offset: 0,
+            compressed_page_size: 0,
+            first_row_index,
+        };
+
+        // Well-formed: starts at 0, strictly increasing, within [0, rg_rows].
+        assert!(super::page_boundaries_valid(
+            &[page(0), page(10), page(20)],
+            30
+        ));
+        // Single page starting at 0.
+        assert!(super::page_boundaries_valid(&[page(0)], 10));
+
+        // First page not at row 0.
+        assert!(!super::page_boundaries_valid(&[page(5), page(10)], 30));
+        // Negative first_row_index (would cast to a huge usize).
+        assert!(!super::page_boundaries_valid(&[page(0), page(-1)], 30));
+        // Non-monotonic.
+        assert!(!super::page_boundaries_valid(
+            &[page(0), page(20), page(10)],
+            30
+        ));
+        // Duplicate (not strictly increasing).
+        assert!(!super::page_boundaries_valid(
+            &[page(0), page(10), page(10)],
+            30
+        ));
+        // Beyond the row group.
+        assert!(!super::page_boundaries_valid(&[page(0), page(40)], 30));
+    }
+
+    // -----------------------------------------------------------------------
+    // MAP shared-shredding end-to-end (mirrors Java's
+    // MapSharedShreddingTableTest read/write semantics).
+    // -----------------------------------------------------------------------
+
+    fn map_shredding_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "tags".to_string(),
+                DataType::Map(MapType::new(
+                    DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+                    DataType::BigInt(BigIntType::new()),
+                )),
+            ),
+        ]
+    }
+
+    fn build_int64_map_array(rows: &[Option<Vec<(&str, Option<i64>)>>]) -> MapArray {
+        let map_type = DataType::Map(MapType::new(
+            DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+            DataType::BigInt(BigIntType::new()),
+        ));
+        let ArrowDataType::Map(entries_field, ordered) =
+            crate::arrow::paimon_type_to_arrow(&map_type).unwrap()
+        else {
+            panic!("map type must convert to Arrow Map")
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type().clone() else {
+            panic!("map entries must be Struct")
+        };
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        let mut offsets = vec![0i32];
+        let mut validity = Vec::new();
+        for row in rows {
+            match row {
+                None => {
+                    validity.push(false);
+                    offsets.push(*offsets.last().unwrap());
+                }
+                Some(entries) => {
+                    validity.push(true);
+                    for (key, value) in entries {
+                        keys.push(*key);
+                        values.push(*value);
+                    }
+                    offsets.push(*offsets.last().unwrap() + entries.len() as i32);
+                }
+            }
+        }
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from(keys)) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(values)),
+            ],
+            None,
+        )
+        .unwrap();
+        MapArray::new(
+            entries_field,
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            entries,
+            Some(NullBuffer::from(validity)),
+            ordered,
+        )
+    }
+
+    fn assert_int64_map_rows(map: &MapArray, rows: &[Option<Vec<(&str, Option<i64>)>>]) {
+        let keys = map.keys().as_any().downcast_ref::<StringArray>().unwrap();
+        let values = map.values().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(map.len(), rows.len());
+        for (row, expected) in rows.iter().enumerate() {
+            match expected {
+                None => assert!(map.is_null(row), "row {row} must be null"),
+                Some(entries) => {
+                    assert!(!map.is_null(row), "row {row} must be non-null");
+                    let start = map.offsets()[row] as usize;
+                    let end = map.offsets()[row + 1] as usize;
+                    assert_eq!(end - start, entries.len(), "row {row} entry count");
+                    for (j, (key, value)) in entries.iter().enumerate() {
+                        assert_eq!(keys.value(start + j), *key, "row {row} key {j}");
+                        assert_eq!(
+                            values.is_null(start + j),
+                            value.is_none(),
+                            "row {row} value {j} nullness"
+                        );
+                        if let Some(v) = value {
+                            assert_eq!(values.value(start + j), *v, "row {row} value {j}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn write_map_shredding_file(
+        rows: &[Option<Vec<(&str, Option<i64>)>>],
+        ids: &[i32],
+        max_columns: usize,
+    ) -> (String, crate::io::FileIO, u64, Vec<DataField>) {
+        let fields = map_shredding_fields();
+        let options = HashMap::from([
+            (
+                "fields.tags.map.storage-layout".to_string(),
+                "shared-shredding".to_string(),
+            ),
+            (
+                "fields.tags.map.shared-shredding.max-columns".to_string(),
+                max_columns.to_string(),
+            ),
+        ]);
+        let logical_schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            logical_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(build_int64_map_array(rows)),
+            ],
+        )
+        .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = format!("memory:/map_shredding_{}.parquet", uuid::Uuid::new_v4());
+        let output = file_io.new_output(&path).unwrap();
+        let mut writer = create_format_writer(
+            &output,
+            logical_schema,
+            "zstd",
+            1,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
+        (path, file_io, file_size, fields)
+    }
+
+    #[tokio::test]
+    async fn test_parquet_map_shredding_write_read_roundtrip() {
+        let rows: Vec<Option<Vec<(&str, Option<i64>)>>> = vec![
+            Some(vec![("a", Some(10)), ("b", None), ("c", Some(30))]), // c overflows
+            None,                                                      // null map
+            Some(vec![]),                                              // empty map
+            Some(vec![("b", Some(40)), ("a", Some(50))]),
+        ];
+        let ids = vec![1, 2, 3, 4];
+        let (path, file_io, file_size, fields) = write_map_shredding_file(&rows, &ids, 2).await;
+
+        // Raw physical layout: "tags" is a struct with the shared-shredding
+        // child columns, proving the writer applied the plan.
+        let raw_bytes = file_io.new_input(&path).unwrap().read().await.unwrap();
+        let raw_batches = parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(
+            raw_bytes.clone(),
+            1024,
+        )
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+        let raw_tags = raw_batches[0].column_by_name("tags").unwrap();
+        let ArrowDataType::Struct(raw_fields) = raw_tags.data_type() else {
+            panic!("physical tags column must be a struct")
+        };
+        let names: Vec<&str> = raw_fields.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["__field_mapping", "__col_0", "__col_1", "__overflow"]
+        );
+
+        // The footer carries two ARROW:schema entries: the construction-time
+        // schema and the one re-encoded at close with the shredding metadata.
+        let metadata = load_metadata_with_page_index(&raw_bytes, false);
+        let kv = metadata
+            .file_metadata()
+            .key_value_metadata()
+            .expect("footer must carry key-value metadata");
+        let arrow_schema_entries = kv
+            .iter()
+            .filter(|kv| kv.key == parquet::arrow::ARROW_SCHEMA_META_KEY)
+            .count();
+        assert_eq!(
+            arrow_schema_entries, 2,
+            "close must append a second ARROW:schema carrying the shredding metadata"
+        );
+
+        // The format reader surfaces the logical MAP column back.
+        let input = file_io.new_input(&path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let reader = create_format_reader(&path, false, &fields).unwrap();
+        let batches = reader
+            .read_batch_stream(Box::new(file_reader), file_size, &fields, None, None, None)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let id = batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            id.iter().collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3), Some(4)]
+        );
+        let tags = batches[0]
+            .column_by_name("tags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_int64_map_rows(tags, &rows);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_map_shredding_residual_path_assembles_before_filter() {
+        // An `Or` predicate is not fully enforced by the parquet row filter, so
+        // the reader takes the residual branch: the shredded MAP column must be
+        // assembled back to its logical type *before* the residual filter runs,
+        // and only matching rows survive.
+        let rows: Vec<Option<Vec<(&str, Option<i64>)>>> = vec![
+            Some(vec![("a", Some(10))]),
+            Some(vec![("b", Some(20))]),
+            Some(vec![("c", Some(30))]),
+            Some(vec![("d", Some(40))]),
+        ];
+        let ids = vec![1, 2, 3, 4];
+        let (path, file_io, file_size, fields) = write_map_shredding_file(&rows, &ids, 2).await;
+
+        let predicates = vec![Predicate::Or(vec![
+            Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: DataType::Int(IntType::new()),
+                op: super::PredicateOperator::Eq,
+                literals: vec![Datum::Int(2)],
+            },
+            Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: DataType::Int(IntType::new()),
+                op: super::PredicateOperator::Eq,
+                literals: vec![Datum::Int(4)],
+            },
+        ])];
+        let file_predicates = FilePredicates {
+            predicates,
+            row_filter_factory: None,
+            file_fields: fields.clone(),
+        };
+
+        let input = file_io.new_input(&path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let reader = create_format_reader(&path, false, &fields).unwrap();
+        let batches = reader
+            .read_batch_stream(
+                Box::new(file_reader),
+                file_size,
+                &fields,
+                Some(&file_predicates),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let id = batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id.iter().collect::<Vec<_>>(), vec![Some(2), Some(4)]);
+        let tags = batches[0]
+            .column_by_name("tags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_int64_map_rows(tags, &[rows[1].clone(), rows[3].clone()]);
+    }
+}

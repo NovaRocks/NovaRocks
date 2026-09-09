@@ -31,14 +31,10 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::connector_read::{
-    MAX_JSON_BYTES, MAX_NAME_BYTES, decode_value, decode_value_type, encode_value,
-    encode_value_type,
-};
-use novarocks_proto_models::connector_read as dto;
+use crate::wire::dto;
+use novarocks_proto_codec::connector_read::{MAX_JSON_BYTES, MAX_NAME_BYTES};
 use novarocks_spi::connector::read_stack::{
-    Bound, ColumnHandle, ConnectorValueType, Domain, Range, TupleDomain, ValueSet,
+    Bound, ColumnHandle, ConnectorValue, ConnectorValueType, Domain, Range, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -64,14 +60,6 @@ pub(crate) fn corrupt(message: impl Into<String>) -> ConnectorError {
 
 pub(crate) fn unsupported(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unsupported, message)
-}
-
-/// Lower a structural wire error into the connector error vocabulary.
-///
-/// The protocol error already names the field path that failed, so it is kept
-/// verbatim instead of being flattened into a generic message.
-pub(crate) fn from_protocol(error: novarocks_proto_codec::ProtocolError) -> ConnectorError {
-    invalid(format!("iceberg typed read wire value is invalid: {error}"))
 }
 
 /// The kind of Iceberg type a column identity names.
@@ -433,12 +421,6 @@ impl IcebergColumnHandle {
         }
     }
 
-    pub fn to_column_handle_proto(&self) -> dto::ColumnHandle {
-        dto::ColumnHandle {
-            handle: Some(dto::column_handle::Handle::Iceberg(self.to_proto())),
-        }
-    }
-
     pub fn from_proto(raw: &dto::IcebergColumnHandle) -> Result<Self, ConnectorError> {
         let identity = raw
             .base_column_identity
@@ -452,16 +434,6 @@ impl IcebergColumnHandle {
             nullable: raw.nullable,
             comment: raw.comment.clone(),
         })
-    }
-
-    pub fn from_column_handle_proto(raw: &dto::ColumnHandle) -> Result<Self, ConnectorError> {
-        let handle = raw
-            .handle
-            .as_ref()
-            .ok_or_else(|| invalid("column handle variant must be present"))?;
-        match handle {
-            dto::column_handle::Handle::Iceberg(iceberg) => Self::from_proto(iceberg),
-        }
     }
 }
 
@@ -597,7 +569,7 @@ pub fn encode_tuple_domain(domain: &TupleDomain<IcebergColumnHandle>) -> dto::Tu
             column_domains: domains
                 .iter()
                 .map(|(column, domain)| dto::ColumnDomain {
-                    column: Some(column.to_column_handle_proto()),
+                    column: Some(column.to_proto()),
                     domain: Some(encode_domain(domain)),
                 })
                 .collect(),
@@ -623,7 +595,7 @@ pub fn decode_tuple_domain(
             .column
             .as_ref()
             .ok_or_else(|| invalid("column domain requires a column handle"))?;
-        let column = IcebergColumnHandle::from_column_handle_proto(column)?;
+        let column = IcebergColumnHandle::from_proto(column)?;
         let domain = entry
             .domain
             .as_ref()
@@ -651,6 +623,219 @@ fn decode_domain(raw: &dto::Domain) -> Result<Domain, ConnectorError> {
     Ok(Domain::new(decode_value_set(values)?, raw.null_allowed))
 }
 
+fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
+    let (kind, decimal_precision, decimal_scale, fixed_length) = match value_type {
+        ConnectorValueType::Boolean => (dto::ValueTypeKind::Boolean, None, None, None),
+        ConnectorValueType::TinyInt => (dto::ValueTypeKind::TinyInt, None, None, None),
+        ConnectorValueType::SmallInt => (dto::ValueTypeKind::SmallInt, None, None, None),
+        ConnectorValueType::Integer => (dto::ValueTypeKind::Integer, None, None, None),
+        ConnectorValueType::BigInt => (dto::ValueTypeKind::BigInt, None, None, None),
+        ConnectorValueType::Real => (dto::ValueTypeKind::Real, None, None, None),
+        ConnectorValueType::Double => (dto::ValueTypeKind::Double, None, None, None),
+        ConnectorValueType::Decimal { precision, scale } => (
+            dto::ValueTypeKind::Decimal,
+            Some(u32::from(precision)),
+            Some(i32::from(scale)),
+            None,
+        ),
+        ConnectorValueType::Date => (dto::ValueTypeKind::Date, None, None, None),
+        ConnectorValueType::TimeMicros => (dto::ValueTypeKind::TimeMicros, None, None, None),
+        ConnectorValueType::TimestampMicros => {
+            (dto::ValueTypeKind::TimestampMicros, None, None, None)
+        }
+        ConnectorValueType::TimestampMillis => {
+            (dto::ValueTypeKind::TimestampMillis, None, None, None)
+        }
+        ConnectorValueType::TimestampTzMicros => {
+            (dto::ValueTypeKind::TimestampTzMicros, None, None, None)
+        }
+        ConnectorValueType::TimestampNanos => {
+            (dto::ValueTypeKind::TimestampNanos, None, None, None)
+        }
+        ConnectorValueType::TimestampTzNanos => {
+            (dto::ValueTypeKind::TimestampTzNanos, None, None, None)
+        }
+        ConnectorValueType::Varchar => (dto::ValueTypeKind::Varchar, None, None, None),
+        ConnectorValueType::Varbinary => (dto::ValueTypeKind::Varbinary, None, None, None),
+        ConnectorValueType::Uuid => (dto::ValueTypeKind::Uuid, None, None, None),
+        ConnectorValueType::Fixed { length } => {
+            (dto::ValueTypeKind::Fixed, None, None, Some(length))
+        }
+        ConnectorValueType::NonComparable => (dto::ValueTypeKind::NonComparable, None, None, None),
+    };
+    dto::ValueType {
+        kind: kind as i32,
+        decimal_precision,
+        decimal_scale,
+        fixed_length,
+    }
+}
+
+fn decode_value_type(raw: &dto::ValueType) -> Result<ConnectorValueType, ConnectorError> {
+    let kind = dto::ValueTypeKind::try_from(raw.kind)
+        .map_err(|_| invalid("unknown iceberg predicate value type"))?;
+    match kind {
+        dto::ValueTypeKind::Unspecified => {
+            Err(invalid("iceberg predicate value type must be specified"))
+        }
+        dto::ValueTypeKind::Decimal => {
+            let precision = raw
+                .decimal_precision
+                .ok_or_else(|| invalid("decimal precision is required"))?;
+            let scale = raw
+                .decimal_scale
+                .ok_or_else(|| invalid("decimal scale is required"))?;
+            if precision == 0 || precision > 38 || scale < 0 || scale > precision as i32 {
+                return Err(invalid("decimal precision or scale is out of range"));
+            }
+            if raw.fixed_length.is_some() {
+                return Err(invalid("decimal type must not carry fixed length"));
+            }
+            Ok(ConnectorValueType::Decimal {
+                precision: precision as u8,
+                scale: scale as i8,
+            })
+        }
+        dto::ValueTypeKind::Fixed => {
+            let length = raw
+                .fixed_length
+                .ok_or_else(|| invalid("fixed type length is required"))?;
+            if length == 0 || length > 64 * 1024 {
+                return Err(invalid("fixed type length is out of range"));
+            }
+            if raw.decimal_precision.is_some() || raw.decimal_scale.is_some() {
+                return Err(invalid("fixed type must not carry decimal parameters"));
+            }
+            Ok(ConnectorValueType::Fixed { length })
+        }
+        simple => {
+            if raw.decimal_precision.is_some()
+                || raw.decimal_scale.is_some()
+                || raw.fixed_length.is_some()
+            {
+                return Err(invalid("simple value type carries unrelated parameters"));
+            }
+            Ok(match simple {
+                dto::ValueTypeKind::Boolean => ConnectorValueType::Boolean,
+                dto::ValueTypeKind::TinyInt => ConnectorValueType::TinyInt,
+                dto::ValueTypeKind::SmallInt => ConnectorValueType::SmallInt,
+                dto::ValueTypeKind::Integer => ConnectorValueType::Integer,
+                dto::ValueTypeKind::BigInt => ConnectorValueType::BigInt,
+                dto::ValueTypeKind::Real => ConnectorValueType::Real,
+                dto::ValueTypeKind::Double => ConnectorValueType::Double,
+                dto::ValueTypeKind::Date => ConnectorValueType::Date,
+                dto::ValueTypeKind::TimeMicros => ConnectorValueType::TimeMicros,
+                dto::ValueTypeKind::TimestampMicros => ConnectorValueType::TimestampMicros,
+                dto::ValueTypeKind::TimestampMillis => ConnectorValueType::TimestampMillis,
+                dto::ValueTypeKind::TimestampTzMicros => ConnectorValueType::TimestampTzMicros,
+                dto::ValueTypeKind::TimestampNanos => ConnectorValueType::TimestampNanos,
+                dto::ValueTypeKind::TimestampTzNanos => ConnectorValueType::TimestampTzNanos,
+                dto::ValueTypeKind::Varchar => ConnectorValueType::Varchar,
+                dto::ValueTypeKind::Varbinary => ConnectorValueType::Varbinary,
+                dto::ValueTypeKind::Uuid => ConnectorValueType::Uuid,
+                dto::ValueTypeKind::NonComparable => ConnectorValueType::NonComparable,
+                dto::ValueTypeKind::Unspecified
+                | dto::ValueTypeKind::Decimal
+                | dto::ValueTypeKind::Fixed => unreachable!("handled above"),
+            })
+        }
+    }
+}
+
+fn encode_value(value: &ConnectorValue) -> dto::Value {
+    let value = match value {
+        ConnectorValue::Boolean(value) => dto::value::Value::Boolean(*value),
+        ConnectorValue::TinyInt(value) => dto::value::Value::TinyInt(i32::from(*value)),
+        ConnectorValue::SmallInt(value) => dto::value::Value::SmallInt(i32::from(*value)),
+        ConnectorValue::Integer(value) => dto::value::Value::Integer(*value),
+        ConnectorValue::BigInt(value) => dto::value::Value::BigInt(*value),
+        ConnectorValue::Real(value) => dto::value::Value::Real(*value),
+        ConnectorValue::Double(value) => dto::value::Value::DoubleValue(*value),
+        ConnectorValue::Decimal {
+            unscaled,
+            precision,
+            scale,
+        } => dto::value::Value::Decimal(dto::DecimalValue {
+            unscaled: unscaled.to_be_bytes().to_vec(),
+            precision: u32::from(*precision),
+            scale: i32::from(*scale),
+        }),
+        ConnectorValue::Date(value) => dto::value::Value::Date(*value),
+        ConnectorValue::TimeMicros(value) => dto::value::Value::TimeMicros(*value),
+        ConnectorValue::TimestampMicros(value) => dto::value::Value::TimestampMicros(*value),
+        ConnectorValue::TimestampMillis(value) => dto::value::Value::TimestampMillis(*value),
+        ConnectorValue::TimestampTzMicros(value) => dto::value::Value::TimestampTzMicros(*value),
+        ConnectorValue::TimestampNanos(value) => dto::value::Value::TimestampNanos(*value),
+        ConnectorValue::TimestampTzNanos(value) => dto::value::Value::TimestampTzNanos(*value),
+        ConnectorValue::Varchar(value) => dto::value::Value::Varchar(value.to_string()),
+        ConnectorValue::Varbinary(value) => dto::value::Value::Varbinary(value.to_vec()),
+        ConnectorValue::Uuid(value) => dto::value::Value::Uuid(value.to_vec()),
+        ConnectorValue::Fixed(value) => dto::value::Value::Fixed(value.to_vec()),
+    };
+    dto::Value { value: Some(value) }
+}
+
+fn decode_value(
+    raw: &dto::Value,
+    expected: ConnectorValueType,
+) -> Result<ConnectorValue, ConnectorError> {
+    let raw = raw
+        .value
+        .as_ref()
+        .ok_or_else(|| invalid("predicate value is required"))?;
+    let value = match raw {
+        dto::value::Value::Boolean(value) => ConnectorValue::Boolean(*value),
+        dto::value::Value::TinyInt(value) => ConnectorValue::TinyInt(
+            i8::try_from(*value).map_err(|_| invalid("tiny integer is out of range"))?,
+        ),
+        dto::value::Value::SmallInt(value) => ConnectorValue::SmallInt(
+            i16::try_from(*value).map_err(|_| invalid("small integer is out of range"))?,
+        ),
+        dto::value::Value::Integer(value) => ConnectorValue::Integer(*value),
+        dto::value::Value::BigInt(value) => ConnectorValue::BigInt(*value),
+        dto::value::Value::Real(value) => ConnectorValue::Real(*value),
+        dto::value::Value::DoubleValue(value) => ConnectorValue::Double(*value),
+        dto::value::Value::Decimal(value) => {
+            let unscaled: [u8; 16] = value
+                .unscaled
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid("decimal unscaled value must contain 16 bytes"))?;
+            ConnectorValue::try_decimal(
+                i128::from_be_bytes(unscaled),
+                u8::try_from(value.precision)
+                    .map_err(|_| invalid("decimal precision is out of range"))?,
+                i8::try_from(value.scale).map_err(|_| invalid("decimal scale is out of range"))?,
+            )?
+        }
+        dto::value::Value::Date(value) => ConnectorValue::Date(*value),
+        dto::value::Value::TimeMicros(value) => ConnectorValue::TimeMicros(*value),
+        dto::value::Value::TimestampMicros(value) => ConnectorValue::TimestampMicros(*value),
+        dto::value::Value::TimestampMillis(value) => ConnectorValue::TimestampMillis(*value),
+        dto::value::Value::TimestampTzMicros(value) => ConnectorValue::TimestampTzMicros(*value),
+        dto::value::Value::TimestampNanos(value) => ConnectorValue::TimestampNanos(*value),
+        dto::value::Value::TimestampTzNanos(value) => ConnectorValue::TimestampTzNanos(*value),
+        dto::value::Value::Varchar(value) => ConnectorValue::Varchar(Arc::from(value.as_str())),
+        dto::value::Value::Varbinary(value) => {
+            ConnectorValue::Varbinary(Arc::from(value.as_slice()))
+        }
+        dto::value::Value::Uuid(value) => {
+            let uuid: [u8; 16] = value
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid("UUID value must contain 16 bytes"))?;
+            ConnectorValue::Uuid(uuid)
+        }
+        dto::value::Value::Fixed(value) => ConnectorValue::Fixed(Arc::from(value.as_slice())),
+    };
+    if value.value_type() != expected || value.payload_bytes() > 64 * 1024 {
+        return Err(invalid(
+            "predicate value does not match its exact declared type",
+        ));
+    }
+    Ok(value)
+}
+
 fn encode_value_set(values: &ValueSet) -> dto::ValueSet {
     dto::ValueSet {
         value_type: Some(encode_value_type(values.value_type())),
@@ -663,7 +848,7 @@ fn decode_value_set(raw: &dto::ValueSet) -> Result<ValueSet, ConnectorError> {
         .value_type
         .as_ref()
         .ok_or_else(|| invalid("value set requires its exact type"))?;
-    let value_type = decode_value_type(value_type, field_path()).map_err(from_protocol)?;
+    let value_type = decode_value_type(value_type)?;
     let mut ranges = Vec::with_capacity(raw.ranges.len());
     for range in &raw.ranges {
         ranges.push(decode_range(range, value_type)?);
@@ -735,11 +920,7 @@ fn decode_bound_value(
         .value
         .as_ref()
         .ok_or_else(|| invalid("a bounded range bound requires a value"))?;
-    decode_value(value, value_type, field_path()).map_err(from_protocol)
-}
-
-fn field_path() -> FieldPath {
-    FieldPath::root("iceberg_typed_read")
+    decode_value(value, value_type)
 }
 
 #[cfg(test)]
@@ -930,17 +1111,13 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn column_handles_round_trip_through_the_closed_wire_variant() {
+    fn column_handles_round_trip_through_the_private_wire_value() {
         let schema = nested_schema();
         let info = IcebergColumnHandle::base_column_of(&schema, 2).expect("base handle");
         let city = info.dereference(&[3]).expect("dereference");
-        let encoded = city.to_column_handle_proto();
-        let decoded =
-            IcebergColumnHandle::from_column_handle_proto(&encoded).expect("decoded handle");
+        let encoded = city.to_proto();
+        let decoded = IcebergColumnHandle::from_proto(&encoded).expect("decoded handle");
         assert_eq!(decoded, city);
-
-        let empty = dto::ColumnHandle { handle: None };
-        assert!(IcebergColumnHandle::from_column_handle_proto(&empty).is_err());
     }
 
     #[test]
@@ -990,6 +1167,25 @@ pub(super) mod tests {
             }],
         };
         assert!(decode_tuple_domain(&missing_column).is_err());
+    }
+
+    #[test]
+    fn private_value_codec_preserves_smallint_and_timestamp_millis_exactly() {
+        for value in [
+            ConnectorValue::SmallInt(i16::MIN),
+            ConnectorValue::SmallInt(i16::MAX),
+            ConnectorValue::TimestampMillis(-1_704_067_200_123),
+            ConnectorValue::TimestampMillis(1_704_067_200_123),
+        ] {
+            let encoded = encode_value(&value);
+            let decoded = decode_value(&encoded, value.value_type()).expect("decoded value");
+            assert_eq!(decoded, value);
+        }
+
+        let out_of_range = dto::Value {
+            value: Some(dto::value::Value::SmallInt(i32::from(i16::MAX) + 1)),
+        };
+        assert!(decode_value(&out_of_range, ConnectorValueType::SmallInt).is_err());
     }
 
     #[test]

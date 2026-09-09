@@ -1,0 +1,5 @@
+-- query 1
+id	name	added
+1	after-a	added-a
+2	before-b	NULL
+3	after-c	added-c

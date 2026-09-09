@@ -899,12 +899,12 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             context.current_catalog,
             context.current_database,
         )?;
-        if target.backend_name != "iceberg" {
-            return Err(format!(
-                "table maintenance only supports iceberg backends, got `{}`",
-                target.backend_name
-            ));
-        }
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| error.to_string())?;
+        self.kernel
+            .connector_control()
+            .acquire_current_metadata_maintenance(&instance_id)
+            .map_err(|error| error.to_string())?;
         Ok(MaintenanceTarget {
             catalog: target.catalog,
             namespace: target.namespace,

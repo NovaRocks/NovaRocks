@@ -28,6 +28,7 @@ pub enum ConnectorScalarType {
     Int32,
     Int64,
     Date32,
+    TimestampMillis,
     TimestampMicros,
     TimestampNanos,
     Utf8,
@@ -43,6 +44,7 @@ pub enum ConnectorScalarValue {
     Int32(i32),
     Int64(i64),
     Date32(i32),
+    TimestampMillis(i64),
     TimestampMicros(i64),
     TimestampNanos(i64),
     Utf8(String),
@@ -58,6 +60,7 @@ impl ConnectorScalarValue {
             Self::Int32(_) => ConnectorScalarType::Int32,
             Self::Int64(_) => ConnectorScalarType::Int64,
             Self::Date32(_) => ConnectorScalarType::Date32,
+            Self::TimestampMillis(_) => ConnectorScalarType::TimestampMillis,
             Self::TimestampMicros(_) => ConnectorScalarType::TimestampMicros,
             Self::TimestampNanos(_) => ConnectorScalarType::TimestampNanos,
             Self::Utf8(_) => ConnectorScalarType::Utf8,
@@ -70,7 +73,10 @@ impl ConnectorScalarValue {
             Self::Boolean(_) | Self::Int8(_) => 1,
             Self::Int16(_) => 2,
             Self::Int32(_) | Self::Date32(_) => 4,
-            Self::Int64(_) | Self::TimestampMicros(_) | Self::TimestampNanos(_) => 8,
+            Self::Int64(_)
+            | Self::TimestampMillis(_)
+            | Self::TimestampMicros(_)
+            | Self::TimestampNanos(_) => 8,
             Self::Utf8(value) => value.len(),
             Self::Binary(value) => value.len(),
         }
@@ -94,11 +100,36 @@ impl ConnectorScalarValue {
             (Self::Int32(left), Self::Int32(right)) => Some(left.cmp(right)),
             (Self::Int64(left), Self::Int64(right)) => Some(left.cmp(right)),
             (Self::Date32(left), Self::Date32(right)) => Some(left.cmp(right)),
+            (Self::TimestampMillis(left), Self::TimestampMillis(right)) => Some(left.cmp(right)),
             (Self::TimestampMicros(left), Self::TimestampMicros(right)) => Some(left.cmp(right)),
             (Self::TimestampNanos(left), Self::TimestampNanos(right)) => Some(left.cmp(right)),
             (Self::Utf8(left), Self::Utf8(right)) => Some(left.as_bytes().cmp(right.as_bytes())),
             (Self::Binary(left), Self::Binary(right)) => Some(left.cmp(right)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn narrow_and_millisecond_scalars_preserve_their_exact_types() {
+        let small = ConnectorScalarValue::Int16(i16::MIN);
+        assert_eq!(small.data_type(), ConnectorScalarType::Int16);
+        assert_eq!(small.payload_bytes(), 2);
+
+        let millis = ConnectorScalarValue::TimestampMillis(1_704_067_200_123);
+        assert_eq!(millis.data_type(), ConnectorScalarType::TimestampMillis);
+        assert_eq!(millis.payload_bytes(), 8);
+        assert_eq!(
+            millis.compare_same_type(&ConnectorScalarValue::TimestampMillis(1_704_067_200_124)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            millis.compare_same_type(&ConnectorScalarValue::TimestampMicros(1_704_067_200_123)),
+            None
+        );
     }
 }

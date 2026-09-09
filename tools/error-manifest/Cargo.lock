@@ -2342,15 +2342,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-connector-binding"
-version = "0.1.0"
-dependencies = [
- "futures",
- "novarocks-proto-codec",
- "novarocks-spi",
-]
-
-[[package]]
 name = "novarocks-error-manifest"
 version = "0.1.0"
 dependencies = [
@@ -2426,7 +2417,6 @@ dependencies = [
  "hex",
  "libc",
  "mysql_common",
- "novarocks-connector-binding",
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-fs",
@@ -2438,6 +2428,7 @@ dependencies = [
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-task-codec",
  "novarocks-types",
  "novarocks-user-error",
  "novarocks-version",
@@ -2467,6 +2458,7 @@ dependencies = [
  "arrow",
  "bytes",
  "crc32c",
+ "futures",
  "libc",
  "novarocks-secret",
  "novarocks-spi",
@@ -2539,7 +2531,7 @@ name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
- "novarocks-execution",
+ "bytes",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",
@@ -2596,6 +2588,19 @@ dependencies = [
  "sha2",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "novarocks-task-codec"
+version = "0.1.0"
+dependencies = [
+ "novarocks-execution",
+ "novarocks-proto-codec",
+ "novarocks-proto-models",
+ "novarocks-spi",
+ "novarocks-types",
+ "prost 0.13.5",
+ "sha2",
 ]
 
 [[package]]

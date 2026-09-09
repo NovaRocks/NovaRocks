@@ -30,6 +30,7 @@ use novarocks_native_trust::{
     AutomaticTlsMaterial, NativeEndpointConnector, NativeIncomingAdapter, NativeTlsMaterial,
     NativeTrust,
 };
+use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
@@ -45,6 +46,20 @@ pub enum BackendNativeTransport {
 }
 
 impl BackendNativeTransport {
+    /// The confidentiality fact shared by this process's Native listener and
+    /// its raw RPC admission adapters.
+    ///
+    /// This is derived from the Server-resolved transport mode rather than
+    /// inferred from a request or endpoint. Automatic and PEM listeners both
+    /// terminate TLS before the RPC service sees a request; plaintext h2c does
+    /// not protect the payload in transit.
+    pub(crate) const fn confidentiality(&self) -> ConfidentialTransport {
+        match self {
+            Self::Plaintext => ConfidentialTransport::Plaintext,
+            Self::Automatic(_) | Self::Pem(_) => ConfidentialTransport::Confidential,
+        }
+    }
+
     pub(crate) fn connector_for(
         &self,
         endpoint: NativeEndpoint,

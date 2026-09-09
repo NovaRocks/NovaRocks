@@ -1,0 +1,5 @@
+[
+  {"table":"schema_evolution","value":{"name":"after-a","id":1,"added":"added-a"}},
+  {"table":"schema_evolution","value":{"name":"before-b","id":2,"added":null}},
+  {"table":"schema_evolution","value":{"name":"after-c","id":3,"added":"added-c"}}
+]

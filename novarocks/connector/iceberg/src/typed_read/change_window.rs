@@ -45,10 +45,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::wire::dto;
 use novarocks_proto_codec::connector_read::{
     MAX_DELETES_PER_SPLIT, MAX_JSON_BYTES, MAX_PATH_BYTES, MAX_SCAN_ASSIGNMENTS,
 };
-use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     ConnectorSplit, ConnectorTableFunctionHandle, HostAddress, SchemaTableName, SplitWeight,
 };
@@ -272,14 +272,6 @@ impl TableChangesFunctionHandle {
         }
     }
 
-    pub fn to_table_function_handle_proto(&self) -> dto::ConnectorTableFunctionHandle {
-        dto::ConnectorTableFunctionHandle {
-            handle: Some(
-                dto::connector_table_function_handle::Handle::IcebergTableChanges(self.to_proto()),
-            ),
-        }
-    }
-
     pub fn from_proto(raw: &dto::TableChangesFunctionHandle) -> Result<Self, ConnectorError> {
         let schema_table_name = raw
             .schema_table_name
@@ -296,20 +288,6 @@ impl TableChangesFunctionHandle {
             start_snapshot_id: raw.start_snapshot_id,
             end_snapshot_id: raw.end_snapshot_id,
         })
-    }
-
-    pub fn from_table_function_handle_proto(
-        raw: &dto::ConnectorTableFunctionHandle,
-    ) -> Result<Self, ConnectorError> {
-        let handle = raw
-            .handle
-            .as_ref()
-            .ok_or_else(|| invalid("connector table function handle variant must be present"))?;
-        match handle {
-            dto::connector_table_function_handle::Handle::IcebergTableChanges(iceberg) => {
-                Self::from_proto(iceberg)
-            }
-        }
     }
 }
 
@@ -487,23 +465,6 @@ impl TableChangesSplit {
         }
     }
 
-    pub fn to_connector_split_proto(&self) -> dto::ConnectorSplit {
-        dto::ConnectorSplit {
-            split_weight_raw: self.split_weight.raw_value(),
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            affinity_key: None,
-            retained_size_in_bytes: self.retained_size_in_bytes,
-            category: Some(dto::connector_split::Category::TableChanges(
-                dto::TableChangesSplitCategory {
-                    provider: Some(dto::table_changes_split_category::Provider::Iceberg(
-                        self.to_proto(),
-                    )),
-                },
-            )),
-        }
-    }
-
     pub fn from_proto(
         raw: &dto::TableChangesSplit,
         split_weight: SplitWeight,
@@ -528,34 +489,6 @@ impl TableChangesSplit {
                 .transpose()?,
             split_weight,
         })
-    }
-
-    pub fn from_connector_split_proto(raw: &dto::ConnectorSplit) -> Result<Self, ConnectorError> {
-        let split_weight = neutral_envelope_split_weight(raw, "iceberg table_changes split")?;
-        let category = raw
-            .category
-            .as_ref()
-            .ok_or_else(|| invalid("connector split category must be present"))?;
-        let table_changes = match category {
-            dto::connector_split::Category::TableChanges(table_changes) => table_changes,
-            dto::connector_split::Category::Data(_)
-            | dto::connector_split::Category::ChangeWindow(_)
-            | dto::connector_split::Category::SystemFiles(_)
-            | dto::connector_split::Category::RewritePositionDeleteFiles(_) => {
-                return Err(invalid(
-                    "connector split is not an iceberg table_changes split",
-                ));
-            }
-        };
-        let provider = table_changes
-            .provider
-            .as_ref()
-            .ok_or_else(|| invalid("table changes split provider variant must be present"))?;
-        match provider {
-            dto::table_changes_split_category::Provider::Iceberg(iceberg) => {
-                Self::from_proto(iceberg, split_weight)
-            }
-        }
     }
 }
 
@@ -730,14 +663,6 @@ impl IcebergChangeWindowHandle {
         }
     }
 
-    pub fn to_change_window_handle_proto(&self) -> dto::ConnectorChangeWindowHandle {
-        dto::ConnectorChangeWindowHandle {
-            handle: Some(dto::connector_change_window_handle::Handle::Iceberg(
-                self.to_proto(),
-            )),
-        }
-    }
-
     pub fn from_proto(raw: &dto::IcebergChangeWindowHandle) -> Result<Self, ConnectorError> {
         let schema_table_name = raw
             .schema_table_name
@@ -755,20 +680,6 @@ impl IcebergChangeWindowHandle {
             to_snapshot_id_inclusive: raw.to_snapshot_id_inclusive,
             partition_spec_jsons: raw.partition_spec_jsons.clone(),
         })
-    }
-
-    pub fn from_change_window_handle_proto(
-        raw: &dto::ConnectorChangeWindowHandle,
-    ) -> Result<Self, ConnectorError> {
-        let handle = raw
-            .handle
-            .as_ref()
-            .ok_or_else(|| invalid("connector change window handle variant must be present"))?;
-        match handle {
-            dto::connector_change_window_handle::Handle::Iceberg(iceberg) => {
-                Self::from_proto(iceberg)
-            }
-        }
     }
 }
 
@@ -1076,24 +987,6 @@ impl IcebergChangeSplit {
         dto::IcebergChangeSplit { rows: Some(rows) }
     }
 
-    pub fn to_connector_split_proto(&self) -> dto::ConnectorSplit {
-        let data = self.data();
-        dto::ConnectorSplit {
-            split_weight_raw: ConnectorSplit::split_weight(data).raw_value(),
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            affinity_key: ConnectorSplit::affinity_key(data).map(str::to_string),
-            retained_size_in_bytes: ConnectorSplit::retained_size_in_bytes(self),
-            category: Some(dto::connector_split::Category::ChangeWindow(
-                dto::ChangeWindowSplitCategory {
-                    provider: Some(dto::change_window_split_category::Provider::Iceberg(
-                        self.to_proto(),
-                    )),
-                },
-            )),
-        }
-    }
-
     pub fn from_proto(
         raw: &dto::IcebergChangeSplit,
         split_weight: SplitWeight,
@@ -1139,44 +1032,6 @@ impl IcebergChangeSplit {
                         decode_deletes(&deleted.previously_applied_deletes)?,
                     )?,
                 ))
-            }
-        }
-    }
-
-    pub fn from_connector_split_proto(raw: &dto::ConnectorSplit) -> Result<Self, ConnectorError> {
-        if !raw.remotely_accessible {
-            return Err(invalid(
-                "an iceberg change-window split is always remotely accessible",
-            ));
-        }
-        if !raw.addresses.is_empty() {
-            return Err(invalid(
-                "an iceberg change-window split names no host addresses",
-            ));
-        }
-        let split_weight = SplitWeight::try_from_raw(raw.split_weight_raw)?;
-        let category = raw
-            .category
-            .as_ref()
-            .ok_or_else(|| invalid("connector split category must be present"))?;
-        let change_window = match category {
-            dto::connector_split::Category::ChangeWindow(change_window) => change_window,
-            dto::connector_split::Category::Data(_)
-            | dto::connector_split::Category::TableChanges(_)
-            | dto::connector_split::Category::SystemFiles(_)
-            | dto::connector_split::Category::RewritePositionDeleteFiles(_) => {
-                return Err(invalid(
-                    "connector split is not an iceberg change-window split",
-                ));
-            }
-        };
-        let provider = change_window
-            .provider
-            .as_ref()
-            .ok_or_else(|| invalid("change window split provider variant must be present"))?;
-        match provider {
-            dto::change_window_split_category::Provider::Iceberg(iceberg) => {
-                Self::from_proto(iceberg, split_weight, raw.affinity_key.clone())
             }
         }
     }
@@ -1647,22 +1502,6 @@ fn decode_data_split(
     IcebergSplit::from_proto(raw, split_weight, affinity_key)
 }
 
-fn neutral_envelope_split_weight(
-    raw: &dto::ConnectorSplit,
-    what: &'static str,
-) -> Result<SplitWeight, ConnectorError> {
-    if !raw.remotely_accessible {
-        return Err(invalid(format!("{what} is always remotely accessible")));
-    }
-    if !raw.addresses.is_empty() {
-        return Err(invalid(format!("{what} names no host addresses")));
-    }
-    if raw.affinity_key.is_some() {
-        return Err(invalid(format!("{what} carries no affinity key")));
-    }
-    SplitWeight::try_from_raw(raw.split_weight_raw)
-}
-
 #[cfg(test)]
 mod tests {
     use novarocks_spi::connector::ConnectorChangeWindowReplaceFailure;
@@ -2106,23 +1945,16 @@ mod tests {
             removed("f.parquet"),
         ];
         for split in splits {
-            let decoded =
-                IcebergChangeSplit::from_connector_split_proto(&split.to_connector_split_proto())
-                    .expect("decoded");
+            let decoded = IcebergChangeSplit::from_proto(
+                &split.to_proto(),
+                ConnectorSplit::split_weight(&split),
+                ConnectorSplit::affinity_key(&split).map(ToOwned::to_owned),
+            )
+            .expect("decoded");
             assert_eq!(decoded.change_op(), split.change_op());
             assert_eq!(decoded.data().path(), split.data().path());
             assert_eq!(decoded.to_proto(), split.to_proto());
         }
-    }
-
-    #[test]
-    fn a_change_split_rejects_a_foreign_split_category() {
-        let split = added("a.parquet");
-        let mut raw = split.to_connector_split_proto();
-        raw.category = Some(dto::connector_split::Category::SystemFiles(
-            dto::SystemFilesSplitCategory { provider: None },
-        ));
-        assert!(IcebergChangeSplit::from_connector_split_proto(&raw).is_err());
     }
 
     #[test]
@@ -2166,7 +1998,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_change_relations_use_separate_closed_wire_carriers() {
+    fn the_two_change_relations_use_separate_private_wire_values() {
         let function = TableChangesFunctionHandle::try_new(TableChangesFunctionHandleParams {
             schema_table_name: SchemaTableName::try_new("db", "t").expect("name"),
             table_schema_json: serde_json::to_string(&partitioned_schema()).expect("schema json"),
@@ -2176,17 +2008,13 @@ mod tests {
             end_snapshot_id: 20,
         })
         .expect("function handle");
-        let decoded = TableChangesFunctionHandle::from_table_function_handle_proto(
-            &function.to_table_function_handle_proto(),
-        )
-        .expect("decoded function handle");
+        let decoded = TableChangesFunctionHandle::from_proto(&function.to_proto())
+            .expect("decoded function handle");
         assert_eq!(decoded, function);
 
         let window = change_window_handle();
-        let decoded = IcebergChangeWindowHandle::from_change_window_handle_proto(
-            &window.to_change_window_handle_proto(),
-        )
-        .expect("decoded window handle");
+        let decoded = IcebergChangeWindowHandle::from_proto(&window.to_proto())
+            .expect("decoded window handle");
         assert_eq!(decoded, window);
         assert_eq!(decoded.from_snapshot_id_exclusive(), 10);
         assert_eq!(decoded.to_snapshot_id_inclusive(), 20);
@@ -2254,7 +2082,7 @@ mod tests {
         })
         .expect("split");
         let decoded =
-            TableChangesSplit::from_connector_split_proto(&split.to_connector_split_proto())
+            TableChangesSplit::from_proto(&split.to_proto(), ConnectorSplit::split_weight(&split))
                 .expect("decoded");
         assert_eq!(decoded.to_proto(), split.to_proto());
         assert_eq!(decoded.change_ordinal(), 1);

@@ -544,6 +544,11 @@ fn connector_values(
             .copied()
             .map(ConnectorValue::TinyInt)
             .collect(),
+        MembershipValues::Int16(values) => values
+            .iter()
+            .copied()
+            .map(ConnectorValue::SmallInt)
+            .collect(),
         MembershipValues::Int32(values) => values
             .iter()
             .copied()
@@ -576,6 +581,11 @@ fn connector_values(
             timezone,
             values,
         } => match (unit, timezone.as_deref()) {
+            (arrow::datatypes::TimeUnit::Millisecond, None) => values
+                .iter()
+                .copied()
+                .map(ConnectorValue::TimestampMillis)
+                .collect(),
             (arrow::datatypes::TimeUnit::Microsecond, None) => values
                 .iter()
                 .copied()
@@ -618,9 +628,6 @@ fn connector_values(
             .iter()
             .map(|value| ConnectorValue::Fixed(value.to_be_bytes().into()))
             .collect(),
-        // The declaration may support these FE values, but the connector SPI
-        // has no equal-width predicate representation for them.
-        MembershipValues::Int16(_) => return None,
     };
     if values.iter().any(|value| {
         matches!(value, ConnectorValue::Real(value) if value.is_nan())
@@ -681,6 +688,45 @@ mod tests {
         ))
         .encode(64 * 1024)
         .expect("canonical domain")
+    }
+
+    #[test]
+    fn connector_feedback_preserves_smallint_and_timestamp_milliseconds() {
+        assert_eq!(
+            connector_values(&ValueDomainDelta::new(
+                MembershipValues::int16([i16::MIN, i16::MAX]),
+                false,
+            )),
+            Some(vec![
+                ConnectorValue::SmallInt(i16::MIN),
+                ConnectorValue::SmallInt(i16::MAX),
+            ])
+        );
+        assert_eq!(
+            connector_values(&ValueDomainDelta::new(
+                MembershipValues::timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    None::<String>,
+                    [-1_704_067_200_123, 1_704_067_200_123],
+                ),
+                false,
+            )),
+            Some(vec![
+                ConnectorValue::TimestampMillis(-1_704_067_200_123),
+                ConnectorValue::TimestampMillis(1_704_067_200_123),
+            ])
+        );
+        assert_eq!(
+            connector_values(&ValueDomainDelta::new(
+                MembershipValues::timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    Some("UTC"),
+                    [1],
+                ),
+                false,
+            )),
+            None
+        );
     }
 
     #[test]

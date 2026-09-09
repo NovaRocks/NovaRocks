@@ -19,7 +19,8 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::fragment::decode::expression::NativeExpressionInputLayout;
@@ -35,13 +36,224 @@ use novarocks_functions::EngineFunctionCatalog;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{common, expr};
-use novarocks_spi::connector::ConnectorCancellation;
+use novarocks_spi::connector::{
+    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorRequestResources,
+    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
+    ConnectorResourceLedger,
+};
 use novarocks_types::QueryId;
 
 use crate::fragment::decode::plan::error::{
     NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
 };
 use crate::fragment::decode::plan::layout::Layout;
+
+/// Adapts connector reservations to the exact fragment tracker created by
+/// native task admission. The adapter exists during pure plan decode, but it
+/// cannot reserve until the host installs that tracker.
+struct NativeConnectorResourceLedger {
+    tracker: OnceLock<Arc<novarocks_execution::runtime::mem_tracker::MemTracker>>,
+    checkpoint: AtomicU64,
+}
+
+impl NativeConnectorResourceLedger {
+    fn new() -> Self {
+        Self {
+            tracker: OnceLock::new(),
+            checkpoint: AtomicU64::new(0),
+        }
+    }
+
+    fn install(
+        &self,
+        tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    ) -> Result<(), String> {
+        if let Some(existing) = self.tracker.get() {
+            return if Arc::ptr_eq(existing, &tracker) {
+                Ok(())
+            } else {
+                Err("connector resource ledger was rebound to another fragment tracker".to_string())
+            };
+        }
+        self.tracker
+            .set(tracker)
+            .map_err(|_| "connector resource ledger installation raced".to_string())
+    }
+}
+
+struct NativeConnectorResourceLease {
+    tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    bytes: i64,
+}
+
+impl ConnectorResourceLease for NativeConnectorResourceLease {
+    fn bytes(&self) -> u64 {
+        u64::try_from(self.bytes).expect("connector resource lease bytes are non-negative")
+    }
+
+    fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+        let additional = i64::try_from(additional).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "connector reservation exceeds the native memory tracker range",
+            )
+        })?;
+        if let Err(error) = self.tracker.consume_and_check_limit(additional) {
+            self.tracker.release(additional);
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                error,
+            ));
+        }
+        self.bytes = self.bytes.checked_add(additional).ok_or_else(|| {
+            self.tracker.release(additional);
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector resource lease overflowed",
+            )
+        })?;
+        Ok(())
+    }
+
+    fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+        let bytes = i64::try_from(bytes).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector resource lease target exceeds the native memory tracker range",
+            )
+        })?;
+        if bytes > self.bytes {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector resource lease cannot grow through shrink_to",
+            ));
+        }
+        self.tracker.release(self.bytes - bytes);
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+impl Drop for NativeConnectorResourceLease {
+    fn drop(&mut self) {
+        self.tracker.release(self.bytes);
+    }
+}
+
+impl ConnectorResourceLedger for NativeConnectorResourceLedger {
+    fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+        Ok(ConnectorResourceCheckpoint::new(
+            self.checkpoint.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
+    fn try_reserve(
+        &self,
+        _class: ConnectorResourceClass,
+        bytes: u64,
+    ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+        let tracker = self.tracker.get().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector attempted to reserve runtime memory before native fragment admission",
+            )
+        })?;
+        let bytes = i64::try_from(bytes).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "connector reservation exceeds the native memory tracker range",
+            )
+        })?;
+        if let Err(error) = tracker.consume_and_check_limit(bytes) {
+            tracker.release(bytes);
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                error,
+            ));
+        }
+        Ok(Box::new(NativeConnectorResourceLease { tracker, bytes }))
+    }
+}
+
+#[cfg(test)]
+mod connector_resource_tests {
+    use super::NativeConnectorResourceLedger;
+    use novarocks_execution::runtime::mem_tracker::MemTracker;
+    use novarocks_spi::connector::{
+        ConnectorErrorKind, ConnectorResourceClass, ConnectorResourceLedger,
+    };
+
+    #[test]
+    fn native_connector_ledger_rejects_reservation_before_fragment_admission() {
+        let ledger = NativeConnectorResourceLedger::new();
+
+        let error = ledger
+            .try_reserve(ConnectorResourceClass::ReaderState, 1)
+            .err()
+            .expect("reservation before tracker installation must fail closed");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(
+            error
+                .to_string()
+                .contains("before native fragment admission")
+        );
+    }
+
+    #[test]
+    fn native_connector_lease_charges_and_releases_the_exact_tracker_chain() {
+        let process = MemTracker::new_root("process");
+        let query = MemTracker::new_child("query", &process);
+        let fragment = MemTracker::new_child("fragment", &query);
+        let ledger = NativeConnectorResourceLedger::new();
+        ledger
+            .install(fragment.clone())
+            .expect("fragment tracker installation succeeds");
+
+        let mut lease = ledger
+            .try_reserve(ConnectorResourceClass::ReaderOutput, 8)
+            .expect("reservation charges installed tracker");
+        assert_eq!(lease.bytes(), 8);
+        assert_eq!(fragment.current(), 8);
+        assert_eq!(query.current(), 8);
+        assert_eq!(process.current(), 8);
+
+        lease.try_grow(5).expect("lease growth is charged");
+        assert_eq!(fragment.current(), 13);
+        assert_eq!(query.current(), 13);
+        assert_eq!(process.current(), 13);
+
+        lease.shrink_to(3).expect("lease shrink is released");
+        assert_eq!(fragment.current(), 3);
+        assert_eq!(query.current(), 3);
+        assert_eq!(process.current(), 3);
+
+        drop(lease);
+        assert_eq!(fragment.current(), 0);
+        assert_eq!(query.current(), 0);
+        assert_eq!(process.current(), 0);
+        assert_eq!(fragment.allocated(), 13);
+        assert_eq!(fragment.deallocated(), 13);
+    }
+
+    #[test]
+    fn native_connector_ledger_only_allows_idempotent_tracker_installation() {
+        let ledger = NativeConnectorResourceLedger::new();
+        let admitted_fragment = MemTracker::new_root("admitted-fragment");
+        let other_fragment = MemTracker::new_root("other-fragment");
+
+        ledger
+            .install(admitted_fragment.clone())
+            .expect("first tracker installation succeeds");
+        ledger
+            .install(admitted_fragment)
+            .expect("exact tracker replay is idempotent");
+
+        let error = ledger
+            .install(other_fragment)
+            .expect_err("rebinding to another fragment must fail closed");
+        assert!(error.contains("rebound to another fragment tracker"));
+    }
+}
 
 /// Everything a typed connector scan needs that only the fragment runtime can
 /// supply: the installed provider generation, this task attempt's split queues,
@@ -73,6 +285,8 @@ pub(crate) struct TypedScanRuntime {
     runtime_filter: RuntimeFilterSessionResolver,
     read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
     storage_resolver: Arc<dyn novarocks_spi::connector::ConnectorStorageResolver>,
+    connector_resources: ConnectorRequestResources,
+    connector_resource_ledger: Arc<NativeConnectorResourceLedger>,
 }
 
 /// Looks up the attempt's runtime-filter session at the moment it is needed.
@@ -119,6 +333,11 @@ impl TypedScanRuntime {
         read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
         storage_resolver: Arc<dyn novarocks_spi::connector::ConnectorStorageResolver>,
     ) -> Self {
+        let connector_resource_ledger = Arc::new(NativeConnectorResourceLedger::new());
+        let connector_resources = ConnectorRequestResources::new(Arc::clone(
+            &connector_resource_ledger,
+        )
+            as Arc<dyn ConnectorResourceLedger>);
         Self {
             execution_id,
             catalog_read_execution,
@@ -128,6 +347,8 @@ impl TypedScanRuntime {
             runtime_filter,
             read_context,
             storage_resolver,
+            connector_resources,
+            connector_resource_ledger,
         }
     }
 
@@ -174,6 +395,17 @@ impl TypedScanRuntime {
         &self,
     ) -> Arc<dyn novarocks_spi::connector::ConnectorStorageResolver> {
         Arc::clone(&self.storage_resolver)
+    }
+
+    pub(crate) fn connector_resources(&self) -> ConnectorRequestResources {
+        self.connector_resources.clone()
+    }
+
+    pub(crate) fn install_connector_resource_tracker(
+        &self,
+        tracker: Arc<novarocks_execution::runtime::mem_tracker::MemTracker>,
+    ) -> Result<(), String> {
+        self.connector_resource_ledger.install(tracker)
     }
 
     pub(crate) fn register_read_execution(

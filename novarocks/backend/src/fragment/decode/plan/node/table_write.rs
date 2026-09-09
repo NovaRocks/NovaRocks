@@ -53,7 +53,7 @@ use novarocks_execution::exec::node::table_writer::{
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_execution::runtime::query_options::query_expire_durations;
-use novarocks_proto_codec::connector_write::ValidatedWriterHandle;
+use novarocks_proto_codec::connector_write::{ConnectorWriteHandleDecoder, ValidatedWriterHandle};
 use novarocks_proto_codec::{FieldPath, arrow_physical};
 use novarocks_proto_models::plan;
 use novarocks_spi::connector::ConnectorRequestContext;
@@ -1719,32 +1719,39 @@ mod tests {
     }
 
     #[test]
-    fn a_writer_handle_without_a_provider_variant_is_refused_at_its_exact_path() {
+    fn a_writer_handle_without_a_provider_payload_is_refused_at_its_exact_path() {
         let mut writer = writer_payload();
-        writer.handle = Some(write_dto::ConnectorWriterHandle { handle: None });
+        writer.handle = Some(write_dto::ConnectorWriterHandle {
+            provider_payload: None,
+        });
         let error = decode_error(&simple_writer_plan(writer));
         assert_protocol(
             &error,
-            "plan_fragment.root.payload.table_writer.handle",
+            "plan_fragment.root.payload.table_writer.handle.provider_payload",
             ProtocolErrorKind::MissingField,
         );
     }
 
     #[test]
-    fn a_structurally_invalid_writer_handle_is_refused_at_its_exact_provider_field() {
+    fn a_writer_handle_with_the_wrong_payload_category_is_refused_at_the_public_boundary() {
         let mut writer = writer_payload();
         let mut carrier = iceberg_writer_handle("9c2f1f66".to_string());
-        if let Some(write_dto::connector_writer_handle::Handle::Iceberg(iceberg)) =
-            carrier.handle.as_mut()
-        {
-            iceberg.table.as_mut().expect("table facts").format_version = 9;
-        }
+        carrier
+            .provider_payload
+            .as_mut()
+            .expect("provider payload")
+            .header
+            .as_mut()
+            .expect("envelope header")
+            .category =
+            novarocks_proto_models::connector_common::ConnectorPayloadCategory::CommitFragment
+                as i32;
         writer.handle = Some(carrier);
         let error = decode_error(&simple_writer_plan(writer));
         assert_protocol(
             &error,
-            "plan_fragment.root.payload.table_writer.handle.iceberg.table.format_version",
-            ProtocolErrorKind::OutOfRange,
+            "plan_fragment.root.payload.table_writer.handle.provider_payload.header",
+            ProtocolErrorKind::InconsistentFields,
         );
     }
 
@@ -2016,14 +2023,7 @@ mod tests {
         );
         let mut writer = write_execution
             .open_writer(ConnectorOpenWriterRequest {
-                handle: test_write_adapter().wrap_writer_handle(
-                    match iceberg_writer_handle("t".to_string()).handle {
-                        Some(write_dto::connector_writer_handle::Handle::Iceberg(iceberg)) => {
-                            iceberg
-                        }
-                        None => unreachable!("the fixture always carries a variant"),
-                    },
-                ),
+                handle: test_write_adapter().wrap_writer_handle("t".to_string()),
                 target: WriteTargetOrdinal::try_new(0).expect("ordinal"),
                 expected_schema: Arc::new(arrow::datatypes::Schema::empty()),
                 physical: ConnectorWriterPhysicalContext::new([0; 16], 1, [0; 16], 0, 0),

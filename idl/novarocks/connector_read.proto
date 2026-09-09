@@ -18,13 +18,14 @@
 syntax = "proto3";
 
 import "catalog.proto";
+import "connector_common.proto";
 
 // NovaRocks-native typed connector read contract.
 //
-// Every handle and split category is its own closed `oneof`; a provider
-// variant is selected structurally, never by a class id, message name, or
-// private payload. The generic scheduler reads only the neutral envelope
-// promoted onto ConnectorSplit and must not interpret a provider variant.
+// Public handles and split categories carry a purpose-tagged provider payload.
+// The generic scheduler reads only the neutral envelope promoted onto
+// ConnectorSplit. Provider-private schemas and semantics live in the provider
+// crate and never enter this package.
 //
 // Owner: produced by the FE native plan/assignment encoder, validated by
 // novarocks-proto, and consumed by the BE native decode adapter. Provider
@@ -41,10 +42,10 @@ package novarocks.connector_read;
 enum ValueTypeKind {
   VALUE_TYPE_KIND_UNSPECIFIED = 0;
   VALUE_TYPE_KIND_BOOLEAN = 1;
-  // An eight-bit signed integer. The engine has one and Iceberg does not, so
-  // a column of this type is always engine-derived; widening it to INTEGER
-  // would be exactly the implicit downgrade this vocabulary refuses.
+  // An eight-bit signed integer. A provider without an exact counterpart must
+  // reject it rather than silently widening it to INTEGER.
   VALUE_TYPE_KIND_TINY_INT = 18;
+  VALUE_TYPE_KIND_SMALL_INT = 19;
   VALUE_TYPE_KIND_INTEGER = 2;
   VALUE_TYPE_KIND_BIG_INT = 3;
   VALUE_TYPE_KIND_REAL = 4;
@@ -56,6 +57,7 @@ enum ValueTypeKind {
   VALUE_TYPE_KIND_TIMESTAMP_TZ_MICROS = 10;
   VALUE_TYPE_KIND_TIMESTAMP_NANOS = 11;
   VALUE_TYPE_KIND_TIMESTAMP_TZ_NANOS = 12;
+  VALUE_TYPE_KIND_TIMESTAMP_MILLIS = 20;
   VALUE_TYPE_KIND_VARCHAR = 13;
   VALUE_TYPE_KIND_VARBINARY = 14;
   VALUE_TYPE_KIND_UUID = 15;
@@ -89,6 +91,7 @@ message Value {
   oneof value {
     bool boolean = 1;
     int32 tiny_int = 17;               // -128..=127.
+    int32 small_int = 18;              // -32768..=32767.
     int32 integer = 2;
     int64 big_int = 3;
     float real = 4;
@@ -100,6 +103,7 @@ message Value {
     int64 timestamp_tz_micros = 10;
     int64 timestamp_nanos = 11;
     int64 timestamp_tz_nanos = 12;
+    int64 timestamp_millis = 19;
     string varchar = 13;               // <= 64 KiB.
     bytes varbinary = 14;              // <= 64 KiB.
     bytes uuid = 15;                   // exactly 16 bytes.
@@ -191,487 +195,99 @@ message CallExpression {
 // Shared identity
 // ---------------------------------------------------------------------------
 
-message SchemaTableName {
-  string schema_name = 1;  // non-empty, <= 1024 bytes.
-  string table_name = 2;   // non-empty, <= 1024 bytes.
-}
-
 message HostAddress {
   string host = 1;  // non-empty, <= 255 bytes.
   uint32 port = 2;  // 1..=65535.
 }
 
 // ---------------------------------------------------------------------------
-// Column handles
+// Provider-owned handles
 // ---------------------------------------------------------------------------
 
-enum ColumnIdentityCategory {
-  COLUMN_IDENTITY_CATEGORY_UNSPECIFIED = 0;
-  COLUMN_IDENTITY_CATEGORY_PRIMITIVE = 1;
-  COLUMN_IDENTITY_CATEGORY_STRUCT = 2;
-  COLUMN_IDENTITY_CATEGORY_ARRAY = 3;
-  COLUMN_IDENTITY_CATEGORY_MAP = 4;
-}
-
-// Iceberg column identity: field id, name, category, and children in schema
-// order. PRIMITIVE must have no children.
-message ColumnIdentity {
-  int32 field_id = 1;
-  string name = 2;
-  ColumnIdentityCategory category = 3;
-  repeated ColumnIdentity children = 4;
-}
-
-message IcebergColumnHandle {
-  ColumnIdentity base_column_identity = 1;
-  string base_type_json = 2;          // Iceberg type JSON of the base column.
-  repeated int32 field_id_path = 3;   // dereference path below the base column.
-  string type_json = 4;               // Iceberg type JSON of the projected column.
-  bool nullable = 5;
-  optional string comment = 6;
-}
-
-// Closed set of column handles. A generic consumer keys on this whole message.
+// A generic consumer keys on the complete encoded payload without interpreting
+// the provider-private column schema.
 message ColumnHandle {
-  oneof handle {
-    IcebergColumnHandle iceberg = 10;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 // ---------------------------------------------------------------------------
 // Transaction handles
 // ---------------------------------------------------------------------------
 
-// Iceberg reuses Trino's Hive-shaped transaction marker. The frontend
-// transaction manager is the only owner; a worker never resolves it.
-message HiveTransactionHandle {
-  bool auto_commit = 1;
-  bytes uuid = 2;  // exactly 16 bytes.
-}
-
 message ConnectorTransactionHandle {
-  oneof handle {
-    HiveTransactionHandle iceberg = 10;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 // ---------------------------------------------------------------------------
 // Table handles
 // ---------------------------------------------------------------------------
 
-// Exactly the data files one read is restricted to.
-//
-// This names a file set, not a rule. A mutation or rewrite cohort commits a
-// replacement for precisely these files, so a read that skipped one of them,
-// or added one outside them, would corrupt the relation rather than return a
-// wrong answer. Nothing here may be re-derived from the snapshot, a predicate,
-// or a size threshold.
-message IcebergPinnedDataFileSet {
-  repeated string paths = 1;  // sorted, unique, non-empty; at most 4096.
-}
-
-// A worker-visible Iceberg table handle. Only DATA relations use it; system
-// relations, table functions, and table execute have their own entry points.
-message IcebergTableHandle {
-  SchemaTableName schema_table_name = 1;
-  optional int64 snapshot_id = 2;
-  string table_schema_json = 3;
-  optional int32 spec_id = 4;
-  map<int32, string> partition_spec_jsons = 5;
-  int32 format_version = 6;                    // 1, 2, or 3.
-  TupleDomain unenforced_predicate = 7;
-  TupleDomain enforced_predicate = 8;
-  optional uint64 limit = 9;
-  repeated IcebergColumnHandle projected_columns = 10;  // pushdown fact; unordered.
-  optional string name_mapping_json = 11;
-  string table_location = 12;
-  map<string, string> storage_properties = 13;
-  // Absent means the whole pinned snapshot. Present means exactly this file
-  // set and nothing else -- including an empty set, which reads no rows.
-  IcebergPinnedDataFileSet pinned_data_files = 14;
-}
-
 message ConnectorTableHandle {
-  oneof handle {
-    IcebergTableHandle iceberg = 10;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 // ---------------------------------------------------------------------------
-// Table function handles (Trino table_changes)
+// Table function handles
 // ---------------------------------------------------------------------------
-
-message TableChangesFunctionHandle {
-  SchemaTableName schema_table_name = 1;
-  string table_schema_json = 2;
-  repeated IcebergColumnHandle columns = 3;  // ordered output columns.
-  optional string name_mapping_json = 4;
-  int64 start_snapshot_id = 5;
-  int64 end_snapshot_id = 6;
-}
 
 message ConnectorTableFunctionHandle {
-  oneof handle {
-    TableChangesFunctionHandle iceberg_table_changes = 10;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 // ---------------------------------------------------------------------------
 // Change-window handles (NovaRocks incremental materialized views)
 // ---------------------------------------------------------------------------
 
-// The window is an endpoint visible-row set difference, not a manifest replay.
-message IcebergChangeWindowHandle {
-  SchemaTableName schema_table_name = 1;
-  string table_schema_json = 2;
-  repeated IcebergColumnHandle columns = 3;  // ordered output columns.
-  optional string name_mapping_json = 4;
-  int64 from_snapshot_id_exclusive = 5;
-  int64 to_snapshot_id_inclusive = 6;
-  // Every partition spec a split of this window may name. A window spans two
-  // snapshots, so files written under different specs can appear on both
-  // sides of the difference and every one of them must be decodable without
-  // resolving the relation through the catalog again.
-  map<int32, string> partition_spec_jsons = 7;
-}
-
 message ConnectorChangeWindowHandle {
-  oneof handle {
-    IcebergChangeWindowHandle iceberg = 10;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 // ---------------------------------------------------------------------------
 // System relation references
 // ---------------------------------------------------------------------------
 
-// Worker-visible system relations. PARTITIONS is deliberately absent: it is a
-// view bound to the same pinned snapshot's FILES relation.
-enum IcebergSystemTableType {
-  ICEBERG_SYSTEM_TABLE_TYPE_UNSPECIFIED = 0;
-  ICEBERG_SYSTEM_TABLE_TYPE_FILES = 1;
-  ICEBERG_SYSTEM_TABLE_TYPE_ENTRIES = 2;
-  ICEBERG_SYSTEM_TABLE_TYPE_SNAPSHOTS = 3;
-  ICEBERG_SYSTEM_TABLE_TYPE_HISTORY = 4;
-  ICEBERG_SYSTEM_TABLE_TYPE_REFS = 5;
-  ICEBERG_SYSTEM_TABLE_TYPE_MANIFESTS = 6;
-  // `$partitions` aggregates the rows `$files` produces for the same pinned
-  // snapshot. It is a kind of its own rather than a FILES reference the worker
-  // is told to aggregate: a FILES reference reaching a backend reads as the
-  // un-aggregated relation, which answers a different question with a
-  // plausible shape -- one row per data file instead of one row per partition.
-  // Both kinds are minted by the same resolution, from the same metadata file,
-  // uuid and snapshot, so the two cannot describe different snapshots.
-  ICEBERG_SYSTEM_TABLE_TYPE_PARTITIONS = 7;
-}
-
-// An immutable metadata reference. The selected backend validates the UUID and
-// snapshot against the metadata file; it never re-resolves through the catalog
-// and never falls back to the latest snapshot.
-message IcebergSystemTableReference {
-  SchemaTableName schema_table_name = 1;
-  IcebergSystemTableType system_table_type = 2;
-  string metadata_file_location = 3;
-  string table_uuid = 4;
-  optional int64 snapshot_id = 5;
-}
-
 message ConnectorSystemTableReference {
-  oneof reference {
-    IcebergSystemTableReference iceberg = 10;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 // ---------------------------------------------------------------------------
 // Table execute handles
 // ---------------------------------------------------------------------------
 
-// Trino's eight procedures plus the single NovaRocks extension. Only OPTIMIZE
-// reuses an ordinary data split; REWRITE_POSITION_DELETE_FILES has its own.
-enum IcebergProcedureId {
-  ICEBERG_PROCEDURE_ID_UNSPECIFIED = 0;
-  ICEBERG_PROCEDURE_ID_OPTIMIZE = 1;
-  ICEBERG_PROCEDURE_ID_OPTIMIZE_MANIFESTS = 2;
-  ICEBERG_PROCEDURE_ID_DROP_EXTENDED_STATS = 3;
-  ICEBERG_PROCEDURE_ID_ROLLBACK_TO_SNAPSHOT = 4;
-  ICEBERG_PROCEDURE_ID_EXPIRE_SNAPSHOTS = 5;
-  ICEBERG_PROCEDURE_ID_REMOVE_ORPHAN_FILES = 6;
-  ICEBERG_PROCEDURE_ID_ADD_FILES = 7;
-  ICEBERG_PROCEDURE_ID_ADD_FILES_FROM_TABLE = 8;
-  ICEBERG_PROCEDURE_ID_REWRITE_POSITION_DELETE_FILES = 9;
-}
-
-message IcebergOptimizeHandle {
-  IcebergTableHandle table_handle = 1;
-  uint64 min_file_size_bytes = 2;
-}
-
-// References one exact frozen rewrite artifact and group. The artifact is
-// external immutable content addressed by its own content id; a scan or page
-// source never derives a digest of its own.
-message IcebergRewriteArtifactContentId {
-  string artifact_location = 1;
-  string artifact_digest_hex = 2;  // 64 lowercase hex characters.
-}
-
-message IcebergRewritePositionDeleteFilesHandle {
-  IcebergTableHandle table_handle = 1;
-  IcebergRewriteArtifactContentId artifact = 2;
-  string group_digest_hex = 3;  // 64 lowercase hex characters.
-}
-
-message IcebergTableExecuteHandle {
-  SchemaTableName schema_table_name = 1;
-  IcebergProcedureId procedure_id = 2;
-  string table_location = 3;
-  oneof procedure_handle {
-    IcebergOptimizeHandle optimize = 10;
-    IcebergRewritePositionDeleteFilesHandle rewrite_position_delete_files = 11;
-  }
-}
-
 message ConnectorTableExecuteHandle {
-  oneof handle {
-    IcebergTableExecuteHandle iceberg = 10;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 // ---------------------------------------------------------------------------
 // Merge table handles
 // ---------------------------------------------------------------------------
 
-message IcebergInsertTableHandle {
-  SchemaTableName schema_table_name = 1;
-  string table_schema_json = 2;
-  string table_location = 3;
-  int32 format_version = 4;
-  optional int32 spec_id = 5;
-}
-
-message IcebergMergeTableHandle {
-  IcebergTableHandle table_handle = 1;
-  IcebergInsertTableHandle insert_table_handle = 2;
-}
-
 message ConnectorMergeTableHandle {
-  oneof handle {
-    IcebergMergeTableHandle iceberg = 10;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 // ---------------------------------------------------------------------------
-// File and delete descriptors
+// Provider-owned split categories
 // ---------------------------------------------------------------------------
-
-enum IcebergFileFormat {
-  ICEBERG_FILE_FORMAT_UNSPECIFIED = 0;
-  ICEBERG_FILE_FORMAT_ORC = 1;
-  ICEBERG_FILE_FORMAT_PARQUET = 2;
-  ICEBERG_FILE_FORMAT_AVRO = 3;
-  // Puffin carries deletion vectors as an addressed blob inside a container
-  // file. It is a delete artifact format only; a data file is never Puffin.
-  ICEBERG_FILE_FORMAT_PUFFIN = 4;
-}
-
-enum IcebergDeleteFileContent {
-  ICEBERG_DELETE_FILE_CONTENT_UNSPECIFIED = 0;
-  ICEBERG_DELETE_FILE_CONTENT_POSITION_DELETES = 1;
-  ICEBERG_DELETE_FILE_CONTENT_EQUALITY_DELETES = 2;
-}
-
-// Typed extension point only. Parquet modular encryption is not implemented in
-// this contract; a non-empty value is rejected by both producer and consumer.
-message ParquetFileDecryptionData {
-  bytes key_metadata = 1;  // <= 64 KiB, redacted in every debug rendering.
-  bytes aad_prefix = 2;    // <= 64 KiB, redacted in every debug rendering.
-}
-
-// One applicable delete file, carried inline with its data split. The file
-// format field is the only format authority; a suffix is never inspected.
-message IcebergDeleteFile {
-  IcebergDeleteFileContent content = 1;
-  string path = 2;
-  IcebergFileFormat format = 3;
-  int64 record_count = 4;
-  int64 file_size_in_bytes = 5;
-  repeated int32 equality_field_ids = 6;  // schema order; <= 4096.
-  optional int64 row_position_lower_bound = 7;
-  optional int64 row_position_upper_bound = 8;
-  int64 data_sequence_number = 9;
-  optional int64 content_offset = 10;        // Puffin deletion vector only.
-  optional int64 content_size_in_bytes = 11; // Puffin deletion vector only.
-  optional ParquetFileDecryptionData decryption_data = 12;
-  // Present when the Iceberg manifest ties this delete artifact to one data
-  // file. Rewrite-position splits require this exact identity; ordinary
-  // position/equality delete readers retain their existing optional behavior.
-  optional string referenced_data_file = 13;
-}
-
-// ---------------------------------------------------------------------------
-// Data splits
-// ---------------------------------------------------------------------------
-
-// One byte range of one Iceberg data file, self-contained: it carries the full
-// applicable delete closure and every fact the reader needs.
-message IcebergSplit {
-  string path = 1;                 // <= 16 KiB.
-  int64 start = 2;
-  int64 length = 3;
-  int64 file_size = 4;
-  int64 file_record_count = 5;
-  IcebergFileFormat file_format = 6;
-  int32 partition_spec_id = 7;
-  string partition_data_json = 8;
-  repeated IcebergDeleteFile deletes = 9;  // <= 1024, planner order.
-  TupleDomain file_statistics_domain = 10;
-  optional int64 data_sequence_number = 11;
-  optional int64 file_first_row_id = 12;
-  optional ParquetFileDecryptionData decryption_data = 13;
-}
 
 message DataSplit {
-  oneof provider {
-    IcebergSplit iceberg = 10;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Table-changes splits
-// ---------------------------------------------------------------------------
-
-enum TableChangesChangeType {
-  TABLE_CHANGES_CHANGE_TYPE_UNSPECIFIED = 0;
-  TABLE_CHANGES_CHANGE_TYPE_ADDED_FILE = 1;
-  TABLE_CHANGES_CHANGE_TYPE_DELETED_FILE = 2;
-}
-
-message TableChangesSplit {
-  TableChangesChangeType change_type = 1;
-  int64 snapshot_id = 2;
-  int64 snapshot_timestamp_millis = 3;
-  int64 change_ordinal = 4;
-  string path = 5;
-  int64 start = 6;
-  int64 length = 7;
-  int64 file_size = 8;
-  int64 file_record_count = 9;
-  IcebergFileFormat file_format = 10;
-  int32 partition_spec_id = 11;
-  string partition_data_json = 12;
-  optional ParquetFileDecryptionData decryption_data = 13;
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 message TableChangesSplitCategory {
-  oneof provider {
-    TableChangesSplit iceberg = 10;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Change-window splits
-// ---------------------------------------------------------------------------
-
-// Rows newly visible at the window's upper endpoint.
-message IcebergAddedRows {
-  IcebergSplit data = 1;
-  repeated int64 restricted_row_ids = 2;  // optional narrowing; <= 4096.
-}
-
-// Rows of a still-present data file that became invisible by position. The
-// backend loads the delete artifacts named here and builds its own private
-// inclusion set; no position list crosses the wire.
-message IcebergPositionDeletedRows {
-  IcebergSplit data = 1;
-  repeated IcebergDeleteFile newly_applied_deletes = 2;
-  repeated IcebergDeleteFile previously_applied_deletes = 3;
-}
-
-// Rows of a still-present data file that became invisible by equality match.
-message IcebergEqualityDeletedRows {
-  IcebergSplit data = 1;
-  repeated IcebergDeleteFile newly_applied_equality_deletes = 2;
-  repeated IcebergDeleteFile previously_applied_deletes = 3;
-}
-
-// Every row of a data file that disappeared between the two endpoints, minus
-// the rows already invisible at the lower endpoint.
-message IcebergDeletedDataFileRows {
-  IcebergSplit data = 1;
-  repeated IcebergDeleteFile previously_applied_deletes = 2;
-}
-
-message IcebergChangeSplit {
-  oneof rows {
-    IcebergAddedRows added_rows = 10;
-    IcebergPositionDeletedRows position_deleted_rows = 11;
-    IcebergEqualityDeletedRows equality_deleted_rows = 12;
-    IcebergDeletedDataFileRows deleted_data_file_rows = 13;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 message ChangeWindowSplitCategory {
-  oneof provider {
-    IcebergChangeSplit iceberg = 10;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// System-relation splits
-// ---------------------------------------------------------------------------
-
-message TrinoManifestFile {
-  string path = 1;
-  int64 length = 2;
-  int32 partition_spec_id = 3;
-  int32 content = 4;
-  int64 sequence_number = 5;
-  int64 min_sequence_number = 6;
-  int64 added_snapshot_id = 7;
-  optional int32 added_files_count = 8;
-  optional int32 existing_files_count = 9;
-  optional int32 deleted_files_count = 10;
-  optional int64 added_rows_count = 11;
-  optional int64 existing_rows_count = 12;
-  optional int64 deleted_rows_count = 13;
-  optional int64 first_row_id = 14;
-  bytes key_metadata = 15;  // non-empty is NOT_SUPPORTED in this contract.
-}
-
-// One manifest of the pinned snapshot's $files relation.
-message FilesTableSplit {
-  TrinoManifestFile manifest = 1;
-  string table_schema_json = 2;
-  string metadata_table_schema_json = 3;
-  map<int32, string> partition_spec_jsons = 4;
-  optional string partition_column_type_json = 5;
-  optional string bounds_column_type_json = 6;
-  optional string encryption_key_id = 7;
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 message SystemFilesSplitCategory {
-  oneof provider {
-    FilesTableSplit iceberg = 10;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Rewrite-position-delete splits
-// ---------------------------------------------------------------------------
-
-// One data file plus the exact Puffin position-delete descriptors selected by
-// the frozen rewrite artifact. Output is (file_path VARCHAR, pos BIGINT).
-message IcebergRewritePositionDeleteFilesSplit {
-  string data_file_path = 1;
-  int64 data_file_size = 2;
-  int32 partition_spec_id = 3;
-  string partition_data_json = 4;
-  repeated IcebergDeleteFile selected_position_deletes = 5;
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 message RewritePositionDeleteFilesSplitCategory {
-  oneof provider {
-    IcebergRewritePositionDeleteFilesSplit iceberg = 10;
-  }
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
 // ---------------------------------------------------------------------------

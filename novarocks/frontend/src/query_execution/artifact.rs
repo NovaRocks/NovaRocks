@@ -1582,8 +1582,8 @@ mod tests {
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
-        ConnectorInstanceId, ConnectorSplit,
+        CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
+        ConnectorProviderId, ConnectorSplit,
     };
 
     use super::{derive_fragment_instance_id, merge_catalog_properties};
@@ -1603,7 +1603,7 @@ mod tests {
                 ConnectorInstanceId::parse(name).expect("valid catalog name"),
                 CatalogVersion::from_bytes([version; 32]),
             ),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             vec![CatalogProperty::new("warehouse", warehouse).expect("valid warehouse")],
             Vec::new(),

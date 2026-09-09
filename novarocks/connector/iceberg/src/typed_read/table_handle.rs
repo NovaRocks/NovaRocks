@@ -26,8 +26,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::wire::dto;
 use novarocks_proto_codec::connector_read::{MAX_JSON_BYTES, MAX_PATH_BYTES};
-use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     ConnectorExpression, ConnectorTableHandle, ConnectorTransactionHandle, Constraint,
     ConstraintApplicationResult, Domain, LimitApplicationResult, OrderedAssignments,
@@ -517,14 +517,6 @@ impl IcebergTableHandle {
         }
     }
 
-    pub fn to_table_handle_proto(&self) -> dto::ConnectorTableHandle {
-        dto::ConnectorTableHandle {
-            handle: Some(dto::connector_table_handle::Handle::Iceberg(
-                self.to_proto(),
-            )),
-        }
-    }
-
     pub fn from_proto(raw: &dto::IcebergTableHandle) -> Result<Self, ConnectorError> {
         let schema_table_name = raw
             .schema_table_name
@@ -571,18 +563,6 @@ impl IcebergTableHandle {
                 .map(IcebergPinnedDataFileSet::from_proto)
                 .transpose()?,
         })
-    }
-
-    pub fn from_table_handle_proto(
-        raw: &dto::ConnectorTableHandle,
-    ) -> Result<Self, ConnectorError> {
-        let handle = raw
-            .handle
-            .as_ref()
-            .ok_or_else(|| invalid("connector table handle variant must be present"))?;
-        match handle {
-            dto::connector_table_handle::Handle::Iceberg(iceberg) => Self::from_proto(iceberg),
-        }
     }
 }
 
@@ -652,14 +632,6 @@ impl HiveTransactionHandle {
         }
     }
 
-    pub fn to_transaction_handle_proto(&self) -> dto::ConnectorTransactionHandle {
-        dto::ConnectorTransactionHandle {
-            handle: Some(dto::connector_transaction_handle::Handle::Iceberg(
-                self.to_proto(),
-            )),
-        }
-    }
-
     pub fn from_proto(raw: &dto::HiveTransactionHandle) -> Result<Self, ConnectorError> {
         let uuid: [u8; 16] = raw
             .uuid
@@ -667,20 +639,6 @@ impl HiveTransactionHandle {
             .try_into()
             .map_err(|_| invalid("iceberg transaction handle uuid must be exactly 16 bytes"))?;
         Ok(Self::new(raw.auto_commit, uuid))
-    }
-
-    pub fn from_transaction_handle_proto(
-        raw: &dto::ConnectorTransactionHandle,
-    ) -> Result<Self, ConnectorError> {
-        let handle = raw
-            .handle
-            .as_ref()
-            .ok_or_else(|| invalid("connector transaction handle variant must be present"))?;
-        match handle {
-            dto::connector_transaction_handle::Handle::Iceberg(iceberg) => {
-                Self::from_proto(iceberg)
-            }
-        }
     }
 }
 
@@ -1011,7 +969,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn table_handles_round_trip_through_the_closed_wire_variant() {
+    fn table_handles_round_trip_through_the_private_wire_value() {
         let schema = partitioned_schema();
         let handle = partitioned_handle();
         let region = IcebergColumnHandle::base_column_of(&schema, 2).expect("region");
@@ -1027,25 +985,17 @@ pub(super) mod tests {
             .into_handle();
         let handle = handle.apply_limit(4).expect("limit").into_handle();
 
-        let encoded = handle.to_table_handle_proto();
-        let decoded =
-            IcebergTableHandle::from_table_handle_proto(&encoded).expect("decoded handle");
+        let encoded = handle.to_proto();
+        let decoded = IcebergTableHandle::from_proto(&encoded).expect("decoded handle");
         assert_eq!(decoded, handle);
-
-        assert!(
-            IcebergTableHandle::from_table_handle_proto(&dto::ConnectorTableHandle {
-                handle: None
-            })
-            .is_err()
-        );
     }
 
     #[test]
     fn a_transaction_handle_round_trips_and_rejects_a_short_uuid() {
         let transaction = HiveTransactionHandle::new(true, [7_u8; 16]);
-        let encoded = transaction.to_transaction_handle_proto();
+        let encoded = transaction.to_proto();
         assert_eq!(
-            HiveTransactionHandle::from_transaction_handle_proto(&encoded).expect("decoded"),
+            HiveTransactionHandle::from_proto(&encoded).expect("decoded"),
             transaction
         );
         assert!(
@@ -1083,9 +1033,9 @@ pub(super) mod tests {
             ]
         );
 
-        let encoded = handle.to_table_handle_proto();
+        let encoded = handle.to_proto();
         assert_eq!(
-            IcebergTableHandle::from_table_handle_proto(&encoded).expect("decoded"),
+            IcebergTableHandle::from_proto(&encoded).expect("decoded"),
             handle
         );
         // A projection is not a narrowing of the file set, so it survives it.

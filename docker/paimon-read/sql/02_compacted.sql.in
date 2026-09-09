@@ -1,0 +1,54 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+USE {{CATALOG}}.{{DATABASE}};
+CALL {{CATALOG}}.sys.compact(table => '{{DATABASE}}.pk_default', compact_strategy => 'full');
+CALL {{CATALOG}}.sys.compact(table => '{{DATABASE}}.pk_sequence', compact_strategy => 'full');
+CALL {{CATALOG}}.sys.compact(table => '{{DATABASE}}.pk_composite', compact_strategy => 'full');
+CALL {{CATALOG}}.sys.compact(table => '{{DATABASE}}.pk_no_stats', compact_strategy => 'full');
+CALL {{CATALOG}}.sys.compact(table => '{{DATABASE}}.pk_date_decimal', compact_strategy => 'full');
+CALL {{CATALOG}}.sys.compact(table => '{{DATABASE}}.pk_all_deleted', compact_strategy => 'full');
+
+SELECT concat('NR_ORACLE|compacted|pk_default|', to_json(named_struct('id', id, 'metric', metric, 'note', note)))
+FROM pk_default ORDER BY id;
+SELECT concat('NR_ORACLE|compacted|pk_sequence|', to_json(named_struct('id', id, 'seq', seq, 'value', value)))
+FROM pk_sequence ORDER BY id;
+SELECT concat('NR_ORACLE|compacted|pk_composite|', to_json(named_struct('region', region, 'account_id', account_id, 'sub_id', sub_id, 'balance', balance, 'note', note)))
+FROM pk_composite ORDER BY region, account_id, sub_id;
+SELECT concat('NR_ORACLE|compacted|pk_no_stats|', to_json(named_struct('id', id, 'value', value)))
+FROM pk_no_stats ORDER BY id;
+SELECT concat('NR_ORACLE|compacted|pk_date_decimal|', to_json(named_struct('business_date', CAST(business_date AS STRING), 'amount', CAST(amount AS STRING), 'id', id, 'value', value)))
+FROM pk_date_decimal ORDER BY business_date, amount, id;
+SELECT concat('NR_ORACLE|compacted|pk_all_deleted|', to_json(named_struct('count', count(*))))
+FROM pk_all_deleted;
+
+SELECT concat('NR_SNAPSHOT|compacted|pk_default|', to_json(named_struct(
+  'snapshot_id', snapshot_id, 'schema_id', schema_id, 'commit_kind', commit_kind,
+  'total_record_count', total_record_count)))
+FROM `pk_default$snapshots` ORDER BY snapshot_id;
+SELECT concat('NR_FILE|compacted|pk_default|', to_json(named_struct(
+  'partition', CAST(partition AS STRING), 'bucket', bucket, 'file_path', file_path,
+  'file_format', file_format, 'schema_id', schema_id, 'level', level,
+  'record_count', record_count, 'file_size_in_bytes', file_size_in_bytes,
+  'min_sequence_number', min_sequence_number, 'max_sequence_number', max_sequence_number)))
+FROM `pk_default$files` ORDER BY file_path;
+SELECT concat('NR_FILE|compacted|pk_sequence|', to_json(named_struct(
+  'partition', CAST(partition AS STRING), 'bucket', bucket, 'file_path', file_path,
+  'file_format', file_format, 'schema_id', schema_id, 'level', level,
+  'record_count', record_count, 'file_size_in_bytes', file_size_in_bytes,
+  'min_sequence_number', min_sequence_number, 'max_sequence_number', max_sequence_number)))
+FROM `pk_sequence$files` ORDER BY file_path;

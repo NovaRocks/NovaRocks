@@ -58,19 +58,19 @@ use novarocks_execution::task_execution::{
     TaskStatusCursor, TransportBudget, UpdateQueryContext,
 };
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::task_execution::descriptor::WireFragmentPlan;
-use novarocks_proto_codec::task_execution::domain as codec_domain;
-use novarocks_proto_codec::task_execution::domain::{stored_credential, stored_message};
-use novarocks_proto_codec::task_execution::operation as codec;
-use novarocks_proto_codec::task_execution::operation::{
+use novarocks_proto_models::catalog::CatalogSet;
+use novarocks_proto_models::novarocks as proto;
+use novarocks_task_codec::descriptor::WireFragmentPlan;
+use novarocks_task_codec::domain as codec_domain;
+use novarocks_task_codec::domain::{stored_credential, stored_message};
+use novarocks_task_codec::operation as codec;
+use novarocks_task_codec::operation::{
     ReceiptHeader, StatusStreamEvent, decode_receipt_batch, decode_status_event,
     encode_abort_query_context, encode_advance_query_context_domain, encode_cancel_task,
     encode_create_task, encode_establish_query_context, encode_operation_batch,
     encode_release_query_context, encode_renew_lease, encode_subscribe_task_status,
     encode_update_task,
 };
-use novarocks_proto_models::catalog::CatalogSet;
-use novarocks_proto_models::novarocks as proto;
 use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::BackendProcessId;
 
@@ -151,7 +151,7 @@ fn encode_operation(
 /// neutral intent.
 #[derive(Clone, Debug)]
 pub(crate) struct AttemptWireFacts {
-    pub(crate) native_compatibility_id: Option<proto::NativeCompatibilityId>,
+    pub(crate) native_compatibility_id: novarocks_types::NativeCompatibilityId,
 }
 
 fn wire_fragment_plan(
@@ -202,7 +202,7 @@ fn encode_query_context_operation(
                     envelopes: credential.envelopes().to_vec(),
                 },
                 *query_options,
-                attempt.native_compatibility_id.clone(),
+                attempt.native_compatibility_id,
             ))
         }
         UpdateQueryContext::AdvanceDomain(advance) => {
@@ -1259,6 +1259,7 @@ const fn outcome_name(outcome: OperationOutcome) -> &'static str {
         OperationOutcome::OperationTimedOut => "operation_timed_out",
         OperationOutcome::RetryableObservationLoss => "retryable_observation_loss",
         OperationOutcome::IdentityMismatch => "identity_mismatch",
+        OperationOutcome::CompatibilityMismatch => "compatibility_mismatch",
         OperationOutcome::CreateConflict => "create_conflict",
         OperationOutcome::ContextNotEstablished => "context_not_established",
         OperationOutcome::ContextConflict => "context_conflict",
@@ -1491,15 +1492,15 @@ mod tests {
         LeaseValidFor, MonotonicInstant, RenewQueryExecutionLease, TaskStatus, TaskStatusVersion,
     };
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_codec::task_execution::domain::{WireContent, WireCredential};
-    use novarocks_proto_codec::task_execution::operation::{
+    use novarocks_proto_models::{catalog, filter};
+    use novarocks_task_codec::domain::{WireContent, WireCredential};
+    use novarocks_task_codec::operation::{
         ESTABLISH_CATALOG_DOMAIN_TAG, ESTABLISH_FILTER_DOMAIN_TAG,
         ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
     };
-    use novarocks_proto_codec::task_execution::operation::{
+    use novarocks_task_codec::operation::{
         decode_subscribe_task_status, encode_operation_outcome, encode_status_event,
     };
-    use novarocks_proto_models::{catalog, filter};
     use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, StageId, TaskId};
     use novarocks_types::{AttemptId, QueryId};
     use tokio_stream::wrappers::ReceiverStream;
@@ -1578,7 +1579,7 @@ mod tests {
     /// The attempt-level wire facts every test sink carries.
     fn test_attempt_facts() -> AttemptWireFacts {
         AttemptWireFacts {
-            native_compatibility_id: None,
+            native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         }
     }
 
@@ -2597,9 +2598,7 @@ mod tests {
             .expect_apply(ApplyAnswer::WithAck(vec![(
                 OperationOutcome::Accepted,
                 Some(proto::task_operation_receipt::Ack::CancelTask(
-                    novarocks_proto_codec::task_execution::status::encode_task_status(
-                        &TaskStatus::created(task),
-                    ),
+                    novarocks_task_codec::status::encode_task_status(&TaskStatus::created(task)),
                 )),
             )]));
 

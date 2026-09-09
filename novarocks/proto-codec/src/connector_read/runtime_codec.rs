@@ -33,6 +33,11 @@ use novarocks_spi::connector::read_stack::{
     Assignment, ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadSplit,
     ConnectorReadTransactionHandle, ConnectorReadWorkSource, TupleDomain,
 };
+use novarocks_spi::connector::{
+    ConnectorCodecError, ConnectorCodecErrorKind, ConnectorReadRelationPayload,
+    ConnectorReadSplitCategory, ConnectorReadSplitPayload, ConnectorReadWireDecoder,
+    ConnectorReadWireEncoder,
+};
 
 use super::{
     CatalogTableHandle, ConnectorTableScanSource, ScheduledSplit, ValidatedColumnHandle,
@@ -159,6 +164,152 @@ pub trait ConnectorReadEncoder: Send + Sync {
     }
 }
 
+impl<T> ConnectorReadEncoder for T
+where
+    T: ConnectorReadWireEncoder + ?Sized,
+{
+    fn owner(&self) -> &str {
+        ConnectorReadWireEncoder::owner(self)
+    }
+
+    fn encode_relation(
+        &self,
+        relation: &ConnectorReadRelation,
+    ) -> Result<dto::CatalogTableHandle, ConnectorReadCodecError> {
+        let payload = self
+            .encode_relation_payload(relation)
+            .map_err(|error| wire_error(self.owner(), error))?;
+        validate_encoded_relation(self.owner(), &payload)?;
+        let provider_payload = Some(crate::connector_common::encode_connector_payload_message(
+            payload.table(),
+        ));
+        let relation = match payload.kind() {
+            novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table => {
+                dto::catalog_table_handle::Relation::Table(dto::ConnectorTableHandle {
+                    provider_payload,
+                })
+            }
+            novarocks_spi::connector::read_stack::ConnectorReadRelationKind::TableFunction => {
+                dto::catalog_table_handle::Relation::TableFunction(
+                    dto::ConnectorTableFunctionHandle { provider_payload },
+                )
+            }
+            novarocks_spi::connector::read_stack::ConnectorReadRelationKind::ChangeWindow => {
+                dto::catalog_table_handle::Relation::ChangeWindow(
+                    dto::ConnectorChangeWindowHandle { provider_payload },
+                )
+            }
+            novarocks_spi::connector::read_stack::ConnectorReadRelationKind::SystemTable => {
+                dto::catalog_table_handle::Relation::SystemTable(
+                    dto::ConnectorSystemTableReference { provider_payload },
+                )
+            }
+            novarocks_spi::connector::read_stack::ConnectorReadRelationKind::TableExecute => {
+                dto::catalog_table_handle::Relation::TableExecute(
+                    dto::ConnectorTableExecuteHandle { provider_payload },
+                )
+            }
+            novarocks_spi::connector::read_stack::ConnectorReadRelationKind::MergeTable => {
+                dto::catalog_table_handle::Relation::MergeTable(dto::ConnectorMergeTableHandle {
+                    provider_payload,
+                })
+            }
+        };
+        Ok(dto::CatalogTableHandle {
+            catalog_handle: Some(crate::catalog::encode_catalog_handle(
+                payload.table().header().catalog(),
+            )),
+            transaction: Some(dto::ConnectorTransactionHandle {
+                provider_payload: Some(crate::connector_common::encode_connector_payload_message(
+                    payload.view(),
+                )),
+            }),
+            relation: Some(relation),
+        })
+    }
+
+    fn encode_column(
+        &self,
+        column: &ConnectorReadColumnHandle,
+    ) -> Result<dto::ColumnHandle, ConnectorReadCodecError> {
+        let payload = self
+            .encode_column_payload(column)
+            .map_err(|error| wire_error(self.owner(), error))?;
+        Ok(dto::ColumnHandle {
+            provider_payload: Some(crate::connector_common::encode_connector_payload_message(
+                &payload,
+            )),
+        })
+    }
+
+    fn encode_transaction(
+        &self,
+        transaction: &ConnectorReadTransactionHandle,
+    ) -> Result<dto::ConnectorTransactionHandle, ConnectorReadCodecError> {
+        let payload = self
+            .encode_transaction_payload(transaction)
+            .map_err(|error| wire_error(self.owner(), error))?;
+        Ok(dto::ConnectorTransactionHandle {
+            provider_payload: Some(crate::connector_common::encode_connector_payload_message(
+                &payload,
+            )),
+        })
+    }
+
+    fn encode_split(
+        &self,
+        split: &ConnectorReadSplit,
+    ) -> Result<dto::ConnectorSplit, ConnectorReadCodecError> {
+        let payload = self
+            .encode_split_payload(split)
+            .map_err(|error| wire_error(self.owner(), error))?;
+        let provider_payload = Some(crate::connector_common::encode_connector_payload_message(
+            payload.provider_payload(),
+        ));
+        let category = match payload.category() {
+            ConnectorReadSplitCategory::Data => {
+                dto::connector_split::Category::Data(dto::DataSplit { provider_payload })
+            }
+            ConnectorReadSplitCategory::TableChanges => {
+                dto::connector_split::Category::TableChanges(dto::TableChangesSplitCategory {
+                    provider_payload,
+                })
+            }
+            ConnectorReadSplitCategory::ChangeWindow => {
+                dto::connector_split::Category::ChangeWindow(dto::ChangeWindowSplitCategory {
+                    provider_payload,
+                })
+            }
+            ConnectorReadSplitCategory::SystemFiles => {
+                dto::connector_split::Category::SystemFiles(dto::SystemFilesSplitCategory {
+                    provider_payload,
+                })
+            }
+            ConnectorReadSplitCategory::RewritePositionDeleteFiles => {
+                dto::connector_split::Category::RewritePositionDeleteFiles(
+                    dto::RewritePositionDeleteFilesSplitCategory { provider_payload },
+                )
+            }
+        };
+        let facts = split.facts();
+        Ok(dto::ConnectorSplit {
+            split_weight_raw: facts.split_weight().raw_value(),
+            remotely_accessible: facts.remotely_accessible(),
+            addresses: facts
+                .addresses()
+                .iter()
+                .map(|address| dto::HostAddress {
+                    host: address.host().to_owned(),
+                    port: u32::from(address.port()),
+                })
+                .collect(),
+            affinity_key: facts.affinity_key().map(ToOwned::to_owned),
+            retained_size_in_bytes: facts.retained_size_in_bytes(),
+            category: Some(category),
+        })
+    }
+}
+
 /// Wire-to-BE half of the connector read codec contract.
 ///
 /// A decoder is the only directional interface allowed to construct opaque
@@ -255,6 +406,144 @@ pub trait ConnectorReadDecoder: Send + Sync {
     }
 }
 
+impl<T> ConnectorReadDecoder for T
+where
+    T: ConnectorReadWireDecoder + ?Sized,
+{
+    fn owner(&self) -> &str {
+        ConnectorReadWireDecoder::owner(self)
+    }
+
+    fn decode_relation(
+        &self,
+        relation: &CatalogTableHandle,
+    ) -> Result<ConnectorReadRelation, ConnectorReadCodecError> {
+        let kind = match relation.relation_kind() {
+            super::ConnectorRelationKind::Table => {
+                novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table
+            }
+            super::ConnectorRelationKind::TableFunction => {
+                novarocks_spi::connector::read_stack::ConnectorReadRelationKind::TableFunction
+            }
+            super::ConnectorRelationKind::ChangeWindow => {
+                novarocks_spi::connector::read_stack::ConnectorReadRelationKind::ChangeWindow
+            }
+            super::ConnectorRelationKind::SystemTable => {
+                novarocks_spi::connector::read_stack::ConnectorReadRelationKind::SystemTable
+            }
+            super::ConnectorRelationKind::TableExecute => {
+                novarocks_spi::connector::read_stack::ConnectorReadRelationKind::TableExecute
+            }
+            super::ConnectorRelationKind::MergeTable => {
+                novarocks_spi::connector::read_stack::ConnectorReadRelationKind::MergeTable
+            }
+        };
+        let payload = ConnectorReadRelationPayload::new(
+            kind,
+            relation.relation().provider_payload().clone(),
+            relation.transaction().provider_payload().clone(),
+        );
+        validate_decoded_relation(self.owner(), relation, &payload)?;
+        self.decode_relation_payload(&payload)
+            .map_err(|error| wire_error(self.owner(), error))
+    }
+
+    fn decode_column(
+        &self,
+        column: &ValidatedColumnHandle,
+    ) -> Result<ConnectorReadColumnHandle, ConnectorReadCodecError> {
+        self.decode_column_payload(column.provider_payload())
+            .map_err(|error| wire_error(self.owner(), error))
+    }
+
+    fn decode_transaction(
+        &self,
+        transaction: &ValidatedTransactionHandle,
+    ) -> Result<ConnectorReadTransactionHandle, ConnectorReadCodecError> {
+        self.decode_transaction_payload(transaction.provider_payload())
+            .map_err(|error| wire_error(self.owner(), error))
+    }
+
+    fn decode_split(
+        &self,
+        split: &ValidatedConnectorSplit,
+    ) -> Result<ConnectorReadSplit, ConnectorReadCodecError> {
+        let category = match split.category() {
+            super::SplitCategory::Data => ConnectorReadSplitCategory::Data,
+            super::SplitCategory::TableChanges => ConnectorReadSplitCategory::TableChanges,
+            super::SplitCategory::ChangeWindow => ConnectorReadSplitCategory::ChangeWindow,
+            super::SplitCategory::SystemFiles => ConnectorReadSplitCategory::SystemFiles,
+            super::SplitCategory::RewritePositionDeleteFiles => {
+                ConnectorReadSplitCategory::RewritePositionDeleteFiles
+            }
+        };
+        self.decode_split_payload(
+            &ConnectorReadSplitPayload::new(category, split.provider_payload().clone()),
+            split.facts(),
+        )
+        .map_err(|error| wire_error(self.owner(), error))
+    }
+}
+
+fn validate_encoded_relation(
+    owner: &str,
+    payload: &ConnectorReadRelationPayload,
+) -> Result<(), ConnectorReadCodecError> {
+    let table = payload.table().header();
+    let view = payload.view().header();
+    if table.category() != novarocks_spi::connector::ConnectorCodecCategory::ReadTable
+        || view.category() != novarocks_spi::connector::ConnectorCodecCategory::ReadView
+        || table.provider_id() != view.provider_id()
+        || table.catalog() != view.catalog()
+    {
+        return Err(ConnectorReadCodecError::invalid(
+            owner,
+            FieldPath::root("catalog_table_handle"),
+            "provider relation payloads disagree on category or binding",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_decoded_relation(
+    owner: &str,
+    relation: &CatalogTableHandle,
+    payload: &ConnectorReadRelationPayload,
+) -> Result<(), ConnectorReadCodecError> {
+    validate_encoded_relation(owner, payload)?;
+    if relation.catalog_handle() != payload.table().header().catalog() {
+        return Err(ConnectorReadCodecError::invalid(
+            owner,
+            FieldPath::root("catalog_table_handle").field("catalog_handle"),
+            "public catalog handle does not match provider relation payloads",
+        ));
+    }
+    Ok(())
+}
+
+fn wire_error(owner: &str, error: ConnectorCodecError) -> ConnectorReadCodecError {
+    let kind = match error.kind() {
+        ConnectorCodecErrorKind::MissingField => ProtocolErrorKind::MissingField,
+        ConnectorCodecErrorKind::InvalidEnum => ProtocolErrorKind::InvalidEnum,
+        ConnectorCodecErrorKind::InvalidValue | ConnectorCodecErrorKind::UnknownField => {
+            ProtocolErrorKind::InvalidValue
+        }
+        ConnectorCodecErrorKind::DuplicateField => ProtocolErrorKind::DuplicateField,
+        ConnectorCodecErrorKind::InconsistentFields => ProtocolErrorKind::InconsistentFields,
+        ConnectorCodecErrorKind::Unsupported => ProtocolErrorKind::Unsupported,
+        ConnectorCodecErrorKind::Capacity => ProtocolErrorKind::Capacity,
+        ConnectorCodecErrorKind::VersionMismatch => ProtocolErrorKind::VersionMismatch,
+    };
+    ConnectorReadCodecError::new(
+        owner,
+        ProtocolError::new(
+            FieldPath::root("provider_payload"),
+            kind,
+            format!("{}: {}", error.path(), error.detail()),
+        ),
+    )
+}
+
 /// Sequence facts carried beside a provider-private split after decoding.
 ///
 /// They are scheduling metadata only. The receiver retains no payload evidence
@@ -320,7 +609,7 @@ pub struct DecodedConnectorReadScan {
 
 impl DecodedConnectorReadScan {
     pub fn decode(
-        codec: &dyn ConnectorReadDecoder,
+        codec: &dyn ConnectorReadWireDecoder,
         source: &ConnectorTableScanSource,
     ) -> Result<Self, ConnectorReadCodecError> {
         let relation = codec.decode_relation(source.table())?;

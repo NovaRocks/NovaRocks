@@ -109,7 +109,9 @@ code-anchors:
 - ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
 - ADR-0129 — vended credential 为何必须在 metadata materialization 前按 attempt 收集（active）
 - ADR-0130 — Connector role binding 为何每个进程角色只发布一个 complete generation（active）
-- ADR-0132 — provider 为何拥有 role-binding factory、而 Server 只组装 role-local resource（active）
+- ADR-0139 — Server 为何以唯一封闭 manifest 定义 active provider 并拒绝退役配置（active）
+- ADR-0137 — 多 provider 的私有 Connector wire 为何归 provider 自有、Native 只承载 opaque envelope（active）
+- ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active）
 - ADR-0125 — Backend catalog runtime、Frontend effect owner 与 provider-private proof 为何使用三种不互换 identity（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
@@ -131,6 +133,7 @@ code-anchors:
 
 #### 历史
 
+- ADR-0132 — provider 为何拥有 role-binding factory、而 Server 只组装 role-local resource（superseded → ADR-0139）
 - ADR-0022 — Connector statistics capability 为何保持 FE-only、generation-fenced 且不进入 BE binding（superseded → ADR-0136）
 - ADR-0082 — 同一快照上的统计发布为何以覆盖度排序、且冲突重试必须重新判定（superseded → ADR-0136）
 
@@ -217,8 +220,8 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 领域哲学：生产运行时只由 native FE/BE 角色组成。FE 拥有 SQL admission 和
 全局协调，BE 拥有本地执行；all-in-one 仅为测试便利且不得改变这条边界。
 外部系统经 Connector 接入，不以 inbound 兼容 server、daemon 或全局 bridge
-混入 native lifecycle。StarRocks 仅是只读 Connector：RPC 覆盖所有拓扑，direct
-永久只支持 shared-data。
+混入 native lifecycle。当前 Server 的封闭 provider 集合是 Iceberg 与 Paimon；
+StarRocks 已废弃且没有 active read capability。
 
 
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
@@ -308,7 +311,7 @@ StateStore 的全局单值限制保持公共契约，record owner 负责自己�
 领域哲学：frontend 拥有 DML 的 statement application flow 与 production routing；每个 publication attempt 仅存活于
 当前 request stack，StateStore 不再保存 DML operation、recovery 或 coordination authority。core 只通过一对一 typed
 engine port 保留 query、connector 和 external commit truth。native persistent INSERT 当前只支持
-Iceberg；StarRocks 只作为 read-only external connector，不能恢复内部 StarRocks 表或 server runtime。每次写入必须复用 admission 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque
+Iceberg；Paimon 仅支持已声明的只读快照，StarRocks 已废弃且不能恢复内部表或 server runtime。每次写入必须复用 admission 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque
 handles，不以 service locator、core callback、metadata fallback 或公共 SPI 模糊 owner。
 
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
@@ -377,6 +380,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
 - ADR-0134 — 概率结构为何精确依赖 registry DataSketches 预发布包、由上游唯一拥有标准格式与集合运算（active）
+- ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）

@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_spi::connector::ConnectorReadWireEncoder;
 use novarocks_spi::connector::read_stack::ConnectorReadColumnHandle;
 use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
@@ -54,7 +54,7 @@ pub(crate) const DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::f
 pub(crate) struct RoundSplitSource {
     pub(crate) plan_node_id: i32,
     pub(crate) source: Box<dyn ConnectorReadSplitSource>,
-    pub(crate) encoder: Arc<dyn ConnectorReadEncoder>,
+    pub(crate) encoder: Arc<dyn ConnectorReadWireEncoder>,
     /// FE admission state is query-attempt local and shared only with this
     /// attempt's control readers.  The source observes it afresh for every
     /// batch; already emitted splits are never revisited.
@@ -320,44 +320,48 @@ mod tests {
 
     struct InertCodec;
 
-    impl ConnectorReadEncoder for InertCodec {
+    impl ConnectorReadWireEncoder for InertCodec {
         fn owner(&self) -> &str {
             "round-close-test"
         }
 
-        fn encode_relation(
+        fn encode_relation_payload(
             &self,
             _relation: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
         ) -> Result<
-            novarocks_proto_models::connector_read::CatalogTableHandle,
-            ConnectorReadCodecError,
+            novarocks_spi::connector::ConnectorReadRelationPayload,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
             unreachable!("close lifecycle tests must not encode relations")
         }
 
-        fn encode_column(
+        fn encode_column_payload(
             &self,
             _column: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-        ) -> Result<novarocks_proto_models::connector_read::ColumnHandle, ConnectorReadCodecError>
-        {
+        ) -> Result<
+            novarocks_spi::connector::ConnectorEncodedPayload,
+            novarocks_spi::connector::ConnectorCodecError,
+        > {
             unreachable!("close lifecycle tests must not encode columns")
         }
 
-        fn encode_transaction(
+        fn encode_transaction_payload(
             &self,
             _transaction: &novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
         ) -> Result<
-            novarocks_proto_models::connector_read::ConnectorTransactionHandle,
-            ConnectorReadCodecError,
+            novarocks_spi::connector::ConnectorEncodedPayload,
+            novarocks_spi::connector::ConnectorCodecError,
         > {
             unreachable!("close lifecycle tests must not encode transactions")
         }
 
-        fn encode_split(
+        fn encode_split_payload(
             &self,
             _split: &ConnectorReadSplit,
-        ) -> Result<novarocks_proto_models::connector_read::ConnectorSplit, ConnectorReadCodecError>
-        {
+        ) -> Result<
+            novarocks_spi::connector::ConnectorReadSplitPayload,
+            novarocks_spi::connector::ConnectorCodecError,
+        > {
             unreachable!("close lifecycle tests must not encode splits")
         }
     }

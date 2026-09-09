@@ -18,10 +18,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
 
-use novarocks_connector_binding::{
-    ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
-    ConnectorControlWriteBinding,
-};
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver, ConnectorControlBinding,
@@ -31,6 +27,10 @@ use novarocks_spi::connector::{
     ConnectorErrorKind, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
     ConnectorMetadataMaintenanceResolver, ConnectorProviderBindingKey, ConnectorProviderId,
     ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorWriteLease,
+};
+use novarocks_spi::connector::{
+    ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
+    ConnectorControlWriteBinding,
 };
 
 /// FE process owner of logical Connector control generations. It contains no
@@ -141,12 +141,7 @@ impl ConnectorControlHost {
     ) -> Result<Self, ConnectorError> {
         let mut factory_map = BTreeMap::new();
         for factory in factories {
-            let provider_id = ConnectorProviderId::parse(factory.provider_kind().provider_id())
-                .map_err(|error| {
-                    invalid(format!(
-                        "invalid connector role factory provider id: {error}"
-                    ))
-                })?;
+            let provider_id = factory.provider_id();
             if factory_map.insert(provider_id.clone(), factory).is_some() {
                 return Err(invalid(format!(
                     "duplicate connector control role factory for provider `{}`",
@@ -1211,14 +1206,14 @@ impl ConnectorWriteStackLease {
     /// Encodes a logical recipe for submission. It cannot decode one back.
     pub fn handle_encoder(
         &self,
-    ) -> Arc<dyn novarocks_proto_codec::connector_write::ConnectorWriteHandleEncoder> {
+    ) -> Arc<dyn novarocks_spi::connector::ConnectorWriteHandleWireEncoder> {
         self.group.handle_encoder()
     }
 
     /// Decodes a staged artifact the backends reported. It cannot forge one.
     pub fn fragment_decoder(
         &self,
-    ) -> Arc<dyn novarocks_proto_codec::connector_write::ConnectorWriteFragmentDecoder> {
+    ) -> Arc<dyn novarocks_spi::connector::ConnectorWriteFragmentWireDecoder> {
         self.group.fragment_decoder()
     }
 }

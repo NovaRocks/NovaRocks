@@ -263,7 +263,7 @@ impl AddFilesEngine for DmlExecutionKernel {
             &request.current_database,
         )
         .map_err(plan_string_failure)?;
-        if target.backend_name != "iceberg" {
+        if target.provider_id.as_str() != "iceberg" {
             return Err(plan_string_failure(format!(
                 "ADD FILES only supports iceberg tables: {}.{}",
                 target.namespace, target.table

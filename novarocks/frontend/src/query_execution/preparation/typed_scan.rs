@@ -31,8 +31,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_connector_binding::ConnectorControlReadBinding;
-use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
+use novarocks_spi::connector::ConnectorControlReadBinding;
 use novarocks_spi::connector::ConnectorPinnedFileSet;
 use novarocks_spi::connector::read_stack::{
     Assignment, ConnectorReadChangeWindow, ConnectorReadColumnBinding, ConnectorReadConstraint,
@@ -130,7 +129,7 @@ pub(crate) struct PreparedTypedScan {
     pub(crate) split_manager: Arc<dyn ConnectorReadSplitManager>,
     /// The only conversion authority for this exact binding.  It is retained
     /// solely for fragment and TaskUpdate egress; planning never calls it.
-    pub(crate) encoder: Arc<dyn ConnectorReadEncoder>,
+    pub(crate) encoder: Arc<dyn novarocks_spi::connector::ConnectorReadWireEncoder>,
     /// The constraint that was offered to the connector, kept so the round
     /// driver enumerates splits under exactly what planning pushed down.
     pub(crate) constraint: ConnectorReadConstraint,

@@ -38,6 +38,7 @@ use novarocks_cluster_harness::{
     NativeTrustFixture, NativeTrustFixtureMode, QueryLifecycleStructuredSnapshot, ServerHandle,
 };
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
+use novarocks_proto_models::novarocks as proto;
 use novarocks_secret::SecretValue;
 use novarocks_types::NativeEndpoint;
 use prost::Message;
@@ -50,6 +51,8 @@ const GRPC_UNAUTHENTICATED: u16 = 16;
 const GRPC_UNIMPLEMENTED: u16 = 12;
 const UNKNOWN_NATIVE_PATH: &str = "/novarocks.NovaRocksGrpc/Nwt3Unknown";
 const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
+const APPLY_TASK_OPERATIONS_PATH: &str = "/novarocks.NovaRocksGrpc/ApplyTaskOperations";
+const DIRECT_INGRESS_SECRET_SENTINEL: &str = "NOVAROCKS_DIRECT_INGRESS_SECRET_SENTINEL";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -386,19 +389,7 @@ impl Scenario for VendedCredentialTlsGate {
             context.handle().native_trust_mode() == self.fixture.mode(),
             "vended TLS gate launched a different Native transport profile"
         );
-        // # The retired direct-ingress probe
-        //
-        // This step used to dial `InitQuery` on BE[0] with a confidential
-        // `CredentialLeaseSecretEnvelope` and require h2c to refuse it while
-        // TLS carried it into later validation. `InitQuery` is gone, and the
-        // envelope's successor carrier is the task protocol's
-        // `QueryContextCredentialDomain` on establish -- but the transport gate
-        // for it, `refuse_confidential_material_in_the_clear`
-        // (`novarocks/proto-codec/src/task_execution/domain.rs`), has no
-        // production caller, so no backend ingress refuses confidential
-        // material in the clear today and a probe would observe nothing.
-        // Restoring this step needs that gate wired into the apply ingress
-        // first; asserting it now would assert a refusal no code produces.
+        assert_confidential_task_ingress(context, self.fixture.mode())?;
 
         let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
         let mut connection = mysql_actor::connect(
@@ -417,7 +408,11 @@ impl Scenario for VendedCredentialTlsGate {
         match self.fixture.mode() {
             NativeTrustFixtureMode::Plaintext => {
                 let init_counts = (0..REQUIRED_BACKENDS)
-                    .map(|index| context.handle().be_log_count(index, "NOVAROCKS_QUERY_INIT"))
+                    .map(|index| {
+                        context
+                            .handle()
+                            .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let error = connection
                     .query::<i64, _>(&query)
@@ -433,12 +428,12 @@ impl Scenario for VendedCredentialTlsGate {
                     ensure!(
                         context
                             .handle()
-                            .be_log_count(index, "NOVAROCKS_QUERY_INIT")?
+                            .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)?
                             == before,
-                        "plaintext vended catalog query reached BE[{index}] Init ingress after FE rejection"
+                        "plaintext vended catalog query established a context on BE[{index}] after FE rejection"
                     );
                 }
-                context.action("proved h2c rejects the real vended definition at FE admission before any BE Init");
+                context.action("proved h2c rejects the real vended definition at FE admission before any BE context establish");
             }
             NativeTrustFixtureMode::Automatic | NativeTrustFixtureMode::Pem => {
                 let rows: Vec<i64> = connection
@@ -545,6 +540,98 @@ fn assert_authentication_order(
     Ok(())
 }
 
+/// Sends confidential task-domain bytes directly to one real BE listener.
+///
+/// The request deliberately omits its operation envelope. On TLS this lets us
+/// observe that the confidentiality gate admitted the bytes and the ordinary
+/// structural decoder rejected them later. On h2c the earlier confidentiality
+/// rejection must win, and neither response may reveal the embedded sentinel.
+fn assert_confidential_task_ingress(
+    context: &mut ScenarioContext,
+    mode: NativeTrustFixtureMode,
+) -> Result<()> {
+    let request = proto::ApplyTaskOperationsRequest {
+        operations: vec![proto::TaskOperation {
+            envelope: None,
+            operation: Some(proto::task_operation::Operation::UpdateQueryContext(
+                proto::UpdateQueryContextRequest {
+                    command: Some(proto::update_query_context_request::Command::Establish(
+                        proto::EstablishQueryContextRequest {
+                            initial_credential: Some(proto::QueryContextCredentialDomain {
+                                lease_id: 1,
+                                epoch: 1,
+                                descriptors: Vec::new(),
+                                envelopes: vec![proto::CredentialLeaseSecretEnvelope {
+                                    lease_id: vec![1; 16],
+                                    epoch: 1,
+                                    s3: Some(proto::CredentialLeaseS3SecretMaterial {
+                                        access_key_id: "direct-ingress-access-key".to_owned(),
+                                        secret_access_key: DIRECT_INGRESS_SECRET_SENTINEL
+                                            .to_owned(),
+                                        session_token: "direct-ingress-session-token".to_owned(),
+                                        session_token_expires_at_unix_ms: 1,
+                                    }),
+                                }],
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        }],
+    };
+    let mut payload = Vec::new();
+    request
+        .encode(&mut payload)
+        .context("encode direct confidential task-ingress probe")?;
+    let mut frame = Vec::with_capacity(payload.len() + 5);
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+
+    let endpoint = context.handle().native_be_endpoint(0)?;
+    let connector = context.handle().native_probe_connector(endpoint, mode)?;
+    let authorization = authorization_header(&context.handle().native_probe_trust()?)?;
+    let response = raw_grpc_probe(
+        connector,
+        APPLY_TASK_OPERATIONS_PATH,
+        Some(&authorization),
+        Some(&frame),
+    )?;
+    ensure!(
+        response.grpc_status == Some(tonic::Code::InvalidArgument as u16),
+        "direct confidential task ingress returned unexpected status: {response:?}"
+    );
+    let diagnostic = response.grpc_message.as_deref().unwrap_or_default();
+    ensure!(
+        !diagnostic.contains(DIRECT_INGRESS_SECRET_SENTINEL),
+        "direct task-ingress rejection leaked confidential material"
+    );
+    match mode {
+        NativeTrustFixtureMode::Plaintext => {
+            ensure!(
+                diagnostic.contains("credential") && diagnostic.contains("confidential"),
+                "h2c did not reject confidential bytes at raw task ingress: {response:?}"
+            );
+            context.action(
+                "proved raw BE ApplyTaskOperations rejects confidential credential bytes on authenticated h2c before domain decode",
+            );
+        }
+        NativeTrustFixtureMode::Automatic | NativeTrustFixtureMode::Pem => {
+            ensure!(
+                diagnostic.contains("envelope")
+                    && !diagnostic.contains("confidential native transport"),
+                "Native TLS did not admit confidential bytes through the transport gate into structural decode: {response:?}"
+            );
+            context.action(format!(
+                "proved raw BE ApplyTaskOperations admits confidential credential bytes through {:?} Native TLS before later structural validation",
+                mode
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Confirms one acceptance query really crossed the trust boundary and
 /// finished there.
 ///
@@ -583,6 +670,7 @@ fn assert_query_crossed_trust_boundary(
 struct GrpcProbe {
     http_status: u16,
     grpc_status: Option<u16>,
+    grpc_message: Option<String>,
 }
 
 fn authorization_header(trust: &NativeTrust) -> Result<String> {
@@ -658,6 +746,7 @@ fn raw_grpc_probe(
                 .context("receive Native raw probe response")?;
             let http_status = response.status().as_u16();
             let header_status = grpc_status(response.headers());
+            let header_message = grpc_message(response.headers());
             let mut body = response.into_body();
             while body
                 .data()
@@ -669,9 +758,11 @@ fn raw_grpc_probe(
             let trailer_status = body
                 .trailers()
                 .await
-                .context("read Native raw probe trailers")?
-                .as_ref()
-                .and_then(grpc_status);
+                .context("read Native raw probe trailers")?;
+            let grpc_status =
+                header_status.or_else(|| trailer_status.as_ref().and_then(grpc_status));
+            let grpc_message =
+                header_message.or_else(|| trailer_status.as_ref().and_then(grpc_message));
             // Native listeners are long-lived. The probe has received the
             // complete response, so waiting for the peer to close would turn
             // a successful keep-alive into a scenario timeout.
@@ -679,7 +770,8 @@ fn raw_grpc_probe(
             let _ = driver.await;
             Ok(GrpcProbe {
                 http_status,
-                grpc_status: header_status.or(trailer_status),
+                grpc_status,
+                grpc_message,
             })
         })
 }
@@ -689,6 +781,13 @@ fn grpc_status(headers: &http::HeaderMap) -> Option<u16> {
         .get("grpc-status")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok())
+}
+
+fn grpc_message(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get("grpc-message")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]

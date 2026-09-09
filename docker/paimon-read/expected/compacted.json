@@ -1,0 +1,17 @@
+[
+  {"table":"pk_default","value":{"id":1,"metric":21,"note":"new-a"}},
+  {"table":"pk_default","value":{"id":2,"metric":22,"note":"new-b"}},
+  {"table":"pk_default","value":{"id":4,"metric":40,"note":"new-d"}},
+  {"table":"pk_sequence","value":{"id":1,"seq":11,"value":"seq-11"}},
+  {"table":"pk_sequence","value":{"id":3,"seq":1,"value":"seq-1"}},
+  {"table":"pk_sequence","value":{"id":4,"seq":7,"value":"equal-second"}},
+  {"table":"pk_composite","value":{"region":"east","account_id":1,"sub_id":1,"balance":99.75,"note":"e-1-1-new"}},
+  {"table":"pk_composite","value":{"region":"west","account_id":2,"sub_id":1,"balance":20.5,"note":"w-2-1"}},
+  {"table":"pk_composite","value":{"region":"west","account_id":2,"sub_id":2,"balance":22.25,"note":"w-2-2"}},
+  {"table":"pk_no_stats","value":{"id":1,"value":"legacy-a-new"}},
+  {"table":"pk_no_stats","value":{"id":3,"value":"legacy-c"}},
+  {"table":"pk_date_decimal","value":{"business_date":"2024-02-29","amount":"10.25","id":1,"value":"leap-new"}},
+  {"table":"pk_date_decimal","value":{"business_date":"2024-03-01","amount":"-20.50","id":2,"value":"march"}},
+  {"table":"pk_date_decimal","value":{"business_date":"2024-03-02","amount":"30.75","id":3,"value":"weekend"}},
+  {"table":"pk_all_deleted","value":{"count":0}}
+]

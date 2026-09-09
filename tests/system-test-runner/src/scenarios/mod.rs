@@ -8,6 +8,7 @@ mod frontend_lifecycle;
 mod mv_recovery;
 mod native_compatibility;
 mod native_trust;
+mod paimon;
 mod query_lifecycle;
 mod runtime_filter;
 mod state_family;
@@ -27,6 +28,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(catalog_state::scenarios());
     scenarios.extend(mv_recovery::scenarios());
     scenarios.extend(native_trust::scenarios());
+    scenarios.extend(paimon::scenarios());
     scenarios.extend(native_compatibility::scenarios());
     scenarios.extend(state_family::scenarios());
     scenarios.extend(table_maintenance::scenarios());

@@ -36,12 +36,12 @@ use novarocks_execution::task_execution::{
     FinalTaskInfo, MaxWait, OperationOutcome, TaskIdentity, TaskOperationId,
 };
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::task_execution::operation::{
+use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+use novarocks_task_codec::operation::{
     decode_operation_outcome, encode_fetch_dynamic_filters, encode_fetch_task_result,
     encode_get_final_task_info,
 };
-use novarocks_proto_codec::task_execution::status::decode_final_task_info;
-use novarocks_proto_models::novarocks::fetch_result_response::Status as FetchStatus;
+use novarocks_task_codec::status::decode_final_task_info;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::BackendProcessId;
 
@@ -564,7 +564,7 @@ impl TaskResultTransport for NativeTaskResultTransport {
             .identity
             .as_ref()
             .map(|answered| {
-                novarocks_proto_codec::task_execution::identity::decode_task_identity(
+                novarocks_task_codec::identity::decode_task_identity(
                     answered,
                     FieldPath::root("fetch_task_dynamic_filters").field("identity"),
                 )

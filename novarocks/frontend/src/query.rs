@@ -1122,16 +1122,12 @@ impl FrontendQuerySession {
         let add_files_engine = Arc::clone(&self.service.add_files_engine);
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
-        let query_options = with_allow_throw_exception(
+        let query_options = with_query_hints(
             state.execution_settings.query_options(),
             match &parsed_statement {
-                ParsedStatement::Query(query) => {
-                    novarocks_sql::admission::query_allows_throw_exception_hint(query)
-                }
-                ParsedStatement::ExplainQuery(explain) => {
-                    novarocks_sql::admission::query_allows_throw_exception_hint(&explain.query)
-                }
-                _ => false,
+                ParsedStatement::Query(query) => Some(query),
+                ParsedStatement::ExplainQuery(explain) => Some(&explain.query),
+                _ => None,
             },
         );
         let mut worker = task::spawn_blocking(move || {
@@ -1455,10 +1451,19 @@ fn substitute_session_user_variables(
     Ok(Substituter { values }.fold_statement(statement))
 }
 
-fn with_allow_throw_exception(query_options: QueryOptions, enabled: bool) -> QueryOptions {
+fn with_query_hints(
+    query_options: QueryOptions,
+    query: Option<&novarocks_parser::ast::Query>,
+) -> QueryOptions {
     let mut raw = *query_options.as_proto();
-    raw.allow_throw_exception = enabled;
-    QueryOptions::parse(raw).expect("allow_throw_exception does not invalidate query options")
+    if let Some(query) = query {
+        raw.allow_throw_exception =
+            novarocks_sql::admission::query_allows_throw_exception_hint(query);
+        if let Some(limit) = novarocks_sql::admission::query_mem_limit_hint(query) {
+            raw.query_mem_limit = limit;
+        }
+    }
+    QueryOptions::parse(raw).expect("typed query hints do not invalidate query options")
 }
 
 fn execute_prepared_query(

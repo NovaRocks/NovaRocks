@@ -1,0 +1,552 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! WriteBuilder for table write API.
+//!
+//! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
+
+use super::format_write_builder::FormatWriteBuilder;
+use crate::table::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
+use uuid::Uuid;
+
+/// Builder for creating table writers and committers.
+///
+/// Provides `new_write` and `new_commit` methods, with optional
+/// `overwrite` support for partition-level overwrites.
+pub struct WriteBuilder<'a>(WriteBuilderKind<'a>);
+
+enum WriteBuilderKind<'a> {
+    Paimon(PaimonWriteBuilder<'a>),
+    Format(FormatWriteBuilder<'a>),
+}
+
+impl<'a> WriteBuilder<'a> {
+    pub fn new(table: &'a Table) -> Self {
+        if table.is_format_table() {
+            Self(WriteBuilderKind::Format(FormatWriteBuilder::new(table)))
+        } else {
+            Self(WriteBuilderKind::Paimon(PaimonWriteBuilder::new(table)))
+        }
+    }
+
+    /// Get the commit user shared by writers and committers created by this builder.
+    pub fn commit_user(&self) -> &str {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.commit_user(),
+            WriteBuilderKind::Format(builder) => builder.commit_user(),
+        }
+    }
+
+    /// Set the commit user shared by writers and committers created by this builder.
+    pub fn with_commit_user(self, commit_user: impl Into<String>) -> crate::Result<Self> {
+        match self.0 {
+            WriteBuilderKind::Paimon(builder) => Ok(Self(WriteBuilderKind::Paimon(
+                builder.with_commit_user(commit_user)?,
+            ))),
+            WriteBuilderKind::Format(builder) => Ok(Self(WriteBuilderKind::Format(
+                builder.with_commit_user(commit_user)?,
+            ))),
+        }
+    }
+
+    /// Mark writers created by this builder as overwrite-aware.
+    pub fn with_overwrite(self) -> Self {
+        match self.0 {
+            WriteBuilderKind::Paimon(builder) => {
+                Self(WriteBuilderKind::Paimon(builder.with_overwrite()))
+            }
+            WriteBuilderKind::Format(builder) => {
+                Self(WriteBuilderKind::Format(builder.with_overwrite()))
+            }
+        }
+    }
+
+    /// Create a new TableCommit for committing write results.
+    pub fn new_commit(&self) -> TableCommit {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.new_commit(),
+            WriteBuilderKind::Format(builder) => builder.new_commit(),
+        }
+    }
+
+    /// Try to create a new TableCommit for committing write results.
+    pub fn try_new_commit(&self) -> crate::Result<TableCommit> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.try_new_commit(),
+            WriteBuilderKind::Format(builder) => builder.try_new_commit(),
+        }
+    }
+
+    /// Create a new TableWrite for writing Arrow data.
+    pub fn new_write(&self) -> crate::Result<TableWrite> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.new_write(),
+            WriteBuilderKind::Format(builder) => builder.new_write(),
+        }
+    }
+
+    /// Create a new TableUpdate for data-evolution row-id updates.
+    pub fn new_update(&self, update_columns: Vec<String>) -> crate::Result<TableUpdate> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.new_update(update_columns),
+            WriteBuilderKind::Format(builder) => builder.new_update(update_columns),
+        }
+    }
+
+    /// Create a new writer for data-evolution row-id deletes.
+    pub fn new_delete(&self) -> crate::Result<DataEvolutionDeleteWriter> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.new_delete(),
+            WriteBuilderKind::Format(builder) => builder.new_delete(),
+        }
+    }
+}
+
+struct PaimonWriteBuilder<'a> {
+    table: &'a Table,
+    commit_user: String,
+    overwrite: bool,
+}
+
+impl<'a> PaimonWriteBuilder<'a> {
+    pub fn new(table: &'a Table) -> Self {
+        Self {
+            table,
+            commit_user: Uuid::new_v4().to_string(),
+            overwrite: false,
+        }
+    }
+
+    /// Get the commit user shared by writers and committers created by this builder.
+    ///
+    /// This value is persisted in snapshot metadata and used for duplicate
+    /// commit detection.
+    pub fn commit_user(&self) -> &str {
+        &self.commit_user
+    }
+
+    /// Set the commit user shared by writers and committers created by this builder.
+    ///
+    /// This value is persisted in snapshot metadata, used for duplicate commit
+    /// detection, and embedded in postpone-bucket data file name prefixes. It
+    /// should identify a unique commit attempt or job instance, and must be a
+    /// safe file name segment.
+    pub fn with_commit_user(mut self, commit_user: impl Into<String>) -> crate::Result<Self> {
+        let commit_user = commit_user.into();
+        validate_commit_user(&commit_user)?;
+        self.commit_user = commit_user;
+        Ok(self)
+    }
+
+    /// Mark writers created by this builder as overwrite-aware.
+    ///
+    /// The commit kind remains explicit at the commit call site.
+    pub fn with_overwrite(mut self) -> Self {
+        self.overwrite = true;
+        self
+    }
+
+    /// Create a new TableCommit for committing write results.
+    pub fn new_commit(&self) -> TableCommit {
+        TableCommit::new(self.table.clone(), self.commit_user.clone())
+    }
+
+    /// Try to create a new TableCommit for committing write results.
+    pub fn try_new_commit(&self) -> crate::Result<TableCommit> {
+        self.ensure_main_branch_write()?;
+        Ok(TableCommit::new(
+            self.table.clone(),
+            self.commit_user.clone(),
+        ))
+    }
+
+    /// Create a new TableWrite for writing Arrow data.
+    ///
+    /// For primary-key tables, sequence numbers are lazily scanned per partition
+    /// when the first writer for that partition is created.
+    pub fn new_write(&self) -> crate::Result<TableWrite> {
+        self.ensure_main_branch_write()?;
+        // A table with a time-travel selector reads a pinned snapshot (and may
+        // carry that snapshot's historical schema), so writing through the
+        // same copy would be inconsistent with what its reads observe — even
+        // when the pinned snapshot happens to share the current schema id.
+        // Java avoids this structurally (write paths use copyWithoutTimeTravel);
+        // here the same table copy can serve both reads and writes, so reject
+        // explicitly. Conflicting selectors (`Err`) cannot be valid for writes
+        // either. Commit-only flows (new_commit) stay untouched.
+        let selector =
+            crate::spec::CoreOptions::new(self.table.schema().options()).try_time_travel_selector();
+        if !matches!(selector, Ok(None)) {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "Cannot write to a table with a time-travel option set \
+                          (scan.version / scan.timestamp-millis / scan.snapshot-id / scan.tag-name)"
+                        .to_string(),
+            });
+        }
+        let write = TableWrite::new(self.table, self.commit_user.clone())?;
+        Ok(if self.overwrite {
+            write.with_overwrite()
+        } else {
+            write
+        })
+    }
+
+    /// Create a new TableUpdate for data-evolution row-id updates.
+    pub fn new_update(&self, update_columns: Vec<String>) -> crate::Result<TableUpdate> {
+        self.ensure_main_branch_write()?;
+        TableUpdate::new(self.table, update_columns)
+    }
+
+    /// Create a new writer for data-evolution row-id deletes.
+    pub fn new_delete(&self) -> crate::Result<DataEvolutionDeleteWriter> {
+        self.ensure_main_branch_write()?;
+        DataEvolutionDeleteWriter::new(self.table)
+    }
+
+    fn ensure_main_branch_write(&self) -> crate::Result<()> {
+        self.table.ensure_not_branch_reference_for_write()
+    }
+}
+
+pub(super) fn validate_commit_user(commit_user: &str) -> crate::Result<()> {
+    let is_invalid = commit_user.is_empty()
+        || commit_user == "."
+        || commit_user == ".."
+        || commit_user.trim() != commit_user
+        || commit_user
+            .chars()
+            .any(|c| matches!(c, '/' | '\\') || c.is_control());
+
+    if is_invalid {
+        return Err(crate::Error::ConfigInvalid {
+            message: "commit_user must be a safe file name segment".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Identifier;
+    use crate::io::{FileIO, FileIOBuilder};
+    use crate::spec::{
+        CommitKind, DataType, IntType, Schema, TableSchema, VarCharType, POSTPONE_BUCKET,
+    };
+    use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    fn test_file_io() -> FileIO {
+        FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    async fn setup_dirs(file_io: &FileIO, table_path: &str) {
+        file_io
+            .mkdirs(&format!("{table_path}/snapshot/"))
+            .await
+            .unwrap();
+        file_io
+            .mkdirs(&format!("{table_path}/manifest/"))
+            .await
+            .unwrap();
+    }
+
+    fn make_batch(ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn test_postpone_pk_table(file_io: &FileIO, table_path: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "-2")
+            .build()
+            .unwrap();
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_postpone_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    fn as_main_branch_reference(table: Table) -> Table {
+        Table {
+            branch_reference: true,
+            ..table
+        }
+    }
+
+    fn input_changelog_pk_table(file_io: &FileIO, table_path: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("changelog-producer", "input")
+            .build()
+            .unwrap();
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_input_changelog"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    fn test_data_evolution_table(file_io: &FileIO, table_path: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "name",
+                DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+            )
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_data_evolution_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    fn make_empty_matched_batch() -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("_ROW_ID", ArrowDataType::Int64, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+                Arc::new(StringArray::from(Vec::<&str>::new())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_with_commit_user_rejects_invalid_file_name_segments() {
+        let table = test_postpone_pk_table(&test_file_io(), "memory:/test_invalid_commit_user");
+        for invalid_commit_user in [
+            "",
+            ".",
+            "..",
+            "job/1",
+            "job\\1",
+            " job",
+            "job ",
+            "job\n1",
+            "job\u{7f}",
+        ] {
+            let err = match table
+                .new_write_builder()
+                .with_commit_user(invalid_commit_user)
+            {
+                Ok(_) => panic!("Expected commit_user {invalid_commit_user:?} to be rejected"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message }
+                    if message.contains("commit_user") && message.contains("file name segment")),
+                "Expected ConfigInvalid for commit_user {invalid_commit_user:?}, got: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_commit_user_is_shared_by_write_and_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_write_builder_commit_user";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let wb = table
+            .new_write_builder()
+            .with_commit_user("my-commit-user")
+            .unwrap();
+        assert_eq!(wb.commit_user(), "my-commit-user");
+
+        let mut write = wb.new_write().unwrap();
+        write
+            .write_arrow_batch(&make_batch(vec![3, 1, 2], vec![30, 10, 20]))
+            .await
+            .unwrap();
+
+        let messages = write.prepare_commit().await.unwrap();
+        assert_eq!(messages[0].bucket, POSTPONE_BUCKET);
+        assert!(
+            messages[0].new_files[0]
+                .file_name
+                .starts_with("data-u-my-commit-user-s-"),
+            "Expected custom commit user in file name, got: {}",
+            messages[0].new_files[0].file_name
+        );
+
+        wb.new_commit().commit(messages).await.unwrap();
+
+        let snapshot_manager =
+            crate::table::SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.commit_user(), "my-commit-user");
+    }
+
+    #[tokio::test]
+    async fn test_branch_reference_rejects_write_and_index_builders() {
+        let table = as_main_branch_reference(test_postpone_pk_table(
+            &test_file_io(),
+            "memory:/test_branch_reference_writes",
+        ));
+
+        let write_err = table.new_write_builder().try_new_commit().err().unwrap();
+        assert!(
+            matches!(write_err, crate::Error::Unsupported { ref message }
+                if message == "Writing to Paimon branch 'main' is not supported"),
+            "Expected branch write rejection, got: {write_err:?}"
+        );
+
+        let commit_err = table
+            .new_write_builder()
+            .new_commit()
+            .commit(Vec::new())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(commit_err, crate::Error::Unsupported { ref message }
+                if message == "Writing to Paimon branch 'main' is not supported"),
+            "Expected branch commit rejection, got: {commit_err:?}"
+        );
+
+        let index_err = table
+            .new_btree_global_index_build_builder()
+            .with_index_column("value")
+            .execute()
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(index_err, crate::Error::Unsupported { ref message }
+                if message == "Writing to Paimon branch 'main' is not supported"),
+            "Expected branch index-build rejection, got: {index_err:?}"
+        );
+
+        let index_drop_err = table
+            .new_global_index_drop_builder()
+            .with_index_column("value")
+            .execute()
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(index_drop_err, crate::Error::Unsupported { ref message }
+                if message == "Writing to Paimon branch 'main' is not supported"),
+            "Expected branch index-drop rejection, got: {index_drop_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_overwrite_marks_new_write_as_overwrite_aware() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_write_builder_overwrite";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = input_changelog_pk_table(&file_io, table_path);
+        let wb = table.new_write_builder().with_overwrite();
+        let mut write = wb.new_write().unwrap();
+        write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+
+        let messages = write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert!(
+            messages[0].new_changelog_files.is_empty(),
+            "Overwrite-aware writer must not produce input changelog files"
+        );
+
+        wb.new_commit().commit(messages).await.unwrap();
+
+        let snapshot_manager =
+            crate::table::SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.commit_kind(), &CommitKind::APPEND);
+    }
+
+    #[test]
+    fn test_new_update_rejects_non_data_evolution_table() {
+        let table = test_postpone_pk_table(&test_file_io(), "memory:/test_new_update_invalid");
+        let err = table
+            .new_write_builder()
+            .new_update(vec!["value".to_string()])
+            .err()
+            .unwrap();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("data-evolution.enabled")),
+            "Expected unsupported data-evolution error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_update_prepares_empty_commit_for_empty_batch() {
+        let file_io = test_file_io();
+        let table = test_data_evolution_table(&file_io, "memory:/test_new_update_empty");
+        let mut update = table
+            .new_write_builder()
+            .new_update(vec!["name".to_string()])
+            .unwrap();
+
+        update
+            .add_matched_batch(make_empty_matched_batch())
+            .unwrap();
+        let messages = update.prepare_commit().await.unwrap();
+        assert!(messages.is_empty());
+    }
+}

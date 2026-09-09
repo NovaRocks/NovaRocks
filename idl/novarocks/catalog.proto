@@ -26,12 +26,6 @@ message CatalogHandle {
   bytes version = 2;
 }
 
-enum CatalogProviderKind {
-  CATALOG_PROVIDER_KIND_UNSPECIFIED = 0;
-  CATALOG_PROVIDER_KIND_ICEBERG = 1;
-  CATALOG_PROVIDER_KIND_STARROCKS = 2;
-}
-
 message CatalogProperty {
   string key = 1;
   string value = 2;
@@ -70,7 +64,7 @@ message CatalogCredentialBinding {
 
 message CatalogProperties {
   CatalogHandle handle = 1;
-  CatalogProviderKind provider_kind = 2;
+  string provider_id = 2;
   uint32 config_format_version = 3;
   repeated CatalogProperty execution_properties = 4;
   repeated CatalogCredentialBinding credential_bindings = 5;

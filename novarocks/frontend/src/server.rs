@@ -34,7 +34,7 @@ use crate::{
     ClientConnectionControlPort, ClientConnectionTerminationReason, MysqlClientConnectionRegistry,
     QuerySessionFactory, ResolvedMysqlListenerSettings,
 };
-use novarocks_connector_binding::ConnectorControlRoleBindingFactory;
+use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 
 use crate::query_execution::maintenance::{
@@ -1032,22 +1032,23 @@ mod tests {
     /// object store.
     struct EchoingControlRoleFactory;
 
-    impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for EchoingControlRoleFactory {
-        fn provider_kind(&self) -> novarocks_spi::connector::CatalogProviderKind {
-            novarocks_spi::connector::CatalogProviderKind::Iceberg
+    impl novarocks_spi::connector::ConnectorControlRoleBindingFactory for EchoingControlRoleFactory {
+        fn provider_id(&self) -> novarocks_spi::connector::ConnectorProviderId {
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static provider ID")
         }
 
         fn normalize_and_validate(
             &self,
             properties: novarocks_spi::connector::CatalogProperties,
         ) -> Result<
-            novarocks_connector_binding::NormalizedCatalogProperties,
-            novarocks_connector_binding::ConnectorMaterializationError,
+            novarocks_spi::connector::NormalizedCatalogProperties,
+            novarocks_spi::connector::ConnectorMaterializationError,
         > {
-            novarocks_connector_binding::NormalizedCatalogProperties::try_new(properties).map_err(
-                |detail| novarocks_connector_binding::ConnectorMaterializationError::new(
-                    novarocks_connector_binding::ConnectorMaterializationErrorClass::InvalidDefinition,
-                    novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+            novarocks_spi::connector::NormalizedCatalogProperties::try_new(properties).map_err(
+                |detail| novarocks_spi::connector::ConnectorMaterializationError::new(
+                    novarocks_spi::connector::ConnectorMaterializationErrorClass::InvalidDefinition,
+                    novarocks_spi::connector::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
                     detail,
                 ),
             )
@@ -1055,13 +1056,13 @@ mod tests {
 
         fn materialize(
             &self,
-            properties: novarocks_connector_binding::NormalizedCatalogProperties,
-            _context: novarocks_connector_binding::MaterializationContext,
+            properties: novarocks_spi::connector::NormalizedCatalogProperties,
+            _context: novarocks_spi::connector::MaterializationContext,
         ) -> futures::future::BoxFuture<
             'static,
             Result<
-                novarocks_connector_binding::ConnectorControlRoleBinding,
-                novarocks_connector_binding::ConnectorMaterializationError,
+                novarocks_spi::connector::ConnectorControlRoleBinding,
+                novarocks_spi::connector::ConnectorMaterializationError,
             >,
         > {
             use futures::FutureExt;
@@ -1072,14 +1073,14 @@ mod tests {
                     1,
                 )
                 .with_catalog_properties(properties.as_catalog_properties().clone())
-                .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)?;
-                novarocks_connector_binding::ConnectorControlRoleBinding::try_new(
+                .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
+                novarocks_spi::connector::ConnectorControlRoleBinding::try_new(
                     properties,
                     Arc::new(control),
                     None,
                     None,
                 )
-                .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)
+                .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)
             }
             .boxed()
         }

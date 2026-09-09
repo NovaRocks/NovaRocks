@@ -37,6 +37,7 @@ pub mod change_planning;
 pub mod commit;
 pub mod connector_factory;
 pub mod default_value;
+pub mod definition;
 pub mod delete_file;
 pub mod delta;
 pub mod distributed_rewrite;
@@ -55,6 +56,7 @@ pub mod planning_facts;
 pub mod position_delete;
 pub mod position_delete_descriptor;
 pub mod provider_binding;
+pub mod provider_types;
 pub mod read_snapshot;
 pub mod reconcile_payload;
 pub mod ref_snapshot;
@@ -75,9 +77,11 @@ pub mod table_definition;
 pub mod typed_boundary;
 pub mod typed_provider_factory;
 pub mod typed_read;
+pub mod wire;
 pub mod write_codec;
 pub mod write_descriptor;
 
+pub use definition::iceberg_contract_definition;
 pub use file_reader::execution_installer::IcebergCatalogRuntimeMaterializer;
 pub use role_binding::{IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory};
 

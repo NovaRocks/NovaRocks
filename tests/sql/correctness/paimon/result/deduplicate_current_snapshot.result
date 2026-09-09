@@ -1,0 +1,23 @@
+-- query 1
+id	metric	note
+1	21	new-a
+2	22	new-b
+4	40	new-d
+
+-- query 2
+id	metric	note
+101	1111	d101-new
+102	1020	d102
+103	1030	d103
+104	1040	d104
+105	1050	d105
+
+-- query 3
+id	seq	value
+1	11	seq-11
+3	1	seq-1
+4	7	equal-second
+
+-- query 4
+row_count
+0

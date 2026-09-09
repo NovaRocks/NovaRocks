@@ -2,7 +2,8 @@ use prost::Message;
 use prost_reflect::DescriptorPool;
 
 use novarocks_proto_models::{
-    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, catalog, common, expr, novarocks, plan,
+    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, catalog, common, connector_common, expr, novarocks,
+    plan,
 };
 
 #[test]
@@ -11,6 +12,7 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
 
     let _ = common::UniqueId::default();
     let _ = catalog::CatalogSet::default();
+    let _ = connector_common::ConnectorEncodedPayload::default();
     let _ = expr::Expr::default();
     let _ = plan::PlanFragment::default();
     let _ = novarocks::CreateTaskRequest::default();
@@ -25,6 +27,28 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
         pool.get_service_by_name("novarocks.NovaRocksGrpc")
             .is_some()
     );
+}
+
+#[test]
+fn connector_common_envelope_has_an_exact_purpose_and_catalog_generation() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let header = pool
+        .get_message_by_name("novarocks.connector_common.ConnectorEnvelopeHeader")
+        .expect("connector envelope header descriptor");
+    for (name, number) in [
+        ("provider_id", 1),
+        ("catalog", 2),
+        ("category", 3),
+        ("codec_revision", 4),
+    ] {
+        assert_eq!(header.get_field_by_name(name).expect(name).number(), number);
+    }
+    let payload = pool
+        .get_message_by_name("novarocks.connector_common.ConnectorEncodedPayload")
+        .expect("connector encoded payload descriptor");
+    assert_eq!(payload.get_field_by_name("header").unwrap().number(), 1);
+    assert_eq!(payload.get_field_by_name("payload").unwrap().number(), 2);
 }
 
 #[test]
@@ -512,80 +536,43 @@ fn retired_request_self_attestation_fields_remain_reserved() {
 }
 
 #[test]
-fn typed_connector_read_handle_and_split_oneofs_are_closed() {
+fn typed_connector_read_handles_use_provider_owned_payloads() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
 
-    // Every handle and split family selects its provider through its own closed
-    // oneof. A generic consumer must never be able to reach a variant by class
-    // id, message name, or an escape hatch field, so the exact variant list is
-    // part of the contract.
+    for message_name in [
+        "novarocks.connector_read.ColumnHandle",
+        "novarocks.connector_read.ConnectorTransactionHandle",
+        "novarocks.connector_read.ConnectorTableHandle",
+        "novarocks.connector_read.ConnectorTableFunctionHandle",
+        "novarocks.connector_read.ConnectorChangeWindowHandle",
+        "novarocks.connector_read.ConnectorSystemTableReference",
+        "novarocks.connector_read.ConnectorTableExecuteHandle",
+        "novarocks.connector_read.ConnectorMergeTableHandle",
+        "novarocks.connector_read.DataSplit",
+        "novarocks.connector_read.TableChangesSplitCategory",
+        "novarocks.connector_read.ChangeWindowSplitCategory",
+        "novarocks.connector_read.SystemFilesSplitCategory",
+        "novarocks.connector_read.RewritePositionDeleteFilesSplitCategory",
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        assert!(
+            message.oneofs().next().is_none(),
+            "{message_name} must not select a provider in public IDL"
+        );
+        let payload = message
+            .get_field_by_name("provider_payload")
+            .unwrap_or_else(|| panic!("{message_name}.provider_payload descriptor"));
+        assert_eq!(payload.number(), 1);
+        assert_eq!(
+            payload.kind().as_message().unwrap().full_name(),
+            "novarocks.connector_common.ConnectorEncodedPayload"
+        );
+    }
+
     for (message_name, oneof_name, expected_variants) in [
-        (
-            "novarocks.connector_read.ColumnHandle",
-            "handle",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.ConnectorTransactionHandle",
-            "handle",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.ConnectorTableHandle",
-            "handle",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.ConnectorTableFunctionHandle",
-            "handle",
-            &["iceberg_table_changes"][..],
-        ),
-        (
-            "novarocks.connector_read.ConnectorChangeWindowHandle",
-            "handle",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.ConnectorSystemTableReference",
-            "reference",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.ConnectorTableExecuteHandle",
-            "handle",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.ConnectorMergeTableHandle",
-            "handle",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.DataSplit",
-            "provider",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.TableChangesSplitCategory",
-            "provider",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.ChangeWindowSplitCategory",
-            "provider",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.SystemFilesSplitCategory",
-            "provider",
-            &["iceberg"][..],
-        ),
-        (
-            "novarocks.connector_read.RewritePositionDeleteFilesSplitCategory",
-            "provider",
-            &["iceberg"][..],
-        ),
         (
             "novarocks.connector_read.ConnectorSplit",
             "category",
@@ -609,21 +596,6 @@ fn typed_connector_read_handle_and_split_oneofs_are_closed() {
                 "merge_table",
             ][..],
         ),
-        (
-            "novarocks.connector_read.IcebergChangeSplit",
-            "rows",
-            &[
-                "added_rows",
-                "position_deleted_rows",
-                "equality_deleted_rows",
-                "deleted_data_file_rows",
-            ][..],
-        ),
-        (
-            "novarocks.connector_read.IcebergTableExecuteHandle",
-            "procedure_handle",
-            &["optimize", "rewrite_position_delete_files"][..],
-        ),
     ] {
         let message = pool
             .get_message_by_name(message_name)
@@ -639,6 +611,56 @@ fn typed_connector_read_handle_and_split_oneofs_are_closed() {
         assert_eq!(
             variants, expected_variants,
             "{message_name}.{oneof_name} variant set changed"
+        );
+    }
+
+    for private_message in [
+        "SchemaTableName",
+        "ColumnIdentity",
+        "IcebergColumnHandle",
+        "HiveTransactionHandle",
+        "IcebergPinnedDataFileSet",
+        "IcebergTableHandle",
+        "TableChangesFunctionHandle",
+        "IcebergChangeWindowHandle",
+        "IcebergSystemTableReference",
+        "IcebergOptimizeHandle",
+        "IcebergRewriteArtifactContentId",
+        "IcebergRewritePositionDeleteFilesHandle",
+        "IcebergTableExecuteHandle",
+        "IcebergInsertTableHandle",
+        "IcebergMergeTableHandle",
+        "ParquetFileDecryptionData",
+        "IcebergDeleteFile",
+        "IcebergSplit",
+        "TableChangesSplit",
+        "IcebergAddedRows",
+        "IcebergPositionDeletedRows",
+        "IcebergEqualityDeletedRows",
+        "IcebergDeletedDataFileRows",
+        "IcebergChangeSplit",
+        "TrinoManifestFile",
+        "FilesTableSplit",
+        "IcebergRewritePositionDeleteFilesSplit",
+    ] {
+        let full_name = format!("novarocks.connector_read.{private_message}");
+        assert!(
+            pool.get_message_by_name(&full_name).is_none(),
+            "provider-private read message {full_name} must not return to public IDL"
+        );
+    }
+    for private_enum in [
+        "ColumnIdentityCategory",
+        "IcebergSystemTableType",
+        "IcebergProcedureId",
+        "IcebergFileFormat",
+        "IcebergDeleteFileContent",
+        "TableChangesChangeType",
+    ] {
+        let full_name = format!("novarocks.connector_read.{private_enum}");
+        assert!(
+            pool.get_enum_by_name(&full_name).is_none(),
+            "provider-private read enum {full_name} must not return to public IDL"
         );
     }
 }
@@ -793,33 +815,6 @@ fn runtime_split_assignment_messages_carry_sequence_and_terminal_facts() {
     );
 }
 
-#[test]
-fn the_worker_system_relation_set_stays_closed() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-
-    let system_table_type = pool
-        .get_enum_by_name("novarocks.connector_read.IcebergSystemTableType")
-        .expect("IcebergSystemTableType descriptor");
-    assert_eq!(
-        system_table_type
-            .values()
-            .map(|value| value.name().to_owned())
-            .collect::<Vec<_>>(),
-        vec![
-            "ICEBERG_SYSTEM_TABLE_TYPE_UNSPECIFIED".to_owned(),
-            "ICEBERG_SYSTEM_TABLE_TYPE_FILES".to_owned(),
-            "ICEBERG_SYSTEM_TABLE_TYPE_ENTRIES".to_owned(),
-            "ICEBERG_SYSTEM_TABLE_TYPE_SNAPSHOTS".to_owned(),
-            "ICEBERG_SYSTEM_TABLE_TYPE_HISTORY".to_owned(),
-            "ICEBERG_SYSTEM_TABLE_TYPE_REFS".to_owned(),
-            "ICEBERG_SYSTEM_TABLE_TYPE_MANIFESTS".to_owned(),
-            "ICEBERG_SYSTEM_TABLE_TYPE_PARTITIONS".to_owned(),
-        ],
-        "the worker set is exact, with no ALL_* or unknown system-table variant"
-    );
-}
-
 /// `participant_roles` was a projection its sender mechanically derived from
 /// two other fields of the same message, so the payload became the sole
 /// participant role authority (ADR-0114). The message that carried it has since
@@ -866,86 +861,63 @@ fn write_dataflow_nodes_are_appended_after_the_existing_distributed_payloads() {
 }
 
 #[test]
-fn the_connector_write_carriers_are_closed_single_provider_oneofs() {
+fn the_connector_write_carriers_use_provider_owned_payloads() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    // Iceberg is the only provider that can write today. StarRocks deliberately
-    // has no arm here: an unused placeholder would advertise a capability the
-    // provider does not have, and `write: None` must stay a real refusal.
-    for (message_name, oneof_name, arm_name) in [
-        (
-            "novarocks.connector_write.ConnectorWriterHandle",
-            "handle",
-            "iceberg",
-        ),
-        (
-            "novarocks.connector_write.ConnectorCommitFragment",
-            "fragment",
-            "iceberg",
-        ),
+    for message_name in [
+        "novarocks.connector_write.ConnectorWriterHandle",
+        "novarocks.connector_write.ConnectorCommitFragment",
     ] {
         let message = pool
             .get_message_by_name(message_name)
             .unwrap_or_else(|| panic!("{message_name} descriptor"));
-        let oneof = message
-            .oneofs()
-            .find(|oneof| oneof.name() == oneof_name)
-            .unwrap_or_else(|| panic!("{message_name}.{oneof_name} oneof"));
-        let arms = oneof
-            .fields()
-            .map(|field| field.name().to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(arms, vec![arm_name.to_string()]);
-        let arm = message
-            .get_field_by_name(arm_name)
-            .unwrap_or_else(|| panic!("{message_name}.{arm_name} descriptor"));
-        // Provider arms start at 10 by repository convention, leaving 1..9 for
-        // neutral envelope fields if one is ever needed.
-        assert_eq!(arm.number(), 10);
+        assert!(message.oneofs().next().is_none());
+        let payload = message.get_field_by_name("provider_payload").unwrap();
+        assert_eq!(payload.number(), 1);
+        assert_eq!(
+            payload.kind().as_message().unwrap().full_name(),
+            "novarocks.connector_common.ConnectorEncodedPayload"
+        );
     }
-}
 
-#[test]
-fn an_iceberg_commit_fragment_describes_exactly_one_artifact() {
-    let pool =
-        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
-    let fragment = pool
-        .get_message_by_name("novarocks.connector_write.IcebergCommitFragment")
-        .expect("IcebergCommitFragment descriptor");
-    let artifact = fragment
-        .oneofs()
-        .find(|oneof| oneof.name() == "artifact")
-        .expect("IcebergCommitFragment.artifact oneof");
-    let arms = artifact
-        .fields()
-        .map(|field| field.name().to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        arms,
-        vec![
-            "data_file".to_string(),
-            "position_delete_file".to_string(),
-            "deletion_vector".to_string(),
-            "equality_delete_file".to_string(),
-        ]
-    );
-    // A fragment carries no writer identity, attempt id, or aggregate summary:
-    // those belong to an execution, not to an artifact.
-    let field_names = fragment
-        .fields()
-        .map(|field| field.name().to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(field_names.len(), 4);
-    for forbidden in [
-        "writer",
-        "operation_id",
-        "cohort_id",
-        "summary",
-        "row_count",
+    for private_message in [
+        "IcebergPartitionValueDescriptor",
+        "IcebergPartitionDescriptor",
+        "IcebergArtifactPartition",
+        "IcebergColumnStats",
+        "IcebergArtifactMetrics",
+        "IcebergContentRange",
+        "IcebergWriteTableFacts",
+        "IcebergWriterOutput",
+        "IcebergDataBranchRecipe",
+        "IcebergStorageRoute",
+        "IcebergOldDeleteArtifactRef",
+        "IcebergEqualityDeleteColumn",
+        "IcebergEqualityDeleteRecipe",
+        "IcebergOldDeleteMergeTarget",
+        "IcebergWriterHandle",
+        "IcebergDataFileArtifact",
+        "IcebergPositionDeleteFileArtifact",
+        "IcebergDeletionVectorArtifact",
+        "IcebergEqualityDeleteFileArtifact",
+        "IcebergCommitFragment",
     ] {
+        let full_name = format!("novarocks.connector_write.{private_message}");
         assert!(
-            !field_names.iter().any(|name| name.contains(forbidden)),
-            "commit fragment must not carry {forbidden}"
+            pool.get_message_by_name(&full_name).is_none(),
+            "provider-private write message {full_name} must not return to public IDL"
+        );
+    }
+    for private_enum in [
+        "IcebergFileFormat",
+        "IcebergFileContent",
+        "IcebergWriteBranch",
+        "IcebergCompression",
+    ] {
+        let full_name = format!("novarocks.connector_write.{private_enum}");
+        assert!(
+            pool.get_enum_by_name(&full_name).is_none(),
+            "provider-private write enum {full_name} must not return to public IDL"
         );
     }
 }
@@ -1364,6 +1336,7 @@ fn the_operation_outcome_enum_reserves_the_client_only_category() {
         "TASK_OPERATION_OUTCOME_IDEMPOTENT",
         "TASK_OPERATION_OUTCOME_OPERATION_TIMED_OUT",
         "TASK_OPERATION_OUTCOME_IDENTITY_MISMATCH",
+        "TASK_OPERATION_OUTCOME_COMPATIBILITY_MISMATCH",
         "TASK_OPERATION_OUTCOME_CREATE_CONFLICT",
         "TASK_OPERATION_OUTCOME_DOMAIN_CONFLICT",
         "TASK_OPERATION_OUTCOME_LEASE_EXPIRED",
@@ -1376,6 +1349,13 @@ fn the_operation_outcome_enum_reserves_the_client_only_category() {
             "{expected} must exist"
         );
     }
+    assert_eq!(
+        outcome
+            .get_value_by_name("TASK_OPERATION_OUTCOME_COMPATIBILITY_MISMATCH")
+            .expect("compatibility mismatch outcome")
+            .number(),
+        17
+    );
 }
 
 /// A batch is a transport convenience. Its response carries one receipt per

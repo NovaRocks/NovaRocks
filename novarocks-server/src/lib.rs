@@ -26,6 +26,8 @@ pub mod memory_limit;
 pub mod native_compatibility;
 pub mod native_trust;
 pub mod network;
+mod paimon_access;
+pub mod provider_manifest;
 pub mod state_store_config;
 mod state_store_limits;
 pub mod supervisor;

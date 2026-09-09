@@ -23,7 +23,7 @@
 
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_read::{
-    ConnectorTableScanSource, encode_connector_expression,
+    ConnectorReadEncoder, ConnectorTableScanSource, encode_connector_expression,
 };
 use novarocks_proto_models::connector_read as dto;
 use novarocks_sql::plan_read::{ColumnId, FragmentId, OutputColumn, TypedExpr};

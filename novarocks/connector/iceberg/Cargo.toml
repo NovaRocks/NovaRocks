@@ -38,6 +38,7 @@ crc32fast = "1"
 futures = "0.3"
 ordered-float = "4"
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
+prost = "0.13"
 rand = "0.8"
 roaring = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -49,7 +50,6 @@ typetag = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 novarocks-fs = { path = "../../fs" }
-novarocks-connector-binding = { path = "../../connector-binding" }
 novarocks-connector-iceberg-functions = { path = "../iceberg-functions" }
 novarocks-proto-codec = { path = "../../proto-codec" }
 novarocks-proto-models = { path = "../../proto-models" }
@@ -58,3 +58,7 @@ novarocks-types = { path = "../../types" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"

@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use super::{
     CatalogCredentialBinding, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    canonicalize_catalog_credential_bindings,
+    ConnectorProviderId, canonicalize_catalog_credential_bindings,
 };
 
 pub const CATALOG_VERSION_BYTES: usize = 32;
@@ -41,24 +41,6 @@ pub const MAX_PRUNE_CATALOG_SET_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CATALOG_PROPERTIES: usize = 128;
 pub const MAX_CATALOG_PROPERTY_KEY_BYTES: usize = 256;
 pub const MAX_CATALOG_PROPERTY_VALUE_BYTES: usize = 4 * 1024;
-
-/// The closed provider family used to materialize a catalog runtime.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum CatalogProviderKind {
-    Iceberg,
-    StarRocks,
-}
-
-impl CatalogProviderKind {
-    pub const ALL: [Self; 2] = [Self::Iceberg, Self::StarRocks];
-
-    pub const fn provider_id(self) -> &'static str {
-        match self {
-            Self::Iceberg => "iceberg",
-            Self::StarRocks => "starrocks",
-        }
-    }
-}
 
 /// Stable content identity for one catalog configuration.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -142,7 +124,7 @@ impl CatalogProperty {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogProperties {
     handle: CatalogHandle,
-    provider_kind: CatalogProviderKind,
+    provider_id: ConnectorProviderId,
     config_format_version: u32,
     execution_properties: Vec<CatalogProperty>,
     credential_bindings: Vec<CatalogCredentialBinding>,
@@ -151,7 +133,7 @@ pub struct CatalogProperties {
 impl CatalogProperties {
     pub fn new(
         handle: CatalogHandle,
-        provider_kind: CatalogProviderKind,
+        provider_id: ConnectorProviderId,
         config_format_version: u32,
         mut execution_properties: Vec<CatalogProperty>,
         credential_bindings: Vec<CatalogCredentialBinding>,
@@ -175,7 +157,7 @@ impl CatalogProperties {
         let credential_bindings = canonicalize_catalog_credential_bindings(credential_bindings)?;
         Ok(Self {
             handle,
-            provider_kind,
+            provider_id,
             config_format_version,
             execution_properties,
             credential_bindings,
@@ -186,8 +168,8 @@ impl CatalogProperties {
         &self.handle
     }
 
-    pub const fn provider_kind(&self) -> CatalogProviderKind {
-        self.provider_kind
+    pub const fn provider_id(&self) -> &ConnectorProviderId {
+        &self.provider_id
     }
 
     pub const fn config_format_version(&self) -> u32 {
@@ -271,7 +253,7 @@ mod tests {
     fn properties_sort_and_reject_duplicate_or_secret_keys() {
         let properties = CatalogProperties::new(
             handle(1),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").unwrap(),
             1,
             vec![
                 CatalogProperty::new("warehouse", "s3://warehouse").unwrap(),
@@ -285,7 +267,7 @@ mod tests {
         assert!(
             CatalogProperties::new(
                 handle(1),
-                CatalogProviderKind::Iceberg,
+                ConnectorProviderId::parse("iceberg").unwrap(),
                 1,
                 vec![
                     CatalogProperty::new("warehouse", "one").unwrap(),

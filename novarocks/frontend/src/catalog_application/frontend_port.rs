@@ -45,13 +45,13 @@ use super::{
     CatalogRuntimePublisherSink,
 };
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
-use novarocks_connector_binding::{
-    ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
-};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
     ConnectorControlResolver, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
     StaticCredentialReference, canonicalize_catalog_credential_bindings,
+};
+use novarocks_spi::connector::{
+    ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
@@ -126,7 +126,7 @@ struct MaterializationSubmission {
     entry: CatalogDesiredStateEntry,
     provider_id: ConnectorProviderId,
     properties: NormalizedCatalogProperties,
-    factory: Arc<dyn novarocks_connector_binding::ConnectorControlRoleBindingFactory>,
+    factory: Arc<dyn novarocks_spi::connector::ConnectorControlRoleBindingFactory>,
     key: CatalogHandle,
     token: u64,
     context: MaterializationContext,
@@ -396,7 +396,7 @@ impl FrontendCatalogApplicationPort {
     fn install_created(
         &self,
         entry: &CatalogDesiredStateEntry,
-        binding: novarocks_connector_binding::ConnectorControlRoleBinding,
+        binding: novarocks_spi::connector::ConnectorControlRoleBinding,
     ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
         let attachment_id = entry.identity().as_uuid();
         let instance_id = entry.config().instance_id();
@@ -809,19 +809,20 @@ impl FrontendCatalogApplicationPort {
             let Ok(permit) = Arc::clone(&self.scheduler.permits).acquire_owned().await else {
                 return;
             };
-            let result =
-                tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(context.deadline()),
-                    factory.materialize(properties.clone(), context.clone()),
+            let result = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(context.deadline()),
+                factory.materialize(properties.clone(), context.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(
+                    novarocks_spi::connector::ConnectorMaterializationError::new(
+                        novarocks_spi::connector::ConnectorMaterializationErrorClass::Timeout,
+                        ConnectorMaterializationRetryDisposition::Transient,
+                        "connector materialization deadline elapsed",
+                    ),
                 )
-                .await
-                .unwrap_or_else(|_| {
-                    Err(novarocks_connector_binding::ConnectorMaterializationError::new(
-                    novarocks_connector_binding::ConnectorMaterializationErrorClass::Timeout,
-                    ConnectorMaterializationRetryDisposition::Transient,
-                    "connector materialization deadline elapsed",
-                ))
-                });
+            });
             drop(permit);
             if !self.token_is_current(&key, token) {
                 return;
@@ -1341,9 +1342,9 @@ fn connector_error(error: novarocks_spi::connector::ConnectorError) -> CatalogAp
 }
 
 fn materialization_error(
-    error: &novarocks_connector_binding::ConnectorMaterializationError,
+    error: &novarocks_spi::connector::ConnectorMaterializationError,
 ) -> CatalogApplicationError {
-    use novarocks_connector_binding::ConnectorMaterializationErrorClass;
+    use novarocks_spi::connector::ConnectorMaterializationErrorClass;
 
     let kind = match error.class() {
         ConnectorMaterializationErrorClass::InvalidDefinition => {
@@ -1393,9 +1394,10 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
-    impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for FailingRoleFactory {
-        fn provider_kind(&self) -> novarocks_spi::connector::CatalogProviderKind {
-            novarocks_spi::connector::CatalogProviderKind::Iceberg
+    impl novarocks_spi::connector::ConnectorControlRoleBindingFactory for FailingRoleFactory {
+        fn provider_id(&self) -> novarocks_spi::connector::ConnectorProviderId {
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static provider ID")
         }
 
         fn normalize_and_validate(
@@ -1403,11 +1405,11 @@ mod tests {
             properties: novarocks_spi::connector::CatalogProperties,
         ) -> Result<
             NormalizedCatalogProperties,
-            novarocks_connector_binding::ConnectorMaterializationError,
+            novarocks_spi::connector::ConnectorMaterializationError,
         > {
             NormalizedCatalogProperties::try_new(properties).map_err(|detail| {
-                novarocks_connector_binding::ConnectorMaterializationError::new(
-                    novarocks_connector_binding::ConnectorMaterializationErrorClass::InvalidDefinition,
+                novarocks_spi::connector::ConnectorMaterializationError::new(
+                    novarocks_spi::connector::ConnectorMaterializationErrorClass::InvalidDefinition,
                     ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
                     detail,
                 )
@@ -1421,18 +1423,20 @@ mod tests {
         ) -> futures::future::BoxFuture<
             'static,
             Result<
-                novarocks_connector_binding::ConnectorControlRoleBinding,
-                novarocks_connector_binding::ConnectorMaterializationError,
+                novarocks_spi::connector::ConnectorControlRoleBinding,
+                novarocks_spi::connector::ConnectorMaterializationError,
             >,
         > {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let disposition = self.disposition;
             async move {
-                Err(novarocks_connector_binding::ConnectorMaterializationError::new(
-                    novarocks_connector_binding::ConnectorMaterializationErrorClass::Unavailable,
-                    disposition,
-                    "injected projection failure",
-                ))
+                Err(
+                    novarocks_spi::connector::ConnectorMaterializationError::new(
+                        novarocks_spi::connector::ConnectorMaterializationErrorClass::Unavailable,
+                        disposition,
+                        "injected projection failure",
+                    ),
+                )
             }
             .boxed()
         }

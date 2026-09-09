@@ -23,14 +23,11 @@
 //! module can forge a value the real seam would refuse. They deliberately
 //! provide no commit authority, because a backend never has one.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
-use novarocks_proto_codec::connector_write::{
-    ConnectorWriteCodecError, ConnectorWriteFragmentEncoder, ConnectorWriteHandleDecoder,
-    ValidatedWriterHandle,
-};
+use bytes::Bytes;
+use novarocks_proto_codec::connector_common::encode_connector_payload_message;
 use novarocks_proto_codec::{FieldPath, arrow_physical};
 use novarocks_proto_models::connector_write as write_dto;
 use novarocks_proto_models::{catalog as catalog_dto, plan};
@@ -40,14 +37,18 @@ use novarocks_spi::connector::write_stack::{
     WriteRuntimeAdapter, WriterMultiplexSchema,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorProviderId,
+    CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+    ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorError, ConnectorErrorKind,
+    ConnectorFieldPath, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+    ConnectorWriteFragmentWireEncoder, ConnectorWriteHandleWireDecoder,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
 
 use crate::connector::ConnectorExecutionWriteBinding;
 
 pub(crate) const TEST_WRITE_CATALOG: &str = "write_catalog";
+const TEST_WRITE_PROVIDER: &str = "test";
+const TEST_WRITE_CODEC_REVISION: u32 = 1;
 
 #[derive(Debug)]
 pub(crate) struct StubProviderRuntime {
@@ -57,8 +58,8 @@ pub(crate) struct StubProviderRuntime {
 
 impl ProviderWriteRuntime for StubProviderRuntime {
     type CommitHandle = ();
-    type WriterHandle = write_dto::IcebergWriterHandle;
-    type CommitFragment = write_dto::ConnectorCommitFragment;
+    type WriterHandle = String;
+    type CommitFragment = String;
 
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
@@ -80,7 +81,7 @@ pub(crate) fn test_write_adapter() -> WriteRuntimeAdapter<StubProviderRuntime> {
     let handle = test_write_catalog_handle();
     WriteRuntimeAdapter::new(Arc::new(StubProviderRuntime {
         descriptor: ConnectorInstanceDescriptor {
-            provider_id: ConnectorProviderId::parse("iceberg").expect("provider id"),
+            provider_id: ConnectorProviderId::parse(TEST_WRITE_PROVIDER).expect("provider id"),
             instance_id: handle.catalog_name().clone(),
         },
         catalog_handle: handle,
@@ -91,16 +92,39 @@ struct StubHandleDecoder {
     adapter: WriteRuntimeAdapter<StubProviderRuntime>,
 }
 
-impl ConnectorWriteHandleDecoder for StubHandleDecoder {
+impl ConnectorWriteHandleWireDecoder for StubHandleDecoder {
     fn owner(&self) -> &str {
         TEST_WRITE_CATALOG
     }
 
-    fn decode_writer_handle(
+    fn decode_writer_handle_payload(
         &self,
-        handle: &ValidatedWriterHandle,
-    ) -> Result<ConnectorWriterHandle, ConnectorWriteCodecError> {
-        Ok(self.adapter.wrap_writer_handle(handle.iceberg().clone()))
+        payload: &ConnectorEncodedPayload,
+    ) -> Result<ConnectorWriterHandle, novarocks_spi::connector::ConnectorCodecError> {
+        let expected = synthetic_header(ConnectorCodecCategory::WriteHandle);
+        payload.header().validate_expected(
+            expected.provider_id(),
+            expected.catalog(),
+            expected.category(),
+            expected.codec_revision(),
+        )?;
+        let value = std::str::from_utf8(payload.payload())
+            .map_err(|error| {
+                novarocks_spi::connector::ConnectorCodecError::new(
+                    ConnectorFieldPath::root("writer_handle").field("provider_payload"),
+                    novarocks_spi::connector::ConnectorCodecErrorKind::InvalidValue,
+                    format!("synthetic writer handle is not UTF-8: {error}"),
+                )
+            })?
+            .to_owned();
+        if value.is_empty() {
+            return Err(novarocks_spi::connector::ConnectorCodecError::new(
+                ConnectorFieldPath::root("writer_handle").field("provider_payload"),
+                novarocks_spi::connector::ConnectorCodecErrorKind::InvalidValue,
+                "synthetic writer handle must not be empty",
+            ));
+        }
+        Ok(self.adapter.wrap_writer_handle(value))
     }
 }
 
@@ -108,26 +132,40 @@ struct StubFragmentEncoder {
     adapter: WriteRuntimeAdapter<StubProviderRuntime>,
 }
 
-impl ConnectorWriteFragmentEncoder for StubFragmentEncoder {
+impl ConnectorWriteFragmentWireEncoder for StubFragmentEncoder {
     fn owner(&self) -> &str {
         TEST_WRITE_CATALOG
     }
 
-    fn encode_commit_fragment(
+    fn encode_commit_fragment_payload(
         &self,
         fragment: &ConnectorCommitFragment,
-    ) -> Result<write_dto::ConnectorCommitFragment, ConnectorWriteCodecError> {
-        self.adapter
+    ) -> Result<ConnectorEncodedPayload, novarocks_spi::connector::ConnectorCodecError> {
+        let value = self
+            .adapter
             .commit_fragment(fragment)
             .cloned()
             .map_err(|error| {
-                ConnectorWriteCodecError::invalid(
-                    TEST_WRITE_CATALOG,
-                    FieldPath::root("commit_fragment"),
+                novarocks_spi::connector::ConnectorCodecError::new(
+                    ConnectorFieldPath::root("commit_fragment"),
+                    novarocks_spi::connector::ConnectorCodecErrorKind::InvalidValue,
                     error.to_string(),
                 )
-            })
+            })?;
+        Ok(ConnectorEncodedPayload::new(
+            synthetic_header(ConnectorCodecCategory::CommitFragment),
+            Bytes::from(value),
+        ))
     }
+}
+
+fn synthetic_header(category: ConnectorCodecCategory) -> ConnectorEnvelopeHeader {
+    ConnectorEnvelopeHeader::new(
+        ConnectorProviderId::parse(TEST_WRITE_PROVIDER).expect("provider id"),
+        test_write_catalog_handle(),
+        category,
+        ConnectorCodecRevision::try_new(TEST_WRITE_CODEC_REVISION).expect("codec revision"),
+    )
 }
 
 /// Records every writer it opened, so a test can prove each driver received its
@@ -307,40 +345,13 @@ pub(crate) fn wire_catalog_handle(name: &str) -> catalog_dto::CatalogHandle {
     }
 }
 
-pub(crate) fn iceberg_writer_handle(table_uuid: String) -> write_dto::ConnectorWriterHandle {
+pub(crate) fn iceberg_writer_handle(value: String) -> write_dto::ConnectorWriterHandle {
+    let payload = ConnectorEncodedPayload::new(
+        synthetic_header(ConnectorCodecCategory::WriteHandle),
+        Bytes::from(value),
+    );
     write_dto::ConnectorWriterHandle {
-        handle: Some(write_dto::connector_writer_handle::Handle::Iceberg(
-            write_dto::IcebergWriterHandle {
-                branch: write_dto::IcebergWriteBranch::Data as i32,
-                table: Some(write_dto::IcebergWriteTableFacts {
-                    table_uuid,
-                    namespace: "db".to_string(),
-                    table_name: "t".to_string(),
-                    table_location: "s3://bucket/db/t".to_string(),
-                    data_location: "s3://bucket/db/t/data".to_string(),
-                    target_ref: "main".to_string(),
-                    base_snapshot_id: None,
-                    base_sequence_number: 0,
-                    schema_id: 0,
-                    default_partition_spec_id: 0,
-                    format_version: 2,
-                }),
-                output: Some(write_dto::IcebergWriterOutput {
-                    file_format: write_dto::IcebergFileFormat::Parquet as i32,
-                    compression: write_dto::IcebergCompression::Zstd as i32,
-                    parquet_row_group_size_bytes: None,
-                }),
-                data: Some(write_dto::IcebergDataBranchRecipe {
-                    input_schema_json: None,
-                    partition_source_column_names: Vec::new(),
-                    partition_column_names: Vec::new(),
-                    transform_exprs: Vec::new(),
-                    row_lineage: false,
-                }),
-                old_deletes: BTreeMap::new(),
-                equality: None,
-            },
-        )),
+        provider_payload: Some(encode_connector_payload_message(&payload)),
     }
 }
 

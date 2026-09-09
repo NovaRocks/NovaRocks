@@ -1,0 +1,126 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.connector.paimon;
+
+import "common.proto";
+
+message PaimonTablePayload {
+  string schema_name = 1;
+  string table_name = 2;
+  string table_location = 3;
+  PaimonMergeEngine merge_engine = 4;
+  PaimonBucketMode bucket_mode = 5;
+  repeated int32 primary_key_field_ids = 6;
+  repeated int32 partition_field_ids = 7;
+}
+
+message PaimonColumnPayload {
+  optional int32 field_id = 1;
+  string name = 2;
+  PaimonDataTypePayload data_type = 3;
+  optional bool nullable = 4;
+  optional uint32 output_ordinal = 5;
+}
+
+message PaimonReadViewPayload {
+  string table_location = 1;
+  optional int64 snapshot_id = 2;
+  optional int64 schema_id = 3;
+  bytes schema_fingerprint = 4;
+  bytes read_recipe_digest = 5;
+  optional int32 sequence_field_id = 6;
+}
+
+message PaimonDataFilePayload {
+  string file_name = 1;
+  optional uint64 file_size = 2;
+  optional int64 schema_id = 3;
+  optional int32 level = 4;
+  optional int64 min_sequence_number = 5;
+  optional int64 max_sequence_number = 6;
+  optional uint64 row_count = 7;
+  PaimonDataCompression compression = 8;
+  bytes min_key = 9;
+  bytes max_key = 10;
+  PaimonBinaryTableStatsPayload key_stats = 11;
+  PaimonBinaryTableStatsPayload value_stats = 12;
+  repeated string extra_files = 13;
+  optional int64 creation_time_millis = 14;
+  optional uint64 delete_row_count = 15;
+  optional bytes embedded_index = 16;
+  optional int32 file_source = 17;
+  PaimonStringListPayload value_stats_cols = 18;
+  optional string external_path = 19;
+  optional int64 first_row_id = 20;
+  PaimonStringListPayload write_cols = 21;
+}
+
+message PaimonOptionalInt64Payload {
+  optional int64 value = 1;
+}
+
+message PaimonBinaryTableStatsPayload {
+  bytes min_values = 1;
+  bytes max_values = 2;
+  repeated PaimonOptionalInt64Payload null_counts = 3;
+}
+
+message PaimonStringListPayload {
+  repeated string values = 1;
+}
+
+message PaimonDeletionFilePayload {
+  string path = 1;
+  optional uint64 offset = 2;
+  optional uint64 length = 3;
+  optional uint64 cardinality = 4;
+}
+
+message PaimonOptionalDeletionFilePayload {
+  PaimonDeletionFilePayload value = 1;
+}
+
+message PaimonDeletionFilesPayload {
+  repeated PaimonOptionalDeletionFilePayload values = 1;
+}
+
+message PaimonRowRangePayload {
+  optional int64 from = 1;
+  optional int64 to = 2;
+}
+
+message PaimonRowRangesPayload {
+  repeated PaimonRowRangePayload values = 1;
+}
+
+message PaimonReadSplitPayload {
+  optional int64 snapshot_id = 1;
+  optional int64 schema_id = 2;
+  bytes partition = 3;
+  optional int32 bucket = 4;
+  repeated PaimonDataFilePayload files = 5;
+  optional bool contains_delete_rows = 6;
+  optional int32 partition_arity = 7;
+  string bucket_path = 8;
+  optional int32 total_buckets = 9;
+  PaimonDeletionFilesPayload data_deletion_files = 10;
+  PaimonRowRangesPayload row_ranges = 11;
+  optional bool raw_convertible = 12;
+}

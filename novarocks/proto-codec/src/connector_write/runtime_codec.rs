@@ -38,6 +38,11 @@ use std::sync::Arc;
 
 use novarocks_proto_models::connector_write as dto;
 use novarocks_spi::connector::write_stack::{ConnectorCommitFragment, ConnectorWriterHandle};
+use novarocks_spi::connector::{
+    ConnectorCodecError, ConnectorCodecErrorKind, ConnectorWriteFragmentWireDecoder,
+    ConnectorWriteFragmentWireEncoder, ConnectorWriteHandleWireDecoder,
+    ConnectorWriteHandleWireEncoder,
+};
 
 use super::{ValidatedCommitFragment, ValidatedWriterHandle};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
@@ -115,6 +120,29 @@ pub trait ConnectorWriteHandleEncoder: Send + Sync {
     }
 }
 
+impl<T> ConnectorWriteHandleEncoder for T
+where
+    T: ConnectorWriteHandleWireEncoder + ?Sized,
+{
+    fn owner(&self) -> &str {
+        ConnectorWriteHandleWireEncoder::owner(self)
+    }
+
+    fn encode_writer_handle(
+        &self,
+        handle: &ConnectorWriterHandle,
+    ) -> Result<dto::ConnectorWriterHandle, ConnectorWriteCodecError> {
+        let payload = self
+            .encode_writer_handle_payload(handle)
+            .map_err(|error| wire_error(self.owner(), error))?;
+        Ok(dto::ConnectorWriterHandle {
+            provider_payload: Some(crate::connector_common::encode_connector_payload_message(
+                &payload,
+            )),
+        })
+    }
+}
+
 /// Backend half: turn a validated carrier back into a provider recipe.
 pub trait ConnectorWriteHandleDecoder: Send + Sync {
     fn owner(&self) -> &str;
@@ -123,6 +151,23 @@ pub trait ConnectorWriteHandleDecoder: Send + Sync {
         &self,
         handle: &ValidatedWriterHandle,
     ) -> Result<ConnectorWriterHandle, ConnectorWriteCodecError>;
+}
+
+impl<T> ConnectorWriteHandleDecoder for T
+where
+    T: ConnectorWriteHandleWireDecoder + ?Sized,
+{
+    fn owner(&self) -> &str {
+        ConnectorWriteHandleWireDecoder::owner(self)
+    }
+
+    fn decode_writer_handle(
+        &self,
+        handle: &ValidatedWriterHandle,
+    ) -> Result<ConnectorWriterHandle, ConnectorWriteCodecError> {
+        self.decode_writer_handle_payload(handle.provider_payload())
+            .map_err(|error| wire_error(self.owner(), error))
+    }
 }
 
 /// Backend half: turn one staged artifact into its carrier.
@@ -143,6 +188,29 @@ pub trait ConnectorWriteFragmentEncoder: Send + Sync {
     }
 }
 
+impl<T> ConnectorWriteFragmentEncoder for T
+where
+    T: ConnectorWriteFragmentWireEncoder + ?Sized,
+{
+    fn owner(&self) -> &str {
+        ConnectorWriteFragmentWireEncoder::owner(self)
+    }
+
+    fn encode_commit_fragment(
+        &self,
+        fragment: &ConnectorCommitFragment,
+    ) -> Result<dto::ConnectorCommitFragment, ConnectorWriteCodecError> {
+        let payload = self
+            .encode_commit_fragment_payload(fragment)
+            .map_err(|error| wire_error(self.owner(), error))?;
+        Ok(dto::ConnectorCommitFragment {
+            provider_payload: Some(crate::connector_common::encode_connector_payload_message(
+                &payload,
+            )),
+        })
+    }
+}
+
 /// Frontend half: turn a validated carrier back into a provider artifact.
 pub trait ConnectorWriteFragmentDecoder: Send + Sync {
     fn owner(&self) -> &str;
@@ -151,4 +219,44 @@ pub trait ConnectorWriteFragmentDecoder: Send + Sync {
         &self,
         fragment: &ValidatedCommitFragment,
     ) -> Result<ConnectorCommitFragment, ConnectorWriteCodecError>;
+}
+
+impl<T> ConnectorWriteFragmentDecoder for T
+where
+    T: ConnectorWriteFragmentWireDecoder + ?Sized,
+{
+    fn owner(&self) -> &str {
+        ConnectorWriteFragmentWireDecoder::owner(self)
+    }
+
+    fn decode_commit_fragment(
+        &self,
+        fragment: &ValidatedCommitFragment,
+    ) -> Result<ConnectorCommitFragment, ConnectorWriteCodecError> {
+        self.decode_commit_fragment_payload(fragment.provider_payload())
+            .map_err(|error| wire_error(self.owner(), error))
+    }
+}
+
+fn wire_error(owner: &str, error: ConnectorCodecError) -> ConnectorWriteCodecError {
+    let kind = match error.kind() {
+        ConnectorCodecErrorKind::MissingField => ProtocolErrorKind::MissingField,
+        ConnectorCodecErrorKind::InvalidEnum => ProtocolErrorKind::InvalidEnum,
+        ConnectorCodecErrorKind::InvalidValue | ConnectorCodecErrorKind::UnknownField => {
+            ProtocolErrorKind::InvalidValue
+        }
+        ConnectorCodecErrorKind::DuplicateField => ProtocolErrorKind::DuplicateField,
+        ConnectorCodecErrorKind::InconsistentFields => ProtocolErrorKind::InconsistentFields,
+        ConnectorCodecErrorKind::Unsupported => ProtocolErrorKind::Unsupported,
+        ConnectorCodecErrorKind::Capacity => ProtocolErrorKind::Capacity,
+        ConnectorCodecErrorKind::VersionMismatch => ProtocolErrorKind::VersionMismatch,
+    };
+    ConnectorWriteCodecError::new(
+        owner,
+        ProtocolError::new(
+            FieldPath::root("provider_payload"),
+            kind,
+            format!("{}: {}", error.path(), error.detail()),
+        ),
+    )
 }

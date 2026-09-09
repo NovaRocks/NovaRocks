@@ -399,7 +399,8 @@ impl InsertEngine for DmlExecutionKernel {
             "Iceberg INSERT target is missing its reserved native attempt".to_string()
         })?;
         let target = TargetBackend {
-            backend_name: "iceberg",
+            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("static Iceberg provider ID"),
             catalog: catalog.clone(),
             namespace: namespace.clone(),
             table: table.clone(),

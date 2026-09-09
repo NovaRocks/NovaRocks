@@ -243,6 +243,9 @@ pub enum OperationOutcome {
     RetryableObservationLoss,
     /// A different task, stage, query, or backend process.
     IdentityMismatch,
+    /// The backend rejected the request before side effects because its
+    /// immutable Native compatibility identity differs from the request.
+    CompatibilityMismatch,
     /// The same task identity with a different descriptor or different
     /// initial domains.
     CreateConflict,
@@ -324,6 +327,7 @@ impl OperationOutcome {
             }
             Self::NormalDestinationCanceled => FrontendAction::Settled,
             Self::IdentityMismatch
+            | Self::CompatibilityMismatch
             | Self::CreateConflict
             | Self::ContextNotEstablished
             | Self::ContextConflict
@@ -1465,13 +1469,14 @@ mod tests {
     use crate::task_execution::identity::TaskOperationId;
     use std::time::Duration;
 
-    const ALL_OUTCOMES: [OperationOutcome; 19] = [
+    const ALL_OUTCOMES: [OperationOutcome; 20] = [
         OperationOutcome::Accepted,
         OperationOutcome::Idempotent,
         OperationOutcome::RetryableTransportUnknown,
         OperationOutcome::OperationTimedOut,
         OperationOutcome::RetryableObservationLoss,
         OperationOutcome::IdentityMismatch,
+        OperationOutcome::CompatibilityMismatch,
         OperationOutcome::CreateConflict,
         OperationOutcome::ContextNotEstablished,
         OperationOutcome::ContextConflict,

@@ -27,8 +27,12 @@ metadata="$tmpdir/metadata.json"
 source_root="$tmpdir/source"
 mkdir -p "$source_root/novarocks/frontend/src/connector" \
   "$source_root/novarocks/backend/src/connector" \
+  "$source_root/novarocks/spi/src/connector/binding" \
+  "$source_root/novarocks/spi/src/connector/provider" \
   "$source_root/novarocks/connector/starrocks/src" \
   "$source_root/novarocks-server/src"
+touch "$source_root/novarocks/spi/src/connector/binding/role.rs"
+touch "$source_root/novarocks/spi/src/connector/provider/role.rs"
 cat >"$source_root/novarocks/connector/starrocks/src/role_binding.rs" <<'EOF'
 impl ConnectorControlRoleBindingFactory for StarRocksControlRoleBindingFactory {}
 impl ConnectorExecutionRoleBindingFactory for StarRocksExecutionRoleBindingFactory {}
@@ -48,23 +52,21 @@ assert_rejected() {
   grep -Fq "$expected" "$metadata_path.stderr"
 }
 
-binding_server="$tmpdir/binding-server.json"
+retired_binding="$tmpdir/retired-binding.json"
 jq '
-  (.packages[] | select(.name == "novarocks-connector-binding") | .dependencies) += [{
-    name: "novarocks-server", kind: null, optional: false
-  }]
-' "$metadata" >"$binding_server"
-assert_rejected "$binding_server" \
-  "novarocks-connector-binding internal normal dependencies must be exactly"
+  .packages += [{name: "novarocks-connector-binding", id: "fixture#binding", dependencies: []}]
+' "$metadata" >"$retired_binding"
+assert_rejected "$retired_binding" \
+  "retired package must be absent: novarocks-connector-binding"
 
-backend_missing="$tmpdir/backend-missing-binding.json"
+backend_missing="$tmpdir/backend-missing-spi.json"
 jq '
   (.packages[] | select(.name == "novarocks-backend") | .dependencies) |= map(
-    select(.name != "novarocks-connector-binding")
+    select(.name != "novarocks-spi")
   )
 ' "$metadata" >"$backend_missing"
 assert_rejected "$backend_missing" \
-  "novarocks-backend must directly declare a normal dependency on novarocks-connector-binding"
+  "novarocks-backend must directly declare a normal dependency on novarocks-spi"
 
 touch "$source_root/novarocks/backend/src/connector/typed_registry.rs"
 if "$CHECKER" --metadata-path "$metadata" --source-root "$source_root" \

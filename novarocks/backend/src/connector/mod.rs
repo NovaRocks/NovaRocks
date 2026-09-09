@@ -22,6 +22,6 @@ pub(crate) mod write_data_plane;
 #[cfg(test)]
 pub(crate) mod write_test_support;
 
-pub use novarocks_connector_binding::{
+pub use novarocks_spi::connector::{
     ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
 };

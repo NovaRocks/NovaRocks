@@ -122,7 +122,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt_reservation: crate::query_execution::completion::QueryAttemptReservation,
 ) -> Result<PreparedIcebergWrite, String> {
-    debug_assert_eq!(target.backend_name, "iceberg");
+    debug_assert_eq!(target.provider_id.as_str(), "iceberg");
 
     // 1. Resolve the write target through the exact planning generation.
     //

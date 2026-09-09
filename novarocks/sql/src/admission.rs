@@ -40,9 +40,51 @@ pub fn query_allows_throw_exception_hint(query: &novarocks_parser::ast::Query) -
     })
 }
 
+/// Returns the positive per-statement execution-memory limit carried by a
+/// typed `SET_VAR(query_mem_limit = N)` hint.
+pub fn query_mem_limit_hint(query: &novarocks_parser::ast::Query) -> Option<i64> {
+    use novarocks_parser::ast::{BinaryOperator, Expr, LiteralKind, SelectHintValue, SetExpr};
+
+    let mut body = query.body.as_ref();
+    while let SetExpr::Query(nested) = body {
+        body = nested.body.as_ref();
+    }
+    let SetExpr::Select(select) = body else {
+        return None;
+    };
+    select.hints.iter().find_map(|hint| {
+        if !hint.name.value.eq_ignore_ascii_case("set_var") {
+            return None;
+        }
+        let SelectHintValue::Call { arguments } = &hint.value else {
+            return None;
+        };
+        arguments.iter().find_map(|argument| {
+            let Expr::Binary(binary) = argument else {
+                return None;
+            };
+            let Expr::Identifier(name) = binary.left.as_ref() else {
+                return None;
+            };
+            if binary.operator != BinaryOperator::Equal
+                || !name.value.eq_ignore_ascii_case("query_mem_limit")
+            {
+                return None;
+            }
+            let Expr::Literal(literal) = binary.right.as_ref() else {
+                return None;
+            };
+            let LiteralKind::Number(value) = &literal.kind else {
+                return None;
+            };
+            value.parse::<i64>().ok().filter(|value| *value > 0)
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::query_allows_throw_exception_hint;
+    use super::{query_allows_throw_exception_hint, query_mem_limit_hint};
 
     #[test]
     fn allow_throw_exception_uses_typed_set_var_hints() {
@@ -53,5 +95,16 @@ mod tests {
             panic!("expected query");
         };
         assert!(query_allows_throw_exception_hint(query));
+    }
+
+    #[test]
+    fn query_memory_limit_uses_typed_set_var_hints() {
+        let mut statements =
+            novarocks_parser::parse("SELECT /*+ SET_VAR(query_mem_limit = 1) */ 1")
+                .expect("typed hint fixture parses");
+        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_mut_slice() else {
+            panic!("expected query");
+        };
+        assert_eq!(query_mem_limit_hint(query), Some(1));
     }
 }

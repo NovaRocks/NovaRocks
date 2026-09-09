@@ -19,8 +19,8 @@ use novarocks_execution::runtime::fragment::io::{
 };
 use novarocks_execution::task_execution::identity::TaskIdentity;
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::task_execution::operation::decode_fetch_task_result;
 use novarocks_proto_models as proto;
+use novarocks_task_codec::operation::decode_fetch_task_result;
 use std::sync::Arc;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);

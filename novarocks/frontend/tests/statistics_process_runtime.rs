@@ -56,6 +56,10 @@ struct CancelAwareExecutor {
     finishes: AtomicUsize,
 }
 
+struct SuccessfulExecutor {
+    finishes: AtomicUsize,
+}
+
 impl StatisticsAttemptExecutor for CancelAwareExecutor {
     fn execute(
         &self,
@@ -84,6 +88,17 @@ impl StatisticsAttemptExecutor for CommitUnknownExecutor {
             novarocks_frontend::statistics_jobs::application::StatisticsPublicationTerminal::CommitUnknown,
             "connector outcome is unknown",
         ))
+    }
+}
+
+impl StatisticsAttemptExecutor for SuccessfulExecutor {
+    fn execute(
+        &self,
+        _job: &StatisticsJob,
+        _cancellation: novarocks_frontend::common::query_cancellation::QueryCancellationView,
+    ) -> Result<(), StatisticsAttemptError> {
+        self.finishes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -191,6 +206,41 @@ async fn commit_unknown_is_terminal_and_never_dispatches_another_mutation() {
     assert_eq!(executor.publishes.load(Ordering::SeqCst), 1);
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(executor.publishes.load(Ordering::SeqCst), 1);
+    worker.shutdown().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_finish_succeeds_once_and_late_cancel_cannot_rewrite_the_terminal() {
+    let repository = StatisticsJobRepository::new();
+    let executor = Arc::new(SuccessfulExecutor {
+        finishes: AtomicUsize::new(0),
+    });
+    let lifecycle = FrontendServingLifecycle::new();
+    lifecycle.mark_ready().expect("mark frontend ready");
+    let mut worker = StatisticsAnalyzeWorker::start(
+        &tokio::runtime::Handle::current(),
+        repository.clone(),
+        executor.clone(),
+        lifecycle,
+    )
+    .await
+    .unwrap();
+    let job = repository.create(create(now_ms())).await.unwrap();
+    let terminal = wait_terminal(&repository, job.job_id).await;
+    assert_eq!(terminal.state, StatisticsJobState::Succeeded);
+    assert_eq!(executor.finishes.load(Ordering::SeqCst), 1);
+
+    let error = repository
+        .request_cancel(job.job_id, now_ms())
+        .await
+        .expect_err("a terminal job is no longer a cancellable active attempt");
+    assert_eq!(error.kind(), StatisticsJobRepositoryErrorKind::NotFound);
+    assert_eq!(
+        repository.get(job.job_id).await.unwrap().unwrap().state,
+        StatisticsJobState::Succeeded
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(executor.finishes.load(Ordering::SeqCst), 1);
     worker.shutdown().unwrap();
 }
 

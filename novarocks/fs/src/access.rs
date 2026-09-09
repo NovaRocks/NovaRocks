@@ -19,11 +19,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use novarocks_spi::connector::{
     CredentialLeaseId, StaticCredentialReference, StorageAccessDomainId,
 };
@@ -60,6 +62,29 @@ pub enum ConditionalCreateOutcome {
     Created,
     AlreadyExists,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FsListEntry {
+    location: String,
+    size: u64,
+    is_dir: bool,
+}
+
+impl FsListEntry {
+    pub fn location(&self) -> &str {
+        &self.location
+    }
+
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub const fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+}
+
+pub type FsListStream = Pin<Box<dyn Stream<Item = FileResult<FsListEntry>> + Send + 'static>>;
 
 impl FsScheme {
     pub fn is_object_store(self) -> bool {
@@ -360,6 +385,72 @@ impl FsAccessHandle {
             .iter()
             .map(ResolvedFsPath::operator_relative_path)
             .collect()
+    }
+
+    /// List entries through this already-authorized storage client.
+    ///
+    /// The returned stream preserves OpenDAL's paginated traversal. The
+    /// caller supplies a fully qualified prefix in the same access domain;
+    /// this method never parses credentials or constructs another client.
+    pub async fn list_location(
+        &self,
+        prefix: impl AsRef<str>,
+        recursive: bool,
+        cancellation: &FileCancellation,
+    ) -> FileResult<FsListStream> {
+        cancellation.check()?;
+        let location = FsLocation::parse(prefix.as_ref())?;
+        let bound = self.bind_location(
+            location.original(),
+            FileIdentity::new(location.original(), 0, None),
+        )?;
+        let list_path = bound
+            .operator_relative_path()
+            .trim_end_matches('/')
+            .to_string()
+            + "/";
+        let lister = self
+            .operator
+            .lister_with(&list_path)
+            .recursive(recursive)
+            .await
+            .map_err(|error| map_opendal_error("list files", error))?;
+        cancellation.check()?;
+
+        let uri_scheme = location.uri_scheme().map(ToOwned::to_owned);
+        let authority = location.authority().map(ToOwned::to_owned);
+        let local_root = self.root.clone();
+        let scheme = self.scheme;
+        let cancellation = cancellation.clone();
+        Ok(Box::pin(lister.map(move |entry| {
+            cancellation.check()?;
+            let entry = entry.map_err(|error| map_opendal_error("list files", error))?;
+            let path = entry.path();
+            let location = match scheme {
+                FsScheme::ObjectStore | FsScheme::Hdfs => format!(
+                    "{}://{}/{}",
+                    uri_scheme.as_deref().unwrap_or(match scheme {
+                        FsScheme::ObjectStore => "s3",
+                        FsScheme::Hdfs => "hdfs",
+                        FsScheme::Local => unreachable!(),
+                    }),
+                    authority.as_deref().unwrap_or_default(),
+                    path.trim_start_matches('/')
+                ),
+                FsScheme::Local => {
+                    let path = match local_root.as_deref() {
+                        Some(root) if root != "." => Path::new(root).join(path),
+                        _ => PathBuf::from(path),
+                    };
+                    path.to_string_lossy().into_owned()
+                }
+            };
+            Ok(FsListEntry {
+                location,
+                size: entry.metadata().content_length(),
+                is_dir: entry.metadata().is_dir(),
+            })
+        })))
     }
 
     /// Atomically create one authorized path without replacing an existing file.

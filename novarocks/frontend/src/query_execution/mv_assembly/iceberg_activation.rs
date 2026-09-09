@@ -202,7 +202,8 @@ pub(crate) fn begin_first_refresh_connector_write_session(
         );
     }
     let target = crate::catalog_application::resolver::TargetBackend {
-        backend_name: "iceberg",
+        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+            .expect("static Iceberg provider ID"),
         catalog: prepared.target_catalog().to_string(),
         namespace: prepared.target_namespace().to_string(),
         table: prepared.target_name().to_string(),
@@ -389,7 +390,8 @@ pub(crate) fn begin_incremental_connector_write_session(
     typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
 ) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
     let target = crate::catalog_application::resolver::TargetBackend {
-        backend_name: "iceberg",
+        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+            .expect("static Iceberg provider ID"),
         catalog: request.target_catalog.clone(),
         namespace: request.target_namespace.clone(),
         table: request.target_name.clone(),

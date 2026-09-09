@@ -25,9 +25,10 @@ use novarocks_secret::SecretValue;
 
 use super::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
-    ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
-    CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
+    ConnectorRequestResources, ConnectorVendedCredentialLeaseCollectionPort,
+    ConnectorVendedCredentialLeaseSink, CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES,
+    StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 
 pub trait ConnectorCancellation: Send + Sync {
@@ -235,6 +236,7 @@ pub struct ConnectorRequestContext {
     vended_credential_lease_sink: Option<Arc<dyn ConnectorVendedCredentialLeaseSink>>,
     vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
     request_scope: ConnectorRequestScope,
+    resources: Option<ConnectorRequestResources>,
 }
 
 impl ConnectorRequestContext {
@@ -264,6 +266,7 @@ impl ConnectorRequestContext {
             vended_credential_lease_sink: None,
             vended_credential_lease_collection: None,
             request_scope: ConnectorRequestScope::new(),
+            resources: None,
         })
     }
 
@@ -282,6 +285,12 @@ impl ConnectorRequestContext {
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
     ) -> Self {
         self.storage_resolver = Some(storage_resolver);
+        self
+    }
+
+    /// Installs the host ledger after this query or task has been admitted.
+    pub fn with_resources(mut self, resources: ConnectorRequestResources) -> Self {
+        self.resources = Some(resources);
         self
     }
 
@@ -347,6 +356,17 @@ impl ConnectorRequestContext {
         self.storage_resolver.as_ref()
     }
 
+    /// Runtime readers fail closed when the host did not install a ledger;
+    /// absence never means an unlimited or untracked request.
+    pub fn resources(&self) -> Result<&ConnectorRequestResources, ConnectorError> {
+        self.resources.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector request resources were not installed after admission",
+            )
+        })
+    }
+
     /// The base query-attempt sink before a metadata call decorates it with
     /// one exact catalog generation.
     pub fn vended_credential_lease_sink(
@@ -383,12 +403,45 @@ fn invalid_storage_route() -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedVendedS3Access, StorageAccessRequest};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{
+        ConnectorCancellation, ConnectorRequestContext, ResolvedVendedS3Access,
+        StorageAccessRequest,
+    };
     use crate::connector::{
-        CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseId,
+        CatalogHandle, CatalogVersion, ConnectorError, ConnectorInstanceId,
+        ConnectorRequestResources, ConnectorResourceCheckpoint, ConnectorResourceClass,
+        ConnectorResourceLease, ConnectorResourceLedger, CredentialLeaseId,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         StorageAccessDomainId, StorageCredentialScopePrefix,
     };
     use novarocks_secret::SecretValue;
+
+    struct Active;
+
+    impl ConnectorCancellation for Active {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct EmptyLedger;
+
+    impl ConnectorResourceLedger for EmptyLedger {
+        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+            Ok(ConnectorResourceCheckpoint::new(1))
+        }
+
+        fn try_reserve(
+            &self,
+            _class: ConnectorResourceClass,
+            _bytes: u64,
+        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
+            unreachable!("this test only checks resource installation")
+        }
+    }
 
     #[test]
     fn storage_request_rejects_noncanonical_or_credentialed_location() {
@@ -428,5 +481,27 @@ mod tests {
         assert!(!rendered.contains("access-canary"));
         assert!(!rendered.contains("secret-canary"));
         assert!(!rendered.contains("token-canary"));
+    }
+
+    #[test]
+    fn request_resources_are_absent_until_the_host_installs_them() {
+        let context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(Active),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap();
+        assert!(context.resources().is_err());
+        let context = context.with_resources(ConnectorRequestResources::new(Arc::new(EmptyLedger)));
+        assert_eq!(
+            context
+                .resources()
+                .unwrap()
+                .checkpoint()
+                .unwrap()
+                .sequence(),
+            1
+        );
     }
 }

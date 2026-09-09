@@ -25,11 +25,11 @@
 
 use std::sync::Arc;
 
+use crate::wire::dto;
 use novarocks_proto_codec::connector_read::{
     MAX_AFFINITY_KEY_BYTES, MAX_DELETES_PER_SPLIT, MAX_ENCRYPTION_MATERIAL_BYTES,
     MAX_EQUALITY_FIELD_IDS, MAX_JSON_BYTES, MAX_PATH_BYTES,
 };
-use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{ConnectorSplit, HostAddress, SplitWeight, TupleDomain};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -708,24 +708,6 @@ impl IcebergSplit {
         }
     }
 
-    /// Encode this split into the neutral scheduler envelope.
-    ///
-    /// Iceberg splits are remotely accessible and name no addresses: any
-    /// admitted backend can read object storage, so pinning one would only
-    /// hurt scheduling.
-    pub fn to_connector_split_proto(&self) -> dto::ConnectorSplit {
-        dto::ConnectorSplit {
-            split_weight_raw: self.split_weight.raw_value(),
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            affinity_key: self.affinity_key.as_ref().map(|key| key.to_string()),
-            retained_size_in_bytes: self.retained_size_in_bytes,
-            category: Some(dto::connector_split::Category::Data(dto::DataSplit {
-                provider: Some(dto::data_split::Provider::Iceberg(self.to_proto())),
-            })),
-        }
-    }
-
     pub fn from_proto(
         raw: &dto::IcebergSplit,
         split_weight: SplitWeight,
@@ -761,38 +743,6 @@ impl IcebergSplit {
             split_weight,
             affinity_key,
         })
-    }
-
-    pub fn from_connector_split_proto(raw: &dto::ConnectorSplit) -> Result<Self, ConnectorError> {
-        if !raw.remotely_accessible {
-            return Err(invalid("an iceberg split is always remotely accessible"));
-        }
-        if !raw.addresses.is_empty() {
-            return Err(invalid("an iceberg split names no host addresses"));
-        }
-        let split_weight = SplitWeight::try_from_raw(raw.split_weight_raw)?;
-        let category = raw
-            .category
-            .as_ref()
-            .ok_or_else(|| invalid("connector split category must be present"))?;
-        let data = match category {
-            dto::connector_split::Category::Data(data) => data,
-            dto::connector_split::Category::TableChanges(_)
-            | dto::connector_split::Category::ChangeWindow(_)
-            | dto::connector_split::Category::SystemFiles(_)
-            | dto::connector_split::Category::RewritePositionDeleteFiles(_) => {
-                return Err(invalid("connector split is not an iceberg data split"));
-            }
-        };
-        let provider = data
-            .provider
-            .as_ref()
-            .ok_or_else(|| invalid("data split provider variant must be present"))?;
-        match provider {
-            dto::data_split::Provider::Iceberg(iceberg) => {
-                Self::from_proto(iceberg, split_weight, raw.affinity_key.clone())
-            }
-        }
     }
 }
 
@@ -1084,7 +1034,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn splits_round_trip_through_the_neutral_envelope() {
+    fn splits_round_trip_through_the_private_wire_value() {
         let mut params = split_params("s3://bucket/a.parquet", 0, 128, 256);
         params.deletes = vec![
             position_delete("p0.parquet"),
@@ -1093,10 +1043,13 @@ pub(super) mod tests {
         params.split_weight = SplitWeight::try_from_raw(37).expect("weight");
         let split = IcebergSplit::try_new(params).expect("split");
 
-        let encoded = split.to_connector_split_proto();
-        assert!(encoded.remotely_accessible);
-        assert!(encoded.addresses.is_empty());
-        let decoded = IcebergSplit::from_connector_split_proto(&encoded).expect("decoded");
+        let encoded = split.to_proto();
+        let decoded = IcebergSplit::from_proto(
+            &encoded,
+            ConnectorSplit::split_weight(&split),
+            ConnectorSplit::affinity_key(&split).map(ToOwned::to_owned),
+        )
+        .expect("decoded");
         assert_eq!(decoded.path(), split.path());
         assert_eq!(decoded.start(), split.start());
         assert_eq!(decoded.length(), split.length());
@@ -1115,33 +1068,11 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn an_unspecified_or_foreign_wire_split_is_rejected() {
+    fn an_unspecified_private_wire_split_is_rejected() {
         let split = IcebergSplit::try_new(split_params("a.parquet", 0, 10, 10)).expect("split");
         let mut raw = split.to_proto();
         raw.file_format = dto::IcebergFileFormat::Unspecified as i32;
         assert!(IcebergSplit::from_proto(&raw, SplitWeight::STANDARD, None).is_err());
-
-        let foreign = dto::ConnectorSplit {
-            split_weight_raw: STANDARD_SPLIT_WEIGHT_RAW,
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            affinity_key: None,
-            retained_size_in_bytes: 1,
-            category: Some(dto::connector_split::Category::SystemFiles(
-                dto::SystemFilesSplitCategory { provider: None },
-            )),
-        };
-        assert!(IcebergSplit::from_connector_split_proto(&foreign).is_err());
-
-        let empty = dto::ConnectorSplit {
-            split_weight_raw: STANDARD_SPLIT_WEIGHT_RAW,
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            affinity_key: None,
-            retained_size_in_bytes: 1,
-            category: None,
-        };
-        assert!(IcebergSplit::from_connector_split_proto(&empty).is_err());
     }
 
     #[test]

@@ -28,13 +28,15 @@ the native NovaRocks FE/BE role model; one binary starts a `fe`, `be`, or
 - `all-in-one` is a test and local-development convenience. It keeps the FE/BE
   application boundary rather than adding a direct-call shortcut.
 
-StarRocks is supported only as a read-only external Connector. RPC reads can
-serve every StarRocks topology; direct reads permanently require shared-data.
-NovaRocks is not a StarRocks BE-compatible server and does not own a native
-internal StarRocks table type.
+The binary's sealed active Connector providers are Iceberg and Paimon. Iceberg
+supports the existing read/write surface; Paimon currently supports bounded
+snapshot reads for append-only and `deduplicate` primary-key tables. The
+StarRocks connector source is retained only as retired reference code: it has no
+active read capability, and Server rejects legacy `[connector.starrocks]`
+configuration.
 
 NovaRocks is still experimental and is not production-ready. It is useful for
-iterating on distributed execution, connector, and Iceberg semantics and for
+iterating on distributed execution, connector, Iceberg, and Paimon semantics and for
 running local SQL experiments on macOS/Linux.
 
 ## Current Scope
@@ -59,8 +61,8 @@ Implemented or actively exercised areas include:
   - Iceberg SELECT, INSERT, DELETE, UPDATE/MERGE-related mutation flows, schema
     changes, refs, and compaction experiments
   - Iceberg-backed materialized-view lifecycle work
-  - StarRocks external Connector with RPC remote reads for all topologies and
-    shared-data-only direct reads
+  - Paimon Filesystem Catalog reads for Parquet append-only and `deduplicate`
+    primary-key tables over shared S3-compatible storage
 
 Known limits:
 
@@ -69,8 +71,8 @@ Known limits:
   validation.
 - Share-nothing mode is not supported; share-data style storage is the main
   target.
-- Some Iceberg features are phase-based and may have narrow
-  contract support rather than full StarRocks parity.
+- Some Iceberg features are phase-based and may have narrow contract support
+  rather than full upstream feature parity.
 
 ## Architecture
 
@@ -178,8 +180,9 @@ enable_path_style_access = true
 `[state_store]` is the frontend-owned durable control-plane store, not a backend
 membership registry. Every BE self-registers to the FE native endpoint and is
 eligible only after its authenticated announce and FE-pull heartbeat agree on its
-process identity. Persistent
-user tables belong to explicitly created external Iceberg catalogs;
+process identity. Persistent user tables belong to explicitly created external
+Iceberg or Paimon catalogs; only Iceberg currently supplies native write
+capabilities.
 `[connector.object_store]` supplies process-local object-store credentials for
 connector execution and does not create a native internal table store.
 
@@ -338,8 +341,9 @@ Common suites include `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`,
 
 ### Native development
 
-The root workspace builds the native FE/BE runtime and external Connector
-crates without a StarRocks server toolchain.
+The root workspace builds the native FE/BE runtime and the active Iceberg and
+Paimon Connector crates without a StarRocks server toolchain. The retired
+StarRocks connector crate is not part of the Server provider manifest.
 
 ```bash
 cargo fmt --all

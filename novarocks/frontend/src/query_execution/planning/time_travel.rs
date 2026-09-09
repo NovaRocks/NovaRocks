@@ -406,7 +406,7 @@ fn rewrite_time_travel_in_factor(
             let target =
                 resolve_table_target(resolver, &our_name, current_catalog, current_database)?;
 
-            if target.backend_name != "iceberg" {
+            if target.provider_id.as_str() != "iceberg" {
                 return Err(format!(
                     "iceberg time travel: table '{}' is not an Iceberg table; time travel is only supported for Iceberg",
                     our_name
@@ -546,7 +546,7 @@ pub(crate) fn external_schema_columns_for_statement(
     name: &ObjectName,
 ) -> Result<Option<Vec<ColumnDef>>, String> {
     let target = resolve_table_target(resolver, name, current_catalog, current_database)?;
-    if target.backend_name != "iceberg" {
+    if target.provider_id.as_str() != "iceberg" {
         // Non-Iceberg sources are already represented in the local catalog.
         return Ok(None);
     }

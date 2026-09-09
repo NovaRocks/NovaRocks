@@ -26,8 +26,8 @@ use novarocks_execution::task_execution::TaskExecutionBudgets;
 
 use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
-use novarocks_connector_binding::ConnectorControlRoleBindingFactory;
 use novarocks_native_trust::NativeTrust;
+use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 use novarocks_types::NativeCompatibilityId;
 

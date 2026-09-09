@@ -987,7 +987,8 @@ fn first_refresh_target_handle(
         crate::catalog_application::resolver::iceberg_connector_table_handle(
             write_lease,
             &crate::catalog_application::resolver::TargetBackend {
-                backend_name: "iceberg",
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("static Iceberg provider ID"),
                 catalog: target.catalog.clone(),
                 namespace: target.namespace.clone(),
                 table: target.table.clone(),

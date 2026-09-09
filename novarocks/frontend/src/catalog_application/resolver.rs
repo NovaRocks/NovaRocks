@@ -25,15 +25,15 @@ use std::sync::Arc;
 
 use crate::catalog_application::CatalogApplicationPort;
 use novarocks_spi::connector::{
-    ConnectorInstanceId, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution, ConnectorWriteLease,
+    ConnectorInstanceId, ConnectorProviderId, ConnectorTableHandle, ConnectorTableIdentity,
+    ConnectorTableRequest, ConnectorTableResolution, ConnectorWriteLease,
 };
 use novarocks_sql::semantic::ObjectName;
 use novarocks_types::naming::{resolve_catalog_namespace_name, resolve_catalog_table_name};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetBackend {
-    pub backend_name: &'static str,
+    pub provider_id: ConnectorProviderId,
     pub catalog: String,
     pub namespace: String,
     pub table: String,
@@ -60,12 +60,12 @@ fn is_default_catalog(value: &str) -> bool {
 }
 
 fn default_catalog_error() -> String {
-    "default_catalog is not a user table catalog; create an external Iceberg catalog and SET catalog before using persistent tables".to_string()
+    "default_catalog is not a user table catalog; create an external catalog and SET catalog before using persistent tables".to_string()
 }
 
 fn missing_current_catalog_error(kind: &str) -> String {
     format!(
-        "{kind} requires an Iceberg catalog; create an external Iceberg catalog and SET catalog before using persistent tables"
+        "{kind} requires an external catalog; create one and SET catalog before using persistent tables"
     )
 }
 
@@ -108,9 +108,9 @@ pub fn resolve_table_target(
 
     let resolved =
         resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
-    require_catalog_admission(admission, &resolved.catalog)?;
+    let provider_id = require_catalog_admission(admission, &resolved.catalog)?;
     Ok(TargetBackend {
-        backend_name: "iceberg",
+        provider_id,
         catalog: resolved.catalog,
         namespace: resolved.namespace,
         table: resolved.table,
@@ -130,9 +130,9 @@ pub fn resolve_existing_table_target(
 
     let resolved =
         resolve_catalog_table_name(name.parts.as_slice(), current_catalog, current_database)?;
-    require_catalog_admission(admission, &resolved.catalog)?;
+    let provider_id = require_catalog_admission(admission, &resolved.catalog)?;
     Ok(TargetBackend {
-        backend_name: "iceberg",
+        provider_id,
         catalog: resolved.catalog,
         namespace: resolved.namespace,
         table: resolved.table,
@@ -150,9 +150,9 @@ pub fn resolve_namespace_target(
     }
 
     let resolved = resolve_catalog_namespace_name(name.parts.as_slice(), current_catalog)?;
-    require_catalog_admission(admission, &resolved.catalog)?;
+    let provider_id = require_catalog_admission(admission, &resolved.catalog)?;
     Ok(TargetBackend {
-        backend_name: "iceberg",
+        provider_id,
         catalog: resolved.catalog,
         namespace: resolved.namespace,
         table: String::new(),
@@ -162,16 +162,18 @@ pub fn resolve_namespace_target(
 fn require_catalog_admission(
     admission: &impl CatalogAdmission,
     catalog: &str,
-) -> Result<(), String> {
+) -> Result<ConnectorProviderId, String> {
     let Some(application) = admission.catalog_application() else {
-        return Ok(());
+        return Err(format!(
+            "catalog `{catalog}` cannot be resolved without the frontend catalog application"
+        ));
     };
     let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
         .map_err(|error| format!("invalid catalog connector instance ID: {error}"))?;
     application
         .admit_catalog(&instance_id)
         .require_ready(&instance_id)
-        .map(|_| ())
+        .map(|observation| observation.provider_id)
         .map_err(|error| error.to_string())
 }
 
@@ -185,6 +187,12 @@ pub fn iceberg_connector_table_handle(
     target: &TargetBackend,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ConnectorTableHandle, String> {
+    if target.provider_id.as_str() != "iceberg" {
+        return Err(format!(
+            "Iceberg write preparation does not support provider `{}`",
+            target.provider_id.as_str()
+        ));
+    }
     let instance_id = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
     if !exact_lease.matches_provider_instance(&instance_id) {
@@ -273,6 +281,41 @@ mod tests {
         }
     }
 
+    struct ReadyCatalogApplication {
+        provider_id: ConnectorProviderId,
+    }
+
+    impl CatalogApplicationPort for ReadyCatalogApplication {
+        fn create_catalog(
+            &self,
+            _command: CatalogCreateCommand,
+        ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
+            Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                "not used by backend resolver test",
+            ))
+        }
+
+        fn drop_catalog(
+            &self,
+            _command: CatalogDropCommand,
+        ) -> Result<(), CatalogApplicationError> {
+            Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                "not used by backend resolver test",
+            ))
+        }
+
+        fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission {
+            CatalogAdmission::Ready(CatalogRuntimeObservation {
+                attachment_id: uuid::Uuid::nil(),
+                instance_id: instance_id.clone(),
+                provider_id: self.provider_id.clone(),
+                generation: 7,
+            })
+        }
+    }
+
     #[test]
     fn external_table_target_requires_catalog_admission_when_port_is_configured() {
         let admission = TestCatalogAdmission {
@@ -308,10 +351,10 @@ mod tests {
             None,
             "default_db",
         )
-        .expect_err("CREATE TABLE without a current Iceberg catalog must fail");
+        .expect_err("CREATE TABLE without a current external catalog must fail");
         assert_eq!(
             error,
-            "CREATE TABLE requires an Iceberg catalog; create an external Iceberg catalog and SET catalog before using persistent tables"
+            "CREATE TABLE requires an external catalog; create one and SET catalog before using persistent tables"
         );
 
         let error = resolve_namespace_target(
@@ -321,10 +364,10 @@ mod tests {
             },
             None,
         )
-        .expect_err("CREATE DATABASE without a current Iceberg catalog must fail");
+        .expect_err("CREATE DATABASE without a current external catalog must fail");
         assert_eq!(
             error,
-            "CREATE DATABASE requires an Iceberg catalog; create an external Iceberg catalog and SET catalog before using persistent tables"
+            "CREATE DATABASE requires an external catalog; create one and SET catalog before using persistent tables"
         );
     }
 
@@ -333,7 +376,7 @@ mod tests {
         let admission = TestCatalogAdmission {
             application: Arc::new(AbsentCatalogApplication),
         };
-        let expected = "default_catalog is not a user table catalog; create an external Iceberg catalog and SET catalog before using persistent tables";
+        let expected = "default_catalog is not a user table catalog; create an external catalog and SET catalog before using persistent tables";
 
         // Qualified by name, regardless of the session catalog.
         let error = resolve_table_target(
@@ -378,5 +421,33 @@ mod tests {
         )
         .expect_err("default_catalog rejection must ignore casing");
         assert_eq!(error, expected);
+    }
+
+    #[test]
+    fn external_target_uses_the_admitted_catalog_provider_identity() {
+        let admission = TestCatalogAdmission {
+            application: Arc::new(ReadyCatalogApplication {
+                provider_id: ConnectorProviderId::parse("paimon").expect("provider ID"),
+            }),
+        };
+
+        let target = resolve_existing_table_target(
+            &admission,
+            &ObjectName {
+                parts: vec![
+                    "warehouse".to_string(),
+                    "sales".to_string(),
+                    "orders".to_string(),
+                ],
+            },
+            None,
+            "default_db",
+        )
+        .expect("ready Paimon catalog target");
+
+        assert_eq!(target.provider_id.as_str(), "paimon");
+        assert_eq!(target.catalog, "warehouse");
+        assert_eq!(target.namespace, "sales");
+        assert_eq!(target.table, "orders");
     }
 }

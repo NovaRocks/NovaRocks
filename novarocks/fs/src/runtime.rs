@@ -19,6 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -29,11 +30,26 @@ use crate::{FileError, FileResult};
 #[derive(Clone, Default)]
 pub struct FileCancellation {
     cancelled: Arc<AtomicBool>,
+    connector_cancellation: Option<Arc<dyn novarocks_spi::connector::ConnectorCancellation>>,
+    deadline: Option<Instant>,
 }
 
 impl FileCancellation {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bind file operations to the cancellation and deadline of one admitted
+    /// connector request without spawning a polling task or retaining the
+    /// request's resource ledger.
+    pub fn from_connector_request(
+        request: &novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            connector_cancellation: Some(Arc::clone(request.cancellation())),
+            deadline: Some(request.deadline()),
+        }
     }
 
     pub fn cancel(&self) {
@@ -42,11 +58,28 @@ impl FileCancellation {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+            || self
+                .connector_cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     pub fn check(&self) -> FileResult<()> {
-        if self.is_cancelled() {
+        if self.cancelled.load(Ordering::Acquire)
+            || self
+                .connector_cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
             Err(FileError::cancelled("file operation cancelled"))
+        } else if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            Err(FileError::deadline("file operation deadline elapsed"))
         } else {
             Ok(())
         }
@@ -57,6 +90,8 @@ impl std::fmt::Debug for FileCancellation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileCancellation")
             .field("cancelled", &self.is_cancelled())
+            .field("connector_bound", &self.connector_cancellation.is_some())
+            .field("deadline", &self.deadline)
             .finish()
     }
 }
@@ -158,8 +193,57 @@ impl FileTaskSpawner for TokioFileTaskSpawner {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use super::*;
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    };
+
+    struct ToggleCancellation(AtomicBool);
+
+    impl ConnectorCancellation for ToggleCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    #[test]
+    fn connector_request_cancellation_and_deadline_reach_file_operations() {
+        let upstream = Arc::new(ToggleCancellation(AtomicBool::new(false)));
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            upstream.clone(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request");
+        let cancellation = FileCancellation::from_connector_request(&request);
+        cancellation.check().expect("active request");
+
+        upstream.0.store(true, Ordering::Release);
+        assert_eq!(
+            cancellation.check().expect_err("cancelled request").kind(),
+            crate::FileErrorKind::Cancelled
+        );
+
+        let expired = ConnectorRequestContext::try_new(
+            Instant::now() - Duration::from_millis(1),
+            Arc::new(ToggleCancellation(AtomicBool::new(false))),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("expired request");
+        assert_eq!(
+            FileCancellation::from_connector_request(&expired)
+                .check()
+                .expect_err("expired request")
+                .kind(),
+            crate::FileErrorKind::DeadlineExceeded
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn file_io_runtime_bridges_from_its_runtime_worker() {

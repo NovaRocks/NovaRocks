@@ -1,0 +1,129 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[package]
+categories = ["database"]
+description = "The rust implementation of Apache Paimon"
+documentation = "https://docs.rs/paimon"
+name = "paimon"
+publish = ["crates-io"]
+
+homepage.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["storage-memory", "storage-fs", "storage-oss"]
+storage-all = [
+    "storage-memory",
+    "storage-fs",
+    "storage-oss",
+    "storage-s3",
+    "storage-cos",
+    "storage-azdls",
+    "storage-obs",
+    "storage-gcs",
+    "storage-hdfs",
+]
+fulltext = ["dep:paimon-ftindex-core", "dep:tempfile"]
+vortex = ["dep:vortex"]
+
+storage-memory = ["opendal/services-memory"]
+storage-fs = ["dep:opendal-service-fs"]
+storage-oss = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-oss"]
+storage-s3 = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-s3"]
+storage-cos = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-cos"]
+storage-azdls = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-azdls"]
+storage-obs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-obs"]
+storage-gcs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-gcs"]
+storage-hdfs = ["dep:opendal-service-hdfs-native"]
+
+[dependencies]
+url = "2.5.2"
+async-trait = "0.1.81"
+bytes = "1.7.1"
+bitflags = "2.6.0"
+tokio = { version = "1.39.2", features = ["fs", "io-util", "macros", "sync", "time"] }
+chrono = { version = "0.4.38", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11.15"
+serde_json = "1.0.120"
+serde_with = "3.9.0"
+serde_repr = "0.1"
+snafu = "0.9.0"
+typed-builder = "^0.19"
+opendal = { package = "opendal-core", version = "0.58.0" }
+opendal-http-transport-reqwest = { version = "0.58.0", optional = true }
+opendal-service-azdls = { version = "0.58.0", optional = true }
+opendal-service-cos = { version = "0.58.0", optional = true }
+opendal-service-fs = { version = "0.58.0", optional = true }
+opendal-service-gcs = { version = "0.58.0", optional = true }
+opendal-service-hdfs-native = { version = "0.58.0", optional = true }
+opendal-service-obs = { version = "0.58.0", optional = true }
+opendal-service-oss = { version = "0.58.0", optional = true }
+opendal-service-s3 = { version = "0.58.0", optional = true }
+pretty_assertions = "1"
+apache-avro = { version = "0.21", features = ["snappy", "zstandard"] }
+indexmap = "2.5.0"
+roaring = "0.11"
+crc32fast = "1"
+zstd = "0.13"
+snap = "1"
+lz4_flex = "0.11"
+arrow-array = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-row = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
+arrow-string = { workspace = true }
+futures = "0.3"
+tokio-util = { workspace = true, features = ["compat"] }
+parquet = { workspace = true, features = ["async", "zstd", "lz4", "snap"] }
+orc-rust = "0.8.0"
+async-stream = "0.3.6"
+reqwest = { version = "0.12", features = ["json"] }
+# DLF authentication dependencies
+base64 = "0.22"
+hex = "0.4"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+urlencoding = "2.1"
+paimon-mosaic-core = "0.2.0"
+paimon-ftindex-core = { version = "0.1.0", optional = true }
+tempfile = { version = "3", optional = true }
+paimon-vindex-core = "0.2.0"
+vortex = { version = "0.75.0", features = ["tokio"], optional = true }
+libloading = "0.9"
+log = "0.4"
+# Keep CI on the dependency set that passed before unicode-segmentation 1.13.3.
+# The 1.13.3 resolver update correlates with Linux Vortex tests hanging.
+unicode-segmentation = "=1.13.2"
+
+[dev-dependencies]
+axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
+rand = "0.8.5"
+tempfile = "3"

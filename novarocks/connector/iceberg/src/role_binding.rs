@@ -26,18 +26,18 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use novarocks_connector_binding::{
+use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
+use novarocks_spi::connector::write_stack::ConnectorWriteExecutionFactory;
+use novarocks_spi::connector::{
+    CatalogProperties, ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
+    ConnectorProviderId,
+};
+use novarocks_spi::connector::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
     ConnectorControlWriteBinding, ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding,
     ConnectorExecutionRoleBindingFactory, ConnectorExecutionWriteBinding,
     ConnectorMaterializationError, ConnectorMaterializationErrorClass,
     ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
-};
-use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
-use novarocks_spi::connector::write_stack::ConnectorWriteExecutionFactory;
-use novarocks_spi::connector::{
-    CatalogProperties, CatalogProviderKind, ConnectorControlFactoryRequest, ConnectorError,
-    ConnectorErrorKind,
 };
 
 use crate::commit::write_stack::codec::{
@@ -74,8 +74,8 @@ impl IcebergControlRoleBindingFactory {
 }
 
 impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
-    fn provider_kind(&self) -> CatalogProviderKind {
-        CatalogProviderKind::Iceberg
+    fn provider_id(&self) -> ConnectorProviderId {
+        ConnectorProviderId::parse("iceberg").expect("static provider ID")
     }
 
     fn normalize_and_validate(
@@ -259,8 +259,8 @@ impl IcebergExecutionRoleBindingFactory {
 }
 
 impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory {
-    fn provider_kind(&self) -> CatalogProviderKind {
-        CatalogProviderKind::Iceberg
+    fn provider_id(&self) -> ConnectorProviderId {
+        ConnectorProviderId::parse("iceberg").expect("static provider ID")
     }
 
     fn bind(
@@ -314,7 +314,7 @@ struct RoleReadRegistrationLease;
 impl ConnectorReadRegistrationLease for RoleReadRegistrationLease {}
 
 fn ensure_iceberg(properties: &CatalogProperties) -> Result<(), ConnectorMaterializationError> {
-    if properties.provider_kind() == CatalogProviderKind::Iceberg {
+    if properties.provider_id().as_str() == "iceberg" {
         return Ok(());
     }
     Err(ConnectorMaterializationError::new(
@@ -338,8 +338,8 @@ mod tests {
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_codec::connector_write::{
-        ConnectorWriteFragmentEncoder, ConnectorWriteHandleEncoder, ValidatedCommitFragment,
-        ValidatedWriterHandle,
+        ConnectorWriteFragmentDecoder, ConnectorWriteFragmentEncoder, ConnectorWriteHandleDecoder,
+        ConnectorWriteHandleEncoder, ValidatedCommitFragment, ValidatedWriterHandle,
     };
     use novarocks_spi::connector::{
         CatalogHandle, CatalogProperty, CatalogVersion, ConnectorInstanceId,
@@ -386,7 +386,7 @@ mod tests {
                 ConnectorInstanceId::parse("catalog.iceberg").expect("catalog"),
                 CatalogVersion::from_bytes([9; 32]),
             ),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             Vec::new(),
             Vec::new(),
@@ -472,7 +472,7 @@ mod tests {
                 ConnectorInstanceId::parse("catalog.iceberg").expect("catalog"),
                 CatalogVersion::from_bytes([8; 32]),
             ),
-            CatalogProviderKind::Iceberg,
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
             1,
             vec![
                 CatalogProperty::new(
