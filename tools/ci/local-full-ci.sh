@@ -464,6 +464,8 @@ run_fail_fast_stage() {
 run_cargo_gates() {
   run_fail_fast_stage "locked Cargo metadata" "cargo-metadata.log" \
     cargo metadata --locked --format-version 1 --no-deps
+  run_fail_fast_stage "Cargo dependency policy" "cargo-deny.log" \
+    cargo deny --locked check advisories bans licenses sources
   run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
     tools/ci/check-generated-artifacts.sh
   run_fail_fast_stage "DataSketches resolved source" "datasketches-source.log" \

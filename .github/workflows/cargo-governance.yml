@@ -45,5 +45,8 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
       - name: Run Cargo governance gates
         run: tools/ci/local-full-ci.sh --cargo-only

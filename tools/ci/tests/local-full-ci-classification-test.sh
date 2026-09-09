@@ -88,6 +88,12 @@ if ! grep -Fx \
   exit 1
 fi
 if ! grep -Fx \
+  "Cargo dependency policy|cargo-deny.log|cargo deny --locked check advisories bans licenses sources" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must enforce the resolved dependency policy" >&2
+  exit 1
+fi
+if ! grep -Fx \
   "cargo check all targets|cargo-check-all-targets.log|cargo check --workspace --all-targets --locked" \
   "$stage_capture" >/dev/null; then
   echo "local full CI must check every workspace target with the committed lock" >&2
