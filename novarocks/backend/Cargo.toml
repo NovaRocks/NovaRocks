@@ -13,6 +13,7 @@ doctest = false
 
 [dependencies]
 novarocks-execution.workspace = true
+novarocks-execution-contract.workspace = true
 novarocks-functions.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 novarocks-native-trust.workspace = true
@@ -32,6 +33,7 @@ hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 novarocks-types.workspace = true
 novarocks-version.workspace = true
+novarocks-worker.workspace = true
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 prometheus.workspace = true
 prost.workspace = true

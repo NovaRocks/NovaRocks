@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
-use novarocks_execution::task_execution::TaskExecutionBudgets;
+use novarocks_query_application::coordination::CoordinationBudgets;
+use novarocks_task_codec::TransportBudget;
 
 use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
@@ -219,7 +220,8 @@ pub struct FrontendExecutionConfig {
     /// Held here rather than read per attempt so a deployment's bounds cannot
     /// change while the process runs, and so an attempt never has to invent
     /// one that configuration failed to supply.
-    task_execution_budgets: TaskExecutionBudgets,
+    coordination_budgets: CoordinationBudgets,
+    transport_budget: TransportBudget,
     /// Connector split enumeration's bounded, server-owned initial feedback
     /// wait. This is frozen at startup and deliberately has no SQL override.
     connector_split_initial_dynamic_filter_wait_cap: Duration,
@@ -255,7 +257,8 @@ impl FrontendExecutionConfig {
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
-            task_execution_budgets: TaskExecutionBudgets::DEFAULT,
+            coordination_budgets: CoordinationBudgets::DEFAULT,
+            transport_budget: TransportBudget::DEFAULT,
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             lake_publication_runtime_policy: LakePublicationRuntimePolicy::try_new(
@@ -301,8 +304,13 @@ impl FrontendExecutionConfig {
         self
     }
 
-    pub fn with_task_execution_budgets(mut self, budgets: TaskExecutionBudgets) -> Self {
-        self.task_execution_budgets = budgets;
+    pub fn with_task_execution_budgets(
+        mut self,
+        coordination: CoordinationBudgets,
+        transport: TransportBudget,
+    ) -> Self {
+        self.coordination_budgets = coordination;
+        self.transport_budget = transport;
         self
     }
 
@@ -1132,7 +1140,8 @@ impl FrontendApplicationHost {
                 native_compatibility_id,
                 execution.task_update_retry_policy,
                 execution.connector_split_initial_dynamic_filter_wait_cap,
-                execution.task_execution_budgets,
+                execution.coordination_budgets,
+                execution.transport_budget,
                 self.backend_topology_port(),
                 self.data_runtime.clone(),
             )

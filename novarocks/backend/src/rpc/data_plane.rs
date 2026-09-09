@@ -17,7 +17,7 @@ use crate::task_execution::{
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
-use novarocks_execution::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models as proto;
 use novarocks_task_codec::operation::decode_fetch_task_result;
@@ -364,7 +364,7 @@ fn typed_fetch_marker(
 #[cfg(test)]
 mod tests {
     use super::{FetchMarkerIdentity, proto, should_emit_typed_fetch_marker, typed_fetch_marker};
-    use novarocks_execution::task_execution::identity::TaskIdentity;
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_types::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId, UniqueId,
     };

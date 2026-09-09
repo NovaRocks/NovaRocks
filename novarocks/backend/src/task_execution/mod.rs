@@ -21,7 +21,7 @@
 //! creation transaction, per-task status, the observation channel, and
 //! terminal retention. It owns no transport: every entry point takes a neutral
 //! typed request from
-//! `novarocks_execution::task_execution::operation` and returns a neutral
+//! `novarocks_execution_contract::task_execution::operation` and returns a neutral
 //! typed receipt, so it is fully drivable by an in-process caller and a
 //! transport adapter adds only encoding.
 //!

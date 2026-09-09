@@ -23,14 +23,15 @@
 //! cannot invent an outcome, drop an acknowledgement, or classify a result by
 //! reading its diagnostic text.
 
-use novarocks_execution::task_execution::identity::{QueryContextRef, TaskOperationId};
-use novarocks_execution::task_execution::operation::{
-    CreateTaskReceipt, OperationOutcome, QueryContextReceipt, ReleaseOutcome, UpdateTaskReceipt,
+use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskOperationId};
+use novarocks_execution_contract::task_execution::operation::{
+    CreateTaskReceipt, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextReceipt,
+    ReleaseOutcome, UpdateTaskReceipt,
 };
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, FinalTaskInfo, SafeDetail, TaskStatus,
 };
-use novarocks_execution::task_execution::transition::QueryContextState;
+use novarocks_execution_contract::task_execution::transition::QueryContextState;
 
 use super::host::TaskDynamicFilterRead;
 
@@ -152,6 +153,7 @@ impl ReleaseAcknowledgement {
 }
 
 pub type CreateTaskOutcome = OperationReceipt<CreateTaskReceipt>;
+pub type AdmissionTicketOutcome = OperationReceipt<QueryContextAdmissionTicketReceipt>;
 pub type UpdateTaskOutcome = OperationReceipt<UpdateTaskReceipt>;
 pub type QueryContextOutcome = OperationReceipt<QueryContextReceipt>;
 pub type ReleaseQueryContextOutcome = OperationReceipt<ReleaseAcknowledgement>;

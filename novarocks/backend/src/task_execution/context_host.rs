@@ -53,10 +53,10 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_execution::task_execution::domain::ContentFingerprint;
-use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
-use novarocks_execution::task_execution::operation::QueryContextDomainUpdate;
-use novarocks_execution::task_execution::status::TaskFailureCategory;
+use novarocks_execution_contract::task_execution::domain::ContentFingerprint;
+use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate;
+use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_codec::lifecycle::{QueryTerminationReason, RuntimeFilterContribution};
 use novarocks_proto_models::novarocks as proto;
@@ -1159,15 +1159,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
 
-    use novarocks_execution::task_execution::ConfidentialContent;
-    use novarocks_execution::task_execution::domain::{
+    use novarocks_execution_contract::ConfidentialContent;
+    use novarocks_execution_contract::task_execution::domain::{
         CodecOwnedContent, CredentialEpoch, CredentialLeaseId, DomainVersion,
     };
-    use novarocks_execution::task_execution::identity::QueryContextRef;
-    use novarocks_execution::task_execution::operation::{
+    use novarocks_execution_contract::task_execution::identity::QueryContextRef;
+    use novarocks_execution_contract::task_execution::operation::{
         CredentialUpdate, QueryContextDomainUpdate,
     };
-    use novarocks_execution::task_execution::status::TaskFailureCategory;
+    use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{
@@ -1209,7 +1209,7 @@ mod tests {
     use crate::task_execution::status::{
         METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter,
     };
-    use novarocks_execution::task_execution::identity::TaskIdentity;
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 
@@ -2497,7 +2497,7 @@ mod tests {
 /// them that a task could legitimately fall back to.
 use novarocks_execution::runtime::fragment::io::{FragmentEvent, FragmentEventSink};
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
 use novarocks_proto_models::filter;
 use novarocks_task_codec::domain::stored_message;
 use novarocks_types::UniqueId;

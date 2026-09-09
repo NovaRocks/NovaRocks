@@ -48,8 +48,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use novarocks_execution::task_execution::domain::CredentialEpoch;
 use novarocks_execution::task_execution::identity::{QueryContextRef, TaskOperationId};
-use novarocks_execution::task_execution::lease::MonotonicInstant;
 use novarocks_execution::task_execution::operation::{OperationOutcome, QueryContextDomainReceipt};
+use novarocks_query_application::coordination::MonotonicInstant;
 use novarocks_spi::connector::CredentialLeaseId as StorageLeaseId;
 use novarocks_types::QueryExecutionId;
 
@@ -464,7 +464,10 @@ impl AcknowledgementObserver for CredentialRotationPump {
             return Ok(());
         };
         if !ack.is_applied() {
-            if ack.outcome().is_retryable() {
+            if matches!(
+                ack.dispatch_result(),
+                novarocks_query_application::coordination::OperationDispatchResult::TransportUnknown
+            ) {
                 // Recorded, not sent: the next turn hands out the identical
                 // retained request, which is the only legal answer to a
                 // genuinely unknown outcome.
@@ -477,8 +480,8 @@ impl AcknowledgementObserver for CredentialRotationPump {
             // stall every later rotation behind it and then fail the attempt
             // on that rotation's hard deadline.
             if matches!(
-                ack.outcome(),
-                OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone
+                ack.worker_outcome(),
+                Some(OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone)
             ) {
                 state.owner.retire(context);
                 // Retiring the last laggard is what settles the rotation, so
@@ -488,7 +491,7 @@ impl AcknowledgementObserver for CredentialRotationPump {
             }
             return Err(format!(
                 "credential rotation for {context} failed closed as {:?}",
-                ack.outcome()
+                ack.worker_outcome()
             ));
         }
         let AckPayload::Context(receipt) = ack.payload() else {

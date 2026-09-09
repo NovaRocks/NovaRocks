@@ -1,0 +1,12 @@
+[package]
+name = "novarocks-execution-contract"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+novarocks-types = { path = "../types" }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }

@@ -3593,6 +3593,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "novarocks-execution",
+ "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-functions",
  "novarocks-native-trust",
@@ -3604,6 +3605,7 @@ dependencies = [
  "novarocks-task-codec",
  "novarocks-types",
  "novarocks-version",
+ "novarocks-worker",
  "once_cell",
  "parquet",
  "prometheus",
@@ -3790,6 +3792,7 @@ dependencies = [
  "libm",
  "md-5 0.10.6",
  "novarocks-connector-iceberg-functions",
+ "novarocks-execution-contract",
  "novarocks-functions",
  "novarocks-spi",
  "novarocks-sql",
@@ -3812,6 +3815,15 @@ dependencies = [
  "tracing",
  "twox-hash 2.1.2",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "novarocks-execution-contract"
+version = "0.1.0"
+dependencies = [
+ "novarocks-types",
+ "sha2",
  "uuid",
 ]
 
@@ -3840,6 +3852,7 @@ dependencies = [
  "mysql_common 0.32.4",
  "novarocks-connector-starrocks",
  "novarocks-execution",
+ "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-functions",
@@ -3848,6 +3861,7 @@ dependencies = [
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-query-application",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
@@ -3982,6 +3996,14 @@ dependencies = [
  "prost-build",
  "prost-reflect",
  "protoc-bin-vendored",
+]
+
+[[package]]
+name = "novarocks-query-application"
+version = "0.1.0"
+dependencies = [
+ "novarocks-execution-contract",
+ "novarocks-workload-control",
 ]
 
 [[package]]
@@ -4201,7 +4223,7 @@ dependencies = [
 name = "novarocks-task-codec"
 version = "0.1.0"
 dependencies = [
- "novarocks-execution",
+ "novarocks-execution-contract",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-spi",
@@ -4261,6 +4283,15 @@ dependencies = [
  "novarocks-proto-models",
  "novarocks-types",
  "sha2",
+]
+
+[[package]]
+name = "novarocks-worker"
+version = "0.1.0"
+dependencies = [
+ "novarocks-execution-contract",
+ "novarocks-types",
+ "uuid",
 ]
 
 [[package]]

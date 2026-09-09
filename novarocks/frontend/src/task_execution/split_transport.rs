@@ -62,12 +62,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use novarocks_execution::task_execution::{
-    ContentFingerprint, DomainProgression, FrontendAction, OperationKind, PlanNodeId,
-    SplitAssignmentIntent, SplitSequence, TaskDomainReceipt, TaskDomainUpdate, TaskOperationId,
-    UpdateTaskReceipt,
+    ContentFingerprint, DomainProgression, OperationKind, PlanNodeId, SplitAssignmentIntent,
+    SplitSequence, TaskDomainReceipt, TaskDomainUpdate, TaskOperationId, UpdateTaskReceipt,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_query_application::coordination::{FrontendAction, frontend_action};
 use novarocks_task_codec::domain::{split_offer, wire_split_assignment};
 use novarocks_types::UniqueId;
 use novarocks_types::identity::TaskId;
@@ -327,12 +327,12 @@ impl SplitDeliveryBridge {
                 Err(detail) => DeliveryOutcome::Local(detail),
             }
         } else if matches!(
-            ack.outcome().frontend_action(),
+            frontend_action(ack.dispatch_result()),
             FrontendAction::RetryExactRequest
         ) {
-            DeliveryOutcome::Unknown(format!("task update outcome unknown: {:?}", ack.outcome()))
+            DeliveryOutcome::Unknown("task update transport outcome is unknown".to_owned())
         } else if matches!(
-            ack.outcome().frontend_action(),
+            frontend_action(ack.dispatch_result()),
             FrontendAction::StopSendingAndReconcile | FrontendAction::Settled
         ) {
             // The destination is gone or already finished. That is not this
@@ -341,16 +341,19 @@ impl SplitDeliveryBridge {
             // round keeps serving the rest.
             DeliveryOutcome::DestinationFinished(format!(
                 "the task update was answered with {:?}",
-                ack.outcome()
+                ack.worker_outcome()
             ))
         } else {
             // Every remaining action -- fail closed, fail the attempt, or stop
             // sending and reconcile -- is a decision about this attempt that
             // must not be resent. The exact outcome travels in `reason`, so
             // none of them is folded into another.
+            let worker_outcome = ack
+                .worker_outcome()
+                .expect("a settled Worker refusal carries its exact outcome");
             DeliveryOutcome::Rejected {
-                reason: format!("{:?}", ack.outcome()),
-                detail: format!("the task update was answered with {:?}", ack.outcome()),
+                reason: format!("{worker_outcome:?}"),
+                detail: format!("the task update was answered with {worker_outcome:?}"),
             }
         };
         let retained = matches!(outcome, DeliveryOutcome::Unknown(_));
@@ -727,9 +730,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use novarocks_execution::task_execution::{
-        DispatchLane, DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer,
-        SplitWatermark, TaskIdentity, UpdateTask,
+        DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer, SplitWatermark,
+        TaskIdentity, UpdateTask,
     };
+    use novarocks_query_application::coordination::DispatchLane;
     use novarocks_spi::connector::ConnectorReadWireEncoder;
     use novarocks_types::identity::{BackendProcessId, StageId};
     use novarocks_types::{AttemptId, QueryId};
@@ -882,6 +886,10 @@ mod tests {
             outcome,
             AckPayload::None,
         )
+    }
+
+    fn transport_unknown_ack(operation_id: TaskOperationId) -> OperationAcknowledgement {
+        OperationAcknowledgement::transport_unknown(operation_id, OperationKind::UpdateTask)
     }
 
     /// Runs `send` on another thread so the owner half can act while it
@@ -1155,10 +1163,7 @@ mod tests {
         let operation_id = release_pending(&bridge);
         assert_eq!(
             bridge
-                .settle(
-                    operation_id,
-                    &failed_ack(operation_id, OperationOutcome::RetryableTransportUnknown)
-                )
+                .settle(operation_id, &transport_unknown_ack(operation_id))
                 .expect("a bound operation settles"),
             SettleVerdict::Retained
         );
@@ -1318,7 +1323,7 @@ mod tests {
             bridge
                 .settle(
                     operation_id,
-                    &failed_ack(operation_id, OperationOutcome::DestinationFailure)
+                    &failed_ack(operation_id, OperationOutcome::InvalidStateOrRequest)
                 )
                 .expect("the released operation is bound"),
             SettleVerdict::Settled

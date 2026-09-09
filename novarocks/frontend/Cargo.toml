@@ -29,10 +29,12 @@ libc.workspace = true
 novarocks-fs.workspace = true
 novarocks-functions.workspace = true
 novarocks-execution.workspace = true
+novarocks-execution-contract.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 novarocks-native-trust.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
+novarocks-query-application.workspace = true
 novarocks-parser.workspace = true
 novarocks-plan-codec.workspace = true
 novarocks-spi.workspace = true

@@ -30,32 +30,34 @@ use std::time::Duration;
 use novarocks_execution::exec::fragment::program::{
     FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
 };
-use novarocks_execution::task_execution::descriptor::{
+use novarocks_execution_contract::task_execution::descriptor::{
     ExchangeInbound, ExchangeSource, ExchangeTopology, PhysicalFragmentPlan, TaskDescriptor,
 };
-use novarocks_execution::task_execution::domain::{
+use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
     DomainProgression, DomainVersion, PlanNodeId, SplitOffer, SplitSequence,
 };
-use novarocks_execution::task_execution::identity::{
-    QueryContextRef, TaskIdentity, TaskOperationId,
+use novarocks_execution_contract::task_execution::identity::{
+    AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
 };
-use novarocks_execution::task_execution::lease::{LeaseBounds, LeaseSequence, LeaseValidFor};
-use novarocks_execution::task_execution::operation::{
-    AbortQueryContext, AdvanceQueryContextDomain, CancelTask, CreateTask, CredentialUpdate,
-    EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo, OperationOutcome,
-    QueryContextDomainUpdate, ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease,
-    SplitAssignmentIntent, TaskDomainUpdate, UpdateQueryContext, UpdateTask,
+use novarocks_execution_contract::task_execution::lease::{LeaseSequence, LeaseValidFor};
+use novarocks_execution_contract::task_execution::operation::{
+    AbortQueryContext, AcquireQueryContextAdmissionTicket, AdvanceQueryContextDomain, CancelTask,
+    CreateTask, CredentialUpdate, EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo,
+    OperationOutcome, QueryContextDomainUpdate, ReleaseOutcome, ReleaseQueryContext,
+    RenewQueryExecutionLease, SplitAssignmentIntent, TaskDomainUpdate, UpdateQueryContext,
+    UpdateTask,
 };
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
     TaskResourceFacts, TaskState, TaskStatus, TaskStatusCursor, TaskStatusVersion,
 };
-use novarocks_execution::task_execution::transition::QueryContextState;
-use novarocks_types::UniqueId;
+use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
+use novarocks_types::{NativeCompatibilityId, UniqueId};
+use novarocks_worker::LeaseBounds;
 
 use super::clock::ManualClock;
 use super::host::{
@@ -617,9 +619,12 @@ impl Fixture {
     }
 
     fn establish_request(&self, query: i64, valid_for: Duration) -> EstablishQueryContext {
+        let context = self.context(query);
+        let ticket_id = self.acquire_ticket(context);
         EstablishQueryContext::new(
             TaskOperationId::new_v7(),
-            self.context(query),
+            context,
+            ticket_id,
             FakeContent::arc(1),
             FakeContent::arc(2),
             FakeContent::arc(3),
@@ -630,6 +635,20 @@ impl Fixture {
             ),
             LeaseValidFor::new(valid_for).expect("a legal lease duration"),
         )
+    }
+
+    fn acquire_ticket(&self, context: QueryContextRef) -> AdmissionTicketId {
+        let request = AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context,
+            LeaseValidFor::new(Duration::from_secs(10)).expect("legal ticket validity"),
+            NativeCompatibilityId::new([0x71; 32]),
+        );
+        self.registry
+            .acquire_query_context_admission_ticket(request)
+            .acknowledgement()
+            .expect("fixture acquisition is admitted")
+            .ticket_id()
     }
 
     /// Establishes one context and asserts it reached `ACTIVE`.
@@ -1087,6 +1106,11 @@ fn establishing_that_expires_before_active_rolls_back_and_wakes_waiters() {
     assert_eq!(counters.contexts_established, 1);
     assert_eq!(counters.contexts_rolled_back, 1);
     assert_eq!(counters.tasks_created, 0);
+    assert_eq!(
+        fixture.registry.admission_reservation_count(),
+        0,
+        "a failed establish must return its query-context reservation"
+    );
     assert_eq!(HostLedger::get(&fixture.ledger.facts_materialized), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 0);
@@ -1290,6 +1314,7 @@ fn a_lease_expiry_aborts_and_is_reported_as_such() {
 fn abort_before_establish_fences_a_later_establish_and_create() {
     let fixture = Fixture::new();
     let context = fixture.context(1);
+    let establish_request = fixture.establish_request(1, LeaseBounds::INITIAL_REQUEST);
     let abort = fixture
         .registry
         .abort_query_context(&AbortQueryContext::new(
@@ -1302,12 +1327,31 @@ fn abort_before_establish_fences_a_later_establish_and_create() {
         fixture.registry.context_state(context),
         QueryContextState::TerminalRetained
     );
+    assert_eq!(
+        fixture.registry.admission_reservation_count(),
+        0,
+        "an absent abort releases the uninstalled reservation"
+    );
+
+    let late_acquire = AcquireQueryContextAdmissionTicket::new(
+        TaskOperationId::new_v7(),
+        context,
+        LeaseValidFor::new(Duration::from_secs(10)).expect("legal ticket validity"),
+        NativeCompatibilityId::new([0x71; 32]),
+    );
+    let late_acquire = fixture
+        .registry
+        .acquire_query_context_admission_ticket(late_acquire);
+    assert_eq!(
+        late_acquire.outcome(),
+        OperationOutcome::ContextTerminalReceipt,
+        "acquire after the abort linearization point cannot reserve capacity"
+    );
+    assert_eq!(fixture.registry.admission_reservation_count(), 0);
 
     let establish = fixture
         .registry
-        .update_query_context(&UpdateQueryContext::Establish(
-            fixture.establish_request(1, LeaseBounds::INITIAL_REQUEST),
-        ));
+        .update_query_context(&UpdateQueryContext::Establish(establish_request));
     assert_eq!(
         establish.outcome(),
         OperationOutcome::ContextTerminalReceipt,
@@ -1325,11 +1369,19 @@ fn abort_before_establish_fences_a_later_establish_and_create() {
 #[test]
 fn an_establish_conflict_is_reported_rather_than_applied() {
     let fixture = Fixture::new();
-    let context = fixture.establish(1);
+    let original = fixture.establish_request(1, LeaseBounds::INITIAL_REQUEST);
+    let context = original.context();
+    let operation = original.envelope().operation_id();
+    let ticket_id = original.admission_ticket_id();
+    let established = fixture
+        .registry
+        .update_query_context(&UpdateQueryContext::Establish(original));
+    assert_eq!(established.outcome(), OperationOutcome::Accepted);
     // A different initial lease duration is a different immutable request.
     let conflicting = EstablishQueryContext::new(
-        TaskOperationId::new_v7(),
+        operation,
         context,
+        ticket_id,
         FakeContent::arc(1),
         FakeContent::arc(2),
         FakeContent::arc(3),
@@ -1350,10 +1402,18 @@ fn an_establish_conflict_is_reported_rather_than_applied() {
 #[test]
 fn different_query_options_conflict_with_an_established_context() {
     let fixture = Fixture::new();
-    let context = fixture.establish(1);
+    let original = fixture.establish_request(1, LeaseBounds::INITIAL_REQUEST);
+    let context = original.context();
+    let operation = original.envelope().operation_id();
+    let ticket_id = original.admission_ticket_id();
+    let established = fixture
+        .registry
+        .update_query_context(&UpdateQueryContext::Establish(original));
+    assert_eq!(established.outcome(), OperationOutcome::Accepted);
     let conflicting = EstablishQueryContext::new(
-        TaskOperationId::new_v7(),
+        operation,
         context,
+        ticket_id,
         FakeContent::arc(1),
         FakeContent::arc(2),
         FakeContent::arc(4),
@@ -1376,14 +1436,35 @@ fn different_query_options_conflict_with_an_established_context() {
 fn an_exact_establish_replay_is_idempotent() {
     let fixture = Fixture::new();
     let request = fixture.establish_request(1, LeaseBounds::INITIAL_REQUEST);
+    let context = request.context();
     let first = fixture
         .registry
         .update_query_context(&UpdateQueryContext::Establish(request.clone()));
     assert_eq!(first.outcome(), OperationOutcome::Accepted);
+    let original_receipt = first
+        .acknowledgement()
+        .expect("accepted establish has a receipt")
+        .clone();
+    let renewal = fixture
+        .registry
+        .update_query_context(&UpdateQueryContext::RenewLease(
+            RenewQueryExecutionLease::new(
+                TaskOperationId::new_v7(),
+                context,
+                LeaseSequence::new(1),
+                LeaseValidFor::new(LeaseBounds::STEADY_REQUEST).expect("legal renewal"),
+            ),
+        ));
+    assert_eq!(renewal.outcome(), OperationOutcome::Accepted);
     let replay = fixture
         .registry
         .update_query_context(&UpdateQueryContext::Establish(request));
     assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
+    assert_eq!(
+        replay.acknowledgement(),
+        Some(&original_receipt),
+        "exact replay returns the original facts rather than a newer context snapshot"
+    );
     assert_eq!(HostLedger::get(&fixture.ledger.facts_materialized), 1);
 }
 
@@ -1885,7 +1966,7 @@ fn a_split_receipt_reports_the_queue_depth_the_offer_left_behind() {
     let receipt = accepted
         .acknowledgement()
         .expect("an applied update carries its receipt");
-    let novarocks_execution::task_execution::operation::TaskDomainReceipt::SplitAssignment {
+    let novarocks_execution_contract::task_execution::operation::TaskDomainReceipt::SplitAssignment {
         nodes,
         ..
     } = receipt
@@ -1953,7 +2034,7 @@ fn a_replayed_split_assignment_is_answered_as_a_duplicate_that_still_reports_its
     let receipt = replayed
         .acknowledgement()
         .expect("a duplicate update carries its retained receipt");
-    let novarocks_execution::task_execution::operation::TaskDomainReceipt::SplitAssignment {
+    let novarocks_execution_contract::task_execution::operation::TaskDomainReceipt::SplitAssignment {
         nodes,
         progression,
     } = receipt
@@ -2641,6 +2722,11 @@ fn an_uncooperative_task_is_terminated_after_the_termination_grace() {
     );
     assert_eq!(HostLedger::get(&fixture.ledger.capabilities_removed), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 0);
+    assert_eq!(
+        fixture.registry.admission_reservation_count(),
+        1,
+        "abort revokes new admission but retains the live context reservation"
+    );
 
     // Inside the grace the owner keeps waiting rather than lying about the
     // task's outcome.
@@ -2652,6 +2738,7 @@ fn an_uncooperative_task_is_terminated_after_the_termination_grace() {
         fixture.registry.context_state(context),
         QueryContextState::Aborting
     );
+    assert_eq!(fixture.registry.admission_reservation_count(), 1);
 
     fixture
         .clock
@@ -2662,6 +2749,11 @@ fn an_uncooperative_task_is_terminated_after_the_termination_grace() {
         QueryContextState::TerminalRetained
     );
     assert_eq!(HostLedger::get(&fixture.ledger.facts_released), 1);
+    assert_eq!(
+        fixture.registry.admission_reservation_count(),
+        0,
+        "the reservation is released with the actual terminal transition"
+    );
     let info = fixture
         .registry
         .get_final_task_info(&GetFinalTaskInfo::new(TaskOperationId::new_v7(), identity));

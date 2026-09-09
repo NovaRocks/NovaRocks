@@ -41,13 +41,15 @@ use crate::task_execution::{
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 #[cfg(test)]
-use novarocks_execution::task_execution::descriptor::TaskDescriptor;
+use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 #[cfg(test)]
-use novarocks_execution::task_execution::identity::QueryContextRef;
+use novarocks_execution_contract::task_execution::identity::QueryContextRef;
 #[cfg(test)]
-use novarocks_execution::task_execution::operation::{QueryContextDomainUpdate, TaskDomainUpdate};
+use novarocks_execution_contract::task_execution::operation::{
+    QueryContextDomainUpdate, TaskDomainUpdate,
+};
 #[cfg(test)]
-use novarocks_execution::task_execution::status::TaskFailureCategory;
+use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1077,10 +1079,10 @@ mod tests {
     /// reclaims it: the clock moves, and only a sweep can notice.
     #[test]
     fn the_deadline_tick_drives_the_task_owner_forward() {
-        use novarocks_execution::task_execution::identity::TaskOperationId;
-        use novarocks_execution::task_execution::operation::AbortQueryContext;
-        use novarocks_execution::task_execution::status::AbortCause;
-        use novarocks_execution::task_execution::transition::QueryContextState;
+        use novarocks_execution_contract::task_execution::identity::TaskOperationId;
+        use novarocks_execution_contract::task_execution::operation::AbortQueryContext;
+        use novarocks_execution_contract::task_execution::status::AbortCause;
+        use novarocks_execution_contract::task_execution::transition::QueryContextState;
         use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, QueryId};
 
         let backend = novarocks_types::BackendProcessId::new_v7();
@@ -1199,8 +1201,8 @@ mod tests {
         use crate::runtime_filter::domain::BackendEnvelopeKind;
         use crate::runtime_filter::test_support::delivery_envelope_for_test;
         use crate::task_execution::{QueryContextHost, SharedFactsRequest};
-        use novarocks_execution::task_execution::CredentialUpdate;
-        use novarocks_execution::task_execution::domain::{
+        use novarocks_execution_contract::CredentialUpdate;
+        use novarocks_execution_contract::task_execution::domain::{
             CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
         };
         use novarocks_proto_codec::FieldPath;

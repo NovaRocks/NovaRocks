@@ -60,9 +60,10 @@ use std::time::Duration;
 
 use novarocks_execution::task_execution::{
     AdvanceQueryContextDomain, ConfidentialContent, CredentialEpoch, CredentialLeaseId,
-    CredentialUpdate, MonotonicInstant, QueryContextDomainUpdate, QueryContextRef, TaskOperationId,
+    CredentialUpdate, QueryContextDomainUpdate, QueryContextRef, TaskOperationId,
     UpdateQueryContext,
 };
+use novarocks_query_application::coordination::MonotonicInstant;
 use novarocks_types::QueryExecutionId;
 
 use super::error::TaskExecutionError;
@@ -402,8 +403,9 @@ mod tests {
 
     use novarocks_execution::task_execution::{
         ConfidentialContent, CredentialEpoch, CredentialLeaseId, CredentialUpdate,
-        MonotonicInstant, QueryContextDomainUpdate, QueryContextRef, UpdateQueryContext,
+        QueryContextDomainUpdate, QueryContextRef, UpdateQueryContext,
     };
+    use novarocks_query_application::coordination::MonotonicInstant;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };

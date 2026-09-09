@@ -15,77 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{fmt, net::SocketAddr, str::FromStr};
-
-use novarocks_types::{NativeEndpoint, UniqueId};
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct RuntimeEndpoint {
-    endpoint: NativeEndpoint,
-}
-
-impl fmt::Display for RuntimeEndpoint {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.endpoint.fmt(formatter)
-    }
-}
-
-impl FromStr for RuntimeEndpoint {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
-impl RuntimeEndpoint {
-    pub fn new(host: impl Into<String>, port: i32) -> Result<Self, String> {
-        let host = host.into();
-        if !(1..=i32::from(u16::MAX)).contains(&port) {
-            return Err(format!(
-                "native runtime endpoint port {port} must be in 1..={}",
-                u16::MAX
-            ));
-        }
-        Ok(Self {
-            endpoint: NativeEndpoint::from_host_port(&host, port as u16)?,
-        })
-    }
-
-    pub fn host(&self) -> &str {
-        self.endpoint.host()
-    }
-
-    pub fn retained_host_capacity(&self) -> usize {
-        self.endpoint.host_capacity()
-    }
-
-    pub fn port(&self) -> i32 {
-        i32::from(self.endpoint.port())
-    }
-
-    pub fn from_socket_addr(addr: SocketAddr) -> Self {
-        Self {
-            endpoint: NativeEndpoint::from_socket_addr(addr),
-        }
-    }
-
-    /// Parse the neutral execution endpoint value used at role boundaries.
-    pub fn parse(src: &str) -> Result<Self, String> {
-        let endpoint = src
-            .parse::<NativeEndpoint>()
-            .map_err(|error| format!("native runtime endpoint is invalid: {error}"))?;
-        Ok(Self { endpoint })
-    }
-
-    pub fn as_host_port(&self) -> String {
-        self.endpoint.as_host_port()
-    }
-
-    pub fn native_endpoint(&self) -> &NativeEndpoint {
-        &self.endpoint
-    }
-}
+pub use novarocks_execution_contract::RuntimeEndpoint;
+use novarocks_types::UniqueId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FragmentDestination {

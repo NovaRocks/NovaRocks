@@ -34,20 +34,149 @@
 //! crate still links no protobuf.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::str::FromStr;
 use std::sync::Arc;
 
-use novarocks_types::UniqueId;
 use novarocks_types::identity::BackendProcessId;
+use novarocks_types::{NativeEndpoint, UniqueId};
 use sha2::{Digest, Sha256};
 
-use crate::exec::fragment::program::{FragmentContractVersion, FragmentNodeId, FragmentSinkKind};
-use crate::exec::fragment::sink::DataStreamPartitionType;
-use crate::runtime::endpoint::RuntimeEndpoint;
 use crate::task_execution::domain::{
     CodecOwnedContent, ContentFingerprint, ExchangeEdgeId, PlanNodeId,
 };
 use crate::task_execution::identity::TaskIdentity;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FragmentContractVersion(u16);
+
+impl FragmentContractVersion {
+    pub const CURRENT: Self = Self(1);
+
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FragmentNodeId(i32);
+
+impl FragmentNodeId {
+    pub const fn new(value: i32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FragmentSinkKind {
+    Result,
+    Noop,
+    DataStream,
+    MultiCastDataStream,
+    SplitDataStream,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataStreamPartitionType {
+    Unpartitioned,
+    Random,
+    HashPartitioned,
+    BucketShuffleHashPartitioned,
+}
+
+impl DataStreamPartitionType {
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Unpartitioned => "UNPARTITIONED",
+            Self::Random => "RANDOM",
+            Self::HashPartitioned => "HASH_PARTITIONED",
+            Self::BucketShuffleHashPartitioned => "BUCKET_SHUFFLE_HASH_PARTITIONED",
+        }
+    }
+
+    pub const fn requires_exprs(self) -> bool {
+        matches!(
+            self,
+            Self::HashPartitioned | Self::BucketShuffleHashPartitioned
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RuntimeEndpoint {
+    endpoint: NativeEndpoint,
+}
+
+impl fmt::Display for RuntimeEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.endpoint.fmt(formatter)
+    }
+}
+
+impl FromStr for RuntimeEndpoint {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl RuntimeEndpoint {
+    pub fn new(host: impl Into<String>, port: i32) -> Result<Self, String> {
+        let host = host.into();
+        if !(1..=i32::from(u16::MAX)).contains(&port) {
+            return Err(format!(
+                "native runtime endpoint port {port} must be in 1..={}",
+                u16::MAX
+            ));
+        }
+        Ok(Self {
+            endpoint: NativeEndpoint::from_host_port(&host, port as u16)?,
+        })
+    }
+
+    pub fn host(&self) -> &str {
+        self.endpoint.host()
+    }
+
+    pub fn retained_host_capacity(&self) -> usize {
+        self.endpoint.host_capacity()
+    }
+
+    pub fn port(&self) -> i32 {
+        i32::from(self.endpoint.port())
+    }
+
+    pub fn from_socket_addr(addr: SocketAddr) -> Self {
+        Self {
+            endpoint: NativeEndpoint::from_socket_addr(addr),
+        }
+    }
+
+    pub fn parse(src: &str) -> Result<Self, String> {
+        let endpoint = src
+            .parse::<NativeEndpoint>()
+            .map_err(|error| format!("native runtime endpoint is invalid: {error}"))?;
+        Ok(Self { endpoint })
+    }
+
+    pub fn as_host_port(&self) -> String {
+        self.endpoint.as_host_port()
+    }
+
+    pub fn native_endpoint(&self) -> &NativeEndpoint {
+        &self.endpoint
+    }
+}
 
 /// The physical fragment plan of one task, owned by the central codec.
 ///
@@ -462,56 +591,6 @@ impl fmt::Display for DescriptorError {
 
 impl std::error::Error for DescriptorError {}
 
-/// Why an inbound exchange frame is rejected.
-///
-/// Every one of these is decided from the frozen descriptor alone, before any
-/// Arrow payload is decoded and before a receiver is allocated.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum IngressRejection {
-    /// The frame's destination key is not this task.
-    UnknownDestinationTask,
-    /// The destination node is not an inbound exchange node of this task.
-    UnknownDestinationNode(FragmentNodeId),
-    /// The sending instance is not in this node's frozen source set.
-    SourceNotFrozen,
-    /// The frame's sender count disagrees with the frozen source set.
-    SenderCountMismatch { expected: u32, received: u32 },
-    /// The frame's sender ordinal is not below the expected sender count.
-    SenderOrdinalOutOfRange { ordinal: u32, expected: u32 },
-    /// The sending instance used the ordinal frozen for another source.
-    SenderOrdinalMismatch { expected: u32, received: u32 },
-}
-
-impl fmt::Display for IngressRejection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownDestinationTask => {
-                formatter.write_str("inbound frame names another task as its destination")
-            }
-            Self::UnknownDestinationNode(node) => {
-                write!(formatter, "inbound frame names unknown node {node:?}")
-            }
-            Self::SourceNotFrozen => {
-                formatter.write_str("inbound frame comes from a task outside the frozen source set")
-            }
-            Self::SenderCountMismatch { expected, received } => write!(
-                formatter,
-                "inbound frame declares {received} senders, topology froze {expected}"
-            ),
-            Self::SenderOrdinalOutOfRange { ordinal, expected } => write!(
-                formatter,
-                "inbound frame sender ordinal {ordinal} is not below {expected}"
-            ),
-            Self::SenderOrdinalMismatch { expected, received } => write!(
-                formatter,
-                "inbound frame sender ordinal {received} does not match its frozen ordinal {expected}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for IngressRejection {}
-
 /// Largest encoded plan a descriptor may carry.
 pub const TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES: usize = 16 * 1024 * 1024;
 
@@ -646,56 +725,6 @@ impl TaskDescriptor {
         ContentFingerprint::from_bytes(bytes)
     }
 
-    /// Whether an inbound exchange frame may be admitted.
-    ///
-    /// The parameters are exactly the fields an exchange frame carries, which
-    /// is why they are kernel keys rather than task identities: the frame has
-    /// no identity in it. Resolving the sender through the frozen source set
-    /// is what turns "a frame from some instance" into "a frame from exactly
-    /// this task on exactly this process", and it is the returned value.
-    ///
-    /// This runs before an Arrow payload is decoded and before a receiver is
-    /// allocated. It does not claim to prevent the byte buffer the gRPC and
-    /// protobuf receive layers have already allocated.
-    pub fn authorize_inbound_frame(
-        &self,
-        destination_kernel_key: UniqueId,
-        destination_node_id: FragmentNodeId,
-        source_kernel_key: UniqueId,
-        sender_ordinal: u32,
-        sender_count: u32,
-    ) -> Result<ExchangeSource, IngressRejection> {
-        if destination_kernel_key != self.fragment_instance_id {
-            return Err(IngressRejection::UnknownDestinationTask);
-        }
-        let node = self.topology.inbound_node(destination_node_id).ok_or(
-            IngressRejection::UnknownDestinationNode(destination_node_id),
-        )?;
-        let source = node
-            .source_by_kernel_key(source_kernel_key)
-            .ok_or(IngressRejection::SourceNotFrozen)?;
-        let expected = node.expected_sender_count().get();
-        if sender_count != expected {
-            return Err(IngressRejection::SenderCountMismatch {
-                expected,
-                received: sender_count,
-            });
-        }
-        if sender_ordinal >= expected {
-            return Err(IngressRejection::SenderOrdinalOutOfRange {
-                ordinal: sender_ordinal,
-                expected,
-            });
-        }
-        if sender_ordinal != source.sender_ordinal() {
-            return Err(IngressRejection::SenderOrdinalMismatch {
-                expected: source.sender_ordinal(),
-                received: sender_ordinal,
-            });
-        }
-        Ok(source)
-    }
-
     /// The backend process this task belongs to.
     pub const fn backend_process_id(&self) -> BackendProcessId {
         self.identity.backend_process_id()
@@ -777,19 +806,17 @@ fn fingerprint_topology(hasher: &mut Sha256, topology: &ExchangeTopology) {
 mod tests {
     use super::{
         DescriptorError, ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource,
-        ExchangeTopology, IngressRejection, PhysicalFragmentPlan,
-        TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES, TaskDescriptor,
+        ExchangeTopology, PhysicalFragmentPlan, TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES,
+        TaskDescriptor,
     };
-    use crate::exec::fragment::program::{
-        FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
-    };
-    use crate::exec::fragment::sink::DataStreamPartitionType;
-    use crate::runtime::endpoint::RuntimeEndpoint;
     use crate::task_execution::domain::{
-        CodecOwnedContent, ContentFingerprint, EdgeSendPermission, ExchangeEdgeDomain,
-        ExchangeEdgeId, PlanNodeId,
+        CodecOwnedContent, ContentFingerprint, ExchangeEdgeId, PlanNodeId,
     };
     use crate::task_execution::identity::TaskIdentity;
+    use crate::{
+        DataStreamPartitionType, FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
+        RuntimeEndpoint,
+    };
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -1143,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn every_edge_the_descriptor_freezes_starts_closed() {
+    fn descriptor_freezes_the_exact_outbound_edge_facts() {
         let backend = BackendProcessId::new_v7();
         let outbound = vec![
             ExchangeEdge::try_new(
@@ -1162,16 +1189,21 @@ mod tests {
             .expect("legal edge"),
         ];
         let descriptor = descriptor(task(1, 1, backend), Vec::new(), outbound, 1);
-        let edges = ExchangeEdgeDomain::from_frozen_edges(descriptor.topology().edge_ids());
+        let edges = descriptor.topology().outbound();
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].edge_id(), edge_id(1));
+        assert_eq!(edges[0].destination_node_id(), FragmentNodeId::new(10));
+        assert_eq!(edges[0].partitioning(), DataStreamPartitionType::Random);
+        assert_eq!(edges[0].destinations().len(), 1);
+        assert_eq!(edges[0].destinations()[0].task(), task(2, 1, backend));
+        assert_eq!(edges[1].edge_id(), edge_id(2));
+        assert_eq!(edges[1].destination_node_id(), FragmentNodeId::new(11));
         assert_eq!(
-            edges.permission(edge_id(1)),
-            Some(EdgeSendPermission::Closed)
+            edges[1].partitioning(),
+            DataStreamPartitionType::Unpartitioned
         );
-        assert_eq!(
-            edges.permission(edge_id(2)),
-            Some(EdgeSendPermission::Closed)
-        );
-        assert!(!edges.all_open());
+        assert_eq!(edges[1].destinations().len(), 1);
+        assert_eq!(edges[1].destinations()[0].task(), task(3, 1, backend));
     }
 
     #[test]
@@ -1290,90 +1322,5 @@ mod tests {
         assert_eq!(descriptor.pipeline_dop().get(), 4);
         assert!(descriptor.accepts_split_plan_node(PlanNodeId::new(3).expect("nonnegative")));
         assert!(!descriptor.accepts_split_plan_node(PlanNodeId::new(4).expect("nonnegative")));
-    }
-
-    #[test]
-    fn inbound_admission_checks_every_frozen_fact_before_any_decode() {
-        let backend = BackendProcessId::new_v7();
-        let identity = task(9, 1, backend);
-        let source_a = task(1, 1, backend);
-        let source_b = task(1, 2, backend);
-        let inbound = ExchangeInbound::try_new(
-            FragmentNodeId::new(20),
-            vec![source(source_a), source(source_b)],
-        )
-        .expect("legal inbound");
-        let descriptor = descriptor(identity, vec![inbound], Vec::new(), 1);
-
-        // A legal frame resolves to the exact frozen source, which is what
-        // gives the caller back a task identity the frame never carried.
-        assert_eq!(
-            descriptor
-                .authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 1), 0, 2)
-                .map(|resolved| resolved.task()),
-            Ok(source_a)
-        );
-
-        // A frame for another task's kernel key.
-        assert_eq!(
-            descriptor.authorize_inbound_frame(
-                UniqueId::new(9, 9),
-                FragmentNodeId::new(20),
-                key(1, 1),
-                0,
-                2
-            ),
-            Err(IngressRejection::UnknownDestinationTask)
-        );
-
-        // Unknown node.
-        assert_eq!(
-            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(21), key(1, 1), 0, 2),
-            Err(IngressRejection::UnknownDestinationNode(
-                FragmentNodeId::new(21)
-            ))
-        );
-
-        // A sender outside the frozen source set.
-        assert_eq!(
-            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 3), 0, 2),
-            Err(IngressRejection::SourceNotFrozen)
-        );
-
-        // Sender count and ordinal must match the frozen set.
-        assert_eq!(
-            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 1), 0, 3),
-            Err(IngressRejection::SenderCountMismatch {
-                expected: 2,
-                received: 3
-            })
-        );
-        assert_eq!(
-            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 2), 2, 2),
-            Err(IngressRejection::SenderOrdinalOutOfRange {
-                ordinal: 2,
-                expected: 2
-            })
-        );
-        assert_eq!(
-            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(1, 2), 0, 2),
-            Err(IngressRejection::SenderOrdinalMismatch {
-                expected: 1,
-                received: 0
-            })
-        );
-    }
-
-    #[test]
-    fn a_task_with_no_inbound_node_rejects_every_frame() {
-        let backend = BackendProcessId::new_v7();
-        let identity = task(1, 1, backend);
-        let descriptor = descriptor(identity, Vec::new(), Vec::new(), 1);
-        assert_eq!(
-            descriptor.authorize_inbound_frame(OWN_KEY, FragmentNodeId::new(20), key(2, 1), 0, 1),
-            Err(IngressRejection::UnknownDestinationNode(
-                FragmentNodeId::new(20)
-            ))
-        );
     }
 }

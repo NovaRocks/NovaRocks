@@ -26,13 +26,16 @@
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
-    AbortQueryContext, CancelTask, CreateTask, CreateTaskReceipt, DispatchBudget, DispatchLane,
-    FetchTaskDynamicFilters, GetFinalTaskInfo, OperationKind, OperationOutcome,
-    QueryContextDomainUpdate, QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
-    TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
-    status::SafeDetail,
+    AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTask,
+    CreateTaskReceipt, FetchTaskDynamicFilters, GetFinalTaskInfo, OperationKind, OperationOutcome,
+    QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate, QueryContextReceipt,
+    ReleaseOutcome, ReleaseQueryContext, TaskDomainUpdate, TaskOperationId, UpdateQueryContext,
+    UpdateTask, UpdateTaskReceipt, status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
+use novarocks_query_application::coordination::{
+    DispatchBudget, DispatchLane, OperationDispatchResult, WorkerReceiptOutcome,
+};
 use novarocks_types::identity::BackendProcessId;
 
 /// What one queued operation costs in queue bytes on top of its payload.
@@ -46,6 +49,7 @@ pub const OPERATION_FIXED_BYTES: usize = 256;
 /// One immutable request an owner has decided to make.
 #[derive(Clone, Debug)]
 pub enum OperationIntent {
+    AcquireQueryContextAdmissionTicket(AcquireQueryContextAdmissionTicket),
     CreateTask(Arc<CreateTask>),
     UpdateTask(Arc<UpdateTask>),
     UpdateQueryContext(Arc<UpdateQueryContext>),
@@ -59,6 +63,7 @@ pub enum OperationIntent {
 impl OperationIntent {
     pub fn kind(&self) -> OperationKind {
         match self {
+            Self::AcquireQueryContextAdmissionTicket(request) => request.envelope().kind(),
             Self::CreateTask(request) => request.envelope().kind(),
             Self::UpdateTask(request) => request.envelope().kind(),
             Self::UpdateQueryContext(request) => request.envelope().kind(),
@@ -72,6 +77,7 @@ impl OperationIntent {
 
     pub fn operation_id(&self) -> TaskOperationId {
         match self {
+            Self::AcquireQueryContextAdmissionTicket(request) => request.envelope().operation_id(),
             Self::CreateTask(request) => request.envelope().operation_id(),
             Self::UpdateTask(request) => request.envelope().operation_id(),
             Self::UpdateQueryContext(request) => request.envelope().operation_id(),
@@ -90,6 +96,9 @@ impl OperationIntent {
     /// The backend process this request is addressed to.
     pub fn backend_process_id(&self) -> BackendProcessId {
         match self {
+            Self::AcquireQueryContextAdmissionTicket(request) => {
+                request.context().backend_process_id()
+            }
             Self::CreateTask(request) => request.identity().backend_process_id(),
             Self::UpdateTask(request) => request.identity().backend_process_id(),
             Self::UpdateQueryContext(request) => request.context().backend_process_id(),
@@ -104,6 +113,7 @@ impl OperationIntent {
     /// What this request occupies in a bounded frontend queue.
     pub fn queued_bytes(&self) -> usize {
         let payload = match self {
+            Self::AcquireQueryContextAdmissionTicket(_) => 0,
             Self::CreateTask(request) => {
                 request.descriptor().plan().encoded_len()
                     + request
@@ -165,6 +175,7 @@ pub enum AckPayload {
     /// The outcome carries no receipt, either because the operation kind has
     /// none or because it failed closed.
     None,
+    AdmissionTicket(QueryContextAdmissionTicketReceipt),
     Create(CreateTaskReceipt),
     Update(UpdateTaskReceipt),
     Context(QueryContextReceipt),
@@ -185,7 +196,7 @@ pub enum AckPayload {
 pub struct OperationAcknowledgement {
     operation_id: TaskOperationId,
     kind: OperationKind,
-    outcome: OperationOutcome,
+    dispatch_result: OperationDispatchResult,
     payload: AckPayload,
     /// The backend's own reason for a refusal, when it gave one.
     ///
@@ -196,16 +207,51 @@ pub struct OperationAcknowledgement {
 }
 
 impl OperationAcknowledgement {
-    pub const fn new(
+    pub fn new(
         operation_id: TaskOperationId,
         kind: OperationKind,
         outcome: OperationOutcome,
         payload: AckPayload,
     ) -> Self {
+        let dispatch_result =
+            OperationDispatchResult::WorkerReceipt(WorkerReceiptOutcome::from_contract(outcome));
+        Self::from_dispatch_result(operation_id, kind, dispatch_result, payload)
+    }
+
+    pub fn worker_receipt(
+        operation_id: TaskOperationId,
+        kind: OperationKind,
+        outcome: OperationOutcome,
+        payload: AckPayload,
+    ) -> Self {
+        let receipt = WorkerReceiptOutcome::from_contract(outcome);
+        Self::from_dispatch_result(
+            operation_id,
+            kind,
+            OperationDispatchResult::WorkerReceipt(receipt),
+            payload,
+        )
+    }
+
+    pub const fn transport_unknown(operation_id: TaskOperationId, kind: OperationKind) -> Self {
+        Self::from_dispatch_result(
+            operation_id,
+            kind,
+            OperationDispatchResult::TransportUnknown,
+            AckPayload::None,
+        )
+    }
+
+    pub const fn from_dispatch_result(
+        operation_id: TaskOperationId,
+        kind: OperationKind,
+        dispatch_result: OperationDispatchResult,
+        payload: AckPayload,
+    ) -> Self {
         Self {
             operation_id,
             kind,
-            outcome,
+            dispatch_result,
             payload,
             detail: None,
         }
@@ -225,8 +271,15 @@ impl OperationAcknowledgement {
         self.kind
     }
 
-    pub const fn outcome(&self) -> OperationOutcome {
-        self.outcome
+    pub const fn worker_outcome(&self) -> Option<OperationOutcome> {
+        match self.dispatch_result {
+            OperationDispatchResult::WorkerReceipt(receipt) => Some(receipt.outcome()),
+            OperationDispatchResult::TransportUnknown => None,
+        }
+    }
+
+    pub const fn dispatch_result(&self) -> OperationDispatchResult {
+        self.dispatch_result
     }
 
     pub const fn payload(&self) -> &AckPayload {
@@ -241,8 +294,8 @@ impl OperationAcknowledgement {
     /// applied one.
     pub const fn is_applied(&self) -> bool {
         matches!(
-            self.outcome,
-            OperationOutcome::Accepted | OperationOutcome::Idempotent
+            self.worker_outcome(),
+            Some(OperationOutcome::Accepted | OperationOutcome::Idempotent)
         )
     }
 }

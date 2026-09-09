@@ -26,19 +26,20 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use novarocks_execution::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution::task_execution::domain::{
-    ConfidentialContent, ContentFingerprint, CredentialDomain, ScalarDomain,
+use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
+use novarocks_execution_contract::task_execution::domain::ContentFingerprint;
+use novarocks_execution_contract::task_execution::identity::{
+    AdmissionTicketId, TaskIdentity, TaskOperationId,
 };
-use novarocks_execution::task_execution::identity::{TaskIdentity, TaskOperationId};
-use novarocks_execution::task_execution::lease::{InstalledLease, LeaseValidFor, MonotonicInstant};
-use novarocks_execution::task_execution::operation::{
-    CreateTaskReceipt, EstablishQueryContext, OperationOutcome,
+use novarocks_execution_contract::task_execution::lease::LeaseValidFor;
+use novarocks_execution_contract::task_execution::operation::{
+    CreateTaskReceipt, EstablishQueryContext, OperationOutcome, QueryContextReceipt,
 };
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, FinalTaskInfo, TaskStatus, TerminationDetail,
 };
-use novarocks_execution::task_execution::transition::{QueryContextState, TerminationLatch};
+use novarocks_execution_contract::task_execution::transition::QueryContextState;
+use novarocks_worker::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
 
 use super::domains::{InitialDomainKey, TaskDomains};
 use super::host::{ReleasedContextEvidence, RunnableTask};
@@ -50,37 +51,43 @@ use super::status::TaskStatusOwner;
 /// The credential material is deliberately absent: it cannot be
 /// fingerprinted, so an exact replay is recognised by comparing the live
 /// material through [`ConfidentialContent::matches`] instead.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct EstablishRecord {
     pub(super) operation: TaskOperationId,
+    pub(super) admission_ticket_id: AdmissionTicketId,
     pub(super) catalog: ContentFingerprint,
     pub(super) runtime_filter: ContentFingerprint,
     pub(super) query_options: ContentFingerprint,
-    pub(super) credential_lease: novarocks_execution::task_execution::domain::CredentialLeaseId,
-    pub(super) credential_epoch: novarocks_execution::task_execution::domain::CredentialEpoch,
+    pub(super) credential_lease:
+        novarocks_execution_contract::task_execution::domain::CredentialLeaseId,
+    pub(super) credential_epoch:
+        novarocks_execution_contract::task_execution::domain::CredentialEpoch,
     pub(super) lease_valid_for: LeaseValidFor,
+    pub(super) original_receipt: Option<QueryContextReceipt>,
 }
 
 impl EstablishRecord {
     pub(super) fn of(request: &EstablishQueryContext) -> Self {
         Self {
             operation: request.envelope().operation_id(),
+            admission_ticket_id: request.admission_ticket_id(),
             catalog: request.catalog_binding().fingerprint(),
             runtime_filter: request.initial_runtime_filter().fingerprint(),
             query_options: request.query_options().fingerprint(),
             credential_lease: request.initial_credential().lease_id(),
             credential_epoch: request.initial_credential().epoch(),
             lease_valid_for: request.initial_lease_valid_for(),
+            original_receipt: None,
         }
     }
 
     /// Whether two establishes are the same immutable request.
     ///
-    /// The operation id is deliberately not compared: two concurrent
-    /// establishes of the identical content are the same creation, and the
-    /// frontend's own retry reuses its id anyway.
-    pub(super) fn same_content(&self, other: &Self) -> bool {
-        self.catalog == other.catalog
+    /// Only the original operation and every immutable fact may replay.
+    pub(super) fn same_request(&self, other: &Self) -> bool {
+        self.operation == other.operation
+            && self.admission_ticket_id == other.admission_ticket_id
+            && self.catalog == other.catalog
             && self.runtime_filter == other.runtime_filter
             && self.query_options == other.query_options
             && self.credential_lease == other.credential_lease
@@ -209,8 +216,9 @@ pub(super) fn estimate_retained_bytes(
     if let Some(info) = final_info {
         bytes += size_of::<FinalTaskInfo>();
         for statistics in info.operator_statistics() {
-            bytes += size_of::<novarocks_execution::task_execution::status::OperatorStatistics>()
-                + statistics.operator().as_str().len();
+            bytes += size_of::<
+                novarocks_execution_contract::task_execution::status::OperatorStatistics,
+            >() + statistics.operator().as_str().len();
         }
         bytes += termination_bytes(info.final_status().termination());
     }
@@ -232,10 +240,7 @@ pub(super) struct ContextEntry {
     pub(super) establish: Option<EstablishRecord>,
     /// Shared facts become observable only when the context reaches `Active`.
     pub(super) facts_visible: bool,
-    pub(super) catalog: ScalarDomain,
-    pub(super) shared_filter: ScalarDomain,
-    pub(super) credential: Option<CredentialDomain>,
-    pub(super) credential_material: Option<Arc<dyn ConfidentialContent>>,
+    pub(super) domains: QueryContextDomains,
     pub(super) source: Arc<TaskStatusSource>,
     pub(super) tasks: BTreeMap<TaskIdentity, TaskEntry>,
     pub(super) retired_at: Option<MonotonicInstant>,
@@ -267,10 +272,7 @@ impl ContextEntry {
             lease: None,
             establish: None,
             facts_visible: false,
-            catalog: ScalarDomain::empty(),
-            shared_filter: ScalarDomain::empty(),
-            credential: None,
-            credential_material: None,
+            domains: QueryContextDomains::empty(),
             source,
             tasks: BTreeMap::new(),
             retired_at: None,

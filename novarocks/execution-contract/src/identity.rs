@@ -86,6 +86,48 @@ impl fmt::Display for TaskOperationId {
     }
 }
 
+/// Opaque identity of one worker-local query-context admission grant.
+///
+/// The identity carries no capacity, ownership, or expiry facts by itself.
+/// Those facts are bound by the acquisition receipt and retained by the
+/// worker that issued it.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct AdmissionTicketId([u8; 16]);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionTicketIdError {
+    Zero,
+}
+
+impl fmt::Display for AdmissionTicketIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Zero => "admission ticket id must not be all zeroes",
+        })
+    }
+}
+
+impl std::error::Error for AdmissionTicketIdError {}
+
+impl AdmissionTicketId {
+    pub fn try_from_bytes(value: [u8; 16]) -> Result<Self, AdmissionTicketIdError> {
+        if value == [0; 16] {
+            return Err(AdmissionTicketIdError::Zero);
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for AdmissionTicketId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdmissionTicketId([redacted])")
+    }
+}
+
 /// Which identity component failed an exact match.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum IdentityField {
@@ -349,8 +391,8 @@ impl fmt::Display for QueryContextRef {
 #[cfg(test)]
 mod tests {
     use super::{
-        IdentityField, IdentityMismatch, QueryContextRef, TaskIdentity, TaskOperationId,
-        TaskOperationIdError,
+        AdmissionTicketId, AdmissionTicketIdError, IdentityField, IdentityMismatch,
+        QueryContextRef, TaskIdentity, TaskOperationId, TaskOperationIdError,
     };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -391,6 +433,17 @@ mod tests {
             TaskOperationId::try_from_uuid(Uuid::new_v4()),
             Err(TaskOperationIdError::NotUuidV7)
         );
+    }
+
+    #[test]
+    fn admission_ticket_id_accepts_any_nonzero_nonce_without_exposing_it() {
+        assert_eq!(
+            AdmissionTicketId::try_from_bytes([0; 16]),
+            Err(AdmissionTicketIdError::Zero)
+        );
+        let arbitrary = AdmissionTicketId::try_from_bytes([0x5a; 16]).expect("nonzero nonce");
+        assert_eq!(arbitrary.to_bytes(), [0x5a; 16]);
+        assert_eq!(format!("{arbitrary:?}"), "AdmissionTicketId([redacted])");
     }
 
     #[test]

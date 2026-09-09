@@ -25,7 +25,7 @@
 //! that was silently accepted, is the failure these markers exist to expose.
 //!
 //! Every emitter here takes the receipt's already-typed
-//! [`OperationOutcome`](novarocks_execution::task_execution::operation::OperationOutcome)
+//! [`OperationOutcome`](novarocks_execution_contract::task_execution::operation::OperationOutcome)
 //! rather than re-deriving the verdict from state. That is deliberate: the
 //! owner classified the progression once, under its own lock, and a second
 //! classification here could disagree with the answer the frontend was given.
@@ -36,10 +36,10 @@
 //! says only that something exists, which is exactly the defect this arc has
 //! produced repeatedly.
 
-use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
-use novarocks_execution::task_execution::lease::LeaseSequence;
-use novarocks_execution::task_execution::operation::{OperationOutcome, ReleaseOutcome};
-use novarocks_execution::task_execution::status::{TaskState, TerminationDetail};
+use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::task_execution::lease::LeaseSequence;
+use novarocks_execution_contract::task_execution::operation::{OperationOutcome, ReleaseOutcome};
+use novarocks_execution_contract::task_execution::status::{TaskState, TerminationDetail};
 
 use super::host::ReleasedContextEvidence;
 use super::receipt::{CreateTaskOutcome, QueryContextOutcome, ReleaseQueryContextOutcome};

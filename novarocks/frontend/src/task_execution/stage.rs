@@ -26,8 +26,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_execution::task_execution::{
-    CancelReason, ExchangeEdgeId, StageRef, StageState, TaskIdentity, TaskState,
-    derive_stage_state, parent_released_children,
+    CancelReason, ExchangeEdgeId, StageRef, TaskIdentity, TaskState,
+};
+use novarocks_query_application::coordination::{
+    StageState, derive_stage_state, parent_released_children,
 };
 use novarocks_sql::plan_read::FragmentId;
 use novarocks_types::identity::{StageId, TaskId};

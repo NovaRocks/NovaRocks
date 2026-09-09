@@ -29,13 +29,13 @@
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks_execution::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
-use novarocks_execution::task_execution::identity::QueryContextRef;
-use novarocks_execution::task_execution::operation::{
+use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
+use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_execution_contract::task_execution::identity::QueryContextRef;
+use novarocks_execution_contract::task_execution::operation::{
     CredentialUpdate, QueryContextDomainUpdate, TaskDomainUpdate,
 };
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;

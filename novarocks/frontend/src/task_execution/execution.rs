@@ -28,11 +28,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
-    AbortCause, AttemptDrainFacts, DispatchBudget, GoneObservation, LatchOutcome, OperationKind,
-    QueryContextRef, StageState, StatusObservation, TaskDomainUpdate, TaskIdentity,
-    TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, TerminationLatch,
-    TransportBudget, UpdateQueryContext, parent_released_children,
+    AbortCause, OperationKind, QueryContextRef, TaskDomainUpdate, TaskIdentity, TaskOperationId,
+    TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, UpdateQueryContext,
 };
+use novarocks_query_application::coordination::{
+    AttemptDrainFacts, DispatchBudget, GoneObservation, LatchOutcome, StageState,
+    StatusObservation, TerminationLatch, parent_released_children,
+};
+use novarocks_task_codec::TransportBudget;
+use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::{StageId, TaskId};
 
 use super::clock::TaskProtocolClock;
@@ -158,6 +162,7 @@ impl QueryTaskExecution {
         graph: TaskGraph,
         budget: DispatchBudget,
         transport: TransportBudget,
+        native_compatibility_id: NativeCompatibilityId,
         clock: Arc<dyn TaskProtocolClock>,
         sink: Arc<dyn TaskOperationSink>,
         intake: StatusIntake,
@@ -170,7 +175,10 @@ impl QueryTaskExecution {
             *tasks_per_context.entry(task.context()).or_default() += 1;
         }
         for (&context, &tasks) in &tasks_per_context {
-            owners.insert(context, QueryContextOwner::new(context, tasks));
+            owners.insert(
+                context,
+                QueryContextOwner::new(context, tasks, native_compatibility_id),
+            );
         }
 
         let mut dispatcher = OperationDispatcher::new(budget, transport);
@@ -183,10 +191,10 @@ impl QueryTaskExecution {
                 .ok_or_else(|| TaskExecutionError::Schedule(format!("task {task_id} is absent")))?;
             dispatcher.register_task(node.identity().backend_process_id())?;
             stage_of_task.insert(task_id, node.stage_id());
-            stage_tasks.entry(node.stage_id()).or_default().insert(
-                task_id,
-                RemoteTask::new(descriptor, node.context(), Vec::new())?,
-            );
+            stage_tasks
+                .entry(node.stage_id())
+                .or_default()
+                .insert(task_id, RemoteTask::new(descriptor, node.context())?);
         }
 
         let mut stages = BTreeMap::<StageId, StageExecution>::new();
@@ -307,6 +315,9 @@ impl QueryTaskExecution {
 
         let mut lifecycle = Vec::<(OperationTarget, OperationIntent)>::new();
         for (&context, owner) in &mut self.owners {
+            if let Some(intent) = owner.admission_intent(now)? {
+                lifecycle.push((OperationTarget::Context(context), intent));
+            }
             if !owner.needs_establish() {
                 continue;
             }
@@ -518,6 +529,7 @@ impl QueryTaskExecution {
             .get_mut(&context)
             .ok_or(TaskExecutionError::UnknownOperation)?;
         match ack.kind() {
+            OperationKind::AcquireQueryContextAdmissionTicket => owner.on_admission_ack(ack, now),
             OperationKind::UpdateQueryContext => owner.on_context_ack(ack),
             OperationKind::ReleaseQueryContext => {
                 owner

@@ -50,13 +50,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use novarocks_execution::task_execution::identity::TaskOperationId;
-use novarocks_execution::task_execution::operation::{
-    OperationOutcome, TransportBudget, UpdateQueryContext,
+use novarocks_execution_contract::task_execution::identity::TaskOperationId;
+use novarocks_execution_contract::task_execution::operation::{
+    OperationOutcome, TaskDomainReceipt, UpdateQueryContext,
 };
-use novarocks_execution::task_execution::status::{SafeDetail, TaskFailureCategory};
+use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailureCategory};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
+use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::domain::{
     ConfidentialTransport, refuse_confidential_material_in_the_clear,
 };
@@ -64,8 +65,8 @@ use novarocks_task_codec::operation::{
     DecodedOperation, DecodedUpdateQueryContext, decode_fetch_dynamic_filters,
     decode_get_final_task_info, decode_operation_batch, decode_subscribe_task_status,
     encode_abort_cause_field, encode_create_task_ack, encode_operation_outcome,
-    encode_query_context_ack, encode_receipt, encode_release_ack, encode_status_event,
-    encode_task_gone_event, encode_update_task_ack,
+    encode_query_context_ack, encode_query_context_admission_ticket_ack, encode_receipt,
+    encode_release_ack, encode_status_event, encode_task_gone_event, encode_update_task_ack,
 };
 use novarocks_task_codec::status::{encode_final_task_info, encode_task_status};
 use novarocks_types::NativeCompatibilityId;
@@ -109,21 +110,40 @@ impl RegistryTaskExecutionIngress {
         &self,
         operation: &DecodedOperation,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
-        if let DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::Establish(request)) =
-            operation
-            && request.native_compatibility_id() != self.native_compatibility_id
-        {
-            return encode_receipt(
+        let compatibility = match operation {
+            DecodedOperation::AcquireQueryContextAdmissionTicket(request) => Some((
                 request.envelope().operation_id(),
+                request.native_compatibility_id(),
+            )),
+            DecodedOperation::UpdateQueryContext(DecodedUpdateQueryContext::Establish(request)) => {
+                Some((
+                    request.envelope().operation_id(),
+                    request.native_compatibility_id(),
+                ))
+            }
+            _ => None,
+        };
+        if let Some((operation_id, compatibility_id)) = compatibility
+            && compatibility_id != self.native_compatibility_id
+        {
+            return Ok(encode_receipt(
+                operation_id,
                 OperationOutcome::CompatibilityMismatch,
                 "native compatibility identity does not match this backend process",
                 None,
-            )
-            .ok_or_else(|| {
-                tonic::Status::internal("compatibility mismatch outcome has no wire representation")
-            });
+            ));
         }
         match operation {
+            DecodedOperation::AcquireQueryContextAdmissionTicket(request) => {
+                let receipt = self
+                    .registry
+                    .acquire_query_context_admission_ticket(*request);
+                encode_item(&receipt, |ack| {
+                    Some(ReceiptAck::QueryContextAdmissionTicket(
+                        encode_query_context_admission_ticket_ack(*ack),
+                    ))
+                })
+            }
             DecodedOperation::CreateTask(request) => {
                 let identity = request.request().identity();
                 let receipt = self.registry.create_task(request.request());
@@ -155,10 +175,12 @@ impl RegistryTaskExecutionIngress {
                 // be decoded again to learn the same thing.
                 let terminal_nonempty = receipt.acknowledgement().is_some_and(|ack| {
                     ack.domains().iter().any(|domain| match domain {
-                        novarocks_execution::task_execution::TaskDomainReceipt::SplitAssignment { nodes, .. } => nodes.iter().any(|node| {
-                            node.watermark().no_more_splits()
-                                && node.watermark().accepted_through().is_some()
-                        }),
+                        TaskDomainReceipt::SplitAssignment { nodes, .. } => {
+                            nodes.iter().any(|node| {
+                                node.watermark().no_more_splits()
+                                    && node.watermark().accepted_through().is_some()
+                            })
+                        }
                         _ => false,
                     })
                 });
@@ -276,18 +298,12 @@ fn encode_item<T>(
         })?),
         None => None,
     };
-    encode_receipt(
+    Ok(encode_receipt(
         receipt.operation_id(),
         receipt.outcome(),
         receipt.detail().map_or("", SafeDetail::as_str),
         ack,
-    )
-    .ok_or_else(|| {
-        tonic::Status::internal(format!(
-            "operation outcome {:?} has no wire representation",
-            receipt.outcome()
-        ))
-    })
+    ))
 }
 
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
@@ -399,12 +415,7 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
             // Losing final info costs diagnostics only, so why it is missing
             // is reported as an outcome rather than as an error.
             None => proto::get_final_task_info_response::Result::Unavailable(
-                encode_operation_outcome(receipt.outcome()).ok_or_else(|| {
-                    tonic::Status::internal(format!(
-                        "final info outcome {:?} has no wire representation",
-                        receipt.outcome()
-                    ))
-                })?,
+                encode_operation_outcome(receipt.outcome()),
             ),
         };
         Ok(proto::GetFinalTaskInfoResponse {
@@ -501,19 +512,21 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use novarocks_execution::task_execution::descriptor::TaskDescriptor;
-    use novarocks_execution::task_execution::domain::{
+    use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
+    use novarocks_execution_contract::task_execution::domain::{
         CodecOwnedContent, ContentFingerprint, DomainVersion,
     };
-    use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
-    use novarocks_execution::task_execution::operation::{
+    use novarocks_execution_contract::task_execution::identity::{
+        AdmissionTicketId, QueryContextRef, TaskIdentity,
+    };
+    use novarocks_execution_contract::task_execution::operation::{
         QueryContextDomainUpdate, TaskDomainUpdate,
     };
-    use novarocks_execution::task_execution::status::{
+    use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, TaskOutputFacts, TaskState, TaskStatus, TaskStatusCursor,
         TaskStatusVersion,
     };
-    use novarocks_execution::task_execution::transition::QueryContextState;
+    use novarocks_execution_contract::task_execution::transition::QueryContextState;
     use novarocks_proto_models::{catalog, common, plan};
     use novarocks_task_codec::identity::{
         encode_query_context_ref, encode_task_identity, encode_task_operation_id,
@@ -718,6 +731,40 @@ mod tests {
                 .apply_task_operations(proto::ApplyTaskOperationsRequest { operations })
                 .expect("a well formed batch is answered with receipts")
         }
+
+        fn acquire_ticket(&self, context: QueryContextRef) -> AdmissionTicketId {
+            let response = self.apply(vec![acquire_ticket(
+                context,
+                TaskOperationId::new_v7(),
+                self.native_compatibility_id,
+            )]);
+            let Some(ReceiptAck::QueryContextAdmissionTicket(ack)) = &response.receipts[0].ack
+            else {
+                panic!("ticket acquisition returns its grant");
+            };
+            let bytes: [u8; 16] = ack
+                .ticket_id
+                .as_ref()
+                .expect("ticket acknowledgement names the nonce")
+                .value
+                .as_slice()
+                .try_into()
+                .expect("ticket nonce is exactly 16 bytes");
+            AdmissionTicketId::try_from_bytes(bytes).expect("worker minted a nonzero nonce")
+        }
+
+        fn establish(
+            &self,
+            context: QueryContextRef,
+            operation: TaskOperationId,
+        ) -> proto::TaskOperation {
+            establish_with_compatibility(
+                context,
+                operation,
+                self.acquire_ticket(context),
+                self.native_compatibility_id,
+            )
+        }
     }
 
     fn envelope(operation: TaskOperationId) -> proto::TaskOperationEnvelope {
@@ -727,9 +774,31 @@ mod tests {
         }
     }
 
+    fn acquire_ticket(
+        context: QueryContextRef,
+        operation: TaskOperationId,
+        native_compatibility_id: NativeCompatibilityId,
+    ) -> proto::TaskOperation {
+        proto::TaskOperation {
+            envelope: Some(envelope(operation)),
+            operation: Some(
+                proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(
+                    proto::AcquireQueryContextAdmissionTicketRequest {
+                        query_context: Some(encode_query_context_ref(context)),
+                        valid_for_millis: 10_000,
+                        native_compatibility_id: Some(proto::NativeCompatibilityId {
+                            value: native_compatibility_id.as_bytes().to_vec(),
+                        }),
+                    },
+                ),
+            ),
+        }
+    }
+
     fn establish_with_compatibility(
         context: QueryContextRef,
         operation: TaskOperationId,
+        admission_ticket_id: AdmissionTicketId,
         native_compatibility_id: NativeCompatibilityId,
     ) -> proto::TaskOperation {
         proto::TaskOperation {
@@ -757,15 +826,14 @@ mod tests {
                             native_compatibility_id: Some(proto::NativeCompatibilityId {
                                 value: native_compatibility_id.as_bytes().to_vec(),
                             }),
+                            admission_ticket_id: Some(proto::AdmissionTicketId {
+                                value: admission_ticket_id.to_bytes().to_vec(),
+                            }),
                         },
                     )),
                 },
             )),
         }
-    }
-
-    fn establish(context: QueryContextRef, operation: TaskOperationId) -> proto::TaskOperation {
-        establish_with_compatibility(context, operation, NativeCompatibilityId::new([0x71; 32]))
     }
 
     fn renew_lease(
@@ -908,7 +976,7 @@ mod tests {
     fn a_foreign_compatibility_identity_is_rejected_before_context_side_effects() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let response = fixture.apply(vec![establish_with_compatibility(
+        let response = fixture.apply(vec![acquire_ticket(
             context,
             TaskOperationId::new_v7(),
             NativeCompatibilityId::new([0x72; 32]),
@@ -927,6 +995,11 @@ mod tests {
             fixture.registry.context_state(context),
             QueryContextState::Absent
         );
+        assert_eq!(
+            fixture.registry.admission_reservation_count(),
+            0,
+            "compatibility must be rejected before the authority reserves capacity"
+        );
 
         let response = fixture.apply(vec![renew_lease(context, TaskOperationId::new_v7(), 1)]);
         assert_eq!(
@@ -944,9 +1017,11 @@ mod tests {
     fn the_exact_native_compatibility_identity_establishes_the_context() {
         let fixture = Fixture::new();
         let context = fixture.context();
+        let ticket_id = fixture.acquire_ticket(context);
         let response = fixture.apply(vec![establish_with_compatibility(
             context,
             TaskOperationId::new_v7(),
+            ticket_id,
             fixture.native_compatibility_id,
         )]);
 
@@ -970,8 +1045,9 @@ mod tests {
         let fixture = Fixture::new();
         let rejected_context = fixture.context();
         let accepted_context = fixture.other_context();
+        let accepted_ticket = fixture.acquire_ticket(accepted_context);
         let response = fixture.apply(vec![
-            establish_with_compatibility(
+            acquire_ticket(
                 rejected_context,
                 TaskOperationId::new_v7(),
                 NativeCompatibilityId::new([0x72; 32]),
@@ -979,6 +1055,7 @@ mod tests {
             establish_with_compatibility(
                 accepted_context,
                 TaskOperationId::new_v7(),
+                accepted_ticket,
                 fixture.native_compatibility_id,
             ),
         ]);
@@ -1017,7 +1094,7 @@ mod tests {
             TaskOperationId::new_v7(),
         ];
         let response = fixture.apply(vec![
-            establish(context, ids[0]),
+            fixture.establish(context, ids[0]),
             renew_lease(context, ids[1], 1),
             release(context, ids[2]),
         ]);
@@ -1059,7 +1136,7 @@ mod tests {
             TaskOperationId::new_v7(),
         ];
         let response = fixture.apply(vec![
-            establish(context, ids[0]),
+            fixture.establish(context, ids[0]),
             cancel(fixture.identity(9, 9), ids[1]),
             renew_lease(context, ids[2], 1),
         ]);
@@ -1200,7 +1277,7 @@ mod tests {
     async fn a_subscription_delivers_its_catch_up_frame_and_then_a_later_event() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        fixture.apply(vec![establish(context, TaskOperationId::new_v7())]);
+        fixture.apply(vec![fixture.establish(context, TaskOperationId::new_v7())]);
         let identity = fixture.identity(1, 1);
         let source = fixture
             .registry
@@ -1252,7 +1329,7 @@ mod tests {
         let context = fixture.context();
         let identity = fixture.identity(1, 1);
         let response = fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
         assert_eq!(
@@ -1363,7 +1440,7 @@ mod tests {
         let context = fixture.context();
         let identity = fixture.identity(1, 1);
         fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
         let response = fixture
@@ -1389,7 +1466,7 @@ mod tests {
         let context = fixture.context();
         let producer = fixture.identity(3, 3);
         fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_producer_task(context, producer, TaskOperationId::new_v7()),
         ]);
         assert!(fixture.registry.has_live_task(producer));
@@ -1421,7 +1498,7 @@ mod tests {
         let context = fixture.context();
         let identity = fixture.identity(1, 1);
         fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
         let envelope = novarocks_proto_models::filter::RuntimeFilterEnvelope {
@@ -1469,7 +1546,7 @@ mod tests {
         let context = fixture.context();
         let identity = fixture.identity(1, 1);
         fixture.apply(vec![
-            establish(context, TaskOperationId::new_v7()),
+            fixture.establish(context, TaskOperationId::new_v7()),
             create_task(context, identity, TaskOperationId::new_v7()),
         ]);
         fixture

@@ -29,14 +29,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_execution::task_execution::{
-    AbortCause, AbortQueryContext, CodecOwnedContent, ContextTransition, CredentialUpdate,
-    EstablishQueryContext, FrontendAction, LeaseBounds, LeaseSequence, LeaseValidFor,
-    MonotonicInstant, OperationKind, OperationOutcome, QueryContextEvent, QueryContextRef,
-    QueryContextState, ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease,
-    RenewSchedule, TaskOperationId, UpdateQueryContext, classify_context_transition,
+    AbortCause, AbortQueryContext, AcquireQueryContextAdmissionTicket, CodecOwnedContent,
+    CredentialUpdate, EstablishQueryContext, LeaseSequence, LeaseValidFor, OperationKind,
+    OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextRef, QueryContextState,
+    ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, TaskOperationId,
+    UpdateQueryContext,
+};
+use novarocks_query_application::coordination::{
+    ContextTransition, FrontendAction, MonotonicInstant, QueryContextEvent, RenewSchedule,
+    RequestedLeaseDurations, classify_context_transition, context_state_is_closed, frontend_action,
 };
 
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
+use novarocks_types::NativeCompatibilityId;
 
 use super::error::TaskExecutionError;
 use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
@@ -50,6 +55,12 @@ use super::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
 /// lease and the attempt's drain budget.
 const RELEASE_RETRY_INITIAL: Duration = Duration::from_millis(50);
 const RELEASE_RETRY_MAX: Duration = Duration::from_secs(1);
+
+/// How long query coordination asks a Worker to hold an unconsumed ticket.
+///
+/// This is a query-side policy. Worker retention limits remain Worker-owned
+/// and are not imported into the frontend.
+const ADMISSION_TICKET_VALID_FOR: Duration = Duration::from_secs(10);
 
 /// The shared facts an establish installs atomically.
 ///
@@ -107,6 +118,21 @@ struct ReleasedLease {
     awaiting_outcome: bool,
 }
 
+/// One immutable capacity request retained for exact replay.
+#[derive(Copy, Clone, Debug)]
+struct ReleasedAdmission {
+    request: AcquireQueryContextAdmissionTicket,
+    first_sent_at: MonotonicInstant,
+    awaiting_outcome: bool,
+}
+
+/// A validated grant held until the first establish is minted.
+#[derive(Copy, Clone, Debug)]
+struct GrantedAdmission {
+    receipt: QueryContextAdmissionTicketReceipt,
+    conservative_expiry: MonotonicInstant,
+}
+
 /// What a release answer did to this owner.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseSettlement {
@@ -125,7 +151,11 @@ pub enum ReleaseSettlement {
 #[derive(Debug)]
 pub struct QueryContextOwner {
     context: QueryContextRef,
+    native_compatibility_id: NativeCompatibilityId,
     state: QueryContextState,
+    admission: Option<ReleasedAdmission>,
+    admission_ticket: Option<GrantedAdmission>,
+    admission_qualified: bool,
     lease_sequence: LeaseSequence,
     renew_schedule: Option<RenewSchedule>,
     establish: Option<ReleasedLease>,
@@ -157,10 +187,18 @@ pub struct QueryContextOwner {
 impl QueryContextOwner {
     /// Creates the owner of one context, over the frozen task set this
     /// attempt places on that backend.
-    pub const fn new(context: QueryContextRef, tasks: usize) -> Self {
+    pub const fn new(
+        context: QueryContextRef,
+        tasks: usize,
+        native_compatibility_id: NativeCompatibilityId,
+    ) -> Self {
         Self {
             context,
+            native_compatibility_id,
             state: QueryContextState::Absent,
+            admission: None,
+            admission_ticket: None,
+            admission_qualified: true,
             lease_sequence: LeaseSequence::INITIAL,
             renew_schedule: None,
             establish: None,
@@ -230,6 +268,56 @@ impl QueryContextOwner {
         !self.establish_acknowledged
     }
 
+    /// Whether this context still needs a Worker capacity grant.
+    pub const fn needs_admission_ticket(&self) -> bool {
+        self.admission_qualified
+            && self.admission_ticket.is_none()
+            && self.establish.is_none()
+            && !self.establish_acknowledged
+    }
+
+    /// Acquires Worker-local capacity before the first establish.
+    ///
+    /// A transport-unknown settlement only releases the in-flight marker. The
+    /// exact request, including its operation id and compatibility identity,
+    /// remains here and is handed out verbatim on the next turn.
+    pub fn admission_intent(
+        &mut self,
+        now: MonotonicInstant,
+    ) -> Result<Option<OperationIntent>, TaskExecutionError> {
+        if !self.needs_admission_ticket() {
+            return Ok(None);
+        }
+        if let Some(released) = &mut self.admission {
+            if released.awaiting_outcome {
+                return Ok(None);
+            }
+            released.awaiting_outcome = true;
+            return Ok(Some(OperationIntent::AcquireQueryContextAdmissionTicket(
+                released.request,
+            )));
+        }
+        if !matches!(self.state, QueryContextState::Absent) {
+            return Ok(None);
+        }
+        let valid_for = LeaseValidFor::new(ADMISSION_TICKET_VALID_FOR)
+            .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
+        let request = AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            self.context,
+            valid_for,
+            self.native_compatibility_id,
+        );
+        self.admission = Some(ReleasedAdmission {
+            request,
+            first_sent_at: now,
+            awaiting_outcome: true,
+        });
+        Ok(Some(OperationIntent::AcquireQueryContextAdmissionTicket(
+            request,
+        )))
+    }
+
     /// The establish request, once.
     pub fn establish_intent(
         &mut self,
@@ -254,11 +342,26 @@ impl QueryContextOwner {
         ) {
             return Ok(None);
         }
-        let valid_for = LeaseValidFor::new(LeaseBounds::INITIAL_REQUEST)
+        let Some(granted) = self.admission_ticket else {
+            return Ok(None);
+        };
+        if now.has_reached(granted.conservative_expiry) {
+            self.admission_ticket = None;
+            self.admission_qualified = false;
+            self.state = QueryContextState::TerminalRetained;
+            self.released = true;
+            return Err(TaskExecutionError::OperationFailed {
+                kind: OperationKind::AcquireQueryContextAdmissionTicket,
+                outcome: OperationOutcome::LeaseExpired,
+                detail: Some("the admission ticket expired before establish was sent".to_owned()),
+            });
+        }
+        let valid_for = LeaseValidFor::new(RequestedLeaseDurations::DEFAULT.initial())
             .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
         let request = Arc::new(UpdateQueryContext::Establish(EstablishQueryContext::new(
             TaskOperationId::new_v7(),
             self.context,
+            granted.receipt.ticket_id(),
             facts.catalog_binding,
             facts.initial_runtime_filter,
             facts.query_options,
@@ -266,6 +369,8 @@ impl QueryContextOwner {
             valid_for,
         )));
         self.state = QueryContextState::Establishing;
+        self.admission_ticket = None;
+        self.admission_qualified = false;
         self.establish = Some(ReleasedLease {
             request: Arc::clone(&request),
             sequence: LeaseSequence::INITIAL,
@@ -305,7 +410,7 @@ impl QueryContextOwner {
         let sequence = self.lease_sequence.next().ok_or_else(|| {
             TaskExecutionError::Schedule("lease sequence space exhausted".to_owned())
         })?;
-        let valid_for = LeaseValidFor::new(LeaseBounds::STEADY_REQUEST)
+        let valid_for = LeaseValidFor::new(RequestedLeaseDurations::DEFAULT.steady())
             .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
         let request = Arc::new(UpdateQueryContext::RenewLease(
             RenewQueryExecutionLease::new(
@@ -361,6 +466,8 @@ impl QueryContextOwner {
         let request = *self.abort.get_or_insert_with(|| {
             AbortQueryContext::new(TaskOperationId::new_v7(), self.context, cause)
         });
+        self.admission_qualified = false;
+        self.admission_ticket = None;
         Some(OperationIntent::AbortQueryContext(request))
     }
 
@@ -395,6 +502,91 @@ impl QueryContextOwner {
 
     fn advance(&mut self) {
         self.progress = self.progress.saturating_add(1);
+    }
+
+    /// Settles one Worker admission answer without starting an establish.
+    ///
+    /// The next runner turn is the only place that may consume a held ticket.
+    /// This keeps a late receipt from advancing a context after its owner lost
+    /// coordination qualification.
+    pub fn on_admission_ack(
+        &mut self,
+        ack: &OperationAcknowledgement,
+        now: MonotonicInstant,
+    ) -> Result<(), TaskExecutionError> {
+        let released = self
+            .admission
+            .as_mut()
+            .filter(|released| {
+                released.awaiting_outcome
+                    && released.request.envelope().operation_id() == ack.operation_id()
+            })
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        released.awaiting_outcome = false;
+        let released = *released;
+
+        if !self.admission_qualified {
+            self.admission = None;
+            return Ok(());
+        }
+        if matches!(
+            frontend_action(ack.dispatch_result()),
+            FrontendAction::RetryExactRequest
+        ) {
+            return Ok(());
+        }
+        if !ack.is_applied() {
+            self.fail_admission();
+            return Err(TaskExecutionError::OperationFailed {
+                kind: OperationKind::AcquireQueryContextAdmissionTicket,
+                outcome: ack
+                    .worker_outcome()
+                    .expect("a non-transport acknowledgement has a Worker outcome"),
+                detail: ack.detail().map(|detail| detail.as_str().to_owned()),
+            });
+        }
+        let AckPayload::AdmissionTicket(receipt) = ack.payload() else {
+            self.fail_admission();
+            return Err(TaskExecutionError::MissingReceipt(
+                OperationKind::AcquireQueryContextAdmissionTicket,
+            ));
+        };
+        self.context.verify_matches(receipt.context())?;
+        if receipt.valid_for() != released.request.valid_for() {
+            self.fail_admission();
+            return Err(TaskExecutionError::OperationFailed {
+                kind: OperationKind::AcquireQueryContextAdmissionTicket,
+                outcome: OperationOutcome::DomainConflict,
+                detail: Some(
+                    "the admission ticket validity differs from the exact request".to_owned(),
+                ),
+            });
+        }
+        let conservative_expiry = released
+            .first_sent_at
+            .saturating_add(receipt.valid_for().get());
+        if now.has_reached(conservative_expiry) {
+            self.fail_admission();
+            return Err(TaskExecutionError::OperationFailed {
+                kind: OperationKind::AcquireQueryContextAdmissionTicket,
+                outcome: OperationOutcome::LeaseExpired,
+                detail: Some("the admission ticket expired before its receipt arrived".to_owned()),
+            });
+        }
+        self.admission = None;
+        self.admission_ticket = Some(GrantedAdmission {
+            receipt: *receipt,
+            conservative_expiry,
+        });
+        Ok(())
+    }
+
+    fn fail_admission(&mut self) {
+        self.admission = None;
+        self.admission_ticket = None;
+        self.admission_qualified = false;
+        self.state = QueryContextState::TerminalRetained;
+        self.released = true;
     }
 
     /// Settles one query-context acknowledgement.
@@ -464,7 +656,7 @@ impl QueryContextOwner {
                 }
                 // A receipt may still report that the context closed while the
                 // establish was in flight; the backend's answer wins.
-                if receipt.state().is_closed() {
+                if context_state_is_closed(receipt.state()) {
                     self.state = receipt.state();
                     self.released = true;
                 }
@@ -474,7 +666,7 @@ impl QueryContextOwner {
             return Ok(());
         }
         if matches!(
-            ack.outcome().frontend_action(),
+            frontend_action(ack.dispatch_result()),
             FrontendAction::RetryExactRequest
         ) {
             // The retained request keeps its first send time, so the identical
@@ -490,7 +682,9 @@ impl QueryContextOwner {
         self.released = true;
         Err(TaskExecutionError::OperationFailed {
             kind: OperationKind::UpdateQueryContext,
-            outcome: ack.outcome(),
+            outcome: ack
+                .worker_outcome()
+                .expect("a non-transport acknowledgement has a Worker outcome"),
             detail: ack.detail().map(|d| d.as_str().to_owned()),
         })
     }
@@ -546,18 +740,18 @@ impl QueryContextOwner {
                 }
             });
         }
-        match ack.outcome() {
+        let Some(outcome) = ack.worker_outcome() else {
+            // The backend outcome is unknown, so preserve the existing
+            // exact-request replay behavior without adding a NotReady delay
+            // that was never observed.
+            self.release_blocked_at = None;
+            self.release_retry_at = None;
+            return Ok(ReleaseSettlement::RetryExactRequest);
+        };
+        match outcome {
             OperationOutcome::ReleaseNotReady => {
                 self.defer_release_retry(now);
                 Ok(ReleaseSettlement::NotReadyKeepRenewing)
-            }
-            OperationOutcome::RetryableTransportUnknown => {
-                // The backend outcome is unknown, so preserve the existing
-                // exact-request replay behavior without adding a NotReady
-                // delay that was never observed.
-                self.release_blocked_at = None;
-                self.release_retry_at = None;
-                Ok(ReleaseSettlement::RetryExactRequest)
             }
             OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone => {
                 self.state = QueryContextState::TerminalRetained;
@@ -585,8 +779,8 @@ impl QueryContextOwner {
         }
         if ack.is_applied()
             || matches!(
-                ack.outcome(),
-                OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone
+                ack.worker_outcome(),
+                Some(OperationOutcome::ContextTerminalReceipt | OperationOutcome::Gone)
             )
         {
             self.state = QueryContextState::TerminalRetained;

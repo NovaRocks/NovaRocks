@@ -31,9 +31,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use novarocks_execution::task_execution::{
-    DispatchBudget, DispatchLane, MonotonicInstant, TaskOperationId, TransportBudget,
-};
+use novarocks_execution::task_execution::TaskOperationId;
+use novarocks_query_application::coordination::{DispatchBudget, DispatchLane, MonotonicInstant};
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::BackendProcessId;
 
 use super::error::{CapacityBound, TaskExecutionError};

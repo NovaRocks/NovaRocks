@@ -26,23 +26,24 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks_execution::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution::task_execution::domain::{
+use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
+use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, CredentialEpoch, CredentialLeaseId, DomainProgression, DomainVersion,
-    ExchangeEdgeId,
+    EdgeOpenVersion, ExchangeEdgeId,
 };
-use novarocks_execution::task_execution::identity::{
-    QueryContextRef, TaskIdentity, TaskOperationId,
+use novarocks_execution_contract::task_execution::identity::{
+    AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
 };
-use novarocks_execution::task_execution::lease::LeaseValidFor;
-use novarocks_execution::task_execution::operation::{
-    AbortQueryContext, AdvanceQueryContextDomain, CancelTask, CreateTask, CreateTaskReceipt,
-    EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo, MaxWait, OperationEnvelope,
-    OperationKind, OperationOutcome, QueryContextDomainReceipt, QueryContextReceipt,
+use novarocks_execution_contract::task_execution::lease::LeaseValidFor;
+use novarocks_execution_contract::task_execution::operation::{
+    AbortQueryContext, AcquireQueryContextAdmissionTicket, AdvanceQueryContextDomain, CancelTask,
+    CreateTask, CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters,
+    GetFinalTaskInfo, MaxWait, OperationEnvelope, OperationKind, OperationOutcome,
+    QueryContextAdmissionTicketReceipt, QueryContextDomainReceipt, QueryContextReceipt,
     ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease, TaskDomainReceipt,
-    TransportBudget, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
 };
-use novarocks_execution::task_execution::transition::QueryContextState;
+use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_proto_models::novarocks;
 use novarocks_types::NativeCompatibilityId;
 use prost::Message;
@@ -64,8 +65,8 @@ pub const ESTABLISH_FILTER_DOMAIN_TAG: &[u8] =
 pub const ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.establish.query_options.v1";
 use crate::identity::{
-    decode_query_context_ref, decode_task_operation_id, encode_query_context_ref,
-    encode_task_operation_id,
+    decode_admission_ticket_id, decode_query_context_ref, decode_task_operation_id,
+    encode_admission_ticket_id, encode_query_context_ref, encode_task_operation_id,
 };
 use crate::lease::decode_duration_millis;
 use crate::status::{
@@ -74,7 +75,7 @@ use crate::status::{
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_codec::{FieldPath, ProtocolError};
 
-use crate::{invalid, invalid_enum, missing, out_of_range};
+use crate::{TransportBudget, invalid, invalid_enum, missing, out_of_range};
 
 /// Decodes an operation envelope.
 pub fn decode_envelope(
@@ -152,6 +153,7 @@ impl DecodedUpdateTask {
 pub struct DecodedEstablishQueryContext {
     context: QueryContextRef,
     envelope: OperationEnvelope,
+    admission_ticket_id: AdmissionTicketId,
     catalog_set: Arc<WireContent<novarocks_proto_models::catalog::CatalogSet>>,
     initial_runtime_filter: Arc<WireContent<novarocks::RuntimeFilterContribution>>,
     query_options: Arc<WireContent<novarocks::QueryOptions>>,
@@ -167,6 +169,10 @@ impl DecodedEstablishQueryContext {
 
     pub const fn envelope(&self) -> OperationEnvelope {
         self.envelope
+    }
+
+    pub const fn admission_ticket_id(&self) -> AdmissionTicketId {
+        self.admission_ticket_id
     }
 
     /// The catalog binding, for the backend's shared-fact owner.
@@ -214,7 +220,7 @@ pub enum DecodedUpdateQueryContext {
     RenewLease {
         context: QueryContextRef,
         envelope: OperationEnvelope,
-        sequence: novarocks_execution::task_execution::lease::LeaseSequence,
+        sequence: novarocks_execution_contract::task_execution::lease::LeaseSequence,
         valid_for: LeaseValidFor,
     },
 }
@@ -239,6 +245,7 @@ impl DecodedUpdateQueryContext {
                 Some(UpdateQueryContext::Establish(EstablishQueryContext::new(
                     request.envelope().operation_id(),
                     request.context(),
+                    request.admission_ticket_id(),
                     Arc::clone(&request.catalog_set) as Arc<dyn CodecOwnedContent>,
                     Arc::clone(&request.initial_runtime_filter) as Arc<dyn CodecOwnedContent>,
                     Arc::clone(&request.query_options) as Arc<dyn CodecOwnedContent>,
@@ -295,6 +302,7 @@ impl DecodedUpdateQueryContext {
 
 /// One decoded operation from a batch.
 pub enum DecodedOperation {
+    AcquireQueryContextAdmissionTicket(AcquireQueryContextAdmissionTicket),
     CreateTask(DecodedCreateTask),
     UpdateTask(DecodedUpdateTask),
     UpdateQueryContext(DecodedUpdateQueryContext),
@@ -320,6 +328,7 @@ impl fmt::Debug for DecodedOperation {
 impl DecodedOperation {
     pub const fn envelope(&self) -> OperationEnvelope {
         match self {
+            Self::AcquireQueryContextAdmissionTicket(request) => request.envelope(),
             Self::CreateTask(request) => request.request.envelope(),
             Self::UpdateTask(request) => request.request.envelope(),
             Self::UpdateQueryContext(request) => request.envelope(),
@@ -368,6 +377,57 @@ pub fn decode_operation(
         .ok_or_else(|| missing(path.clone(), "an operation requires a command"))?;
 
     match operation {
+        novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(acquire) => {
+            let acquire_path = path.clone().field("acquire_query_context_admission_ticket");
+            let envelope = decode_envelope(
+                envelope_src,
+                OperationKind::AcquireQueryContextAdmissionTicket,
+                path.field("envelope"),
+            )?;
+            let context = acquire.query_context.as_ref().ok_or_else(|| {
+                missing(
+                    acquire_path.clone().field("query_context"),
+                    "admission ticket acquisition requires a query context reference",
+                )
+            })?;
+            let context =
+                decode_query_context_ref(context, acquire_path.clone().field("query_context"))?;
+            let valid_for = decode_duration_millis(
+                acquire.valid_for_millis,
+                acquire_path.clone().field("valid_for_millis"),
+                LeaseValidFor::MAX_REPRESENTABLE,
+            )?;
+            let valid_for = LeaseValidFor::new(valid_for).map_err(|error| {
+                invalid(
+                    acquire_path.clone().field("valid_for_millis"),
+                    error.to_string(),
+                )
+            })?;
+            let native_compatibility_id =
+                acquire.native_compatibility_id.as_ref().ok_or_else(|| {
+                    missing(
+                        acquire_path.clone().field("native_compatibility_id"),
+                        "admission ticket acquisition requires a native compatibility identity",
+                    )
+                })?;
+            let native_compatibility_id = NativeCompatibilityId::try_from_slice(
+                &native_compatibility_id.value,
+            )
+            .map_err(|error| {
+                invalid(
+                    acquire_path.field("native_compatibility_id").field("value"),
+                    error.to_string(),
+                )
+            })?;
+            Ok(DecodedOperation::AcquireQueryContextAdmissionTicket(
+                AcquireQueryContextAdmissionTicket::new(
+                    envelope.operation_id(),
+                    context,
+                    valid_for,
+                    native_compatibility_id,
+                ),
+            ))
+        }
         novarocks::task_operation::Operation::CreateTask(create) => {
             let create_path = path.clone().field("create_task");
             let envelope = decode_envelope(
@@ -539,6 +599,16 @@ fn decode_update_query_context(
             })?;
             let context =
                 decode_query_context_ref(context, establish_path.clone().field("query_context"))?;
+            let admission_ticket_id = establish.admission_ticket_id.as_ref().ok_or_else(|| {
+                missing(
+                    establish_path.clone().field("admission_ticket_id"),
+                    "establish requires an admission ticket id",
+                )
+            })?;
+            let admission_ticket_id = decode_admission_ticket_id(
+                admission_ticket_id,
+                establish_path.clone().field("admission_ticket_id"),
+            )?;
             let catalog_set = establish.catalog_set.clone().ok_or_else(|| {
                 missing(
                     establish_path.clone().field("catalog_set"),
@@ -641,6 +711,7 @@ fn decode_update_query_context(
                 DecodedEstablishQueryContext {
                     context,
                     envelope,
+                    admission_ticket_id,
                     catalog_set,
                     initial_runtime_filter,
                     query_options,
@@ -768,14 +839,11 @@ fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, Proto
     }
 }
 
-/// Encodes a server-reported outcome.
+/// Encodes a Worker-produced receipt verdict.
 ///
-/// Four neutral categories have no wire representation on purpose. Two of
-/// them are what a client concludes when no receipt arrives at all, and two
-/// are exchange ingress rejections that travel on the data plane, not in an
-/// operation receipt. Returning `None` for those is what stops a caller from
-/// silently shipping one under a category that means something else.
-fn encode_outcome(value: OperationOutcome) -> Option<i32> {
+/// The shared outcome set contains only Worker verdicts, so every value has
+/// one exact wire representation.
+fn encode_outcome(value: OperationOutcome) -> i32 {
     let encoded = match value {
         OperationOutcome::Accepted => novarocks::TaskOperationOutcome::Accepted,
         OperationOutcome::Idempotent => novarocks::TaskOperationOutcome::Idempotent,
@@ -801,12 +869,8 @@ fn encode_outcome(value: OperationOutcome) -> Option<i32> {
         OperationOutcome::TerminalRejected => novarocks::TaskOperationOutcome::TerminalRejected,
         OperationOutcome::Gone => novarocks::TaskOperationOutcome::Gone,
         OperationOutcome::ResourceExhausted => novarocks::TaskOperationOutcome::ResourceExhausted,
-        OperationOutcome::RetryableTransportUnknown
-        | OperationOutcome::RetryableObservationLoss
-        | OperationOutcome::NormalDestinationCanceled
-        | OperationOutcome::DestinationFailure => return None,
     };
-    Some(encoded as i32)
+    encoded as i32
 }
 
 fn decode_context_state(value: i32, path: FieldPath) -> Result<QueryContextState, ProtocolError> {
@@ -878,7 +942,7 @@ pub struct ReceiptHeader {
     /// Kept rather than discarded: this decoder was validating the field and
     /// then dropping it, so a refusal reached the client as an outcome name
     /// with the reason it had in hand thrown away.
-    detail: Option<novarocks_execution::task_execution::status::SafeDetail>,
+    detail: Option<novarocks_execution_contract::task_execution::status::SafeDetail>,
 }
 
 impl ReceiptHeader {
@@ -899,7 +963,9 @@ impl ReceiptHeader {
     }
 
     /// The backend's own reason for a refusal, if it gave one.
-    pub const fn detail(&self) -> Option<&novarocks_execution::task_execution::status::SafeDetail> {
+    pub const fn detail(
+        &self,
+    ) -> Option<&novarocks_execution_contract::task_execution::status::SafeDetail> {
         self.detail.as_ref()
     }
 }
@@ -920,7 +986,8 @@ pub fn decode_receipt_header(
     let detail =
         crate::status::decode_safe_detail(&src.safe_detail, path.clone().field("safe_detail"))?;
     if let Some(field_path) = src.safe_field_path.as_deref()
-        && field_path.len() > novarocks_execution::task_execution::status::SAFE_FIELD_PATH_MAX_BYTES
+        && field_path.len()
+            > novarocks_execution_contract::task_execution::status::SAFE_FIELD_PATH_MAX_BYTES
     {
         return Err(out_of_range(
             path.field("safe_field_path"),
@@ -1075,7 +1142,7 @@ pub fn encode_fetch_task_result(
 /// Only the accepted epoch is reported: no credential material, and no digest
 /// of any, ever appears in a receipt.
 pub fn encode_credential_receipt(
-    lease_id: novarocks_execution::task_execution::domain::CredentialLeaseId,
+    lease_id: novarocks_execution_contract::task_execution::domain::CredentialLeaseId,
     epoch: CredentialEpoch,
 ) -> novarocks::QueryContextCredentialReceipt {
     novarocks::QueryContextCredentialReceipt {
@@ -1118,7 +1185,7 @@ pub struct DecodedReleaseAck {
     pub state: QueryContextState,
     /// Why the context was terminated, when a release answered on one that was
     /// terminated instead of released.
-    pub termination_cause: Option<novarocks_execution::task_execution::status::AbortCause>,
+    pub termination_cause: Option<novarocks_execution_contract::task_execution::status::AbortCause>,
     /// The backend's sealed runtime-filter observation. Absent means the
     /// release held no participant to seal.
     pub runtime_filter: Option<QueryTerminalProfileContributionTelemetry>,
@@ -1176,21 +1243,20 @@ pub fn decode_release_ack(
 
 /// Encodes a cancel reason back onto the wire, for a receipt or a status.
 pub fn encode_cancel_reason_field(
-    value: novarocks_execution::task_execution::status::CancelReason,
+    value: novarocks_execution_contract::task_execution::status::CancelReason,
 ) -> i32 {
     encode_cancel_reason(value)
 }
 
 /// Encodes an abort cause back onto the wire.
 pub fn encode_abort_cause_field(
-    value: novarocks_execution::task_execution::status::AbortCause,
+    value: novarocks_execution_contract::task_execution::status::AbortCause,
 ) -> i32 {
     encode_abort_cause(value)
 }
 
-/// Encodes an operation outcome back onto the wire, or `None` when the
-/// category has no wire representation.
-pub fn encode_operation_outcome(value: OperationOutcome) -> Option<i32> {
+/// Encodes one Worker receipt verdict back onto the wire.
+pub fn encode_operation_outcome(value: OperationOutcome) -> i32 {
     encode_outcome(value)
 }
 
@@ -1281,6 +1347,26 @@ pub fn encode_release_query_context(request: ReleaseQueryContext) -> novarocks::
     }
 }
 
+/// Encodes one worker admission ticket acquisition.
+pub fn encode_acquire_query_context_admission_ticket(
+    request: AcquireQueryContextAdmissionTicket,
+) -> novarocks::TaskOperation {
+    novarocks::TaskOperation {
+        envelope: Some(encode_envelope(request.envelope())),
+        operation: Some(
+            novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(
+                novarocks::AcquireQueryContextAdmissionTicketRequest {
+                    query_context: Some(encode_query_context_ref(request.context())),
+                    valid_for_millis: request.valid_for().get().as_millis() as u64,
+                    native_compatibility_id: Some(novarocks::NativeCompatibilityId {
+                        value: request.native_compatibility_id().as_bytes().to_vec(),
+                    }),
+                },
+            ),
+        ),
+    }
+}
+
 /// Encodes one lease renewal.
 pub fn encode_renew_lease(request: &RenewQueryExecutionLease) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
@@ -1356,6 +1442,9 @@ pub fn encode_establish_query_context(
                         native_compatibility_id: Some(novarocks::NativeCompatibilityId {
                             value: native_compatibility_id.as_bytes().to_vec(),
                         }),
+                        admission_ticket_id: Some(encode_admission_ticket_id(
+                            request.admission_ticket_id(),
+                        )),
                     },
                 )),
             },
@@ -1379,8 +1468,6 @@ pub fn encode_operation_batch(
     }
     Ok(request)
 }
-
-/// Encodes one task-domain receipt.
 
 /// Encodes the progression of one *accepted* domain.
 ///
@@ -1458,7 +1545,15 @@ pub fn decode_task_domain_receipt(
             })
         }
         novarocks::task_domain_receipt::Receipt::OpenExchangeEdges(edges) => {
-            let edge_path = path.field("open_exchange_edges").field("opened_edge_ids");
+            let receipt_path = path.field("open_exchange_edges");
+            let accepted_version =
+                EdgeOpenVersion::new(edges.accepted_version).map_err(|error| {
+                    invalid(
+                        receipt_path.clone().field("accepted_version"),
+                        error.to_string(),
+                    )
+                })?;
+            let edge_path = receipt_path.field("opened_edge_ids");
             let mut opened = Vec::with_capacity(edges.opened_edge_ids.len());
             for (index, edge) in edges.opened_edge_ids.iter().enumerate() {
                 opened.push(
@@ -1468,6 +1563,7 @@ pub fn decode_task_domain_receipt(
                 );
             }
             Ok(TaskDomainReceipt::OpenExchangeEdges {
+                accepted_version,
                 opened,
                 progression,
             })
@@ -1524,7 +1620,7 @@ pub fn decode_query_context_domain_receipt(
 pub fn encode_task_domain_receipt(
     value: &TaskDomainReceipt,
 ) -> Option<novarocks::TaskDomainReceipt> {
-    use novarocks_execution::task_execution::operation::TaskDomainReceipt as Receipt;
+    use novarocks_execution_contract::task_execution::operation::TaskDomainReceipt as Receipt;
     let progression = encode_accepted_progression(match value {
         Receipt::SplitAssignment { progression, .. }
         | Receipt::TaskDynamicFilter { progression, .. }
@@ -1549,13 +1645,16 @@ pub fn encode_task_domain_receipt(
                 accepted_version: accepted_version.map_or(0, DomainVersion::get),
             })
         }
-        Receipt::OpenExchangeEdges { opened, .. } => {
-            novarocks::task_domain_receipt::Receipt::OpenExchangeEdges(
-                novarocks::OpenExchangeEdgesReceipt {
-                    opened_edge_ids: opened.iter().map(|edge| edge.get()).collect(),
-                },
-            )
-        }
+        Receipt::OpenExchangeEdges {
+            accepted_version,
+            opened,
+            ..
+        } => novarocks::task_domain_receipt::Receipt::OpenExchangeEdges(
+            novarocks::OpenExchangeEdgesReceipt {
+                opened_edge_ids: opened.iter().map(|edge| edge.get()).collect(),
+                accepted_version: accepted_version.get(),
+            },
+        ),
     };
     Some(novarocks::TaskDomainReceipt {
         receipt: Some(receipt),
@@ -1569,7 +1668,7 @@ pub fn encode_task_domain_receipt(
 pub fn encode_query_context_domain_receipt(
     value: &QueryContextDomainReceipt,
 ) -> Option<novarocks::QueryContextDomainReceipt> {
-    use novarocks_execution::task_execution::operation::QueryContextDomainReceipt as Receipt;
+    use novarocks_execution_contract::task_execution::operation::QueryContextDomainReceipt as Receipt;
     let progression = encode_accepted_progression(match value {
         Receipt::CatalogBinding { progression, .. }
         | Receipt::SharedDynamicFilter { progression, .. }
@@ -1698,6 +1797,57 @@ pub fn decode_update_task_ack(
     Ok(UpdateTaskReceipt::new(identity, domains))
 }
 
+/// Decodes an admission-ticket acknowledgement against the exact request.
+///
+/// An opaque ticket id proves nothing by itself. The repeated context and
+/// requested validity must match before the caller may use the ticket to
+/// establish a query context.
+pub fn decode_query_context_admission_ticket_ack(
+    src: &novarocks::QueryContextAdmissionTicketAck,
+    expected: AcquireQueryContextAdmissionTicket,
+    path: FieldPath,
+) -> Result<QueryContextAdmissionTicketReceipt, ProtocolError> {
+    let ticket_id = src.ticket_id.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("ticket_id"),
+            "an admission ticket acknowledgement requires a ticket id",
+        )
+    })?;
+    let ticket_id = decode_admission_ticket_id(ticket_id, path.clone().field("ticket_id"))?;
+
+    let context = src.query_context.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("query_context"),
+            "an admission ticket acknowledgement requires a context reference",
+        )
+    })?;
+    let context = decode_query_context_ref(context, path.clone().field("query_context"))?;
+    if context != expected.context() {
+        return Err(invalid(
+            path.clone().field("query_context"),
+            "an admission ticket acknowledgement names a different context than the request",
+        ));
+    }
+
+    let valid_for = decode_duration_millis(
+        src.valid_for_millis,
+        path.clone().field("valid_for_millis"),
+        LeaseValidFor::MAX_REPRESENTABLE,
+    )?;
+    let valid_for = LeaseValidFor::new(valid_for)
+        .map_err(|error| invalid(path.clone().field("valid_for_millis"), error.to_string()))?;
+    if valid_for != expected.valid_for() {
+        return Err(invalid(
+            path.field("valid_for_millis"),
+            "an admission ticket acknowledgement reports a different validity than the request",
+        ));
+    }
+
+    Ok(QueryContextAdmissionTicketReceipt::new(
+        ticket_id, context, valid_for,
+    ))
+}
+
 fn decode_task_domain_receipts(
     src: &[novarocks::TaskDomainReceipt],
     path: FieldPath,
@@ -1731,7 +1881,7 @@ pub fn decode_query_context_ack(
 ) -> Result<
     (
         QueryContextReceipt,
-        Option<novarocks_execution::task_execution::status::AbortCause>,
+        Option<novarocks_execution_contract::task_execution::status::AbortCause>,
     ),
     ProtocolError,
 > {
@@ -1783,8 +1933,8 @@ pub fn decode_query_context_ack(
 /// Returns `None` when the receipt reports the one state that has no wire
 /// representation.
 pub fn encode_query_context_ack(
-    value: &novarocks_execution::task_execution::operation::QueryContextReceipt,
-    termination_cause: Option<novarocks_execution::task_execution::status::AbortCause>,
+    value: &novarocks_execution_contract::task_execution::operation::QueryContextReceipt,
+    termination_cause: Option<novarocks_execution_contract::task_execution::status::AbortCause>,
 ) -> Option<novarocks::QueryContextAck> {
     Some(novarocks::QueryContextAck {
         query_context: Some(encode_query_context_ref(value.context())),
@@ -1799,29 +1949,36 @@ pub fn encode_query_context_ack(
     })
 }
 
-/// Encodes one operation receipt.
-///
-/// Returns `None` when the outcome has no wire representation, which is the
-/// only way a caller can be stopped from shipping a client-only category as
-/// something a backend claimed.
+/// Encodes the exact worker admission grant returned for one acquisition.
+pub fn encode_query_context_admission_ticket_ack(
+    value: QueryContextAdmissionTicketReceipt,
+) -> novarocks::QueryContextAdmissionTicketAck {
+    novarocks::QueryContextAdmissionTicketAck {
+        ticket_id: Some(encode_admission_ticket_id(value.ticket_id())),
+        query_context: Some(encode_query_context_ref(value.context())),
+        valid_for_millis: value.valid_for().get().as_millis() as u64,
+    }
+}
+
+/// Encodes one Worker operation receipt.
 pub fn encode_receipt(
     operation_id: TaskOperationId,
     outcome: OperationOutcome,
     safe_detail: &str,
     ack: Option<novarocks::task_operation_receipt::Ack>,
-) -> Option<novarocks::TaskOperationReceipt> {
-    Some(novarocks::TaskOperationReceipt {
+) -> novarocks::TaskOperationReceipt {
+    novarocks::TaskOperationReceipt {
         operation_id: Some(encode_task_operation_id(operation_id)),
-        outcome: encode_outcome(outcome)?,
+        outcome: encode_outcome(outcome),
         safe_detail: safe_detail.to_owned(),
         safe_field_path: None,
         ack,
-    })
+    }
 }
 
 /// Encodes one status stream event.
 pub fn encode_status_event(
-    value: &novarocks_execution::task_execution::status::TaskStatus,
+    value: &novarocks_execution_contract::task_execution::status::TaskStatus,
 ) -> novarocks::TaskStatusStreamEvent {
     novarocks::TaskStatusStreamEvent {
         event: Some(novarocks::task_status_stream_event::Event::TaskStatus(
@@ -1871,14 +2028,14 @@ pub fn decode_status_event(
 /// One observed status event.
 #[derive(Clone, Debug)]
 pub enum StatusStreamEvent {
-    Status(novarocks_execution::task_execution::status::TaskStatus),
+    Status(novarocks_execution_contract::task_execution::status::TaskStatus),
     Gone(TaskIdentity),
 }
 
 /// Encodes a status subscription request.
 pub fn encode_subscribe_task_status(
     context: QueryContextRef,
-    cursors: &[novarocks_execution::task_execution::status::TaskStatusCursor],
+    cursors: &[novarocks_execution_contract::task_execution::status::TaskStatusCursor],
 ) -> Result<novarocks::SubscribeTaskStatusRequest, ProtocolError> {
     if cursors.len() > crate::status::MAX_SUBSCRIPTION_CURSORS {
         return Err(out_of_range(
@@ -1903,7 +2060,7 @@ pub fn decode_subscribe_task_status(
 ) -> Result<
     (
         QueryContextRef,
-        Vec<novarocks_execution::task_execution::status::TaskStatusCursor>,
+        Vec<novarocks_execution_contract::task_execution::status::TaskStatusCursor>,
     ),
     ProtocolError,
 > {

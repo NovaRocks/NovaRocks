@@ -39,9 +39,10 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     ExchangeDestination, ExchangeEdge, ExchangeEdgeId, ExchangeInbound, ExchangeSource,
     ExchangeTopology, PhysicalFragmentPlan, PlanNodeId, QueryContextRef, StageRef, TaskDescriptor,
-    TaskIdentity, TransportBudget,
+    TaskIdentity,
 };
 use novarocks_sql::plan_read::{FragmentEdge, FragmentId, PartitionKind};
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::{
     BackendProcessId, FrontendProcessId, QueryExecutionId, StageId, TaskId,

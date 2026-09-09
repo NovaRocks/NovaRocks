@@ -32,8 +32,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
-use novarocks_execution::task_execution::identity::TaskIdentity;
-use novarocks_execution::task_execution::status::{TaskStatus, TaskStatusCursor};
+use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::status::{TaskStatus, TaskStatusCursor};
 
 /// One immutable observation frame.
 #[derive(Clone, Debug, Eq, PartialEq)]

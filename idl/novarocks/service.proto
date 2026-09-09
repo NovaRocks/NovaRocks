@@ -562,6 +562,13 @@ message TaskOperationId {
   bytes value = 1;  // exactly 16 non-nil UUID-v7 bytes
 }
 
+// Opaque identity of one worker-local query-context admission grant. Capacity,
+// ownership, and expiry are bound by the acquisition receipt, not encoded in
+// the identity.
+message AdmissionTicketId {
+  bytes value = 1;  // exactly 16 nonzero unpredictable nonce bytes
+}
+
 // The indivisible wire identity of one task. Every component is compared
 // exactly. Because the backend process is part of it, a restarted backend that
 // reuses an endpoint can never accept or impersonate a request minted for its
@@ -700,7 +707,7 @@ message TaskDynamicFilterDomain {
 // move is closed to open; this release has no close, reconfigure, or dynamic
 // membership operation.
 message OpenExchangeEdgesDomain {
-  uint32 version = 1;             // exactly 1 in this release
+  uint32 version = 1;             // nonzero, strictly monotonic; values may skip
   repeated uint32 edge_ids = 2;   // 1..=256, all frozen by the descriptor
 }
 
@@ -759,6 +766,15 @@ message QueryExecutionLeaseGrant {
   uint64 valid_for_millis = 2;  // nonzero, <= 3600000; clamped to 1000..=30000
 }
 
+// Ask one worker to reserve the capacity needed to establish an exact query
+// context. The duration is part of the immutable request and is echoed by the
+// receipt; it is never a cross-host absolute deadline.
+message AcquireQueryContextAdmissionTicketRequest {
+  QueryContextRef query_context = 1;
+  uint64 valid_for_millis = 2;  // nonzero, <= 3600000
+  NativeCompatibilityId native_compatibility_id = 3;
+}
+
 // Create one task. The descriptor is a required field of this message and of
 // no other: there is no optional descriptor anywhere in this protocol, so no
 // request can be ambiguous about whether it creates or updates.
@@ -792,6 +808,7 @@ message EstablishQueryContextRequest {
   QueryExecutionLeaseGrant initial_lease = 5;  // sequence must be 0
   QueryOptions query_options = 6;
   NativeCompatibilityId native_compatibility_id = 7;
+  AdmissionTicketId admission_ticket_id = 8;
 }
 
 // Advance one shared domain of an existing query context. It cannot create
@@ -883,6 +900,7 @@ message TaskOperation {
     CancelTaskRequest cancel_task = 5;
     AbortQueryContextRequest abort_query_context = 6;
     ReleaseQueryContextRequest release_query_context = 7;
+    AcquireQueryContextAdmissionTicketRequest acquire_query_context_admission_ticket = 8;
   }
 }
 
@@ -947,6 +965,7 @@ message ScalarDomainReceipt {
 
 message OpenExchangeEdgesReceipt {
   repeated uint32 opened_edge_ids = 1;  // <= 256
+  uint32 accepted_version = 2;  // non-zero retained EdgeOpenVersion
 }
 
 // How one accepted domain progressed.
@@ -996,6 +1015,15 @@ message QueryExecutionLeaseReceipt {
   uint64 requested_valid_for_millis = 2;
   uint64 effective_valid_for_millis = 3;  // the only duration the frontend may
                                           // schedule its next renewal from
+}
+
+// The exact admission grant produced for one acquisition request. Repeating
+// context and validity lets the receiver prove that the opaque id belongs to
+// the request it sent.
+message QueryContextAdmissionTicketAck {
+  AdmissionTicketId ticket_id = 1;
+  QueryContextRef query_context = 2;
+  uint64 valid_for_millis = 3;  // nonzero, <= 3600000
 }
 
 // Acknowledgement of a task creation. Receiving it proves the task, its
@@ -1079,6 +1107,7 @@ message TaskOperationReceipt {
     QueryContextAck query_context = 7;
     ReleaseQueryContextAck release_query_context = 8;
     TaskStatus cancel_task = 9;
+    QueryContextAdmissionTicketAck query_context_admission_ticket = 10;
   }
 }
 

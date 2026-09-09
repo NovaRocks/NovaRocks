@@ -24,9 +24,11 @@
 use std::fmt;
 
 use novarocks_execution::task_execution::{
-    DescriptorError, DomainConflict, ExchangeEdgeId, FinalInfoDisagreement, IdentityMismatch,
-    OperationKind, OperationOutcome, RequestError, ResultPacketVerdict, StatusObservation,
-    TaskState,
+    DescriptorError, DomainConflict, ExchangeEdgeId, IdentityMismatch, OperationKind,
+    OperationOutcome, RequestError, TaskState,
+};
+use novarocks_query_application::coordination::{
+    FinalInfoDisagreement, ResultPacketVerdict, StatusObservation,
 };
 use novarocks_types::identity::{BackendProcessId, TaskId};
 
@@ -53,6 +55,9 @@ pub enum TaskExecutionError {
     UnknownOperation,
     /// An acknowledgement carried the wrong receipt shape for its operation.
     MissingReceipt(OperationKind),
+    /// A Worker receipt did not settle the immutable domain intent that this
+    /// query coordinator released.
+    DomainReceipt(String),
     /// A receipt addressed a different task, stage, query, or process.
     Identity(IdentityMismatch),
     /// An update would move one of a task's domains backwards.
@@ -207,6 +212,12 @@ impl fmt::Display for TaskExecutionError {
             }
             Self::MissingReceipt(kind) => {
                 write!(formatter, "{kind} was accepted without its receipt")
+            }
+            Self::DomainReceipt(detail) => {
+                write!(
+                    formatter,
+                    "task domain receipt does not settle its intent: {detail}"
+                )
             }
             Self::Identity(mismatch) => write!(formatter, "task protocol receipt {mismatch}"),
             Self::DomainRegression {

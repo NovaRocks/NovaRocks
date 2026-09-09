@@ -27,7 +27,8 @@
 
 use std::collections::BTreeMap;
 
-use novarocks_execution::task_execution::{FrontendAction, PlanNodeId};
+use novarocks_execution::task_execution::PlanNodeId;
+use novarocks_query_application::coordination::FrontendAction;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::TaskId;
 
@@ -78,5 +79,12 @@ pub(crate) fn task_kernel_index(graph: &TaskGraph) -> BTreeMap<UniqueId, TaskId>
     reason = "The task protocol is not routed into production yet; the adapter is exercised by this module's tests until the transport cutover lands."
 )]
 pub(crate) fn delivery_action(error: &SplitAssignmentDriverError) -> FrontendAction {
-    error.as_operation_outcome().frontend_action()
+    match error {
+        SplitAssignmentDriverError::Transport { .. } => FrontendAction::RetryExactRequest,
+        SplitAssignmentDriverError::Closed => FrontendAction::StopSendingAndReconcile,
+        SplitAssignmentDriverError::Rejected { .. }
+        | SplitAssignmentDriverError::Assignment(_)
+        | SplitAssignmentDriverError::NoAdmittedTask { .. }
+        | SplitAssignmentDriverError::SplitSource { .. } => FrontendAction::FailAttempt,
+    }
 }

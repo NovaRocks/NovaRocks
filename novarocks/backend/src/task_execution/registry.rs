@@ -52,32 +52,31 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use novarocks_execution::exec::fragment::program::FragmentSinkKind;
-use novarocks_execution::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution::task_execution::domain::{
-    ContentFingerprint, CredentialDomain, DomainConflict, DomainProgression, DomainVersion,
-    ScalarDomain,
-};
-use novarocks_execution::task_execution::identity::{
+use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
+use novarocks_execution_contract::task_execution::domain::{ContentFingerprint, DomainProgression};
+use novarocks_execution_contract::task_execution::identity::{
     IdentityField, IdentityMismatch, QueryContextRef, TaskIdentity, TaskOperationId,
 };
-use novarocks_execution::task_execution::lease::{
-    InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon,
+use novarocks_execution_contract::task_execution::operation::{
+    AbortQueryContext, AcquireQueryContextAdmissionTicket, AdvanceQueryContextDomain, CancelTask,
+    CreateTask, CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters,
+    GetFinalTaskInfo, OperationEnvelope, OperationOutcome, QueryContextDomainReceipt,
+    QueryContextDomainUpdate, QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
+    RenewQueryExecutionLease, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
 };
-use novarocks_execution::task_execution::operation::{
-    AbortQueryContext, AdvanceQueryContextDomain, CancelTask, CreateTask, CreateTaskReceipt,
-    EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo, OperationEnvelope,
-    OperationOutcome, OperationWaitCaps, QueryContextDomainReceipt, QueryContextDomainUpdate,
-    QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext, RenewQueryExecutionLease,
-    TransportBudget, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
-};
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, TaskFailureCategory, TaskOutputFacts, TaskState, TerminationDetail,
 };
-use novarocks_execution::task_execution::transition::{
-    ContextOperationKind, ContextTransition, LatchOutcome, OperationAdmission, QueryContextEvent,
-    QueryContextState, classify_context_transition, classify_operation_admission,
-};
+use novarocks_execution_contract::task_execution::transition::QueryContextState;
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
+use novarocks_worker::{
+    AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
+    AdmissionTicketProgression, AdmissionTicketRedemptionRejection, ContextOperationKind,
+    ContextTransition, InstalledLease, LatchOutcome, LeaseBounds, LeaseProgression,
+    MonotonicInstant, OperationAdmission, OperationWaitCaps, QueryContextDomains,
+    QueryContextEvent, RequestHorizon, classify_context_transition, classify_operation_admission,
+};
 
 use super::clock::{BackendMonotonicClock, ProcessMonotonicClock};
 use super::domains::{self, InitialDomainKey, TaskDomains};
@@ -91,9 +90,9 @@ use super::host::{
 use super::marker;
 use super::observation::TaskStatusSource;
 use super::receipt::{
-    CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome, FinalTaskInfoOutcome,
-    OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
-    UpdateTaskOutcome,
+    AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
+    FinalTaskInfoOutcome, OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement,
+    ReleaseQueryContextOutcome, UpdateTaskOutcome,
 };
 use super::status::{
     METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
@@ -118,6 +117,7 @@ pub struct TaskExecutionRegistryConfig {
     pub backend_process_id: BackendProcessId,
     pub lease_bounds: LeaseBounds,
     pub wait_caps: OperationWaitCaps,
+    pub admission_tickets: AdmissionTicketConfig,
     pub request_horizon: RequestHorizon,
     pub metric_publish_min_interval: Duration,
     pub max_tasks_per_context: usize,
@@ -147,6 +147,7 @@ impl TaskExecutionRegistryConfig {
             backend_process_id,
             lease_bounds: LeaseBounds::DEFAULT,
             wait_caps: OperationWaitCaps::DEFAULT,
+            admission_tickets: AdmissionTicketConfig::DEFAULT,
             request_horizon: RequestHorizon::DEFAULT,
             metric_publish_min_interval: METRIC_PUBLISH_MIN_INTERVAL,
             max_tasks_per_context: budget.max_tasks_per_context(),
@@ -164,6 +165,7 @@ impl TaskExecutionRegistryConfig {
 /// What one deadline sweep did.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct DeadlineSweep {
+    pub admission_tickets_expired: usize,
     pub leases_expired: usize,
     pub tasks_retired: usize,
     pub tasks_reaped: usize,
@@ -260,6 +262,7 @@ pub struct TaskExecutionRegistry {
     clock: Arc<dyn BackendMonotonicClock>,
     context_host: Arc<dyn QueryContextHost>,
     task_host: Arc<dyn TaskExecutionHost>,
+    admission_tickets: AdmissionTicketAuthority,
     state: Mutex<RegistryState>,
     gate: Condvar,
     counters: AtomicCounters,
@@ -277,6 +280,7 @@ impl TaskExecutionRegistry {
             clock,
             context_host,
             task_host,
+            admission_tickets: AdmissionTicketAuthority::new(config.admission_tickets),
             state: Mutex::new(RegistryState::default()),
             gate: Condvar::new(),
             counters: AtomicCounters::default(),
@@ -422,6 +426,81 @@ impl TaskExecutionRegistry {
             .and_then(|context| state.contexts.get(context))
             .and_then(|entry| entry.tasks.get(&identity))
             .is_some_and(|entry| matches!(entry, TaskEntry::Live(_)))
+    }
+
+    // ---------------------------------------------------- admission tickets
+
+    /// Reserves worker-local query-context capacity before establish.
+    pub fn acquire_query_context_admission_ticket(
+        &self,
+        request: AcquireQueryContextAdmissionTicket,
+    ) -> AdmissionTicketOutcome {
+        let operation = request.envelope().operation_id();
+        let context = request.context();
+        if context.backend_process_id() != self.config.backend_process_id {
+            return identity_mismatch(
+                operation,
+                IdentityMismatch::new(IdentityField::BackendProcess),
+            );
+        }
+
+        let now = self.clock.now();
+        let acquisition = {
+            let mut state = self.state.lock().expect(REGISTRY_LOCK);
+            self.expire_leases_locked(&mut state, now);
+            if let Err(mismatch) = fence_frontend(&state, context) {
+                return identity_mismatch(operation, mismatch);
+            }
+            if matches!(
+                state.context_state(context),
+                QueryContextState::Releasing
+                    | QueryContextState::Aborting
+                    | QueryContextState::TerminalRetained
+                    | QueryContextState::Gone
+            ) {
+                self.admission_tickets.revoke_unredeemed(context, now);
+                return OperationReceipt::rejected(
+                    operation,
+                    OperationOutcome::ContextTerminalReceipt,
+                    "admission ticket acquisition reached a closed query context",
+                );
+            }
+            // The registry lock remains held across issuance so an abort cannot
+            // close admission between the context-state check and the grant.
+            self.admission_tickets.acquire(request, now)
+        };
+
+        match acquisition {
+            Ok(grant) => {
+                let outcome = match grant.progression() {
+                    AdmissionTicketProgression::Issued => OperationOutcome::Accepted,
+                    AdmissionTicketProgression::Replayed => OperationOutcome::Idempotent,
+                };
+                OperationReceipt::acknowledged(operation, outcome, grant.receipt())
+            }
+            Err(rejection) => {
+                let outcome = match rejection {
+                    AdmissionTicketAcquisitionRejection::ReservationCapacityExhausted
+                    | AdmissionTicketAcquisitionRejection::ReplayCapacityExhausted => {
+                        OperationOutcome::ResourceExhausted
+                    }
+                    AdmissionTicketAcquisitionRejection::Inactive(_) => {
+                        OperationOutcome::ContextTerminalReceipt
+                    }
+                    AdmissionTicketAcquisitionRejection::ValidityExceedsWorkerLimit
+                    | AdmissionTicketAcquisitionRejection::ContextAlreadyGranted
+                    | AdmissionTicketAcquisitionRejection::OperationReplayConflict => {
+                        OperationOutcome::InvalidStateOrRequest
+                    }
+                };
+                OperationReceipt::rejected(operation, outcome, rejection.to_string())
+            }
+        }
+    }
+
+    /// Returns query-context capacity currently reserved by admission grants.
+    pub fn admission_reservation_count(&self) -> usize {
+        self.admission_tickets.reserved_count(self.clock.now())
     }
 
     // ---------------------------------------------------------------- create
@@ -928,11 +1007,12 @@ impl TaskExecutionRegistry {
         }
         let _scope = OperationScope::enter(self, context, Lane::Mutation);
         let record = EstablishRecord::of(request);
+        let deadline = self.deadline_of(envelope);
 
         // The creation gate. Winning it installs the sequence-zero lease and
         // starts the backend-local timer at this exact linearization point,
         // so a slow materialization is already racing its own deadline.
-        let mut transaction = {
+        let mut transaction = loop {
             let mut state = self.state.lock().expect(REGISTRY_LOCK);
             let now = self.clock.now();
             self.expire_leases_locked(&mut state, now);
@@ -942,6 +1022,9 @@ impl TaskExecutionRegistry {
             let current = state.context_state(context);
             match classify_context_transition(current, QueryContextEvent::Establish) {
                 ContextTransition::Apply(QueryContextState::Establishing) => {
+                    if let Some(receipt) = self.redeem_admission_ticket(request, now) {
+                        return receipt;
+                    }
                     let lease = InstalledLease::install_initial(
                         request.initial_lease_valid_for(),
                         self.config.lease_bounds,
@@ -950,7 +1033,7 @@ impl TaskExecutionRegistry {
                     let mut entry = ContextEntry::absent(Arc::new(TaskStatusSource::new()));
                     entry.state = QueryContextState::Establishing;
                     entry.lease = Some(lease);
-                    entry.establish = Some(record);
+                    entry.establish = Some(record.clone());
                     state.contexts.insert(context, entry);
                     state
                         .context_by_execution
@@ -958,20 +1041,25 @@ impl TaskExecutionRegistry {
                     self.counters
                         .contexts_established
                         .fetch_add(1, Ordering::Relaxed);
-                    EstablishTransaction {
+                    break EstablishTransaction {
                         registry: self,
                         context,
                         committed: false,
-                    }
+                    };
                 }
                 ContextTransition::Idempotent => {
                     let entry = state.contexts.get(&context).expect("existing context");
                     let same = entry
                         .establish
-                        .is_some_and(|installed| installed.same_content(&record))
-                        && entry.credential_material.as_ref().is_none_or(|installed| {
-                            request.initial_credential().matches_installed(&**installed)
-                        });
+                        .as_ref()
+                        .is_some_and(|installed| installed.same_request(&record))
+                        && entry
+                            .domains
+                            .initial_credential_matches(request.initial_credential());
+                    let original_receipt = entry
+                        .establish
+                        .as_ref()
+                        .and_then(|installed| installed.original_receipt.clone());
                     if !same {
                         return OperationReceipt::rejected(
                             operation,
@@ -979,19 +1067,32 @@ impl TaskExecutionRegistry {
                             "establish conflicts with the query context that already exists",
                         );
                     }
-                    return OperationReceipt::acknowledged(
-                        operation,
-                        OperationOutcome::Idempotent,
-                        context_receipt(entry, context),
-                    );
+                    if let Some(receipt) = self.redeem_admission_ticket(request, now) {
+                        return receipt;
+                    }
+                    if let Some(receipt) = original_receipt {
+                        return OperationReceipt::acknowledged(
+                            operation,
+                            OperationOutcome::Idempotent,
+                            receipt,
+                        );
+                    }
+                    if now.has_reached(deadline) {
+                        return OperationReceipt::rejected(
+                            operation,
+                            OperationOutcome::OperationTimedOut,
+                            "exact establish replay timed out behind the creation gate",
+                        );
+                    }
+                    drop(self.wait_gate(state));
+                    continue;
                 }
                 ContextTransition::AlreadyTerminal => {
-                    let outcome = terminal_outcome(&state, context);
-                    let entry = state.contexts.get(&context).expect("terminal context");
-                    return OperationReceipt::acknowledged(
+                    self.admission_tickets.revoke_unredeemed(context, now);
+                    return OperationReceipt::rejected(
                         operation,
-                        outcome,
-                        context_receipt(entry, context),
+                        OperationOutcome::ContextTerminalReceipt,
+                        "establish names a ticket for a closed query context",
                     );
                 }
                 ContextTransition::LostToRelease
@@ -1048,15 +1149,13 @@ impl TaskExecutionRegistry {
                 let entry = state.contexts.get_mut(&context).expect("establishing");
                 entry.state = QueryContextState::Active;
                 entry.facts_visible = true;
-                entry.catalog = ScalarDomain::empty().apply(DomainVersion::FIRST, record.catalog);
-                entry.shared_filter =
-                    ScalarDomain::empty().apply(DomainVersion::FIRST, record.runtime_filter);
-                entry.credential = Some(CredentialDomain::install(
+                entry.domains = QueryContextDomains::install_initial(
+                    record.catalog,
+                    record.runtime_filter,
                     record.credential_lease,
                     record.credential_epoch,
-                ));
-                entry.credential_material =
-                    Some(Arc::clone(request.initial_credential().material()));
+                    Arc::clone(request.initial_credential().material()),
+                );
                 // Deliberately untouched: reaching `Active` must not reset or
                 // extend the sequence-zero expiry.
                 debug_assert!(
@@ -1065,6 +1164,11 @@ impl TaskExecutionRegistry {
                         .is_some_and(|lease| lease.sequence().is_initial())
                 );
                 let receipt = context_receipt(entry, context);
+                entry
+                    .establish
+                    .as_mut()
+                    .expect("establishing context retains its request")
+                    .original_receipt = Some(receipt.clone());
                 transaction.commit();
                 self.gate.notify_all();
                 drop(state);
@@ -1087,6 +1191,37 @@ impl TaskExecutionRegistry {
                         "the query context terminated while it was establishing",
                     ),
                 }
+            }
+        }
+    }
+
+    fn redeem_admission_ticket(
+        &self,
+        request: &EstablishQueryContext,
+        now: MonotonicInstant,
+    ) -> Option<QueryContextOutcome> {
+        let operation = request.envelope().operation_id();
+        match self
+            .admission_tickets
+            .redeem(request.admission_ticket_id(), request.context(), now)
+        {
+            Ok(_) => None,
+            Err(rejection) => {
+                let outcome = match rejection {
+                    AdmissionTicketRedemptionRejection::ForeignContext => {
+                        OperationOutcome::ContextConflict
+                    }
+                    AdmissionTicketRedemptionRejection::Unknown
+                    | AdmissionTicketRedemptionRejection::Expired
+                    | AdmissionTicketRedemptionRejection::Closed => {
+                        OperationOutcome::InvalidStateOrRequest
+                    }
+                };
+                Some(OperationReceipt::rejected(
+                    operation,
+                    outcome,
+                    rejection.to_string(),
+                ))
             }
         }
     }
@@ -1527,6 +1662,7 @@ impl TaskExecutionRegistry {
                 if self.release_ready_locked(&state, context) {
                     let entry = state.contexts.get_mut(&context).expect("active context");
                     entry.state = QueryContextState::Releasing;
+                    self.admission_tickets.revoke_unredeemed(context, now);
                     (ReleaseOutcome::Released, OperationOutcome::Accepted, true)
                 } else {
                     // Nothing was applied and the first-wins position is
@@ -1712,6 +1848,8 @@ impl TaskExecutionRegistry {
     /// the whole lifecycle testable by moving an injected clock.
     pub fn advance_deadlines(&self) -> DeadlineSweep {
         let mut sweep = self.settle();
+        sweep.admission_tickets_expired =
+            self.admission_tickets.advance_deadlines(self.clock.now());
         sweep.metrics_flushed = self.flush_throttled_metrics();
         sweep
     }
@@ -1860,6 +1998,7 @@ impl TaskExecutionRegistry {
                 .context_by_execution
                 .insert(context.query_execution_id(), context);
             state.retired_context_order.push_back(context);
+            self.admission_tickets.release_context(context, now);
             return true;
         }
         if !matches!(
@@ -1892,6 +2031,7 @@ impl TaskExecutionRegistry {
             true
         };
         if won {
+            self.admission_tickets.revoke_unredeemed(context, now);
             state.pending_termination.insert(context);
         }
         won
@@ -2091,7 +2231,7 @@ impl TaskExecutionRegistry {
                     entry.released_evidence = self.context_host.release(context);
                     entry.facts_released = true;
                 }
-                entry.credential_material = None;
+                entry.domains = QueryContextDomains::empty();
                 if event == QueryContextEvent::AbortCompleted {
                     marker::context_termination_completed(
                         context,
@@ -2100,6 +2240,7 @@ impl TaskExecutionRegistry {
                     );
                 }
             }
+            self.admission_tickets.release_context(context, now);
             state.retired_context_order.push_back(context);
         }
     }
@@ -2187,7 +2328,7 @@ impl TaskExecutionRegistry {
                 return;
             };
             entry.state = QueryContextState::Gone;
-            entry.credential_material = None;
+            entry.domains = QueryContextDomains::empty();
             entry.establish = None;
             entry.tasks.keys().copied().collect()
         };
@@ -2418,6 +2559,9 @@ impl EstablishTransaction<'_> {
         self.registry
             .rollback_context_locked(state, self.context, now);
         self.registry
+            .admission_tickets
+            .release_context(self.context, now);
+        self.registry
             .counters
             .contexts_rolled_back
             .fetch_add(1, Ordering::Relaxed);
@@ -2451,10 +2595,7 @@ impl TaskExecutionRegistry {
         };
         entry.lease = None;
         entry.facts_visible = false;
-        entry.catalog = ScalarDomain::empty();
-        entry.shared_filter = ScalarDomain::empty();
-        entry.credential = None;
-        entry.credential_material = None;
+        entry.domains = QueryContextDomains::empty();
         if !entry.facts_released {
             self.context_host.release(context);
             entry.facts_released = true;
@@ -2757,43 +2898,11 @@ fn classify_shared_domain(
     entry: &ContextEntry,
     domain: &QueryContextDomainUpdate,
 ) -> DomainProgression {
-    match domain {
-        QueryContextDomainUpdate::CatalogBinding { version, payload } => {
-            entry.catalog.classify(*version, payload.fingerprint())
-        }
-        QueryContextDomainUpdate::SharedDynamicFilter { version, payload } => entry
-            .shared_filter
-            .classify(*version, payload.fingerprint()),
-        QueryContextDomainUpdate::Credential(update) => {
-            let Some(credential) = entry.credential else {
-                return DomainProgression::Conflict(DomainConflict::UnknownMember);
-            };
-            // The owner of the live slot answers the content question, so no
-            // secret ever reaches the neutral classification.
-            let matches = entry
-                .credential_material
-                .as_ref()
-                .is_some_and(|installed| update.matches_installed(&**installed));
-            credential.classify_refresh(update.lease_id(), update.epoch(), matches)
-        }
-    }
+    entry.domains.classify(domain)
 }
 
 fn apply_shared_domain(entry: &mut ContextEntry, domain: &QueryContextDomainUpdate) {
-    match domain {
-        QueryContextDomainUpdate::CatalogBinding { version, payload } => {
-            entry.catalog = entry.catalog.apply(*version, payload.fingerprint());
-        }
-        QueryContextDomainUpdate::SharedDynamicFilter { version, payload } => {
-            entry.shared_filter = entry.shared_filter.apply(*version, payload.fingerprint());
-        }
-        QueryContextDomainUpdate::Credential(update) => {
-            if let Some(credential) = entry.credential {
-                entry.credential = Some(credential.apply_refresh(update.epoch()));
-                entry.credential_material = Some(Arc::clone(update.material()));
-            }
-        }
-    }
+    entry.domains.apply(domain);
 }
 
 fn shared_domain_receipt(
@@ -2801,25 +2910,5 @@ fn shared_domain_receipt(
     domain: &QueryContextDomainUpdate,
     progression: DomainProgression,
 ) -> QueryContextDomainReceipt {
-    match domain {
-        QueryContextDomainUpdate::CatalogBinding { .. } => {
-            QueryContextDomainReceipt::CatalogBinding {
-                accepted_version: entry.catalog.accepted_version(),
-                progression,
-            }
-        }
-        QueryContextDomainUpdate::SharedDynamicFilter { .. } => {
-            QueryContextDomainReceipt::SharedDynamicFilter {
-                accepted_version: entry.shared_filter.accepted_version(),
-                progression,
-            }
-        }
-        QueryContextDomainUpdate::Credential(update) => QueryContextDomainReceipt::Credential {
-            lease_id: update.lease_id(),
-            accepted_epoch: entry
-                .credential
-                .map_or(update.epoch(), CredentialDomain::accepted_epoch),
-            progression,
-        },
-    }
+    entry.domains.receipt(domain, progression)
 }

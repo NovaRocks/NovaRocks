@@ -54,22 +54,26 @@ use prometheus::{
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
-    DispatchLane, OperationKind, OperationOutcome, QueryContextRef, TaskIdentity, TaskOperationId,
-    TaskStatusCursor, TransportBudget, UpdateQueryContext,
+    AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome, QueryContextRef,
+    TaskIdentity, TaskOperationId, TaskStatusCursor, UpdateQueryContext,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::catalog::CatalogSet;
 use novarocks_proto_models::novarocks as proto;
+use novarocks_query_application::coordination::{
+    DispatchLane, OperationDispatchResult, WorkerReceiptOutcome,
+};
+use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::descriptor::WireFragmentPlan;
 use novarocks_task_codec::domain as codec_domain;
 use novarocks_task_codec::domain::{stored_credential, stored_message};
 use novarocks_task_codec::operation as codec;
 use novarocks_task_codec::operation::{
     ReceiptHeader, StatusStreamEvent, decode_receipt_batch, decode_status_event,
-    encode_abort_query_context, encode_advance_query_context_domain, encode_cancel_task,
-    encode_create_task, encode_establish_query_context, encode_operation_batch,
-    encode_release_query_context, encode_renew_lease, encode_subscribe_task_status,
-    encode_update_task,
+    encode_abort_query_context, encode_acquire_query_context_admission_ticket,
+    encode_advance_query_context_domain, encode_cancel_task, encode_create_task,
+    encode_establish_query_context, encode_operation_batch, encode_release_query_context,
+    encode_renew_lease, encode_subscribe_task_status, encode_update_task,
 };
 use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::BackendProcessId;
@@ -120,6 +124,9 @@ fn encode_operation(
     attempt: &AttemptWireFacts,
 ) -> Result<proto::TaskOperation, String> {
     match intent {
+        OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
+            Ok(encode_acquire_query_context_admission_ticket(*request))
+        }
         OperationIntent::CreateTask(request) => {
             let fragment = wire_fragment_plan(request.descriptor().plan())?;
             let domains = encode_task_domains(request.initial_domains())?;
@@ -233,7 +240,8 @@ fn encode_query_context_operation(
 const fn consumes_ack_body(kind: OperationKind) -> bool {
     matches!(
         kind,
-        OperationKind::CreateTask
+        OperationKind::AcquireQueryContextAdmissionTicket
+            | OperationKind::CreateTask
             | OperationKind::UpdateTask
             | OperationKind::UpdateQueryContext
             | OperationKind::ReleaseQueryContext
@@ -273,6 +281,7 @@ struct SentOperation {
 /// refused rather than read as this request's proof.
 #[derive(Clone, Copy, Debug)]
 enum AckAddress {
+    Admission(AcquireQueryContextAdmissionTicket),
     Task(TaskIdentity),
     Context(QueryContextRef),
     /// The kind carries no acknowledgement body.
@@ -282,6 +291,9 @@ enum AckAddress {
 impl AckAddress {
     fn of(intent: &OperationIntent) -> Self {
         match intent {
+            OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
+                Self::Admission(*request)
+            }
             OperationIntent::CreateTask(request) => Self::Task(request.identity()),
             OperationIntent::UpdateTask(request) => Self::Task(request.identity()),
             OperationIntent::CancelTask(request) => Self::Task(request.identity()),
@@ -313,6 +325,13 @@ fn decode_ack(
         .as_ref()
         .ok_or_else(|| format!("an applied {kind} carries no acknowledgement body"))?;
     match (kind, body, address) {
+        (
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(ack),
+            AckAddress::Admission(expected),
+        ) => codec::decode_query_context_admission_ticket_ack(ack, expected, path())
+            .map(AckPayload::AdmissionTicket)
+            .map_err(|error| error.to_string()),
         (
             OperationKind::CreateTask,
             proto::task_operation_receipt::Ack::CreateTask(ack),
@@ -461,21 +480,21 @@ impl TaskAckIntake {
 
 /// Classifies one unary RPC status by type.
 ///
-/// Only a status that leaves the remote outcome genuinely unknown becomes
-/// [`OperationOutcome::RetryableTransportUnknown`], the single category the
-/// protocol allows the identical immutable request to be resent under.
+/// Only a status that leaves the remote outcome genuinely unknown becomes a
+/// transport-unknown dispatch result, the single category the protocol allows
+/// the identical immutable request to be resent under.
 /// Everything else is settled and fails closed, however transient its wording
 /// looks: this never reads a status message.
-fn classify_apply_status(status: &tonic::Status) -> OperationOutcome {
+fn classify_apply_status(status: &tonic::Status) -> OperationDispatchResult {
     match status.code() {
         tonic::Code::Unavailable
         | tonic::Code::DeadlineExceeded
         | tonic::Code::Cancelled
-        | tonic::Code::Unknown => OperationOutcome::RetryableTransportUnknown,
+        | tonic::Code::Unknown => OperationDispatchResult::TransportUnknown,
         // A typed capacity rejection. The backend answered, so there is
         // nothing unknown about it and no older path to degrade onto.
-        tonic::Code::ResourceExhausted => OperationOutcome::ResourceExhausted,
-        _ => OperationOutcome::InvalidStateOrRequest,
+        tonic::Code::ResourceExhausted => worker_result(OperationOutcome::ResourceExhausted),
+        _ => worker_result(OperationOutcome::InvalidStateOrRequest),
     }
 }
 
@@ -484,11 +503,15 @@ fn classify_apply_status(status: &tonic::Status) -> OperationOutcome {
 /// URI and connector construction are deterministic local failures that
 /// resending cannot repair. A completed connector that then cannot dial or
 /// establish its HTTP/2 stream leaves the remote outcome unknown.
-fn classify_channel_error(error: &ChannelAcquisitionError) -> OperationOutcome {
+fn classify_channel_error(error: &ChannelAcquisitionError) -> OperationDispatchResult {
     match error {
-        ChannelAcquisitionError::Fatal(_) => OperationOutcome::InvalidStateOrRequest,
-        ChannelAcquisitionError::RetryableNetwork(_) => OperationOutcome::RetryableTransportUnknown,
+        ChannelAcquisitionError::Fatal(_) => worker_result(OperationOutcome::InvalidStateOrRequest),
+        ChannelAcquisitionError::RetryableNetwork(_) => OperationDispatchResult::TransportUnknown,
     }
+}
+
+const fn worker_result(outcome: OperationOutcome) -> OperationDispatchResult {
+    OperationDispatchResult::WorkerReceipt(WorkerReceiptOutcome::from_contract(outcome))
 }
 
 /// Whether a status stream rejection is fatal to the attempt.
@@ -757,15 +780,15 @@ async fn apply_operations(
 ) {
     let response = match send_operations(&send.client, request, deadline).await {
         Ok(response) => response,
-        Err(outcome) => {
-            if outcome.is_retryable() {
+        Err(result) => {
+            if matches!(result, OperationDispatchResult::TransportUnknown) {
                 // An unknown outcome may have left the shared HTTP/2 stream
                 // unusable. Drop the cached channel so the identical request
                 // is replayed on a fresh one instead of stalling on a poisoned
                 // cache.
                 send.data_runtime.invalidate_channel(&send.endpoint);
             }
-            publish_uniform(&send.acks, &sent, outcome);
+            publish_uniform(&send.acks, &sent, result);
             return;
         }
     };
@@ -788,7 +811,11 @@ async fn apply_operations(
             // been received.
             tracing::warn!(detail = %error, "task operation batch response is unusable");
             observe_refusal(REFUSAL_UNUSABLE_RESPONSE, sent.len());
-            publish_uniform(&send.acks, &sent, OperationOutcome::InvalidStateOrRequest);
+            publish_uniform(
+                &send.acks,
+                &sent,
+                worker_result(OperationOutcome::InvalidStateOrRequest),
+            );
             return;
         }
     };
@@ -801,15 +828,20 @@ async fn apply_operations(
     }
 }
 
-fn publish_uniform(acks: &TaskAckIntakeHandle, sent: &[SentOperation], outcome: OperationOutcome) {
+fn publish_uniform(
+    acks: &TaskAckIntakeHandle,
+    sent: &[SentOperation],
+    result: OperationDispatchResult,
+) {
     for item in sent {
-        observe_settled(item.kind, item.lease_renewal, outcome);
-        acks.publish(OperationAcknowledgement::new(
+        observe_dispatch_result(item.kind, item.lease_renewal, result);
+        let acknowledgement = OperationAcknowledgement::from_dispatch_result(
             item.operation_id,
             item.kind,
-            outcome,
+            result,
             AckPayload::None,
-        ));
+        );
+        acks.publish(acknowledgement);
     }
 }
 
@@ -822,7 +854,7 @@ fn acknowledgement(
     let outcome = header.outcome();
     if !is_applied(outcome) || !consumes_ack_body(item.kind) {
         observe_settled(item.kind, item.lease_renewal, outcome);
-        return OperationAcknowledgement::new(
+        return OperationAcknowledgement::worker_receipt(
             item.operation_id,
             item.kind,
             outcome,
@@ -833,7 +865,7 @@ fn acknowledgement(
     match decode_ack(item.kind, item.address, receipt) {
         Ok(payload) => {
             observe_settled(item.kind, item.lease_renewal, outcome);
-            OperationAcknowledgement::new(item.operation_id, item.kind, outcome, payload)
+            OperationAcknowledgement::worker_receipt(item.operation_id, item.kind, outcome, payload)
                 .with_detail(header.detail().cloned())
         }
         Err(detail) => {
@@ -850,7 +882,7 @@ fn acknowledgement(
                 item.lease_renewal,
                 OperationOutcome::InvalidStateOrRequest,
             );
-            OperationAcknowledgement::new(
+            OperationAcknowledgement::worker_receipt(
                 item.operation_id,
                 item.kind,
                 OperationOutcome::InvalidStateOrRequest,
@@ -869,11 +901,11 @@ async fn send_operations(
     client: &Client,
     request: proto::ApplyTaskOperationsRequest,
     deadline: Duration,
-) -> Result<proto::ApplyTaskOperationsResponse, OperationOutcome> {
+) -> Result<proto::ApplyTaskOperationsResponse, OperationDispatchResult> {
     let expires_at = tokio::time::Instant::now() + deadline;
     let mut grpc = tokio::time::timeout_at(expires_at, client.grpc_with_channel_error())
         .await
-        .map_err(|_| OperationOutcome::RetryableTransportUnknown)?
+        .map_err(|_| OperationDispatchResult::TransportUnknown)?
         .map_err(|error| {
             let outcome = classify_channel_error(&error);
             tracing::warn!(detail = %error, "apply_task_operations channel acquisition failed");
@@ -884,13 +916,13 @@ async fn send_operations(
         // Nothing was submitted, so nothing was applied. It is still reported
         // as unknown rather than as a rejection, because a caller may only
         // conclude "not applied" from an answer it received.
-        return Err(OperationOutcome::RetryableTransportUnknown);
+        return Err(OperationDispatchResult::TransportUnknown);
     }
     let mut wire = tonic::Request::new(request);
     wire.set_timeout(remaining);
     tokio::time::timeout_at(expires_at, grpc.apply_task_operations(wire))
         .await
-        .map_err(|_| OperationOutcome::RetryableTransportUnknown)?
+        .map_err(|_| OperationDispatchResult::TransportUnknown)?
         .map(tonic::Response::into_inner)
         .map_err(|status| {
             let outcome = classify_apply_status(&status);
@@ -1255,9 +1287,7 @@ const fn outcome_name(outcome: OperationOutcome) -> &'static str {
     match outcome {
         OperationOutcome::Accepted => "accepted",
         OperationOutcome::Idempotent => "idempotent",
-        OperationOutcome::RetryableTransportUnknown => "retryable_transport_unknown",
         OperationOutcome::OperationTimedOut => "operation_timed_out",
-        OperationOutcome::RetryableObservationLoss => "retryable_observation_loss",
         OperationOutcome::IdentityMismatch => "identity_mismatch",
         OperationOutcome::CompatibilityMismatch => "compatibility_mismatch",
         OperationOutcome::CreateConflict => "create_conflict",
@@ -1267,8 +1297,6 @@ const fn outcome_name(outcome: OperationOutcome) -> &'static str {
         OperationOutcome::LeaseExpired => "lease_expired",
         OperationOutcome::ReleaseNotReady => "release_not_ready",
         OperationOutcome::ContextTerminalReceipt => "context_terminal_receipt",
-        OperationOutcome::NormalDestinationCanceled => "normal_destination_canceled",
-        OperationOutcome::DestinationFailure => "destination_failure",
         OperationOutcome::InvalidStateOrRequest => "invalid_state_or_request",
         OperationOutcome::TerminalRejected => "terminal_rejected",
         OperationOutcome::Gone => "gone",
@@ -1458,6 +1486,23 @@ fn observe_settled(kind: OperationKind, lease_renewal: bool, outcome: OperationO
     }
 }
 
+fn observe_dispatch_result(
+    kind: OperationKind,
+    lease_renewal: bool,
+    result: OperationDispatchResult,
+) {
+    let name = match result {
+        OperationDispatchResult::WorkerReceipt(receipt) => outcome_name(receipt.outcome()),
+        OperationDispatchResult::TransportUnknown => "transport_unknown",
+    };
+    TASK_OPERATION_RECEIPTS
+        .with_label_values(&[kind.as_str(), name])
+        .inc();
+    if lease_renewal {
+        TASK_LEASE_RENEWALS.with_label_values(&[name]).inc();
+    }
+}
+
 fn observe_refusal(reason: &str, operations: usize) {
     TASK_OPERATION_REFUSALS
         .with_label_values(&[reason])
@@ -1487,9 +1532,9 @@ mod tests {
     use std::pin::Pin;
 
     use novarocks_execution::task_execution::{
-        CancelReason, CancelTask, CreateTaskReceipt, CredentialEpoch, CredentialLeaseId,
-        CredentialUpdate, EstablishQueryContext, FetchTaskDynamicFilters, LeaseSequence,
-        LeaseValidFor, MonotonicInstant, RenewQueryExecutionLease, TaskStatus, TaskStatusVersion,
+        AdmissionTicketId, CancelReason, CancelTask, CreateTaskReceipt, CredentialEpoch,
+        CredentialLeaseId, CredentialUpdate, EstablishQueryContext, FetchTaskDynamicFilters,
+        LeaseSequence, LeaseValidFor, RenewQueryExecutionLease, TaskStatus, TaskStatusVersion,
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter};
@@ -1509,7 +1554,7 @@ mod tests {
     use crate::native::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
     use crate::task_execution::dispatch::OperationDispatcher;
     use crate::task_execution::status_intake::{CountingWake, StatusIntake};
-    use novarocks_execution::task_execution::DispatchBudget;
+    use novarocks_query_application::coordination::{DispatchBudget, MonotonicInstant};
 
     use super::*;
 
@@ -1594,6 +1639,7 @@ mod tests {
         let request = UpdateQueryContext::Establish(EstablishQueryContext::new(
             TaskOperationId::new_v7(),
             context(backend),
+            AdmissionTicketId::try_from_bytes([0x54; 16]).expect("the ticket is nonzero"),
             Arc::new(WireContent::new(
                 ESTABLISH_CATALOG_DOMAIN_TAG,
                 catalog::CatalogSet::default(),
@@ -1766,8 +1812,7 @@ mod tests {
                         .envelope
                         .as_ref()
                         .and_then(|envelope| envelope.operation_id.clone()),
-                    outcome: encode_operation_outcome(outcome)
-                        .expect("every test outcome has a wire form"),
+                    outcome: encode_operation_outcome(outcome),
                     safe_detail: String::new(),
                     safe_field_path: None,
                     ack,
@@ -2032,12 +2077,12 @@ mod tests {
         );
         assert_eq!(
             acks.iter()
-                .map(OperationAcknowledgement::outcome)
+                .map(OperationAcknowledgement::worker_outcome)
                 .collect::<Vec<_>>(),
             vec![
-                OperationOutcome::Accepted,
-                OperationOutcome::TerminalRejected,
-                OperationOutcome::Idempotent,
+                Some(OperationOutcome::Accepted),
+                Some(OperationOutcome::TerminalRejected),
+                Some(OperationOutcome::Idempotent),
             ],
             "one item's failure leaves every other item exactly as its own receipt reports"
         );
@@ -2068,10 +2113,9 @@ mod tests {
         let acks = settled(&fixture.acks, 2).await;
 
         for ack in &acks {
-            assert_eq!(ack.outcome(), OperationOutcome::InvalidStateOrRequest);
-            assert!(
-                !ack.outcome().is_retryable(),
-                "an answer that arrived is never resent"
+            assert_eq!(
+                ack.worker_outcome(),
+                Some(OperationOutcome::InvalidStateOrRequest)
             );
         }
     }
@@ -2097,7 +2141,7 @@ mod tests {
 
         assert!(
             acks.iter()
-                .all(|ack| ack.outcome() == OperationOutcome::InvalidStateOrRequest),
+                .all(|ack| ack.worker_outcome() == Some(OperationOutcome::InvalidStateOrRequest)),
             "a response with fewer receipts than items cannot be attributed"
         );
     }
@@ -2115,16 +2159,15 @@ mod tests {
         fixture.sink.submit(&batch);
         let first = settled(&fixture.acks, 1).await;
         assert_eq!(
-            first[0].outcome(),
-            OperationOutcome::RetryableTransportUnknown
+            first[0].dispatch_result(),
+            OperationDispatchResult::TransportUnknown
         );
-        assert!(first[0].outcome().is_retryable());
 
         // The owner replays the same immutable intent, so the same bytes go
         // back out under the same operation id.
         fixture.sink.submit(&batch);
         let second = settled(&fixture.acks, 1).await;
-        assert_eq!(second[0].outcome(), OperationOutcome::Accepted);
+        assert_eq!(second[0].worker_outcome(), Some(OperationOutcome::Accepted));
         assert_eq!(second[0].operation_id(), first[0].operation_id());
 
         let applied = fixture.loopback.peer.applied();
@@ -2148,8 +2191,10 @@ mod tests {
         fixture.sink.submit(&batch);
         let acks = settled(&fixture.acks, 1).await;
 
-        assert_eq!(acks[0].outcome(), OperationOutcome::InvalidStateOrRequest);
-        assert!(!acks[0].outcome().is_retryable());
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::InvalidStateOrRequest)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2162,8 +2207,10 @@ mod tests {
         fixture.sink.submit(&batch);
         let acks = settled(&fixture.acks, 1).await;
 
-        assert_eq!(acks[0].outcome(), OperationOutcome::IdentityMismatch);
-        assert!(!acks[0].outcome().is_retryable());
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::IdentityMismatch)
+        );
         assert!(
             fixture.loopback.peer.applied().is_empty(),
             "a replaced process is never retried elsewhere"
@@ -2185,7 +2232,10 @@ mod tests {
         let acks = settled(&fixture.acks, 1).await;
 
         assert_eq!(acks[0].kind(), OperationKind::FetchTaskDynamicFilters);
-        assert_eq!(acks[0].outcome(), OperationOutcome::InvalidStateOrRequest);
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::InvalidStateOrRequest)
+        );
         assert!(
             fixture.loopback.peer.applied().is_empty(),
             "a read has its own RPC and never becomes a batch item"
@@ -2200,16 +2250,12 @@ mod tests {
             tonic::Code::Cancelled,
             tonic::Code::Unknown,
         ] {
-            let outcome = classify_apply_status(&Status::new(code, "unknown outcome"));
-            assert_eq!(outcome, OperationOutcome::RetryableTransportUnknown);
-            assert!(
-                outcome.is_retryable(),
-                "{code:?} keeps the request replayable"
-            );
+            let result = classify_apply_status(&Status::new(code, "unknown outcome"));
+            assert_eq!(result, OperationDispatchResult::TransportUnknown);
         }
         assert_eq!(
             classify_apply_status(&Status::new(tonic::Code::ResourceExhausted, "full")),
-            OperationOutcome::ResourceExhausted
+            worker_result(OperationOutcome::ResourceExhausted)
         );
         for code in [
             tonic::Code::InvalidArgument,
@@ -2224,16 +2270,20 @@ mod tests {
             tonic::Code::DataLoss,
             tonic::Code::Unauthenticated,
         ] {
-            let outcome = classify_apply_status(&Status::new(code, "settled"));
-            assert!(!outcome.is_retryable(), "{code:?} must not be resent");
+            let result = classify_apply_status(&Status::new(code, "settled"));
+            assert!(
+                matches!(result, OperationDispatchResult::WorkerReceipt(_)),
+                "{code:?} must not be resent"
+            );
         }
-        assert!(
-            !classify_channel_error(&ChannelAcquisitionError::fatal("bad material")).is_retryable()
-        );
-        assert!(
-            classify_channel_error(&ChannelAcquisitionError::retryable_network("dial failed"))
-                .is_retryable()
-        );
+        assert!(matches!(
+            classify_channel_error(&ChannelAcquisitionError::fatal("bad material")),
+            OperationDispatchResult::WorkerReceipt(_)
+        ));
+        assert!(matches!(
+            classify_channel_error(&ChannelAcquisitionError::retryable_network("dial failed")),
+            OperationDispatchResult::TransportUnknown
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -2488,6 +2538,67 @@ mod tests {
     // Acknowledgement bodies
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn an_admission_request_and_receipt_keep_the_exact_context_validity_and_compatibility() {
+        let backend = BackendProcessId::new_v7();
+        let context = context(backend);
+        let valid_for = LeaseValidFor::new(Duration::from_secs(10)).expect("a legal validity");
+        let compatibility = novarocks_types::NativeCompatibilityId::new([0x71; 32]);
+        let request = AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context,
+            valid_for,
+            compatibility,
+        );
+        let encoded = encode_operation(
+            &OperationIntent::AcquireQueryContextAdmissionTicket(request),
+            &test_attempt_facts(),
+        )
+        .expect("the admission request is encodable");
+        let Some(proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(encoded)) =
+            encoded.operation
+        else {
+            panic!("admission uses its own batch operation");
+        };
+        assert_eq!(encoded.valid_for_millis, 10_000);
+        assert_eq!(
+            encoded
+                .native_compatibility_id
+                .expect("compatibility is required")
+                .value,
+            compatibility.as_bytes()
+        );
+
+        let ticket = AdmissionTicketId::try_from_bytes([0x57; 16]).expect("the ticket is nonzero");
+        let receipt = proto::TaskOperationReceipt {
+            operation_id: None,
+            outcome: 0,
+            safe_detail: String::new(),
+            safe_field_path: None,
+            ack: Some(
+                proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(
+                    codec::encode_query_context_admission_ticket_ack(
+                        novarocks_execution::task_execution::QueryContextAdmissionTicketReceipt::new(
+                            ticket,
+                            context,
+                            valid_for,
+                        ),
+                    ),
+                ),
+            ),
+        };
+        let payload = decode_ack(
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            AckAddress::Admission(request),
+            &receipt,
+        )
+        .expect("the exact receipt decodes");
+        assert!(matches!(
+            payload,
+            AckPayload::AdmissionTicket(receipt) if receipt.ticket_id() == ticket
+        ));
+    }
+
     /// A create acknowledgement is the frontend's only proof that a task was
     /// installed, and its status snapshot closes the window between creating a
     /// task and observing it. These read the real wire bodies through the real
@@ -2578,7 +2689,10 @@ mod tests {
 
         fixture.sink.submit(&batch);
         let acks = settled(&fixture.acks, 1).await;
-        assert_eq!(acks[0].outcome(), OperationOutcome::InvalidStateOrRequest);
+        assert_eq!(
+            acks[0].worker_outcome(),
+            Some(OperationOutcome::InvalidStateOrRequest)
+        );
         assert_eq!(*acks[0].payload(), AckPayload::None);
     }
 
@@ -2604,7 +2718,7 @@ mod tests {
 
         fixture.sink.submit(&batch);
         let acks = settled(&fixture.acks, 1).await;
-        assert_eq!(acks[0].outcome(), OperationOutcome::Accepted);
+        assert_eq!(acks[0].worker_outcome(), Some(OperationOutcome::Accepted));
         assert_eq!(*acks[0].payload(), AckPayload::None);
     }
 }

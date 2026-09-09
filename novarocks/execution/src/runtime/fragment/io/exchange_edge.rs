@@ -22,17 +22,17 @@
 //! on another thread, so each edge's live answer is one atomic word rather
 //! than a lock the send path has to take.
 //!
-//! Whether an open request is *legal* is not decided here:
-//! [`ExchangeEdgeDomain`] already owns that classification, and this module
-//! holds one instance of it and publishes what it accepted. Nothing here can
-//! add a destination, reopen an edge, or reconfigure one.
+//! The runtime owns the private grant state that classifies edge-open
+//! permissions. It consumes only the descriptor's frozen edge set and exact
+//! versioned grants. Nothing here can add a destination, reopen an edge, or
+//! reconfigure one.
 //!
 //! One runtime fact has no descriptor equivalent: a destination that withdrew
 //! its ingress capability because it no longer needs this output. That is the
 //! destination's normal departure, not this producer's failure, so it closes
 //! exactly one edge and is recorded for a status producer to report.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -42,8 +42,7 @@ use novarocks_types::UniqueId;
 
 use crate::task_execution::descriptor::ExchangeEdge;
 use crate::task_execution::domain::{
-    DomainConflict, DomainProgression, EdgeOpenVersion, EdgeSendPermission, ExchangeEdgeDomain,
-    ExchangeEdgeId,
+    DomainConflict, EdgeOpenVersion, EdgeSendPermission, ExchangeEdgeId,
 };
 
 /// What a producer may do on one outbound edge right now.
@@ -232,6 +231,84 @@ pub enum EdgeOpenAccepted {
     Idempotent,
 }
 
+/// Execution-private state of the permissions granted to one producer.
+///
+/// Contract types describe the frozen members and exact versioned decision;
+/// this state owns their runtime progression. Recording the complete set per
+/// version makes only an exact replay idempotent, while the permission map
+/// prevents a second version from reopening an edge.
+#[derive(Debug)]
+struct EdgeGrantState {
+    permissions: BTreeMap<ExchangeEdgeId, EdgeSendPermission>,
+    opened_sets: BTreeMap<EdgeOpenVersion, BTreeSet<ExchangeEdgeId>>,
+}
+
+impl EdgeGrantState {
+    fn from_frozen_edges(edges: impl IntoIterator<Item = ExchangeEdgeId>) -> Self {
+        Self {
+            permissions: edges
+                .into_iter()
+                .map(|edge| (edge, EdgeSendPermission::Closed))
+                .collect(),
+            opened_sets: BTreeMap::new(),
+        }
+    }
+
+    fn permission(&self, edge: ExchangeEdgeId) -> Option<EdgeSendPermission> {
+        self.permissions.get(&edge).copied()
+    }
+
+    fn grant(
+        &mut self,
+        version: EdgeOpenVersion,
+        requested: &[ExchangeEdgeId],
+    ) -> Result<EdgeOpenAccepted, DomainConflict> {
+        if requested.is_empty() {
+            return Err(DomainConflict::UnknownMember);
+        }
+
+        let mut set = BTreeSet::new();
+        for edge in requested {
+            if !self.permissions.contains_key(edge) {
+                return Err(DomainConflict::UnknownMember);
+            }
+            if !set.insert(*edge) {
+                return Err(DomainConflict::SameTokenDifferentContent);
+            }
+        }
+
+        if let Some(applied) = self.opened_sets.get(&version) {
+            return if *applied == set {
+                Ok(EdgeOpenAccepted::Idempotent)
+            } else {
+                Err(DomainConflict::SameTokenDifferentContent)
+            };
+        }
+
+        if set
+            .iter()
+            .any(|edge| self.permission(*edge) == Some(EdgeSendPermission::Open))
+        {
+            return Err(DomainConflict::SameTokenDifferentContent);
+        }
+
+        if self
+            .opened_sets
+            .keys()
+            .next_back()
+            .is_some_and(|accepted| version < *accepted)
+        {
+            return Err(DomainConflict::NotMonotonic);
+        }
+
+        for edge in &set {
+            self.permissions.insert(*edge, EdgeSendPermission::Open);
+        }
+        self.opened_sets.insert(version, set);
+        Ok(EdgeOpenAccepted::Applied)
+    }
+}
+
 /// Every outbound edge of one producer task, each with its own gate.
 ///
 /// The set is frozen at construction from the descriptor's outbound edges and
@@ -241,7 +318,7 @@ pub enum EdgeOpenAccepted {
 pub struct ExchangeEdgeGates {
     gates: BTreeMap<ExchangeEdgeId, Arc<EdgeSendGate>>,
     destinations: HashMap<ExchangeDestinationKey, Arc<EdgeSendGate>>,
-    granted: Mutex<ExchangeEdgeDomain>,
+    granted: Mutex<EdgeGrantState>,
     /// Every producer driver that must be woken when an edge opens.
     ///
     /// A driver that parked because its edge was closed is parked on a
@@ -280,7 +357,7 @@ impl ExchangeEdgeGates {
                 }
             }
         }
-        let granted = ExchangeEdgeDomain::from_frozen_edges(gates.keys().copied());
+        let granted = EdgeGrantState::from_frozen_edges(gates.keys().copied());
         Ok(Arc::new(Self {
             gates,
             destinations,
@@ -369,19 +446,17 @@ impl ExchangeEdgeGates {
 
     /// Grants send permission to a complete edge set.
     ///
-    /// The classification belongs to [`ExchangeEdgeDomain`], not to this
-    /// module: an unknown edge, a repeat naming a different set, and any
-    /// version other than the one that opened an edge are conflicts. A
-    /// conflict grants nothing, so the edges stay closed.
+    /// The private runtime grant state rejects an unknown edge, a repeat
+    /// naming a different set, a stale version, or an attempt to reopen an
+    /// edge. A conflict grants nothing, so the edges stay closed.
     pub fn open(
         &self,
         version: EdgeOpenVersion,
         edges: &[ExchangeEdgeId],
     ) -> Result<EdgeOpenAccepted, DomainConflict> {
         let mut granted = self.granted.lock().expect("exchange edge grant lock");
-        match granted.classify_open(version, edges) {
-            DomainProgression::Apply => {
-                granted.apply_open(version, edges);
+        match granted.grant(version, edges) {
+            Ok(EdgeOpenAccepted::Applied) => {
                 for edge in edges {
                     if let Some(gate) = self.gates.get(edge) {
                         gate.grant_send_permission();
@@ -393,12 +468,8 @@ impl ExchangeEdgeGates {
                 self.notify_open_waiters();
                 Ok(EdgeOpenAccepted::Applied)
             }
-            DomainProgression::Idempotent => Ok(EdgeOpenAccepted::Idempotent),
-            DomainProgression::Conflict(conflict) => Err(conflict),
-            // An edge-open request carries no ordering it could fall behind,
-            // so this arm is unreachable; it is rejected rather than assumed
-            // away.
-            DomainProgression::Older => Err(DomainConflict::NotMonotonic),
+            Ok(EdgeOpenAccepted::Idempotent) => Ok(EdgeOpenAccepted::Idempotent),
+            Err(conflict) => Err(conflict),
         }
     }
 
@@ -591,6 +662,31 @@ mod tests {
             gates.gate(edge(2)).expect("edge two").state(),
             EdgeSendState::AwaitingPermission,
             "the rejected set's unopened edge stays closed"
+        );
+    }
+
+    #[test]
+    fn a_stale_unseen_version_cannot_open_another_edge() {
+        let gates = two_edges();
+        assert_eq!(
+            gates.open(version(2), &[edge(1)]),
+            Ok(EdgeOpenAccepted::Applied),
+            "a monotonic snapshot may skip an intermediate version"
+        );
+
+        assert_eq!(
+            gates.open(EdgeOpenVersion::FIRST, &[edge(2)]),
+            Err(DomainConflict::NotMonotonic),
+            "an unseen version below the accepted high watermark is stale"
+        );
+        assert_eq!(
+            gates.granted_permission(edge(2)),
+            Some(EdgeSendPermission::Closed)
+        );
+        assert_eq!(
+            gates.gate(edge(2)).expect("edge two").state(),
+            EdgeSendState::AwaitingPermission,
+            "a stale decision must publish no send permission"
         );
     }
 

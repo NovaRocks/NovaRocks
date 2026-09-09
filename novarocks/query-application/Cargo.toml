@@ -1,0 +1,8 @@
+[package]
+name = "novarocks-query-application"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+novarocks-execution-contract = { path = "../execution-contract" }
+novarocks-workload-control = { path = "../workload-control" }

@@ -64,15 +64,13 @@ use novarocks_execution::runtime::operator_statistics::project_operator_statisti
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_execution::task_execution::descriptor::{
-    ExchangeSource, IngressRejection, TaskDescriptor,
-};
-use novarocks_execution::task_execution::domain::{
+use novarocks_execution_contract::task_execution::descriptor::{ExchangeSource, TaskDescriptor};
+use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ContentFingerprint, DomainVersion,
 };
-use novarocks_execution::task_execution::identity::TaskIdentity;
-use novarocks_execution::task_execution::operation::TaskDomainUpdate;
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
 };
 use novarocks_proto_codec::connector_read::{
@@ -85,6 +83,7 @@ use novarocks_spi::connector::{
 use novarocks_task_codec::domain::{WireContent, stored_message};
 use novarocks_task_codec::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
 use novarocks_types::{QueryExecutionId, UniqueId};
+use novarocks_worker::{IngressRejection, authorize_inbound_frame};
 use tracing::debug;
 
 use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
@@ -275,7 +274,8 @@ impl TaskInboundCapabilities {
             installed.get(&destination_kernel_key).map(Arc::clone)
         };
         let descriptor = descriptor.ok_or(IngressRejection::UnknownDestinationTask)?;
-        let source = descriptor.authorize_inbound_frame(
+        let source = authorize_inbound_frame(
+            &descriptor,
             destination_kernel_key,
             destination_node_id,
             source_kernel_key,
@@ -308,7 +308,8 @@ impl TaskInboundCapabilities {
         let Some(descriptor) = descriptor else {
             return ExchangeRouteClaim::NotHeld;
         };
-        match descriptor.authorize_inbound_frame(
+        match authorize_inbound_frame(
+            &descriptor,
             query.destination_fragment_instance_id,
             node_id,
             query.source_fragment_instance_id,
@@ -1495,17 +1496,17 @@ mod tests {
     use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-    use novarocks_execution::task_execution::descriptor::{
+    use novarocks_execution_contract::task_execution::descriptor::{
         ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource, ExchangeTopology,
-        IngressRejection, PhysicalFragmentPlan, TaskDescriptor,
+        PhysicalFragmentPlan, TaskDescriptor,
     };
-    use novarocks_execution::task_execution::domain::{
+    use novarocks_execution_contract::task_execution::domain::{
         CodecOwnedContent, ContentFingerprint, DomainVersion, EdgeOpenVersion, ExchangeEdgeId,
         PlanNodeId, SplitOffer, SplitSequence,
     };
-    use novarocks_execution::task_execution::identity::TaskIdentity;
-    use novarocks_execution::task_execution::operation::TaskDomainUpdate;
-    use novarocks_execution::task_execution::status::{
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
+    use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
     };
     use novarocks_proto_codec::FieldPath;
@@ -1521,6 +1522,7 @@ mod tests {
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
+    use novarocks_worker::IngressRejection;
 
     use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
     use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
@@ -2631,7 +2633,7 @@ mod tests {
             novarocks_task_codec::domain::WireContent::new(b"split", assignment),
         );
         TaskDomainUpdate::SplitAssignment(
-            novarocks_execution::task_execution::operation::SplitAssignmentIntent::new(
+            novarocks_execution_contract::task_execution::operation::SplitAssignmentIntent::new(
                 node, offer, payload,
             ),
         )
@@ -2649,7 +2651,7 @@ mod tests {
         // split batch: the queue would then accept sequence numbers that no
         // scheduler ever issued.
         let update = TaskDomainUpdate::SplitAssignment(
-            novarocks_execution::task_execution::operation::SplitAssignmentIntent::new(
+            novarocks_execution_contract::task_execution::operation::SplitAssignmentIntent::new(
                 PlanNodeId::new(10).expect("nonnegative node"),
                 SplitOffer::Seal,
                 Arc::new(novarocks_task_codec::domain::WireContent::new(

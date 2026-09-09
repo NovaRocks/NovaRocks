@@ -32,18 +32,18 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use novarocks_execution::task_execution::domain::{CodecOwnedContent, DomainVersion};
-use novarocks_execution::task_execution::identity::TaskIdentity;
-use novarocks_execution::task_execution::lease::MonotonicInstant;
-use novarocks_execution::task_execution::status::{
+use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, DynamicFilterAdvertisement, FINAL_TASK_INFO_MAX_OPERATORS,
     FinalTaskInfo, OperatorStatistics, TaskFailure, TaskOutputFacts, TaskResourceFacts, TaskState,
     TaskStatus, TaskStatusError, TaskStatusVersion, TaskWriterFacts, TerminationDetail,
 };
-use novarocks_execution::task_execution::transition::{
-    RootDrainAction, TaskTransition, classify_root_drain, classify_task_transition,
-};
 use novarocks_types::UniqueId;
+use novarocks_worker::{
+    MonotonicInstant, RootDrainAction, TaskTransition, classify_root_drain,
+    classify_task_transition,
+};
 
 use super::clock::BackendMonotonicClock;
 use super::host::TaskDynamicFilterRead;

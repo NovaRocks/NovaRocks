@@ -25,7 +25,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use novarocks_execution::task_execution::MonotonicInstant;
+use novarocks_query_application::coordination::MonotonicInstant;
 
 /// The clock a task-protocol owner reads.
 pub trait TaskProtocolClock: std::fmt::Debug + Send + Sync {

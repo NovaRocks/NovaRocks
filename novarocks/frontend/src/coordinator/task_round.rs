@@ -27,8 +27,9 @@ use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::operation::CredentialUpdate;
-use novarocks_execution::task_execution::{DispatchBudget, TransportBudget};
+use novarocks_query_application::coordination::DispatchBudget;
 use novarocks_sql::plan_read::FragmentEdge;
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecutionId};
 
 use crate::native::data_runtime::FrontendDataRuntime;
@@ -176,6 +177,7 @@ pub(crate) fn assemble_round(
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
 
     let acks = TaskAckIntake::new(Arc::clone(&wake));
+    let native_compatibility_id = transport.attempt.native_compatibility_id;
     let sink = NativeTaskOperationSink::new(
         backends,
         transport.transport,
@@ -201,6 +203,7 @@ pub(crate) fn assemble_round(
         graph,
         transport.budget,
         transport.transport,
+        native_compatibility_id,
         Arc::new(ProcessMonotonicClock::new()),
         sink,
         intake,

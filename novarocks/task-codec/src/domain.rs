@@ -32,12 +32,12 @@
 use std::fmt;
 use std::sync::Arc;
 
-use novarocks_execution::task_execution::domain::{
+use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
     DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer, SplitSequence,
     SplitWatermark,
 };
-use novarocks_execution::task_execution::operation::{
+use novarocks_execution_contract::task_execution::operation::{
     CredentialUpdate, PlanNodeSplitReceipt, QueryContextDomainUpdate, SplitAssignmentIntent,
     TaskDomainUpdate,
 };
@@ -957,7 +957,7 @@ mod tests {
         refuse_confidential_material_in_the_clear, stored_credential, stored_message,
     };
 
-    use novarocks_execution::task_execution::domain::{
+    use novarocks_execution_contract::task_execution::domain::{
         CodecOwnedContent, ConfidentialContent, DomainVersion,
     };
     use novarocks_proto_models::{catalog, filter, novarocks};
@@ -1045,8 +1045,8 @@ mod tests {
         struct Foreign;
 
         impl CodecOwnedContent for Foreign {
-            fn fingerprint(&self) -> novarocks_execution::task_execution::ContentFingerprint {
-                novarocks_execution::task_execution::ContentFingerprint::from_bytes([0; 16])
+            fn fingerprint(&self) -> novarocks_execution_contract::ContentFingerprint {
+                novarocks_execution_contract::ContentFingerprint::from_bytes([0; 16])
             }
 
             fn encoded_len(&self) -> usize {

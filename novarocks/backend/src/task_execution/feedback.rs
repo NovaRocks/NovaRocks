@@ -47,8 +47,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use novarocks_execution::runtime_filter::RuntimeFilterChannelId;
-use novarocks_execution::task_execution::domain::DomainVersion;
-use novarocks_execution::task_execution::identity::TaskIdentity;
+use novarocks_execution_contract::task_execution::domain::DomainVersion;
+use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_proto_models::filter;
 use novarocks_task_codec::domain::wire_task_dynamic_filter;
 
@@ -227,7 +227,7 @@ mod tests {
     use std::sync::Arc;
 
     use novarocks_execution::runtime_filter::RuntimeFilterChannelId;
-    use novarocks_execution::task_execution::identity::TaskIdentity;
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_proto_models::filter;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -372,7 +372,9 @@ mod tests {
         let identity = identity();
         let (status, reporter) = owner(identity);
         reporter.running();
-        reporter.finished(novarocks_execution::task_execution::status::TaskOutputFacts::new(true));
+        reporter.finished(
+            novarocks_execution_contract::task_execution::status::TaskOutputFacts::new(true),
+        );
         let egress = TaskRuntimeFilterFeedbackEgress::new(identity, reporter);
 
         egress.try_publish(

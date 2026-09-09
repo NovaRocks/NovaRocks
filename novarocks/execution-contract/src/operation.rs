@@ -25,14 +25,15 @@
 //! request never gives them shared atomicity, a shared revision, or a shared
 //! success.
 //!
-//! This module also freezes the protocol's dispatch and payload budgets.
-//! "Every task is created concurrently" rules out a plan-depth serial chain,
-//! not an unbounded fan-out of requests, queues, or memory.
+//! Endpoint retry, dispatch, admission, and resource policy belongs to the
+//! query application, Worker, or Native adapter rather than this contract.
 
 use std::fmt;
 use std::time::Duration;
 
 use std::sync::Arc;
+
+use novarocks_types::NativeCompatibilityId;
 
 use crate::task_execution::descriptor::TaskDescriptor;
 use crate::task_execution::domain::{
@@ -41,7 +42,7 @@ use crate::task_execution::domain::{
     TaskDomainKind,
 };
 use crate::task_execution::identity::{
-    IdentityMismatch, QueryContextRef, TaskIdentity, TaskOperationId,
+    AdmissionTicketId, IdentityMismatch, QueryContextRef, TaskIdentity, TaskOperationId,
 };
 use crate::task_execution::lease::{LeaseReceipt, LeaseSequence, LeaseValidFor};
 use crate::task_execution::status::{AbortCause, CancelReason, TaskStatus};
@@ -50,6 +51,7 @@ use crate::task_execution::transition::QueryContextState;
 /// The operations that make up the task control and observation surface.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum OperationKind {
+    AcquireQueryContextAdmissionTicket,
     CreateTask,
     UpdateTask,
     UpdateQueryContext,
@@ -61,19 +63,9 @@ pub enum OperationKind {
 }
 
 impl OperationKind {
-    /// Whether this operation keeps a query context alive or closes it.
-    ///
-    /// Lifecycle operations get their own dispatch lane so a burst of creates
-    /// and updates can never starve a renewal, an abort, or a release.
-    pub const fn is_lifecycle(self) -> bool {
-        matches!(
-            self,
-            Self::UpdateQueryContext | Self::AbortQueryContext | Self::ReleaseQueryContext
-        )
-    }
-
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AcquireQueryContextAdmissionTicket => "AcquireQueryContextAdmissionTicket",
             Self::CreateTask => "CreateTask",
             Self::UpdateTask => "UpdateTask",
             Self::UpdateQueryContext => "UpdateQueryContext",
@@ -142,7 +134,9 @@ impl MaxWait {
     /// The default wait for one operation kind.
     pub fn default_for(kind: OperationKind) -> Self {
         let value = match kind {
-            OperationKind::CreateTask => Self::DEFAULT_CREATE,
+            OperationKind::AcquireQueryContextAdmissionTicket | OperationKind::CreateTask => {
+                Self::DEFAULT_CREATE
+            }
             OperationKind::UpdateQueryContext => Self::DEFAULT_CREATE,
             _ => Self::DEFAULT_UPDATE,
         };
@@ -151,36 +145,6 @@ impl MaxWait {
 
     pub const fn get(self) -> Duration {
         self.0
-    }
-}
-
-/// The server-side caps a backend clamps every requested wait into.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct OperationWaitCaps {
-    create: Duration,
-    update: Duration,
-}
-
-impl OperationWaitCaps {
-    pub const DEFAULT: Self = Self {
-        create: MaxWait::DEFAULT_CREATE,
-        update: MaxWait::DEFAULT_UPDATE,
-    };
-
-    pub fn new(create: Duration, update: Duration) -> Option<Self> {
-        if create.is_zero() || update.is_zero() {
-            return None;
-        }
-        Some(Self { create, update })
-    }
-
-    /// The effective wait for one operation, never longer than the cap.
-    pub fn clamp(self, kind: OperationKind, requested: MaxWait) -> Duration {
-        let cap = match kind {
-            OperationKind::CreateTask | OperationKind::UpdateQueryContext => self.create,
-            _ => self.update,
-        };
-        requested.get().min(cap)
     }
 }
 
@@ -225,22 +189,18 @@ impl OperationEnvelope {
 
 /// The machine-readable outcome categories of one operation.
 ///
-/// Retry, failure, and observation recovery are decided from this category
-/// alone. Nothing in this protocol classifies an outcome by inspecting an
-/// error message.
+/// Every category is a Worker-produced receipt verdict with an exact wire
+/// representation. Transport failure, observation loss, and destination
+/// delivery are query-side port results and do not enter this enum.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum OperationOutcome {
     /// The operation was applied.
     Accepted,
     /// An exact replay of an already applied operation.
     Idempotent,
-    /// The transport could not prove whether the backend applied it.
-    RetryableTransportUnknown,
     /// The operation exceeded its effective wait while queued or waiting on
     /// the creation gate. Nothing was created and nothing partial remains.
     OperationTimedOut,
-    /// The status transport dropped, but the exact backend process is intact.
-    RetryableObservationLoss,
     /// A different task, stage, query, or backend process.
     IdentityMismatch,
     /// The backend rejected the request before side effects because its
@@ -264,10 +224,6 @@ pub enum OperationOutcome {
     /// A late operation reached a retained terminal context without
     /// conflicting.
     ContextTerminalReceipt,
-    /// A push destination withdrew its capability for a normal reason.
-    NormalDestinationCanceled,
-    /// A destination failed, aborted, or does not match the frozen topology.
-    DestinationFailure,
     /// Malformed, out of bounds, or an illegal state transition.
     InvalidStateOrRequest,
     /// A terminal task received a new update it never applied.
@@ -277,83 +233,6 @@ pub enum OperationOutcome {
     /// A per-context or per-backend capacity bound was reached. This fails
     /// closed rather than degrading: there is no older path to fall back to.
     ResourceExhausted,
-}
-
-/// What a frontend does with an outcome.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum FrontendAction {
-    /// The operation is settled; carry on.
-    Settled,
-    /// Resend the identical immutable request to the same task and process,
-    /// inside the owner's error budget and the legal request horizon.
-    RetryExactRequest,
-    /// Resubscribe the observation with the per-task cursors. The backend's
-    /// tasks are untouched.
-    ResubscribeObservation,
-    /// This operation failed closed. The attempt's fate depends on what the
-    /// operation was for, not on this classification.
-    FailOperationClosed,
-    /// The current query attempt fails. Never retried on another backend.
-    FailAttempt,
-    /// Keep renewing and retry the identical release once local state has
-    /// advanced.
-    RetryAfterProgress,
-    /// Stop sending for this context and finish reconciling. Whether this is
-    /// fatal depends on whether the frontend already holds the terminal facts
-    /// it needs.
-    StopSendingAndReconcile,
-}
-
-impl OperationOutcome {
-    /// The action this outcome prescribes.
-    pub const fn frontend_action(self) -> FrontendAction {
-        match self {
-            Self::Accepted | Self::Idempotent => FrontendAction::Settled,
-            Self::RetryableTransportUnknown => FrontendAction::RetryExactRequest,
-            Self::RetryableObservationLoss => FrontendAction::ResubscribeObservation,
-            Self::OperationTimedOut => FrontendAction::FailOperationClosed,
-            Self::ReleaseNotReady => FrontendAction::RetryAfterProgress,
-            // A task that already terminated is not a reason to fail the
-            // attempt. The sender could not have known -- it holds a status
-            // older than the terminal by construction -- and the operation has
-            // nothing left to do. What it must do is stop sending to that task
-            // and reconcile against the status stream, which is where the
-            // task's own terminal says why it ended. Failing here would make
-            // this rejection a second authority on that question, and it would
-            // fail queries whose work is already complete: a delivery landing
-            // just after an early-terminating scan finished.
-            Self::ContextTerminalReceipt | Self::Gone | Self::TerminalRejected => {
-                FrontendAction::StopSendingAndReconcile
-            }
-            Self::NormalDestinationCanceled => FrontendAction::Settled,
-            Self::IdentityMismatch
-            | Self::CompatibilityMismatch
-            | Self::CreateConflict
-            | Self::ContextNotEstablished
-            | Self::ContextConflict
-            | Self::DomainConflict
-            | Self::LeaseExpired
-            | Self::DestinationFailure
-            | Self::InvalidStateOrRequest
-            | Self::ResourceExhausted => FrontendAction::FailAttempt,
-        }
-    }
-
-    /// Whether the identical immutable request may be resent.
-    ///
-    /// Only a genuinely unknown transport outcome may be. A typed rejection
-    /// is never retried, however transient its wording looks.
-    pub const fn is_retryable(self) -> bool {
-        matches!(self, Self::RetryableTransportUnknown)
-    }
-
-    /// Whether the operation was applied or provably never applied.
-    pub const fn is_settled(self) -> bool {
-        !matches!(
-            self,
-            Self::RetryableTransportUnknown | Self::RetryableObservationLoss
-        )
-    }
 }
 
 /// The split receipt of one plan node.
@@ -405,6 +284,7 @@ pub enum TaskDomainReceipt {
         progression: DomainProgression,
     },
     OpenExchangeEdges {
+        accepted_version: EdgeOpenVersion,
         opened: Vec<ExchangeEdgeId>,
         progression: DomainProgression,
     },
@@ -564,6 +444,44 @@ impl QueryContextReceipt {
     }
 }
 
+/// The immutable admission grant returned by the issuing worker.
+///
+/// The context and validity are repeated deliberately. A caller validates the
+/// receipt against its exact request instead of treating possession of an
+/// opaque ticket id as proof that it was issued for the right attempt.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct QueryContextAdmissionTicketReceipt {
+    ticket_id: AdmissionTicketId,
+    context: QueryContextRef,
+    valid_for: LeaseValidFor,
+}
+
+impl QueryContextAdmissionTicketReceipt {
+    pub const fn new(
+        ticket_id: AdmissionTicketId,
+        context: QueryContextRef,
+        valid_for: LeaseValidFor,
+    ) -> Self {
+        Self {
+            ticket_id,
+            context,
+            valid_for,
+        }
+    }
+
+    pub const fn ticket_id(self) -> AdmissionTicketId {
+        self.ticket_id
+    }
+
+    pub const fn context(self) -> QueryContextRef {
+        self.context
+    }
+
+    pub const fn valid_for(self) -> LeaseValidFor {
+        self.valid_for
+    }
+}
+
 /// How a release request was answered.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseOutcome {
@@ -577,269 +495,6 @@ pub enum ReleaseOutcome {
     /// The context was already terminal. The receipt reports the original
     /// cause.
     AlreadyTerminal,
-}
-
-impl ReleaseOutcome {
-    /// Whether the owner must keep renewing the lease.
-    pub const fn requires_continued_renewal(self) -> bool {
-        matches!(self, Self::NotReady)
-    }
-}
-
-/// The dispatch budgets one frontend keeps per backend process.
-///
-/// Concurrency is bounded and fair by construction. Lifecycle permits are
-/// reserved so a renewal, an abort, or a release can always get out even
-/// while a large create batch is in flight.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct DispatchBudget {
-    create_permits: usize,
-    update_permits: usize,
-    lifecycle_permits: usize,
-}
-
-impl DispatchBudget {
-    pub const DEFAULT: Self = Self {
-        create_permits: 16,
-        update_permits: 12,
-        lifecycle_permits: 4,
-    };
-
-    pub const fn new(
-        create_permits: usize,
-        update_permits: usize,
-        lifecycle_permits: usize,
-    ) -> Option<Self> {
-        if create_permits == 0 || update_permits == 0 || lifecycle_permits == 0 {
-            return None;
-        }
-        Some(Self {
-            create_permits,
-            update_permits,
-            lifecycle_permits,
-        })
-    }
-
-    pub const fn create_permits(self) -> usize {
-        self.create_permits
-    }
-
-    pub const fn update_permits(self) -> usize {
-        self.update_permits
-    }
-
-    pub const fn lifecycle_permits(self) -> usize {
-        self.lifecycle_permits
-    }
-
-    pub const fn total_permits(self) -> usize {
-        self.create_permits + self.update_permits + self.lifecycle_permits
-    }
-
-    /// Which lane an operation is dispatched on.
-    pub const fn lane_of(kind: OperationKind) -> DispatchLane {
-        if kind.is_lifecycle() {
-            DispatchLane::Lifecycle
-        } else if matches!(kind, OperationKind::CreateTask) {
-            DispatchLane::Create
-        } else {
-            DispatchLane::Update
-        }
-    }
-
-    pub const fn permits_for(self, lane: DispatchLane) -> usize {
-        match lane {
-            DispatchLane::Create => self.create_permits,
-            DispatchLane::Update => self.update_permits,
-            DispatchLane::Lifecycle => self.lifecycle_permits,
-        }
-    }
-}
-
-/// The weighted-fair dispatch lanes of one backend.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub enum DispatchLane {
-    Create,
-    Update,
-    Lifecycle,
-}
-
-/// Every budget the native task protocol runs one attempt with.
-///
-/// Grouped because they are configured together and validated together: a
-/// deployment that tightens one of them has to hand the whole set to the owner
-/// in one move, and an owner given only some of them would have to invent the
-/// rest.
-#[derive(Clone, Copy, Debug)]
-pub struct TaskExecutionBudgets {
-    pub dispatch: DispatchBudget,
-    pub wait_caps: OperationWaitCaps,
-    pub lease_bounds: crate::task_execution::lease::LeaseBounds,
-    pub transport: TransportBudget,
-    /// How many consecutive status subscription failures one attempt tolerates
-    /// before it reports the observation lost rather than retrying in silence.
-    pub status_subscription_error_budget: u32,
-}
-
-impl TaskExecutionBudgets {
-    /// The frozen contract values.
-    ///
-    /// Not invented defaults: each member's own `DEFAULT` is the number the
-    /// protocol froze, and a deployment tightens them through configuration
-    /// rather than starting from nothing.
-    pub const DEFAULT: Self = Self {
-        dispatch: DispatchBudget::DEFAULT,
-        wait_caps: OperationWaitCaps::DEFAULT,
-        lease_bounds: crate::task_execution::lease::LeaseBounds::DEFAULT,
-        transport: TransportBudget::DEFAULT,
-        status_subscription_error_budget: DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET,
-    };
-}
-
-/// How many consecutive status subscription failures one attempt tolerates.
-///
-/// Small on purpose: a subscription that keeps failing is an observation loss,
-/// and reporting that is more useful than retrying in silence.
-pub const DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET: u32 = 8;
-
-/// Payload and queue budgets of the operation transport.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct TransportBudget {
-    max_batch_items: usize,
-    max_batch_encoded_bytes: usize,
-    max_descriptor_encoded_bytes: usize,
-    max_query_backend_queued_operations: usize,
-    max_query_backend_queued_bytes: usize,
-    max_backend_queued_operations: usize,
-    max_backend_queued_bytes: usize,
-    max_tasks_per_context: usize,
-    max_active_tasks_per_backend: usize,
-    frontend_queue_residence: Duration,
-}
-
-impl TransportBudget {
-    pub const DEFAULT: Self = Self {
-        max_batch_items: 32,
-        max_batch_encoded_bytes: 48 * 1024 * 1024,
-        max_descriptor_encoded_bytes: 16 * 1024 * 1024,
-        max_query_backend_queued_operations: 4096,
-        max_query_backend_queued_bytes: 256 * 1024 * 1024,
-        max_backend_queued_operations: 16384,
-        max_backend_queued_bytes: 512 * 1024 * 1024,
-        max_tasks_per_context: 4096,
-        max_active_tasks_per_backend: 32768,
-        frontend_queue_residence: Duration::from_secs(15),
-    };
-
-    /// Builds a budget, rejecting a zero or an inverted bound.
-    ///
-    /// The defaults are the frozen contract, but a deployment has to be able
-    /// to tighten them and a test has to be able to prove the enforcement
-    /// path without manufacturing a 48 MiB payload. The ordering rules are
-    /// what make the bounds a hierarchy rather than ten unrelated numbers: a
-    /// descriptor has to fit in a batch, a batch in one query's queue, and
-    /// that queue in the process's, or the smaller bound makes the larger one
-    /// unreachable. The task counts nest for the same reason — a
-    /// `QueryContextRef` names one query on one backend, so one context's
-    /// tasks are a subset of that backend's.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "every bound is independent; grouping them would invent a hierarchy the contract does not have"
-    )]
-    pub fn new(
-        max_batch_items: usize,
-        max_batch_encoded_bytes: usize,
-        max_descriptor_encoded_bytes: usize,
-        max_query_backend_queued_operations: usize,
-        max_query_backend_queued_bytes: usize,
-        max_backend_queued_operations: usize,
-        max_backend_queued_bytes: usize,
-        max_tasks_per_context: usize,
-        max_active_tasks_per_backend: usize,
-        frontend_queue_residence: Duration,
-    ) -> Option<Self> {
-        if max_batch_items == 0
-            || max_batch_encoded_bytes == 0
-            || max_descriptor_encoded_bytes == 0
-            || max_query_backend_queued_operations == 0
-            || max_query_backend_queued_bytes == 0
-            || max_backend_queued_operations == 0
-            || max_backend_queued_bytes == 0
-            || max_tasks_per_context == 0
-            || max_active_tasks_per_backend == 0
-            || frontend_queue_residence.is_zero()
-        {
-            return None;
-        }
-        if max_descriptor_encoded_bytes > max_batch_encoded_bytes
-            || max_batch_encoded_bytes > max_query_backend_queued_bytes
-            || max_query_backend_queued_bytes > max_backend_queued_bytes
-            || max_batch_items > max_query_backend_queued_operations
-            || max_query_backend_queued_operations > max_backend_queued_operations
-            || max_tasks_per_context > max_active_tasks_per_backend
-        {
-            return None;
-        }
-        Some(Self {
-            max_batch_items,
-            max_batch_encoded_bytes,
-            max_descriptor_encoded_bytes,
-            max_query_backend_queued_operations,
-            max_query_backend_queued_bytes,
-            max_backend_queued_operations,
-            max_backend_queued_bytes,
-            max_tasks_per_context,
-            max_active_tasks_per_backend,
-            frontend_queue_residence,
-        })
-    }
-
-    pub const fn max_batch_items(self) -> usize {
-        self.max_batch_items
-    }
-
-    pub const fn max_batch_encoded_bytes(self) -> usize {
-        self.max_batch_encoded_bytes
-    }
-
-    pub const fn max_descriptor_encoded_bytes(self) -> usize {
-        self.max_descriptor_encoded_bytes
-    }
-
-    pub const fn max_query_backend_queued_operations(self) -> usize {
-        self.max_query_backend_queued_operations
-    }
-
-    pub const fn max_query_backend_queued_bytes(self) -> usize {
-        self.max_query_backend_queued_bytes
-    }
-
-    pub const fn max_backend_queued_operations(self) -> usize {
-        self.max_backend_queued_operations
-    }
-
-    pub const fn max_backend_queued_bytes(self) -> usize {
-        self.max_backend_queued_bytes
-    }
-
-    pub const fn max_tasks_per_context(self) -> usize {
-        self.max_tasks_per_context
-    }
-
-    pub const fn max_active_tasks_per_backend(self) -> usize {
-        self.max_active_tasks_per_backend
-    }
-
-    /// How long an operation may sit in the frontend queue before it fails
-    /// closed locally rather than being sent late.
-    pub const fn frontend_queue_residence(self) -> Duration {
-        self.frontend_queue_residence
-    }
-
-    /// Whether a batch of `items` totalling `encoded_bytes` fits.
-    pub const fn batch_fits(self, items: usize, encoded_bytes: usize) -> bool {
-        items > 0 && items <= self.max_batch_items && encoded_bytes <= self.max_batch_encoded_bytes
-    }
 }
 
 /// One split-domain offer for one plan node: a contiguous batch, or the
@@ -1103,6 +758,50 @@ impl UpdateTask {
     }
 }
 
+/// Acquire worker-local capacity before creating a query context.
+#[derive(Copy, Clone, Debug)]
+pub struct AcquireQueryContextAdmissionTicket {
+    envelope: OperationEnvelope,
+    context: QueryContextRef,
+    valid_for: LeaseValidFor,
+    native_compatibility_id: NativeCompatibilityId,
+}
+
+impl AcquireQueryContextAdmissionTicket {
+    pub fn new(
+        operation_id: TaskOperationId,
+        context: QueryContextRef,
+        valid_for: LeaseValidFor,
+        native_compatibility_id: NativeCompatibilityId,
+    ) -> Self {
+        Self {
+            envelope: OperationEnvelope::with_default_wait(
+                operation_id,
+                OperationKind::AcquireQueryContextAdmissionTicket,
+            ),
+            context,
+            valid_for,
+            native_compatibility_id,
+        }
+    }
+
+    pub const fn envelope(self) -> OperationEnvelope {
+        self.envelope
+    }
+
+    pub const fn context(self) -> QueryContextRef {
+        self.context
+    }
+
+    pub const fn valid_for(self) -> LeaseValidFor {
+        self.valid_for
+    }
+
+    pub const fn native_compatibility_id(self) -> NativeCompatibilityId {
+        self.native_compatibility_id
+    }
+}
+
 /// Create one query context and install its shared facts atomically.
 ///
 /// The initial lease is not a parameter of this type beyond its duration: its
@@ -1111,6 +810,7 @@ impl UpdateTask {
 pub struct EstablishQueryContext {
     envelope: OperationEnvelope,
     context: QueryContextRef,
+    admission_ticket_id: AdmissionTicketId,
     catalog_binding: Arc<dyn CodecOwnedContent>,
     initial_runtime_filter: Arc<dyn CodecOwnedContent>,
     query_options: Arc<dyn CodecOwnedContent>,
@@ -1119,9 +819,14 @@ pub struct EstablishQueryContext {
 }
 
 impl EstablishQueryContext {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the establish contract names each independently validated immutable fact"
+    )]
     pub fn new(
         operation_id: TaskOperationId,
         context: QueryContextRef,
+        admission_ticket_id: AdmissionTicketId,
         catalog_binding: Arc<dyn CodecOwnedContent>,
         initial_runtime_filter: Arc<dyn CodecOwnedContent>,
         query_options: Arc<dyn CodecOwnedContent>,
@@ -1134,6 +839,7 @@ impl EstablishQueryContext {
                 OperationKind::UpdateQueryContext,
             ),
             context,
+            admission_ticket_id,
             catalog_binding,
             initial_runtime_filter,
             query_options,
@@ -1148,6 +854,10 @@ impl EstablishQueryContext {
 
     pub const fn context(&self) -> QueryContextRef {
         self.context
+    }
+
+    pub const fn admission_ticket_id(&self) -> AdmissionTicketId {
+        self.admission_ticket_id
     }
 
     pub fn catalog_binding(&self) -> &Arc<dyn CodecOwnedContent> {
@@ -1459,205 +1169,30 @@ impl GetFinalTaskInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        DispatchBudget, DispatchLane, FrontendAction, MaxWait, MaxWaitError, OperationEnvelope,
-        OperationKind, OperationOutcome, OperationWaitCaps, PlanNodeSplitReceipt, ReleaseOutcome,
-        TaskDomainReceipt, TransportBudget,
+        MaxWait, MaxWaitError, OperationEnvelope, OperationKind, PlanNodeSplitReceipt,
+        TaskDomainReceipt,
     };
-    use crate::task_execution::domain::{
-        DomainProgression, PlanNodeId, SplitSequence, SplitWatermark, TaskDomainKind,
-    };
-    use crate::task_execution::identity::TaskOperationId;
+    use crate::TaskOperationId;
+    use crate::{DomainProgression, PlanNodeId, SplitSequence, SplitWatermark, TaskDomainKind};
     use std::time::Duration;
 
-    const ALL_OUTCOMES: [OperationOutcome; 20] = [
-        OperationOutcome::Accepted,
-        OperationOutcome::Idempotent,
-        OperationOutcome::RetryableTransportUnknown,
-        OperationOutcome::OperationTimedOut,
-        OperationOutcome::RetryableObservationLoss,
-        OperationOutcome::IdentityMismatch,
-        OperationOutcome::CompatibilityMismatch,
-        OperationOutcome::CreateConflict,
-        OperationOutcome::ContextNotEstablished,
-        OperationOutcome::ContextConflict,
-        OperationOutcome::DomainConflict,
-        OperationOutcome::LeaseExpired,
-        OperationOutcome::ReleaseNotReady,
-        OperationOutcome::ContextTerminalReceipt,
-        OperationOutcome::NormalDestinationCanceled,
-        OperationOutcome::DestinationFailure,
-        OperationOutcome::InvalidStateOrRequest,
-        OperationOutcome::TerminalRejected,
-        OperationOutcome::Gone,
-        OperationOutcome::ResourceExhausted,
-    ];
-
     #[test]
-    fn max_wait_rejects_zero_and_overflow_and_defaults_per_kind() {
-        assert_eq!(MaxWait::new(Duration::ZERO), Err(MaxWaitError::Zero));
-        assert_eq!(
-            MaxWait::new(MaxWait::MAX_REPRESENTABLE + Duration::from_secs(1)),
-            Err(MaxWaitError::Overflow)
-        );
-        assert_eq!(
-            MaxWait::default_for(OperationKind::CreateTask).get(),
-            Duration::from_secs(15)
-        );
-        assert_eq!(
-            MaxWait::default_for(OperationKind::UpdateQueryContext).get(),
-            Duration::from_secs(15)
-        );
-        for kind in [
-            OperationKind::UpdateTask,
-            OperationKind::CancelTask,
-            OperationKind::AbortQueryContext,
-            OperationKind::ReleaseQueryContext,
-            OperationKind::FetchTaskDynamicFilters,
-            OperationKind::GetFinalTaskInfo,
-        ] {
-            assert_eq!(
-                MaxWait::default_for(kind).get(),
-                Duration::from_secs(5),
-                "{kind}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_backend_clamps_a_requested_wait_and_never_extends_it() {
-        let caps = OperationWaitCaps::DEFAULT;
-        let long = MaxWait::new(Duration::from_secs(120)).expect("representable");
-        assert_eq!(
-            caps.clamp(OperationKind::CreateTask, long),
-            Duration::from_secs(15)
-        );
-        assert_eq!(
-            caps.clamp(OperationKind::UpdateTask, long),
-            Duration::from_secs(5)
-        );
-        let short = MaxWait::new(Duration::from_millis(250)).expect("representable");
-        assert_eq!(
-            caps.clamp(OperationKind::CreateTask, short),
-            Duration::from_millis(250),
-            "a shorter request is honoured, never padded up to the cap"
-        );
-        assert!(OperationWaitCaps::new(Duration::ZERO, Duration::from_secs(1)).is_none());
-    }
-
-    #[test]
-    fn an_envelope_carries_its_own_identity_kind_and_deadline() {
-        let id = TaskOperationId::new_v7();
-        let envelope = OperationEnvelope::with_default_wait(id, OperationKind::CancelTask);
-        assert_eq!(envelope.operation_id(), id);
+    fn operation_envelope_carries_exact_identity_kind_and_wait() {
+        let operation_id = TaskOperationId::new_v7();
+        let envelope =
+            OperationEnvelope::with_default_wait(operation_id, OperationKind::CancelTask);
+        assert_eq!(envelope.operation_id(), operation_id);
         assert_eq!(envelope.kind(), OperationKind::CancelTask);
         assert_eq!(envelope.max_wait().get(), Duration::from_secs(5));
+        assert_eq!(MaxWait::new(Duration::ZERO), Err(MaxWaitError::Zero));
     }
 
     #[test]
-    fn only_an_unknown_transport_outcome_is_retryable() {
-        for outcome in ALL_OUTCOMES {
-            let retryable = outcome == OperationOutcome::RetryableTransportUnknown;
-            assert_eq!(outcome.is_retryable(), retryable, "{outcome:?}");
-        }
-        assert!(!OperationOutcome::RetryableObservationLoss.is_retryable());
-        assert!(!OperationOutcome::OperationTimedOut.is_retryable());
-        assert!(!OperationOutcome::DomainConflict.is_retryable());
-    }
-
-    #[test]
-    fn every_outcome_has_exactly_one_prescribed_action() {
-        assert_eq!(
-            OperationOutcome::Accepted.frontend_action(),
-            FrontendAction::Settled
-        );
-        assert_eq!(
-            OperationOutcome::RetryableTransportUnknown.frontend_action(),
-            FrontendAction::RetryExactRequest
-        );
-        assert_eq!(
-            OperationOutcome::RetryableObservationLoss.frontend_action(),
-            FrontendAction::ResubscribeObservation
-        );
-        assert_eq!(
-            OperationOutcome::OperationTimedOut.frontend_action(),
-            FrontendAction::FailOperationClosed
-        );
-        assert_eq!(
-            OperationOutcome::ReleaseNotReady.frontend_action(),
-            FrontendAction::RetryAfterProgress
-        );
-        assert_eq!(
-            OperationOutcome::NormalDestinationCanceled.frontend_action(),
-            FrontendAction::Settled,
-            "a normal downstream departure is not a producer failure"
-        );
-        assert_eq!(
-            OperationOutcome::TerminalRejected.frontend_action(),
-            FrontendAction::StopSendingAndReconcile,
-            "a task that already terminated is reconciled against its own status, \
-             not treated as this operation's failure: the sender held an older \
-             status by construction and the operation has nothing left to do"
-        );
-        for fatal in [
-            OperationOutcome::IdentityMismatch,
-            OperationOutcome::CreateConflict,
-            OperationOutcome::ContextNotEstablished,
-            OperationOutcome::ContextConflict,
-            OperationOutcome::DomainConflict,
-            OperationOutcome::LeaseExpired,
-            OperationOutcome::DestinationFailure,
-            OperationOutcome::InvalidStateOrRequest,
-            OperationOutcome::ResourceExhausted,
-        ] {
-            assert_eq!(
-                fatal.frontend_action(),
-                FrontendAction::FailAttempt,
-                "{fatal:?}"
-            );
-        }
-        for reconcile in [
-            OperationOutcome::ContextTerminalReceipt,
-            OperationOutcome::Gone,
-        ] {
-            assert_eq!(
-                reconcile.frontend_action(),
-                FrontendAction::StopSendingAndReconcile,
-                "{reconcile:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn only_the_two_unknown_outcomes_leave_an_operation_unsettled() {
-        for outcome in ALL_OUTCOMES {
-            let settled = !matches!(
-                outcome,
-                OperationOutcome::RetryableTransportUnknown
-                    | OperationOutcome::RetryableObservationLoss
-            );
-            assert_eq!(outcome.is_settled(), settled, "{outcome:?}");
-        }
-    }
-
-    #[test]
-    fn a_split_receipt_reports_one_watermark_per_plan_node() {
-        let node = PlanNodeId::new(4).expect("nonnegative");
+    fn split_receipt_preserves_the_exact_plan_node_watermark() {
+        let node = PlanNodeId::new(4).expect("plan node");
         let watermark =
-            SplitWatermark::empty().apply_batch(SplitSequence::new(9).expect("nonzero"), true);
+            SplitWatermark::empty().apply_batch(SplitSequence::new(9).expect("sequence"), true);
         let receipt = PlanNodeSplitReceipt::new(node, watermark).with_queued_splits(3);
-        assert_eq!(receipt.node(), node);
-        assert_eq!(
-            receipt.watermark().accepted_through().map(|s| s.get()),
-            Some(9)
-        );
-        assert!(receipt.watermark().no_more_splits());
-        assert_eq!(receipt.queued_splits(), Some(3));
-        assert_eq!(
-            PlanNodeSplitReceipt::new(node, watermark).queued_splits(),
-            None,
-            "an unreported queue depth is absent, not zero"
-        );
-
         let domain = TaskDomainReceipt::SplitAssignment {
             nodes: vec![receipt],
             progression: DomainProgression::Apply,
@@ -1665,221 +1200,17 @@ mod tests {
         assert_eq!(domain.kind(), TaskDomainKind::SplitAssignment);
         assert_eq!(domain.progression(), DomainProgression::Apply);
     }
-
-    #[test]
-    fn a_not_ready_release_keeps_the_owner_renewing() {
-        assert!(ReleaseOutcome::NotReady.requires_continued_renewal());
-        assert!(!ReleaseOutcome::Released.requires_continued_renewal());
-        assert!(!ReleaseOutcome::AlreadyTerminal.requires_continued_renewal());
-    }
-
-    #[test]
-    fn lifecycle_operations_get_their_own_reserved_lane() {
-        assert!(OperationKind::UpdateQueryContext.is_lifecycle());
-        assert!(OperationKind::AbortQueryContext.is_lifecycle());
-        assert!(OperationKind::ReleaseQueryContext.is_lifecycle());
-        for not_lifecycle in [
-            OperationKind::CreateTask,
-            OperationKind::UpdateTask,
-            OperationKind::CancelTask,
-            OperationKind::FetchTaskDynamicFilters,
-            OperationKind::GetFinalTaskInfo,
-        ] {
-            assert!(!not_lifecycle.is_lifecycle(), "{not_lifecycle}");
-        }
-
-        assert_eq!(
-            DispatchBudget::lane_of(OperationKind::CreateTask),
-            DispatchLane::Create
-        );
-        assert_eq!(
-            DispatchBudget::lane_of(OperationKind::UpdateTask),
-            DispatchLane::Update
-        );
-        assert_eq!(
-            DispatchBudget::lane_of(OperationKind::CancelTask),
-            DispatchLane::Update
-        );
-        assert_eq!(
-            DispatchBudget::lane_of(OperationKind::ReleaseQueryContext),
-            DispatchLane::Lifecycle
-        );
-    }
-
-    #[test]
-    fn dispatch_permits_are_bounded_and_reserve_a_lifecycle_share() {
-        let budget = DispatchBudget::DEFAULT;
-        assert_eq!(budget.create_permits(), 16);
-        assert_eq!(budget.update_permits(), 12);
-        assert_eq!(budget.lifecycle_permits(), 4);
-        assert_eq!(budget.total_permits(), 32);
-        assert_eq!(budget.permits_for(DispatchLane::Lifecycle), 4);
-        assert!(
-            budget.permits_for(DispatchLane::Lifecycle) > 0,
-            "a create burst must never be able to starve a renewal"
-        );
-        assert!(DispatchBudget::new(1, 1, 0).is_none());
-    }
-
-    #[test]
-    fn a_tightened_budget_is_accepted_and_an_inverted_hierarchy_is_not() {
-        // A deployment must be able to tighten these, and a test must be able
-        // to prove the enforcement path without manufacturing a 48 MiB
-        // payload.
-        let tight = TransportBudget::new(
-            2,
-            4096,
-            1024,
-            8,
-            8192,
-            16,
-            16_384,
-            4,
-            8,
-            Duration::from_secs(1),
-        )
-        .expect("a tightened budget is legal");
-        assert!(tight.batch_fits(2, 4096));
-        assert!(!tight.batch_fits(3, 1));
-        assert!(!tight.batch_fits(1, 4097));
-
-        // Every zero is refused.
-        assert!(
-            TransportBudget::new(
-                0,
-                4096,
-                1024,
-                8,
-                8192,
-                16,
-                16_384,
-                4,
-                8,
-                Duration::from_secs(1)
-            )
-            .is_none()
-        );
-        assert!(
-            TransportBudget::new(2, 4096, 1024, 8, 8192, 16, 16_384, 4, 8, Duration::ZERO)
-                .is_none()
-        );
-
-        // The bounds are a hierarchy: a descriptor fits in a batch, a batch in
-        // one query's queue, that queue in the process's.
-        assert!(
-            TransportBudget::new(
-                2,
-                1024,
-                4096,
-                8,
-                8192,
-                16,
-                16_384,
-                4,
-                8,
-                Duration::from_secs(1)
-            )
-            .is_none(),
-            "a descriptor larger than a batch could never be sent"
-        );
-        assert!(
-            TransportBudget::new(
-                2,
-                8192,
-                1024,
-                8,
-                4096,
-                16,
-                16_384,
-                4,
-                8,
-                Duration::from_secs(1)
-            )
-            .is_none(),
-            "a batch larger than one query's queue could never be enqueued"
-        );
-        assert!(
-            TransportBudget::new(
-                2,
-                4096,
-                1024,
-                8,
-                8192,
-                16,
-                4096,
-                4,
-                8,
-                Duration::from_secs(1)
-            )
-            .is_none(),
-            "one query may not be allowed more than the whole process"
-        );
-        assert!(
-            TransportBudget::new(
-                2,
-                4096,
-                1024,
-                8,
-                8192,
-                16,
-                16_384,
-                8,
-                4,
-                Duration::from_secs(1)
-            )
-            .is_none(),
-            "one context may not hold more tasks than the backend allows"
-        );
-
-        // The frozen default satisfies its own hierarchy.
-        let default = TransportBudget::DEFAULT;
-        assert!(
-            TransportBudget::new(
-                default.max_batch_items(),
-                default.max_batch_encoded_bytes(),
-                default.max_descriptor_encoded_bytes(),
-                default.max_query_backend_queued_operations(),
-                default.max_query_backend_queued_bytes(),
-                default.max_backend_queued_operations(),
-                default.max_backend_queued_bytes(),
-                default.max_tasks_per_context(),
-                default.max_active_tasks_per_backend(),
-                default.frontend_queue_residence(),
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn transport_budgets_bound_batches_queues_and_task_counts() {
-        let budget = TransportBudget::DEFAULT;
-        assert_eq!(budget.max_batch_items(), 32);
-        assert_eq!(budget.max_batch_encoded_bytes(), 48 * 1024 * 1024);
-        assert_eq!(budget.max_descriptor_encoded_bytes(), 16 * 1024 * 1024);
-        assert_eq!(budget.max_query_backend_queued_operations(), 4096);
-        assert_eq!(budget.max_query_backend_queued_bytes(), 256 * 1024 * 1024);
-        assert_eq!(budget.max_backend_queued_operations(), 16384);
-        assert_eq!(budget.max_backend_queued_bytes(), 512 * 1024 * 1024);
-        assert_eq!(budget.max_tasks_per_context(), 4096);
-        assert_eq!(budget.max_active_tasks_per_backend(), 32768);
-        assert_eq!(budget.frontend_queue_residence(), Duration::from_secs(15));
-
-        assert!(budget.batch_fits(32, 48 * 1024 * 1024));
-        assert!(!budget.batch_fits(33, 1));
-        assert!(!budget.batch_fits(1, 48 * 1024 * 1024 + 1));
-        assert!(!budget.batch_fits(0, 0), "an empty batch is not a batch");
-    }
 }
 
 #[cfg(test)]
 mod request_tests {
     use super::{
-        AbortQueryContext, AdvanceQueryContextDomain, CancelTask, CreateTask, CredentialUpdate,
-        EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo, OperationKind,
+        AbortQueryContext, AcquireQueryContextAdmissionTicket, AdvanceQueryContextDomain,
+        CancelTask, CreateTask, CredentialUpdate, EstablishQueryContext, FetchTaskDynamicFilters,
+        GetFinalTaskInfo, OperationKind, QueryContextAdmissionTicketReceipt,
         QueryContextDomainUpdate, ReleaseQueryContext, RenewQueryExecutionLease, RequestError,
         SplitAssignmentIntent, TaskDomainUpdate, UpdateQueryContext, UpdateTask,
     };
-    use crate::exec::fragment::program::{FragmentContractVersion, FragmentSinkKind};
     use crate::task_execution::descriptor::{
         ExchangeTopology, PhysicalFragmentPlan, TaskDescriptor,
     };
@@ -1889,14 +1220,16 @@ mod request_tests {
         SplitSequence, TaskDomainKind,
     };
     use crate::task_execution::identity::{
-        IdentityField, IdentityMismatch, QueryContextRef, TaskIdentity, TaskOperationId,
+        AdmissionTicketId, IdentityField, IdentityMismatch, QueryContextRef, TaskIdentity,
+        TaskOperationId,
     };
     use crate::task_execution::lease::{LeaseSequence, LeaseValidFor};
     use crate::task_execution::status::{AbortCause, CancelReason};
-    use novarocks_types::UniqueId;
+    use crate::{FragmentContractVersion, FragmentSinkKind};
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
+    use novarocks_types::{NativeCompatibilityId, UniqueId};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::Duration;
@@ -2103,6 +1436,7 @@ mod request_tests {
         let establish = UpdateQueryContext::Establish(EstablishQueryContext::new(
             TaskOperationId::new_v7(),
             context,
+            AdmissionTicketId::try_from_bytes([0x51; 16]).expect("nonzero ticket"),
             content(),
             content(),
             content(),
@@ -2143,6 +1477,7 @@ mod request_tests {
         let establish = EstablishQueryContext::new(
             TaskOperationId::new_v7(),
             context,
+            AdmissionTicketId::try_from_bytes([0x52; 16]).expect("nonzero ticket"),
             content(),
             content(),
             content(),
@@ -2156,6 +1491,36 @@ mod request_tests {
             establish.initial_credential().epoch(),
             CredentialEpoch::FIRST
         );
+    }
+
+    #[test]
+    fn admission_ticket_request_and_receipt_bind_exact_context_and_validity() {
+        let context = QueryContextRef::new(
+            execution(),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let valid_for = valid_for();
+        let native_compatibility_id = NativeCompatibilityId::new([0x47; 32]);
+        let request = AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context,
+            valid_for,
+            native_compatibility_id,
+        );
+        assert_eq!(
+            request.envelope().kind(),
+            OperationKind::AcquireQueryContextAdmissionTicket
+        );
+        assert_eq!(request.context(), context);
+        assert_eq!(request.valid_for(), valid_for);
+        assert_eq!(request.native_compatibility_id(), native_compatibility_id);
+
+        let ticket_id = AdmissionTicketId::try_from_bytes([0x53; 16]).expect("nonzero ticket");
+        let receipt = QueryContextAdmissionTicketReceipt::new(ticket_id, context, valid_for);
+        assert_eq!(receipt.ticket_id(), ticket_id);
+        assert_eq!(receipt.context(), context);
+        assert_eq!(receipt.valid_for(), valid_for);
     }
 
     #[test]

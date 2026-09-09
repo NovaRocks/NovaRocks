@@ -35,18 +35,16 @@
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
-use novarocks_execution::exec::fragment::program::{
-    FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
-};
-use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_execution::task_execution::descriptor::{
+use novarocks_execution_contract::DataStreamPartitionType;
+use novarocks_execution_contract::RuntimeEndpoint;
+use novarocks_execution_contract::task_execution::descriptor::{
     ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource, ExchangeTopology,
     PhysicalFragmentPlan, TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES, TaskDescriptor,
 };
-use novarocks_execution::task_execution::domain::{
+use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ContentFingerprint, ExchangeEdgeId, PlanNodeId,
 };
+use novarocks_execution_contract::{FragmentContractVersion, FragmentNodeId, FragmentSinkKind};
 use novarocks_proto_models::{novarocks, plan};
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -418,10 +416,10 @@ fn decode_inbound(
         sources.push(ExchangeSource::new(task, key, source.sender_ordinal));
     }
     ExchangeInbound::try_new(node, sources).map_err(|error| match error {
-        novarocks_execution::task_execution::descriptor::DescriptorError::DuplicateInboundSource(
+        novarocks_execution_contract::task_execution::descriptor::DescriptorError::DuplicateInboundSource(
             _,
         ) => duplicate(path, error.to_string()),
-        novarocks_execution::task_execution::descriptor::DescriptorError::InvalidInboundSenderOrdinals {
+        novarocks_execution_contract::task_execution::descriptor::DescriptorError::InvalidInboundSenderOrdinals {
             ..
         } => inconsistent(path, error.to_string()),
         _ => inconsistent(path, error.to_string()),

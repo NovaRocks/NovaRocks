@@ -25,9 +25,9 @@
 //! the unknown outcome the protocol's exact-request replay exists for.
 //!
 //! Loss is reported as `DEADLINE_EXCEEDED`, which the frontend's
-//! `classify_apply_status` maps to `RetryableTransportUnknown` — the outcome
-//! whose prescribed action is `RetryExactRequest`. Anything else would tell
-//! the frontend the backend had answered.
+//! `classify_apply_status` maps to a transport-unknown dispatch result, whose
+//! prescribed frontend action is exact-request replay. Anything else would
+//! tell the frontend the backend had answered.
 //!
 //! Two faults deliberately are not acknowledgement drops, because for them the
 //! answer arriving is not what the case is about.
@@ -75,8 +75,8 @@
     reason = "The tonic service boundary must preserve Status without changing its generated signature."
 )]
 
-use novarocks_execution::task_execution::identity::{QueryContextRef, TaskIdentity};
-use novarocks_execution::task_execution::operation::OperationOutcome;
+use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::task_execution::operation::OperationOutcome;
 use novarocks_failpoint::QueryLifecycleFaultKind;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};

@@ -312,7 +312,8 @@ pub struct FrontendDistributedQueryCoordinator {
     ///
     /// Held rather than read per attempt so a deployment's bounds cannot change
     /// while the process runs.
-    task_execution_budgets: novarocks_execution::task_execution::TaskExecutionBudgets,
+    coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
+    transport_budget: novarocks_task_codec::TransportBudget,
     /// This frontend process's own identity, minted once per process.
     ///
     /// It is half of every query context reference, so a backend can tell one
@@ -366,7 +367,8 @@ impl FrontendDistributedQueryCoordinator {
         native_compatibility_id: NativeCompatibilityId,
         task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
         connector_split_initial_dynamic_filter_wait_cap: Duration,
-        task_execution_budgets: novarocks_execution::task_execution::TaskExecutionBudgets,
+        coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
+        transport_budget: novarocks_task_codec::TransportBudget,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, DistributedQueryError> {
@@ -391,7 +393,8 @@ impl FrontendDistributedQueryCoordinator {
             query_ids: Arc::new(query_id_source),
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
             data_runtime,
-            task_execution_budgets,
+            coordination_budgets,
+            transport_budget,
             frontend_process_id: FrontendProcessId::new_v7(),
             task_update_retry_policy,
             connector_split_initial_dynamic_filter_wait_cap,
@@ -442,8 +445,9 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: crate::common::backend_topology::BackendTopologyService,
     ) -> Self {
         Self {
-            task_execution_budgets:
-                novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
+            coordination_budgets:
+                novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
+            transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
             backend_services: Some(BackendServicesSource::Fixed {
@@ -506,8 +510,9 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: crate::common::backend_topology::BackendTopologyService,
     ) -> Self {
         Self {
-            task_execution_budgets:
-                novarocks_execution::task_execution::TaskExecutionBudgets::DEFAULT,
+            coordination_budgets:
+                novarocks_query_application::coordination::CoordinationBudgets::DEFAULT,
+            transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
             backend_services: Some(BackendServicesSource::Sequence {
@@ -968,10 +973,10 @@ impl FrontendDistributedQueryCoordinator {
             establish,
             Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
             AttemptTransport {
-                budget: self.task_execution_budgets.dispatch,
-                transport: self.task_execution_budgets.transport,
+                budget: self.coordination_budgets.dispatch,
+                transport: self.transport_budget,
                 status_subscription_error_budget: self
-                    .task_execution_budgets
+                    .coordination_budgets
                     .status_subscription_error_budget,
                 attempt,
                 data_runtime: self.data_runtime.clone(),
@@ -982,11 +987,7 @@ impl FrontendDistributedQueryCoordinator {
             NativeTaskResultTransport::new(
                 &backends,
                 self.data_runtime.clone(),
-                TaskReadGrace::new(
-                    self.task_execution_budgets
-                        .transport
-                        .frontend_queue_residence(),
-                ),
+                TaskReadGrace::new(self.transport_budget.frontend_queue_residence()),
             )
             .map_err(failed)?,
         );
@@ -1050,10 +1051,7 @@ impl FrontendDistributedQueryCoordinator {
         // The membership owner gets the same window the old Init RPC had to
         // prove a replacement, taken from the task protocol's own establish
         // cap rather than a second number invented here.
-        let establish_wait = self.task_execution_budgets.wait_caps.clamp(
-            OperationKind::UpdateQueryContext,
-            MaxWait::default_for(OperationKind::UpdateQueryContext),
-        );
+        let establish_wait = MaxWait::default_for(OperationKind::UpdateQueryContext).get();
         let mut batches = Vec::new();
         // Recorded rather than inferred, exactly as the old path recorded it: a
         // write commits on the strength of this fact.
@@ -1545,9 +1543,7 @@ impl FrontendDistributedQueryCoordinator {
             &wake,
             split_assignment.as_ref(),
             statement_deadline,
-            self.task_execution_budgets
-                .transport
-                .frontend_queue_residence(),
+            self.transport_budget.frontend_queue_residence(),
             execution_id,
             &mut final_task_info,
         );

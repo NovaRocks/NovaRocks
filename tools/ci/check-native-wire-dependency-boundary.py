@@ -33,6 +33,8 @@ from pathlib import Path
 
 MODELS = "novarocks-proto-models"
 PROTO = "novarocks-proto-codec"
+TASK_CODEC = "novarocks-task-codec"
+EXECUTION_CONTRACT = "novarocks-execution-contract"
 SPI = "novarocks-spi"
 TYPES = "novarocks-types"
 FRONTEND = "novarocks-frontend"
@@ -42,10 +44,18 @@ FAILPOINT = "novarocks-failpoint"
 STARROCKS = "novarocks-connector-starrocks"
 
 PROTO_INTERNAL_NORMAL_DEPENDENCIES = {MODELS, SPI, TYPES}
+TASK_CODEC_INTERNAL_NORMAL_DEPENDENCIES = {
+    EXECUTION_CONTRACT,
+    MODELS,
+    PROTO,
+    SPI,
+    TYPES,
+}
+EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES = {TYPES}
 ROLE_DIRECT_REQUIREMENTS = {MODELS, PROTO}
-WIRE_PACKAGES = {MODELS, PROTO}
+WIRE_PACKAGES = {MODELS, PROTO, TASK_CODEC}
 
-# Models and Proto are codec-layer crates.  They must not reach application,
+# Models, Proto, and Task Codec are codec-layer crates. They must not reach application,
 # provider, state-store, execution, or Tonic ownership through a normal edge.
 FORBIDDEN_CODEC_CLOSURE = {
     "tonic",
@@ -60,6 +70,14 @@ FORBIDDEN_CODEC_CLOSURE = {
     "novarocks-state-store-sqlite",
 }
 
+FORBIDDEN_EXECUTION_CONTRACT_CLOSURE = WIRE_PACKAGES | {
+    "novarocks-backend",
+    "novarocks-execution",
+    "novarocks-frontend",
+    "novarocks-server",
+    "novarocks-sql",
+}
+
 # These crates are below the generated/codec wire layer. Their *normal
 # transitive closure* cannot acquire wire crates. Server is checked separately
 # for direct dependencies because it intentionally composes the FE and BE,
@@ -69,6 +87,7 @@ FORBIDDEN_CODEC_CLOSURE = {
 LOWER_LAYER_ROOTS = {
     SPI,
     TYPES,
+    EXECUTION_CONTRACT,
     "novarocks-sql",
     "novarocks-execution",
     "novarocks-state-store-foundationdb",
@@ -199,6 +218,53 @@ def verify_proto(metadata):
         )
 
 
+def verify_task_codec(metadata):
+    task_codec = package_by_name(metadata, TASK_CODEC)
+    actual = {
+        name
+        for name in normal_dependency_names(task_codec)
+        if name.startswith("novarocks-")
+    }
+    if actual != TASK_CODEC_INTERNAL_NORMAL_DEPENDENCIES:
+        missing = sorted(TASK_CODEC_INTERNAL_NORMAL_DEPENDENCIES - actual)
+        unexpected = sorted(actual - TASK_CODEC_INTERNAL_NORMAL_DEPENDENCIES)
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected: " + ", ".join(unexpected))
+        fail(
+            f"{TASK_CODEC} internal normal dependencies must be exactly: "
+            + ", ".join(sorted(TASK_CODEC_INTERNAL_NORMAL_DEPENDENCIES))
+            + " ("
+            + "; ".join(details)
+            + ")"
+        )
+
+
+def verify_execution_contract(metadata):
+    contract = package_by_name(metadata, EXECUTION_CONTRACT)
+    actual = {
+        name
+        for name in normal_dependency_names(contract)
+        if name.startswith("novarocks-")
+    }
+    if actual != EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES:
+        fail(
+            f"{EXECUTION_CONTRACT} internal normal dependencies must be exactly: "
+            + ", ".join(sorted(EXECUTION_CONTRACT_INTERNAL_NORMAL_DEPENDENCIES))
+        )
+    forbidden = sorted(
+        normal_closure(metadata, EXECUTION_CONTRACT)
+        & FORBIDDEN_EXECUTION_CONTRACT_CLOSURE
+    )
+    if forbidden:
+        fail(
+            f"{EXECUTION_CONTRACT} normal dependency closure contains forbidden packages: "
+            + ", ".join(forbidden)
+        )
+
+
 def verify_role_direct_dependencies(metadata):
     for role in (FRONTEND, BACKEND):
         direct = normal_dependency_names(package_by_name(metadata, role), include_optional=False)
@@ -211,7 +277,7 @@ def verify_role_direct_dependencies(metadata):
 
 
 def verify_codec_closures(metadata):
-    for package_name in (MODELS, PROTO):
+    for package_name in (MODELS, PROTO, TASK_CODEC):
         forbidden = sorted(normal_closure(metadata, package_name) & FORBIDDEN_CODEC_CLOSURE)
         if forbidden:
             fail(
@@ -311,6 +377,8 @@ def main():
 
     verify_models(metadata)
     verify_proto(metadata)
+    verify_task_codec(metadata)
+    verify_execution_contract(metadata)
     verify_role_direct_dependencies(metadata)
     verify_codec_closures(metadata)
     verify_lower_layer_closures(metadata)
