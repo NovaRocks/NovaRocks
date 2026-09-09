@@ -762,6 +762,13 @@ impl PipelineDriver {
         let Some(proc) = op.as_processor_ref() else {
             return true;
         };
+        // A finishing operator can own output that only another driver turn
+        // can push. This check stays inside the observable generation bracket
+        // in terminal_sink_block_decision_on_worker, so an external event
+        // that changes the answer cannot be lost between finishing and park.
+        if proc.finishing_wait().can_progress() {
+            return true;
+        }
         if proc.need_input() {
             return true;
         }
@@ -821,6 +828,9 @@ impl PipelineDriver {
             let generation = before.as_ref().map(|observable| observable.generation());
             if operator.is_finished() {
                 continue;
+            }
+            if processor.finishing_wait().can_progress() {
+                return Ok(WorkerBlockDecision::Runnable);
             }
             if processor.has_output() {
                 return Ok(WorkerBlockDecision::Runnable);
@@ -1489,7 +1499,11 @@ impl PipelineDriver {
             // that could not finish yet would never get another chance.
             let wait = proc.finishing_wait();
             self.operator_finishing_set[idx] = !wait.is_pending();
-            if !wait.is_pending() {
+            // Owed output is work only this driver can perform. Treat it as
+            // immediate progress so the loop calls set_finishing again;
+            // parking on the sink observable here can miss an external event
+            // that changed ExternalEvent -> OwedOutput during the call above.
+            if !wait.is_pending() || wait.can_progress() {
                 *made_progress = true;
             }
         }
@@ -1570,6 +1584,9 @@ mod tests {
         wait: Arc<Mutex<FinishingWait>>,
         set_finishing_calls: Arc<AtomicUsize>,
         observable: Arc<Observable>,
+        open_during_first_finish: bool,
+        open_after_first_wait_check: bool,
+        wait_checks: AtomicUsize,
     }
 
     impl ScriptedSink {
@@ -1578,6 +1595,31 @@ mod tests {
                 wait,
                 set_finishing_calls: Arc::new(AtomicUsize::new(0)),
                 observable: Arc::new(Observable::new()),
+                open_during_first_finish: false,
+                open_after_first_wait_check: false,
+                wait_checks: AtomicUsize::new(0),
+            }
+        }
+
+        fn opening_during_first_finish(wait: Arc<Mutex<FinishingWait>>) -> Self {
+            Self {
+                wait,
+                set_finishing_calls: Arc::new(AtomicUsize::new(0)),
+                observable: Arc::new(Observable::new()),
+                open_during_first_finish: true,
+                open_after_first_wait_check: false,
+                wait_checks: AtomicUsize::new(0),
+            }
+        }
+
+        fn opening_after_first_wait_check(wait: Arc<Mutex<FinishingWait>>) -> Self {
+            Self {
+                wait,
+                set_finishing_calls: Arc::new(AtomicUsize::new(0)),
+                observable: Arc::new(Observable::new()),
+                open_during_first_finish: false,
+                open_after_first_wait_check: true,
+                wait_checks: AtomicUsize::new(0),
             }
         }
 
@@ -1622,12 +1664,23 @@ mod tests {
         }
 
         fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
-            self.set_finishing_calls.fetch_add(1, Ordering::SeqCst);
+            let prior_calls = self.set_finishing_calls.fetch_add(1, Ordering::SeqCst);
             // The turn is what pushes owed output, exactly as the exchange
             // sink flushes its parked payload and sends its end-of-stream
             // inside this call. A wait for an external event is unchanged by
             // it.
             let mut wait = self.wait.lock().expect("scripted wait lock");
+            if self.open_during_first_finish
+                && prior_calls == 0
+                && *wait == FinishingWait::ExternalEvent
+            {
+                // Reproduce the gate-open race: the notification happens
+                // before the driver freezes its blocked generation, while the
+                // sink returns owing output that only another call can push.
+                *wait = FinishingWait::OwedOutput;
+                self.observable.notify_observers();
+                return Ok(());
+            }
             if *wait == FinishingWait::OwedOutput {
                 *wait = FinishingWait::Complete;
             }
@@ -1635,7 +1688,15 @@ mod tests {
         }
 
         fn finishing_wait(&self) -> FinishingWait {
-            self.wait()
+            let observed = self.wait();
+            if self.open_after_first_wait_check
+                && self.wait_checks.fetch_add(1, Ordering::SeqCst) == 0
+                && observed == FinishingWait::ExternalEvent
+            {
+                *self.wait.lock().expect("scripted wait lock") = FinishingWait::OwedOutput;
+                self.observable.notify_observers();
+            }
+            observed
         }
 
         fn sink_observable(&self) -> Option<Arc<Observable>> {
@@ -1708,6 +1769,53 @@ mod tests {
             calls.load(Ordering::SeqCst) > turns_before_parking,
             "the re-readied turn is the one that finishes the sink"
         );
+    }
+
+    #[test]
+    fn a_gate_open_during_finishing_cannot_park_output_owed_by_the_driver() {
+        let wait = Arc::new(Mutex::new(FinishingWait::ExternalEvent));
+        let sink = ScriptedSink::opening_during_first_finish(Arc::clone(&wait));
+        let calls = Arc::clone(&sink.set_finishing_calls);
+        let mut driver = PipelineDriver::new(
+            2,
+            vec![Box::new(FinishedSource), Box::new(sink)],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        let state = driver.process(Duration::from_millis(10));
+
+        assert!(matches!(state, DriverState::Finished), "actual: {state:?}");
+        assert_eq!(
+            *wait.lock().expect("scripted wait lock"),
+            FinishingWait::Complete
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_gate_open_after_finishing_check_cannot_park_output_owed_by_the_driver() {
+        let wait = Arc::new(Mutex::new(FinishingWait::ExternalEvent));
+        let sink = ScriptedSink::opening_after_first_wait_check(Arc::clone(&wait));
+        let calls = Arc::clone(&sink.set_finishing_calls);
+        let mut driver = PipelineDriver::new(
+            3,
+            vec![Box::new(FinishedSource), Box::new(sink)],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        let state = driver.process(Duration::from_millis(10));
+        assert!(matches!(state, DriverState::Finished), "actual: {state:?}");
+        assert_eq!(
+            *wait.lock().expect("scripted wait lock"),
+            FinishingWait::Complete
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
 
