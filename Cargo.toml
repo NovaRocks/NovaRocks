@@ -28,9 +28,102 @@ default-members = ["novarocks-server"]
 # Vendored upstream packages keep their own workspace and lock authority.
 exclude = ["vendor"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [workspace.dependencies]
+anyhow = "1"
+arrow = "58.2.0"
+arrow-array = "58.2.0"
+arrow-buffer = "58.2.0"
+arrow-schema = "58.2.0"
+async-trait = "0.1"
+axum = "0.7"
+base64 = "0.22"
+bytes = "1"
+chrono = "0.4"
+crc32c = "0.6"
 datasketches = { version = "=0.5.0-rc.1", default-features = false }
+futures = "0.3"
+h2 = "0.4"
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+hyper-util = "0.1"
+libc = "0.2"
+md-5 = "0.10"
+mysql = "25.0.1"
+num-traits = "0.2"
+once_cell = "1.19"
+opendal = "0.55"
 paimon = { version = "=0.3.0", default-features = false }
+parquet = "58.2.0"
+prometheus = "0.13"
+prost = "0.13"
+prost-build = "0.13"
+prost-reflect = "0.14"
+protoc-bin-vendored = "3"
+rand = "0.8"
+rcgen = "0.13"
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false }
+roaring = "0.10"
+rustls = { version = "0.23", default-features = false }
+ryu = "1"
+serde = "1"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = "1"
+tokio-stream = "0.1"
+toml = "0.8"
+tonic = "0.12"
+tonic-build = "0.12"
+tower = "0.5"
+tracing = "0.1"
+url = "2"
+uuid = "1.8"
+
+# Internal dependency identities are rooted here; consumers retain dependency
+# kind, target, optionality, and feature selection.
+novarocks-backend = { path = "novarocks/backend", version = "0.1.0" }
+novarocks-cluster-harness = { path = "tests/cluster-harness", version = "0.1.0" }
+novarocks-connector-iceberg = { path = "novarocks/connector/iceberg", version = "0.1.0" }
+novarocks-connector-iceberg-functions = { path = "novarocks/connector/iceberg-functions", version = "0.1.0" }
+novarocks-connector-paimon = { path = "novarocks/connector/paimon", version = "0.1.0" }
+novarocks-connector-starrocks = { path = "novarocks/connector/starrocks", version = "0.1.0" }
+novarocks-execution = { path = "novarocks/execution", version = "0.1.0" }
+novarocks-failpoint = { path = "novarocks/failpoint", version = "0.1.0", default-features = false }
+novarocks-frontend = { path = "novarocks/frontend", version = "0.1.0" }
+novarocks-fs = { path = "novarocks/fs", version = "0.1.0" }
+novarocks-functions = { path = "novarocks/functions", version = "0.1.0" }
+novarocks-native-trust = { path = "novarocks/native-trust", version = "0.1.0" }
+novarocks-parser = { path = "novarocks/parser", version = "0.1.0" }
+novarocks-plan-codec = { path = "novarocks/plan-codec", version = "0.1.0" }
+novarocks-proto-codec = { path = "novarocks/proto-codec", version = "0.1.0" }
+novarocks-proto-models = { path = "novarocks/proto-models", version = "0.1.0" }
+novarocks-secret = { path = "novarocks/secret", version = "0.1.0" }
+novarocks-server = { path = "novarocks-server", version = "0.1.0" }
+novarocks-spi = { path = "novarocks/spi", version = "0.1.0" }
+novarocks-sql = { path = "novarocks/sql", version = "0.1.0" }
+novarocks-state-store-api = { path = "novarocks/state-store/api", version = "0.1.0" }
+novarocks-state-store-sqlite = { path = "novarocks/state-store/sqlite", version = "0.1.0" }
+novarocks-state-store-testkit = { path = "novarocks/state-store/testkit", version = "0.1.0" }
+novarocks-task-codec = { path = "novarocks/task-codec", version = "0.1.0" }
+novarocks-test-support = { path = "tests/test-support", version = "0.1.0" }
+novarocks-types = { path = "novarocks/types", version = "0.1.0" }
+novarocks-user-error = { path = "novarocks/user-error", version = "0.1.0" }
+novarocks-version = { path = "novarocks/version", version = "0.1.0" }
 
 [profile.dev]
 opt-level = 0

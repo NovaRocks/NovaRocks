@@ -1,7 +1,11 @@
 [package]
 name = "novarocks-state-store-mysql"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
@@ -14,25 +18,25 @@ test = false
 bench = false
 
 [dependencies]
-anyhow = "1"
-async-trait = "0.1"
-bytes = "1"
-futures = "0.3"
-hex = "0.4"
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hex.workspace = true
 mysql_async = { version = "=0.37.0", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
-novarocks-secret = { path = "../../secret" }
-novarocks-state-store-api = { path = "../api" }
-rustls = { version = "0.23", default-features = false }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
-tracing = "0.1"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+novarocks-secret.workspace = true
+novarocks-state-store-api.workspace = true
+rustls.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
-novarocks-state-store-testkit = { path = "../testkit" }
-tempfile = "3"
+novarocks-state-store-testkit.workspace = true
+tempfile.workspace = true
 
 [features]
 default = ["mysql-state-store-provider"]

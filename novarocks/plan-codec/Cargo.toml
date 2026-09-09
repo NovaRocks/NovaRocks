@@ -17,23 +17,27 @@
 
 [package]
 name = "novarocks-plan-codec"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-arrow = { version = "58.2.0" }
-arrow-buffer = "58.2.0"
-novarocks-functions = { path = "../functions" }
-novarocks-proto-codec = { path = "../proto-codec" }
-novarocks-proto-models = { path = "../proto-models" }
-novarocks-spi = { path = "../spi" }
-novarocks-sql = { path = "../sql" }
-novarocks-types = { path = "../types" }
+arrow.workspace = true
+arrow-buffer.workspace = true
+novarocks-functions.workspace = true
+novarocks-proto-codec.workspace = true
+novarocks-proto-models.workspace = true
+novarocks-spi.workspace = true
+novarocks-sql.workspace = true
+novarocks-types.workspace = true
 
 [dev-dependencies]
-hex = "0.4"
-novarocks-sql = { path = "../sql", features = ["test-support"] }
-prost = "0.13"
+hex.workspace = true
+novarocks-sql = { workspace = true, features = ["test-support"] }
+prost.workspace = true

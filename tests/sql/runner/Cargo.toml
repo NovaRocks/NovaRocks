@@ -17,8 +17,9 @@
 
 [package]
 name = "novarocks-sql-test-runner"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 default-run = "novarocks-sql-test"
 autobins = false
 
@@ -35,24 +36,27 @@ name = "publication-catalog-fixture"
 path = "src/bin/publication-catalog-fixture.rs"
 
 [dependencies]
-anyhow = "1"
+anyhow.workspace = true
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
-mysql = "25.0.1"
-novarocks-cluster-harness = { path = "../../cluster-harness" }
-novarocks-failpoint = { path = "../../../novarocks/failpoint", default-features = false }
-novarocks-parser = { path = "../../../novarocks/parser" }
-novarocks-sql = { path = "../../../novarocks/sql" }
-novarocks-types = { path = "../../../novarocks/types" }
+mysql.workspace = true
+novarocks-cluster-harness.workspace = true
+novarocks-failpoint.workspace = true
+novarocks-parser.workspace = true
+novarocks-sql.workspace = true
+novarocks-types.workspace = true
 rayon = "1.10"
-regex = "1.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-toml = "0.8"
-tempfile = "3"
-opendal = { version = "0.55", features = ["services-fs", "services-s3"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "signal"] }
+regex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+tempfile.workspace = true
+opendal = { workspace = true, features = ["services-fs", "services-s3"] }
+reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "sync", "signal"] }
 
 [dev-dependencies]
+
+[lints]
+workspace = true

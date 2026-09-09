@@ -17,15 +17,19 @@
 
 [package]
 name = "novarocks-error-manifest"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "novarocks-error-manifest"
 path = "src/main.rs"
 
 [dependencies]
-novarocks-frontend = { path = "../../novarocks/frontend" }
-novarocks-parser = { path = "../../novarocks/parser" }
-novarocks-sql = { path = "../../novarocks/sql" }
-novarocks-user-error = { path = "../../novarocks/user-error" }
+novarocks-frontend.workspace = true
+novarocks-parser.workspace = true
+novarocks-sql.workspace = true
+novarocks-user-error.workspace = true
+
+[lints]
+workspace = true

@@ -1,42 +1,46 @@
 [package]
 name = "novarocks-server"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "novarocks"
 path = "src/main.rs"
 
 [dependencies]
-novarocks-backend = { path = "../novarocks/backend" }
-novarocks-connector-iceberg = { path = "../novarocks/connector/iceberg" }
-novarocks-connector-paimon = { path = "../novarocks/connector/paimon" }
-novarocks-connector-iceberg-functions = { path = "../novarocks/connector/iceberg-functions" }
-novarocks-execution = { path = "../novarocks/execution" }
-novarocks-failpoint = { path = "../novarocks/failpoint", default-features = false }
-novarocks-frontend = { path = "../novarocks/frontend" }
-novarocks-functions = { path = "../novarocks/functions" }
-novarocks-fs = { path = "../novarocks/fs" }
-novarocks-native-trust = { path = "../novarocks/native-trust" }
-novarocks-secret = { path = "../novarocks/secret" }
-novarocks-spi = { path = "../novarocks/spi" }
-novarocks-state-store-api = { path = "../novarocks/state-store/api" }
-novarocks-sql = { path = "../novarocks/sql" }
-novarocks-state-store-sqlite = { path = "../novarocks/state-store/sqlite" }
-novarocks-types = { path = "../novarocks/types" }
-novarocks-version = { path = "../novarocks/version" }
-anyhow = "1"
+novarocks-backend.workspace = true
+novarocks-connector-iceberg.workspace = true
+novarocks-connector-paimon.workspace = true
+novarocks-connector-iceberg-functions.workspace = true
+novarocks-execution.workspace = true
+novarocks-failpoint.workspace = true
+novarocks-frontend.workspace = true
+novarocks-functions.workspace = true
+novarocks-fs.workspace = true
+novarocks-native-trust.workspace = true
+novarocks-secret.workspace = true
+novarocks-spi.workspace = true
+novarocks-state-store-api.workspace = true
+novarocks-sql.workspace = true
+novarocks-state-store-sqlite.workspace = true
+novarocks-types.workspace = true
+novarocks-version.workspace = true
+anyhow.workspace = true
 atty = "0.2"
-chrono = "0.4"
-libc = "0.2"
-futures = "0.3"
-hex = "0.4"
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-tracing = "0.1"
+chrono.workspace = true
+libc.workspace = true
+futures.workspace = true
+hex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "time"] }
-tokio = { version = "1", features = ["rt-multi-thread", "signal", "sync", "time"] }
-uuid = "1"
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync", "time"] }
+uuid.workspace = true
 
 [features]
 mv-first-refresh-staging-test-support = []
@@ -47,7 +51,7 @@ native-compatibility-test-fixture = ["novarocks-version/native-compatibility-tes
 # MySQL; `state_store_app_config` asserts config/composition by direct call.
 # Domain behaviour belongs to its owner crate, the SQL suites or the system
 # scenarios — not to this package.
-bytes = "1"
-mysql = "25"
-novarocks-test-support = { path = "../tests/test-support" }
-tempfile = "3"
+bytes.workspace = true
+mysql.workspace = true
+novarocks-test-support.workspace = true
+tempfile.workspace = true

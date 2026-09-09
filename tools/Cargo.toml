@@ -17,20 +17,24 @@
 
 [package]
 name = "novarocks-tools"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "oss_parquet_probe"
 path = "src/bin/oss_parquet_probe.rs"
 
 [dependencies]
-anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-bytes = "1"
-futures = "0.3"
-opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3"] }
-parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
-novarocks-fs = { path = "../novarocks/fs" }
-novarocks-server = { path = "../novarocks-server" }
-novarocks-spi = { path = "../novarocks/spi" }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+bytes.workspace = true
+futures.workspace = true
+opendal = { workspace = true, features = ["services-oss", "services-fs", "services-s3"] }
+parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
+novarocks-fs.workspace = true
+novarocks-server.workspace = true
+novarocks-spi.workspace = true
+
+[lints]
+workspace = true

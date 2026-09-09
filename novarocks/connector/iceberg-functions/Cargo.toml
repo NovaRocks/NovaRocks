@@ -17,14 +17,18 @@
 
 [package]
 name = "novarocks-connector-iceberg-functions"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-arrow-array = "58.2.0"
-arrow-schema = "58.2.0"
+arrow-array.workspace = true
+arrow-schema.workspace = true
 datasketches = { workspace = true, features = ["theta"] }
-novarocks-functions = { path = "../../functions" }
+novarocks-functions.workspace = true

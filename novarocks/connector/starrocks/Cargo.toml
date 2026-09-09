@@ -1,17 +1,21 @@
 [package]
 name = "novarocks-connector-starrocks"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-arrow = "58.2.0"
-base64 = "0.22"
-bytes = "1"
-futures = "0.3"
-novarocks-spi = { path = "../../spi" }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+arrow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+futures.workspace = true
+novarocks-spi.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

@@ -17,29 +17,33 @@
 
 [package]
 name = "novarocks-system-test-runner"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "novarocks-system-tests"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-bytes = "1"
-h2 = "0.4"
-http = "1"
-mysql = "25.0.1"
-novarocks-cluster-harness = { path = "../cluster-harness" }
-novarocks-connector-iceberg = { path = "../../novarocks/connector/iceberg" }
-novarocks-fs = { path = "../../novarocks/fs" }
-novarocks-native-trust = { path = "../../novarocks/native-trust" }
-novarocks-proto-models = { path = "../../novarocks/proto-models" }
-novarocks-secret = { path = "../../novarocks/secret" }
-novarocks-types = { path = "../../novarocks/types" }
-novarocks-version = { path = "../../novarocks/version" }
-prost = "0.13"
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
-tonic = { version = "0.12", features = ["transport"] }
+anyhow.workspace = true
+bytes.workspace = true
+h2.workspace = true
+http.workspace = true
+mysql.workspace = true
+novarocks-cluster-harness.workspace = true
+novarocks-connector-iceberg.workspace = true
+novarocks-fs.workspace = true
+novarocks-native-trust.workspace = true
+novarocks-proto-models.workspace = true
+novarocks-secret.workspace = true
+novarocks-types.workspace = true
+novarocks-version.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tonic = { workspace = true, features = ["transport"] }

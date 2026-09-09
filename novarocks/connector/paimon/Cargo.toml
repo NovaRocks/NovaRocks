@@ -17,32 +17,36 @@
 
 [package]
 name = "novarocks-connector-paimon"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-arrow = "58.2.0"
-async-trait = "0.1"
-bytes = "1"
-chrono = "0.4"
-futures = "0.3"
+arrow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
 paimon = { workspace = true }
-prost = "0.13"
-sha2 = "0.10"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
-novarocks-fs = { path = "../../fs" }
-novarocks-proto-codec = { path = "../../proto-codec" }
-novarocks-proto-models = { path = "../../proto-models" }
-novarocks-spi = { path = "../../spi" }
+prost.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+novarocks-fs.workspace = true
+novarocks-proto-codec.workspace = true
+novarocks-proto-models.workspace = true
+novarocks-spi.workspace = true
 
 [dev-dependencies]
 paimon = { workspace = true, features = ["storage-memory"] }
-serde_json = "1"
-tempfile = "3"
+serde_json.workspace = true
+tempfile.workspace = true
 
 [build-dependencies]
-prost-build = "0.13"
-protoc-bin-vendored = "3"
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true

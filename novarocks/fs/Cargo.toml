@@ -17,28 +17,32 @@
 
 [package]
 name = "novarocks-fs"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-arrow = "58.2.0"
-bytes = "1"
-crc32c = "0.6"
-futures = "0.3"
-libc = "0.2"
-opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
+arrow.workspace = true
+bytes.workspace = true
+crc32c.workspace = true
+futures.workspace = true
+libc.workspace = true
+opendal = { workspace = true, features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
 orc-rust = { version = "0.8.0", default-features = false }
-parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tracing = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
-url = "2"
-novarocks-secret = { path = "../secret" }
-novarocks-spi = { path = "../spi" }
+parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+url.workspace = true
+novarocks-secret.workspace = true
+novarocks-spi.workspace = true
 
 [dev-dependencies]
-anyhow = "1"
-tempfile = "3"
+anyhow.workspace = true
+tempfile.workspace = true

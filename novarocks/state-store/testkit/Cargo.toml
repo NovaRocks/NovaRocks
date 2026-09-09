@@ -1,14 +1,18 @@
 [package]
 name = "novarocks-state-store-testkit"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-async-trait = "0.1"
-bytes = "1"
-novarocks-state-store-api = { path = "../api" }
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-uuid = { version = "1", features = ["serde", "v7"] }
+async-trait.workspace = true
+bytes.workspace = true
+novarocks-state-store-api.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+uuid = { workspace = true, features = ["serde", "v7"] }
