@@ -3581,6 +3581,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-arrow-pool-bench"
+version = "0.1.0"
+dependencies = [
+ "arrow-buffer",
+]
+
+[[package]]
 name = "novarocks-backend"
 version = "0.1.0"
 dependencies = [
@@ -3932,6 +3939,10 @@ dependencies = [
  "arrow-schema",
  "sha2",
 ]
+
+[[package]]
+name = "novarocks-memory"
+version = "0.1.0"
 
 [[package]]
 name = "novarocks-native-trust"

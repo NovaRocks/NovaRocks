@@ -22,7 +22,7 @@
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks/backend", "novarocks/catalog-application", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend", "novarocks/fs", "novarocks/functions", "novarocks/native-trust", "novarocks/parser", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/runtime", "novarocks/state-store/testkit", "novarocks/state-store/sqlite", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/task-codec", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "novarocks-server", "tests/cluster-harness", "tests/datasketches-tck", "tests/system-test-runner", "tests/test-support", "tests/sql/runner", "tools", "tools/connector-binding-bench", "tools/datasketches-bench", "tools/error-manifest"]
+members = ["novarocks/backend", "novarocks/catalog-application", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend", "novarocks/fs", "novarocks/functions", "novarocks/memory", "novarocks/native-trust", "novarocks/parser", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/runtime", "novarocks/state-store/testkit", "novarocks/state-store/sqlite", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/task-codec", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "novarocks-server", "tests/cluster-harness", "tests/datasketches-tck", "tests/system-test-runner", "tests/test-support", "tests/sql/runner", "tools", "tools/arrow-pool-bench", "tools/connector-binding-bench", "tools/datasketches-bench", "tools/error-manifest"]
 # Native development defaults to the server package.
 default-members = ["novarocks-server"]
 # Vendored upstream packages keep their own workspace and lock authority.
@@ -108,6 +108,7 @@ novarocks-execution-contract = { path = "novarocks/execution-contract", version 
 novarocks-failpoint = { path = "novarocks/failpoint", version = "0.1.0", default-features = false }
 novarocks-frontend = { path = "novarocks/frontend", version = "0.1.0" }
 novarocks-fs = { path = "novarocks/fs", version = "0.1.0" }
+novarocks-memory = { path = "novarocks/memory", version = "0.1.0" }
 novarocks-functions = { path = "novarocks/functions", version = "0.1.0" }
 novarocks-native-trust = { path = "novarocks/native-trust", version = "0.1.0" }
 novarocks-parser = { path = "novarocks/parser", version = "0.1.0" }
