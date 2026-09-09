@@ -48,6 +48,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STAGES = ("s1", "s2", "compacted", "schema")
 MARKERS = ("ORACLE", "SNAPSHOT", "SCHEMA", "FILE", "MANIFEST")
 FIXTURE_KIND = "novarocks-paimon-read-v1"
+# Local-only alias for the pinned Spark base manifest. The tag embeds the
+# digest, so the name can only ever stand for that one manifest.
+LOCAL_BASE_ALIAS_REPOSITORY = "novarocks/paimon-read-base"
 ALL_TABLES = (
     "append_none",
     "append_snappy",
@@ -326,6 +329,9 @@ def load_versions() -> dict[str, str]:
     for size_name in ("PAIMON_SPARK_JAR_SIZE", "PAIMON_S3_JAR_SIZE"):
         if int(versions[size_name]) <= 0:
             raise FixtureError(f"{size_name} must be positive")
+    # prepare overrides SPARK_IMAGE_REPOSITORY with the selected registry path;
+    # keep the manifest's own value so the local lookup can try both names.
+    versions["SPARK_IMAGE_DEFAULT_REPOSITORY"] = versions["SPARK_IMAGE_REPOSITORY"]
     return versions
 
 
@@ -564,12 +570,136 @@ def image_tag(versions: Mapping[str, str], definition_sha256: str) -> str:
     )
 
 
+def inspect_local_image(reference: str) -> dict[str, Any] | None:
+    """Return `docker image inspect` output for a reference on this host.
+
+    `docker image inspect` is a local-store lookup and never contacts a
+    registry. None means this host has no such reference.
+    """
+    result = subprocess.run(
+        ["docker", "image", "inspect", reference, "--format", "{{json .}}"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        payload = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as error:
+        raise FixtureError(
+            f"cannot parse docker image inspect output for {reference}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise FixtureError(f"unexpected docker image inspect output for {reference}")
+    return payload
+
+
+def image_platform(info: Mapping[str, Any]) -> str:
+    platform = f"{info.get('Os')}/{info.get('Architecture')}"
+    variant = info.get("Variant")
+    if variant:
+        platform = f"{platform}/{variant}"
+    return platform
+
+
+def local_base_alias(versions: Mapping[str, str]) -> str:
+    """Local-only tag standing for the pinned Spark base manifest.
+
+    The tag embeds the digest, so this name can only ever mean that one
+    manifest. It is also the Dockerfile's SPARK_BASE default, which keeps a
+    direct `docker build` working once the fixture has run on this host.
+    """
+    digest = versions["SPARK_IMAGE_MANIFEST_DIGEST"]
+    return f"{LOCAL_BASE_ALIAS_REPOSITORY}:{digest.split(':', 1)[1][:12]}"
+
+
+def local_base_candidates(versions: Mapping[str, str]) -> list[str]:
+    """References that may already name the pinned Spark base on this host."""
+    digest = versions["SPARK_IMAGE_MANIFEST_DIGEST"]
+    default_repository = versions.get(
+        "SPARK_IMAGE_DEFAULT_REPOSITORY", versions["SPARK_IMAGE_REPOSITORY"]
+    )
+    candidates = [
+        f"{versions['SPARK_IMAGE_REPOSITORY']}@{digest}",
+        f"{default_repository}@{digest}",
+        # A containerd-backed image store keys images by manifest digest, so
+        # this finds the pinned manifest under whatever name it carries locally.
+        digest,
+    ]
+    unique: list[str] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def missing_base_image_error(
+    versions: Mapping[str, str], candidates: Sequence[str]
+) -> FixtureError:
+    digest = versions["SPARK_IMAGE_MANIFEST_DIGEST"]
+    platform = versions["SPARK_IMAGE_PLATFORM"]
+    default_repository = versions.get(
+        "SPARK_IMAGE_DEFAULT_REPOSITORY", versions["SPARK_IMAGE_REPOSITORY"]
+    )
+    tried = "\n".join(f"  {candidate}" for candidate in candidates)
+    return FixtureError(
+        "the pinned Spark base image is not in this host's image store\n"
+        "preparing the fixture never pulls; import the pinned manifest once, "
+        "then re-run:\n"
+        f"  docker pull --platform {platform} {default_repository}@{digest}\n"
+        "if the daemon cannot reach Docker Hub, pull the same digest through a "
+        "reachable mirror and name it:\n"
+        f"  docker pull --platform {platform} dockerproxy.net/apache/spark@{digest}\n"
+        "  PAIMON_SPARK_IMAGE_REPOSITORY=dockerproxy.net/apache/spark ...\n"
+        f"local references tried:\n{tried}"
+    )
+
+
+def resolve_local_base_image(versions: Mapping[str, str]) -> str:
+    """Return a local alias tag for the pinned Linux/amd64 Spark manifest.
+
+    Design: ADR-0141 (docs/adr/ADR-0141-fixture-images-never-pull.md)
+
+    Preparing the fixture never pulls, so the manifest must already be on this
+    host and a missing image is an error. BuildKit is then handed a tag rather
+    than the digest, because it resolves a digest-pinned `FROM` against the
+    registry even for an image that is already local with a matching
+    RepoDigest; the digest identity is checked here instead.
+    """
+    digest = versions["SPARK_IMAGE_MANIFEST_DIGEST"]
+    platform = versions["SPARK_IMAGE_PLATFORM"]
+    candidates = local_base_candidates(versions)
+    for candidate in candidates:
+        info = inspect_local_image(candidate)
+        if info is None:
+            continue
+        names = info.get("RepoDigests") or []
+        # A containerd store reports the manifest digest as the image id; a
+        # graphdriver store reports the config digest and carries the manifest
+        # digest in RepoDigests. Either one proves the pinned identity.
+        if info.get("Id") != digest and not any(
+            isinstance(name, str) and name.endswith(f"@{digest}") for name in names
+        ):
+            raise FixtureError(
+                f"local image {candidate} is not the pinned Spark manifest {digest}"
+            )
+        found = image_platform(info)
+        if found != platform:
+            raise FixtureError(
+                f"local Spark base {candidate} is {found}, "
+                f"but the fixture pins {platform}"
+            )
+        alias = local_base_alias(versions)
+        run_command(["docker", "tag", candidate, alias])
+        return alias
+    raise missing_base_image_error(versions, candidates)
+
+
 def build_image(versions: Mapping[str, str], definition_sha256: str) -> str:
     tag = image_tag(versions, definition_sha256)
-    base = (
-        f"{versions['SPARK_IMAGE_REPOSITORY']}@"
-        f"{versions['SPARK_IMAGE_MANIFEST_DIGEST']}"
-    )
+    base = resolve_local_base_image(versions)
     arguments = [
         "docker",
         "build",
@@ -599,6 +729,9 @@ def spark_command(runtime: Runtime, versions: Mapping[str, str], tag: str) -> li
     return [
         "docker",
         "run",
+        # Never pull: the tag was just built from this host's own image store.
+        "--pull",
+        "never",
         "--interactive",
         "--rm",
         "--platform",
@@ -678,6 +811,8 @@ def compose_mc(runtime: Runtime, script: str, target: str) -> str:
         "-f",
         str(runtime.compose_file),
         "run",
+        "--pull",
+        "never",
         "--rm",
         "--no-deps",
         "-T",
@@ -706,6 +841,8 @@ def compose_mc_bytes(runtime: Runtime, script: str, target: str) -> bytes:
         "-f",
         str(runtime.compose_file),
         "run",
+        "--pull",
+        "never",
         "--rm",
         "--no-deps",
         "-T",

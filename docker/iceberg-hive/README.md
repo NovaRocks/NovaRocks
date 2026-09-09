@@ -105,6 +105,14 @@ The default image is built locally from this directory and tagged as
 `novarocks/hive-metastore:4.0.0`. It uses `apache/hive:4.0.0` plus Hadoop S3A
 support jars.
 
+The fixture never pulls during a run: `up.sh` requires `apache/hive:4.0.0` to
+be in the local image store before it builds, and `compose.yml` declares
+`pull_policy: never`. Import the base once:
+
+```bash
+docker pull apache/hive:4.0.0
+```
+
 If the bundled Hadoop version in `apache/hive:4.0.0` changes, check it before
 building and update `HADOOP_VERSION` in `Dockerfile`:
 

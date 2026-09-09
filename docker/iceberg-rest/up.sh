@@ -165,6 +165,36 @@ docker_image_exists() {
   wait "$pid"
 }
 
+require_local_image() {
+  # Design: ADR-0141 (docs/adr/ADR-0141-fixture-images-never-pull.md)
+  # Fixtures never pull during a run: a missing image is an error, not a
+  # download. Compose services are held to this by `pull_policy: never` in
+  # compose.yml; this gate covers `docker build`, which has no equivalent flag
+  # and lets BuildKit pull any FROM it cannot resolve locally.
+  local image="$1" purpose="$2" status
+  if docker_image_exists "$image"; then
+    return 0
+  else
+    status="$?"
+  fi
+  if [[ "$status" -eq 124 ]]; then
+    cat >&2 <<EOF
+Docker image inspect timed out for: $image
+
+Docker Desktop may be unhealthy. Check it manually before running setup again:
+  docker image inspect $image
+EOF
+    return 1
+  fi
+  cat >&2 <<EOF
+Missing local image ($purpose): $image
+
+This fixture never pulls during a run. Import it once, then re-run:
+  docker pull $image
+EOF
+  return 1
+}
+
 hash4="${hash:0:4}"
 offset=$((16#$hash4 % 1000))
 mysql_port_start="${NOVA_ENV_MYSQL_PORT_START:-9030}"
@@ -273,6 +303,9 @@ build_default_spark_image() {
     echo "Missing Spark Iceberg Dockerfile: $spark_build_context/Dockerfile" >&2
     return 1
   fi
+  # The Dockerfile's FROM is a tag, which BuildKit resolves from the local
+  # store when it is present and pulls when it is not.
+  require_local_image "apache/spark:$spark_version" "Spark Iceberg base" || return 1
 
   docker build \
     --build-arg "SPARK_VERSION=$spark_version" \
@@ -751,6 +784,22 @@ if [[ "$update_current_link" == "true" ]]; then
 fi
 
 if [[ "$prepare_only" != true ]]; then
+  # `pull_policy: never` already refuses to download, so turn the missing
+  # image into an actionable message before compose reports a bare failure.
+  compose_images="$(docker compose \
+    --env-file "$compose_env" \
+    -p "$compose_project" \
+    -f "$compose_file" \
+    config --images)"
+  missing_compose_image=0
+  while IFS= read -r compose_image; do
+    [[ -n "$compose_image" ]] || continue
+    require_local_image "$compose_image" "compose service" || missing_compose_image=1
+  done <<< "$compose_images"
+  if (( missing_compose_image != 0 )); then
+    exit 1
+  fi
+
   docker compose \
     --env-file "$compose_env" \
     -p "$compose_project" \

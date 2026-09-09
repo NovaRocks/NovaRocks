@@ -208,11 +208,16 @@ pinned_image="$(run_with_timeout 15 docker compose \
 if run_with_timeout 15 docker image inspect "$pinned_image" >/dev/null 2>&1; then
   echo "Using locally verified pinned MySQL image"
 else
-  run_with_timeout "$docker_timeout" docker compose \
-    --env-file "$compose_env" \
-    -p "$compose_project" \
-    -f "$compose_file" \
-    pull mysql
+  # Fixtures never pull during a run: a missing image is an error, not a
+  # download, so the fixture cannot silently start against a freshly fetched
+  # image on one host and a long-cached one on another.
+  cat >&2 <<EOF
+Missing local image (MySQL state store): $pinned_image
+
+This fixture never pulls during a run. Import it once, then re-run:
+  docker pull $pinned_image
+EOF
+  exit 1
 fi
 run_with_timeout "$docker_timeout" docker compose \
   --env-file "$compose_env" \

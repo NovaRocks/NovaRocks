@@ -289,6 +289,20 @@ EOF
     exit 1
   fi
 
+  # The hms image is built here, and its Dockerfile FROM is a tag that
+  # BuildKit pulls when it is not already local. Fixtures never pull during a
+  # run, so require the base up front; `pull_policy: never` covers the rest.
+  hive_base_image="apache/hive:4.0.0"
+  if ! docker image inspect "$hive_base_image" >/dev/null 2>&1; then
+    cat >&2 <<EOF
+Missing local image (Hive Metastore base): $hive_base_image
+
+This fixture never pulls during a run. Import it once, then re-run:
+  docker pull $hive_base_image
+EOF
+    exit 1
+  fi
+
   docker compose \
     --env-file "$compose_env" \
     -p "$hive_compose_project" \

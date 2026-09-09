@@ -15,10 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# The default is the Linux/amd64 manifest behind apache/spark:3.5.3. The
+# Design: ADR-0141 (docs/adr/ADR-0141-fixture-images-never-pull.md)
+# The pinned base is the Linux/amd64 manifest behind apache/spark:3.5.3. The
 # fixture deliberately runs this platform on every host so the external writer
 # is byte-for-byte reproducible, including on Apple Silicon Docker Desktop.
-ARG SPARK_BASE=apache/spark@sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955
+#
+# SPARK_BASE must be a reference BuildKit can resolve from the local image
+# store, and fixture.py supplies a local alias tag for exactly the manifest
+# recorded below. A digest reference here would defeat that: BuildKit resolves
+# `FROM repo@sha256:...` against the registry even when the image is already
+# local and its RepoDigest matches, so a digest-pinned FROM turns every build
+# -- a fully cached one included -- into a registry round-trip and fails on a
+# host that cannot reach the registry. The digest stays the sole authority for
+# which manifest may be used; fixture.py verifies it against the local image
+# store before it creates the alias, so the check moved out of BuildKit's
+# resolver into an explicit preflight rather than being dropped.
+ARG SPARK_BASE_MANIFEST_DIGEST=sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955
+ARG SPARK_BASE=novarocks/paimon-read-base:b2da01c5855f
 FROM --platform=linux/amd64 ${SPARK_BASE}
 
 ARG PAIMON_VERSION=1.3.1

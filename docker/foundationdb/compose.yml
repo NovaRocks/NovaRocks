@@ -15,9 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Test fixtures never pull during a run: every service uses the image already
+# in this host's store, and a missing image is a reported failure instead of a
+# download. Import pinned images ahead of time (see this directory's README).
 services:
   foundationdb:
     image: foundationdb/foundationdb:7.3.69
+    pull_policy: never
     platform: linux/amd64
     environment:
       FDB_CLUSTER_FILE: "${NOVA_FDB_CONTAINER_CLUSTER_FILE}"

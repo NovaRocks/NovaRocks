@@ -10,6 +10,14 @@ from the workspace path and writes credentials only to generated mode-0600
 files below `runtime/`. It does not read a Homebrew installation and does not
 reuse either Iceberg fixture.
 
+The fixture never pulls during a run: `compose.yml` declares
+`pull_policy: never` and `up.sh` reports a missing image instead of downloading
+one. Import the pinned image once:
+
+```bash
+docker pull mysql:8.4.10@sha256:c831a0f11348d402b43d77453e17d770be2eef356615a2823fe0f5a0d6c8b9af
+```
+
 Callers must install cleanup before startup:
 
 ```bash

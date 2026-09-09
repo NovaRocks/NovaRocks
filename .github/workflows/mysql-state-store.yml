@@ -38,6 +38,21 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
+      - name: Import pinned fixture images
+        run: |
+          set -euo pipefail
+          # The fixture itself never pulls: compose.yml sets `pull_policy:
+          # never` so a run uses the host's own image store and reports a
+          # missing image instead of downloading one mid-test. A fresh runner
+          # therefore imports the pinned image in this explicit step, read
+          # straight from compose.yml so the two cannot drift.
+          image="$(awk '/^    image:/ { print $2; exit }' docker/mysql-state-store/compose.yml)"
+          case "$image" in
+            ''|*'$'*) echo "cannot resolve a literal image from docker/mysql-state-store/compose.yml: '$image'" >&2; exit 1 ;;
+          esac
+          echo "importing $image"
+          docker pull "$image"
+
       - name: Run MySQL experimental provider checks
         env:
           NOVAROCKS_RUN_MYSQL_DOCKER_OWNERSHIP_TEST: "1"
