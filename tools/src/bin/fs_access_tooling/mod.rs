@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_fs::{
-    FsAccessHandle, FsAccessResolver, ObjectStoreAccessContext,
-};
+use novarocks_fs::{FsAccessHandle, FsAccessResolver, ObjectStoreAccessContext};
 use novarocks_spi::connector::StorageAccessDomainId;
 
 pub fn resolve_tool_location(

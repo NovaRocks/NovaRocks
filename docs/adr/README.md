@@ -379,7 +379,7 @@ fallback 模糊 owner 和故障语义。
 
 - ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
-- ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
+- ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active；其中 SQL runner 独立 workspace/profile 前提由 ADR-0142 替换）
 - ADR-0134 — 概率结构为何精确依赖 registry DataSketches 预发布包、由上游唯一拥有标准格式与集合运算（active）
 - ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
@@ -387,6 +387,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 - ADR-0122 — SQLite 为何是唯一 production StateStore、远程 provider 仅保留实验 leaf crate（active）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active）
+- ADR-0142 — NovaRocks 自有 packages 为何共享一个 Cargo workspace、resolver 与 lock authority（active）
 
 #### 历史
 

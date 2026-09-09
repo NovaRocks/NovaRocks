@@ -17,48 +17,52 @@
 
 [package]
 name = "novarocks-connector-iceberg"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-anyhow = "1"
-base64 = "0.22"
+anyhow.workspace = true
+base64.workspace = true
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"
 iceberg-catalog-hms = "0.9.0"
-opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
-arrow = { version = "58.2.0", features = ["prettyprint", "ipc", "ipc_compression"] }
-async-trait = "0.1"
-bytes = "1"
-chrono = "0.4"
+opendal = { workspace = true, features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
+arrow = { workspace = true, features = ["prettyprint", "ipc", "ipc_compression"] }
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
 crc32fast = "1"
-futures = "0.3"
+futures.workspace = true
 ordered-float = "4"
-parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
-prost = "0.13"
-rand = "0.8"
-roaring = "0.10"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-tracing = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
+prost.workspace = true
+rand.workspace = true
+roaring.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 typetag = "0.2"
-url = "2"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
-novarocks-fs = { path = "../../fs" }
-novarocks-connector-iceberg-functions = { path = "../iceberg-functions" }
-novarocks-proto-codec = { path = "../../proto-codec" }
-novarocks-proto-models = { path = "../../proto-models" }
-novarocks-spi = { path = "../../spi" }
-novarocks-types = { path = "../../types" }
+url.workspace = true
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
+novarocks-fs.workspace = true
+novarocks-connector-iceberg-functions.workspace = true
+novarocks-proto-codec.workspace = true
+novarocks-proto-models.workspace = true
+novarocks-spi.workspace = true
+novarocks-types.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 
 [build-dependencies]
-prost-build = "0.13"
-protoc-bin-vendored = "3"
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true

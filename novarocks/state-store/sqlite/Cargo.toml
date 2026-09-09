@@ -1,20 +1,24 @@
 [package]
 name = "novarocks-state-store-sqlite"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-async-trait = "0.1"
-bytes = "1"
+async-trait.workspace = true
+bytes.workspace = true
 fs2 = "0.4"
 log = "0.4"
-novarocks-state-store-api = { path = "../api" }
+novarocks-state-store-api.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-uuid = { version = "1", features = ["v4", "v7"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true

@@ -1,23 +1,27 @@
 [package]
 name = "novarocks-spi"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-async-trait = "0.1"
-arrow = { version = "58.2.0" }
-bytes = "1"
-novarocks-secret = { path = "../secret" }
-sha2 = "0.10"
-serde = { version = "1", features = ["derive"] }
-url = "2"
-uuid = { version = "1", features = ["serde", "v7"] }
+async-trait.workspace = true
+arrow.workspace = true
+bytes.workspace = true
+novarocks-secret.workspace = true
+sha2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+url.workspace = true
+uuid = { workspace = true, features = ["serde", "v7"] }
 
 [dev-dependencies]
-serde_json = "1"
+serde_json.workspace = true
 
 [features]
 connector-conformance = []

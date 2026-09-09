@@ -25,6 +25,49 @@ source "$REPO_ROOT/tools/ci/local-full-ci.sh" --source-only
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
+if (
+  parse_args --cargo-only --suite filter
+) >/dev/null 2>&1; then
+  echo "--cargo-only must reject SQL and runtime options" >&2
+  exit 1
+fi
+
+cargo_only_capture="$tmpdir/cargo-only-main"
+(
+  init_run_dir() {
+    CI_RUN_DIR="$tmpdir/cargo-only-run"
+    CI_SUMMARY="$CI_RUN_DIR/summary.md"
+    mkdir -p "$CI_RUN_DIR"
+  }
+  validate_explicit_suites_early() {
+    printf '%s\n' "validate" >>"$cargo_only_capture"
+  }
+  run_cargo_gates() {
+    printf '%s\n' "cargo" >>"$cargo_only_capture"
+  }
+  prepare_runtime() {
+    printf '%s\n' "runtime" >>"$cargo_only_capture"
+    return 97
+  }
+  run_system_scenarios_stage() {
+    printf '%s\n' "system" >>"$cargo_only_capture"
+    return 97
+  }
+  run_sql_suites() {
+    printf '%s\n' "sql" >>"$cargo_only_capture"
+    return 97
+  }
+  ci_render_summary() { :; }
+
+  main --cargo-only >/dev/null
+)
+
+if [ "$(tr '\n' ' ' <"$cargo_only_capture")" != "validate cargo " ]; then
+  echo "--cargo-only must run validation and Cargo gates without runtime or SQL stages" >&2
+  cat "$cargo_only_capture" >&2
+  exit 1
+fi
+
 stage_capture="$tmpdir/cargo-gates"
 (
   SKIP_CARGO_TEST="true"
@@ -38,6 +81,24 @@ stage_capture="$tmpdir/cargo-gates"
   run_cargo_gates
 )
 
+if ! grep -Fx \
+  "locked Cargo metadata|cargo-metadata.log|cargo metadata --locked --format-version 1 --no-deps" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must validate locked Cargo metadata" >&2
+  exit 1
+fi
+if ! grep -Fx \
+  "Cargo dependency policy|cargo-deny.log|cargo deny --locked check advisories bans licenses sources" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must enforce the resolved dependency policy" >&2
+  exit 1
+fi
+if ! grep -Fx \
+  "cargo check all targets|cargo-check-all-targets.log|cargo check --workspace --all-targets --locked" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must check every workspace target with the committed lock" >&2
+  exit 1
+fi
 if ! grep -Fx \
   "DataSketches resolved source|datasketches-source.log|python3 tools/ci/check-datasketches-source.py" \
   "$stage_capture" >/dev/null; then

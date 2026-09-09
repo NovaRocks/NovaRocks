@@ -1,6 +1,6 @@
 # Connector binding benchmark harness
 
-This independent Cargo workspace freezes the NCP-2R4 workload identity before
+This root-workspace benchmark package freezes the NCP-2R4 workload identity before
 product edits. It writes stable JSON containing the git revision, build profile,
 sample settings, workload SHA-256, supported measurements, and explicit
 unsupported measurements.

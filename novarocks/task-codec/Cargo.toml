@@ -1,19 +1,23 @@
 [package]
 name = "novarocks-task-codec"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-novarocks-execution = { path = "../execution" }
-novarocks-proto-codec = { path = "../proto-codec" }
-novarocks-proto-models = { path = "../proto-models" }
-novarocks-spi = { path = "../spi" }
-novarocks-types = { path = "../types" }
-prost = "0.13"
-sha2 = "0.10"
+novarocks-execution.workspace = true
+novarocks-proto-codec.workspace = true
+novarocks-proto-models.workspace = true
+novarocks-spi.workspace = true
+novarocks-types.workspace = true
+prost.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }

@@ -1,18 +1,22 @@
 [package]
 name = "novarocks-proto-models"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 build = "build.rs"
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-prost = "0.13"
+prost.workspace = true
 
 [dev-dependencies]
-prost-reflect = "0.14"
+prost-reflect.workspace = true
 
 [build-dependencies]
-prost-build = "0.13"
-protoc-bin-vendored = "3"
+prost-build.workspace = true
+protoc-bin-vendored.workspace = true

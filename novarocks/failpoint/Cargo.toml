@@ -1,12 +1,16 @@
 [package]
 name = "novarocks-failpoint"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
+
+[lints]
+workspace = true
 
 [features]
 default = ["typed"]
 typed = ["dep:novarocks-types"]
 
 [dependencies]
-novarocks-types = { path = "../types", optional = true }
+novarocks-types = { workspace = true, optional = true }

@@ -17,17 +17,16 @@
 
 [package]
 name = "novarocks-datasketches-bench"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
 
-[workspace]
-
 [dependencies]
-datasketches = { version = "=0.5.0-rc.1", default-features = false, features = ["hll", "theta"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.10"
+datasketches = { workspace = true, features = ["hll", "theta"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
 toml = "0.9"
 
 [dev-dependencies]
@@ -41,5 +40,7 @@ harness = false
 name = "size-profile"
 path = "src/bin/size-profile.rs"
 
+# Cargo does not allow a package to inherit workspace lints and override one;
+# this benchmark keeps its explicit unsafe-code exception local.
 [lints.rust]
 unsafe_code = "allow"

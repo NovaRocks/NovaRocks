@@ -55,14 +55,19 @@ fn probe_location_from_args(prefix: &str) -> Result<String> {
 
 fn parse_access_domain(value: &str) -> Result<StorageAccessDomainId> {
     let value = value.trim();
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         anyhow::bail!("--access-domain must be exactly 64 lowercase hexadecimal characters");
     }
     let mut bytes = [0_u8; 32];
     for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(chunk).expect("ASCII checked");
-        bytes[index] = u8::from_str_radix(text, 16)
-            .with_context(|| "--access-domain must be exactly 64 lowercase hexadecimal characters")?;
+        bytes[index] = u8::from_str_radix(text, 16).with_context(
+            || "--access-domain must be exactly 64 lowercase hexadecimal characters",
+        )?;
     }
     Ok(StorageAccessDomainId::from_bytes(bytes))
 }
@@ -140,7 +145,10 @@ async fn main() -> Result<()> {
                 credential_name = Some(args.next().context("missing value for --credential-name")?);
             }
             "--credential-generation" => {
-                credential_generation = Some(args.next().context("missing value for --credential-generation")?);
+                credential_generation = Some(
+                    args.next()
+                        .context("missing value for --credential-generation")?,
+                );
             }
             "--endpoint" => {
                 endpoint = Some(args.next().context("missing value for --endpoint")?);
@@ -168,7 +176,9 @@ async fn main() -> Result<()> {
 
     let location = probe_location_from_args(&prefix)?;
     let reference = StaticCredentialReference::try_new(
-        credential_name.as_deref().context("missing required --credential-name")?,
+        credential_name
+            .as_deref()
+            .context("missing required --credential-name")?,
         credential_generation
             .as_deref()
             .context("missing required --credential-generation")?,
@@ -214,8 +224,12 @@ async fn main() -> Result<()> {
         },
         &pool,
     );
-    let access = fs_access_tooling::resolve_tool_location(&location, access_domain, Some(object_store_access))
-        .map_err(anyhow::Error::msg)?;
+    let access = fs_access_tooling::resolve_tool_location(
+        &location,
+        access_domain,
+        Some(object_store_access),
+    )
+    .map_err(anyhow::Error::msg)?;
     let relative_path =
         fs_access_tooling::single_relative_path(&access, &location).map_err(anyhow::Error::msg)?;
     let list_prefix = fs_access_tooling::list_prefix(&relative_path);
