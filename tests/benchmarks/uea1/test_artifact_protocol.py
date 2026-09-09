@@ -97,7 +97,7 @@ class ArtifactFixture:
             },
         }
         self.performance = {
-            "schema_version": 7,
+            "schema_version": 8,
             "run_id": self.run_id,
             "run_manifest_sha256": "",
             "manifest_sha256": self.hashes["manifest"],
@@ -129,9 +129,9 @@ class ArtifactFixture:
                     "workload": "short",
                     "window_index": index,
                     "configured_concurrency": 1,
-                    "started_elapsed_millis": 100 + index * 200,
-                    "ended_elapsed_millis": 200 + index * 200,
-                    "drain_ended_elapsed_millis": 201 + index * 200,
+                    "started_elapsed_micros": (100 + index * 200) * 1000,
+                    "ended_elapsed_micros": (200 + index * 200) * 1000,
+                    "drain_ended_elapsed_micros": (201 + index * 200) * 1000,
                 }
                 for index in range(15)
             ],
@@ -505,7 +505,7 @@ class ArtifactProtocolTest(unittest.TestCase):
 
     def test_old_performance_schema_is_rejected(self):
         self.fixture.performance["schema_version"] = 2
-        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "schema_version 7"):
+        with self.assertRaisesRegex(PROTOCOL.ProtocolError, "schema_version 8"):
             self.fixture.extract()
 
     def test_diagnostic_run_token_must_match_run_manifest(self):
@@ -574,6 +574,13 @@ class ArtifactProtocolTest(unittest.TestCase):
         self.fixture.performance["query_samples"][0]["ended_elapsed_micros"] = 200_001
         with self.assertRaisesRegex(PROTOCOL.ProtocolError, "outside its window"):
             self.fixture.extract()
+
+    def test_sub_millisecond_window_end_keeps_an_in_window_success(self):
+        window = self.fixture.performance["measurement_windows"][0]
+        window["ended_elapsed_micros"] = 200_999
+        window["drain_ended_elapsed_micros"] = 201_000
+        self.fixture.performance["query_samples"][0]["ended_elapsed_micros"] = 200_998
+        self.fixture.extract()
 
     def test_missing_resource_role_is_rejected(self):
         self.fixture.resources["samples"].pop()

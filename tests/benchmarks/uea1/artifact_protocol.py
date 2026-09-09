@@ -338,10 +338,10 @@ def _validate_preparation_diagnostic_frame(
     for offset, raw in enumerate(windows):
         window = _expect_object(raw, f"measurement_windows[{offset}]")
         window_started = _nonnegative_number(
-            window.get("started_elapsed_millis"),
-            f"measurement_windows[{offset}].started_elapsed_millis",
+            window.get("started_elapsed_micros"),
+            f"measurement_windows[{offset}].started_elapsed_micros",
         )
-        if window_started * 1000 < ended:
+        if window_started < ended:
             raise ProtocolError("timed measurement overlaps preparation diagnostic prelude")
 
 
@@ -663,8 +663,8 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
     )
     if completion["schema_version"] != 2:
         raise ProtocolError("completion marker must use schema_version 2")
-    if performance.get("schema_version") != 7:
-        raise ProtocolError("performance artifact must use schema_version 7")
+    if performance.get("schema_version") != 8:
+        raise ProtocolError("performance artifact must use schema_version 8")
     run_manifest_sha256 = _sha256_file(artifact_paths["run_manifest"])
     if (
         run_manifest.get("formal") is not True
@@ -949,20 +949,24 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
                 "workload",
                 "window_index",
                 "configured_concurrency",
-                "started_elapsed_millis",
-                "ended_elapsed_millis",
-                "drain_ended_elapsed_millis",
+                "started_elapsed_micros",
+                "ended_elapsed_micros",
+                "drain_ended_elapsed_micros",
             },
             f"measurement_windows[{offset}]",
         )
         workload = _nonempty_string(window["workload"], f"measurement_windows[{offset}].workload")
         index = window["window_index"]
         concurrency = window["configured_concurrency"]
-        start = window["started_elapsed_millis"]
-        end = window["ended_elapsed_millis"]
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in (index, concurrency, start, end)):
+        start = window["started_elapsed_micros"]
+        end = window["ended_elapsed_micros"]
+        drain_end = window["drain_ended_elapsed_micros"]
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (index, concurrency, start, end, drain_end)
+        ):
             raise ProtocolError(f"measurement_windows[{offset}] has non-integer coordinates")
-        if index < 0 or concurrency <= 0 or start < 0 or end <= start:
+        if index < 0 or concurrency <= 0 or start < 0 or end <= start or drain_end < end:
             raise ProtocolError(f"measurement_windows[{offset}] has invalid coordinates")
         if index in seen_window_indices:
             raise ProtocolError(f"duplicate measurement window index {index}")
@@ -972,11 +976,19 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
                 "workload": workload,
                 "window_index": index,
                 "configured_concurrency": concurrency,
-                "duration_millis": end - start,
-                "started_elapsed_millis": start,
-                "ended_elapsed_millis": end,
+                "duration_millis": (end - start) / 1000,
+                "started_elapsed_millis": start // 1000,
+                "ended_elapsed_millis": (end + 999) // 1000,
             }
         )
+
+    window_bounds_micros = {
+        int(window["window_index"]): (
+            int(window["started_elapsed_micros"]),
+            int(window["ended_elapsed_micros"]),
+        )
+        for window in windows_raw
+    }
 
     windows_by_index = {window["window_index"]: window for window in windows}
     query_by_window: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
@@ -1029,8 +1041,7 @@ def extract_comparison_input(descriptor_path: Path) -> dict[str, Any]:
         start_micros = sample.get("started_elapsed_micros")
         if not isinstance(start_micros, int) or not isinstance(end_micros, int):
             raise ProtocolError(f"query_samples[{offset}] has no monotonic start/end")
-        window_start = window["started_elapsed_millis"] * 1000
-        window_end = window["ended_elapsed_millis"] * 1000
+        window_start, window_end = window_bounds_micros[window_index]
         if outcome == "success":
             if sample_workload == "slow-output-client":
                 raise ProtocolError(

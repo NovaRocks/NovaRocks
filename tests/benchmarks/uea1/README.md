@@ -49,8 +49,11 @@ baseline pilots before candidate measurement. These files contain fixture
 identities and aggregate counts, never credentials or source rows.
 
 `uea1-performance.json` records every measured window in the same monotonic
-elapsed-millisecond domain as `process-resources.json`. Resource comparisons
-select samples between `started_elapsed_millis` and `ended_elapsed_millis`;
+time domain as `process-resources.json`, with microsecond window boundaries and
+millisecond process samples. Resource comparisons
+select query samples against the exact `started_elapsed_micros` and
+`ended_elapsed_micros` boundaries; process-resource samples retain their native
+millisecond resolution;
 setup, warmup, cleanup, and post-window drain samples remain diagnostic only.
 Every performance and startup run also writes `run-manifest.json`. Formal runs
 require a clean checkout and that checkout's exact

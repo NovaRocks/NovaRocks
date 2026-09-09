@@ -195,10 +195,9 @@ pub fn run(
         &timed_fixture_identities,
     )?;
     ensure!(
-        measurement_windows
-            .iter()
-            .all(|window| window.started_elapsed_millis.saturating_mul(1000)
-                >= diagnostic.frame.ended_elapsed_micros),
+        measurement_windows.iter().all(|window| {
+            window.started_elapsed_micros >= diagnostic.frame.ended_elapsed_micros
+        }),
         "{} timed measurement overlapped its diagnostic prelude",
         scenario.name()
     );
@@ -279,8 +278,9 @@ impl MonotonicTimeline {
         self.anchor_elapsed_micros + self.anchor.elapsed().as_micros()
     }
 
-    fn elapsed_millis(self) -> u128 {
-        self.elapsed_micros() / 1000
+    fn elapsed_micros_at(self, instant: Instant) -> u128 {
+        self.anchor_elapsed_micros
+            .saturating_add(instant.saturating_duration_since(self.anchor).as_micros())
     }
 }
 
@@ -616,7 +616,7 @@ fn run_mixed_window(
     prepared: &business::PreparedWindow,
     window_index: usize,
     require_sustained_producers: bool,
-    monitor: &ProcessResourceMonitor,
+    _monitor: &ProcessResourceMonitor,
     timeline: MonotonicTimeline,
 ) -> Result<(Vec<QuerySample>, Vec<BusinessSample>, MeasurementWindow)> {
     let scenario_remaining = context.remaining("run mixed performance window")?;
@@ -728,9 +728,12 @@ fn run_mixed_window(
         }));
     }
     drop(sender);
-    let started_elapsed_millis = timeline.elapsed_millis();
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(workload.duration_ms);
+    let started_elapsed_micros = timeline.elapsed_micros_at(started);
+    let ended_elapsed_micros = timeline.elapsed_micros_at(deadline);
     window_deadline
-        .set(Instant::now() + Duration::from_millis(workload.duration_ms))
+        .set(deadline)
         .map_err(|_| anyhow::anyhow!("mixed window deadline was initialized twice"))?;
     start.wait();
     let mut queries = Vec::new();
@@ -775,9 +778,9 @@ fn run_mixed_window(
             workload: "mixed".into(),
             window_index,
             configured_concurrency,
-            started_elapsed_millis,
-            ended_elapsed_millis: started_elapsed_millis + u128::from(workload.duration_ms),
-            drain_ended_elapsed_millis: monitor.elapsed_millis(),
+            started_elapsed_micros,
+            ended_elapsed_micros,
+            drain_ended_elapsed_micros: timeline.elapsed_micros(),
         },
     ))
 }
@@ -794,7 +797,7 @@ struct QueryWindowInput<'a> {
 
 fn run_query_window(
     input: QueryWindowInput<'_>,
-    monitor: &ProcessResourceMonitor,
+    _monitor: &ProcessResourceMonitor,
     timeline: MonotonicTimeline,
 ) -> Result<(Vec<QuerySample>, MeasurementWindow)> {
     let QueryWindowInput {
@@ -882,9 +885,12 @@ fn run_query_window(
         }));
     }
     drop(sender);
-    let started_elapsed_millis = timeline.elapsed_millis();
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(duration_ms);
+    let started_elapsed_micros = timeline.elapsed_micros_at(started);
+    let ended_elapsed_micros = timeline.elapsed_micros_at(deadline);
     window_deadline
-        .set(Instant::now() + Duration::from_millis(duration_ms))
+        .set(deadline)
         .map_err(|_| anyhow::anyhow!("short window deadline was initialized twice"))?;
     start.wait();
     for worker in workers {
@@ -898,9 +904,9 @@ fn run_query_window(
             workload: workload.to_string(),
             window_index,
             configured_concurrency: concurrency,
-            started_elapsed_millis,
-            ended_elapsed_millis: started_elapsed_millis + u128::from(duration_ms),
-            drain_ended_elapsed_millis: monitor.elapsed_millis(),
+            started_elapsed_micros,
+            ended_elapsed_micros,
+            drain_ended_elapsed_micros: timeline.elapsed_micros(),
         },
     ))
 }
@@ -946,7 +952,7 @@ fn measure_query(
 fn run_slow_output(
     context: &ScenarioContext,
     workload: &SlowOutputWorkload,
-    monitor: &ProcessResourceMonitor,
+    _monitor: &ProcessResourceMonitor,
     timeline: MonotonicTimeline,
 ) -> Result<(Vec<QuerySample>, Vec<MeasurementWindow>)> {
     let timeout = context.remaining("run slow-output performance window")?;
@@ -958,11 +964,9 @@ fn run_slow_output(
         let mut unread = connect_raw_mysql(context.mysql_user(), context.mysql_port(), timeout)?;
         send_query(&mut unread, &workload.query)?;
         let started = Instant::now();
-        let started_elapsed_micros = timeline.elapsed_micros();
-        let started_elapsed_millis = started_elapsed_micros / 1000;
+        let started_elapsed_micros = timeline.elapsed_micros_at(started);
         let deadline = started + Duration::from_millis(workload.duration_ms);
-        let ended_elapsed_micros = started_elapsed_micros
-            .saturating_add(u128::from(workload.duration_ms).saturating_mul(1000));
+        let ended_elapsed_micros = timeline.elapsed_micros_at(deadline);
         let interval = Duration::from_millis(workload.interval_ms);
         let mut probe_workers = Vec::new();
         for (client, name, sql) in [
@@ -1074,9 +1078,9 @@ fn run_slow_output(
             workload: "slow-output".to_string(),
             window_index,
             configured_concurrency: 4,
-            started_elapsed_millis,
-            ended_elapsed_millis: ended_elapsed_micros / 1000,
-            drain_ended_elapsed_millis: monitor.elapsed_millis(),
+            started_elapsed_micros,
+            ended_elapsed_micros,
+            drain_ended_elapsed_micros: timeline.elapsed_micros(),
         });
     }
     Ok((samples, windows))

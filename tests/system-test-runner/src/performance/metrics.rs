@@ -43,9 +43,9 @@ pub struct MeasurementWindow {
     pub workload: String,
     pub window_index: usize,
     pub configured_concurrency: usize,
-    pub started_elapsed_millis: u128,
-    pub ended_elapsed_millis: u128,
-    pub drain_ended_elapsed_millis: u128,
+    pub started_elapsed_micros: u128,
+    pub ended_elapsed_micros: u128,
+    pub drain_ended_elapsed_micros: u128,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PreparationEvent {
@@ -134,7 +134,7 @@ pub fn write_report(input: PerformanceReportInput<'_>) -> Result<String> {
         preparation_events,
     } = input;
     let report = PerformanceReport {
-        schema_version: 7,
+        schema_version: 8,
         run_id,
         run_manifest_sha256,
         resources_sha256,
@@ -225,7 +225,7 @@ mod tests {
             &fs::read(root.join("uea1-performance.json")).expect("read report"),
         )
         .expect("decode report");
-        assert_eq!(report["schema_version"], 7);
+        assert_eq!(report["schema_version"], 8);
         assert_eq!(report["resources_sha256"], "b".repeat(64));
         assert_eq!(report["run_manifest_sha256"], "a".repeat(64));
         fs::remove_dir_all(root).expect("remove report fixture");
