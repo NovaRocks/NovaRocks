@@ -24,7 +24,7 @@ use common::state_store_fixture;
 use novarocks_frontend::table_maintenance::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     CommitOutcome, Key, Precondition, StateStore, TransactionId, Value,
 };
 use uuid::Uuid;

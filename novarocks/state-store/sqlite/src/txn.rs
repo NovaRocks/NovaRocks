@@ -27,14 +27,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rusqlite::{Connection, InterruptHandle, OptionalExtension, ffi, params};
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     CommitOutcome, CommitReceipt, CommitResolution, Key, Precondition, RangePage, RangeRequest,
     ReadTransaction, StateRecord, StateStoreError, StateStoreErrorKind, StateStoreLimits,
     StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId, Value, VersionToken,
     WriteTransaction,
 };
 
-use novarocks_spi::state_store::StateStoreMetrics;
+use novarocks_state_store_api::StateStoreMetrics;
 
 use super::{SqliteHistoryRetentionConfig, SqliteStateStore, history, open_connection, schema};
 
@@ -1907,7 +1907,7 @@ mod tests {
 
     use super::super::{SqliteHistoryRetentionConfig, SqliteStateStore};
     use super::*;
-    use novarocks_spi::state_store::{
+    use novarocks_state_store_api::{
         CommitOutcome, CommitReceipt, CommitResolution, Direction, Key, KeyRange, Precondition,
         RangeRequest, StateRecord, StateStoreErrorKind, StateStoreOpenRequest, TransactionId,
         Value, VersionToken,

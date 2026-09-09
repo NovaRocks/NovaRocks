@@ -15,4 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use novarocks_spi::state_store::StateStoreMetrics;
+pub use novarocks_state_store_api::StateStoreMetrics;

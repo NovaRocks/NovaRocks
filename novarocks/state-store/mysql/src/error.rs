@@ -16,7 +16,7 @@
 // under the License.
 
 use mysql_async::{DriverError, Error, IoError, TlsError};
-use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind};
 
 #[derive(Clone, Copy)]
 enum MysqlTlsErrorClass {

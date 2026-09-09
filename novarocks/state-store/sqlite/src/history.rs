@@ -17,7 +17,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind};
 
 use super::{SqliteHistoryRetentionConfig, schema, sqlite_error};
 

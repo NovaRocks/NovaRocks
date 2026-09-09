@@ -36,7 +36,7 @@ use novarocks_frontend::mv::domain::repository::{
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_spi::connector::ConnectorTableObjectId;
-use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
+use novarocks_state_store_api::{CommitOutcome, Key, Precondition, TransactionId, Value};
 #[path = "common/mod.rs"]
 mod common;
 use common::state_store_fixture::{

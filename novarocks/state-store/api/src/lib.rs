@@ -15,18 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0140 (docs/adr/ADR-0140-state-store-contract-and-testkit-crates.md)
+
+//! Neutral StateStore domain contract.
+//!
+//! This crate owns the complete storage-side vocabulary: transactions, ranges,
+//! versions, commit outcomes, errors, limits, and the provider
+//! factory/instance/lifecycle contract. It depends on no columnar runtime, no
+//! Connector contract, and no application. Test fakes and the shared behaviour
+//! suite live in the separate `novarocks-state-store-testkit` crate, so a
+//! production dependency can never pull them in.
+
 mod contract;
 mod error;
 mod limits;
 mod metrics;
 mod provider;
 mod range;
-
-#[cfg(feature = "state-store-conformance")]
-pub mod conformance;
-
-#[cfg(feature = "state-store-conformance")]
-pub mod testing;
 
 pub use contract::{
     ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Key,

@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, Version};
 
-use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind, StoreIdentity};
+use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind, StoreIdentity};
 
 use super::codec::MysqlCodec;
 use crate::MYSQL_MAX_META_VALUE_BYTES;

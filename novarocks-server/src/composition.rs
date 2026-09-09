@@ -59,7 +59,7 @@ use novarocks_spi::connector::{
     MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
     WriteCommitEvidenceLimits,
 };
-use novarocks_spi::state_store::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
+use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
 use novarocks_types::{ClusterRole, NativeCompatibilityId};
 

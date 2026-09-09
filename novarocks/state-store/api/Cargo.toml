@@ -1,0 +1,18 @@
+[package]
+name = "novarocks-state-store-api"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["serde", "v7"] }
+
+# Test-only. The provider-contract target drives async trait methods; this
+# never reaches the production closure, which the boundary guard verifies.
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

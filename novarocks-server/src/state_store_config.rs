@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use novarocks_spi::state_store::{MAX_KEY_BYTES, StateStoreProviderId};
+use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderId};
 use novarocks_state_store_sqlite::SqliteHistoryRetentionConfig;
 
 use crate::state_store_limits::{StateStoreLimitOverrides, resolve_state_store_limits};

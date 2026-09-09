@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_secret::SecretValue;
 #[cfg(feature = "state-store-test-hooks")]
-use novarocks_spi::state_store::ContinuationToken;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::ContinuationToken;
+use novarocks_state_store_api::{
     CommitOutcome, Direction, Key, KeyRange, Precondition, RangeRequest, StateStore,
     StateStoreErrorKind, TransactionId, Value,
 };
@@ -57,7 +57,7 @@ use uuid::{Uuid, Version};
 
 mod common;
 
-use novarocks_spi::state_store::conformance::{
+use novarocks_state_store_testkit::conformance::{
     self as state_store_conformance, PostDispatchControl, PostDispatchController,
     PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };
@@ -160,7 +160,7 @@ fn transaction_store_config(
 async fn open_mysql_store(
     runtime: &MysqlProviderTestHarness,
     config: MysqlTestStoreConfig,
-) -> Result<Arc<dyn StateStore>, novarocks_spi::state_store::StateStoreError> {
+) -> Result<Arc<dyn StateStore>, novarocks_state_store_api::StateStoreError> {
     runtime
         .open_store(config, Instant::now() + Duration::from_secs(30))
         .await
@@ -171,7 +171,7 @@ async fn open_store(
     database: &str,
     cluster_id: &str,
     deadline_ms: u64,
-) -> Result<std::sync::Arc<dyn StateStore>, novarocks_spi::state_store::StateStoreError> {
+) -> Result<std::sync::Arc<dyn StateStore>, novarocks_state_store_api::StateStoreError> {
     open_mysql_store(runtime, store_config(database, cluster_id, deadline_ms)).await
 }
 
@@ -2050,7 +2050,7 @@ async fn mysql_preconditions_stage_successfully_and_fail_only_at_commit() {
     .await
     .expect("stage precondition seed");
     assert_committed(seed.commit().await);
-    let stale = novarocks_spi::state_store::VersionToken::try_from(Bytes::from_static(b"stale"))
+    let stale = novarocks_state_store_api::VersionToken::try_from(Bytes::from_static(b"stale"))
         .expect("stale version");
 
     for (item, precondition) in [
@@ -3152,7 +3152,7 @@ async fn mysql_commit_predispatch_gate_deadline_terminalizes() {
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve gated pre-dispatch commit"),
-        novarocks_spi::state_store::CommitResolution::Unresolved
+        novarocks_state_store_api::CommitResolution::Unresolved
     );
     let outcome = waiter.await.expect("join pre-dispatch deadline waiter");
     assert!(
@@ -3168,7 +3168,7 @@ async fn mysql_commit_predispatch_gate_deadline_terminalizes() {
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve terminalized pre-dispatch commit"),
-        novarocks_spi::state_store::CommitResolution::NotCommitted
+        novarocks_state_store_api::CommitResolution::NotCommitted
     );
     drop(store);
     runtime
@@ -3218,7 +3218,7 @@ async fn assert_prepare_failure_terminalizes_after_rollback_failure(
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve terminalized prepare failure"),
-        novarocks_spi::state_store::CommitResolution::NotCommitted
+        novarocks_state_store_api::CommitResolution::NotCommitted
     );
     let failed_connection = MysqlCommitTestApi::last_prepare_failure_connection_id();
     assert_ne!(failed_connection, 0);
@@ -3297,7 +3297,7 @@ async fn mysql_prepare_error_reports_unknown_when_terminalization_cannot_checkou
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve pending after unknown terminalization"),
-        novarocks_spi::state_store::CommitResolution::Unresolved
+        novarocks_state_store_api::CommitResolution::Unresolved
     );
     drop(store);
     runtime
@@ -3360,7 +3360,7 @@ async fn mysql_prepare_error_terminalization_timeout_destroys_locked_connection(
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve locked terminalization timeout"),
-        novarocks_spi::state_store::CommitResolution::Unresolved
+        novarocks_state_store_api::CommitResolution::Unresolved
     );
 
     let mut first = hold_connection(&runtime, &database.name, Duration::from_secs(4))
@@ -3444,7 +3444,7 @@ async fn mysql_prepare_error_prefers_authoritative_committed_receipt() {
             .resolve_commit(&transaction_id)
             .await
             .expect("resolve authoritative committed ledger"),
-        novarocks_spi::state_store::CommitResolution::Committed(_)
+        novarocks_state_store_api::CommitResolution::Committed(_)
     ));
     drop(store);
     runtime
@@ -3520,7 +3520,7 @@ async fn mysql_change_poll_cancellation_destroys_active_connection_and_holds_gua
     let poll_store = Arc::clone(&store);
     let waiter = tokio::spawn(async move {
         poll_store
-            .poll_changes(&novarocks_spi::state_store::ChangePollRequest {
+            .poll_changes(&novarocks_state_store_api::ChangePollRequest {
                 after: None,
                 page_size: 1,
             })

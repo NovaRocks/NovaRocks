@@ -24,12 +24,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, Direction, Key, RangePage,
     RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind, StoreIdentity, StoreRevision,
 };
 
-use novarocks_spi::state_store::StateStoreMetrics;
+use novarocks_state_store_api::StateStoreMetrics;
 
 use super::open_connection;
 use super::schema::load_change_retention_floor;

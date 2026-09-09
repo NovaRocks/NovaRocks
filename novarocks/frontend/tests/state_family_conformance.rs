@@ -53,7 +53,7 @@ use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };
 use novarocks_secret::SecretValue;
-use novarocks_spi::state_store::{Direction, Key, KeyRange, RangeRequest, StateStore};
+use novarocks_state_store_api::{Direction, Key, KeyRange, RangeRequest, StateStore};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;

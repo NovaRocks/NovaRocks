@@ -34,8 +34,8 @@ use super::commit::{
 use super::range::range_page;
 use super::{classify_native_read_error, record_provider_error_metric};
 use crate::runtime::OperationHandle;
-use novarocks_spi::state_store::StateStoreMetrics;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::StateStoreMetrics;
+use novarocks_state_store_api::{
     CommitOutcome, Key, Precondition, RangePage, RangeRequest, ReadTransaction, StateRecord,
     StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreOperation, StateStoreOutcome,
     TransactionId, Value, VersionToken, WriteTransaction,

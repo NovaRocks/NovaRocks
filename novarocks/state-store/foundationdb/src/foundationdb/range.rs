@@ -26,7 +26,7 @@ use tokio::time::{Instant, timeout_at};
 
 use super::codec::KeyspaceCodec;
 use super::txn::Mutation;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     Direction, Key, RangePage, RangeRequest, StateRecord, StateStoreError, StateStoreErrorKind,
     Value, VersionToken,
 };
@@ -268,7 +268,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use novarocks_spi::state_store::{KeyRange, Precondition};
+    use novarocks_state_store_api::{KeyRange, Precondition};
 
     fn key(value: &'static [u8]) -> Key {
         Key::try_from(Bytes::from_static(value)).expect("key")

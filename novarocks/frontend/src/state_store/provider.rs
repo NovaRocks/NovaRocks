@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
 };
 

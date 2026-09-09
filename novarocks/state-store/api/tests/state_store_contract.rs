@@ -16,7 +16,7 @@
 // under the License.
 
 use bytes::Bytes;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangeCursor, Direction, Key, KeyRange, RangeRequest, StateStore, StateStoreErrorKind,
     StateStoreLimits, StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
     StateStoreProviderId, StoreRevision, Value, VersionToken,

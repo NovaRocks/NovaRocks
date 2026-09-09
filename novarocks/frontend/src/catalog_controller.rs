@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks_spi::state_store::{ChangeCursor, ChangePollRequest, StateStore, StoreIdentity};
+use novarocks_state_store_api::{ChangeCursor, ChangePollRequest, StateStore, StoreIdentity};
 use tokio::task::JoinHandle;
 
 use crate::catalog_application::FrontendCatalogApplicationPort;
@@ -301,11 +301,12 @@ mod tests {
         builtin_state_store_provider_registry,
     };
     use novarocks_spi::connector::{ConnectorControlResolver, ConnectorProviderId};
-    use novarocks_spi::state_store::{
+    use novarocks_state_store_api::{
         ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore,
         StateStoreError, StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot,
-        StoreIdentity, TransactionId, WriteTransaction, conformance::FaultInjectingStateStore,
+        StoreIdentity, TransactionId, WriteTransaction,
     };
+    use novarocks_state_store_testkit::conformance::FaultInjectingStateStore;
 
     use super::*;
     use crate::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
@@ -394,7 +395,7 @@ mod tests {
 
         async fn identity(
             &self,
-        ) -> Result<novarocks_spi::state_store::StoreIdentity, StateStoreError> {
+        ) -> Result<novarocks_state_store_api::StoreIdentity, StateStoreError> {
             self.inner.identity().await
         }
 
@@ -610,15 +611,15 @@ mod tests {
     impl ReadTransaction for ScanMissesAttachmentsRead {
         async fn get(
             &mut self,
-            key: &novarocks_spi::state_store::Key,
-        ) -> Result<Option<novarocks_spi::state_store::StateRecord>, StateStoreError> {
+            key: &novarocks_state_store_api::Key,
+        ) -> Result<Option<novarocks_state_store_api::StateRecord>, StateStoreError> {
             self.inner.get(key).await
         }
 
         async fn range(
             &mut self,
-            request: &novarocks_spi::state_store::RangeRequest,
-        ) -> Result<novarocks_spi::state_store::RangePage, StateStoreError> {
+            request: &novarocks_state_store_api::RangeRequest,
+        ) -> Result<novarocks_state_store_api::RangePage, StateStoreError> {
             let mut page = self.inner.range(request).await?;
             if self.hide_from_scan {
                 page.records.clear();
@@ -1296,7 +1297,7 @@ mod tests {
             .await
             .expect("read change page");
         let fault = FaultInjectingStateStore::new(Arc::clone(&store));
-        fault.script_next_change_page(novarocks_spi::state_store::ChangePage {
+        fault.script_next_change_page(novarocks_state_store_api::ChangePage {
             resync_required: true,
             ..change
         });

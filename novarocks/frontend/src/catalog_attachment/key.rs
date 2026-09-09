@@ -16,7 +16,7 @@
 // under the License.
 
 use novarocks_spi::connector::ConnectorInstanceId;
-use novarocks_spi::state_store::Key;
+use novarocks_state_store_api::Key;
 
 use crate::state_family::{PersistentKeyPrefix, StateFamily};
 

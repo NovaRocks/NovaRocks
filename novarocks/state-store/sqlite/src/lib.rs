@@ -33,7 +33,7 @@ use fs2::FileExt;
 use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags};
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
     StateStoreErrorKind, StateStoreLimits, StateStoreMetrics, StateStoreMetricsSnapshot,
     StateStoreOpenRequest, StateStoreProviderId, StoreIdentity, TransactionId, WriteTransaction,

@@ -32,6 +32,7 @@ novarocks-proto-models = { path = "../proto-models" }
 novarocks-parser = { path = "../parser" }
 novarocks-plan-codec = { path = "../plan-codec" }
 novarocks-spi = { path = "../spi" }
+novarocks-state-store-api = { path = "../state-store/api" }
 novarocks-sql = { path = "../sql" }
 novarocks-task-codec = { path = "../task-codec" }
 novarocks-types = { path = "../types" }
@@ -54,7 +55,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 [dev-dependencies]
 novarocks-connector-starrocks = { path = "../connector/starrocks" }
 novarocks-secret = { path = "../secret" }
-novarocks-spi = { path = "../spi", features = ["state-store-conformance"] }
+novarocks-state-store-testkit = { path = "../state-store/testkit" }
 novarocks-sql = { path = "../sql", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }

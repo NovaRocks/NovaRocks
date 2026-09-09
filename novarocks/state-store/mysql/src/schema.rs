@@ -37,7 +37,7 @@ use super::identity::{
 };
 #[cfg(feature = "state-store-test-hooks")]
 use super::open_test_hooks::{MysqlOpenGatePhase, take_mysql_open_gate};
-use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind};
 
 const SCHEMA_MANIFEST: &str = concat!(
     "CREATE TABLE state_store_meta (\n",

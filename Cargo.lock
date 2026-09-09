@@ -3628,6 +3628,8 @@ dependencies = [
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-state-store-api",
+ "novarocks-state-store-testkit",
  "novarocks-task-codec",
  "novarocks-types",
  "novarocks-user-error",
@@ -3788,6 +3790,7 @@ dependencies = [
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-state-store-api",
  "novarocks-state-store-sqlite",
  "novarocks-test-support",
  "novarocks-types",
@@ -3812,7 +3815,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tokio",
  "url",
  "uuid",
 ]
@@ -3840,6 +3842,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-state-store-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "sha2",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "novarocks-state-store-foundationdb"
 version = "0.1.0"
 dependencies = [
@@ -3850,7 +3863,8 @@ dependencies = [
  "futures",
  "hex",
  "novarocks-secret",
- "novarocks-spi",
+ "novarocks-state-store-api",
+ "novarocks-state-store-testkit",
  "serde",
  "serde_json",
  "sha2",
@@ -3871,7 +3885,8 @@ dependencies = [
  "hex",
  "mysql_async",
  "novarocks-secret",
- "novarocks-spi",
+ "novarocks-state-store-api",
+ "novarocks-state-store-testkit",
  "rustls",
  "serde",
  "serde_json",
@@ -3890,9 +3905,20 @@ dependencies = [
  "bytes",
  "fs2",
  "log",
- "novarocks-spi",
+ "novarocks-state-store-api",
  "rusqlite",
  "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "novarocks-state-store-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "novarocks-state-store-api",
  "tokio",
  "uuid",
 ]

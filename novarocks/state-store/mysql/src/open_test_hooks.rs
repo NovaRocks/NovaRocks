@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::Notify;
 
-use novarocks_spi::state_store::{StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_api::{StateStoreError, StateStoreErrorKind};
 
 static OPEN_GATES: OnceLock<Mutex<HashMap<String, Arc<OpenGateState>>>> = OnceLock::new();
 

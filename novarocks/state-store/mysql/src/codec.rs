@@ -19,7 +19,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use novarocks_spi::state_store::{Key, StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_api::{Key, StateStoreError, StateStoreErrorKind};
 
 use crate::MYSQL_MAX_KEY_BYTES;
 
@@ -168,10 +168,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{DurableCommitState, MysqlCodec, redacted_identity_hash};
-    use novarocks_spi::state_store::StateStoreErrorKind;
+    use novarocks_state_store_api::StateStoreErrorKind;
 
     fn assert_corruption<T: std::fmt::Debug>(
-        result: Result<T, novarocks_spi::state_store::StateStoreError>,
+        result: Result<T, novarocks_state_store_api::StateStoreError>,
     ) {
         assert_eq!(
             result

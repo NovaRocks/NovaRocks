@@ -28,7 +28,7 @@ use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
 use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
-use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
+use novarocks_state_store_api::{StateStore, StateStoreProviderId};
 use novarocks_types::NativeCompatibilityId;
 
 use crate::catalog_application::desired_state::{
@@ -1246,7 +1246,7 @@ mod tests {
         },
     };
     use async_trait::async_trait;
-    use novarocks_spi::state_store::{
+    use novarocks_state_store_api::{
         StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderDescriptor,
         StateStoreProviderFactory, StateStoreProviderInstance,
     };
@@ -1258,7 +1258,7 @@ mod tests {
 
     const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
         TEST_STATE_STORE_PROVIDER_ID,
-        novarocks_spi::state_store::MAX_KEY_BYTES,
+        novarocks_state_store_api::MAX_KEY_BYTES,
     );
 
     struct FailingFactory;

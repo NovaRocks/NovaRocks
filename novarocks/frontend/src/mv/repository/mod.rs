@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     Direction, Key, KeyRange, Precondition, RangeRequest, ReadTransaction, StateRecord, StateStore,
     StateStoreError, StateStoreErrorKind, WriteTransaction,
 };
@@ -65,7 +65,7 @@ impl StateStoreMvRepository {
     ) -> Result<Arc<Self>, MvRepositoryError> {
         Ok(Arc::new(Self {
             runner_metrics: StateStoreMetrics::new(
-                novarocks_spi::state_store::StateStoreProviderId::new("frontend-mv-accelerator"),
+                novarocks_state_store_api::StateStoreProviderId::new("frontend-mv-accelerator"),
             ),
             store,
             runtime,

@@ -16,7 +16,7 @@
 // under the License.
 
 //! Test-only in-memory StateStore support. This module is deliberately gated
-//! behind `state-store-conformance` and is not a production provider.
+//! test-only crate and is not a production provider.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,20 +27,20 @@ use bytes::Bytes;
 use tokio::sync::{oneshot, watch};
 use uuid::Uuid;
 
-use super::{
+use novarocks_state_store_api::{
     ChangeCursor, ChangeHint, ChangePage, ChangePollRequest, CommitOutcome, CommitReceipt,
     CommitResolution, Direction, Key, Precondition, RangePage, RangeRequest, ReadTransaction,
     StateRecord, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
     StateStoreMetrics, StateStoreMetricsSnapshot, StateStoreOperation, StateStoreOutcome,
     StoreIdentity, StoreRevision, TransactionId, Value, VersionToken, WriteTransaction,
 };
-use super::{
+use novarocks_state_store_api::{
     StateStoreOpenRequest, StateStoreProviderDescriptor, StateStoreProviderFactory,
     StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
 
-const IN_MEMORY_PROVIDER_ID: super::StateStoreProviderId =
-    super::StateStoreProviderId::new("in-memory-test");
+const IN_MEMORY_PROVIDER_ID: novarocks_state_store_api::StateStoreProviderId =
+    novarocks_state_store_api::StateStoreProviderId::new("in-memory-test");
 
 /// A deterministic, serializable reference implementation for consumer tests.
 pub struct InMemoryStateStore {
@@ -870,7 +870,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::state_store::conformance::{
+    use crate::conformance::{
         FaultGate, FaultInjectingStateStore, PostDispatchControl, PostDispatchController,
         PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
         run_state_store_conformance,

@@ -27,14 +27,14 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 use super::test_support::{MysqlCommitTestApi, MysqlProviderTestHarness};
-use novarocks_spi::state_store::MAX_VALUE_BYTES;
+use novarocks_state_store_api::MAX_VALUE_BYTES;
 
 use crate::{
     MYSQL_MAX_KEY_BYTES, MySqlClientConfig, MySqlTlsMode, MysqlTestLimitOverrides,
     MysqlTestProviderConfig, MysqlTestStoreConfig,
 };
 use novarocks_secret::SecretValue;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, ContinuationToken,
     Direction as StoreDirection, Key, KeyRange, Precondition as StorePrecondition, RangeRequest,
     StateRecord, StateStore, StateStoreError, TransactionId, Value, VersionToken, WriteTransaction,

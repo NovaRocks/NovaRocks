@@ -26,7 +26,7 @@ use std::time::Instant as StdInstant;
 use foundationdb::Database;
 use foundationdb::api::{FdbApiBuilder, NetworkRunner, NetworkStop};
 use foundationdb::options::NetworkOption;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
 };
 use tokio::sync::Notify;

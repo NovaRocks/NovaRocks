@@ -1,0 +1,14 @@
+[package]
+name = "novarocks-state-store-testkit"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+novarocks-state-store-api = { path = "../api" }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+uuid = { version = "1", features = ["serde", "v7"] }

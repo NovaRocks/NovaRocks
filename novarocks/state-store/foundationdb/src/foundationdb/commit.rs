@@ -30,8 +30,8 @@ use super::txn::create_raw_transaction_with_observer;
 #[cfg(test)]
 use crate::FOUNDATIONDB_STATE_STORE_PROVIDER_ID;
 use crate::runtime::OperationHandle;
-use novarocks_spi::state_store::StateStoreMetrics;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::StateStoreMetrics;
+use novarocks_state_store_api::{
     CommitOutcome, CommitReceipt, CommitResolution, StateStoreError, StateStoreErrorKind,
     StateStoreLimits, StateStoreOperation, StateStoreOutcome, StoreRevision, TransactionId,
 };

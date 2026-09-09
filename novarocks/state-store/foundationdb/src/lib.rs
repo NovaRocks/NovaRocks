@@ -21,7 +21,7 @@ pub mod config;
 
 pub use config::{FoundationDbClientConfig, FoundationDbProviderConfig};
 
-use novarocks_spi::state_store::StateStoreProviderId;
+use novarocks_state_store_api::StateStoreProviderId;
 
 pub const FOUNDATIONDB_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
     StateStoreProviderId::new("foundationdb");
@@ -33,14 +33,14 @@ pub enum FoundationDbProviderBuildError {
 }
 
 impl FoundationDbProviderBuildError {
-    pub fn into_state_store_error(self) -> novarocks_spi::state_store::StateStoreError {
+    pub fn into_state_store_error(self) -> novarocks_state_store_api::StateStoreError {
         match self {
-            Self::NotCompiled => novarocks_spi::state_store::StateStoreError::new(
-                novarocks_spi::state_store::StateStoreErrorKind::ProviderUnavailable,
+            Self::NotCompiled => novarocks_state_store_api::StateStoreError::new(
+                novarocks_state_store_api::StateStoreErrorKind::ProviderUnavailable,
                 "FoundationDB state store provider is not compiled in",
             ),
-            Self::InvalidConfiguration => novarocks_spi::state_store::StateStoreError::new(
-                novarocks_spi::state_store::StateStoreErrorKind::InvalidConfiguration,
+            Self::InvalidConfiguration => novarocks_state_store_api::StateStoreError::new(
+                novarocks_state_store_api::StateStoreErrorKind::InvalidConfiguration,
                 "FoundationDB state store provider configuration is invalid",
             ),
         }
@@ -52,12 +52,12 @@ pub fn foundationdb_provider_factory(
     config: FoundationDbProviderConfig,
     client: FoundationDbClientConfig,
 ) -> Result<
-    Box<dyn novarocks_spi::state_store::StateStoreProviderFactory>,
+    Box<dyn novarocks_state_store_api::StateStoreProviderFactory>,
     FoundationDbProviderBuildError,
 > {
     FoundationDbStateStoreProviderFactory::new(config, client)
         .map(|factory| {
-            Box::new(factory) as Box<dyn novarocks_spi::state_store::StateStoreProviderFactory>
+            Box::new(factory) as Box<dyn novarocks_state_store_api::StateStoreProviderFactory>
         })
         .map_err(|_| FoundationDbProviderBuildError::InvalidConfiguration)
 }
@@ -67,7 +67,7 @@ pub fn foundationdb_provider_factory(
     _config: FoundationDbProviderConfig,
     _client: FoundationDbClientConfig,
 ) -> Result<
-    Box<dyn novarocks_spi::state_store::StateStoreProviderFactory>,
+    Box<dyn novarocks_state_store_api::StateStoreProviderFactory>,
     FoundationDbProviderBuildError,
 > {
     Err(FoundationDbProviderBuildError::NotCompiled)
@@ -169,7 +169,7 @@ use self::codec::KeyspaceCodec;
 #[cfg(feature = "foundationdb-provider")]
 use self::identity::open_identity;
 #[cfg(feature = "foundationdb-provider")]
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore, StateStoreError,
     StateStoreErrorKind, StateStoreLimits, StateStoreMetricsSnapshot, StoreIdentity, TransactionId,
     WriteTransaction,
@@ -178,7 +178,7 @@ use novarocks_spi::state_store::{
 #[cfg(feature = "foundationdb-provider")]
 use self::runtime::ProviderHandle;
 #[cfg(feature = "foundationdb-provider")]
-use novarocks_spi::state_store::StateStoreMetrics;
+use novarocks_state_store_api::StateStoreMetrics;
 
 #[cfg(feature = "foundationdb-provider")]
 pub(crate) struct FoundationDbStateStore {
@@ -336,7 +336,7 @@ impl StateStore for FoundationDbStateStore {
 #[cfg(all(test, feature = "foundationdb-provider"))]
 mod tests {
     use super::*;
-    use novarocks_spi::state_store::{StateStoreErrorKind, StateStoreOperation};
+    use novarocks_state_store_api::{StateStoreErrorKind, StateStoreOperation};
 
     #[test]
     fn provider_error_metrics_count_each_blocker_without_public_operation_duplication() {

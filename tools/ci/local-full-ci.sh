@@ -458,6 +458,14 @@ run_cargo_gates() {
     tools/ci/check-connector-role-binding-boundary.py
   run_fail_fast_stage "connector role binding boundary mutations" "connector-role-binding-boundary-test.log" \
     tools/ci/tests/connector-role-binding-boundary-test.sh
+  run_fail_fast_stage "StateStore dependency boundary" "state-store-dependency-boundary.log" \
+    python3 tools/ci/check-state-store-dependency-boundary.py --manifest-path Cargo.toml
+  run_fail_fast_stage "StateStore dependency boundary mutations" "state-store-dependency-boundary-test.log" \
+    tools/ci/tests/state-store-dependency-boundary-test.sh
+  run_fail_fast_stage "SPI dependency boundary" "spi-dependency-boundary.log" \
+    python3 tools/ci/check-spi-dependency-boundary.py --manifest-path Cargo.toml
+  run_fail_fast_stage "SPI dependency boundary mutations" "spi-dependency-boundary-test.log" \
+    tools/ci/tests/spi-dependency-boundary-test.sh
   run_fail_fast_stage "NCP-8 statistics boundary" "ncp8-statistics-boundary.log" \
     tools/ci/check-ncp8-statistics-boundary.py
   run_fail_fast_stage "NCP-8 statistics boundary mutations" "ncp8-statistics-boundary-test.log" \

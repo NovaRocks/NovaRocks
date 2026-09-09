@@ -16,11 +16,11 @@
 // under the License.
 
 #[cfg(feature = "state-store-test-hooks")]
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitReceipt, CommitResolution, Key,
     StateRecord, StoreRevision, TransactionId, Value,
 };
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     Precondition, StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest,
 };
 

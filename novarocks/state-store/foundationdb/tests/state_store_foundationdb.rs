@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use foundationdb::Database;
 use foundationdb::options::TransactionOption;
-use novarocks_spi::state_store::{
+use novarocks_state_store_api::{
     ChangePollRequest, CommitOutcome, CommitResolution, Direction, Key, KeyRange, Precondition,
     RangeRequest, StateStore, StateStoreErrorKind, TransactionId, Value,
 };
@@ -43,7 +43,7 @@ use novarocks_state_store_foundationdb::{
 use uuid::Uuid;
 
 #[cfg(feature = "state-store-test-hooks")]
-use novarocks_spi::state_store::conformance::{
+use novarocks_state_store_testkit::conformance::{
     self as state_store_conformance, PostDispatchControl, PostDispatchController,
     PostDispatchScenario, StateStoreConformanceFixture, StateStoreFactory,
 };

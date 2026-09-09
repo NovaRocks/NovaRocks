@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use novarocks_spi::state_store::StateStoreErrorKind;
+use novarocks_state_store_api::StateStoreErrorKind;
 use novarocks_state_store_foundationdb::{
     FoundationDbClientConfig, FoundationDbProviderTestHarness, FoundationDbTestLimitOverrides,
     FoundationDbTestProviderConfig, FoundationDbTestStoreConfig,
