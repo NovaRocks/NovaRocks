@@ -4801,7 +4801,7 @@ mod tests {
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let authority = control.resources();
         let credit = authority
             .reserve_result_credit(&root.owner.scope(), bytes)
@@ -6638,7 +6638,7 @@ mod tests {
         let root = root_task(first, 1);
         let observer = running.bind_root_result(root).await.unwrap();
         let batch = result_batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let (control, credit_owner, authority, credit) = result_credit(&batch);
         let delivery_running = Arc::clone(&running);
         let delivery_task = tokio::spawn(async move {
@@ -7204,7 +7204,7 @@ mod tests {
         let root = root_task(first, 6);
         let observer = running.bind_root_result(root).await.unwrap();
         let batch = result_batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let (control, credit_owner, authority, credit) = result_credit(&batch);
         let (reply, response) = oneshot::channel();
         actor

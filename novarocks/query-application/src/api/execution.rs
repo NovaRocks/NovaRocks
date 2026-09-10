@@ -153,16 +153,61 @@ pub trait ExecutionControl: Send + 'static {
 /// ```
 pub struct ExecutionHandle {
     control: Box<dyn ExecutionControl>,
+    output: Option<crate::api::ExecutionOutput>,
 }
 
 impl ExecutionHandle {
-    pub fn new(control: impl ExecutionControl) -> Self {
+    pub fn new(control: impl ExecutionControl, output: crate::api::ExecutionOutput) -> Self {
         Self {
             control: Box::new(control),
+            output: Some(output),
         }
     }
 
     pub fn request_cancel(&self) -> Result<(), QueryExecutionError> {
         self.control.request_cancel()
+    }
+
+    /// Transfers the single result consumer to the protocol/application owner.
+    /// Cancellation remains available on this handle while that output is in
+    /// use, and taking it twice cannot create another consumer.
+    pub fn take_output(&mut self) -> Option<crate::api::ExecutionOutput> {
+        self.output.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+    use crate::api::ExecutionOutput;
+
+    struct RecordingControl(Arc<AtomicBool>);
+
+    impl ExecutionControl for RecordingControl {
+        fn request_cancel(&self) -> Result<(), QueryExecutionError> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn execution_handle_transfers_output_once_and_keeps_control() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut handle = ExecutionHandle::new(
+            RecordingControl(Arc::clone(&cancelled)),
+            ExecutionOutput::Completion,
+        );
+        assert!(matches!(
+            handle.take_output(),
+            Some(ExecutionOutput::Completion)
+        ));
+        assert!(handle.take_output().is_none());
+        handle.request_cancel().unwrap();
+        assert!(cancelled.load(Ordering::SeqCst));
     }
 }

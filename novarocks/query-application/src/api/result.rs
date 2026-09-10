@@ -24,9 +24,11 @@
 //! owns the existing workload-control credit through protocol consumption, so
 //! an item queue can never become a second or weaker byte authority.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use arrow::{
+    array::ArrayData,
+    buffer::Buffer,
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -39,6 +41,48 @@ use novarocks_workload_control::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{QueryExecutionError, QueryExecutionErrorKind};
+
+/// Returns the workload charge retained by one delivered batch.
+///
+/// Several arrays and slices may share one allocation. Charging the visible
+/// buffers independently would multiply that allocation, while Arrow's generic
+/// object-size estimate also includes unstable Rust metadata. Result delivery
+/// instead charges each reachable backing allocation once. Sharing across
+/// separate batches remains conservatively charged once per delivery owner. A
+/// batch with no Arrow backing keeps a one-byte sentinel because its row count
+/// can still carry result semantics.
+pub(crate) fn decoded_result_charge_bytes(batch: &RecordBatch) -> usize {
+    let mut seen = HashSet::new();
+    let backing_bytes = batch.columns().iter().fold(0usize, |total, column| {
+        total.saturating_add(array_backing_bytes(&column.to_data(), &mut seen))
+    });
+    // A zero-column batch can still carry a nonzero row count. Keep that
+    // delivery represented in the byte authority without inventing unstable
+    // Arrow object-size accounting.
+    backing_bytes.max(1)
+}
+
+fn array_backing_bytes(data: &ArrayData, seen: &mut HashSet<usize>) -> usize {
+    let mut total = 0usize;
+    for buffer in data.buffers() {
+        total = total.saturating_add(buffer_backing_bytes(buffer, seen));
+    }
+    if let Some(nulls) = data.nulls() {
+        total = total.saturating_add(buffer_backing_bytes(nulls.buffer(), seen));
+    }
+    for child in data.child_data() {
+        total = total.saturating_add(array_backing_bytes(child, seen));
+    }
+    total
+}
+
+fn buffer_backing_bytes(buffer: &Buffer, seen: &mut HashSet<usize>) -> usize {
+    let allocation = buffer.data_ptr().as_ptr() as usize;
+    if !seen.insert(allocation) {
+        return 0;
+    }
+    buffer.capacity().max(buffer.len())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultField {
@@ -260,16 +304,17 @@ impl BatchDelivery {
                 )),
             ));
         }
-        let decoded_bytes = match u64::try_from(batch.as_ref().unwrap().get_array_memory_size()) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return Err(reject_batch(
-                    batch.take().unwrap(),
-                    credit.take().unwrap(),
-                    invalid_result_delivery("decoded result batch size does not fit u64"),
-                ));
-            }
-        };
+        let decoded_bytes =
+            match u64::try_from(decoded_result_charge_bytes(batch.as_ref().unwrap())) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Err(reject_batch(
+                        batch.take().unwrap(),
+                        credit.take().unwrap(),
+                        invalid_result_delivery("decoded result batch size does not fit u64"),
+                    ));
+                }
+            };
         if decoded_bytes == 0 || credit.as_ref().unwrap().held_bytes() != decoded_bytes {
             let credited = credit.as_ref().unwrap().held_bytes();
             return Err(reject_batch(
@@ -709,7 +754,7 @@ fn failed_result_delivery_message(message: impl Into<Arc<str>>) -> QueryExecutio
 #[cfg(test)]
 mod tests {
     use arrow::{
-        array::Int64Array,
+        array::{ArrayRef, Int64Array},
         datatypes::{DataType, Field, Schema},
     };
     use novarocks_types::{AttemptId, QueryId};
@@ -743,6 +788,39 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![11_i64, 13]))],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn decoded_result_bytes_charge_shared_backing_once() {
+        let source = Int64Array::from(vec![11_i64, 13, 17, 19]);
+        let left = Arc::new(source.slice(0, 2)) as ArrayRef;
+        let right = Arc::new(source.slice(2, 2)) as ArrayRef;
+        let left_only = RecordBatch::try_from_iter(vec![("left", Arc::clone(&left))]).unwrap();
+        let shared = RecordBatch::try_from_iter(vec![("left", left), ("right", right)]).unwrap();
+
+        assert_eq!(
+            decoded_result_charge_bytes(&shared),
+            decoded_result_charge_bytes(&left_only)
+        );
+    }
+
+    #[test]
+    fn decoded_result_bytes_keep_zero_column_rows_represented() {
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(7));
+        let batch =
+            RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
+
+        assert_eq!(decoded_result_charge_bytes(&batch), 1);
+
+        let control = workload();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let credit = decoded_credit(&control, &root.owner.scope(), 1);
+        let (delivery, _receipt) =
+            BatchDelivery::try_new(execution_id(1), ResultPacketSequence::new(0), batch, credit)
+                .unwrap();
+        assert_eq!(delivery.batch().num_rows(), 7);
     }
 
     fn workload() -> WorkloadControl {
@@ -812,7 +890,7 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let credit = decoded_credit(&control, &root.owner.scope(), bytes);
         let authority = control.resources();
         let (delivery, receipt) =
@@ -842,7 +920,7 @@ mod tests {
     #[tokio::test]
     async fn protocol_capacity_wait_succeeds_after_capacity_release() {
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -886,7 +964,7 @@ mod tests {
     async fn protocol_capacity_waits_from_one_scope_are_fifo_and_coexist() {
         let first_batch = batch();
         let second_batch = batch();
-        let bytes = u64::try_from(first_batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&first_batch)).unwrap();
         let control = workload_with_limits(bytes * 5, bytes * 4);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -964,7 +1042,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn protocol_capacity_wait_timeout_is_one_absolute_deadline() {
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1016,7 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn protocol_capacity_wait_returns_cancelled_delivery_to_adapter() {
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1067,7 +1145,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn protocol_capacity_wait_uses_the_work_scope_deadline() {
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let work = control
@@ -1115,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn unrepresentable_protocol_capacity_fails_without_waiting() {
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1149,7 +1227,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_protocol_capacity_wait_releases_delivery_credit() {
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1191,7 +1269,7 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let credit = decoded_credit(&local, &work.owner.scope(), bytes);
         let (delivery, receipt) =
             BatchDelivery::try_new(execution_id(7), ResultPacketSequence::new(0), batch, credit)
@@ -1220,7 +1298,7 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let credit = decoded_credit(&control, &root.owner.scope(), bytes);
         let authority = control.resources();
         let (delivery, receipt) =
@@ -1257,7 +1335,7 @@ mod tests {
         );
 
         let batch = batch();
-        let bytes = u64::try_from(batch.get_array_memory_size()).unwrap();
+        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
         let credit = decoded_credit(&control, &root.owner.scope(), bytes);
         let (delivery, receipt) =
             BatchDelivery::try_new(id, ResultPacketSequence::new(0), batch, credit).unwrap();
