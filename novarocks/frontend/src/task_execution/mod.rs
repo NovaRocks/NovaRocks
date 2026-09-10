@@ -38,6 +38,7 @@ pub(crate) mod abort_effect;
 pub(crate) mod blocking_io;
 pub mod clock;
 pub mod completion;
+pub mod context_convergence;
 pub mod context_owner;
 pub mod credential;
 pub(crate) mod credential_pump;
@@ -62,6 +63,10 @@ pub use blocking_io::ConnectorBlockingIoBudget;
 pub use clock::{ManualClock, ProcessMonotonicClock, TaskProtocolClock};
 pub use completion::{
     ReadCompletionTracker, ReadVerdict, WriteCompletionTracker, WriteVerdict, accept_final_info,
+};
+pub use context_convergence::{
+    ContextConvergenceIntake, ContextConvergenceIntakeHandle, ContextConvergencePublishAdmission,
+    ContextConvergencePublishError,
 };
 pub use context_owner::{
     ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,

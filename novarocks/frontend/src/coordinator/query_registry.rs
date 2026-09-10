@@ -24,6 +24,10 @@ use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
+use novarocks_execution_contract::task_execution::context_convergence::{
+    QueryContextConvergenceReceipt, QueryContextConvergenceState,
+};
+use novarocks_execution_contract::task_execution::identity::QueryContextRef;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_query_application::coordination::{
     AttemptConvergenceFacts, AttemptDisposition, LogicalConclusion,
@@ -129,10 +133,14 @@ impl LatchedQueryFailure {
 
 #[derive(Default)]
 struct AttemptState {
-    /// Process identities, not durable membership ids. A `backend_idx` is a
-    /// round-local scheduling ordinal and must never identify an active
-    /// attempt after topology publication.
-    scheduled_backends: Option<BTreeSet<BackendProcessId>>,
+    /// Exact contexts frozen for this attempt, keyed by the scheduling
+    /// ordinal that selected their backend process. The ordinal is retained
+    /// only to qualify an exact process-replacement observation; it never
+    /// identifies a context without the frozen process identity.
+    scheduled_contexts: Option<BTreeMap<usize, QueryContextRef>>,
+    /// Compatibility-only process ownership used before an exact attempt is
+    /// registered. It cannot authorize context convergence facts.
+    legacy_scheduled_backends: Option<BTreeMap<usize, BackendProcessId>>,
     /// A concrete cause supersedes a lifecycle observation. Within one
     /// priority class the first observed cause remains primary, preserving
     /// causal ordering without interpreting rendered error text.
@@ -352,7 +360,7 @@ pub(crate) struct AttemptRouteSnapshot {
     query_id: QueryId,
     execution_id: QueryExecutionId,
     disposition: AttemptDisposition,
-    scheduled_backends: Option<BTreeSet<BackendProcessId>>,
+    scheduled_contexts: Option<BTreeMap<usize, QueryContextRef>>,
     primary_failure: Option<LatchedQueryFailure>,
     convergence: AttemptConvergenceFacts,
     backend_responsibilities: BTreeMap<BackendProcessId, AttemptBackendResponsibilitySnapshot>,
@@ -371,8 +379,8 @@ impl AttemptRouteSnapshot {
         self.disposition
     }
 
-    pub(crate) fn scheduled_backends(&self) -> Option<&BTreeSet<BackendProcessId>> {
-        self.scheduled_backends.as_ref()
+    pub(crate) fn scheduled_contexts(&self) -> Option<&BTreeMap<usize, QueryContextRef>> {
+        self.scheduled_contexts.as_ref()
     }
 
     pub(crate) fn primary_failure(&self) -> Option<&LatchedQueryFailure> {
@@ -406,7 +414,6 @@ pub(crate) struct AttemptResourceObservation {
 /// acknowledgement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AttemptStopEvidence {
-    WorkerPublished { version: u64 },
     TrustedExecutionFence { version: u64 },
 }
 
@@ -420,7 +427,7 @@ pub(crate) struct AttemptProcessReplacementEvidence {
 pub(crate) struct AttemptBackendResponsibilitySnapshot {
     pub(crate) resource: Option<AttemptResourceObservation>,
     pub(crate) current_unknown: bool,
-    pub(crate) worker_stop_version: Option<u64>,
+    pub(crate) context_convergence: Option<QueryContextConvergenceReceipt>,
     pub(crate) trusted_fence_version: Option<u64>,
     pub(crate) process_replacement: Option<AttemptProcessReplacementEvidence>,
 }
@@ -554,6 +561,25 @@ impl FrontendQueryRegistry {
         &self,
         execution_id: QueryExecutionId,
     ) -> Result<RegisteredAttempt, DistributedQueryError> {
+        self.register_initial_attempt_inner(execution_id, None)
+    }
+
+    /// Registers the first attempt and freezes its exact Worker contexts in
+    /// the same registry transaction.
+    pub(crate) fn register_initial_attempt_with_contexts(
+        &self,
+        execution_id: QueryExecutionId,
+        contexts: &[(usize, QueryContextRef)],
+    ) -> Result<RegisteredAttempt, DistributedQueryError> {
+        let frozen = self.validate_query_contexts(execution_id, contexts)?;
+        self.register_initial_attempt_inner(execution_id, Some(frozen))
+    }
+
+    fn register_initial_attempt_inner(
+        &self,
+        execution_id: QueryExecutionId,
+        mut frozen_contexts: Option<BTreeMap<usize, QueryContextRef>>,
+    ) -> Result<RegisteredAttempt, DistributedQueryError> {
         let query_id = execution_id.query_id();
         if query_id
             .process_attribution()
@@ -581,10 +607,15 @@ impl FrontendQueryRegistry {
         let logical_registration_generation = match state.logical.get_mut(&key) {
             None => {
                 let generation = next_logical_registration_generation(&mut state)?;
-                state.logical.insert(
-                    key,
-                    LogicalQuery::with_initial_attempt(execution_id, generation),
-                );
+                let mut logical = LogicalQuery::with_initial_attempt(execution_id, generation);
+                if let Some(contexts) = frozen_contexts.take() {
+                    let attempt = logical
+                        .attempts
+                        .get_mut(&execution_id)
+                        .expect("new logical query contains its initial attempt");
+                    set_attempt_query_contexts(attempt, contexts)?;
+                }
+                state.logical.insert(key, logical);
                 generation
             }
             Some(logical) => {
@@ -599,8 +630,28 @@ impl FrontendQueryRegistry {
                         self.describe_query_id(query_id)
                     )));
                 }
+                if let Some(contexts) = frozen_contexts.as_ref() {
+                    let context_backends = contexts
+                        .iter()
+                        .map(|(&ordinal, context)| (ordinal, context.backend_process_id()))
+                        .collect::<BTreeMap<_, _>>();
+                    if logical
+                        .unbound_attempt
+                        .legacy_scheduled_backends
+                        .as_ref()
+                        .is_some_and(|legacy| legacy != &context_backends)
+                    {
+                        return Err(contract_violation(
+                            "exact query contexts conflict with compatibility backend ownership",
+                        ));
+                    }
+                }
                 let initial_state =
                     std::mem::replace(&mut logical.unbound_attempt, AttemptState::new());
+                let mut initial_state = initial_state;
+                if let Some(contexts) = frozen_contexts.take() {
+                    set_attempt_query_contexts(&mut initial_state, contexts)?;
+                }
                 logical.legacy_registration_id = None;
                 logical.current_attempt = Some(execution_id);
                 logical.attempts.insert(execution_id, initial_state);
@@ -750,7 +801,7 @@ impl FrontendQueryRegistry {
             } else {
                 AttemptDisposition::Residual
             },
-            scheduled_backends: attempt.scheduled_backends.clone(),
+            scheduled_contexts: attempt.scheduled_contexts.clone(),
             primary_failure: attempt.first_failure.clone(),
             convergence: attempt.convergence,
             backend_responsibilities: attempt.backend_responsibilities.clone(),
@@ -776,12 +827,12 @@ impl FrontendQueryRegistry {
         set_attempt_backend_ownership(&mut query.unbound_attempt, backend_ownership)
     }
 
-    pub(crate) fn set_attempt_scheduled_backend_ownership(
+    pub(crate) fn set_attempt_query_contexts(
         &self,
         registered: &RegisteredAttempt,
-        backend_ownership: &[(usize, BackendProcessId)],
+        contexts: &[(usize, QueryContextRef)],
     ) -> Result<(), DistributedQueryError> {
-        self.validate_backend_ownership(backend_ownership)?;
+        let frozen = self.validate_query_contexts(registered.execution_id, contexts)?;
         let mut state = self.state.lock().expect("frontend query registry lock");
         let key = self.validate_registered_attempt(&state, registered)?;
         let logical = state
@@ -792,7 +843,90 @@ impl FrontendQueryRegistry {
             .attempts
             .get_mut(&registered.execution_id)
             .expect("frontend attempt owner points at attempt state");
-        set_attempt_backend_ownership(attempt, backend_ownership)
+        set_attempt_query_contexts(attempt, frozen)
+    }
+
+    /// Records one exact, versioned Worker convergence publication.
+    ///
+    /// Only a context frozen into this attempt can advance the retained fact.
+    /// Task terminal states and Abort acknowledgements do not carry this type
+    /// and therefore cannot enter this API.
+    pub(crate) fn record_query_context_convergence(
+        &self,
+        registered: &RegisteredAttempt,
+        receipt: QueryContextConvergenceReceipt,
+    ) -> Result<AttemptBackendResponsibilitySnapshot, DistributedQueryError> {
+        if receipt.context().query_execution_id() != registered.execution_id {
+            return Err(contract_violation(format!(
+                "query context convergence belongs to a different attempt (expected={:?} actual={:?})",
+                registered.execution_id,
+                receipt.context().query_execution_id()
+            )));
+        }
+        let mut state = self.state.lock().expect("frontend query registry lock");
+        let key = self.validate_registered_attempt(&state, registered)?;
+        let logical = state
+            .logical
+            .get_mut(&key)
+            .expect("frontend attempt owner points at a logical entry");
+        let attempt = logical
+            .attempts
+            .get_mut(&registered.execution_id)
+            .expect("frontend attempt owner points at attempt state");
+        let contexts = attempt.scheduled_contexts.as_ref().ok_or_else(|| {
+            contract_violation(
+                "query context convergence cannot be recorded before exact contexts are frozen",
+            )
+        })?;
+        let expected = contexts
+            .values()
+            .find(|context| context.backend_process_id() == receipt.context().backend_process_id())
+            .copied()
+            .ok_or_else(|| {
+                contract_violation(format!(
+                    "backend process {} is not a frozen participant of attempt {:?}",
+                    receipt.context().backend_process_id(),
+                    registered.execution_id
+                ))
+            })?;
+        if expected != receipt.context() {
+            return Err(contract_violation(format!(
+                "query context convergence identity does not match the frozen context (expected={expected} actual={})",
+                receipt.context()
+            )));
+        }
+        match receipt.state() {
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced => {}
+        }
+
+        let responsibility = attempt
+            .backend_responsibilities
+            .get_mut(&receipt.context().backend_process_id())
+            .expect("frozen context has a backend responsibility");
+        match responsibility.context_convergence {
+            None => responsibility.context_convergence = Some(receipt),
+            Some(existing) if existing == receipt => {}
+            Some(existing) if existing.version() == receipt.version() => {
+                return Err(contract_violation(format!(
+                    "query context convergence version {} has conflicting facts",
+                    receipt.version()
+                )));
+            }
+            Some(existing) if receipt.version() < existing.version() => {
+                return Err(contract_violation(format!(
+                    "query context convergence version {} is older than retained version {}",
+                    receipt.version(),
+                    existing.version()
+                )));
+            }
+            Some(existing) => match (existing.state(), receipt.state()) {
+                (
+                    QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                    QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                ) => responsibility.context_convergence = Some(receipt),
+            },
+        }
+        Ok(*responsibility)
     }
 
     /// Replaces the last observation for one frozen backend only when its
@@ -845,9 +979,9 @@ impl FrontendQueryRegistry {
         Ok(*responsibility)
     }
 
-    /// Retains only positive stop or fencing evidence for one exact frozen
-    /// backend. This does not release resource accounting; the Worker-owned
-    /// release path advances `resources_converged` separately.
+    /// Retains an independently trusted execution fence for one frozen
+    /// backend. Worker-owned convergence must enter through its exact typed
+    /// receipt instead.
     pub(crate) fn record_attempt_stop_evidence(
         &self,
         registered: &RegisteredAttempt,
@@ -857,22 +991,12 @@ impl FrontendQueryRegistry {
         let mut state = self.state.lock().expect("frontend query registry lock");
         let responsibility =
             self.attempt_backend_responsibility_mut(&mut state, registered, backend_process_id)?;
-        match evidence {
-            AttemptStopEvidence::WorkerPublished { version } => {
-                responsibility.worker_stop_version = Some(
-                    responsibility
-                        .worker_stop_version
-                        .map_or(version, |old| old.max(version)),
-                );
-            }
-            AttemptStopEvidence::TrustedExecutionFence { version } => {
-                responsibility.trusted_fence_version = Some(
-                    responsibility
-                        .trusted_fence_version
-                        .map_or(version, |old| old.max(version)),
-                );
-            }
-        }
+        let AttemptStopEvidence::TrustedExecutionFence { version } = evidence;
+        responsibility.trusted_fence_version = Some(
+            responsibility
+                .trusted_fence_version
+                .map_or(version, |old| old.max(version)),
+        );
         Ok(*responsibility)
     }
 
@@ -892,7 +1016,45 @@ impl FrontendQueryRegistry {
                 "backend process replacement must change the exact process identity",
             ));
         }
+        let topology = self
+            .backend_topology
+            .lock()
+            .expect("frontend backend topology gate lock");
+        if !topology.initialized || topology.revision != topology_revision {
+            return Err(contract_violation(format!(
+                "backend process replacement requires the exact current topology revision (current={:?} evidence={topology_revision})",
+                topology.initialized.then_some(topology.revision)
+            )));
+        }
         let mut state = self.state.lock().expect("frontend query registry lock");
+        let key = self.validate_registered_attempt(&state, registered)?;
+        let logical = state
+            .logical
+            .get(&key)
+            .expect("frontend attempt owner points at a logical entry");
+        let attempt = logical
+            .attempts
+            .get(&registered.execution_id)
+            .expect("frontend attempt owner points at attempt state");
+        let ordinal = attempt
+            .scheduled_contexts
+            .as_ref()
+            .and_then(|contexts| {
+                contexts.iter().find_map(|(&ordinal, context)| {
+                    (context.backend_process_id() == old_backend_process_id).then_some(ordinal)
+                })
+            })
+            .ok_or_else(|| {
+                contract_violation(format!(
+                    "backend process {old_backend_process_id} has no frozen ordinal in attempt {:?}",
+                    registered.execution_id
+                ))
+            })?;
+        if topology.live_process_ids.get(&ordinal) != Some(&replacement) {
+            return Err(contract_violation(format!(
+                "backend process replacement does not match frozen ordinal {ordinal} at topology revision {topology_revision}"
+            )));
+        }
         let responsibility = self.attempt_backend_responsibility_mut(
             &mut state,
             registered,
@@ -958,6 +1120,78 @@ impl FrontendQueryRegistry {
         Ok(())
     }
 
+    fn validate_query_contexts(
+        &self,
+        execution_id: QueryExecutionId,
+        contexts: &[(usize, QueryContextRef)],
+    ) -> Result<BTreeMap<usize, QueryContextRef>, DistributedQueryError> {
+        let mut frozen = BTreeMap::new();
+        let mut process_ids = BTreeSet::new();
+        let mut frontend_process_id = None;
+        for &(ordinal, context) in contexts {
+            if context.query_execution_id() != execution_id {
+                return Err(contract_violation(format!(
+                    "query context at ordinal {ordinal} belongs to a different attempt (expected={execution_id:?} actual={:?})",
+                    context.query_execution_id()
+                )));
+            }
+            if frozen.insert(ordinal, context).is_some() {
+                return Err(contract_violation(format!(
+                    "query context ownership contains duplicate scheduling ordinal {ordinal}"
+                )));
+            }
+            if !process_ids.insert(context.backend_process_id()) {
+                return Err(contract_violation(format!(
+                    "query context ownership contains duplicate backend process identity {}",
+                    context.backend_process_id()
+                )));
+            }
+            match frontend_process_id {
+                None => frontend_process_id = Some(context.frontend_process_id()),
+                Some(expected) if expected == context.frontend_process_id() => {}
+                Some(expected) => {
+                    return Err(contract_violation(format!(
+                        "query context ownership mixes frontend process identities {expected} and {}",
+                        context.frontend_process_id()
+                    )));
+                }
+            }
+        }
+        let topology = self
+            .backend_topology
+            .lock()
+            .expect("frontend backend topology gate lock");
+        if !topology.initialized {
+            return Err(contract_violation(
+                "exact query contexts require an initialized backend topology",
+            ));
+        }
+        for (&ordinal, context) in &frozen {
+            match topology.live_process_ids.get(&ordinal) {
+                Some(process_id) if *process_id == context.backend_process_id() => {}
+                Some(process_id) => {
+                    return Err(DistributedQueryError::new(
+                        DistributedQueryErrorKind::Rejected,
+                        format!(
+                            "query context ordinal {ordinal} process identity {} is stale; current process identity is {process_id}",
+                            context.backend_process_id()
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(DistributedQueryError::new(
+                        DistributedQueryErrorKind::Rejected,
+                        format!(
+                            "query context ordinal {ordinal} process identity {} is not present in the current frontend topology",
+                            context.backend_process_id()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(frozen)
+    }
+
     fn attempt_backend_responsibility_mut<'a>(
         &self,
         state: &'a mut RegistryState,
@@ -984,33 +1218,59 @@ impl FrontendQueryRegistry {
             })
     }
 
-    pub(crate) fn replace_live_backends(&self, revision: u64, backends: &[LiveBackendTarget]) {
+    pub(crate) fn replace_live_backends(
+        &self,
+        revision: u64,
+        backends: &[LiveBackendTarget],
+    ) -> Result<(), DistributedQueryError> {
+        let live_process_ids = backends
+            .iter()
+            .map(|target| {
+                Ok((
+                    target.backend_idx(),
+                    target.process_id().map_err(|error| {
+                        contract_violation(format!(
+                            "published backend target has an invalid process identity: {error}"
+                        ))
+                    })?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, DistributedQueryError>>()?;
+        if live_process_ids.len() != backends.len() {
+            return Err(contract_violation(
+                "published backend topology contains duplicate scheduling ordinals",
+            ));
+        }
         let mut topology = self
             .backend_topology
             .lock()
             .expect("frontend backend topology gate lock");
-        if topology.initialized && revision < topology.revision {
-            return;
+        if topology.initialized {
+            if revision < topology.revision {
+                return Err(contract_violation(format!(
+                    "backend topology revision {revision} is older than retained revision {}",
+                    topology.revision
+                )));
+            }
+            if revision == topology.revision {
+                if topology.live_process_ids == live_process_ids {
+                    return Ok(());
+                }
+                return Err(contract_violation(format!(
+                    "backend topology revision {revision} has conflicting process identities"
+                )));
+            }
         }
         topology.initialized = true;
         topology.revision = revision;
-        topology.live_process_ids = backends
-            .iter()
-            .map(|target| {
-                (
-                    target.backend_idx(),
-                    target
-                        .process_id()
-                        .expect("published live backend target has a validated process id"),
-                )
-            })
-            .collect();
+        topology.live_process_ids = live_process_ids;
         drop(topology);
 
         // A topology revision governs future statement admission only. Existing
         // attempts retain their frozen participant manifest and are failed only
         // by lifecycle/control/transport evidence, or an exact replacement
         // event for one of their process identities.
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1401,25 +1661,84 @@ fn set_attempt_backend_ownership(
     attempt: &mut AttemptState,
     backend_ownership: &[(usize, BackendProcessId)],
 ) -> Result<(), DistributedQueryError> {
-    if attempt.scheduled_backends.is_some() {
+    if attempt.legacy_scheduled_backends.is_some() {
         return Err(contract_violation(
             "frontend query scheduled backend ownership is already registered",
         ));
     }
-    let mut scheduled_backends = BTreeSet::new();
-    for &(_, process_id) in backend_ownership {
-        if !scheduled_backends.insert(process_id) {
+    let mut scheduled_backends = BTreeMap::new();
+    let mut process_ids = BTreeSet::new();
+    for &(ordinal, process_id) in backend_ownership {
+        if scheduled_backends.insert(ordinal, process_id).is_some() {
+            return Err(contract_violation(
+                "frontend query scheduled backend ownership contains duplicate scheduling ordinals",
+            ));
+        }
+        if !process_ids.insert(process_id) {
             return Err(contract_violation(
                 "frontend query scheduled backend ownership contains duplicate backend process identities",
             ));
         }
     }
-    attempt.backend_responsibilities = scheduled_backends
+    attempt.backend_responsibilities = process_ids
         .iter()
         .copied()
         .map(|process_id| (process_id, AttemptBackendResponsibilitySnapshot::default()))
         .collect();
-    attempt.scheduled_backends = Some(scheduled_backends);
+    attempt.legacy_scheduled_backends = Some(scheduled_backends);
+    Ok(())
+}
+
+fn set_attempt_query_contexts(
+    attempt: &mut AttemptState,
+    scheduled_contexts: BTreeMap<usize, QueryContextRef>,
+) -> Result<(), DistributedQueryError> {
+    if attempt.scheduled_contexts.is_some() {
+        return Err(contract_violation(
+            "frontend query exact context ownership is already registered",
+        ));
+    }
+    let scheduled_backends = scheduled_contexts
+        .values()
+        .map(|context| context.backend_process_id())
+        .collect::<BTreeSet<_>>();
+    let scheduled_ownership = scheduled_contexts
+        .iter()
+        .map(|(&ordinal, context)| (ordinal, context.backend_process_id()))
+        .collect::<BTreeMap<_, _>>();
+    match &attempt.legacy_scheduled_backends {
+        Some(legacy) if legacy != &scheduled_ownership => {
+            return Err(contract_violation(
+                "exact query contexts conflict with compatibility backend ownership",
+            ));
+        }
+        Some(_) => {
+            let retained_backends = attempt
+                .backend_responsibilities
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if retained_backends != scheduled_backends {
+                return Err(contract_violation(
+                    "compatibility backend responsibility facts do not match frozen exact contexts",
+                ));
+            }
+        }
+        None if !attempt.backend_responsibilities.is_empty() => {
+            return Err(contract_violation(
+                "exact query contexts cannot replace unowned backend responsibility facts",
+            ));
+        }
+        None => {
+            attempt.backend_responsibilities = scheduled_backends
+                .iter()
+                .copied()
+                .map(|process_id| (process_id, AttemptBackendResponsibilitySnapshot::default()))
+                .collect();
+        }
+    }
+    attempt.legacy_scheduled_backends = None;
+    attempt.scheduled_contexts = Some(scheduled_contexts);
     Ok(())
 }
 
@@ -1460,11 +1779,58 @@ fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
 mod tests {
     use super::*;
 
-    use novarocks_proto_codec::lifecycle::AttemptId;
+    use novarocks_execution::task_execution::AdmissionEpochCapability;
+    use novarocks_execution_contract::QueryContextConvergenceVersion;
+    use novarocks_proto_codec::lifecycle::{AttemptId, QueryControlEndpoint};
+    use novarocks_proto_codec::membership::BackendProcessDescriptor;
+    use novarocks_types::{FrontendProcessId, NativeCompatibilityId};
 
     fn execution(query_id: QueryId, attempt: u64) -> QueryExecutionId {
         QueryExecutionId::new(query_id, AttemptId::new(attempt).expect("attempt id"))
             .expect("query execution id")
+    }
+
+    fn context(
+        execution_id: QueryExecutionId,
+        frontend_process_id: FrontendProcessId,
+        backend_process_id: BackendProcessId,
+    ) -> QueryContextRef {
+        QueryContextRef::new(execution_id, frontend_process_id, backend_process_id)
+    }
+
+    fn initialize_topology(
+        registry: &FrontendQueryRegistry,
+        revision: u64,
+        contexts: &[(usize, QueryContextRef)],
+    ) {
+        let mut topology = registry
+            .backend_topology
+            .lock()
+            .expect("frontend backend topology gate lock");
+        topology.initialized = true;
+        topology.revision = revision;
+        topology.live_process_ids = contexts
+            .iter()
+            .map(|&(ordinal, context)| (ordinal, context.backend_process_id()))
+            .collect();
+    }
+
+    fn live_target(ordinal: usize, process_id: BackendProcessId) -> LiveBackendTarget {
+        let descriptor = BackendProcessDescriptor::new(
+            process_id,
+            QueryControlEndpoint::new("127.0.0.1", 19000 + ordinal as u16)
+                .expect("query control endpoint"),
+            "test-deployment",
+            "test-build",
+            NativeCompatibilityId::new([0x71; 32]),
+        )
+        .expect("backend process descriptor");
+        LiveBackendTarget::new(
+            ordinal,
+            descriptor,
+            AdmissionEpochCapability::try_from_bytes([0x61; 16])
+                .expect("admission epoch capability"),
+        )
     }
 
     /// The one convergence slot answers with the evidence the latest attempt
@@ -1689,11 +2055,15 @@ mod tests {
             .expect("activate replacement");
         let first_backend = BackendProcessId::new_v7();
         let second_backend = BackendProcessId::new_v7();
+        let frontend = FrontendProcessId::new_v7();
+        let first_context = context(first, frontend, first_backend);
+        let second_context = context(second, frontend, second_backend);
+        initialize_topology(&registry, 1, &[(0, first_context), (1, second_context)]);
         registry
-            .set_attempt_scheduled_backend_ownership(&first_registration, &[(0, first_backend)])
+            .set_attempt_query_contexts(&first_registration, &[(0, first_context)])
             .expect("record residual backend");
         registry
-            .set_attempt_scheduled_backend_ownership(&_second_registration, &[(1, second_backend)])
+            .set_attempt_query_contexts(&_second_registration, &[(1, second_context)])
             .expect("record current backend");
         registry
             .latch_attempt_failure(
@@ -1714,8 +2084,8 @@ mod tests {
 
         let residual = registry.route_attempt(first).expect("residual route");
         assert_eq!(
-            residual.scheduled_backends(),
-            Some(&BTreeSet::from([first_backend]))
+            residual.scheduled_contexts(),
+            Some(&BTreeMap::from([(0, first_context)]))
         );
         assert_eq!(
             residual
@@ -1728,8 +2098,8 @@ mod tests {
 
         let current = registry.route_attempt(second).expect("current route");
         assert_eq!(
-            current.scheduled_backends(),
-            Some(&BTreeSet::from([second_backend]))
+            current.scheduled_contexts(),
+            Some(&BTreeMap::from([(1, second_context)]))
         );
         assert!(current.primary_failure().is_none());
         assert_eq!(current.convergence(), AttemptConvergenceFacts::default());
@@ -2023,7 +2393,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_backend_ownership_is_still_sealed_one_shot() {
+    fn empty_exact_context_ownership_is_still_sealed_one_shot() {
         let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(0x27));
         let query_id = QueryId::new(0x27, 1);
         let execution_id = execution(query_id, 1);
@@ -2031,24 +2401,175 @@ mod tests {
             .register_initial_attempt(execution_id)
             .expect("register attempt");
 
+        initialize_topology(&registry, 1, &[]);
         registry
-            .set_attempt_scheduled_backend_ownership(&_registration, &[])
+            .set_attempt_query_contexts(&_registration, &[])
             .expect("seal empty ownership");
         assert_eq!(
             registry
                 .route_attempt(execution_id)
                 .expect("route sealed attempt")
-                .scheduled_backends(),
-            Some(&BTreeSet::new())
+                .scheduled_contexts(),
+            Some(&BTreeMap::new())
+        );
+        let backend = BackendProcessId::new_v7();
+        let replacement_context = context(execution_id, FrontendProcessId::new_v7(), backend);
+        initialize_topology(&registry, 2, &[(0, replacement_context)]);
+        assert!(
+            registry
+                .set_attempt_query_contexts(&_registration, &[(0, replacement_context)],)
+                .is_err(),
+            "a sealed empty ownership set cannot be replaced"
+        );
+    }
+
+    #[test]
+    fn exact_registration_validates_and_atomically_freezes_contexts() {
+        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(0x2d));
+        let query_id = QueryId::new(0x2d, 1);
+        let execution_id = execution(query_id, 1);
+        let other_execution = execution(query_id, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let first_backend = BackendProcessId::new_v7();
+        let second_backend = BackendProcessId::new_v7();
+        let first = context(execution_id, frontend, first_backend);
+        let second = context(execution_id, frontend, second_backend);
+        assert!(
+            registry
+                .register_initial_attempt_with_contexts(execution_id, &[(0, first)])
+                .is_err(),
+            "exact contexts require an initialized topology"
+        );
+        assert!(registry.route_attempt(execution_id).is_none());
+        initialize_topology(&registry, 1, &[(0, first), (1, second)]);
+
+        assert!(
+            registry
+                .register_initial_attempt_with_contexts(
+                    execution_id,
+                    &[(0, context(other_execution, frontend, first_backend))],
+                )
+                .is_err(),
+            "a context from another attempt must fail before registry mutation"
+        );
+        assert!(registry.route_attempt(execution_id).is_none());
+        assert!(
+            registry
+                .register_initial_attempt_with_contexts(execution_id, &[(0, first), (0, second)],)
+                .is_err(),
+            "scheduling ordinals are unique within an attempt"
         );
         assert!(
             registry
-                .set_attempt_scheduled_backend_ownership(
-                    &_registration,
-                    &[(0, BackendProcessId::new_v7())],
-                )
+                .register_initial_attempt_with_contexts(execution_id, &[(0, first), (1, first)],)
                 .is_err(),
-            "a sealed empty ownership set cannot be replaced"
+            "one backend process has exactly one context in an attempt"
+        );
+
+        let registration = registry
+            .register_initial_attempt_with_contexts(execution_id, &[(0, first), (1, second)])
+            .expect("register exact attempt and contexts atomically");
+        assert_eq!(registration.execution_id(), execution_id);
+        assert_eq!(
+            registry
+                .route_attempt(execution_id)
+                .expect("route exact attempt")
+                .scheduled_contexts(),
+            Some(&BTreeMap::from([(0, first), (1, second)]))
+        );
+    }
+
+    #[test]
+    fn exact_context_upgrade_preserves_legacy_responsibility_facts() {
+        let execution_id = execution(QueryId::new(0x2e, 1), 1);
+        let backend = BackendProcessId::new_v7();
+        let mut attempt = AttemptState::new();
+        set_attempt_backend_ownership(&mut attempt, &[(0, backend)])
+            .expect("freeze compatibility ownership");
+        let retained = AttemptBackendResponsibilitySnapshot {
+            resource: Some(AttemptResourceObservation {
+                version: 7,
+                last_known_usage_bytes: 4096,
+            }),
+            current_unknown: true,
+            trusted_fence_version: Some(3),
+            ..AttemptBackendResponsibilitySnapshot::default()
+        };
+        *attempt
+            .backend_responsibilities
+            .get_mut(&backend)
+            .expect("compatibility responsibility") = retained;
+
+        let exact = context(execution_id, FrontendProcessId::new_v7(), backend);
+        set_attempt_query_contexts(&mut attempt, BTreeMap::from([(0, exact)]))
+            .expect("upgrade matching exact contexts");
+        assert_eq!(
+            attempt.backend_responsibilities.get(&backend),
+            Some(&retained),
+            "exact identity upgrade must not erase resource or fencing facts"
+        );
+
+        let mut inconsistent = AttemptState::new();
+        set_attempt_backend_ownership(&mut inconsistent, &[(0, backend)])
+            .expect("freeze compatibility ownership");
+        inconsistent.backend_responsibilities.clear();
+        assert!(
+            set_attempt_query_contexts(&mut inconsistent, BTreeMap::from([(0, exact)])).is_err(),
+            "incomplete responsibility ownership fails closed"
+        );
+
+        let other_backend = BackendProcessId::new_v7();
+        let frontend = FrontendProcessId::new_v7();
+        let mut reordered = AttemptState::new();
+        set_attempt_backend_ownership(&mut reordered, &[(0, backend), (1, other_backend)])
+            .expect("freeze ordinal-qualified compatibility ownership");
+        assert!(
+            set_attempt_query_contexts(
+                &mut reordered,
+                BTreeMap::from([
+                    (0, context(execution_id, frontend, other_backend)),
+                    (1, context(execution_id, frontend, backend)),
+                ]),
+            )
+            .is_err(),
+            "the same process set at different ordinals cannot qualify exact contexts"
+        );
+    }
+
+    #[test]
+    fn topology_publication_is_monotonic_and_equal_revision_is_exactly_idempotent() {
+        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(0x2f));
+        let first = BackendProcessId::new_v7();
+        let conflicting = BackendProcessId::new_v7();
+        registry
+            .replace_live_backends(7, &[live_target(0, first)])
+            .expect("publish first topology");
+        registry
+            .replace_live_backends(7, &[live_target(0, first)])
+            .expect("replay exact topology");
+        assert!(
+            registry
+                .replace_live_backends(7, &[live_target(0, conflicting)])
+                .is_err(),
+            "equal revision with another mapping is a contract conflict"
+        );
+        assert!(
+            registry
+                .replace_live_backends(6, &[live_target(0, first)])
+                .is_err(),
+            "a stale topology publication fails closed"
+        );
+        registry
+            .replace_live_backends(8, &[live_target(0, conflicting)])
+            .expect("advance topology revision");
+        let topology = registry
+            .backend_topology
+            .lock()
+            .expect("frontend backend topology gate lock");
+        assert_eq!(topology.revision, 8);
+        assert_eq!(
+            topology.live_process_ids,
+            BTreeMap::from([(0, conflicting)])
         );
     }
 
@@ -2062,8 +2583,10 @@ mod tests {
             .expect("register attempt");
         let backend = BackendProcessId::new_v7();
         let replacement = BackendProcessId::new_v7();
+        let query_context = context(execution_id, FrontendProcessId::new_v7(), backend);
+        initialize_topology(&registry, 1, &[(0, query_context)]);
         registry
-            .set_attempt_scheduled_backend_ownership(&registration, &[(0, backend)])
+            .set_attempt_query_contexts(&registration, &[(0, query_context)])
             .expect("seal participant");
 
         let observed = AttemptResourceObservation {
@@ -2131,6 +2654,34 @@ mod tests {
             "a byte sample cannot clear residual uncertainty"
         );
 
+        {
+            let mut topology = registry
+                .backend_topology
+                .lock()
+                .expect("frontend backend topology gate lock");
+            topology.initialized = true;
+            topology.revision = 11;
+            topology.live_process_ids = BTreeMap::from([(1, replacement)]);
+        }
+        assert!(
+            registry
+                .record_attempt_process_replacement(&registration, backend, replacement, 11)
+                .is_err(),
+            "a replacement at another ordinal cannot fence the frozen process"
+        );
+        {
+            registry
+                .backend_topology
+                .lock()
+                .expect("frontend backend topology gate lock")
+                .live_process_ids = BTreeMap::from([(0, replacement)]);
+        }
+        assert!(
+            registry
+                .record_attempt_process_replacement(&registration, backend, replacement, 10)
+                .is_err(),
+            "replacement evidence must identify the exact observed topology revision"
+        );
         let responsibility = registry
             .record_attempt_process_replacement(&registration, backend, replacement, 11)
             .expect("record exact process replacement");
@@ -2179,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn positive_stop_evidence_remains_distinct_from_resource_convergence() {
+    fn exact_context_convergence_is_versioned_and_identity_bound() {
         let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(0x2c));
         let query_id = QueryId::new(0x2c, 1);
         let execution_id = execution(query_id, 1);
@@ -2187,18 +2738,44 @@ mod tests {
             .register_initial_attempt(execution_id)
             .expect("register attempt");
         let backend = BackendProcessId::new_v7();
+        let frontend = FrontendProcessId::new_v7();
+        let query_context = context(execution_id, frontend, backend);
+        initialize_topology(&registry, 1, &[(0, query_context)]);
         registry
-            .set_attempt_scheduled_backend_ownership(&registration, &[(0, backend)])
+            .set_attempt_query_contexts(&registration, &[(0, query_context)])
             .expect("seal participant");
 
+        let receipt = QueryContextConvergenceReceipt::new(
+            query_context,
+            QueryContextConvergenceVersion::new(4).expect("version"),
+            QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+        );
         let worker_stop = registry
-            .record_attempt_stop_evidence(
-                &registration,
-                backend,
-                AttemptStopEvidence::WorkerPublished { version: 4 },
-            )
-            .expect("record Worker stop fact");
-        assert_eq!(worker_stop.worker_stop_version, Some(4));
+            .record_query_context_convergence(&registration, receipt)
+            .expect("record Worker convergence fact");
+        assert_eq!(worker_stop.context_convergence, Some(receipt));
+        assert_eq!(
+            registry
+                .record_query_context_convergence(&registration, receipt)
+                .expect("replay Worker convergence fact")
+                .context_convergence,
+            Some(receipt),
+            "an equal version with equal facts is idempotent"
+        );
+        assert!(
+            registry
+                .record_query_context_convergence(
+                    &registration,
+                    QueryContextConvergenceReceipt::new(
+                        query_context,
+                        QueryContextConvergenceVersion::new(3).expect("version"),
+                        QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                    ),
+                )
+                .is_err(),
+            "a stale convergence publication is rejected"
+        );
+
         let fenced = registry
             .record_attempt_stop_evidence(
                 &registration,
@@ -2206,7 +2783,7 @@ mod tests {
                 AttemptStopEvidence::TrustedExecutionFence { version: 2 },
             )
             .expect("record trusted fence fact");
-        assert_eq!(fenced.worker_stop_version, Some(4));
+        assert_eq!(fenced.context_convergence, Some(receipt));
         assert_eq!(fenced.trusted_fence_version, Some(2));
         assert_eq!(
             registry
@@ -2220,10 +2797,13 @@ mod tests {
         let foreign_backend = BackendProcessId::new_v7();
         assert!(
             registry
-                .record_attempt_stop_evidence(
+                .record_query_context_convergence(
                     &registration,
-                    foreign_backend,
-                    AttemptStopEvidence::WorkerPublished { version: 1 },
+                    QueryContextConvergenceReceipt::new(
+                        context(execution_id, frontend, foreign_backend),
+                        QueryContextConvergenceVersion::FIRST,
+                        QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+                    ),
                 )
                 .is_err(),
             "evidence for a process outside the frozen participant set is rejected"
@@ -2235,8 +2815,8 @@ mod tests {
                 .backend_responsibilities()
                 .get(&backend)
                 .expect("backend responsibility")
-                .worker_stop_version,
-            Some(4)
+                .context_convergence,
+            Some(receipt)
         );
     }
 
