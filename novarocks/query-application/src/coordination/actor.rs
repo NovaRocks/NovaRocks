@@ -823,6 +823,10 @@ pub enum LogicalExecutionActorError {
     InvariantViolation,
     Establish(EstablishIssueError),
     StandDown(ContextStandDownError),
+    /// The exact root Task reached a non-success terminal state. The caller
+    /// still owns the running-attempt permit and must classify this attempt
+    /// for replacement or logical conclusion.
+    RootAttemptTerminal,
     ResultDeliveryFailed,
 }
 
@@ -854,6 +858,7 @@ impl fmt::Display for LogicalExecutionActorError {
             Self::AlreadyConcluded => "logical execution has already concluded",
             Self::ReplacementNotReady => "attempt replacement qualification is incomplete",
             Self::InvariantViolation => "logical execution actor invariant was violated",
+            Self::RootAttemptTerminal => "root task reached a non-success terminal state",
             Self::ResultDeliveryFailed => "logical result delivery failed",
             Self::Establish(_)
             | Self::StandDown(_)
@@ -1063,6 +1068,7 @@ struct ResultRuntime {
     schema_receipt: Option<ResultDeliveryReceipt>,
     schema_writer_completed: bool,
     failure_sender: Option<watch::Sender<Option<QueryExecutionError>>>,
+    terminal_error: Option<QueryExecutionError>,
     transport: QueryResultTransport,
     root_success: Option<RootSuccessGate>,
     finish_waiter: Option<PendingResultFinish>,
@@ -1580,6 +1586,7 @@ pub fn spawn_logical_execution_actor(
                     schema_receipt: Some(schema_receipt),
                     schema_writer_completed: false,
                     failure_sender: Some(failure_sender),
+                    terminal_error: None,
                     transport,
                     root_success: None,
                     finish_waiter: None,
@@ -2841,27 +2848,31 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
         return;
     };
     if let Some(sender) = runtime.failure_sender.take() {
-        match state.conclusion() {
-            Some(LogicalConclusion::Succeeded) => drop(sender),
-            Some(LogicalConclusion::Cancelled) => {
-                sender.send_replace(Some(QueryExecutionError::new(
-                    crate::api::QueryExecutionErrorKind::Cancelled,
-                    "logical execution was cancelled before success EOF",
-                )));
+        if let Some(error) = runtime.terminal_error.take() {
+            sender.send_replace(Some(error));
+        } else {
+            match state.conclusion() {
+                Some(LogicalConclusion::Succeeded) => drop(sender),
+                Some(LogicalConclusion::Cancelled) => {
+                    sender.send_replace(Some(QueryExecutionError::new(
+                        crate::api::QueryExecutionErrorKind::Cancelled,
+                        "logical execution was cancelled before success EOF",
+                    )));
+                }
+                Some(LogicalConclusion::Failed) => {
+                    sender.send_replace(Some(QueryExecutionError::new(
+                        crate::api::QueryExecutionErrorKind::Failed,
+                        "logical execution failed before success EOF",
+                    )));
+                }
+                Some(LogicalConclusion::BusinessDecisionRequired) => {
+                    sender.send_replace(Some(QueryExecutionError::new(
+                        crate::api::QueryExecutionErrorKind::Failed,
+                        "logical execution requires a business decision before success EOF",
+                    )));
+                }
+                None => {}
             }
-            Some(LogicalConclusion::Failed) => {
-                sender.send_replace(Some(QueryExecutionError::new(
-                    crate::api::QueryExecutionErrorKind::Failed,
-                    "logical execution failed before success EOF",
-                )));
-            }
-            Some(LogicalConclusion::BusinessDecisionRequired) => {
-                sender.send_replace(Some(QueryExecutionError::new(
-                    crate::api::QueryExecutionErrorKind::Failed,
-                    "logical execution requires a business decision before success EOF",
-                )));
-            }
-            None => {}
         }
     }
     runtime.root_success = None;
@@ -2894,9 +2905,28 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
 fn conclude_for_work_cancellation(
     state: &mut LogicalExecutionState,
     replacement: Option<&ReplacementRuntime>,
-    runtime: Option<&mut ResultRuntime>,
+    mut runtime: Option<&mut ResultRuntime>,
     reason: &CancellationReason,
 ) {
+    if let Some(runtime) = runtime.as_deref_mut() {
+        let (kind, message) = match reason {
+            CancellationReason::DeadlineExceeded
+            | CancellationReason::FrontendDrainDeadlineExceeded => (
+                crate::api::QueryExecutionErrorKind::DeadlineExceeded,
+                "logical execution deadline expired before success EOF",
+            ),
+            CancellationReason::Requested
+            | CancellationReason::ExplicitKill { .. }
+            | CancellationReason::ExplicitKillConnection { .. }
+            | CancellationReason::ClientDisconnected
+            | CancellationReason::ServerShutdown
+            | CancellationReason::OwnerDropped => (
+                crate::api::QueryExecutionErrorKind::Cancelled,
+                "logical execution was cancelled before success EOF",
+            ),
+        };
+        runtime.terminal_error = Some(QueryExecutionError::new(kind, message));
+    }
     let conclusion = match reason {
         CancellationReason::DeadlineExceeded
         | CancellationReason::FrontendDrainDeadlineExceeded => LogicalConclusion::Failed,
@@ -3834,8 +3864,11 @@ fn apply_root_status_observation(
         || status.state().is_abort();
     gate.status = Some(status);
     if terminal_failure {
-        let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
-        fail_result_observation(state, runtime);
+        // A Worker terminal state is an attempt fact. The owner holding the
+        // running permit decides whether the fixed logical execution may
+        // replace this attempt; observation itself cannot conclude the
+        // business operation.
+        let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
     } else {
         let _ = reply.send(Ok(()));
     }
@@ -5655,6 +5688,56 @@ mod tests {
         parent.complete();
     }
 
+    #[tokio::test]
+    async fn inherited_deadline_is_preserved_on_the_result_stream() {
+        let runtime = Handle::current();
+        let first = execution(8801);
+        let (parent, work_owner, stage) = test_governed_child_work(None);
+        let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            first,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            Arc::new(DelayedQualificationPort::default()),
+            work_owner,
+            stage,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+
+        parent.cancel(CancellationReason::DeadlineExceeded);
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        let error = match stream.next().await {
+            Err(error) => error,
+            Ok(_) => panic!("deadline must terminate the result stream"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
+        assert_eq!(
+            error.message(),
+            "logical execution deadline expired before success EOF"
+        );
+
+        drop(running);
+        drop(stream);
+        drop(actor);
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        parent.complete();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn inherited_work_deadline_cancels_backpressured_replacement() {
         let runtime = Handle::current();
@@ -7260,7 +7343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_terminal_failure_closes_the_logical_execution() {
+    async fn root_terminal_failure_returns_attempt_decision_to_the_permit_owner() {
         let runtime = Handle::current();
         let first = execution(114);
         let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
@@ -7279,10 +7362,18 @@ mod tests {
                 .observe_status(root_status(root, 1, TaskState::Aborted))
                 .await
                 .unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::RootAttemptTerminal
         );
-        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
-        drop(running);
+        let snapshot = actor.snapshot().await.unwrap();
+        assert_eq!(snapshot.conclusion, None);
+        assert!(matches!(
+            snapshot.phase,
+            ExecutionPhase::Running { execution, .. } if execution == first
+        ));
+        assert_eq!(
+            actor.fail_attempt(running).await.unwrap(),
+            LogicalConclusion::Failed
+        );
         drop(stream);
         drop(actor);
         drop(owner);
