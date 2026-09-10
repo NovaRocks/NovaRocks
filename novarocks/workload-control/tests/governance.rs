@@ -851,6 +851,90 @@ async fn cancelled_and_dropped_decode_waiters_unregister_and_release_explicitly(
 }
 
 #[tokio::test]
+async fn borrowed_decode_wait_drop_preserves_raw_credit_and_accounting() {
+    let control = control();
+    let work = root(&control, WorkClass::Query);
+    let blocker_work = root(&control, WorkClass::Query);
+    let authority = control.resources();
+    let mut raw = small_raw_credit(&control, &work.owner.scope());
+    let blocker = authority
+        .reserve(&blocker_work.owner.scope(), 92, ResourceClass::Data)
+        .unwrap();
+
+    let mut waiting = Box::pin(raw.reserve_decode_when_available_in_place(&authority, 16));
+    assert!(poll(&mut waiting).is_pending());
+    assert_eq!(control.snapshot().resource_waiters, 1);
+    drop(waiting);
+
+    assert_eq!(raw.stage(), ResultCreditStage::RawRetained);
+    assert_eq!(raw.held_bytes(), 20);
+    assert_eq!(control.snapshot().resource_waiters, 0);
+    let snapshot = authority.snapshot();
+    assert_eq!(snapshot.result_credit.raw_retained_bytes, 20);
+    assert_eq!(snapshot.result_credit.decode_reserved_bytes, 0);
+    assert_eq!(snapshot.held_bytes(), 112);
+    drop((raw, blocker));
+    assert_eq!(authority.snapshot().held_bytes(), 0);
+}
+
+#[tokio::test]
+async fn borrowed_decode_wait_cancellation_preserves_raw_credit_and_accounting() {
+    let control = control();
+    let work = root(&control, WorkClass::Query);
+    let blocker_work = root(&control, WorkClass::Query);
+    let authority = control.resources();
+    let mut raw = small_raw_credit(&control, &work.owner.scope());
+    let blocker = authority
+        .reserve(&blocker_work.owner.scope(), 92, ResourceClass::Data)
+        .unwrap();
+
+    let mut waiting = Box::pin(raw.reserve_decode_when_available_in_place(&authority, 16));
+    assert!(poll(&mut waiting).is_pending());
+    work.owner.cancel(CancellationReason::Requested);
+    assert_eq!(
+        waiting.await,
+        Err(WorkError::Cancelled(CancellationReason::Requested))
+    );
+
+    assert_eq!(raw.stage(), ResultCreditStage::RawRetained);
+    assert_eq!(raw.held_bytes(), 20);
+    assert_eq!(control.snapshot().resource_waiters, 0);
+    let snapshot = authority.snapshot();
+    assert_eq!(snapshot.result_credit.raw_retained_bytes, 20);
+    assert_eq!(snapshot.result_credit.decode_reserved_bytes, 0);
+    assert_eq!(snapshot.held_bytes(), 112);
+    drop((raw, blocker));
+    assert_eq!(authority.snapshot().held_bytes(), 0);
+}
+
+#[tokio::test]
+async fn borrowed_decode_wait_moves_credit_in_place_after_capacity_is_granted() {
+    let control = control();
+    let work = root(&control, WorkClass::Query);
+    let blocker_work = root(&control, WorkClass::Query);
+    let authority = control.resources();
+    let mut raw = small_raw_credit(&control, &work.owner.scope());
+    let mut blocker = authority
+        .reserve(&blocker_work.owner.scope(), 92, ResourceClass::Data)
+        .unwrap();
+
+    let mut waiting = Box::pin(raw.reserve_decode_when_available_in_place(&authority, 16));
+    assert!(poll(&mut waiting).is_pending());
+    blocker.release_unused(16).unwrap();
+    waiting.await.unwrap();
+
+    assert_eq!(raw.stage(), ResultCreditStage::DecodeReserved);
+    assert_eq!(raw.held_bytes(), 36);
+    let snapshot = authority.snapshot();
+    assert_eq!(snapshot.result_credit.raw_retained_bytes, 0);
+    assert_eq!(snapshot.result_credit.decode_reserved_bytes, 36);
+    assert_eq!(snapshot.data_reserved_bytes, 92);
+    assert_eq!(snapshot.data_used_bytes, 20);
+    drop((raw, blocker));
+    assert_eq!(authority.snapshot().held_bytes(), 0);
+}
+
+#[tokio::test]
 async fn result_fetch_credit_waiters_grant_fifo_without_direct_bypass() {
     let control = control();
     let blocker_work = root(&control, WorkClass::Query);

@@ -163,6 +163,15 @@ impl RootResultObserver {
         &self,
         status: TaskStatus,
     ) -> Result<(), LogicalExecutionActorError> {
+        self.observe_status_with_failure(status, RootTerminalFailure::Unspecified)
+            .await
+    }
+
+    pub(crate) async fn observe_status_with_failure(
+        &self,
+        status: TaskStatus,
+        terminal_failure: RootTerminalFailure,
+    ) -> Result<(), LogicalExecutionActorError> {
         if status.state().is_failure()
             || status.state().is_cancellation()
             || status.state().is_abort()
@@ -173,6 +182,7 @@ impl RootResultObserver {
                     activation: self.activation,
                     root: self.root,
                     status,
+                    terminal_failure,
                     reply,
                 })
                 .await
@@ -492,19 +502,51 @@ impl RunningAttemptPermit {
     /// Transfers the running authority after the coordinator has submitted
     /// all root-result packets. This does not assert success: the actor still
     /// requires exact root Finished and final Worker EOS ACK observations.
-    pub async fn finish_result_stream(
+    pub(crate) async fn finish_result_stream(
         self,
-    ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
-        let sender = self
-            .mailbox_liveness
-            .as_ref()
-            .cloned()
-            .ok_or(LogicalExecutionActorError::StaleAuthority)?;
-        request(&sender, |reply| ActorCommand::FinishResultStream {
-            permit: self,
-            reply,
-        })
-        .await
+    ) -> Result<LogicalConclusion, RunningAttemptHandoffError> {
+        self.handoff(|permit, reply| ActorCommand::FinishResultStream { permit, reply })
+            .await
+    }
+
+    pub(crate) async fn await_work_cancellation(
+        self,
+    ) -> Result<LogicalConclusion, RunningAttemptHandoffError> {
+        self.handoff(|permit, reply| ActorCommand::AwaitWorkCancellation { permit, reply })
+            .await
+    }
+
+    async fn handoff(
+        self,
+        command: impl FnOnce(RunningAttemptPermit, ActorReply<LogicalConclusion>) -> ActorCommand,
+    ) -> Result<LogicalConclusion, RunningAttemptHandoffError> {
+        let Some(sender) = self.mailbox_liveness.as_ref().cloned() else {
+            return Err(RunningAttemptHandoffError::NotSubmitted {
+                permit: self,
+                error: LogicalExecutionActorError::StaleAuthority,
+            });
+        };
+        let slot = match sender.reserve().await {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Err(RunningAttemptHandoffError::NotSubmitted {
+                    permit: self,
+                    error: LogicalExecutionActorError::MailboxClosed,
+                });
+            }
+        };
+        let (reply, response) = oneshot::channel();
+        slot.send(command(self, reply));
+        match response.await {
+            Ok(Ok(conclusion)) => Ok(conclusion),
+            Ok(Err(LogicalExecutionActorError::ExecutionConcluded(conclusion))) => {
+                Err(RunningAttemptHandoffError::ExecutionConcluded(conclusion))
+            }
+            Ok(Err(error)) => Err(RunningAttemptHandoffError::ActorOutcomeUnknown(error)),
+            Err(_) => Err(RunningAttemptHandoffError::ActorOutcomeUnknown(
+                LogicalExecutionActorError::MailboxClosed,
+            )),
+        }
     }
 
     fn mailbox(&self) -> &mpsc::Sender<ActorCommand> {
@@ -534,6 +576,21 @@ impl RunningAttemptPermit {
             .expect("live running permit retains actor liveness");
         (capability, lifetime, mailbox_liveness)
     }
+}
+
+/// Result of handing the sole running authority to a terminal actor command.
+#[derive(Debug)]
+pub(crate) enum RunningAttemptHandoffError {
+    /// Mailbox ownership was never transferred, so the attempt decision remains
+    /// available to the caller.
+    NotSubmitted {
+        permit: RunningAttemptPermit,
+        error: LogicalExecutionActorError,
+    },
+    /// The actor fixed this exact conclusion while processing the handoff.
+    ExecutionConcluded(LogicalConclusion),
+    /// The actor accepted the permit, but its reply did not prove a conclusion.
+    ActorOutcomeUnknown(LogicalExecutionActorError),
 }
 
 impl Drop for RunningAttemptPermit {
@@ -784,6 +841,7 @@ impl LogicalExecutionActorConfig {
         schema: ResultSchema,
         delivery_capacity: NonZeroUsize,
     ) -> Self {
+        self.output_mode = LogicalOutputMode::ResultStream;
         self.result_schema = Some(schema);
         self.result_delivery_capacity = Some(delivery_capacity);
         self
@@ -827,6 +885,9 @@ pub enum LogicalExecutionActorError {
     /// still owns the running-attempt permit and must classify this attempt
     /// for replacement or logical conclusion.
     RootAttemptTerminal,
+    /// The actor already fixed the logical execution's terminal state. No
+    /// attempt decision authority remains with the caller.
+    ExecutionConcluded(LogicalConclusion),
     ResultDeliveryFailed,
 }
 
@@ -859,6 +920,12 @@ impl fmt::Display for LogicalExecutionActorError {
             Self::ReplacementNotReady => "attempt replacement qualification is incomplete",
             Self::InvariantViolation => "logical execution actor invariant was violated",
             Self::RootAttemptTerminal => "root task reached a non-success terminal state",
+            Self::ExecutionConcluded(conclusion) => {
+                return write!(
+                    formatter,
+                    "logical execution already concluded as {conclusion:?}"
+                );
+            }
             Self::ResultDeliveryFailed => "logical result delivery failed",
             Self::Establish(_)
             | Self::StandDown(_)
@@ -1037,7 +1104,15 @@ struct RootTerminalObservation {
     activation: AttemptActivationIdentity,
     root: TaskIdentity,
     status: TaskStatus,
+    terminal_failure: RootTerminalFailure,
     reply: ActorReply<()>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum RootTerminalFailure {
+    Unspecified,
+    Pending,
+    Authoritative(QueryExecutionError),
 }
 
 enum PendingResult {
@@ -1144,9 +1219,14 @@ enum ActorCommand {
         permit: RunningAttemptPermit,
         reply: ActorReply<LogicalConclusion>,
     },
+    AwaitWorkCancellation {
+        permit: RunningAttemptPermit,
+        reply: ActorReply<LogicalConclusion>,
+    },
     BeginReplacement {
         permit: RunningAttemptPermit,
         failure: AttemptFailureClass,
+        terminal_error: Option<QueryExecutionError>,
         replacement: QueryExecutionId,
         replacement_contexts: Vec<QueryContextRef>,
         reply: ActorReply<ReplacementQualification>,
@@ -1293,6 +1373,26 @@ impl LogicalExecutionActor {
         request(&self.sender, |reply| ActorCommand::BeginReplacement {
             permit,
             failure,
+            terminal_error: None,
+            replacement,
+            replacement_contexts,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn begin_replacement_with_error(
+        &self,
+        permit: RunningAttemptPermit,
+        failure: AttemptFailureClass,
+        terminal_error: QueryExecutionError,
+        replacement: QueryExecutionId,
+        replacement_contexts: Vec<QueryContextRef>,
+    ) -> Result<ReplacementQualification, LogicalExecutionActorError> {
+        request(&self.sender, |reply| ActorCommand::BeginReplacement {
+            permit,
+            failure,
+            terminal_error: Some(terminal_error),
             replacement,
             replacement_contexts,
             reply,
@@ -1795,6 +1895,16 @@ async fn run_actor(
         let root_terminal_pending = root_terminal_receiver.is_some();
         tokio::select! {
             biased;
+            reason = work_cancellation.cancelled(), if state.conclusion().is_none() => {
+                revoke_all_establish_authority(&mut attempts);
+                conclude_for_work_cancellation(
+                    state,
+                    replacement.as_ref(),
+                    result_runtime.as_mut(),
+                    &reason,
+                );
+                lifetime.settle();
+            }
             changed = abandoned.changed(), if !*abandoned.borrow() => {
                 if changed.is_ok() && *abandoned.borrow() {
                     revoke_all_establish_authority(&mut attempts);
@@ -1806,16 +1916,6 @@ async fn run_actor(
                     );
                     lifetime.settle();
                 }
-            }
-            reason = work_cancellation.cancelled(), if state.conclusion().is_none() => {
-                revoke_all_establish_authority(&mut attempts);
-                conclude_for_work_cancellation(
-                    state,
-                    replacement.as_ref(),
-                    result_runtime.as_mut(),
-                    &reason,
-                );
-                lifetime.settle();
             }
             observation = wait_for_root_terminal(root_terminal_receiver.as_mut()), if root_terminal_pending => {
                 match observation {
@@ -2601,6 +2701,7 @@ fn apply_root_terminal_observation(
         observation.activation,
         observation.root,
         observation.status,
+        observation.terminal_failure,
         observation.reply,
     );
 }
@@ -2639,15 +2740,15 @@ fn drive_root_success(
     }
     let finish = runtime
         .finish_waiter
-        .take()
+        .as_ref()
         .ok_or(LogicalExecutionActorError::InvariantViolation)?;
     if finish.permit.identity() != gate.activation {
-        drop(finish.permit);
-        let _ = finish
-            .reply
-            .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
         return Err(LogicalExecutionActorError::ResultDeliveryFailed);
     }
+    let finish = runtime
+        .finish_waiter
+        .take()
+        .expect("validated finish waiter remains owned by the result runtime");
     runtime.pending = Some(PendingResult::End(PendingResultEnd {
         permit: finish.permit,
         sequence,
@@ -2670,8 +2771,8 @@ fn apply_result_capacity(
     let slot = match reserved {
         Ok(slot) => slot,
         Err(_) => {
-            reject_pending_result(pending);
             conclude_failed(state);
+            reject_pending_result(state, pending);
             return;
         }
     };
@@ -2697,10 +2798,8 @@ fn apply_result_capacity(
                 Err(_) => {
                     drop(slot);
                     drop(pending.delivery);
-                    let _ = pending
-                        .reply
-                        .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                     conclude_failed(state);
+                    reply_result_failure(state, pending.reply);
                     return;
                 }
             };
@@ -2719,10 +2818,7 @@ fn apply_result_capacity(
                 Ok(capability) if identity_of(&capability) == activation => capability,
                 _ => {
                     drop(slot);
-                    drop(pending.permit);
-                    let _ = pending
-                        .reply
-                        .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                    conclude_consumed_handoff_as_failed(state, pending.permit, pending.reply);
                     return;
                 }
             };
@@ -2731,11 +2827,7 @@ fn apply_result_capacity(
                 .and_then(|effect| state.complete_attempt_success_effect(&capability, effect));
             let Ok(success) = success else {
                 drop(slot);
-                drop(pending.permit);
-                let _ = pending
-                    .reply
-                    .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
-                conclude_failed(state);
+                conclude_consumed_handoff_as_failed(state, pending.permit, pending.reply);
                 return;
             };
             let permit = match state.begin_success_end_of_stream(
@@ -2746,11 +2838,7 @@ fn apply_result_capacity(
                 Ok(permit) => permit,
                 Err(_) => {
                     drop(slot);
-                    drop(pending.permit);
-                    let _ = pending
-                        .reply
-                        .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
-                    conclude_failed(state);
+                    conclude_consumed_handoff_as_failed(state, pending.permit, pending.reply);
                     return;
                 }
             };
@@ -2814,14 +2902,14 @@ fn apply_result_receipt(
                         let _ = reply.send(Ok(()));
                     }
                     Err(_) => {
-                        let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                         conclude_failed(state);
+                        reply_result_failure(state, reply);
                     }
                 }
             } else {
                 let _ = state.fail_result_delivery(permit);
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 conclude_failed(state);
+                reply_result_failure(state, reply);
             }
         }
         InFlightResult::End {
@@ -2837,34 +2925,31 @@ fn apply_result_receipt(
                         let _ = reply.send(Ok(LogicalConclusion::Succeeded));
                     }
                     Err(_) => {
-                        lifetime.abandon();
-                        let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                         conclude_failed(state);
+                        reply_fixed_handoff_conclusion(state, &lifetime, reply);
                     }
                 }
             } else {
                 let _ = state.fail_success_end_of_stream(permit);
-                lifetime.settle();
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 conclude_failed(state);
+                reply_fixed_handoff_conclusion(state, &lifetime, reply);
             }
         }
     }
 }
 
-fn reject_pending_result(pending: PendingResult) {
+fn reject_pending_result(state: &mut LogicalExecutionState, pending: PendingResult) {
     match pending {
         PendingResult::Batch(pending) => {
             drop(pending.delivery);
-            let _ = pending
-                .reply
-                .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+            reply_result_failure(state, pending.reply);
         }
         PendingResult::End(pending) => {
-            drop(pending.permit);
-            let _ = pending
-                .reply
-                .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+            if state.conclusion().is_none() {
+                conclude_consumed_handoff_as_failed(state, pending.permit, pending.reply);
+            } else {
+                reply_consumed_handoff_actual(state, pending.permit, pending.reply, true);
+            }
         }
     }
 }
@@ -2903,13 +2988,14 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
     }
     runtime.root_success = None;
     if let Some(finish) = runtime.finish_waiter.take() {
-        drop(finish.permit);
-        let _ = finish
-            .reply
-            .send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+        if state.conclusion().is_none() {
+            conclude_consumed_handoff_as_failed(state, finish.permit, finish.reply);
+        } else {
+            reply_consumed_handoff_actual(state, finish.permit, finish.reply, true);
+        }
     }
     if let Some(pending) = runtime.pending.take() {
-        reject_pending_result(pending);
+        reject_pending_result(state, pending);
     }
     let Some(in_flight) = runtime.in_flight.take() else {
         return;
@@ -2917,13 +3003,12 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
     match in_flight {
         InFlightResult::Schema { .. } => {}
         InFlightResult::Batch { reply, .. } => {
-            let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+            reply_result_failure(state, reply);
         }
         InFlightResult::End {
             lifetime, reply, ..
         } => {
-            lifetime.settle();
-            let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+            reply_fixed_handoff_conclusion(state, &lifetime, reply);
         }
     }
 }
@@ -2986,8 +3071,7 @@ fn conclude_or_interrupt_success(
             return;
         };
         let _ = state.conclude_success_end_of_stream(permit, conclusion);
-        lifetime.settle();
-        let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+        reply_fixed_handoff_conclusion(state, &lifetime, reply);
         return;
     }
     conclude_with(state, replacement, conclusion);
@@ -3134,6 +3218,14 @@ fn handle_command(
             credit,
             reply,
         } => {
+            if let Some(conclusion) = state.conclusion() {
+                drop(batch);
+                drop(credit);
+                let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
+                    conclusion,
+                )));
+                return;
+            }
             let Some(runtime) = result_runtime else {
                 drop(batch);
                 drop(credit);
@@ -3153,8 +3245,8 @@ fn handle_command(
             {
                 drop(batch);
                 drop(credit);
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 conclude_failed(state);
+                reply_result_failure(state, reply);
                 return;
             }
             if verify_running_activation(state, activation).is_err()
@@ -3172,20 +3264,20 @@ fn handle_command(
             if sequence.next().is_none() || !runtime.schema.accepts(batch.batch()) {
                 drop(batch);
                 drop(credit);
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 conclude_failed(state);
+                reply_result_failure(state, reply);
                 return;
             }
             let delivery = BatchDelivery::try_new(activation.execution(), sequence, batch, credit);
             let Ok((delivery, receipt)) = delivery else {
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 conclude_failed(state);
+                reply_result_failure(state, reply);
                 return;
             };
             if start_schema_delivery(state, runtime, activation).is_err() {
                 drop(delivery);
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 conclude_failed(state);
+                reply_result_failure(state, reply);
                 return;
             }
             runtime.pending = Some(PendingResult::Batch(PendingResultBatch {
@@ -3206,6 +3298,12 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 return;
             };
+            if let Some(conclusion) = state.conclusion() {
+                let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
+                    conclusion,
+                )));
+                return;
+            }
             if verify_running_activation(state, activation).is_err()
                 || root.query_execution_id() != activation.execution()
             {
@@ -3217,8 +3315,8 @@ fn handle_command(
                     let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 }
                 Some(gate) if gate.activation == activation => {
-                    let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                     conclude_failed(state);
+                    reply_result_failure(state, reply);
                 }
                 _ => {
                     runtime.root_success = Some(RootSuccessGate {
@@ -3242,7 +3340,15 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 return;
             };
-            apply_root_status_observation(state, runtime, activation, root, status, reply);
+            apply_root_status_observation(
+                state,
+                runtime,
+                activation,
+                root,
+                status,
+                RootTerminalFailure::Unspecified,
+                reply,
+            );
         }
         ActorCommand::ObserveRootEosAck {
             activation,
@@ -3255,6 +3361,12 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 return;
             };
+            if let Some(conclusion) = state.conclusion() {
+                let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
+                    conclusion,
+                )));
+                return;
+            }
             if verify_result_observation_activation(state, activation).is_err() {
                 let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
                 return;
@@ -3264,8 +3376,8 @@ fn handle_command(
                 || (sequence.get() > 0
                     && state.delivered_result_through() != Some(sequence.get().saturating_sub(1)))
             {
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 fail_result_observation(state, runtime);
+                reply_result_failure(state, reply);
                 return;
             }
             let Some(gate) = runtime.root_success.as_mut() else {
@@ -3274,8 +3386,8 @@ fn handle_command(
             };
             if gate.activation != activation || gate.root != expected_root || root != expected_root
             {
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 conclude_failed(state);
+                reply_result_failure(state, reply);
                 return;
             }
             match gate.final_eos_ack {
@@ -3287,16 +3399,15 @@ fn handle_command(
                     let _ = reply.send(Ok(()));
                 }
                 Some(_) => {
-                    let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                     fail_result_observation(state, runtime);
+                    reply_result_failure(state, reply);
                 }
             }
         }
         ActorCommand::FinishResultStream { permit, reply } => {
             let activation = permit.identity();
             let Some(runtime) = result_runtime else {
-                drop(permit);
-                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                conclude_consumed_handoff_as_failed(state, permit, reply);
                 return;
             };
             let success_ready = attempts
@@ -3313,24 +3424,38 @@ fn handle_command(
                 || matches!(runtime.pending, Some(PendingResult::End(_)))
                 || matches!(runtime.in_flight, Some(InFlightResult::End { .. }))
             {
-                drop(permit);
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+                conclude_consumed_handoff_as_failed(state, permit, reply);
                 return;
             }
             if let Some(attempt) = attempts.get_mut(&activation.execution()) {
                 attempt.establish.revoke_issue_authority();
             }
             if start_schema_delivery(state, runtime, activation).is_err() {
-                drop(permit);
-                let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
-                conclude_failed(state);
+                conclude_consumed_handoff_as_failed(state, permit, reply);
                 return;
             }
             runtime.finish_waiter = Some(PendingResultFinish { permit, reply });
         }
+        ActorCommand::AwaitWorkCancellation { permit, reply } => {
+            if state.conclusion().is_none() {
+                if let Some(reason) = work_cancellation.reason() {
+                    revoke_all_establish_authority(attempts);
+                    conclude_for_work_cancellation(
+                        state,
+                        replacement.as_ref(),
+                        result_runtime.as_deref_mut(),
+                        &reason,
+                    );
+                } else {
+                    conclude_failed(state);
+                }
+            }
+            reply_consumed_handoff_actual(state, permit, reply, false);
+        }
         ActorCommand::BeginReplacement {
             permit,
             failure,
+            terminal_error,
             replacement: replacement_execution,
             replacement_contexts,
             reply,
@@ -3344,7 +3469,7 @@ fn handle_command(
                 )
                 && let Some(pending) = runtime.pending.take()
             {
-                reject_pending_result(pending);
+                reject_pending_result(state, pending);
             }
             if let Some(reason) = work_cancellation.reason() {
                 revoke_all_establish_authority(attempts);
@@ -3379,6 +3504,11 @@ fn handle_command(
                 match state.begin_replacement(&capability, replacement_execution, failure, false) {
                     Ok(token) => token,
                     Err(error) => {
+                        if let (Some(runtime), Some(terminal_error)) =
+                            (result_runtime, terminal_error)
+                        {
+                            runtime.terminal_error = Some(terminal_error);
+                        }
                         let _ = state.conclude(&capability, LogicalConclusion::Failed);
                         lifetime.settle();
                         let _ = reply.send(Err(error.into()));
@@ -3856,8 +3986,15 @@ fn apply_root_status_observation(
     activation: AttemptActivationIdentity,
     root: TaskIdentity,
     status: TaskStatus,
+    terminal_failure: RootTerminalFailure,
     reply: ActorReply<()>,
 ) {
+    if let Some(conclusion) = state.conclusion() {
+        let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
+            conclusion,
+        )));
+        return;
+    }
     if verify_result_observation_activation(state, activation).is_err() {
         let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
         return;
@@ -3867,8 +4004,26 @@ fn apply_root_status_observation(
         return;
     };
     if gate.activation != activation || gate.root != root || status.identity() != gate.root {
-        let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
         conclude_or_interrupt_success(state, None, Some(runtime), LogicalConclusion::Failed);
+        reply_result_failure(state, reply);
+        return;
+    }
+    let authoritative_refinement = gate.status.as_ref() == Some(&status)
+        && runtime.attempt_decision_pending == Some(activation)
+        && matches!(&terminal_failure, RootTerminalFailure::Authoritative(_));
+    if authoritative_refinement {
+        let RootTerminalFailure::Authoritative(error) = terminal_failure else {
+            unreachable!("authoritative refinement was checked above");
+        };
+        runtime.terminal_error = Some(error);
+        if state.output_visible() {
+            fail_result_observation(state, runtime);
+            let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
+                LogicalConclusion::Failed,
+            )));
+        } else {
+            let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
+        }
         return;
     }
     let cursor = gate.status.as_ref().map_or_else(
@@ -3884,32 +4039,45 @@ fn apply_root_status_observation(
         StatusObservation::VersionConflict
         | StatusObservation::IdentityMismatch(_)
         | StatusObservation::TerminalOverwrite => {
-            let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
             fail_result_observation(state, runtime);
+            reply_result_failure(state, reply);
             return;
         }
     }
     if let Some(held) = gate.status.as_ref()
+        && held.version().next() == Some(status.version())
         && !matches!(
             classify_observed_task_transition(held.state(), status.state()),
             ObservedTaskTransition::Advance | ObservedTaskTransition::SameState
         )
     {
-        let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
         fail_result_observation(state, runtime);
+        reply_result_failure(state, reply);
         return;
     }
-    let terminal_failure = status.state().is_failure()
+    let terminal_state = status.state().is_failure()
         || status.state().is_cancellation()
         || status.state().is_abort();
     gate.status = Some(status);
-    if terminal_failure {
+    if terminal_state {
+        let cause_pending = matches!(&terminal_failure, RootTerminalFailure::Pending);
+        if let RootTerminalFailure::Authoritative(error) = terminal_failure {
+            runtime.terminal_error = Some(error);
+        }
+        if cause_pending {
+            runtime.attempt_decision_pending = Some(activation);
+            if let Some(pending) = runtime.pending.take() {
+                reject_pending_result(state, pending);
+            }
+            let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
+            return;
+        }
         if state.output_visible() {
             // Once data crossed the visibility boundary this attempt cannot
             // be replaced without duplicating a prefix. Fail the logical
             // stream and interrupt any protocol delivery immediately.
-            let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
             fail_result_observation(state, runtime);
+            reply_result_failure(state, reply);
         } else {
             // Freeze all pending and future data in the same actor turn that
             // accepts the terminal fact. The running-permit owner can now
@@ -3917,7 +4085,7 @@ fn apply_root_status_observation(
             // batch racing across the visibility boundary.
             runtime.attempt_decision_pending = Some(activation);
             if let Some(pending) = runtime.pending.take() {
-                reject_pending_result(pending);
+                reject_pending_result(state, pending);
             }
             let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
         }
@@ -3960,8 +4128,7 @@ fn fail_result_observation(state: &mut LogicalExecutionState, runtime: &mut Resu
         return;
     };
     let _ = state.fail_success_end_of_stream(permit);
-    lifetime.settle();
-    let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+    reply_fixed_handoff_conclusion(state, &lifetime, reply);
 }
 
 fn settle_terminal(
@@ -4006,6 +4173,71 @@ fn settle_terminal_with_error(
             let _ = reply.send(Err(state_error.into()));
         }
     }
+}
+
+fn conclude_consumed_handoff_as_failed(
+    state: &mut LogicalExecutionState,
+    permit: RunningAttemptPermit,
+    reply: ActorReply<LogicalConclusion>,
+) {
+    if state.conclusion().is_none() {
+        let capability = permit
+            .capability
+            .as_ref()
+            .expect("live running handoff retains its capability");
+        if state
+            .conclude(capability, LogicalConclusion::Failed)
+            .is_err()
+        {
+            conclude_failed(state);
+        }
+    }
+    reply_consumed_handoff_actual(state, permit, reply, true);
+}
+
+fn reply_consumed_handoff_actual(
+    state: &LogicalExecutionState,
+    permit: RunningAttemptPermit,
+    reply: ActorReply<LogicalConclusion>,
+    as_error: bool,
+) {
+    let (_capability, lifetime, _mailbox_liveness) = permit.into_parts();
+    let Some(conclusion) = state.conclusion() else {
+        lifetime.abandon();
+        let _ = reply.send(Err(LogicalExecutionActorError::InvariantViolation));
+        return;
+    };
+    lifetime.settle();
+    let response = if as_error {
+        Err(LogicalExecutionActorError::ExecutionConcluded(conclusion))
+    } else {
+        Ok(conclusion)
+    };
+    let _ = reply.send(response);
+}
+
+fn reply_fixed_handoff_conclusion(
+    state: &LogicalExecutionState,
+    lifetime: &Arc<PermitLifetime>,
+    reply: ActorReply<LogicalConclusion>,
+) {
+    let Some(conclusion) = state.conclusion() else {
+        lifetime.abandon();
+        let _ = reply.send(Err(LogicalExecutionActorError::InvariantViolation));
+        return;
+    };
+    lifetime.settle();
+    let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
+        conclusion,
+    )));
+}
+
+fn reply_result_failure(state: &LogicalExecutionState, reply: ActorReply<()>) {
+    let error = state.conclusion().map_or(
+        LogicalExecutionActorError::ResultDeliveryFailed,
+        LogicalExecutionActorError::ExecutionConcluded,
+    );
+    let _ = reply.send(Err(error));
 }
 
 #[cfg(test)]
@@ -5790,6 +6022,95 @@ mod tests {
         parent.complete();
     }
 
+    #[tokio::test]
+    async fn pump_cancellation_handoff_waits_for_actor_deadline_conclusion() {
+        let runtime = Handle::current();
+        let first = execution(8802);
+        let (parent, work_owner, stage) = test_governed_child_work(None);
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
+            first,
+            ExecutionEffect::None,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
+        )
+        .unwrap()
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+
+        parent.cancel(CancellationReason::DeadlineExceeded);
+        assert_eq!(
+            running.await_work_cancellation().await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        let error = match stream.next().await {
+            Err(error) => error,
+            Ok(_) => panic!("deadline must terminate the result stream"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
+
+        drop(stream);
+        drop(actor);
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        parent.complete();
+    }
+
+    #[tokio::test]
+    async fn work_deadline_wins_when_running_permit_is_abandoned_in_the_same_tick() {
+        let runtime = Handle::current();
+        let first = execution(8803);
+        let (parent, work_owner, stage) = test_governed_child_work(None);
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
+            first,
+            ExecutionEffect::None,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
+        )
+        .unwrap()
+        .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+
+        parent.cancel(CancellationReason::DeadlineExceeded);
+        drop(running);
+        let error = match stream.next().await {
+            Err(error) => error,
+            Ok(_) => panic!("deadline must terminate the result stream"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
+
+        drop(stream);
+        drop(actor);
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        parent.complete();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn inherited_work_deadline_cancels_backpressured_replacement() {
         let runtime = Handle::current();
@@ -6977,7 +7298,7 @@ mod tests {
         assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
         assert_eq!(
             delivery_task.await.unwrap().unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Cancelled)
         );
         assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
         drop(stream);
@@ -7037,7 +7358,7 @@ mod tests {
         delivery.fail(error);
         assert_eq!(
             delivery_task.await.unwrap().unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Cancelled)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
         assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
@@ -7081,7 +7402,7 @@ mod tests {
         ));
         assert_eq!(
             delivery_task.await.unwrap().unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
         assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
@@ -7179,7 +7500,7 @@ mod tests {
                 .deliver_result_batch(ResultPacketSequence::new(1), gap_batch, gap_credit)
                 .await
                 .unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
         assert_eq!(gap_authority.snapshot().result_credit.held_bytes(), 0);
@@ -7211,7 +7532,7 @@ mod tests {
                 .deliver_result_batch(ResultPacketSequence::new(u64::MAX), batch, credit)
                 .await
                 .unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
         let error = match stream.next().await {
@@ -7245,7 +7566,7 @@ mod tests {
                 .observe_final_worker_eos_ack(foreign, ResultPacketSequence::new(0))
                 .await
                 .unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
         drop(stream);
@@ -7457,6 +7778,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coalesced_root_status_may_skip_nonterminal_versions() {
+        let runtime = Handle::current();
+        let first = execution(1141);
+        let config = recovery_config(first, Arc::new(DelayedQualificationPort::default()), 2)
+            .with_result_stream(result_schema(), NonZeroUsize::new(1).unwrap());
+        let (mut owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let ExecutionOutput::Rows(mut stream) = owner.take_output().unwrap() else {
+            panic!("result execution must expose its row stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let root = root_task(first, 71);
+        let observer = running.bind_root_result(root).await.unwrap();
+        observer
+            .observe_status(root_status(root, 1, TaskState::Planned))
+            .await
+            .unwrap();
+        observer
+            .observe_status(root_status(root, 4, TaskState::Finished))
+            .await
+            .unwrap();
+        assert_eq!(actor.snapshot().await.unwrap().conclusion, None);
+        observer
+            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .await
+            .unwrap();
+        let finish = tokio::spawn(async move { running.finish_result_stream().await });
+        let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
+            panic!("coalesced stable success must still deliver EOF");
+        };
+        end.complete();
+        assert_eq!(finish.await.unwrap().unwrap(), LogicalConclusion::Succeeded);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
     async fn wrong_final_ack_sequence_fails_at_observation() {
         let runtime = Handle::current();
         let first = execution(115);
@@ -7476,7 +7836,7 @@ mod tests {
                 .observe_final_worker_eos_ack(root, ResultPacketSequence::new(1))
                 .await
                 .unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
         drop(running);
@@ -7512,7 +7872,7 @@ mod tests {
                 .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
                 .await
                 .unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
         let error = match stream.next().await {
@@ -7598,6 +7958,7 @@ mod tests {
                 activation: observer.activation(),
                 root,
                 status: root_status(root, 2, TaskState::Aborted),
+                terminal_failure: RootTerminalFailure::Unspecified,
                 reply,
             })
             .unwrap();
@@ -7605,12 +7966,12 @@ mod tests {
 
         assert_eq!(
             response.await.unwrap().unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
+            LogicalExecutionActorError::ExecutionConcluded(LogicalConclusion::Failed)
         );
-        assert_eq!(
+        assert!(matches!(
             finish_task.await.unwrap().unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
-        );
+            RunningAttemptHandoffError::ExecutionConcluded(LogicalConclusion::Failed)
+        ));
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
         drop(stream);
         drop(actor);
@@ -7649,10 +8010,10 @@ mod tests {
             "protocol writer failed to encode EOF",
         ));
 
-        assert_eq!(
+        assert!(matches!(
             finish_task.await.unwrap().unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
-        );
+            RunningAttemptHandoffError::ExecutionConcluded(LogicalConclusion::Failed)
+        ));
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
         drop(stream);
         drop(actor);
@@ -7701,10 +8062,10 @@ mod tests {
         };
 
         parent.cancel(CancellationReason::Requested);
-        assert_eq!(
+        assert!(matches!(
             finish_task.await.unwrap().unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
-        );
+            RunningAttemptHandoffError::ExecutionConcluded(LogicalConclusion::Cancelled)
+        ));
         wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
         drop(end);
         drop(observer);
@@ -7736,10 +8097,10 @@ mod tests {
         let finish_task = tokio::spawn(async move { running.finish_result_stream().await });
         drop(observer);
 
-        assert_eq!(
+        assert!(matches!(
             finish_task.await.unwrap().unwrap_err(),
-            LogicalExecutionActorError::ResultDeliveryFailed
-        );
+            RunningAttemptHandoffError::ExecutionConcluded(LogicalConclusion::Failed)
+        ));
         wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
         drop(stream);
         drop(actor);

@@ -702,28 +702,26 @@ impl QueryResultStream {
         if self.terminal_seen {
             return Ok(None);
         }
-        let message = loop {
-            let event = if let Some(failure) = self.failure.as_mut() {
-                tokio::select! {
-                    biased;
-                    failure = failure.wait() => StreamEvent::Failure(failure),
-                    message = self.receiver.recv() => StreamEvent::Message(message),
-                }
-            } else {
-                StreamEvent::Message(self.receiver.recv().await)
-            };
-            match event {
-                StreamEvent::Failure(error) => {
-                    self.failure.take();
-                    self.receiver.close();
-                    while let Ok(delivery) = self.receiver.try_recv() {
-                        drop(delivery);
-                    }
-                    self.terminal_seen = true;
-                    return Err(error);
-                }
-                StreamEvent::Message(message) => break message,
+        let event = if let Some(failure) = self.failure.as_mut() {
+            tokio::select! {
+                biased;
+                failure = failure.wait() => StreamEvent::Failure(failure),
+                message = self.receiver.recv() => StreamEvent::Message(message),
             }
+        } else {
+            StreamEvent::Message(self.receiver.recv().await)
+        };
+        let message = match event {
+            StreamEvent::Failure(error) => {
+                self.failure.take();
+                self.receiver.close();
+                while let Ok(delivery) = self.receiver.try_recv() {
+                    drop(delivery);
+                }
+                self.terminal_seen = true;
+                return Err(error);
+            }
+            StreamEvent::Message(message) => message,
         };
         match message {
             Some(delivery @ ResultDelivery::Batch(_)) => Ok(Some(delivery)),

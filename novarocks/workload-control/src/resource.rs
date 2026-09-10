@@ -1062,47 +1062,48 @@ impl ResultCredit {
         authority: &LocalResourceAuthority,
         bytes: u64,
     ) -> Result<Self, ResultCreditReservationError> {
-        if let Err(error) = self.require(
+        match self
+            .reserve_decode_when_available_in_place(authority, bytes)
+            .await
+        {
+            Ok(()) => Ok(self),
+            Err(error) => Err(Self::reservation_error(error, self)),
+        }
+    }
+
+    /// Reserve decoded-output bytes in FIFO order without transferring the raw
+    /// credit into the waiting future. The caller retains the same
+    /// `RawRetained` token when the wait is cancelled, fails, or its future is
+    /// dropped. A successful wait changes this token to `DecodeReserved` before
+    /// returning.
+    pub async fn reserve_decode_when_available_in_place(
+        &mut self,
+        authority: &LocalResourceAuthority,
+        bytes: u64,
+    ) -> Result<(), WorkError> {
+        self.require(
             ResultCreditStage::RawRetained,
             ResultCreditStage::DecodeReserved,
-        ) {
-            return Err(Self::reservation_error(error, self));
-        }
-        if let Err(error) = self.scope.check() {
-            return Err(Self::reservation_error(error, self));
-        }
+        )?;
+        self.scope.check()?;
         if !Arc::ptr_eq(&authority.inner, &self.scope.inner) {
-            return Err(Self::reservation_error(WorkError::ForeignAuthority, self));
+            return Err(WorkError::ForeignAuthority);
         }
         if bytes == 0 {
-            return Err(Self::reservation_error(
-                WorkError::Capacity("zero-byte decode reservation"),
-                self,
-            ));
+            return Err(WorkError::Capacity("zero-byte decode reservation"));
         }
         let Some(combined) = self.primary_bytes.checked_add(bytes) else {
-            return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
+            return Err(WorkError::ArithmeticOverflow);
         };
         let config = &self.scope.inner.resource_config;
         let data_limit = config.total_bytes - config.control_bytes;
         if combined > config.per_scope_bytes || combined > data_limit {
-            return Err(Self::reservation_error(
-                WorkError::Capacity("unrepresentable decode allocation"),
-                self,
-            ));
+            return Err(WorkError::Capacity("unrepresentable decode allocation"));
         }
-        let cancellation = match self.scope.cancellation() {
-            Ok(cancellation) => cancellation,
-            Err(error) => return Err(Self::reservation_error(error, self)),
-        };
-        let capacity_deadline = match tokio::time::Instant::now()
+        let cancellation = self.scope.cancellation()?;
+        let capacity_deadline = tokio::time::Instant::now()
             .checked_add(self.scope.inner.config.capacity_wait_timeout)
-        {
-            Some(deadline) => deadline,
-            None => {
-                return Err(Self::reservation_error(WorkError::ArithmeticOverflow, self));
-            }
-        };
+            .ok_or(WorkError::ArithmeticOverflow)?;
         let wait_deadline = cancellation
             .deadline()
             .map_or(capacity_deadline, |deadline| {
@@ -1137,10 +1138,10 @@ impl ResultCredit {
             Ok(None) => {
                 self.stage = ResultCreditStage::DecodeReserved;
                 self.secondary_bytes = bytes;
-                return Ok(self);
+                return Ok(());
             }
             Ok(Some(registration)) => registration,
-            Err(error) => return Err(Self::reservation_error(error, self)),
+            Err(error) => return Err(error),
         };
 
         let inner = Arc::clone(&self.scope.inner);
@@ -1151,14 +1152,9 @@ impl ResultCredit {
             let changed = inner.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if let Err(error) = self.scope.check() {
-                return Err(Self::reservation_error(error, self));
-            }
+            self.scope.check()?;
             if tokio::time::Instant::now() >= wait_deadline {
-                return Err(Self::reservation_error(
-                    WorkError::CapacityWaitTimeout,
-                    self,
-                ));
+                return Err(WorkError::CapacityWaitTimeout);
             }
 
             let grant = inner.update_facts_silent(|state| {
@@ -1202,17 +1198,17 @@ impl ResultCredit {
                     inner.notify_capacity_available();
                     self.stage = ResultCreditStage::DecodeReserved;
                     self.secondary_bytes = bytes;
-                    return Ok(self);
+                    return Ok(());
                 }
                 Ok(false) => {}
-                Err(error) => return Err(Self::reservation_error(error, self)),
+                Err(error) => return Err(error),
             }
 
             tokio::select! {
                 _ = changed => {},
                 _ = &mut timeout => {},
                 reason = &mut cancelled => {
-                    return Err(Self::reservation_error(WorkError::Cancelled(reason), self));
+                    return Err(WorkError::Cancelled(reason));
                 }
             }
         }

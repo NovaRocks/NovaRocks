@@ -29,6 +29,8 @@ mod operation;
 mod recovery;
 mod replacement;
 mod result;
+mod result_decode;
+mod result_pump;
 mod stand_down;
 mod status;
 
@@ -46,5 +48,6 @@ pub use operation::*;
 pub use recovery::*;
 pub use replacement::*;
 pub use result::*;
+pub use result_pump::*;
 pub use stand_down::*;
 pub use status::*;

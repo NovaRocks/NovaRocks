@@ -36,6 +36,8 @@ pub enum ExecutionEffect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptFailureClass {
     RecoverableInfrastructure,
+    ExecutionFailure,
+    ResourceGovernance,
     ContractViolation,
     Cancelled,
     DeadlineExceeded,
@@ -133,6 +135,17 @@ mod tests {
                 ..recoverable()
             }),
             RecoveryDecision::Refuse(RecoveryRefusal::ExternalEffect)
+        );
+    }
+
+    #[test]
+    fn local_resource_governance_never_restarts_a_remote_attempt() {
+        assert_eq!(
+            evaluate_recovery(RecoveryInput {
+                failure: AttemptFailureClass::ResourceGovernance,
+                ..recoverable()
+            }),
+            RecoveryDecision::Refuse(RecoveryRefusal::FailureClass)
         );
     }
 }
