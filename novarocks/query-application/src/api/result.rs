@@ -42,24 +42,50 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 
-/// Returns the workload charge retained by one delivered batch.
+/// Move-only decoded result and its canonical workload-accounting facts.
 ///
-/// Several arrays and slices may share one allocation. Charging the visible
-/// buffers independently would multiply that allocation, while Arrow's generic
-/// object-size estimate also includes unstable Rust metadata. Result delivery
-/// instead charges each reachable backing allocation once. Sharing across
-/// separate batches remains conservatively charged once per delivery owner. A
-/// batch with no Arrow backing keeps a one-byte sentinel because its row count
-/// can still carry result semantics.
-pub(crate) fn decoded_result_charge_bytes(batch: &RecordBatch) -> usize {
+/// Construction walks the Arrow graph exactly once. Several arrays and slices
+/// may share one allocation, so the backing measure charges each reachable
+/// allocation once. Sharing across separate batches remains conservatively
+/// charged once per owner. A batch without Arrow backing retains a one-byte
+/// governance sentinel because its row count can still carry result semantics.
+/// The private fields prevent a caller from pairing a batch with invented
+/// accounting facts.
+pub(crate) struct DecodedResultBatch {
+    batch: RecordBatch,
+    unique_backing_bytes: u64,
+    governance_charge_bytes: u64,
+}
+
+impl DecodedResultBatch {
+    pub(crate) fn try_new(batch: RecordBatch) -> Result<Self, QueryExecutionError> {
+        let unique_backing_bytes = u64::try_from(unique_arrow_backing_bytes(&batch))
+            .map_err(|_| invalid_result_delivery("decoded result backing size does not fit u64"))?;
+        Ok(Self {
+            batch,
+            unique_backing_bytes,
+            governance_charge_bytes: unique_backing_bytes.max(1),
+        })
+    }
+
+    pub(crate) const fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+
+    pub(crate) const fn unique_backing_bytes(&self) -> u64 {
+        self.unique_backing_bytes
+    }
+
+    pub(crate) const fn governance_charge_bytes(&self) -> u64 {
+        self.governance_charge_bytes
+    }
+}
+
+fn unique_arrow_backing_bytes(batch: &RecordBatch) -> usize {
     let mut seen = HashSet::new();
-    let backing_bytes = batch.columns().iter().fold(0usize, |total, column| {
+    batch.columns().iter().fold(0usize, |total, column| {
         total.saturating_add(array_backing_bytes(&column.to_data(), &mut seen))
-    });
-    // A zero-column batch can still carry a nonzero row count. Keep that
-    // delivery represented in the byte authority without inventing unstable
-    // Arrow object-size accounting.
-    backing_bytes.max(1)
+    })
 }
 
 fn array_backing_bytes(data: &ArrayData, seen: &mut HashSet<usize>) -> usize {
@@ -279,7 +305,7 @@ impl std::fmt::Debug for BatchDeliveryReservationError {
 pub struct BatchDelivery {
     execution_id: QueryExecutionId,
     sequence: ResultPacketSequence,
-    batch: Option<RecordBatch>,
+    decoded: Option<DecodedResultBatch>,
     decoded_bytes: u64,
     credit: Option<ResultCredit>,
     signal: DeliverySignal,
@@ -289,36 +315,26 @@ impl BatchDelivery {
     pub(crate) fn try_new(
         execution_id: QueryExecutionId,
         sequence: ResultPacketSequence,
-        batch: RecordBatch,
+        decoded: DecodedResultBatch,
         credit: ResultCredit,
     ) -> Result<(Self, ResultDeliveryReceipt), QueryExecutionError> {
-        let mut batch = Some(batch);
+        let mut decoded = Some(decoded);
         let mut credit = Some(credit);
         if credit.as_ref().unwrap().stage() != ResultCreditStage::DecodedQueued {
             let actual = credit.as_ref().unwrap().stage();
             return Err(reject_batch(
-                batch.take().unwrap(),
+                decoded.take().unwrap(),
                 credit.take().unwrap(),
                 invalid_result_delivery(format!(
                     "result batch credit must be DecodedQueued, got {actual:?}"
                 )),
             ));
         }
-        let decoded_bytes =
-            match u64::try_from(decoded_result_charge_bytes(batch.as_ref().unwrap())) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return Err(reject_batch(
-                        batch.take().unwrap(),
-                        credit.take().unwrap(),
-                        invalid_result_delivery("decoded result batch size does not fit u64"),
-                    ));
-                }
-            };
-        if decoded_bytes == 0 || credit.as_ref().unwrap().held_bytes() != decoded_bytes {
+        let decoded_bytes = decoded.as_ref().unwrap().governance_charge_bytes();
+        if credit.as_ref().unwrap().held_bytes() != decoded_bytes {
             let credited = credit.as_ref().unwrap().held_bytes();
             return Err(reject_batch(
-                batch.take().unwrap(),
+                decoded.take().unwrap(),
                 credit.take().unwrap(),
                 invalid_result_delivery(format!(
                     "decoded result batch holds {decoded_bytes} bytes but its credit holds {credited}"
@@ -330,7 +346,7 @@ impl BatchDelivery {
             Self {
                 execution_id,
                 sequence,
-                batch,
+                decoded,
                 decoded_bytes,
                 credit,
                 signal,
@@ -348,9 +364,10 @@ impl BatchDelivery {
     }
 
     pub fn batch(&self) -> &RecordBatch {
-        self.batch
+        self.decoded
             .as_ref()
-            .expect("batch delivery owns its batch before completion")
+            .expect("batch delivery owns its decoded result before completion")
+            .batch()
     }
 
     pub const fn decoded_bytes(&self) -> u64 {
@@ -438,7 +455,7 @@ impl BatchDelivery {
             }
             Err(error) => {
                 let (error, credit) = reservation_parts(error);
-                drop(self.batch.take());
+                drop(self.decoded.take());
                 drop(credit);
                 let error = failed_result_delivery("begin protocol result write", error);
                 self.signal
@@ -451,7 +468,7 @@ impl BatchDelivery {
     /// Release all result credit after actual protocol acceptance.
     pub fn complete(mut self) -> Result<(), QueryExecutionError> {
         // The credit covers the Arrow buffers through their final owner.
-        drop(self.batch.take());
+        drop(self.decoded.take());
         let credit = self
             .credit
             .take()
@@ -471,7 +488,7 @@ impl BatchDelivery {
     }
 
     pub fn fail(mut self, error: QueryExecutionError) {
-        drop(self.batch.take());
+        drop(self.decoded.take());
         drop(self.credit.take());
         self.signal.finish(ResultDeliveryDisposition::Failed(error));
     }
@@ -481,7 +498,7 @@ impl Drop for BatchDelivery {
     fn drop(&mut self) {
         // The payload dies before its capacity becomes available, and both
         // happen before the owner observes Dropped.
-        drop(self.batch.take());
+        drop(self.decoded.take());
         drop(self.credit.take());
         self.signal.finish(ResultDeliveryDisposition::Dropped);
     }
@@ -729,12 +746,12 @@ fn reservation_parts(error: ResultCreditReservationError) -> (WorkError, ResultC
 }
 
 fn reject_batch(
-    batch: RecordBatch,
+    decoded: DecodedResultBatch,
     credit: ResultCredit,
     error: QueryExecutionError,
 ) -> QueryExecutionError {
     // Never make the governed bytes available while their Arrow owner lives.
-    drop(batch);
+    drop(decoded);
     drop(credit);
     error
 }
@@ -754,8 +771,8 @@ fn failed_result_delivery_message(message: impl Into<Arc<str>>) -> QueryExecutio
 #[cfg(test)]
 mod tests {
     use arrow::{
-        array::{ArrayRef, Int64Array},
-        datatypes::{DataType, Field, Schema},
+        array::{Array, ArrayData, ArrayRef, DictionaryArray, Int64Array, ListArray, StringArray},
+        datatypes::{DataType, Field, Int32Type, Schema},
     };
     use novarocks_types::{AttemptId, QueryId};
     use novarocks_workload_control::{
@@ -790,37 +807,159 @@ mod tests {
         .unwrap()
     }
 
+    fn decoded(batch: RecordBatch) -> DecodedResultBatch {
+        DecodedResultBatch::try_new(batch).unwrap()
+    }
+
+    fn shallow_backing_bytes(data: &ArrayData) -> u64 {
+        let buffers = data.buffers().iter().fold(0_u64, |total, buffer| {
+            total + u64::try_from(buffer.capacity().max(buffer.len())).unwrap()
+        });
+        buffers
+            + data
+                .nulls()
+                .map(|nulls| {
+                    u64::try_from(nulls.buffer().capacity().max(nulls.buffer().len())).unwrap()
+                })
+                .unwrap_or(0)
+    }
+
     #[test]
-    fn decoded_result_bytes_charge_shared_backing_once() {
+    fn decoded_result_batch_measures_fixed_width_backing() {
+        let fixed = Arc::new(Int64Array::from(vec![11_i64, 13, 17])) as ArrayRef;
+        let expected = shallow_backing_bytes(&fixed.to_data());
+        let decoded = decoded(RecordBatch::try_from_iter(vec![("fixed", fixed)]).unwrap());
+
+        assert_eq!(decoded.unique_backing_bytes(), expected);
+        assert_eq!(decoded.governance_charge_bytes(), expected);
+    }
+
+    #[test]
+    fn decoded_result_batch_measures_varlen_and_null_backing() {
+        let strings =
+            Arc::new(StringArray::from(vec![Some("ready"), None, Some("done")])) as ArrayRef;
+        let nullable = Arc::new(Int64Array::from(vec![Some(11_i64), None, Some(17)])) as ArrayRef;
+        let expected =
+            shallow_backing_bytes(&strings.to_data()) + shallow_backing_bytes(&nullable.to_data());
+        let decoded = decoded(
+            RecordBatch::try_from_iter(vec![("strings", strings), ("nullable", nullable)]).unwrap(),
+        );
+
+        assert_eq!(decoded.unique_backing_bytes(), expected);
+        assert_eq!(decoded.governance_charge_bytes(), expected);
+    }
+
+    #[test]
+    fn decoded_result_batch_measures_nested_backing() {
+        let list = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(11), None]),
+            None,
+            Some(vec![Some(17)]),
+        ])) as ArrayRef;
+        let data = list.to_data();
+        let expected = shallow_backing_bytes(&data)
+            + data
+                .child_data()
+                .iter()
+                .map(shallow_backing_bytes)
+                .sum::<u64>();
+        let decoded = decoded(RecordBatch::try_from_iter(vec![("nested", list)]).unwrap());
+
+        assert_eq!(decoded.unique_backing_bytes(), expected);
+        assert_eq!(decoded.governance_charge_bytes(), expected);
+    }
+
+    #[test]
+    fn decoded_result_batch_measures_dictionary_backing() {
+        let dictionary = Arc::new(
+            vec!["ready", "running", "ready"]
+                .into_iter()
+                .collect::<DictionaryArray<Int32Type>>(),
+        ) as ArrayRef;
+        let data = dictionary.to_data();
+        let expected = shallow_backing_bytes(&data)
+            + data
+                .child_data()
+                .iter()
+                .map(shallow_backing_bytes)
+                .sum::<u64>();
+        let decoded =
+            decoded(RecordBatch::try_from_iter(vec![("dictionary", dictionary)]).unwrap());
+
+        assert_eq!(decoded.unique_backing_bytes(), expected);
+        assert_eq!(decoded.governance_charge_bytes(), expected);
+    }
+
+    #[test]
+    fn decoded_result_batch_charges_shared_slice_backing_once() {
         let source = Int64Array::from(vec![11_i64, 13, 17, 19]);
         let left = Arc::new(source.slice(0, 2)) as ArrayRef;
         let right = Arc::new(source.slice(2, 2)) as ArrayRef;
         let left_only = RecordBatch::try_from_iter(vec![("left", Arc::clone(&left))]).unwrap();
         let shared = RecordBatch::try_from_iter(vec![("left", left), ("right", right)]).unwrap();
 
+        let left_only = decoded(left_only);
+        let shared = decoded(shared);
+
         assert_eq!(
-            decoded_result_charge_bytes(&shared),
-            decoded_result_charge_bytes(&left_only)
+            shared.unique_backing_bytes(),
+            left_only.unique_backing_bytes()
+        );
+        assert_eq!(
+            shared.governance_charge_bytes(),
+            shared.unique_backing_bytes()
         );
     }
 
     #[test]
-    fn decoded_result_bytes_keep_zero_column_rows_represented() {
+    fn decoded_result_batch_separates_zero_backing_from_governance_charge() {
         let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(7));
         let batch =
             RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options).unwrap();
+        let decoded = decoded(batch);
 
-        assert_eq!(decoded_result_charge_bytes(&batch), 1);
+        assert_eq!(decoded.unique_backing_bytes(), 0);
+        assert_eq!(decoded.governance_charge_bytes(), 1);
 
         let control = workload();
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let credit = decoded_credit(&control, &root.owner.scope(), 1);
-        let (delivery, _receipt) =
-            BatchDelivery::try_new(execution_id(1), ResultPacketSequence::new(0), batch, credit)
-                .unwrap();
+        let (delivery, _receipt) = BatchDelivery::try_new(
+            execution_id(1),
+            ResultPacketSequence::new(0),
+            decoded,
+            credit,
+        )
+        .unwrap();
         assert_eq!(delivery.batch().num_rows(), 7);
+        assert_eq!(delivery.decoded_bytes(), 1);
+    }
+
+    #[test]
+    fn batch_delivery_rejects_non_exact_governance_credit() {
+        let decoded = decoded(batch());
+        let charge = decoded.governance_charge_bytes();
+        let control = workload();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let credit = decoded_credit(&control, &root.owner.scope(), charge + 1);
+
+        let error = match BatchDelivery::try_new(
+            execution_id(1),
+            ResultPacketSequence::new(0),
+            decoded,
+            credit,
+        ) {
+            Ok(_) => panic!("non-exact decoded credit must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+        assert_eq!(control.resources().snapshot().result_credit.held_bytes(), 0);
+        drop(root);
     }
 
     fn workload() -> WorkloadControl {
@@ -889,8 +1028,8 @@ mod tests {
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let credit = decoded_credit(&control, &root.owner.scope(), bytes);
         let authority = control.resources();
         let (delivery, receipt) =
@@ -919,8 +1058,8 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_capacity_wait_succeeds_after_capacity_release() {
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -962,9 +1101,9 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_capacity_waits_from_one_scope_are_fifo_and_coexist() {
-        let first_batch = batch();
-        let second_batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&first_batch)).unwrap();
+        let first_batch = decoded(batch());
+        let second_batch = decoded(batch());
+        let bytes = first_batch.governance_charge_bytes();
         let control = workload_with_limits(bytes * 5, bytes * 4);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1041,8 +1180,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn protocol_capacity_wait_timeout_is_one_absolute_deadline() {
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1093,8 +1232,8 @@ mod tests {
 
     #[tokio::test]
     async fn protocol_capacity_wait_returns_cancelled_delivery_to_adapter() {
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1144,8 +1283,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn protocol_capacity_wait_uses_the_work_scope_deadline() {
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let work = control
@@ -1192,8 +1331,8 @@ mod tests {
 
     #[tokio::test]
     async fn unrepresentable_protocol_capacity_fails_without_waiting() {
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1226,8 +1365,8 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_protocol_capacity_wait_releases_delivery_credit() {
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let control = workload_with_limits(bytes * 3, bytes * 2);
         let work = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
@@ -1268,8 +1407,8 @@ mod tests {
         let work = local
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let credit = decoded_credit(&local, &work.owner.scope(), bytes);
         let (delivery, receipt) =
             BatchDelivery::try_new(execution_id(7), ResultPacketSequence::new(0), batch, credit)
@@ -1297,8 +1436,8 @@ mod tests {
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let credit = decoded_credit(&control, &root.owner.scope(), bytes);
         let authority = control.resources();
         let (delivery, receipt) =
@@ -1334,8 +1473,8 @@ mod tests {
             ResultDeliveryDisposition::Completed
         );
 
-        let batch = batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let batch = decoded(batch());
+        let bytes = batch.governance_charge_bytes();
         let credit = decoded_credit(&control, &root.owner.scope(), bytes);
         let (delivery, receipt) =
             BatchDelivery::try_new(id, ResultPacketSequence::new(0), batch, credit).unwrap();

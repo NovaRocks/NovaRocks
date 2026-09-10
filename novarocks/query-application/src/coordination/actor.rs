@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::record_batch::RecordBatch;
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, EstablishQueryContext, OperationOutcome, QueryContextRef,
     ResultPacketSequence, TaskIdentity, TaskStatus, TaskStatusCursor,
@@ -38,9 +37,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::{
-    BatchDelivery, EndDelivery, ExecutionOutput, QueryExecutionError, QueryResultStream,
-    QueryResultTransport, ResultDelivery, ResultDeliveryDisposition, ResultDeliveryReceipt,
-    ResultQueuePermit, ResultSchema,
+    BatchDelivery, DecodedResultBatch, EndDelivery, ExecutionOutput, QueryExecutionError,
+    QueryResultStream, QueryResultTransport, ResultDelivery, ResultDeliveryDisposition,
+    ResultDeliveryReceipt, ResultQueuePermit, ResultSchema,
 };
 
 use super::actor_state::{
@@ -451,10 +450,10 @@ impl RunningAttemptPermit {
     /// the batch, so a Native adapter can delay its Worker ACK until success.
     /// If the waiter is cancelled after submission, `snapshot` retains the
     /// delivered watermark and is the retryable ACK authority.
-    pub async fn deliver_result_batch(
+    pub(crate) async fn deliver_result_batch(
         &self,
         sequence: ResultPacketSequence,
-        batch: RecordBatch,
+        batch: DecodedResultBatch,
         credit: ResultCredit,
     ) -> Result<(), LogicalExecutionActorError> {
         request(self.mailbox(), |reply| ActorCommand::DeliverResultBatch {
@@ -1110,7 +1109,7 @@ enum ActorCommand {
     DeliverResultBatch {
         activation: AttemptActivationIdentity,
         sequence: ResultPacketSequence,
-        batch: RecordBatch,
+        batch: DecodedResultBatch,
         credit: ResultCredit,
         reply: ActorReply<()>,
     },
@@ -3101,7 +3100,7 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
                 return;
             }
-            if sequence.next().is_none() || !runtime.schema.accepts(&batch) {
+            if sequence.next().is_none() || !runtime.schema.accepts(batch.batch()) {
                 drop(batch);
                 drop(credit);
                 let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
@@ -3943,6 +3942,7 @@ mod tests {
     use super::*;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use novarocks_execution_contract::{
         AbortCause, AdmissionEpochCapability, AdmissionTicketId, CodecOwnedContent,
         ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
@@ -4768,20 +4768,23 @@ mod tests {
         )])
     }
 
-    fn result_batch() -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )])),
-            vec![Arc::new(Int64Array::from(vec![7_i64, 11]))],
+    fn result_batch() -> DecodedResultBatch {
+        DecodedResultBatch::try_new(
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    DataType::Int64,
+                    false,
+                )])),
+                vec![Arc::new(Int64Array::from(vec![7_i64, 11]))],
+            )
+            .unwrap(),
         )
         .unwrap()
     }
 
     fn result_credit(
-        batch: &RecordBatch,
+        batch: &DecodedResultBatch,
     ) -> (
         WorkloadControl,
         WorkOwner,
@@ -4801,7 +4804,7 @@ mod tests {
         let root = control
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let bytes = batch.governance_charge_bytes();
         let authority = control.resources();
         let credit = authority
             .reserve_result_credit(&root.owner.scope(), bytes)
@@ -6638,7 +6641,7 @@ mod tests {
         let root = root_task(first, 1);
         let observer = running.bind_root_result(root).await.unwrap();
         let batch = result_batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let bytes = batch.governance_charge_bytes();
         let (control, credit_owner, authority, credit) = result_credit(&batch);
         let delivery_running = Arc::clone(&running);
         let delivery_task = tokio::spawn(async move {
@@ -7204,7 +7207,7 @@ mod tests {
         let root = root_task(first, 6);
         let observer = running.bind_root_result(root).await.unwrap();
         let batch = result_batch();
-        let bytes = u64::try_from(crate::api::decoded_result_charge_bytes(&batch)).unwrap();
+        let bytes = batch.governance_charge_bytes();
         let (control, credit_owner, authority, credit) = result_credit(&batch);
         let (reply, response) = oneshot::channel();
         actor
