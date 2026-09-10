@@ -30,8 +30,12 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
+use bytes::Bytes;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_execution::runtime::exchange::{
+    TypedRootResultDecodeBounds, preflight_typed_root_result_decode,
+};
 use novarocks_execution::task_execution::domain::DomainVersion;
 use novarocks_execution::task_execution::operation::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
@@ -111,6 +115,64 @@ pub fn decode_fetched_query_batch(
     Ok(FetchedQueryBatch::new(chunks.remove(0)))
 }
 
+/// Move-only ownership of one validated but not yet decoded root-result packet.
+///
+/// Construction performs the complete metadata-only IPC preflight. Keeping the
+/// payload opaque ensures the transport can return it without allocating an
+/// Arrow `RecordBatch`, while the later result pump can retain the raw bytes,
+/// reserve decode capacity from the trusted bounds, and consume this value
+/// exactly once to decode.
+pub struct RawRootResultPacket {
+    packet_sequence: ResultPacketSequence,
+    payload: Bytes,
+    payload_bytes: u64,
+    decode_bounds: TypedRootResultDecodeBounds,
+}
+
+impl RawRootResultPacket {
+    fn try_new(
+        packet_sequence: ResultPacketSequence,
+        payload: Bytes,
+        payload_limit: ResultByteLimit,
+    ) -> Result<Self, String> {
+        let payload_bytes = u64::try_from(payload.len())
+            .map_err(|_| "root result payload length does not fit u64".to_string())?;
+        let decode_bounds = preflight_typed_root_result_decode(&payload, payload_limit)?;
+        Ok(Self {
+            packet_sequence,
+            payload,
+            payload_bytes,
+            decode_bounds,
+        })
+    }
+
+    pub const fn packet_sequence(&self) -> ResultPacketSequence {
+        self.packet_sequence
+    }
+
+    /// Logical protobuf payload bytes used by result-credit accounting.
+    ///
+    /// The opaque receive buffer may retain transport allocator slack. That
+    /// process overhead remains bounded by the Native message cap and the
+    /// process-wide result-fetch concurrency supervisor; it is not presented
+    /// as exact query-owned Arrow or payload backing.
+    pub const fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
+    }
+
+    pub const fn decode_bounds(&self) -> TypedRootResultDecodeBounds {
+        self.decode_bounds
+    }
+
+    /// Consume the sole raw owner and allocate the decoded Arrow batch.
+    pub fn decode(
+        self,
+        expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
+    ) -> Result<FetchedQueryBatch, String> {
+        decode_fetched_query_batch(&self.payload, expected_output_schema)
+    }
+}
+
 /// Outcome of a single `fetch_result` call.
 pub enum FetchOutcome {
     /// A result batch is available.
@@ -158,10 +220,7 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
 )]
 pub enum RootResultOutcome {
     /// One result packet.
-    Ready {
-        packet_sequence: u64,
-        batch: FetchedQueryBatch,
-    },
+    Ready(RawRootResultPacket),
     /// Nothing available within this poll's wait.
     NotReady,
     /// EOS arrived at this sequence but still needs the frontend's final ACK.
@@ -175,11 +234,11 @@ pub enum RootResultOutcome {
 impl fmt::Debug for RootResultOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ready {
-                packet_sequence, ..
-            } => formatter
+            Self::Ready(packet) => formatter
                 .debug_struct("Ready")
-                .field("packet_sequence", packet_sequence)
+                .field("packet_sequence", &packet.packet_sequence())
+                .field("payload_bytes", &packet.payload_bytes())
+                .field("decode_bounds", &packet.decode_bounds())
                 .finish_non_exhaustive(),
             Self::NotReady => formatter.write_str("NotReady"),
             Self::EndOfStreamPending { packet_sequence } => formatter
@@ -319,7 +378,6 @@ pub trait TaskResultTransport: Send + Sync + 'static {
         max_wait: MaxWait,
         acknowledged: Option<ResultPacketSequence>,
         max_result_bytes: ResultByteLimit,
-        expected_output_schema: Option<ChunkSchemaRef>,
     ) -> Pin<Box<dyn Future<Output = Result<RootResultOutcome, String>> + Send + 'static>>;
 
     /// Reads one terminal task's bounded final info.
@@ -406,7 +464,6 @@ impl TaskResultTransport for NativeTaskResultTransport {
         max_wait: MaxWait,
         acknowledged: Option<ResultPacketSequence>,
         max_result_bytes: ResultByteLimit,
-        expected_output_schema: Option<ChunkSchemaRef>,
     ) -> Pin<Box<dyn Future<Output = Result<RootResultOutcome, String>> + Send + 'static>> {
         let route = self
             .client_of(root_task)
@@ -447,60 +504,7 @@ impl TaskResultTransport for NativeTaskResultTransport {
                     .map(tonic::Response::into_inner)
                     .map_err(|error| format!("fetch_task_result rpc failed: {error}"))
             }?;
-            validate_result_payload_size(
-                &address,
-                response.result_arrow_ipc.len(),
-                max_result_bytes,
-            )?;
-            let status = FetchStatus::try_from(response.status).map_err(|_| {
-                format!(
-                    "{address}: root result poll returned unknown status {}",
-                    response.status
-                )
-            })?;
-            match status {
-            FetchStatus::Ready => {
-                // The sequence orders the whole stream, so a value that is not
-                // a sequence is refused rather than mapped onto one.
-                let packet_sequence = u64::try_from(response.packet_seq).map_err(|_| {
-                    format!(
-                        "{address}: root result packet sequence {} is not a sequence",
-                        response.packet_seq
-                    )
-                })?;
-                if response.eos {
-                    return Ok(RootResultOutcome::EndOfStreamPending { packet_sequence });
-                }
-                if response.result_arrow_ipc.is_empty() {
-                    return Err(format!("{address}: root result READY carries no payload"));
-                }
-                decode_fetched_query_batch(
-                    &response.result_arrow_ipc,
-                    expected_output_schema
-                        .as_ref()
-                        .map(ExpectedOutputSchemaView::new),
-                )
-                    .map(|batch| RootResultOutcome::Ready {
-                        packet_sequence,
-                        batch,
-                    })
-                    .map_err(|error| format!("{address}: {error}"))
-            }
-            FetchStatus::NotReady => Ok(RootResultOutcome::NotReady),
-            FetchStatus::Error => Ok(RootResultOutcome::Failed(response.message)),
-            FetchStatus::Eof => acknowledged
-                .map(|sequence| RootResultOutcome::EndOfStream {
-                    packet_sequence: sequence.get(),
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "{address}: root result poll answered EOF before any packet acknowledgement"
-                    )
-                }),
-            FetchStatus::ResultStatusUnspecified => Err(format!(
-                "{address}: root result poll returned an unspecified status"
-            )),
-            }
+            classify_root_result_response(&address, response, acknowledged, max_result_bytes)
         })
     }
 
@@ -653,6 +657,116 @@ fn validate_native_result_byte_limit(limit: ResultByteLimit) -> Result<(), Strin
     Ok(())
 }
 
+fn classify_root_result_response(
+    address: &str,
+    response: novarocks_proto_models::novarocks::FetchResultResponse,
+    acknowledged: Option<ResultPacketSequence>,
+    max_result_bytes: ResultByteLimit,
+) -> Result<RootResultOutcome, String> {
+    validate_result_payload_size(address, response.result_arrow_ipc.len(), max_result_bytes)?;
+    let status = FetchStatus::try_from(response.status).map_err(|_| {
+        format!(
+            "{address}: root result poll returned unknown status {}",
+            response.status
+        )
+    })?;
+    match status {
+        FetchStatus::Ready => {
+            // The sequence orders the whole stream, so a value that is not a
+            // sequence is refused rather than mapped onto one.
+            let packet_sequence = u64::try_from(response.packet_seq).map_err(|_| {
+                format!(
+                    "{address}: root result packet sequence {} is not a sequence",
+                    response.packet_seq
+                )
+            })?;
+            if response.eos {
+                if !response.result_arrow_ipc.is_empty() {
+                    return Err(format!(
+                        "{address}: root result READY end marker carries {} unexpected payload bytes",
+                        response.result_arrow_ipc.len()
+                    ));
+                }
+                return Ok(RootResultOutcome::EndOfStreamPending { packet_sequence });
+            }
+            if response.result_arrow_ipc.is_empty() {
+                return Err(format!("{address}: root result READY carries no payload"));
+            }
+            RawRootResultPacket::try_new(
+                ResultPacketSequence::new(packet_sequence),
+                response.result_arrow_ipc,
+                max_result_bytes,
+            )
+            .map(RootResultOutcome::Ready)
+            .map_err(|error| format!("{address}: {error}"))
+        }
+        FetchStatus::NotReady => {
+            require_empty_root_result_payload(address, "NOT_READY", &response)?;
+            if response.packet_seq != 0 || response.eos {
+                return Err(format!(
+                    "{address}: root result NOT_READY carries terminal fields packet_seq={} eos={}",
+                    response.packet_seq, response.eos
+                ));
+            }
+            Ok(RootResultOutcome::NotReady)
+        }
+        FetchStatus::Error => {
+            require_empty_root_result_payload(address, "ERROR", &response)?;
+            if response.packet_seq != 0 || response.eos {
+                return Err(format!(
+                    "{address}: root result ERROR carries terminal fields packet_seq={} eos={}",
+                    response.packet_seq, response.eos
+                ));
+            }
+            Ok(RootResultOutcome::Failed(response.message))
+        }
+        FetchStatus::Eof => {
+            require_empty_root_result_payload(address, "EOF", &response)?;
+            if !response.eos {
+                return Err(format!(
+                    "{address}: root result EOF is missing its eos marker"
+                ));
+            }
+            let acknowledged = acknowledged.ok_or_else(|| {
+                format!(
+                    "{address}: root result poll answered EOF before any packet acknowledgement"
+                )
+            })?;
+            let packet_sequence = u64::try_from(response.packet_seq).map_err(|_| {
+                format!(
+                    "{address}: root result EOF packet sequence {} is not a sequence",
+                    response.packet_seq
+                )
+            })?;
+            if packet_sequence != acknowledged.get() {
+                return Err(format!(
+                    "{address}: root result EOF sequence {packet_sequence} does not match acknowledged {}",
+                    acknowledged.get()
+                ));
+            }
+            Ok(RootResultOutcome::EndOfStream { packet_sequence })
+        }
+        FetchStatus::ResultStatusUnspecified => Err(format!(
+            "{address}: root result poll returned an unspecified status"
+        )),
+    }
+}
+
+fn require_empty_root_result_payload(
+    address: &str,
+    status: &str,
+    response: &novarocks_proto_models::novarocks::FetchResultResponse,
+) -> Result<(), String> {
+    if response.result_arrow_ipc.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{address}: root result {status} carries {} unexpected payload bytes",
+            response.result_arrow_ipc.len()
+        ))
+    }
+}
+
 fn validate_result_payload_size(
     address: &str,
     payload_bytes: usize,
@@ -694,19 +808,125 @@ fn classify_dynamic_filter_status(address: &str, status: &tonic::Status) -> Dyna
 
 #[cfg(test)]
 mod tests {
-    use novarocks_execution::task_execution::ResultByteLimit;
+    use std::sync::Arc;
+
+    use arrow::{datatypes::Schema, record_batch::RecordBatch};
+    use bytes::Bytes;
+    use novarocks_execution::{
+        exec::chunk::{Chunk, ChunkSchema},
+        runtime::exchange::encode_chunks,
+        task_execution::ResultByteLimit,
+    };
+    use novarocks_proto_models::novarocks::{FetchResultResponse, fetch_result_response::Status};
     use novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
 
     use super::{
-        decode_fetched_query_batch, validate_native_result_byte_limit, validate_result_payload_size,
+        RootResultOutcome, classify_root_result_response, decode_fetched_query_batch,
+        validate_native_result_byte_limit, validate_result_payload_size,
     };
+
+    fn typed_empty_result_payload() -> Vec<u8> {
+        let chunk = Chunk::new_with_chunk_schema(
+            RecordBatch::new_empty(Arc::new(Schema::empty())),
+            Arc::new(ChunkSchema::empty()),
+        );
+        encode_chunks(&[chunk], true).expect("encode typed root result")
+    }
+
+    fn ready_response(payload: impl Into<Bytes>) -> FetchResultResponse {
+        FetchResultResponse {
+            status: Status::Ready as i32,
+            result_arrow_ipc: payload.into(),
+            packet_seq: 7,
+            ..FetchResultResponse::default()
+        }
+    }
 
     #[test]
     fn opaque_fetch_decode_requires_exactly_one_chunk() {
         let Err(error) = decode_fetched_query_batch(&[], None) else {
             panic!("empty payload is not a batch");
         };
-        assert_eq!(error, "typed root result decoded 0 chunks, expected 1");
+        assert!(error.contains("greater than zero"), "actual: {error}");
+    }
+
+    #[test]
+    fn ready_response_returns_preflighted_raw_packet_without_arrow_decode() {
+        let payload = typed_empty_result_payload();
+        let limit = ResultByteLimit::new(u64::try_from(payload.len()).unwrap()).unwrap();
+        let outcome =
+            classify_root_result_response("backend", ready_response(payload.clone()), None, limit)
+                .expect("current writer output passes transport preflight");
+        let RootResultOutcome::Ready(packet) = outcome else {
+            panic!("READY data must remain a raw packet");
+        };
+
+        assert_eq!(packet.packet_sequence().get(), 7);
+        assert_eq!(
+            packet.payload_bytes(),
+            u64::try_from(payload.len()).unwrap()
+        );
+        assert!(packet.decode_bounds().decode_operation_upper_bound() > 0);
+    }
+
+    #[test]
+    fn ready_response_rejects_malformed_ipc_during_metadata_preflight() {
+        let malformed = Bytes::from_static(b"not-an-nrx1-packet");
+        let limit = ResultByteLimit::new(u64::try_from(malformed.len()).unwrap()).unwrap();
+        let error =
+            classify_root_result_response("backend", ready_response(malformed), None, limit)
+                .expect_err("malformed READY data must fail before Arrow decode");
+
+        assert!(error.contains("missing NRX1 envelope"), "actual: {error}");
+    }
+
+    #[test]
+    fn raw_packet_is_consumed_by_one_explicit_decode() {
+        let payload = typed_empty_result_payload();
+        let limit = ResultByteLimit::new(u64::try_from(payload.len()).unwrap()).unwrap();
+        let RootResultOutcome::Ready(packet) =
+            classify_root_result_response("backend", ready_response(payload), None, limit)
+                .expect("current writer output passes transport preflight")
+        else {
+            panic!("READY data must remain a raw packet");
+        };
+
+        let batch = packet.decode(None).expect("explicit packet decode");
+        assert_eq!(batch.into_chunk().len(), 0);
+    }
+
+    #[test]
+    fn terminal_result_responses_require_empty_payload_and_exact_ack() {
+        let limit = ResultByteLimit::new(1024).unwrap();
+        let mut pending = ready_response(Bytes::from_static(b"unexpected"));
+        pending.eos = true;
+        let error = classify_root_result_response("backend", pending, None, limit)
+            .expect_err("an EOS marker cannot discard a data payload");
+        assert!(error.contains("unexpected payload bytes"), "{error}");
+
+        let acknowledged = super::ResultPacketSequence::new(7);
+        let eof = FetchResultResponse {
+            status: Status::Eof as i32,
+            packet_seq: 8,
+            eos: true,
+            ..FetchResultResponse::default()
+        };
+        let error = classify_root_result_response("backend", eof, Some(acknowledged), limit)
+            .expect_err("EOF must echo the exact acknowledged sequence");
+        assert!(error.contains("does not match acknowledged 7"), "{error}");
+
+        let eof = FetchResultResponse {
+            status: Status::Eof as i32,
+            packet_seq: 7,
+            eos: true,
+            ..FetchResultResponse::default()
+        };
+        let outcome = classify_root_result_response("backend", eof, Some(acknowledged), limit)
+            .expect("exact terminal acknowledgement");
+        assert!(matches!(
+            outcome,
+            RootResultOutcome::EndOfStream { packet_sequence: 7 }
+        ));
     }
 
     #[test]

@@ -1235,7 +1235,6 @@ impl FrontendDistributedQueryCoordinator {
                 match RootResultPolls::start(
                     Arc::clone(&result_transport) as Arc<dyn TaskResultTransport>,
                     root_task,
-                    Arc::clone(&root_output_schema),
                     statement_deadline,
                     self.result_fetch_byte_limit,
                     Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
@@ -1268,10 +1267,8 @@ impl FrontendDistributedQueryCoordinator {
             // parking on the wake the poller raised.
             if let Some(answer) = root_result_polls.as_mut().and_then(RootResultPolls::take) {
                 match answer {
-                    Ok(RootResultOutcome::Ready {
-                        packet_sequence,
-                        batch,
-                    }) => {
+                    Ok(RootResultOutcome::Ready(packet)) => {
+                        let packet_sequence = packet.packet_sequence().get();
                         if let Err(error) = round.consume_root_result_packet(packet_sequence, false)
                         {
                             emit_distributed_write_phase_marker(
@@ -1290,6 +1287,25 @@ impl FrontendDistributedQueryCoordinator {
                                 format!("root result packet was refused: {error}"),
                             ));
                         }
+                        let batch = match packet.decode(Some(
+                            crate::native::fragment_transport::ExpectedOutputSchemaView::new(
+                                &root_output_schema,
+                            ),
+                        )) {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                break Err(self.fail_task_round(
+                                    query_id,
+                                    &mut round,
+                                    &split_delivery,
+                                    classification,
+                                    QueryFailureCause::RemoteTransportObservation,
+                                    format!(
+                                        "root result packet for task {root_task} decode failed: {error}"
+                                    ),
+                                ));
+                            }
+                        };
                         root_batch_count = root_batch_count.saturating_add(1);
                         let mut batch_rows = 0;
                         if let Some(decoder) = statistics_decoder.as_mut() {
@@ -3375,7 +3391,6 @@ mod tests {
             _max_wait: MaxWait,
             acknowledged: Option<ResultPacketSequence>,
             _max_result_bytes: ResultByteLimit,
-            _expected_output_schema: Option<novarocks_execution::exec::chunk::ChunkSchemaRef>,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<RootResultOutcome, String>>
@@ -3489,7 +3504,6 @@ mod tests {
         let mut polls = super::RootResultPolls::start(
             Arc::clone(&transport) as Arc<dyn super::TaskResultTransport>,
             root_task_for_test(),
-            Arc::new(novarocks_execution::exec::chunk::ChunkSchema::empty()),
             Instant::now() + Duration::from_secs(60),
             ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
                 .expect("the test result byte limit is nonzero"),
@@ -3974,7 +3988,6 @@ impl RootResultPolls {
     fn start(
         transport: Arc<dyn TaskResultTransport>,
         root_task: TaskIdentity,
-        expected_output_schema: novarocks_execution::exec::chunk::ChunkSchemaRef,
         statement_deadline: Instant,
         max_result_bytes: ResultByteLimit,
         wake: Arc<dyn StatusIntakeWake>,
@@ -3998,22 +4011,21 @@ impl RootResultPolls {
                         max_root_result_wait(now, statement_deadline),
                         acknowledged,
                         max_result_bytes,
-                        Some(Arc::clone(&expected_output_schema)),
                     )
                     .await;
                 let expected_acknowledgement = match &answer {
                     Ok(
-                        RootResultOutcome::Ready {
-                            packet_sequence, ..
-                        }
-                        | RootResultOutcome::EndOfStreamPending { packet_sequence },
-                    ) => Some(ResultPacketSequence::new(*packet_sequence)),
+                        RootResultOutcome::Ready(packet)
+                    ) => Some(packet.packet_sequence()),
+                    Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) => {
+                        Some(ResultPacketSequence::new(*packet_sequence))
+                    }
                     _ => None,
                 };
                 let last = !matches!(
                     &answer,
                     Ok(
-                        RootResultOutcome::Ready { .. }
+                        RootResultOutcome::Ready(_)
                             | RootResultOutcome::NotReady
                             | RootResultOutcome::EndOfStreamPending { .. }
                     )
