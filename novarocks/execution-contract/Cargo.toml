@@ -1,12 +1,16 @@
 [package]
 name = "novarocks-execution-contract"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
-novarocks-types = { path = "../types" }
-sha2 = "0.10"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+novarocks-types.workspace = true
+sha2.workspace = true
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }

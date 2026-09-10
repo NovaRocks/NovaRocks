@@ -17,12 +17,15 @@
 
 [package]
 name = "novarocks-catalog-application"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
 novarocks-spi = { path = "../spi" }
-

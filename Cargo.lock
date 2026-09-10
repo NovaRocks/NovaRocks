@@ -4193,9 +4193,7 @@ dependencies = [
  "futures",
  "novarocks-state-store-api",
  "novarocks-state-store-testkit",
- "sha2",
  "tokio",
- "uuid",
 ]
 
 [[package]]

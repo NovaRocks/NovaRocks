@@ -15,41 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::time::Duration;
+//! Provider-neutral execution of one logical StateStore operation.
+//!
+//! Attempt identities and observations come from the open store instance. The
+//! runtime keeps the observation it was issued and never reconstructs an
+//! identity after losing sight of a commit.
 
 use futures::future::BoxFuture;
 use novarocks_state_store_api::{
-    CommitOutcome, CommitReceipt, MAX_RUNNER_ATTEMPTS, StateStore, StateStoreError,
-    StateStoreErrorKind, StateStoreMetrics, TransactionId, WriteTransaction,
+    CommitObservation, CommitOutcome, CommitReceipt, StateStore, StateStoreError,
+    StateStoreErrorKind, WriteTransaction,
 };
-use sha2::{Digest, Sha256};
 use tokio::time::{Instant, sleep_until, timeout_at};
-use uuid::Uuid;
 
-const RETRY_BACKOFFS: [Duration; MAX_RUNNER_ATTEMPTS - 1] = [
-    Duration::from_millis(10),
-    Duration::from_millis(20),
-    Duration::from_millis(40),
-    Duration::from_millis(80),
-];
+use crate::StateStoreRunPolicy;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct OperationId(Uuid);
-
-impl OperationId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    pub const fn as_uuid(&self) -> &Uuid {
-        &self.0
-    }
-}
-
-impl From<Uuid> for OperationId {
-    fn from(value: Uuid) -> Self {
-        Self(value)
-    }
+/// Application-owned observation hooks for the neutral runner.
+///
+/// Product domains keep their labels and counters. The StateStore runtime only
+/// reports the four facts that its retry policy can produce.
+pub trait StateStoreRunMetrics: Send + Sync {
+    fn record_retry(&self);
+    fn record_saturated_retry(&self);
+    fn record_deadline(&self);
+    fn record_unresolved(&self);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,62 +47,55 @@ pub struct RunSuccess<T> {
     pub receipt: CommitReceipt,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum RunFailure {
     Begin(StateStoreError),
     Operation(StateStoreError),
     RetryExhausted(StateStoreError),
     DefiniteFailure(StateStoreError),
     CommitUnknown {
-        transaction_id: TransactionId,
+        observation: CommitObservation,
         error: StateStoreError,
     },
     DeadlineExceeded,
 }
 
-pub fn derive_transaction_id(operation_id: OperationId, attempt: usize) -> TransactionId {
-    assert!(
-        (1..=MAX_RUNNER_ATTEMPTS).contains(&attempt),
-        "state store runner attempt must be between 1 and 5"
-    );
-
-    let mut digest = Sha256::new();
-    digest.update(operation_id.as_uuid().as_bytes());
-    digest.update((attempt as u32).to_be_bytes());
-    let digest = digest.finalize();
-
-    let mut bytes = [0_u8; 16];
-    bytes[..6].copy_from_slice(&operation_id.as_uuid().as_bytes()[..6]);
-    bytes[6..].copy_from_slice(&digest[..10]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    TransactionId::from(Uuid::from_bytes(bytes))
-}
-
-/// Run a transaction body with no externally visible side effects.
+/// Run a transaction body that has no externally visible side effects.
 ///
-/// The body may be replayed only after a conflict or a failure known to have
-/// happened before commit. Stable request identifiers must be allocated before
-/// this call. A cancelled runner or commit timeout has an unknown outcome; the
-/// caller must resolve the attempt transaction identities derived from the
-/// same [`OperationId`] or establish the effect with an authoritative read.
+/// Each replay reserves a fresh attempt from the same open StateStore instance.
+/// A dispatched commit that times out returns the exact observation capability
+/// issued with that attempt; callers must resolve it or establish the effect by
+/// an authoritative read before starting new work.
 pub async fn run_side_effect_free<T, F>(
     store: &dyn StateStore,
-    metrics: &StateStoreMetrics,
-    operation_id: OperationId,
+    metrics: &dyn StateStoreRunMetrics,
+    policy: StateStoreRunPolicy,
     purpose: &str,
     mut operation: F,
 ) -> Result<RunSuccess<T>, RunFailure>
 where
     F: for<'a> FnMut(&'a mut dyn WriteTransaction) -> BoxFuture<'a, Result<T, StateStoreError>>,
 {
-    let deadline = Instant::now() + store.limits().transaction_deadline;
-    let max_attempts = store.limits().runner_max_attempts.min(MAX_RUNNER_ATTEMPTS);
+    let deadline = Instant::now() + policy.operation_timeout();
+    let mut attempts_spent = 0_usize;
 
-    for attempt in 1..=max_attempts {
-        let transaction_id = derive_transaction_id(operation_id, attempt);
+    loop {
+        let (write_attempt, observation) = match store.attempts().reserve() {
+            Ok(reserved) => reserved,
+            Err(error) if error.kind() == StateStoreErrorKind::Saturated => {
+                metrics.record_saturated_retry();
+                if !wait_for_retry(deadline, policy.backoff_after(attempts_spent + 1)).await {
+                    return Err(deadline_exceeded(metrics));
+                }
+                continue;
+            }
+            Err(error) => return Err(RunFailure::Begin(error)),
+        };
+
+        attempts_spent += 1;
+
         let mut transaction =
-            match timeout_at(deadline, store.begin_write(transaction_id, purpose)).await {
+            match timeout_at(deadline, store.begin_write(write_attempt, purpose)).await {
                 Ok(Ok(transaction)) => transaction,
                 Ok(Err(error)) => return Err(RunFailure::Begin(error)),
                 Err(_) => return Err(deadline_exceeded(metrics)),
@@ -129,11 +111,12 @@ where
             Ok(outcome) => outcome,
             Err(_) => {
                 metrics.record_deadline();
+                metrics.record_unresolved();
                 return Err(RunFailure::CommitUnknown {
-                    transaction_id,
+                    observation,
                     error: StateStoreError::new(
                         StateStoreErrorKind::DeadlineExceeded,
-                        "state store commit exceeded the runner deadline",
+                        "state store commit exceeded the operation budget",
                     ),
                 });
             }
@@ -146,68 +129,76 @@ where
                 return Err(RunFailure::DefiniteFailure(error));
             }
             CommitOutcome::CommitUnknown(error) => {
-                return Err(RunFailure::CommitUnknown {
-                    transaction_id,
-                    error,
-                });
+                metrics.record_unresolved();
+                return Err(RunFailure::CommitUnknown { observation, error });
             }
         };
 
-        if attempt == max_attempts {
+        if attempts_spent >= policy.max_attempts() {
             return Err(RunFailure::RetryExhausted(retry_error));
         }
 
         metrics.record_retry();
-        let wake_at = (Instant::now() + RETRY_BACKOFFS[attempt - 1]).min(deadline);
-        sleep_until(wake_at).await;
-        if Instant::now() >= deadline {
+        if !wait_for_retry(deadline, policy.backoff_after(attempts_spent)).await {
             return Err(deadline_exceeded(metrics));
         }
     }
-
-    unreachable!("state store limits require at least one runner attempt")
 }
 
-fn deadline_exceeded(metrics: &StateStoreMetrics) -> RunFailure {
+async fn wait_for_retry(deadline: Instant, backoff: std::time::Duration) -> bool {
+    let wake_at = (Instant::now() + backoff).min(deadline);
+    sleep_until(wake_at).await;
+    Instant::now() < deadline
+}
+
+fn deadline_exceeded(metrics: &dyn StateStoreRunMetrics) -> RunFailure {
     metrics.record_deadline();
     RunFailure::DeadlineExceeded
 }
 
 #[cfg(test)]
 mod tests {
-    use novarocks_state_store_api::{StateStoreMetrics, StateStoreProviderId};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use novarocks_state_store_testkit::testing::InMemoryStateStore;
-    use uuid::Uuid;
 
     use super::*;
 
-    const RUNTIME_PROVIDER: StateStoreProviderId = StateStoreProviderId::new("runtime-test");
+    #[derive(Default)]
+    struct TestMetrics {
+        retries: AtomicU64,
+        saturated: AtomicU64,
+        deadlines: AtomicU64,
+        unresolved: AtomicU64,
+    }
 
-    #[test]
-    fn transaction_identity_is_stable_per_operation_attempt() {
-        let operation = OperationId::from(
-            Uuid::parse_str("018f1d6f-1234-7890-8123-456789abcdef").expect("operation UUID"),
-        );
+    impl StateStoreRunMetrics for TestMetrics {
+        fn record_retry(&self) {
+            self.retries.fetch_add(1, Ordering::Relaxed);
+        }
 
-        assert_eq!(
-            derive_transaction_id(operation, 1),
-            derive_transaction_id(operation, 1)
-        );
-        assert_ne!(
-            derive_transaction_id(operation, 1),
-            derive_transaction_id(operation, 2)
-        );
+        fn record_saturated_retry(&self) {
+            self.saturated.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_deadline(&self) {
+            self.deadlines.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_unresolved(&self) {
+            self.unresolved.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[tokio::test]
-    async fn runner_commits_through_the_provider_neutral_spi() {
+    async fn runner_uses_an_attempt_issued_by_the_open_store() {
         let store = InMemoryStateStore::new("runtime-test-cluster");
-        let metrics = StateStoreMetrics::new(RUNTIME_PROVIDER);
+        let metrics = TestMetrics::default();
 
         let success = run_side_effect_free(
             &store,
             &metrics,
-            OperationId::new_v7(),
+            StateStoreRunPolicy::default(),
             "runtime owner test",
             |_| Box::pin(async { Ok::<_, StateStoreError>(42_u8) }),
         )
@@ -215,6 +206,7 @@ mod tests {
         .expect("commit through StateStore SPI");
 
         assert_eq!(success.value, 42);
-        assert_eq!(metrics.snapshot().retry_count, 0);
+        assert_eq!(metrics.retries.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.unresolved.load(Ordering::Relaxed), 0);
     }
 }

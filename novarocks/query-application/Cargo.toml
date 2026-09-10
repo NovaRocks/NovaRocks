@@ -1,16 +1,20 @@
 [package]
 name = "novarocks-query-application"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-novarocks-execution-contract = { path = "../execution-contract" }
-novarocks-spi = { path = "../spi" }
-novarocks-sql = { path = "../sql" }
-novarocks-types = { path = "../types" }
-novarocks-workload-control = { path = "../workload-control" }
-bytes = "1"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+novarocks-execution-contract.workspace = true
+novarocks-spi.workspace = true
+novarocks-sql.workspace = true
+novarocks-types.workspace = true
+novarocks-workload-control.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
-novarocks-sql = { path = "../sql", features = ["test-support"] }
+novarocks-sql = { workspace = true, features = ["test-support"] }

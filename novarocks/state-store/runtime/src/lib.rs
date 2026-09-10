@@ -21,9 +21,11 @@
 //! record families and prefixes remain with the application domain that owns
 //! those records.
 
+mod policy;
 mod runner;
 
-pub use novarocks_state_store_api::StateStoreMetrics;
-pub use runner::{
-    OperationId, RunFailure, RunSuccess, derive_transaction_id, run_side_effect_free,
+pub use policy::{
+    DEFAULT_MAX_ATTEMPTS, DEFAULT_OPERATION_TIMEOUT, MAX_ATTEMPTS_CEILING,
+    OPERATION_TIMEOUT_CEILING, StateStoreRunPolicy, StateStoreRunPolicyError,
 };
+pub use runner::{RunFailure, RunSuccess, StateStoreRunMetrics, run_side_effect_free};
