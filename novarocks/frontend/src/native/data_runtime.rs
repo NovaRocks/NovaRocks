@@ -13,6 +13,9 @@ use tonic::transport::Channel;
 
 use super::transport::FrontendNativeTransport;
 use super::transport_supervisor::NativeTransportSupervisor;
+use crate::task_execution::blocking_io::{
+    ConnectorBlockingIoBudget, ConnectorBlockingIoSupervisor,
+};
 
 /// Process-wide root-result I/O concurrency. Long polls are parked async, but
 /// their channels and response buffers still consume finite process capacity.
@@ -31,6 +34,7 @@ pub(crate) struct FrontendDataRuntime {
     channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
     task_transport_supervisor: NativeTransportSupervisor,
     result_fetch_permits: Arc<Semaphore>,
+    connector_blocking_io: ConnectorBlockingIoSupervisor,
 }
 
 impl FrontendDataRuntime {
@@ -39,7 +43,10 @@ impl FrontendDataRuntime {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
         task_transport_budget: TransportBudget,
+        connector_blocking_io_budget: ConnectorBlockingIoBudget,
     ) -> Result<Self, String> {
+        let connector_blocking_io =
+            ConnectorBlockingIoSupervisor::new(handle.clone(), connector_blocking_io_budget);
         Ok(Self {
             handle,
             native_trust,
@@ -49,6 +56,7 @@ impl FrontendDataRuntime {
                 task_transport_budget,
             )?,
             result_fetch_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RESULT_FETCHES)),
+            connector_blocking_io,
         })
     }
 
@@ -71,6 +79,7 @@ impl FrontendDataRuntime {
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
             TransportBudget::DEFAULT,
+            ConnectorBlockingIoBudget::default(),
         )
         .expect("the default task transport budget is valid")
     }
@@ -92,6 +101,10 @@ impl FrontendDataRuntime {
             .acquire_owned()
             .await
             .map_err(|_| "frontend result-fetch supervisor is closed".to_owned())
+    }
+
+    pub(crate) fn connector_blocking_io(&self) -> &ConnectorBlockingIoSupervisor {
+        &self.connector_blocking_io
     }
 
     pub(crate) fn block_on<F>(&self, future: F) -> Result<F::Output, String>
@@ -149,6 +162,7 @@ mod tests {
 
     use super::FrontendDataRuntime;
     use crate::native::transport::FrontendNativeTransport;
+    use crate::task_execution::ConnectorBlockingIoBudget;
 
     fn data_runtime(handle: tokio::runtime::Handle) -> FrontendDataRuntime {
         let trust = NativeTrust::new(
@@ -163,6 +177,7 @@ mod tests {
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
             TransportBudget::DEFAULT,
+            ConnectorBlockingIoBudget::default(),
         )
         .expect("the default task transport budget is valid")
     }

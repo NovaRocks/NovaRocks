@@ -544,6 +544,13 @@ pub fn compose_frontend_server_config(
         task_execution_budgets.coordination,
         task_execution_budgets.transport,
     )
+    .with_connector_blocking_io_budget(
+        novarocks_frontend::task_execution::ConnectorBlockingIoBudget::try_new(
+            runtime_config.connector_blocking_io_max_inflight,
+            runtime_config.connector_split_blocking_io_max_inflight,
+        )
+        .map_err(|error| anyhow::anyhow!("construct Connector blocking-I/O budget: {error}"))?,
+    )
     .with_result_fetch_byte_limit(result_fetch_byte_limit);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");

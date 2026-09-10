@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use novarocks_execution::exec::fragment::program::{FragmentContractVersion, FragmentSinkKind};
@@ -52,6 +52,7 @@ use novarocks_types::identity::{
 };
 use novarocks_types::{AttemptId, NativeCompatibilityId, QueryId};
 
+use super::blocking_io::{ConnectorBlockingIoBudget, ConnectorBlockingIoSupervisor};
 use super::clock::{ManualClock, TaskProtocolClock};
 use super::context_owner::{
     ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
@@ -84,6 +85,22 @@ const LEAF_TO_MIDDLE_NODE: i32 = 20;
 const MIDDLE_TO_ROOT_NODE: i32 = 30;
 const LEAF_TO_ROOT_NODE: i32 = 31;
 const SCAN_NODE: i32 = 5;
+
+fn test_connector_blocking_io() -> ConnectorBlockingIoSupervisor {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(8)
+            .enable_all()
+            .build()
+            .expect("test Connector blocking-I/O runtime")
+    });
+    ConnectorBlockingIoSupervisor::new(
+        runtime.handle().clone(),
+        ConnectorBlockingIoBudget::default(),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -3473,7 +3490,8 @@ fn round_of(harness: Harness) -> (TaskRoundForTest, Arc<CountingWake>) {
         Box::new(FakeEstablish),
         Arc::new(RecordingSubscriptions::default())
             as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
-    );
+    )
+    .with_connector_blocking_io(test_connector_blocking_io());
     (round, wake)
 }
 
@@ -4071,6 +4089,7 @@ fn a_credential_rotation_reaches_every_context_and_is_reported_once() {
         CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
         Arc::clone(&storage),
         clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
     )
     .expect("a refreshable lease means there is something to rotate");
     let mut driver = Arc::clone(&pump);
@@ -4149,6 +4168,7 @@ fn a_rotation_that_cannot_be_accepted_before_its_hard_deadline_fails_the_attempt
         CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
         storage,
         clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);
@@ -4198,6 +4218,7 @@ fn a_wiped_rotation_owner_stops_driving_the_credential_domain() {
         CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
         storage,
         clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);
@@ -4240,6 +4261,7 @@ fn a_context_that_is_already_over_is_retired_rather_than_failing_the_rotation() 
         CredentialRefreshOwner::from_establish(&credential, contexts.iter().copied()),
         storage,
         clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
     )
     .expect("a refreshable lease");
     let mut driver = Arc::clone(&pump);

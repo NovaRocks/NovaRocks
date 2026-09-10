@@ -28,6 +28,7 @@ use novarocks_task_codec::TransportBudget;
 
 use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
+use crate::task_execution::ConnectorBlockingIoBudget;
 use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
@@ -223,6 +224,7 @@ pub struct FrontendExecutionConfig {
     /// one that configuration failed to supply.
     coordination_budgets: CoordinationBudgets,
     transport_budget: TransportBudget,
+    connector_blocking_io_budget: ConnectorBlockingIoBudget,
     /// Positive root-result payload credit placed on every Native fetch.
     result_fetch_byte_limit: ResultByteLimit,
     /// Connector split enumeration's bounded, server-owned initial feedback
@@ -262,6 +264,7 @@ impl FrontendExecutionConfig {
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
             coordination_budgets: CoordinationBudgets::DEFAULT,
             transport_budget: TransportBudget::DEFAULT,
+            connector_blocking_io_budget: ConnectorBlockingIoBudget::default(),
             result_fetch_byte_limit: ResultByteLimit::new(16 * 1024 * 1024)
                 .expect("the test result fetch byte limit is nonzero"),
             connector_split_initial_dynamic_filter_wait_cap:
@@ -316,6 +319,11 @@ impl FrontendExecutionConfig {
     ) -> Self {
         self.coordination_budgets = coordination;
         self.transport_budget = transport;
+        self
+    }
+
+    pub fn with_connector_blocking_io_budget(mut self, budget: ConnectorBlockingIoBudget) -> Self {
+        self.connector_blocking_io_budget = budget;
         self
     }
 
@@ -486,6 +494,7 @@ impl FrontendApplicationHost {
             native_trust,
             native_transport,
             execution.transport_budget,
+            execution.connector_blocking_io_budget,
         )
         .map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)

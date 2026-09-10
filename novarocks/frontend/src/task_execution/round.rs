@@ -34,6 +34,7 @@ use novarocks_execution::task_execution::status::TerminationDetail;
 use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::status::TaskStatusCursor;
 
+use super::blocking_io::ConnectorBlockingIoSupervisor;
 use super::context_owner::{ContextEstablishSource, QueryContextOwner};
 use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
@@ -188,6 +189,7 @@ pub(crate) struct TaskRound {
     observers: Vec<Arc<dyn AcknowledgementObserver>>,
     pumps: Vec<Box<dyn TurnPump>>,
     pumps_sealed: bool,
+    connector_blocking_io: Option<ConnectorBlockingIoSupervisor>,
 }
 
 impl TaskRound {
@@ -205,7 +207,21 @@ impl TaskRound {
             observers: Vec::new(),
             pumps: Vec::new(),
             pumps_sealed: false,
+            connector_blocking_io: None,
         }
+    }
+
+    /// Installs the process owner used by blocking Connector calls.
+    pub(crate) fn with_connector_blocking_io(
+        mut self,
+        supervisor: ConnectorBlockingIoSupervisor,
+    ) -> Self {
+        self.connector_blocking_io = Some(supervisor);
+        self
+    }
+
+    pub(crate) fn connector_blocking_io(&self) -> Option<&ConnectorBlockingIoSupervisor> {
+        self.connector_blocking_io.as_ref()
     }
 
     /// Adds one owner that must see every acknowledgement this runner settles.

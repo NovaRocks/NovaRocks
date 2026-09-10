@@ -623,6 +623,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_state_store_configuration(&cfg)?;
     validate_application_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
+    validate_connector_blocking_io_config(&cfg.runtime)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
     validate_result_retained_config(&cfg.runtime)?;
@@ -1196,6 +1197,10 @@ pub struct RuntimeConfig {
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
     pub data_runtime_max_blocking_threads: usize,
+    #[serde(default = "default_connector_blocking_io_max_inflight")]
+    pub connector_blocking_io_max_inflight: usize,
+    #[serde(default = "default_connector_split_blocking_io_max_inflight")]
+    pub connector_split_blocking_io_max_inflight: usize,
     #[serde(default = "default_spill_io_threads")]
     pub spill_io_threads: usize,
     #[serde(default = "default_spill_io_queue_size")]
@@ -1608,6 +1613,21 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_connector_blocking_io_config(runtime: &RuntimeConfig) -> Result<()> {
+    let budget = novarocks_frontend::task_execution::ConnectorBlockingIoBudget::try_new(
+        runtime.connector_blocking_io_max_inflight,
+        runtime.connector_split_blocking_io_max_inflight,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if runtime.data_runtime_max_blocking_threads < budget.total() {
+        anyhow::bail!(
+            "runtime.data_runtime_max_blocking_threads must be at least \
+             runtime.connector_blocking_io_max_inflight"
+        );
+    }
+    Ok(())
+}
+
 fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
     novarocks_backend::BackendResultRetainedLimits::try_new(
         runtime.result_retained_bytes_per_root,
@@ -1854,6 +1874,14 @@ fn default_data_runtime_max_blocking_threads() -> usize {
     64
 }
 
+fn default_connector_blocking_io_max_inflight() -> usize {
+    16
+}
+
+fn default_connector_split_blocking_io_max_inflight() -> usize {
+    12
+}
+
 fn default_spill_io_threads() -> usize {
     0 // 0 means use actual exec thread count
 }
@@ -2005,6 +2033,9 @@ impl Default for RuntimeConfig {
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
+            connector_blocking_io_max_inflight: default_connector_blocking_io_max_inflight(),
+            connector_split_blocking_io_max_inflight:
+                default_connector_split_blocking_io_max_inflight(),
             spill_io_threads: default_spill_io_threads(),
             spill_io_queue_size: default_spill_io_queue_size(),
             scan_submit_fail_max: default_scan_submit_fail_max(),
@@ -2299,8 +2330,8 @@ mod tests {
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait,
         NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
-        TransportBudget, validate_query_control_config, validate_result_retained_config,
-        validate_task_execution_config,
+        TransportBudget, validate_connector_blocking_io_config, validate_query_control_config,
+        validate_result_retained_config, validate_task_execution_config,
     };
     use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
     use novarocks_types::ClusterRole;
@@ -3263,6 +3294,8 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 0);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 64);
+        assert_eq!(cfg.runtime.connector_blocking_io_max_inflight, 16);
+        assert_eq!(cfg.runtime.connector_split_blocking_io_max_inflight, 12);
     }
 
     #[test]
@@ -3272,11 +3305,39 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
 [runtime]
 data_runtime_worker_threads = 6
 data_runtime_max_blocking_threads = 99
+connector_blocking_io_max_inflight = 8
+connector_split_blocking_io_max_inflight = 5
 "#,
         )
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 6);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 99);
+        assert_eq!(cfg.runtime.connector_blocking_io_max_inflight, 8);
+        assert_eq!(cfg.runtime.connector_split_blocking_io_max_inflight, 5);
+    }
+
+    #[test]
+    fn connector_blocking_io_config_reserves_protected_capacity() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.connector_split_blocking_io_max_inflight =
+            runtime.connector_blocking_io_max_inflight;
+        let error = validate_connector_blocking_io_config(&runtime)
+            .expect_err("ordinary work must leave protected capacity");
+        assert!(
+            error.to_string().contains("leave protected capacity"),
+            "{error}"
+        );
+
+        let mut runtime = RuntimeConfig::default();
+        runtime.data_runtime_max_blocking_threads = runtime.connector_blocking_io_max_inflight - 1;
+        let error = validate_connector_blocking_io_config(&runtime)
+            .expect_err("the Tokio blocking pool must fit the whole supervisor budget");
+        assert!(
+            error
+                .to_string()
+                .contains("data_runtime_max_blocking_threads"),
+            "{error}"
+        );
     }
 
     #[test]

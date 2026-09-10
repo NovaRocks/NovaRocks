@@ -34,6 +34,7 @@
 //! coordinator keeps owning distributed query execution untouched.
 // Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
 
+pub(crate) mod blocking_io;
 pub mod clock;
 pub mod completion;
 pub mod context_owner;
@@ -56,6 +57,7 @@ pub mod status_intake;
 #[cfg(test)]
 mod tests;
 
+pub use blocking_io::ConnectorBlockingIoBudget;
 pub use clock::{ManualClock, ProcessMonotonicClock, TaskProtocolClock};
 pub use completion::{
     ReadCompletionTracker, ReadVerdict, WriteCompletionTracker, WriteVerdict, accept_final_info,
