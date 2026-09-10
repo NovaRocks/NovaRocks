@@ -17,7 +17,7 @@
 
 use crate::{
     WorkError, WorkId, WorkScope,
-    scope::{Inner, ProtocolWaiter, State},
+    scope::{Inner, ResultWaiter, State},
 };
 use std::sync::{Arc, Mutex};
 
@@ -197,6 +197,55 @@ impl Drop for ResourceWaitRegistration {
     }
 }
 
+/// One ordered reservation before a Worker result fetch. A logical execution
+/// has at most one poll in flight, while different scopes queue independently
+/// under the process authority.
+struct ResultFetchWaitRegistration {
+    scope: WorkScope,
+    ticket: Option<u64>,
+}
+
+impl ResultFetchWaitRegistration {
+    fn remove_locked(&mut self, state: &mut State) -> bool {
+        let Some(ticket) = self.ticket.take() else {
+            return false;
+        };
+        let removed = state.resource_waiters.result_fetch.remove(&ticket);
+        let scope_ticket = state
+            .resource_waiters
+            .result_fetch_by_scope
+            .remove(&self.scope.id);
+        debug_assert!(
+            removed.is_some(),
+            "Result fetch waiter registration was already removed"
+        );
+        debug_assert_eq!(scope_ticket, Some(ticket));
+        if removed.is_some() {
+            state
+                .nodes
+                .get_mut(&self.scope.id)
+                .unwrap()
+                .resource_waiters -= 1;
+            state.collect(self.scope.id);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for ResultFetchWaitRegistration {
+    fn drop(&mut self) {
+        if self.ticket.is_none() {
+            return;
+        }
+        let inner = Arc::clone(&self.scope.inner);
+        inner.update_facts(|state| {
+            self.remove_locked(state);
+        });
+    }
+}
+
 /// One independently ordered protocol-output wait. Unlike generic resource
 /// waits, a scope may own several of these because every retained result batch
 /// carries its own credit and must be able to make progress independently.
@@ -215,7 +264,6 @@ impl ProtocolWaitRegistration {
             removed.is_some(),
             "Protocol waiter registration was already removed"
         );
-        state.protocol_wait_queue.retain(|queued| *queued != ticket);
         if removed.is_some() {
             state
                 .nodes
@@ -325,6 +373,81 @@ fn reserve_protocol_bytes(
     Ok(())
 }
 
+fn reserve_result_fetch_bytes(
+    state: &mut State,
+    config: &ResourceConfig,
+    scope: &WorkScope,
+    bytes: u64,
+) -> Result<ResultCredit, WorkError> {
+    check_capacity(state, config, scope.id, bytes, ResourceClass::Data)?;
+    let node = state.nodes.get(&scope.id).unwrap();
+    let holders = node
+        .resource_holders
+        .checked_add(1)
+        .ok_or(WorkError::ArithmeticOverflow)?;
+    checked_result_stage_add(
+        state,
+        scope.id,
+        ResultCreditStage::ReservedBeforeFetch,
+        bytes,
+    )?;
+
+    state.nodes.get_mut(&scope.id).unwrap().resource_holders = holders;
+    reserve_bytes(state, scope.id, bytes, ResourceClass::Data);
+    add_result_stage(
+        state,
+        scope.id,
+        ResultCreditStage::ReservedBeforeFetch,
+        bytes,
+    );
+    Ok(ResultCredit {
+        scope: scope.clone(),
+        stage: ResultCreditStage::ReservedBeforeFetch,
+        primary_bytes: bytes,
+        secondary_bytes: 0,
+    })
+}
+
+fn register_result_fetch_waiter(
+    scope: &WorkScope,
+    state: &mut State,
+    bytes: u64,
+) -> Result<ResultFetchWaitRegistration, WorkError> {
+    state
+        .nodes
+        .get(&scope.id)
+        .ok_or(WorkError::Released)?
+        .check()?;
+    if state
+        .resource_waiters
+        .result_fetch_by_scope
+        .contains_key(&scope.id)
+    {
+        return Err(WorkError::AlreadyWaitingForResultFetch);
+    }
+    if state.waiting_records() >= scope.inner.config.waiting_limit {
+        return Err(WorkError::Capacity("waiting entries"));
+    }
+    let ticket = state.next_result_fetch_waiter_id()?;
+    state.resource_waiters.result_fetch.insert(
+        ticket,
+        ResultWaiter {
+            scope: scope.id,
+            bytes,
+        },
+    );
+    state
+        .resource_waiters
+        .result_fetch_by_scope
+        .insert(scope.id, ticket);
+    state.nodes.get_mut(&scope.id).unwrap().resource_waiters += 1;
+    state.record_waiting_peak();
+    Ok(ResultFetchWaitRegistration {
+        scope: scope.clone(),
+        ticket: Some(ticket),
+    })
+}
+
 fn register_protocol_waiter(
     scope: &WorkScope,
     state: &mut State,
@@ -341,12 +464,11 @@ fn register_protocol_waiter(
     let ticket = state.next_protocol_waiter_id()?;
     state.resource_waiters.protocol.insert(
         ticket,
-        ProtocolWaiter {
+        ResultWaiter {
             scope: scope.id,
             bytes,
         },
     );
-    state.protocol_wait_queue.push_back(ticket);
     state.nodes.get_mut(&scope.id).unwrap().resource_waiters += 1;
     state.record_waiting_peak();
     Ok(ProtocolWaitRegistration {
@@ -410,51 +532,127 @@ impl LocalResourceAuthority {
             return Err(WorkError::Capacity("zero-byte result credit"));
         }
         self.inner.update_facts_silent(|state| {
-            check_capacity(
-                state,
-                &self.inner.resource_config,
-                scope.id,
-                bytes,
-                ResourceClass::Data,
-            )?;
-            let node = state.nodes.get(&scope.id).unwrap();
-            let holders = node
-                .resource_holders
-                .checked_add(1)
-                .ok_or(WorkError::ArithmeticOverflow)?;
-            checked_result_stage_add(
-                state,
-                scope.id,
-                ResultCreditStage::ReservedBeforeFetch,
-                bytes,
-            )?;
-
-            state.nodes.get_mut(&scope.id).unwrap().resource_holders = holders;
-            reserve_bytes(state, scope.id, bytes, ResourceClass::Data);
-            add_result_stage(
-                state,
-                scope.id,
-                ResultCreditStage::ReservedBeforeFetch,
-                bytes,
-            );
-            Ok(ResultCredit {
-                scope: scope.clone(),
-                stage: ResultCreditStage::ReservedBeforeFetch,
-                primary_bytes: bytes,
-                secondary_bytes: 0,
-            })
+            if !state.resource_waiters.result_fetch.is_empty() {
+                return Err(WorkError::Capacity("result fetch reservation queue"));
+            }
+            reserve_result_fetch_bytes(state, &self.inner.resource_config, scope, bytes)
         })
     }
 
-    /// Wait for a capacity-change hint. The caller must then retry the atomic
-    /// reservation because another scope may win the race.
-    pub async fn wait_for_result_credit(
+    /// Reserve result capacity in FIFO order before issuing a Worker fetch.
+    ///
+    /// The queue head checks and charges capacity under the process authority
+    /// lock, so a later fetch cannot steal a release between notification and
+    /// retry. One absolute deadline bounds the whole wait. Cancellation,
+    /// timeout, Drop, and every error remove the registration exactly once.
+    pub async fn reserve_result_credit_when_available(
         &self,
         scope: &WorkScope,
         bytes: u64,
-    ) -> Result<(), WorkError> {
-        self.wait_for_capacity(scope, bytes, ResourceClass::Data)
-            .await
+    ) -> Result<ResultCredit, WorkError> {
+        if !Arc::ptr_eq(&self.inner, &scope.inner) {
+            return Err(WorkError::ForeignAuthority);
+        }
+        if bytes == 0 {
+            return Err(WorkError::Capacity("zero-byte result credit"));
+        }
+        let data_limit =
+            self.inner.resource_config.total_bytes - self.inner.resource_config.control_bytes;
+        if bytes > self.inner.resource_config.per_scope_bytes || bytes > data_limit {
+            return Err(WorkError::Capacity(
+                "unrepresentable result fetch allocation",
+            ));
+        }
+        let cancellation = scope.cancellation()?;
+        let capacity_deadline = tokio::time::Instant::now()
+            .checked_add(self.inner.config.capacity_wait_timeout)
+            .ok_or(WorkError::ArithmeticOverflow)?;
+        let wait_deadline = cancellation
+            .deadline()
+            .map_or(capacity_deadline, |deadline| {
+                deadline.min(capacity_deadline)
+            });
+
+        let start = self.inner.update_facts(|state| {
+            state
+                .nodes
+                .get(&scope.id)
+                .ok_or(WorkError::Released)?
+                .check()?;
+            if tokio::time::Instant::now() >= wait_deadline {
+                return Err(WorkError::CapacityWaitTimeout);
+            }
+            if state.resource_waiters.result_fetch.is_empty() {
+                match reserve_result_fetch_bytes(state, &self.inner.resource_config, scope, bytes) {
+                    Ok(credit) => return Ok(Ok(credit)),
+                    Err(WorkError::Capacity(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            register_result_fetch_waiter(scope, state, bytes).map(Err)
+        });
+        let mut registration = match start? {
+            Ok(credit) => return Ok(credit),
+            Err(registration) => registration,
+        };
+
+        let timeout = tokio::time::sleep_until(wait_deadline);
+        let cancelled = cancellation.cancelled();
+        tokio::pin!(timeout, cancelled);
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            scope.check()?;
+            if tokio::time::Instant::now() >= wait_deadline {
+                return Err(WorkError::CapacityWaitTimeout);
+            }
+
+            let grant = self.inner.update_facts_silent(|state| {
+                let ticket = registration
+                    .ticket
+                    .expect("live result fetch wait owns its queue ticket");
+                let waiter = state
+                    .resource_waiters
+                    .result_fetch
+                    .get(&ticket)
+                    .ok_or(WorkError::Released)?;
+                debug_assert_eq!((waiter.scope, waiter.bytes), (scope.id, bytes));
+                if state.resource_waiters.result_fetch.keys().next().copied() != Some(ticket) {
+                    return Ok(None);
+                }
+                state
+                    .nodes
+                    .get(&scope.id)
+                    .ok_or(WorkError::Released)?
+                    .check()?;
+                if tokio::time::Instant::now() >= wait_deadline {
+                    return Err(WorkError::CapacityWaitTimeout);
+                }
+                match reserve_result_fetch_bytes(state, &self.inner.resource_config, scope, bytes) {
+                    Ok(credit) => {
+                        registration.remove_locked(state);
+                        Ok(Some(credit))
+                    }
+                    Err(WorkError::Capacity(_)) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            });
+            match grant {
+                Ok(Some(credit)) => {
+                    self.inner.notify_capacity_available();
+                    return Ok(credit);
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+
+            tokio::select! {
+                _ = changed => {},
+                _ = &mut timeout => {},
+                reason = &mut cancelled => return Err(WorkError::Cancelled(reason)),
+            }
+        }
     }
 
     /// Wait for a capacity hint; callers retry reserve to acquire the capacity.
@@ -841,7 +1039,7 @@ impl ResultCredit {
             ));
         }
         let result = self.scope.inner.update_facts_silent(|state| {
-            if !state.protocol_wait_queue.is_empty() {
+            if !state.resource_waiters.protocol.is_empty() {
                 return Err(WorkError::Capacity("protocol reservation queue"));
             }
             reserve_protocol_bytes(
@@ -929,7 +1127,7 @@ impl ResultCredit {
             if tokio::time::Instant::now() >= wait_deadline {
                 return Err(WorkError::CapacityWaitTimeout);
             }
-            if state.protocol_wait_queue.is_empty() {
+            if state.resource_waiters.protocol.is_empty() {
                 match reserve_protocol_bytes(
                     state,
                     &self.scope.inner.resource_config,
@@ -982,7 +1180,7 @@ impl ResultCredit {
                     .get(&ticket)
                     .ok_or(WorkError::Released)?;
                 debug_assert_eq!((waiter.scope, waiter.bytes), (self.scope.id, bytes));
-                if state.protocol_wait_queue.front().copied() != Some(ticket) {
+                if state.resource_waiters.protocol.keys().next().copied() != Some(ticket) {
                     return Ok(false);
                 }
                 state

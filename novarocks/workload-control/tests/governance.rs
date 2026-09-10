@@ -703,7 +703,6 @@ async fn protocol_result_credit_waiters_share_a_scope_and_grant_fifo() {
     assert!(poll(&mut first).is_pending());
     assert!(poll(&mut second).is_pending());
     assert_eq!(control.snapshot().resource_waiters, 2);
-
     blocker.release_unused(16).unwrap();
     assert!(poll(&mut second).is_pending());
     let first = first.await.unwrap();
@@ -717,6 +716,96 @@ async fn protocol_result_credit_waiters_share_a_scope_and_grant_fifo() {
     drop((second, blocker));
     assert_eq!(authority.snapshot().held_bytes(), 0);
     drop((work, blocker_work));
+}
+
+#[tokio::test]
+async fn result_fetch_credit_waiters_grant_fifo_without_direct_bypass() {
+    let control = control();
+    let blocker_work = root(&control, WorkClass::Query);
+    let first_work = root(&control, WorkClass::Query);
+    let second_work = root(&control, WorkClass::Query);
+    let bypass_work = root(&control, WorkClass::Query);
+    let authority = control.resources();
+    let blocker = authority
+        .reserve_result_credit(&blocker_work.owner.scope(), 112)
+        .unwrap();
+    let first_scope = first_work.owner.scope();
+    let second_scope = second_work.owner.scope();
+    let mut first = Box::pin(authority.reserve_result_credit_when_available(&first_scope, 64));
+    let mut second = Box::pin(authority.reserve_result_credit_when_available(&second_scope, 64));
+    assert!(poll(&mut first).is_pending());
+    assert!(poll(&mut second).is_pending());
+    assert_eq!(control.snapshot().resource_waiters, 2);
+    assert!(matches!(
+        authority
+            .reserve_result_credit_when_available(&first_scope, 1)
+            .await,
+        Err(WorkError::AlreadyWaitingForResultFetch)
+    ));
+    assert_eq!(control.snapshot().resource_waiters, 2);
+    assert!(matches!(
+        authority.reserve_result_credit(&bypass_work.owner.scope(), 1),
+        Err(WorkError::Capacity("result fetch reservation queue"))
+    ));
+
+    drop(blocker);
+    assert!(poll(&mut second).is_pending());
+    let first = first.await.unwrap();
+    assert_eq!(first.stage(), ResultCreditStage::ReservedBeforeFetch);
+    assert_eq!(control.snapshot().resource_waiters, 1);
+    assert!(poll(&mut second).is_pending());
+    drop(first);
+
+    let second = second.await.unwrap();
+    assert_eq!(second.stage(), ResultCreditStage::ReservedBeforeFetch);
+    assert_eq!(control.snapshot().resource_waiters, 0);
+    drop(second);
+    assert_eq!(authority.snapshot().held_bytes(), 0);
+}
+
+#[tokio::test]
+async fn dropped_and_cancelled_result_fetch_waiters_unregister_exactly_once() {
+    let control = control();
+    let blocker_work = root(&control, WorkClass::Query);
+    let dropped_work = root(&control, WorkClass::Query);
+    let successor_work = root(&control, WorkClass::Query);
+    let cancelled_work = root(&control, WorkClass::Query);
+    let authority = control.resources();
+    let blocker = authority
+        .reserve_result_credit(&blocker_work.owner.scope(), 112)
+        .unwrap();
+
+    let dropped_scope = dropped_work.owner.scope();
+    let mut dropped = Box::pin(authority.reserve_result_credit_when_available(&dropped_scope, 16));
+    let successor_scope = successor_work.owner.scope();
+    let mut successor =
+        Box::pin(authority.reserve_result_credit_when_available(&successor_scope, 16));
+    assert!(poll(&mut dropped).is_pending());
+    assert!(poll(&mut successor).is_pending());
+    assert_eq!(control.snapshot().resource_waiters, 2);
+    drop(dropped);
+    assert_eq!(control.snapshot().resource_waiters, 1);
+    drop(blocker);
+    drop(successor.await.unwrap());
+    assert_eq!(control.snapshot().resource_waiters, 0);
+
+    let blocker = authority
+        .reserve_result_credit(&blocker_work.owner.scope(), 112)
+        .unwrap();
+
+    let cancelled_scope = cancelled_work.owner.scope();
+    let mut cancelled =
+        Box::pin(authority.reserve_result_credit_when_available(&cancelled_scope, 16));
+    assert!(poll(&mut cancelled).is_pending());
+    assert_eq!(control.snapshot().resource_waiters, 1);
+    cancelled_work.owner.cancel(CancellationReason::Requested);
+    assert!(matches!(
+        cancelled.await,
+        Err(WorkError::Cancelled(CancellationReason::Requested))
+    ));
+    assert_eq!(control.snapshot().resource_waiters, 0);
+    assert_eq!(authority.snapshot().held_bytes(), 112);
+    drop(blocker);
 }
 
 #[test]
@@ -911,25 +1000,6 @@ fn result_credit_enforces_process_and_scope_limits_under_competition() {
     }
     assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(authority.snapshot().held_bytes(), 0);
-}
-
-#[tokio::test]
-async fn result_credit_wait_inherits_scope_cancellation() {
-    let control = control();
-    let holder = root(&control, WorkClass::Query);
-    let waiting_work = root(&control, WorkClass::Query);
-    let authority = control.resources();
-    let held = authority
-        .reserve_result_credit(&holder.owner.scope(), 112)
-        .unwrap();
-    let waiting_scope = waiting_work.owner.scope();
-    let mut waiting = Box::pin(authority.wait_for_result_credit(&waiting_scope, 16));
-    assert!(poll(&mut waiting).is_pending());
-    waiting_work.owner.cancel(CancellationReason::Requested);
-    assert!(matches!(waiting.await, Err(WorkError::Cancelled(_))));
-    assert_eq!(control.snapshot().resource_waiters, 0);
-    assert_eq!(authority.snapshot().held_bytes(), 112);
-    drop(held);
 }
 
 #[tokio::test]
@@ -1318,6 +1388,41 @@ async fn resource_wait_timeout_is_absolute_despite_repeated_capacity_notificatio
         .wait_for_capacity(&scope, 1, ResourceClass::Data)
         .await
         .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn result_fetch_wait_timeout_is_absolute_despite_repeated_notifications() {
+    let control = control();
+    let blocker = root(&control, WorkClass::Query);
+    let work = root(&control, WorkClass::Query);
+    let authority = control.resources();
+    let memory = authority
+        .reserve_result_credit(&blocker.owner.scope(), 112)
+        .unwrap();
+    let scope = work.owner.scope();
+    let mut waiting = Box::pin(authority.reserve_result_credit_when_available(&scope, 16));
+    assert!(poll(&mut waiting).is_pending());
+    for _ in 0..2 {
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let signal = authority
+            .reserve(&blocker.owner.scope(), 1, ResourceClass::Control)
+            .unwrap();
+        drop(signal);
+        assert!(poll(&mut waiting).is_pending());
+    }
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(matches!(waiting.await, Err(WorkError::CapacityWaitTimeout)));
+    assert_eq!(control.snapshot().resource_waiters, 0);
+    assert_eq!(scope.check(), Ok(()));
+    assert_eq!(scope.cancellation().unwrap().reason(), None);
+    assert_eq!(authority.snapshot().held_bytes(), 112);
+    drop(memory);
+    drop(
+        authority
+            .reserve_result_credit_when_available(&scope, 16)
+            .await
+            .unwrap(),
+    );
 }
 
 #[tokio::test(start_paused = true)]
