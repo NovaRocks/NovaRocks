@@ -179,12 +179,27 @@ impl PreparedDistributedQuery {
         self.prepared.scan_bindings().typed_scans()
     }
 
-    pub(crate) fn connector_attempt_access(
+    /// Resolve one exact scan from the immutable logical execution.
+    ///
+    /// Attempt initialization uses this borrowed view only to clone the
+    /// secret-free fields of one scan into a blocking-call recipe. The
+    /// immutable artifact itself remains owned by the actor.
+    pub(crate) fn typed_scan(
         &self,
         fragment_id: FragmentId,
         node_id: i32,
-    ) -> Option<&crate::query_execution::preparation::ConnectorAttemptAccessEntry> {
-        self.attempt_access.get(fragment_id, node_id)
+    ) -> Option<&crate::query_execution::preparation::scan::PreparedTypedConnectorScan> {
+        self.prepared
+            .scan_bindings()
+            .typed_scan(fragment_id, node_id)
+    }
+
+    pub(crate) fn share_connector_attempt_access(
+        &self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>> {
+        self.attempt_access.share(fragment_id, node_id)
     }
 
     /// Borrow-only identity and fragment-set view used by the Frontend RF

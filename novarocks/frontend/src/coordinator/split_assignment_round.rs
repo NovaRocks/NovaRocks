@@ -32,11 +32,11 @@ use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
 use crate::native::data_runtime::FrontendDataRuntime;
-use crate::query_execution::artifact::ValidatedFragmentSchedule;
+use crate::query_execution::artifact::{PreparedDistributedQuery, ValidatedFragmentSchedule};
 use crate::query_execution::split_assignment::{
     AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitEnumeration,
     RoundSplitEnumerationResult, RoundSplitSource, SplitAssignmentDriverError,
-    TaskUpdateRetryPolicy, TaskUpdateTransport,
+    TaskUpdateRetryPolicy, TaskUpdateTransport, emit_split_source_close_marker,
 };
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::task_execution::error::TaskExecutionError;
@@ -88,6 +88,183 @@ pub(crate) fn assignment_endpoints(
         }
     }
     endpoints.into_iter().collect()
+}
+
+/// Immutable, single-scan input for one attempt source-open call.
+///
+/// It shares only this scan's process-local access entry. The actor keeps the
+/// complete prepared artifact and all previously opened sources.
+pub(crate) struct RoundSplitSourceRecipe {
+    fragment_id: FragmentId,
+    plan_node_id: i32,
+    table_scan: crate::query_execution::connector_domain::TableScanNode,
+    constraint: novarocks_spi::connector::read_stack::ConnectorReadConstraint,
+    access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>,
+}
+
+impl RoundSplitSourceRecipe {
+    pub(crate) fn from_artifacts(
+        artifacts: &PreparedDistributedQuery,
+        fragment_id: FragmentId,
+        plan_node_id: i32,
+    ) -> Result<Self, String> {
+        let scan = artifacts
+            .typed_scan(fragment_id, plan_node_id)
+            .ok_or_else(|| {
+                format!(
+                    "typed connector scan fragment_id={fragment_id} node_id={plan_node_id} is absent from its frozen artifact"
+                )
+            })?;
+        let access = artifacts
+            .share_connector_attempt_access(fragment_id, plan_node_id)
+            .ok_or_else(|| {
+                format!(
+                    "typed connector scan fragment_id={fragment_id} node_id={plan_node_id} has no attempt access"
+                )
+            })?;
+        Ok(Self {
+            fragment_id,
+            plan_node_id,
+            table_scan: scan.prepared.table_scan.clone(),
+            constraint: scan.prepared.constraint.clone(),
+            access,
+        })
+    }
+
+    pub(crate) const fn fragment_id(&self) -> FragmentId {
+        self.fragment_id
+    }
+
+    pub(crate) const fn plan_node_id(&self) -> i32 {
+        self.plan_node_id
+    }
+
+    pub(crate) fn generation(&self) -> &novarocks_spi::connector::read_stack::ConnectorReadBinding {
+        self.access.access().frozen().binding()
+    }
+}
+
+/// One source-open result before the actor attaches attempt-wide feedback.
+pub(crate) struct OpenedRoundSplitSource {
+    plan_node_id: i32,
+    source: Option<Box<dyn novarocks_spi::connector::read_stack::ConnectorReadSplitSource>>,
+    encoder: Option<Arc<dyn novarocks_spi::connector::ConnectorReadWireEncoder>>,
+    feedback_bindings: Vec<(
+        u32,
+        novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+    )>,
+    blocking_io: ConnectorBlockingIoSupervisor,
+}
+
+impl OpenedRoundSplitSource {
+    pub(crate) fn into_round_source(
+        mut self,
+        feedback: Arc<crate::runtime_filter::feedback::RuntimeFilterFeedbackState>,
+    ) -> RoundSplitSource {
+        RoundSplitSource {
+            plan_node_id: self.plan_node_id,
+            source: self
+                .source
+                .take()
+                .expect("an opened split source is consumed exactly once"),
+            encoder: self
+                .encoder
+                .take()
+                .expect("an opened split source encoder is consumed exactly once"),
+            feedback,
+            feedback_bindings: std::mem::take(&mut self.feedback_bindings),
+            initial_wait_initialized: false,
+            initial_wait_deadline: None,
+        }
+    }
+}
+
+impl Drop for OpenedRoundSplitSource {
+    fn drop(&mut self) {
+        let Some(mut source) = self.source.take() else {
+            return;
+        };
+        let plan_node_id = self.plan_node_id;
+        let _ = self.blocking_io.spawn_protected(move || {
+            if let Err(error) = source.close() {
+                tracing::warn!(
+                    plan_node_id,
+                    error = %error,
+                    "closing an unadopted split source failed"
+                );
+            }
+            emit_split_source_close_marker(plan_node_id);
+        });
+    }
+}
+
+/// Open one exact scan source from frozen logical semantics and one attempt's
+/// request capability.
+///
+/// The attempt initializer is the only source-open owner. Keeping provider
+/// reacquisition and `get_splits` in this narrow operation makes the exact
+/// generation, pushed constraint, and runtime-filter columns travel through
+/// one managed blocking-I/O call.
+pub(crate) fn open_round_split_source(
+    recipe: RoundSplitSourceRecipe,
+    session: &novarocks_spi::connector::read_stack::ConnectorSession,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    blocking_io: ConnectorBlockingIoSupervisor,
+) -> Result<OpenedRoundSplitSource, String> {
+    let table_scan = &recipe.table_scan;
+    let access = &recipe.access;
+    let connector_context = crate::connector::context_for_planning_lease_typed(
+        access.planning_lease(),
+        connector_context.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let attempt_context =
+        novarocks_spi::connector::ConnectorAttemptContext::from_admitted_request(connector_context);
+    let capabilities = access
+        .access()
+        .for_attempt(&attempt_context, access.planning_lease())
+        .map_err(|error| error.to_string())?;
+    let source = capabilities
+        .splits()
+        .get_splits(
+            session,
+            capabilities.frozen(),
+            table_scan.assignments(),
+            &table_scan.dynamic_filter_columns(),
+            &recipe.constraint,
+        )
+        .map_err(|error| {
+            format!(
+                "typed connector scan node_id={} cannot open its split source: {error}",
+                recipe.plan_node_id
+            )
+        })?;
+    Ok(OpenedRoundSplitSource {
+        plan_node_id: recipe.plan_node_id,
+        source: Some(source),
+        encoder: Some(capabilities.encoder()),
+        feedback_bindings: feedback_bindings(table_scan),
+        blocking_io,
+    })
+}
+
+fn feedback_bindings(
+    table_scan: &crate::query_execution::connector_domain::TableScanNode,
+) -> Vec<(
+    u32,
+    novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+)> {
+    table_scan
+        .dynamic_filters()
+        .iter()
+        .filter_map(|binding| {
+            table_scan
+                .assignments()
+                .iter()
+                .find(|assignment| assignment.variable() == binding.variable())
+                .map(|assignment| (binding.filter_id(), assignment.column().clone()))
+        })
+        .collect()
 }
 
 /// Everything one round needs to start assigning splits, built before the

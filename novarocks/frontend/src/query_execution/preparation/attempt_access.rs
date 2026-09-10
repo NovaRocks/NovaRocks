@@ -18,6 +18,7 @@
 //! Process-local Connector access retained by one logical execution.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use novarocks_query_application::preparation::NegotiatedScanReceipt;
 use novarocks_spi::connector::{
@@ -30,7 +31,7 @@ use novarocks_sql::plan_read::FragmentId;
 /// identity, request-scoped credentials, or open split source; those are
 /// acquired separately for each attempt.
 pub(crate) struct LogicalExecutionAccessScope {
-    entries: BTreeMap<(FragmentId, i32), ConnectorAttemptAccessEntry>,
+    entries: BTreeMap<(FragmentId, i32), Arc<ConnectorAttemptAccessEntry>>,
 }
 
 pub(crate) type ConnectorAttemptAccessPlan = LogicalExecutionAccessScope;
@@ -54,7 +55,7 @@ pub(crate) struct ConnectorAttemptAccessEntry {
 /// Builder used only by scan finalization. Callers cannot assemble an access
 /// plan from unrelated negotiation and provider facts.
 pub(super) struct ConnectorAttemptAccessPlanBuilder {
-    entries: BTreeMap<(FragmentId, i32), ConnectorAttemptAccessEntry>,
+    entries: BTreeMap<(FragmentId, i32), Arc<ConnectorAttemptAccessEntry>>,
 }
 
 impl ConnectorAttemptAccessPlanBuilder {
@@ -102,11 +103,11 @@ impl ConnectorAttemptAccessPlanBuilder {
         }
         self.entries.insert(
             (fragment_id, node_id),
-            ConnectorAttemptAccessEntry {
+            Arc::new(ConnectorAttemptAccessEntry {
                 catalog_properties,
                 planning_lease: generation_guard,
                 access,
-            },
+            }),
         );
         Ok(())
     }
@@ -150,12 +151,12 @@ impl FrozenDescriptionInputs {
 }
 
 impl LogicalExecutionAccessScope {
-    pub(crate) fn get(
+    pub(crate) fn share(
         &self,
         fragment_id: FragmentId,
         node_id: i32,
-    ) -> Option<&ConnectorAttemptAccessEntry> {
-        self.entries.get(&(fragment_id, node_id))
+    ) -> Option<Arc<ConnectorAttemptAccessEntry>> {
+        self.entries.get(&(fragment_id, node_id)).cloned()
     }
 
     pub(crate) fn iter(
@@ -163,7 +164,7 @@ impl LogicalExecutionAccessScope {
     ) -> impl Iterator<Item = (FragmentId, i32, &ConnectorAttemptAccessEntry)> {
         self.entries
             .iter()
-            .map(|(&(fragment_id, node_id), entry)| (fragment_id, node_id, entry))
+            .map(|(&(fragment_id, node_id), entry)| (fragment_id, node_id, entry.as_ref()))
     }
 
     pub(crate) fn exactly_covers(&self, receipts: &[NegotiatedScanReceipt]) -> bool {

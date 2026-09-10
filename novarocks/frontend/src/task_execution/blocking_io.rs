@@ -129,6 +129,12 @@ pub(crate) struct ConnectorBlockingIoSupervisor {
     ordinary: Arc<Semaphore>,
 }
 
+/// Move-only ownership of one ordinary Connector call's process capacity.
+pub(crate) struct ConnectorBlockingIoAdmission {
+    ordinary: tokio::sync::OwnedSemaphorePermit,
+    total: tokio::sync::OwnedSemaphorePermit,
+}
+
 impl ConnectorBlockingIoSupervisor {
     pub(crate) fn new(runtime: Handle, budget: ConnectorBlockingIoBudget) -> Self {
         Self {
@@ -160,17 +166,52 @@ impl ConnectorBlockingIoSupervisor {
         self.spawn(true, call)
     }
 
+    /// Await one ordinary admission directly in the caller's actor future.
+    ///
+    /// This creates no helper task. Dropping the future removes its semaphore
+    /// waiter; dropping the admission before submission returns both permits.
+    pub(crate) async fn acquire_ordinary(
+        &self,
+    ) -> Result<ConnectorBlockingIoAdmission, ConnectorBlockingIoError> {
+        let ordinary = Arc::clone(&self.ordinary)
+            .acquire_owned()
+            .await
+            .map_err(|_| ConnectorBlockingIoError {
+                detail: "connector blocking-I/O ordinary lane closed".to_owned(),
+            })?;
+        let total = Arc::clone(&self.total).acquire_owned().await.map_err(|_| {
+            ConnectorBlockingIoError {
+                detail: "connector blocking-I/O supervisor closed".to_owned(),
+            }
+        })?;
+        Ok(ConnectorBlockingIoAdmission { ordinary, total })
+    }
+
+    /// Submit a recipe after its actor has acquired process capacity.
+    pub(crate) fn spawn_admitted_ordinary<T, F>(
+        &self,
+        admission: ConnectorBlockingIoAdmission,
+        call: F,
+    ) -> ConnectorBlockingIoJob<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.spawn_admitted(call, Some(admission.ordinary), admission.total)
+    }
+
     fn spawn<T, F>(&self, ordinary: bool, call: F) -> ConnectorBlockingIoJob<T>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        let total = Arc::clone(&self.total);
+        let ordinary_permits = Arc::clone(&self.ordinary);
+        let runtime = self.runtime.clone();
         let outcome = Arc::new(Mutex::new(None));
         let published = Arc::clone(&outcome);
         let ready = Arc::new(tokio::sync::Notify::new());
         let publish_ready = Arc::clone(&ready);
-        let total = Arc::clone(&self.total);
-        let ordinary_permits = Arc::clone(&self.ordinary);
         self.runtime.spawn(async move {
             let ordinary_permit = if ordinary {
                 match ordinary_permits.acquire_owned().await {
@@ -198,18 +239,7 @@ impl ConnectorBlockingIoSupervisor {
                     return;
                 }
             };
-            let completed = tokio::task::spawn_blocking(move || {
-                // Both guards stay in this closure until the synchronous call
-                // returns. Cancellation of the async submitter cannot return
-                // capacity while Connector code is still running.
-                let _ordinary_permit = ordinary_permit;
-                let _total_permit = total_permit;
-                call()
-            })
-            .await
-            .map_err(|error| ConnectorBlockingIoError {
-                detail: format!("connector blocking-I/O worker failed: {error}"),
-            });
+            let completed = run_admitted(runtime, call, ordinary_permit, total_permit).await;
             *published.lock().unwrap_or_else(|error| error.into_inner()) = Some(completed);
             // Each job has exactly one consuming waiter. A stored single
             // permit also covers completion before `finish` registers, while
@@ -218,6 +248,55 @@ impl ConnectorBlockingIoSupervisor {
         });
         ConnectorBlockingIoJob { outcome, ready }
     }
+
+    fn spawn_admitted<T, F>(
+        &self,
+        call: F,
+        ordinary_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        total_permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> ConnectorBlockingIoJob<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let outcome = Arc::new(Mutex::new(None));
+        let published = Arc::clone(&outcome);
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let publish_ready = Arc::clone(&ready);
+        let runtime = self.runtime.clone();
+        self.runtime.spawn(async move {
+            let completed = run_admitted(runtime, call, ordinary_permit, total_permit).await;
+            *published.lock().unwrap_or_else(|error| error.into_inner()) = Some(completed);
+            publish_ready.notify_one();
+        });
+        ConnectorBlockingIoJob { outcome, ready }
+    }
+}
+
+async fn run_admitted<T, F>(
+    runtime: Handle,
+    call: F,
+    ordinary_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    total_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<T, ConnectorBlockingIoError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let completed = runtime
+        .spawn_blocking(move || {
+            // Both guards stay in this closure until the synchronous call
+            // returns. Cancellation of the async submitter cannot return
+            // capacity while Connector code is still running.
+            let _ordinary_permit = ordinary_permit;
+            let _total_permit = total_permit;
+            call()
+        })
+        .await
+        .map_err(|error| ConnectorBlockingIoError {
+            detail: format!("connector blocking-I/O worker failed: {error}"),
+        });
+    completed
 }
 
 fn publish_error<T>(

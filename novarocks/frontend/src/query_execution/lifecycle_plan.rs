@@ -98,6 +98,32 @@ impl ConnectorStorageResolver for AttemptCredentialLeaseStorageRoute {
     }
 }
 
+/// Secret-free contribution capability for provider calls that may outlive
+/// their attempt actor. The route never keeps the collector alive; an offer
+/// arriving after cancellation fails closed instead of extending credential
+/// lifetime through an uninterruptible Connector call.
+struct AttemptCredentialLeaseSinkRoute {
+    owner: Weak<AttemptCredentialLeaseCollector>,
+}
+
+impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseSinkRoute {
+    fn offer_vended_s3_credential_lease(
+        &self,
+        catalog_properties: &CatalogProperties,
+        contribution: VendedS3CredentialLeaseContribution,
+    ) -> Result<(), ConnectorError> {
+        self.owner
+            .upgrade()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "attempt credential collector is no longer available",
+                )
+            })?
+            .offer_vended_s3_credential_lease(catalog_properties, contribution)
+    }
+}
+
 /// Move-only FE collection state for credentials obtained during one candidate
 /// attempt's metadata observation. The SPI sees only the sink trait; table,
 /// plan, cache, and Core request types cannot recover these values.
@@ -105,6 +131,7 @@ pub(crate) struct AttemptCredentialLeaseCollector {
     execution_id: QueryExecutionId,
     state: Mutex<AttemptCredentialLeaseCollectorState>,
     route: Arc<AttemptCredentialLeaseStorageRoute>,
+    sink_route: Arc<AttemptCredentialLeaseSinkRoute>,
 }
 
 struct AttemptCredentialLeaseCollectorState {
@@ -128,6 +155,9 @@ impl AttemptCredentialLeaseCollector {
             route: Arc::new(AttemptCredentialLeaseStorageRoute::new_planning(
                 collector.clone(),
             )),
+            sink_route: Arc::new(AttemptCredentialLeaseSinkRoute {
+                owner: collector.clone(),
+            }),
         })
     }
 
@@ -160,8 +190,8 @@ impl AttemptCredentialLeaseCollector {
         )
     }
 
-    pub(crate) fn sink(self: &Arc<Self>) -> Arc<dyn ConnectorVendedCredentialLeaseSink> {
-        Arc::clone(self) as Arc<dyn ConnectorVendedCredentialLeaseSink>
+    pub(crate) fn sink(&self) -> Arc<dyn ConnectorVendedCredentialLeaseSink> {
+        Arc::clone(&self.sink_route) as Arc<dyn ConnectorVendedCredentialLeaseSink>
     }
 
     /// The collector is also the FE-local storage authority while planning is
@@ -1096,6 +1126,26 @@ mod tests {
             "an endpoint-free contribution without a provider source is not refreshable"
         );
         assert!(collector.into_credential_leases().is_err());
+    }
+
+    #[test]
+    fn provider_sink_does_not_keep_a_cancelled_attempt_collector_alive() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let weak_collector = Arc::downgrade(&collector);
+        let sink = collector.sink();
+        drop(collector);
+
+        assert!(
+            weak_collector.upgrade().is_none(),
+            "a provider-held sink must not extend the attempt collector lifetime"
+        );
+        let error = sink
+            .offer_vended_s3_credential_lease(
+                &vended_catalog_properties(),
+                vended_contribution("late-provider"),
+            )
+            .expect_err("late contribution fails after its attempt is gone");
+        assert!(error.to_string().contains("no longer available"), "{error}");
     }
 
     #[test]

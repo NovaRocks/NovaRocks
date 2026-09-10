@@ -19,6 +19,12 @@
 
 use std::sync::{Arc, OnceLock};
 
+#[derive(Default)]
+struct QueryCancellationState {
+    reason: OnceLock<QueryCancellationReason>,
+    changed: tokio::sync::Notify,
+}
+
 /// The actor that first requested cancellation for a statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryCancellationReason {
@@ -50,7 +56,7 @@ pub enum QueryCancellationRequestResult {
 /// The write capability for one statement cancellation lifetime.
 #[derive(Clone, Default)]
 pub struct QueryCancellationSource {
-    reason: Arc<OnceLock<QueryCancellationReason>>,
+    state: Arc<QueryCancellationState>,
 }
 
 impl QueryCancellationSource {
@@ -60,15 +66,19 @@ impl QueryCancellationSource {
 
     pub fn view(&self) -> QueryCancellationView {
         QueryCancellationView {
-            reason: Arc::clone(&self.reason),
+            state: Arc::clone(&self.state),
         }
     }
 
     pub fn request(&self, reason: QueryCancellationReason) -> QueryCancellationRequestResult {
-        match self.reason.set(reason) {
-            Ok(()) => QueryCancellationRequestResult::Requested,
+        match self.state.reason.set(reason) {
+            Ok(()) => {
+                self.state.changed.notify_waiters();
+                QueryCancellationRequestResult::Requested
+            }
             Err(_) => QueryCancellationRequestResult::AlreadyRequested(
-                self.reason
+                self.state
+                    .reason
                     .get()
                     .expect("cancellation reason is present after rejected set")
                     .clone(),
@@ -85,16 +95,30 @@ impl QueryCancellationSource {
 /// it. Those consumers leave with CLS-R5 and CLS-R4 respectively.
 #[derive(Clone)]
 pub struct QueryCancellationView {
-    reason: Arc<OnceLock<QueryCancellationReason>>,
+    state: Arc<QueryCancellationState>,
 }
 
 impl QueryCancellationView {
     pub fn is_cancelled(&self) -> bool {
-        self.reason.get().is_some()
+        self.state.reason.get().is_some()
     }
 
     pub fn reason(&self) -> Option<QueryCancellationReason> {
-        self.reason.get().cloned()
+        self.state.reason.get().cloned()
+    }
+
+    /// Wait for the first cancellation without losing a transition that races
+    /// subscription setup.
+    pub async fn cancelled(&self) -> QueryCancellationReason {
+        loop {
+            let changed = self.state.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(reason) = self.reason() {
+                return reason;
+            }
+            changed.await;
+        }
     }
 }
 
@@ -148,5 +172,32 @@ mod tests {
             .count();
         assert_eq!(requested, 1);
         assert!(source.view().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn async_observer_sees_completion_before_subscription() {
+        let source = QueryCancellationSource::new();
+        let view = source.view();
+        source.request(QueryCancellationReason::ServerShutdown);
+
+        assert_eq!(
+            view.cancelled().await,
+            QueryCancellationReason::ServerShutdown
+        );
+    }
+
+    #[tokio::test]
+    async fn async_observer_wakes_after_subscription() {
+        let source = QueryCancellationSource::new();
+        let view = source.view();
+        let observer = tokio::spawn(async move { view.cancelled().await });
+        tokio::task::yield_now().await;
+
+        source.request(QueryCancellationReason::ClientDisconnected);
+
+        assert_eq!(
+            observer.await.expect("cancellation observer"),
+            QueryCancellationReason::ClientDisconnected
+        );
     }
 }

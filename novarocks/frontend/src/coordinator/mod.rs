@@ -16,6 +16,7 @@
 // under the License.
 
 // MIGRATION: wired into the round once the typed producer lands.
+mod attempt_initialization;
 mod execution;
 mod query_registry;
 mod scheduler;

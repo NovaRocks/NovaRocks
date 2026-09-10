@@ -32,8 +32,7 @@ use crate::native::fragment_transport::{
     TaskReadGrace, TaskResultTransport,
 };
 use crate::query_execution::artifact::{
-    PreparedDistributedQuery, RuntimeFilterDeploymentReadyDistributedQuery,
-    ValidatedFragmentSchedule, ValidatedNativeSubmission,
+    RuntimeFilterDeploymentReadyDistributedQuery, ValidatedNativeSubmission,
 };
 use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptReservation};
 use crate::query_execution::contract::{
@@ -44,7 +43,7 @@ use crate::query_execution::contract::{
 use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
-use crate::query_execution::split_assignment::{RoundSplitSource, TaskUpdateTransport};
+use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::runtime::statement_result::StatementResult;
 use crate::task_execution::sources::AttemptEstablishFacts;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
@@ -54,16 +53,14 @@ use novarocks_types::{
     QueryIdAttribution, QueryProcessNamespace,
 };
 
+use super::attempt_initialization::{AttemptInitializing, RoundCredentialLeaseSource};
 use super::query_registry::{
     FrontendQueryRegistry, QueryFailureCause, QueryLifecycleConvergenceReader,
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
 };
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
-use super::split_assignment_round::{
-    OpenRoundSplitSources, RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
-    assignment_endpoints, assignment_targets,
-};
+use super::split_assignment_round::{RoundSplitAssignmentPlan, SplitAssignmentRoundGuard};
 use super::task_round::{
     AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
 };
@@ -331,48 +328,6 @@ pub struct FrontendDistributedQueryCoordinator {
     native_compatibility_id: NativeCompatibilityId,
 }
 
-/// Credential material stays under its planning collector until the round has
-/// opened every connector split source. Opening a source may read Iceberg
-/// manifests through the request-bound resolver and may observe the vended
-/// response that must be sealed into the same Init manifest.
-enum RoundCredentialLeaseSource {
-    Frozen(QueryCredentialLeases),
-    Reservation {
-        reservation: QueryAttemptReservation,
-        observed_collected: Option<Arc<AtomicBool>>,
-    },
-}
-
-impl RoundCredentialLeaseSource {
-    fn connector_request_context(
-        &self,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> novarocks_spi::connector::ConnectorRequestContext {
-        match self {
-            Self::Frozen(_) => context,
-            Self::Reservation { reservation, .. } => reservation.connector_request_context(context),
-        }
-    }
-
-    fn into_credential_leases(self) -> Result<QueryCredentialLeases, DistributedQueryError> {
-        match self {
-            Self::Frozen(leases) => Ok(leases),
-            Self::Reservation {
-                reservation,
-                observed_collected,
-            } => {
-                if let Some(observed_collected) = observed_collected {
-                    observed_collected.store(
-                        reservation.has_collected_credential_leases(),
-                        Ordering::Release,
-                    );
-                }
-                reservation.into_credential_leases()
-            }
-        }
-    }
-}
-
 impl FrontendDistributedQueryCoordinator {
     #[expect(
         private_interfaces,
@@ -601,7 +556,7 @@ impl FrontendDistributedQueryCoordinator {
             request,
             None,
             RoundCredentialLeaseSource::Reservation {
-                reservation,
+                reservation: Some(reservation),
                 observed_collected: None,
             },
         )
@@ -695,34 +650,48 @@ impl FrontendDistributedQueryCoordinator {
         .map_err(failed)?;
         let connector_context =
             credential_lease_source.connector_request_context(connector_context);
-        let split_assignment_plan = prepare_round_split_assignment(
-            &parts.artifacts,
-            &schedule,
+        let initializing = AttemptInitializing::new(
+            execution_id,
+            parts.artifacts,
+            schedule,
             self.task_update_retry_policy,
             Arc::clone(&feedback_state),
             self.connector_split_initial_dynamic_filter_wait_cap,
-            &connector_context,
-            self.data_runtime.connector_blocking_io().clone(),
+            connector_context,
+            parts.cancellation.clone(),
+            self.data_runtime.clone(),
+            credential_lease_source,
         )?;
-        // A source open may load manifest metadata under the request-local
-        // resolver and collect one exact vended response. Seal that collector
-        // only after every source is open, then hand its leases to Init.
-        let credential_leases = credential_lease_source.into_credential_leases()?;
-        if !credential_leases.is_empty()
-            && !self
-                .data_runtime
-                .native_transport()
-                .permits_confidential_credential_leases()
+        // The synchronous statement worker is the remaining T12 bridge. The
+        // async initializer performs no Connector I/O on that worker and adds
+        // no semaphore-waiter helper task, but this bridge still waits on the
+        // actor and therefore does not complete the per-query thread cut.
+        let ready = self
+            .data_runtime
+            .block_on(initializing.initialize())
+            .map_err(failed)??;
+        let (
+            ready_execution_id,
+            artifacts,
+            schedule,
+            ready_feedback_state,
+            split_assignment_plan,
+            credential_leases,
+        ) = ready.into_parts();
+        if ready_execution_id != execution_id
+            || !Arc::ptr_eq(&ready_feedback_state, &feedback_state)
         {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
-                "vended credential lease admission requires TLS Native transport",
+                "attempt initializer returned readiness for another attempt",
             ));
         }
+        self.backend_topology
+            .validate_snapshot(&parts.topology)
+            .map_err(pre_ready_topology_validation_error)?;
         let binding_attachment =
-            encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
-        let scheduled = parts
-            .artifacts
+            encode_binding_attachment(artifacts.runtime_filter_binding_view())?;
+        let scheduled = artifacts
             .attach_runtime_filter_bindings(binding_attachment)?
             .bind_schedule(schedule)?;
         let deployment = compile_scheduled_runtime_filter_deployment(
@@ -2017,7 +1986,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
             first_request,
             first_retry_boundary,
             RoundCredentialLeaseSource::Reservation {
-                reservation: first_reservation,
+                reservation: Some(first_reservation),
                 observed_collected: None,
             },
         ) {
@@ -2072,7 +2041,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                     replacement_request,
                     None,
                     RoundCredentialLeaseSource::Reservation {
-                        reservation: replacement_reservation,
+                        reservation: Some(replacement_reservation),
                         observed_collected: None,
                     },
                 )
@@ -2106,7 +2075,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
             first_request,
             Some(round_factory.as_ref() as &dyn PreReadyRetryBoundary),
             RoundCredentialLeaseSource::Reservation {
-                reservation,
+                reservation: Some(reservation),
                 observed_collected: Some(Arc::clone(&retry_collected_vended_credentials)),
             },
         ) {
@@ -4304,120 +4273,4 @@ fn abort_task_round(round: &mut TaskRound, reason: &str) {
             );
         }
     }
-}
-/// Open one lazy split source per typed connector scan of this round.
-///
-/// Enumeration itself does not happen here: `get_splits` hands back a source
-/// the round pumps. Returning `None` means this query reads nothing through a
-/// connector, so no split pump is installed.
-///
-/// The session is minted per round rather than reused from preparation:
-/// preparation runs before the execution id exists, so there is no session to
-/// inherit, and enumeration must not borrow an identity that named a different
-/// attempt.
-fn prepare_round_split_assignment(
-    artifacts: &PreparedDistributedQuery,
-    schedule: &ValidatedFragmentSchedule,
-    retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
-    feedback: Arc<RuntimeFilterFeedbackState>,
-    initial_dynamic_filter_wait_cap: Duration,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
-) -> Result<Option<RoundSplitAssignmentPlan>, DistributedQueryError> {
-    let scan_nodes = artifacts
-        .typed_scans()
-        .map(|(fragment_id, plan_node_id, _)| (fragment_id, plan_node_id))
-        .collect::<Vec<_>>();
-    if scan_nodes.is_empty() {
-        return Ok(None);
-    }
-    let session = crate::query_execution::compiler::typed_connector_session().map_err(failed)?;
-    let mut sources = OpenRoundSplitSources::with_capacity(scan_nodes.len(), blocking_io.clone());
-    for (fragment_id, plan_node_id, scan) in artifacts.typed_scans() {
-        let table_scan = &scan.prepared.table_scan;
-        let access = artifacts
-            .connector_attempt_access(fragment_id, plan_node_id)
-            .ok_or_else(|| {
-                failed(format!(
-                    "typed connector scan fragment_id={fragment_id} node_id={plan_node_id} has no attempt access"
-                ))
-            })?;
-        let connector_context = crate::connector::context_for_planning_lease_typed(
-            access.planning_lease(),
-            connector_context.clone(),
-        )
-        .map_err(|error| failed(error.to_string()))?;
-        let attempt_context =
-            novarocks_spi::connector::ConnectorAttemptContext::from_admitted_request(
-                connector_context,
-            );
-        let capabilities = access
-            .access()
-            .for_attempt(&attempt_context, access.planning_lease())
-            .map_err(|error| failed(error.to_string()))?;
-        let source = capabilities
-            .splits()
-            .get_splits(
-                &session,
-                capabilities.frozen(),
-                table_scan.assignments(),
-                &table_scan.dynamic_filter_columns(),
-                &scan.prepared.constraint,
-            )
-            .map_err(|error| {
-                failed(format!(
-                    "typed connector scan node_id={plan_node_id} cannot open its split source: {error}"
-                ))
-            })?;
-        sources.push(RoundSplitSource {
-            plan_node_id,
-            source,
-            encoder: capabilities.encoder(),
-            feedback: Arc::clone(&feedback),
-            feedback_bindings: feedback_bindings(table_scan),
-            initial_wait_initialized: false,
-            initial_wait_deadline: None,
-        });
-    }
-    let targets = assignment_targets(schedule, &scan_nodes);
-    // Every scan node must have somewhere to send its work. An empty task set
-    // would silently drop every split of that scan.
-    for plan_node_id in sources.plan_node_ids() {
-        if targets
-            .get(&plan_node_id)
-            .is_none_or(|targets| targets.is_empty())
-        {
-            return Err(failed(format!(
-                "typed connector scan node_id={plan_node_id} has no admitted task in this schedule"
-            )));
-        }
-    }
-    let sources = sources.into_sources();
-    Ok(Some(RoundSplitAssignmentPlan::new(
-        targets,
-        sources,
-        retry_policy,
-        initial_dynamic_filter_wait_cap,
-        assignment_endpoints(schedule),
-        blocking_io,
-    )))
-}
-
-fn feedback_bindings(
-    table_scan: &crate::query_execution::connector_domain::TableScanNode,
-) -> Vec<(
-    u32,
-    novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-)> {
-    table_scan
-        .dynamic_filters()
-        .iter()
-        .filter_map(|binding| {
-            table_scan
-                .assignments()
-                .iter()
-                .find(|assignment| assignment.variable() == binding.variable())
-                .map(|assignment| (binding.filter_id(), assignment.column().clone()))
-        })
-        .collect()
 }
