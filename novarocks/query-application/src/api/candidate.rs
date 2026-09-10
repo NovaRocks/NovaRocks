@@ -28,12 +28,12 @@ use std::{
 
 use novarocks_spi::connector::read_stack::ConnectorReadBinding;
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
+    ConnectorControlPlanningLease, ConnectorErrorKind, ConnectorReadSelector,
+    ConnectorSemanticFact, ConnectorTableHandle,
 };
 use novarocks_sql::binding::{SqlTableBindingAllocator, SqlTableBindingId, SqlTableBindingScopeId};
 use novarocks_sql::planning::query_execution::SealedScanIdentity;
 use novarocks_workload_control::WorkOwner;
-use sha2::{Digest, Sha256};
 
 const MAX_FACT_BYTES: usize = 64 * 1024;
 const MAX_IDENTITY_BYTES: usize = 256;
@@ -67,20 +67,34 @@ impl ObjectPath {
 pub struct ProviderFactFormat {
     provider: Arc<str>,
     format: Arc<str>,
+    version: u16,
 }
 
 impl ProviderFactFormat {
     pub fn try_new(provider: impl Into<Arc<str>>, format: impl Into<Arc<str>>) -> Option<Self> {
+        Self::try_new_versioned(provider, format, 1)
+    }
+
+    pub fn try_new_versioned(
+        provider: impl Into<Arc<str>>,
+        format: impl Into<Arc<str>>,
+        version: u16,
+    ) -> Option<Self> {
         let provider = provider.into();
         let format = format.into();
         if provider.is_empty()
             || provider.len() > MAX_IDENTITY_BYTES
             || format.is_empty()
             || format.len() > MAX_IDENTITY_BYTES
+            || version == 0
         {
             return None;
         }
-        Some(Self { provider, format })
+        Some(Self {
+            provider,
+            format,
+            version,
+        })
     }
 
     pub fn provider(&self) -> &str {
@@ -91,8 +105,15 @@ impl ProviderFactFormat {
         &self.format
     }
 
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
     fn encoded_len(&self) -> Option<usize> {
-        self.provider.len().checked_add(self.format.len())
+        self.provider
+            .len()
+            .checked_add(self.format.len())?
+            .checked_add(std::mem::size_of::<u16>())
     }
 }
 
@@ -124,6 +145,21 @@ macro_rules! encoded_binding_fact {
                 &self.value
             }
 
+            #[allow(
+                dead_code,
+                reason = "catalog generation uses a process-local format while semantic facts use this provider conversion"
+            )]
+            fn from_provider_fact(fact: &ConnectorSemanticFact) -> Option<Self> {
+                Self::try_new(
+                    ProviderFactFormat::try_new_versioned(
+                        fact.provider().as_str(),
+                        fact.format(),
+                        fact.version(),
+                    )?,
+                    Arc::<[u8]>::from(fact.value().as_ref()),
+                )
+            }
+
             fn encoded_len(&self) -> Option<usize> {
                 self.format
                     .encoded_len()
@@ -141,8 +177,8 @@ encoded_binding_fact!(DataVersion);
 pub struct ExactObjectBinding {
     object: ObjectPath,
     catalog_generation: CatalogGeneration,
-    object_identity: ObjectIdentity,
-    data_version: DataVersion,
+    object_identity: Option<ObjectIdentity>,
+    data_version: Option<DataVersion>,
     read_binding: Option<ConnectorReadBinding>,
 }
 
@@ -157,8 +193,39 @@ impl ExactObjectBinding {
         Self {
             object,
             catalog_generation,
-            object_identity,
-            data_version,
+            object_identity: Some(object_identity),
+            data_version: Some(data_version),
+            read_binding: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_publication_test(
+        object: ObjectPath,
+        catalog_generation: CatalogGeneration,
+        relation: &novarocks_sql::compiler::SqlMvRewritePublicationRelation,
+    ) -> Self {
+        Self {
+            object,
+            catalog_generation,
+            object_identity: ObjectIdentity::from_provider_fact(
+                relation.revision().object_identity(),
+            ),
+            data_version: DataVersion::from_provider_fact(relation.revision().data_version()),
+            read_binding: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_without_semantic_revision_for_test(
+        object: ObjectPath,
+        catalog_generation: CatalogGeneration,
+    ) -> Self {
+        Self {
+            object,
+            catalog_generation,
+            object_identity: None,
+            data_version: None,
             read_binding: None,
         }
     }
@@ -171,12 +238,39 @@ impl ExactObjectBinding {
         &self.catalog_generation
     }
 
-    pub const fn object_identity(&self) -> &ObjectIdentity {
-        &self.object_identity
+    pub const fn object_identity(&self) -> Option<&ObjectIdentity> {
+        self.object_identity.as_ref()
     }
 
-    pub const fn data_version(&self) -> &DataVersion {
-        &self.data_version
+    pub const fn data_version(&self) -> Option<&DataVersion> {
+        self.data_version.as_ref()
+    }
+
+    pub fn has_stable_semantic_revision(&self) -> bool {
+        self.object_identity.is_some() && self.data_version.is_some()
+    }
+
+    pub(crate) fn matches_publication_relation(
+        &self,
+        relation: &novarocks_sql::compiler::SqlMvRewritePublicationRelation,
+    ) -> Result<bool, String> {
+        let expected_parts = relation.table_fqn().split('.').collect::<Vec<_>>();
+        let actual_parts = self.object.parts();
+        if expected_parts.len() != actual_parts.len()
+            || expected_parts
+                .iter()
+                .zip(actual_parts)
+                .any(|(expected, actual)| *expected != actual.as_ref())
+        {
+            return Ok(false);
+        }
+        let expected_object =
+            ObjectIdentity::from_provider_fact(relation.revision().object_identity())
+                .ok_or_else(|| "MV publication object identity is invalid".to_string())?;
+        let expected_version = DataVersion::from_provider_fact(relation.revision().data_version())
+            .ok_or_else(|| "MV publication data version is invalid".to_string())?;
+        Ok(self.object_identity.as_ref() == Some(&expected_object)
+            && self.data_version.as_ref() == Some(&expected_version))
     }
 
     pub(crate) fn read_binding(&self) -> Result<&ConnectorReadBinding, String> {
@@ -189,8 +283,18 @@ impl ExactObjectBinding {
         self.object
             .encoded_len()?
             .checked_add(self.catalog_generation.encoded_len()?)?
-            .checked_add(self.object_identity.encoded_len()?)?
-            .checked_add(self.data_version.encoded_len()?)
+            .checked_add(
+                self.object_identity
+                    .as_ref()
+                    .and_then(ObjectIdentity::encoded_len)
+                    .unwrap_or_default(),
+            )?
+            .checked_add(
+                self.data_version
+                    .as_ref()
+                    .and_then(DataVersion::encoded_len)
+                    .unwrap_or_default(),
+            )
     }
 }
 
@@ -258,36 +362,32 @@ impl ExactBindingReceiptStore {
         )
         .ok_or_else(|| "Connector control generation fact is invalid".to_string())?;
 
-        let mut object_hash = Sha256::new();
-        object_hash.update(b"novarocks/exact-object-binding/v1\0");
-        object_hash.update(table.owner().as_str().as_bytes());
-        object_hash.update(b"\0");
-        object_hash.update(table.payload());
-        let object_identity = ObjectIdentity::try_new(
-            format("connector-table-handle-digest/v1")?,
-            <[u8; 32]>::from(object_hash.finalize()),
-        )
-        .ok_or_else(|| "Connector object identity fact is invalid".to_string())?;
-
-        let mut version_hash = Sha256::new();
-        version_hash.update(b"novarocks/exact-data-version/v1\0");
-        version_hash.update(table.payload());
-        match selector {
-            ConnectorReadSelector::Current => version_hash.update([0]),
-            ConnectorReadSelector::SnapshotId(snapshot) => {
-                version_hash.update([1]);
-                version_hash.update(snapshot.to_be_bytes());
-            }
-            ConnectorReadSelector::TimestampMicros(timestamp) => {
-                version_hash.update([2]);
-                version_hash.update(timestamp.to_be_bytes());
-            }
+        let semantic_revision = match planning_lease
+            .binding()
+            .metadata()
+            .exact_semantic_revision(table, selector)
+        {
+            Ok(revision) => Some(revision),
+            Err(error) if error.kind() == ConnectorErrorKind::Unsupported => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        if semantic_revision.as_ref().is_some_and(|revision| {
+            revision.object_identity().provider() != &descriptor.provider_id
+                || revision.data_version().provider() != &descriptor.provider_id
+        }) {
+            return Err(
+                "provider-issued Connector semantic revision names another provider".to_string(),
+            );
         }
-        let data_version = DataVersion::try_new(
-            format("connector-read-version-digest/v1")?,
-            <[u8; 32]>::from(version_hash.finalize()),
-        )
-        .ok_or_else(|| "Connector data version fact is invalid".to_string())?;
+        let object_identity = semantic_revision
+            .as_ref()
+            .and_then(|revision| ObjectIdentity::from_provider_fact(revision.object_identity()));
+        let data_version = semantic_revision
+            .as_ref()
+            .and_then(|revision| DataVersion::from_provider_fact(revision.data_version()));
+        if semantic_revision.is_some() && (object_identity.is_none() || data_version.is_none()) {
+            return Err("provider-issued Connector semantic revision is invalid".to_string());
+        }
         let receipt = ExactObjectBinding {
             object,
             catalog_generation,
@@ -404,7 +504,7 @@ pub struct MvCandidateFact {
 }
 
 impl MvCandidateFact {
-    fn retain(input: MvCandidateFactInput<'_>) -> Self {
+    pub(crate) fn retain(input: MvCandidateFactInput<'_>) -> Self {
         Self {
             publication_id: input.publication_id,
             definition_fingerprint: input.definition_fingerprint,
@@ -412,29 +512,6 @@ impl MvCandidateFact {
             inputs: input.inputs.to_vec().into(),
             output: input.output.clone(),
         }
-    }
-    #[cfg(test)]
-    pub(crate) fn try_new_for_test(
-        publication_id: MvPublicationId,
-        definition_fingerprint: [u8; 32],
-        definition_provenance: &str,
-        inputs: &[ExactObjectBinding],
-        output: &ExactObjectBinding,
-    ) -> Option<Self> {
-        if definition_fingerprint == [0; 32]
-            || definition_provenance.is_empty()
-            || definition_provenance.len() > MAX_FACT_BYTES
-            || inputs.is_empty()
-        {
-            return None;
-        }
-        Some(Self {
-            publication_id,
-            definition_fingerprint,
-            definition_provenance: Arc::from(definition_provenance),
-            inputs: Arc::from(inputs),
-            output: output.clone(),
-        })
     }
     pub const fn publication_id(&self) -> MvPublicationId {
         self.publication_id
@@ -479,6 +556,10 @@ impl<'a> MvCandidateFactInput<'a> {
             || definition_provenance.is_empty()
             || definition_provenance.len() > MAX_FACT_BYTES
             || inputs.is_empty()
+            || inputs
+                .iter()
+                .chain(std::iter::once(output))
+                .any(|binding| !binding.has_stable_semantic_revision())
         {
             return None;
         }
@@ -1271,11 +1352,11 @@ mod tests {
             "catalog-generation/v1"
         );
         assert_eq!(
-            value.object_identity().format_identity().format(),
+            value.object_identity().unwrap().format_identity().format(),
             "table-uuid/v1"
         );
         assert_eq!(
-            value.data_version().format_identity().provider(),
+            value.data_version().unwrap().format_identity().provider(),
             "iceberg-rest"
         );
     }

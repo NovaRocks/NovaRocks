@@ -21,6 +21,8 @@
 //! mutable collections.  They expose only the frozen facts that an encoder may
 //! map into a native carrier.
 
+use std::collections::BTreeMap;
+
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_read::{
     ConnectorReadEncoder, ConnectorTableScanSource, encode_connector_expression,
@@ -30,8 +32,8 @@ use novarocks_sql::plan_read::{ColumnId, FragmentId, OutputColumn, TypedExpr};
 use novarocks_types::schema::ColumnDef;
 
 use super::scan::{
-    PreparedTypedConnectorScan, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumnKind,
-    ResolvedScanExecution, ScanExecutionBindings,
+    PreparedScanExecutionKind, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumnKind,
+    ScanExecutionBindings,
 };
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 
@@ -39,11 +41,18 @@ use novarocks_proto_codec::lifecycle::ScanRangeParams;
 #[derive(Clone, Copy)]
 pub struct NativeScanFactsView<'a> {
     bindings: &'a ScanExecutionBindings,
+    connector_scans: &'a FrozenNativeConnectorScans,
 }
 
 impl<'a> NativeScanFactsView<'a> {
-    pub(crate) fn new(bindings: &'a ScanExecutionBindings) -> Self {
-        Self { bindings }
+    pub(crate) fn new(
+        bindings: &'a ScanExecutionBindings,
+        connector_scans: &'a FrozenNativeConnectorScans,
+    ) -> Self {
+        Self {
+            bindings,
+            connector_scans,
+        }
     }
 
     pub fn binding_node_ids(self) -> impl Iterator<Item = i32> + 'a {
@@ -72,14 +81,14 @@ impl<'a> NativeScanFactsView<'a> {
         fragment_id: FragmentId,
         node_id: i32,
     ) -> Option<NativeConnectorReadView<'a>> {
-        self.bindings
-            .typed_scan(fragment_id, node_id)
+        self.connector_scans
+            .get(fragment_id, node_id)
             .map(|scan| NativeConnectorReadView { scan })
     }
 
     pub fn connector_read_for_node(self, node_id: i32) -> Option<NativeConnectorReadView<'a>> {
-        self.bindings
-            .typed_scan_for_node(node_id)
+        self.connector_scans
+            .for_node(node_id)
             .map(|scan| NativeConnectorReadView { scan })
     }
 
@@ -104,26 +113,15 @@ impl<'a> NativeScanBindingView<'a> {
     }
 
     pub fn execution(self) -> NativeScanExecutionKind {
-        match self.binding.execution {
-            // A system relation is an admitted connector read like any other:
-            // the encoder agrees the lane, and which relation family was
-            // frozen is carried by the typed scan's own handle.
-            // A pinned cohort read is an admitted connector read too: what is
-            // different about it -- the exact file set -- is carried by the
-            // typed handle the connector froze, not by the encoder lane. The
-            // same holds for a table-execute read: its frozen group is a fact
-            // of the handle, not of the lane.
-            ResolvedScanExecution::AdmittedConnectorRead(_)
-            | ResolvedScanExecution::AdmittedSystemTable(_)
-            | ResolvedScanExecution::AdmittedPinnedFileSet(_)
-            | ResolvedScanExecution::AdmittedTableExecute(_) => {
+        match self.binding.execution_kind {
+            PreparedScanExecutionKind::AdmittedConnectorRead => {
                 NativeScanExecutionKind::AdmittedConnectorRead
             }
             // The encoder-facing name is still `SealedConnectorScan`; it marks
             // the change-window lane, which no longer carries a provider-sealed
             // opaque scan. Renaming the encoder-visible variant is a separate
             // change to the native fragment encoder.
-            ResolvedScanExecution::AdmittedChangeWindow(_) => {
+            PreparedScanExecutionKind::SealedConnectorScan => {
                 NativeScanExecutionKind::SealedConnectorScan
             }
         }
@@ -221,83 +219,149 @@ pub enum NativeRequiredReadReason {
 /// read the carrier and the binding generation, never drive enumeration.
 #[derive(Clone, Copy)]
 pub struct NativeConnectorReadView<'a> {
-    scan: &'a PreparedTypedConnectorScan,
+    scan: &'a FrozenNativeConnectorScan,
 }
 
 impl<'a> NativeConnectorReadView<'a> {
-    /// Encode the frozen SPI scan only at native fragment egress.  The codec
-    /// belongs to the exact catalog runtime that materialized every opaque
-    /// handle.
+    /// Return the source encoded once when scan preparation was finalized.
     pub fn table_scan_source(self) -> Result<ConnectorTableScanSource, String> {
-        let node = &self.scan.prepared.table_scan;
-        let codec = self.scan.prepared.encoder.as_ref();
-        let source = node.source();
-        let assignments = source
-            .assignments()
-            .iter()
-            .enumerate()
-            .map(|(index, assignment)| {
-                codec.encode_assignment(
-                    assignment,
-                    FieldPath::root("connector_table_scan_source")
-                        .field("assignments")
-                        .index(index),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())?;
-        let work_source = match source.work_source() {
-            novarocks_spi::connector::read_stack::ConnectorReadWorkSource::RuntimeSplits => {
-                dto::ScanWorkSource::RuntimeSplits as i32
-            }
-            novarocks_spi::connector::read_stack::ConnectorReadWorkSource::WholeRelation => {
-                dto::ScanWorkSource::WholeRelation as i32
-            }
-        };
-        let raw = dto::ConnectorTableScanSource {
-            table: Some(
-                codec
-                    .encode_relation(node.table().relation())
-                    .map_err(|error| error.to_string())?,
-            ),
-            assignments,
-            enforced_predicate: Some(
-                codec
-                    .encode_tuple_domain(
-                        source.enforced_predicate(),
-                        FieldPath::root("connector_table_scan_source").field("enforced_predicate"),
-                    )
-                    .map_err(|error| error.to_string())?,
-            ),
-            unenforced_predicate: Some(
-                codec
-                    .encode_tuple_domain(
-                        source.unenforced_predicate(),
-                        FieldPath::root("connector_table_scan_source")
-                            .field("unenforced_predicate"),
-                    )
-                    .map_err(|error| error.to_string())?,
-            ),
-            remaining_expression: source
-                .remaining_expression()
-                .map(encode_connector_expression),
-            dynamic_filters: source
-                .dynamic_filters()
-                .iter()
-                .map(|binding| dto::DynamicFilterBinding {
-                    filter_id: binding.filter_id(),
-                    variable: binding.variable().to_owned(),
-                })
-                .collect(),
-            max_batch_rows: source.max_batch_rows(),
-            max_batch_bytes: source.max_batch_bytes(),
-            work_source,
-        };
-        ConnectorTableScanSource::parse(raw, FieldPath::root("connector_table_scan_source"))
-            .map_err(|error| error.to_string())
+        Ok(self.scan.source.clone())
     }
 
     pub fn residual_predicates(self) -> &'a [TypedExpr] {
         &self.scan.residual_predicates
     }
+}
+
+pub(crate) struct FrozenNativeConnectorScans {
+    entries: BTreeMap<(FragmentId, i32), FrozenNativeConnectorScan>,
+}
+
+pub(super) struct FrozenNativeConnectorScansBuilder {
+    entries: BTreeMap<(FragmentId, i32), FrozenNativeConnectorScan>,
+}
+
+struct FrozenNativeConnectorScan {
+    source: ConnectorTableScanSource,
+    residual_predicates: Vec<TypedExpr>,
+}
+
+impl FrozenNativeConnectorScansBuilder {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        fragment_id: FragmentId,
+        node_id: i32,
+        source: ConnectorTableScanSource,
+        residual_predicates: Vec<TypedExpr>,
+    ) -> Result<(), String> {
+        if self
+            .entries
+            .insert(
+                (fragment_id, node_id),
+                FrozenNativeConnectorScan {
+                    source,
+                    residual_predicates,
+                },
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate frozen native connector scan fragment_id={fragment_id} node_id={node_id}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> FrozenNativeConnectorScans {
+        FrozenNativeConnectorScans {
+            entries: self.entries,
+        }
+    }
+}
+
+impl FrozenNativeConnectorScans {
+    fn get(&self, fragment_id: FragmentId, node_id: i32) -> Option<&FrozenNativeConnectorScan> {
+        self.entries.get(&(fragment_id, node_id))
+    }
+
+    fn for_node(&self, node_id: i32) -> Option<&FrozenNativeConnectorScan> {
+        self.entries
+            .iter()
+            .find_map(|(&(_, candidate), scan)| (candidate == node_id).then_some(scan))
+    }
+}
+
+pub(super) fn finalize_connector_scan_source(
+    node: &crate::query_execution::connector_domain::TableScanNode,
+    codec: &dyn novarocks_spi::connector::ConnectorReadWireEncoder,
+) -> Result<ConnectorTableScanSource, String> {
+    let source = node.source();
+    let assignments = source
+        .assignments()
+        .iter()
+        .enumerate()
+        .map(|(index, assignment)| {
+            codec.encode_assignment(
+                assignment,
+                FieldPath::root("connector_table_scan_source")
+                    .field("assignments")
+                    .index(index),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let work_source = match source.work_source() {
+        novarocks_spi::connector::read_stack::ConnectorReadWorkSource::RuntimeSplits => {
+            dto::ScanWorkSource::RuntimeSplits as i32
+        }
+        novarocks_spi::connector::read_stack::ConnectorReadWorkSource::WholeRelation => {
+            dto::ScanWorkSource::WholeRelation as i32
+        }
+    };
+    let raw = dto::ConnectorTableScanSource {
+        table: Some(
+            codec
+                .encode_relation(node.table().relation())
+                .map_err(|error| error.to_string())?,
+        ),
+        assignments,
+        enforced_predicate: Some(
+            codec
+                .encode_tuple_domain(
+                    source.enforced_predicate(),
+                    FieldPath::root("connector_table_scan_source").field("enforced_predicate"),
+                )
+                .map_err(|error| error.to_string())?,
+        ),
+        unenforced_predicate: Some(
+            codec
+                .encode_tuple_domain(
+                    source.unenforced_predicate(),
+                    FieldPath::root("connector_table_scan_source").field("unenforced_predicate"),
+                )
+                .map_err(|error| error.to_string())?,
+        ),
+        remaining_expression: source
+            .remaining_expression()
+            .map(encode_connector_expression),
+        dynamic_filters: source
+            .dynamic_filters()
+            .iter()
+            .map(|binding| dto::DynamicFilterBinding {
+                filter_id: binding.filter_id(),
+                variable: binding.variable().to_owned(),
+            })
+            .collect(),
+        max_batch_rows: source.max_batch_rows(),
+        max_batch_bytes: source.max_batch_bytes(),
+        work_source,
+    };
+    ConnectorTableScanSource::parse(raw, FieldPath::root("connector_table_scan_source"))
+        .map_err(|error| error.to_string())
 }

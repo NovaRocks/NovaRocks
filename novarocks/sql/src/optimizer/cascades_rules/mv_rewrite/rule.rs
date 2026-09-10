@@ -62,7 +62,10 @@ pub(crate) struct MvRewriteRule {
 impl MvRewriteRule {
     pub(crate) fn new(candidates: Vec<MvRewriteCandidate>) -> Self {
         Self {
-            candidates,
+            candidates: candidates
+                .into_iter()
+                .filter(|candidate| candidate.selection.is_some())
+                .collect(),
             applied: Mutex::new(HashSet::new()),
         }
     }
@@ -233,10 +236,13 @@ fn try_rewrite(
     }
 
     // 5. Build the operator chain bottom-up.
-    let rewrite_selection = match &cand.selection {
-        Some(selection) => selected_candidate_marker(&cand.mv_name, query, selection)?,
-        None => MvRewriteSelection::unverified(cand.mv_name.clone()),
-    };
+    let rewrite_selection = selected_candidate_marker(
+        &cand.mv_name,
+        query,
+        cand.selection
+            .as_ref()
+            .expect("MV rewrite rule retains only publication-proven candidates"),
+    )?;
     let scan_group = memo.new_group(MExpr {
         id: memo.next_expr_id(),
         op: Operator::LogicalScan(ScanOp {
@@ -529,7 +535,9 @@ fn selected_candidate_marker(
         "{}.{}.{}",
         source.table.catalog, source.table.namespace, source.table.table
     );
-    if selection.publication_inputs() != [query_fqn] {
+    if selection.publication_inputs().len() != 1
+        || selection.publication_inputs()[0].table_fqn() != query_fqn
+    {
         return None;
     }
     let occurrence =
@@ -539,6 +547,8 @@ fn selected_candidate_marker(
         selection.publication_id(),
         selection.definition_fingerprint(),
         vec![(occurrence, 0)],
+        selection.publication_inputs().to_vec(),
+        selection.publication_target().clone(),
     ))
 }
 
@@ -985,7 +995,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "agg_mv", &["a", "b", "s"]),
             target_stats_ref: stats_ref_for_test(700),
-            selection: None,
+            selection: Some(selection_facts()),
         }
     }
 
@@ -1017,12 +1027,21 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "direct_agg_mv", &["a", "s"]),
             target_stats_ref: stats_ref_for_test(703),
-            selection: None,
+            selection: Some(selection_facts()),
         }
     }
 
     fn stats_ref_for_test(value: u32) -> crate::optimizer::stats_input::StatsRef {
         crate::optimizer::stats_input::StatsRef::new(value)
+    }
+
+    fn selection_facts() -> crate::compiler::SqlMvRewriteSelectionFacts {
+        crate::compiler::SqlMvRewriteSelectionFacts::try_new(
+            [7; 16],
+            [9; 32],
+            vec!["cat.ns.t".to_string()],
+        )
+        .expect("valid MV publication selection")
     }
 
     fn prune_root_aggregate_outputs(
@@ -1119,6 +1138,39 @@ mod tests {
             rule.apply(&root_expr, &mut memo).is_empty(),
             "second apply must be a no-op"
         );
+    }
+
+    #[test]
+    fn candidate_without_publication_proof_never_reaches_the_rewrite_rule() {
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let s = col(3, "s");
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanKind::Filter(PlanFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![base_scan(&[a, v])],
+                None,
+            )],
+            None,
+        );
+        let mut memo = test_memo();
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+        advance_factory(&mut memo, 200);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+        let mut candidate = agg_candidate(0);
+        candidate.selection = None;
+
+        let rule = MvRewriteRule::new(vec![candidate]);
+
+        assert!(rule.apply(&root_expr, &mut memo).is_empty());
     }
 
     #[test]
@@ -1475,7 +1527,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "wide_spj_mv", &["a", "b", "v"]),
             target_stats_ref: stats_ref_for_test(704),
-            selection: None,
+            selection: Some(selection_facts()),
         };
 
         // Query only needs a,b; the injected MV scan must not cost/read v.
@@ -1527,7 +1579,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "or_mv", &["a", "b", "v"]),
             target_stats_ref: stats_ref_for_test(705),
-            selection: None,
+            selection: Some(selection_facts()),
         };
 
         // Query uses the same OR arms in the opposite order; normalization must
@@ -1586,7 +1638,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "or_mv", &["a", "b", "v"]),
             target_stats_ref: stats_ref_for_test(706),
-            selection: None,
+            selection: Some(selection_facts()),
         };
 
         let a = col(1, "a");
@@ -1655,7 +1707,7 @@ mod tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "cnt_mv", &["a", "c"]),
             target_stats_ref: stats_ref_for_test(702),
-            selection: None,
+            selection: Some(selection_facts()),
         };
 
         let a = col(1, "a");

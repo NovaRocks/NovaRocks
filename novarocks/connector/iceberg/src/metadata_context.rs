@@ -35,7 +35,7 @@ use novarocks_types::naming::normalize_identifier;
 use crate::catalog_control::IcebergCatalogControlState;
 use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::loaded_table::{
-    IcebergPhysicalTable, IcebergRestLoadTableVendedS3LeaseRefresher,
+    IcebergAttemptTableAccess, IcebergPhysicalTable, IcebergRestLoadTableVendedS3LeaseRefresher,
     IcebergRestVendedS3LeaseRefresher, IcebergVendedCredentialLeaseSeed,
     IcebergVendedS3RenewalCapability, parse_vended_access_delegation,
 };
@@ -266,11 +266,43 @@ impl IcebergMetadataContext {
         &self,
         namespace: &str,
         table: &str,
-        frozen: &IcebergPhysicalTable,
+        access: &IcebergAttemptTableAccess,
         request_context: &ConnectorRequestContext,
     ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
         let namespace = normalize_identifier(namespace).map_err(invalid_request)?;
         let table = normalize_identifier(table).map_err(invalid_request)?;
+        let ident = TableIdent::from_strs([namespace.as_str(), table.as_str()])
+            .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
+        if access.identifier() != &ident {
+            return Err((
+                ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "reacquire Iceberg table {namespace}.{table}: target does not match the frozen table identity"
+                ),
+            ));
+        }
+        if request_context.cancellation().is_cancelled() {
+            return Err((
+                ConnectorErrorKind::Cancelled,
+                "reacquire Iceberg table access was cancelled".to_string(),
+            ));
+        }
+        if std::time::Instant::now() >= request_context.deadline() {
+            return Err((
+                ConnectorErrorKind::DeadlineExceeded,
+                "reacquire Iceberg table access deadline elapsed".to_string(),
+            ));
+        }
+        let Some(capability) = access.renewal() else {
+            let request_binding = self
+                .resources
+                .planning_binding()
+                .for_request(request_context.clone());
+            return access
+                .reacquired_request_scoped(request_binding)
+                .map_err(|error| (error.kind(), error.to_string()));
+        };
+        let frozen = access;
         let collection = request_context
             .vended_credential_lease_collection()
             .ok_or_else(|| {
@@ -281,19 +313,6 @@ impl IcebergMetadataContext {
                     ),
                 )
             })?;
-        let ident = TableIdent::from_strs([namespace.as_str(), table.as_str()])
-            .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
-        if frozen.table.identifier() != &ident {
-            return Err((
-                ConnectorErrorKind::InvalidRequest,
-                format!(
-                    "reacquire Iceberg table {namespace}.{table}: target does not match the frozen table identity"
-                ),
-            ));
-        }
-        let capability = frozen
-            .attempt_access()
-            .map_err(|error| (error.kind(), error.to_string()))?;
         let rest_catalog = self
             .novarocks_catalog
             .vended_credential_refresh_catalog()
@@ -342,7 +361,8 @@ impl IcebergMetadataContext {
                     ),
                 ));
             }
-            seed.validate_table_access(&frozen.table)
+            frozen
+                .validate_table_access(&seed)
                 .map_err(|error| (error.kind(), error.to_string()))?;
             let contribution = seed
                 .into_vended_s3_credential_lease_contribution()
@@ -361,7 +381,8 @@ impl IcebergMetadataContext {
                 .resources
                 .planning_binding()
                 .for_request(request_context.clone());
-            return IcebergPhysicalTable::reacquired_request_scoped(frozen, request_binding)
+            return frozen
+                .reacquired_request_scoped(request_binding)
                 .map_err(|error| (error.kind(), error.to_string()));
         }
         let target =
@@ -394,10 +415,11 @@ impl IcebergMetadataContext {
         let observed = materialization
             .materialize_for_request(request_binding.clone())
             .map_err(|error| (error.kind(), error.to_string()))?;
-        IcebergPhysicalTable::validate_attempt_reacquisition(frozen, &observed, &seed)
+        frozen
+            .validate_attempt_reacquisition(&observed, &seed)
             .map_err(|error| (error.kind(), error.to_string()))?;
         let contribution =
-            self.vended_attempt_contribution(seed, ident, frozen.table.metadata().uuid())?;
+            self.vended_attempt_contribution(seed, ident, frozen.metadata().uuid())?;
         collection
             .offer_vended_s3_credential_lease(contribution)
             .map_err(|error| {
@@ -408,7 +430,8 @@ impl IcebergMetadataContext {
                     ),
                 )
             })?;
-        IcebergPhysicalTable::reacquired_request_scoped(frozen, request_binding)
+        frozen
+            .reacquired_request_scoped(request_binding)
             .map_err(|error| (error.kind(), error.to_string()))
     }
 

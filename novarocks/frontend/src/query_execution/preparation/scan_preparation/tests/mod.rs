@@ -40,7 +40,7 @@ fn prepare_scan_bindings(
     plan: &DistributedPlan,
     connectors: &FixtureConnectorRegistry,
     resolver: Option<&dyn ScanBindingResolver>,
-) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
+) -> Result<super::PreparedScanSet, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     prepare_scan_bindings_with_controls(plan, &controls, resolver)
 }
@@ -50,7 +50,7 @@ fn prepare_scan_bindings_with_runtime_filters(
     plan: &DistributedPlan,
     connectors: &FixtureConnectorRegistry,
     runtime_filter_scans: &[novarocks_sql::planning::query_execution::SqlRuntimeFilterSourceScanRequest],
-) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
+) -> Result<super::PreparedScanSet, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(plan, &controls);
     let typed = fixture_control_role_host(plan, &controls);
@@ -70,7 +70,7 @@ fn prepare_scan_bindings_with_runtime_filters(
 fn prepare_scan_bindings_with_delta_resolver(
     plan: &DistributedPlan,
     connectors: &FixtureConnectorRegistry,
-) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
+) -> Result<super::PreparedScanSet, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(plan, &controls);
     let typed = fixture_control_role_host(plan, &controls);
@@ -94,7 +94,7 @@ fn prepare_scan_bindings_with_controls(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
     resolver: Option<&dyn ScanBindingResolver>,
-) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
+) -> Result<super::PreparedScanSet, String> {
     let query_bindings = fixture_query_table_bindings(plan, controls);
     let typed = fixture_control_role_host(plan, controls);
     super::prepare_scan_bindings(
@@ -211,9 +211,13 @@ fn fixture_control_role_host_with_foreign_provider(
             Arc::clone(lease.binding()),
             Some(novarocks_spi::connector::ConnectorControlReadBinding::new(
                 Arc::clone(&adapter) as _,
-                adapter as _,
-                None,
-                Arc::new(FixtureReadCodec),
+                Arc::clone(&adapter) as _,
+                Some(Arc::new(FixtureRequestControlFactory {
+                    adapter: Arc::clone(&adapter),
+                })),
+                Arc::new(FixtureReadCodec {
+                    catalog: catalog_handle,
+                }),
             )),
             None,
         )
@@ -253,6 +257,31 @@ struct FixtureTypedControl {
     descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
     catalog_handle: novarocks_spi::connector::CatalogHandle,
     pinned_requests: std::sync::Mutex<Vec<novarocks_spi::connector::ConnectorPinnedFileSet>>,
+}
+
+struct FixtureRequestControlFactory {
+    adapter:
+        Arc<novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter<FixtureTypedControl>>,
+}
+
+impl novarocks_spi::connector::read_stack::ConnectorReadRequestControlFactory
+    for FixtureRequestControlFactory
+{
+    fn for_planning(
+        &self,
+        _request: &novarocks_spi::connector::ConnectorPlanningContext,
+    ) -> Result<
+        novarocks_spi::connector::read_stack::ConnectorReadRequestControl,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Ok(
+            novarocks_spi::connector::read_stack::ConnectorReadRequestControl::static_attempt_access(
+                Arc::clone(&self.adapter) as _,
+                Arc::clone(&self.adapter) as _,
+                self.adapter.binding().clone(),
+            ),
+        )
+    }
 }
 
 impl FixtureTypedControl {
@@ -489,9 +518,31 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
     }
 }
 
-/// The codec is intentionally inert: scan planning holds only SPI values and
-/// must never invoke a codec before native egress.
-struct FixtureReadCodec;
+/// Deterministic fixture codec used by the preparation finalizer. Splits stay
+/// lazy, while the immutable scan source is encoded exactly once.
+struct FixtureReadCodec {
+    catalog: novarocks_spi::connector::CatalogHandle,
+}
+
+impl FixtureReadCodec {
+    fn payload(
+        &self,
+        category: novarocks_spi::connector::ConnectorCodecCategory,
+        bytes: &'static [u8],
+    ) -> novarocks_spi::connector::ConnectorEncodedPayload {
+        novarocks_spi::connector::ConnectorEncodedPayload::new(
+            novarocks_spi::connector::ConnectorEnvelopeHeader::new(
+                novarocks_spi::connector::ConnectorProviderId::parse("fixture")
+                    .expect("fixture provider"),
+                self.catalog.clone(),
+                category,
+                novarocks_spi::connector::ConnectorCodecRevision::try_new(1)
+                    .expect("fixture revision"),
+            ),
+            bytes::Bytes::from_static(bytes),
+        )
+    }
+}
 
 impl novarocks_spi::connector::ConnectorReadWireEncoder for FixtureReadCodec {
     fn owner(&self) -> &str {
@@ -500,12 +551,22 @@ impl novarocks_spi::connector::ConnectorReadWireEncoder for FixtureReadCodec {
 
     fn encode_relation_payload(
         &self,
-        _relation: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
+        relation: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
     ) -> Result<
         novarocks_spi::connector::ConnectorReadRelationPayload,
         novarocks_spi::connector::ConnectorCodecError,
     > {
-        unreachable!("scan preparation fixture must not encode wire relations")
+        Ok(novarocks_spi::connector::ConnectorReadRelationPayload::new(
+            relation.kind(),
+            self.payload(
+                novarocks_spi::connector::ConnectorCodecCategory::ReadTable,
+                b"table",
+            ),
+            self.payload(
+                novarocks_spi::connector::ConnectorCodecCategory::ReadView,
+                b"view",
+            ),
+        ))
     }
 
     fn encode_column_payload(
@@ -515,7 +576,10 @@ impl novarocks_spi::connector::ConnectorReadWireEncoder for FixtureReadCodec {
         novarocks_spi::connector::ConnectorEncodedPayload,
         novarocks_spi::connector::ConnectorCodecError,
     > {
-        unreachable!("scan preparation fixture must not encode wire columns")
+        Ok(self.payload(
+            novarocks_spi::connector::ConnectorCodecCategory::ReadColumn,
+            b"column",
+        ))
     }
 
     fn encode_transaction_payload(
@@ -525,7 +589,10 @@ impl novarocks_spi::connector::ConnectorReadWireEncoder for FixtureReadCodec {
         novarocks_spi::connector::ConnectorEncodedPayload,
         novarocks_spi::connector::ConnectorCodecError,
     > {
-        unreachable!("scan preparation fixture must not encode wire transactions")
+        Ok(self.payload(
+            novarocks_spi::connector::ConnectorCodecCategory::ReadView,
+            b"transaction",
+        ))
     }
 
     fn encode_split_payload(

@@ -1212,7 +1212,7 @@ impl TestQueryCompiler {
         Ok(TestPreparedQueryOperation::Distributed {
             assembly,
             completion: PreparedQueryCompletion::profile(
-                distributed_plan,
+                std::sync::Arc::new(distributed_plan),
                 planning_start.elapsed(),
                 std::time::Instant::now(),
             ),
@@ -1370,20 +1370,6 @@ pub(crate) fn ensure_mainline_distributed_execution(
     Ok(())
 }
 
-fn optimizer_settings_for_execution(
-    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
-) -> novarocks_sql::compiler::SessionOptimizerSettings {
-    let mut settings = execution
-        .map(|execution| execution.optimizer_settings().clone())
-        .unwrap_or_default();
-    if settings.cbo_broadcast_backend_count.is_none()
-        && let Some(execution) = execution
-    {
-        settings.effective_backend_count = Some(execution.topology().targets().len() as f64);
-    }
-    settings
-}
-
 /// Freeze one statement's scan-preparation inputs.
 ///
 /// The typed control registry is the composition root's single instance, so
@@ -1391,22 +1377,10 @@ fn optimizer_settings_for_execution(
 pub(crate) fn scan_preparation_options(
     typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
-    let live_target_parallelism = std::num::NonZeroUsize::new(execution.topology().targets().len());
-    #[cfg(test)]
-    let target_parallelism = live_target_parallelism.or(Some(
-        std::num::NonZeroUsize::new(1).expect("one is non-zero"),
-    ));
-    #[cfg(not(test))]
-    let target_parallelism = live_target_parallelism;
-    let target_parallelism = target_parallelism.ok_or_else(|| {
-        "connector split preparation requires a non-empty admitted backend topology".to_string()
-    })?;
     Ok(
         crate::query_execution::preparation::ScanPreparationOptions::new(
             settings.connector_static_predicate_pushdown_enabled(),
-            target_parallelism,
             None,
         )
         .with_typed_connector_control(
@@ -1638,15 +1612,9 @@ impl PreparedDmlWriteAssembly {
         ),
         String,
     > {
-        if !self.encoding.matches_native_attachment(&native_bundle) {
-            return Err(
-                "native fragment bundle does not match the sealed DML encoding input".into(),
-            );
-        }
-        let (_, prepared) = self.encoding.into_parts();
         let request = build_distributed_write_request(
             &self.query_execution,
-            prepared,
+            self.encoding,
             native_bundle,
             self.query_options,
             &self.execution,
@@ -1693,7 +1661,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             &maintenance_execution
         }
     };
-    let optimizer_settings = optimizer_settings_for_execution(Some(execution));
+    let optimizer_settings = execution.optimizer_settings().clone();
     // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
     // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
     // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
@@ -1734,10 +1702,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     }
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| {
-            "Iceberg write requires a non-empty admitted backend topology".to_string()
-        })?;
     let analyze_request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
@@ -1746,7 +1710,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
         &catalog_snapshot,
         DmlQueryExecutionKernel::function_catalog(state),
         crate::query_execution::constant_eval::constant_evaluator(),
@@ -1796,14 +1760,10 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         connector_context,
         Some(table_bindings.as_ref()),
         scan_resolver,
-        scan_preparation_options(
-            state.typed_connector_control(),
-            &optimizer_settings,
-            execution,
-        )?,
+        scan_preparation_options(state.typed_connector_control(), &optimizer_settings)?,
     )?;
-    let encoding = NativeFragmentEncodingInput::new(distributed_plan, prepared)
-        .with_sealed_write_targets(sealed_write_targets);
+    let encoding =
+        NativeFragmentEncodingInput::new(prepared).with_sealed_write_targets(sealed_write_targets);
     Ok(PreparedDmlWriteAssembly::new(
         encoding,
         query_opts,
@@ -1943,10 +1903,9 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
 /// SQL owns all optimizer, physical-plan, and writer-topology construction.
 /// Core only resolves the frozen bindings while preparing fragments and keeps
 /// the resulting writer/cohort map for application-owned operation fencing.
-pub(crate) fn prepare_dml_change_stream_write_with_execution(
+pub(crate) fn prepare_dml_change_stream_write(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
     plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -1964,10 +1923,10 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
         connector_context,
         Some(query_table_bindings),
         Some(&scan_resolver),
-        scan_preparation_options(typed_connector_control, &optimizer_settings, execution)?,
+        scan_preparation_options(typed_connector_control, &optimizer_settings)?,
     )?;
     Ok(PlannedIcebergChangeStreamWrite {
-        encoding: NativeFragmentEncodingInput::new(distributed_plan, prepared),
+        encoding: NativeFragmentEncodingInput::new(prepared),
         writer_routes,
     })
 }
@@ -1995,18 +1954,17 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
         crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
             query_table_bindings,
         );
-    let settings = optimizer_settings_for_execution(Some(execution));
+    let settings = execution.optimizer_settings().clone();
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed_plan,
         connector_control,
         connector_context,
         Some(query_table_bindings),
         Some(&scan_resolver),
-        scan_preparation_options(typed_connector_control, &settings, execution)?,
+        scan_preparation_options(typed_connector_control, &settings)?,
     )?;
     Ok(PreparedMvNativeWriteAssembly::session(
-        NativeFragmentEncodingInput::new(distributed_plan, prepared)
-            .with_sealed_write_targets(sealed_write_targets),
+        NativeFragmentEncodingInput::new(prepared).with_sealed_write_targets(sealed_write_targets),
         None,
         write_session,
     ))
@@ -2069,10 +2027,6 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     ),
     TestQueryCompilerError,
 > {
-    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| {
-            "SQL compilation requires a non-empty admitted backend topology".to_string()
-        })?;
     let table_bindings = analyzer_catalog.query_table_bindings();
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     // MV rewrite is an optional SQL optimization. An application composition
@@ -2103,7 +2057,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
         &catalog_snapshot,
         query_kernel.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
@@ -2148,11 +2102,10 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         scan_preparation_options(
             DmlQueryExecutionKernel::typed_connector_control(query_kernel),
             execution.optimizer_settings(),
-            execution,
         )?,
     )?;
     let assembly = PreparedDistributedQueryAssembly::new(
-        NativeFragmentEncodingInput::new(distributed_plan.clone(), prepared),
+        NativeFragmentEncodingInput::new(prepared),
         query_opts,
         distributed_intent,
         execution.clone(),
@@ -2177,10 +2130,6 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     level: novarocks_sql::compiler::ExplainLevel,
     logical: bool,
 ) -> Result<QueryResult, TestQueryCompilerError> {
-    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| {
-            "SQL compilation requires a non-empty admitted backend topology".to_string()
-        })?;
     let table_bindings = analyzer_catalog.query_table_bindings();
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let mv_definitions =
@@ -2206,7 +2155,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
                 current_database: current_database.to_string(),
                 optimizer_settings: execution.optimizer_settings().clone(),
             },
-            novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+            novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
             &catalog_snapshot,
             query_kernel.function_catalog().as_ref(),
             crate::query_execution::constant_eval::constant_evaluator(),
@@ -2256,13 +2205,13 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
 )]
 fn execute_distributed_result_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
-    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    encoding: NativeFragmentEncodingInput,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<QueryResult, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        prepared,
+        encoding,
         native_bundle,
         query_options,
         crate::query_execution::contract::DistributedQueryIntent::Result,
@@ -2278,14 +2227,14 @@ fn execute_distributed_result_with_execution(
 
 fn build_distributed_write_request(
     _query_execution: &crate::query_execution::service::QueryExecutionService,
-    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    encoding: NativeFragmentEncodingInput,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        prepared,
+        encoding,
         native_bundle,
         query_options,
         crate::query_execution::contract::DistributedQueryIntent::Write,
@@ -2313,13 +2262,13 @@ fn execute_distributed_write_request(
 )]
 fn execute_distributed_profile_with_execution(
     query_execution: &crate::query_execution::service::QueryExecutionService,
-    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    encoding: NativeFragmentEncodingInput,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        prepared,
+        encoding,
         native_bundle,
         query_options,
         crate::query_execution::contract::DistributedQueryIntent::Profile,

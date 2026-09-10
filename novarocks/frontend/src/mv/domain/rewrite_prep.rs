@@ -28,7 +28,7 @@ use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
     MvRewriteDefinitionIndex, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
-    SqlMvRewriteSelectionFacts,
+    SqlMvRewritePublicationRelation, SqlMvRewriteSelectionFacts,
 };
 
 /// Freeze rewrite candidates from the caller's leaf ports.  The frozen index
@@ -59,7 +59,7 @@ fn freeze_mv_rewrite_definition(
     definition: crate::mv::domain::persistence::definition::StoredMvDefinition,
 ) -> Result<SqlMvRewriteDefinitionFacts, String> {
     let selection =
-        freeze_mv_rewrite_selection(connector_control, storage_observation, &definition).ok();
+        freeze_mv_rewrite_selection(connector_control, storage_observation, &definition);
     let mut base_table_states = std::collections::BTreeMap::new();
     if definition.storage_engine == "iceberg" {
         for fqn in &definition.base_table_refs {
@@ -81,10 +81,10 @@ fn freeze_mv_rewrite_definition(
         definition.last_refresh_table_object_ids,
         base_table_states,
     )?;
-    Ok(match selection {
-        Some(selection) => facts.with_selection_facts(selection),
-        None => facts,
-    })
+    match selection {
+        Ok(selection) => Ok(facts.with_selection_facts(selection)),
+        Err(error) => facts.with_selection_unavailable(error),
+    }
 }
 
 fn freeze_mv_rewrite_selection(
@@ -138,14 +138,36 @@ fn freeze_mv_rewrite_selection(
     let fingerprint: [u8; 32] = fingerprint
         .try_into()
         .map_err(|_| "MV rewrite definition fingerprint must be 32 bytes".to_string())?;
-    SqlMvRewriteSelectionFacts::try_new(
+    let provider = lease.binding().descriptor().provider_id.clone();
+    let publication_inputs = publication
+        .bases
+        .iter()
+        .map(|base| {
+            Ok(SqlMvRewritePublicationRelation::new(
+                base.table_fqn.clone(),
+                novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                    provider.clone(),
+                    &base.object_id,
+                    Some(base.to_snapshot),
+                )
+                .map_err(|error| format!("freeze MV rewrite base revision: {error}"))?,
+            )?)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let publication_target = SqlMvRewritePublicationRelation::new(
+        format!("{catalog}.{namespace}.{table}"),
+        novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            provider,
+            package.target_object_id(),
+            Some(publication.target_snapshot_id),
+        )
+        .map_err(|error| format!("freeze MV rewrite target revision: {error}"))?,
+    )?;
+    SqlMvRewriteSelectionFacts::try_new_with_publication(
         *publication.publication_id.as_uuid().as_bytes(),
         fingerprint,
-        publication
-            .bases
-            .iter()
-            .map(|base| base.table_fqn.clone())
-            .collect(),
+        publication_inputs,
+        publication_target,
     )
 }
 

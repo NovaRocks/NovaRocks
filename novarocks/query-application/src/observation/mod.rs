@@ -146,6 +146,15 @@ impl PreparationLimits {
     pub const fn deadline(self) -> Instant {
         self.deadline
     }
+
+    /// Maximum retained footprint one provider response may add.
+    ///
+    /// The preparation driver reserves this amount from the process-local
+    /// resource authority before invoking the provider, then reconciles the
+    /// reservation with the response's reported footprint.
+    pub const fn max_response_bytes(self) -> usize {
+        self.max_response_bytes.get()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

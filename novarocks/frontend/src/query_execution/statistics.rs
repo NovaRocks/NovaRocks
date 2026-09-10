@@ -260,19 +260,13 @@ impl PreparedStatisticsCollectionRequest {
         self,
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<DistributedQueryRequest, DistributedQueryError> {
-        if !self.encoding.matches_native_attachment(&native_attachment) {
-            return Err(contract_violation(
-                "native fragment bundle does not match the sealed statistics encoding input",
-            ));
-        }
-        let (_, prepared) = self.encoding.into_parts();
-        Ok(build_statistics_query_request_with_execution(
-            prepared,
+        build_statistics_query_request_with_execution(
+            self.encoding,
             native_attachment,
             None,
             self.program,
             &self.execution,
-        ))
+        )
     }
 }
 
@@ -358,16 +352,12 @@ pub fn prepare_statistics_collection_request(
         crate::query_execution::compiler::scan_preparation_options(
             typed_connector_control,
             execution.optimizer_settings(),
-            execution,
         )
         .map_err(contract_violation)?,
     )
     .map_err(contract_violation)?;
     Ok(PreparedStatisticsCollectionRequest {
-        encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput::new(
-            distributed,
-            prepared,
-        ),
+        encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput::new(prepared),
         program,
         execution: execution.clone(),
     })

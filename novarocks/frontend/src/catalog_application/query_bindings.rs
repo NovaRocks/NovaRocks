@@ -32,7 +32,9 @@ use std::sync::{Arc, Mutex};
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use arrow::datatypes::SchemaRef;
 use novarocks_query_application::api::{ExactBindingReceiptStore, SealedExactBindingReceipts};
-use novarocks_query_application::preparation::AdmittedScanSubject;
+use novarocks_query_application::preparation::{
+    AdmittedScanSubject, SelectedMvQueryInputs, prove_selected_mv_query_inputs,
+};
 use novarocks_spi::connector::read_stack::ConnectorReadTableHandle;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
@@ -507,6 +509,22 @@ impl QueryTableBindingStore {
         self.exact_binding_receipts
             .sealed_view()
             .ok_or_else(|| "query table binding store is not semantically sealed".to_string())
+    }
+
+    /// Resolve an optimizer-selected MV action against the exact pre-rewrite
+    /// bindings admitted by this query. The returned proof is move-only and
+    /// still requires the final target scan receipt before it can authorize
+    /// an execution description.
+    pub(crate) fn prove_selected_mv_query_inputs(
+        &self,
+        action: novarocks_sql::planning::query_execution::SealedMvRewriteAction,
+    ) -> Result<SelectedMvQueryInputs, String> {
+        let receipts = self.sealed_exact_binding_receipts()?;
+        prove_selected_mv_query_inputs(
+            novarocks_query_application::api::QueryConsistency::Strict,
+            &receipts,
+            action,
+        )
     }
 
     /// Sign the indivisible SQL-scan/Connector-handle pairing through this

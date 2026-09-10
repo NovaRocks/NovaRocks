@@ -25,8 +25,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableHandle,
-    StatisticsDataVersion,
+    ConnectorError, ConnectorInstanceId, ConnectorReadSelector, ConnectorRequestContext,
+    ConnectorTableHandle, StatisticsDataVersion,
 };
 
 /// Arrow field metadata key for connector fields that participate in a read
@@ -1383,6 +1383,21 @@ impl ConnectorReadReferenceFacts {
 
 pub trait ConnectorMetadata: Send + Sync {
     fn instance_id(&self) -> &ConnectorInstanceId;
+
+    /// Derive a process-independent semantic revision from this exact admitted
+    /// table handle and selector. Providers must not perform another catalog
+    /// lookup here: the result has to describe the same metadata observation
+    /// carried by `table`.
+    fn exact_semantic_revision(
+        &self,
+        _table: &ConnectorTableHandle,
+        _selector: ConnectorReadSelector,
+    ) -> Result<super::ConnectorExactSemanticRevision, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector metadata does not expose stable exact semantic revisions",
+        ))
+    }
 
     fn list_namespaces(
         &self,

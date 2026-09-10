@@ -1357,7 +1357,14 @@ mod is_known_rule_name_tests {
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "or_mv", &["a", "b", "v"]),
             target_stats_ref: StatsRef::new(1),
-            selection: None,
+            selection: Some(
+                crate::compiler::SqlMvRewriteSelectionFacts::try_new(
+                    [7; 16],
+                    [9; 32],
+                    vec!["cat.ns.t".to_string()],
+                )
+                .expect("valid MV publication selection"),
+            ),
         };
 
         let mut stats = QueryStatsSnapshot::empty();

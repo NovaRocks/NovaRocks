@@ -430,10 +430,6 @@ fn compile_dml_change_stream_write(
         );
     }
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| {
-            "MOR change-stream write requires a frozen non-empty backend topology".to_string()
-        })?;
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
@@ -442,7 +438,7 @@ fn compile_dml_change_stream_write(
             current_database: target.namespace.clone(),
             optimizer_settings: dml_change_stream_optimizer_settings(),
         },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
         &catalog,
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
@@ -478,10 +474,9 @@ fn compile_dml_change_stream_write(
             // the commit.
             shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
         })?;
-    let planned = crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
+    let planned = crate::query_execution::compiler::prepare_dml_change_stream_write(
         state.connector_control().as_ref(),
         state.typed_connector_control(),
-        execution,
         sealed,
         table_bindings.as_ref(),
         connector_context,
@@ -1716,7 +1711,7 @@ fn run_change_stream_write_session_stage(
     write_session: &Arc<ConnectorWriteSession>,
     planned: crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
     native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-    statement: &str,
+    _statement: &str,
 ) -> Result<QueryExecutionResult, String> {
     let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
         encoding,
@@ -1734,14 +1729,8 @@ fn run_change_stream_write_session_stage(
         return Ok(result);
     }
     let native_bundle = native_encoder.encode(&encoding)?;
-    if !encoding.matches_native_attachment(&native_bundle) {
-        return Err(format!(
-            "native fragment bundle does not match the sealed {statement} encoding input"
-        ));
-    }
-    let (_, prepared) = encoding.into_parts();
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        prepared,
+        encoding,
         native_bundle,
         None,
         crate::query_execution::contract::DistributedQueryIntent::Write,
@@ -3022,8 +3011,6 @@ fn execute_exact_cow_match_query(
             state.catalog_application().map(Arc::as_ref),
         );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| "COW match execution requires a non-empty admitted topology".to_string())?;
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         novarocks_sql::compiler::SqlCompileIntent::Query,
@@ -3032,7 +3019,7 @@ fn execute_exact_cow_match_query(
             current_database: target.namespace.clone(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
         &catalog,
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
@@ -3066,20 +3053,12 @@ fn execute_exact_cow_match_query(
         crate::query_execution::dml::write::scan_preparation_options(
             state.typed_connector_control(),
             execution.optimizer_settings(),
-            execution,
         )?,
     )?;
-    let encoding =
-        crate::query_execution::compiler::NativeFragmentEncodingInput::new(distributed, prepared);
+    let encoding = crate::query_execution::compiler::NativeFragmentEncodingInput::new(prepared);
     let native_bundle = native_encoder.encode(&encoding)?;
-    if !encoding.matches_native_attachment(&native_bundle) {
-        return Err(
-            "native fragment bundle does not match the sealed mutation read encoding input".into(),
-        );
-    }
-    let (_, prepared) = encoding.into_parts();
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        prepared,
+        encoding,
         native_bundle,
         None,
         crate::query_execution::contract::DistributedQueryIntent::Result,

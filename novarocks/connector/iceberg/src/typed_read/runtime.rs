@@ -23,7 +23,9 @@
 
 use novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime;
 use novarocks_spi::connector::read_stack::{
-    ConnectorReadRelationKind, ConnectorSplit, HostAddress, SplitWeight,
+    ConnectorMergeTableHandle as _, ConnectorReadRelationKind, ConnectorSplit,
+    ConnectorTableExecuteHandle as _, ConnectorTableHandle as _, HostAddress, SchemaTableName,
+    SplitWeight,
 };
 use novarocks_spi::connector::{CatalogHandle, ConnectorInstanceDescriptor};
 
@@ -52,6 +54,17 @@ impl IcebergRuntimeRelation {
             Self::SystemTable(_) => ConnectorReadRelationKind::SystemTable,
             Self::TableExecute(_) => ConnectorReadRelationKind::TableExecute,
             Self::MergeTable(_) => ConnectorReadRelationKind::MergeTable,
+        }
+    }
+
+    pub(crate) fn schema_table_name(&self) -> &SchemaTableName {
+        match self {
+            Self::Table(handle) => handle.schema_table_name(),
+            Self::TableFunction(handle) => handle.schema_table_name(),
+            Self::ChangeWindow(handle) => handle.schema_table_name(),
+            Self::SystemTable(handle) => handle.schema_table_name(),
+            Self::TableExecute(handle) => handle.schema_table_name(),
+            Self::MergeTable(handle) => handle.schema_table_name(),
         }
     }
 }

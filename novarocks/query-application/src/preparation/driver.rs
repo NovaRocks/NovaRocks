@@ -24,7 +24,10 @@ use std::{
     sync::Arc,
 };
 
-use novarocks_workload_control::{Stage, StageRequest, WorkScope};
+use novarocks_workload_control::{
+    AllocationCharge, LocalResourceAuthority, Reservation, ResourceClass, Stage, StageRequest,
+    WorkScope,
+};
 
 use crate::observation::{
     NegotiationId, ObservationId, ObservationRequirement, PreparationBudget,
@@ -275,6 +278,7 @@ pub struct PreparationDriver<OR, OF, NR, NF> {
     observations: Arc<dyn ObservationSource<OR, OF>>,
     negotiations: Arc<dyn NegotiationSource<NR, NF>>,
     limits: PreparationLimits,
+    resources: LocalResourceAuthority,
 }
 
 impl<OR, OF, NR, NF> PreparationDriver<OR, OF, NR, NF>
@@ -292,12 +296,72 @@ where
         observations: Arc<dyn ObservationSource<OR, OF>>,
         negotiations: Arc<dyn NegotiationSource<NR, NF>>,
         limits: PreparationLimits,
+        resources: LocalResourceAuthority,
     ) -> Self {
         Self {
             observations,
             negotiations,
             limits,
+            resources,
         }
+    }
+
+    async fn reserve_provider_response(
+        &self,
+        scope: &WorkScope,
+    ) -> Result<Reservation, PreparationError> {
+        let bytes = u64::try_from(self.limits.max_response_bytes()).map_err(|_| {
+            PreparationError::new(
+                PreparationErrorKind::Governance,
+                "provider response reservation does not fit the local resource ledger",
+            )
+        })?;
+        loop {
+            if std::time::Instant::now() >= self.limits.deadline() {
+                return Err(PreparationError::new(
+                    PreparationErrorKind::DeadlineExceeded,
+                    "query preparation deadline exceeded before reserving provider response capacity",
+                ));
+            }
+            match self.resources.reserve(scope, bytes, ResourceClass::Data) {
+                Ok(reservation) => return Ok(reservation),
+                Err(novarocks_workload_control::WorkError::Capacity(_)) => {
+                    let wait = self
+                        .resources
+                        .wait_for_capacity(scope, bytes, ResourceClass::Data);
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(self.limits.deadline())) => {
+                            return Err(PreparationError::new(
+                                PreparationErrorKind::DeadlineExceeded,
+                                "query preparation deadline exceeded while waiting for provider response capacity",
+                            ));
+                        }
+                        result = wait => result.map_err(resource_error)?,
+                    }
+                }
+                Err(error) => return Err(resource_error(error)),
+            }
+        }
+    }
+
+    fn settle_provider_response(
+        &self,
+        mut reservation: Reservation,
+        actual_bytes: usize,
+    ) -> Result<Option<AllocationCharge>, PreparationError> {
+        if actual_bytes == 0 {
+            return Ok(None);
+        }
+        let actual_bytes = u64::try_from(actual_bytes).map_err(|_| {
+            PreparationError::new(
+                PreparationErrorKind::Governance,
+                "provider response footprint does not fit the local resource ledger",
+            )
+        })?;
+        reservation
+            .charge(actual_bytes)
+            .map(Some)
+            .map_err(resource_error)
     }
 
     pub async fn prepare(
@@ -327,6 +391,9 @@ where
         let mut diagnostic_budget_exhausted = false;
         let mut stalled = BTreeSet::new();
         let mut issued_observation_ids = BTreeSet::new();
+        // Each charge remains live exactly as long as the retained provider
+        // facts that the compiler may inspect during this preparation.
+        let mut retained_response_charges = Vec::<AllocationCharge>::new();
 
         loop {
             scope.check().map_err(governance_error)?;
@@ -350,6 +417,7 @@ where
                             return Err(contract_error("compiler repeated an observation id"));
                         }
                         budget.begin_observation(request.request.preparation_footprint_bytes())?;
+                        let response_reservation = self.reserve_provider_response(scope).await?;
                         let id = request.id;
                         let requirement = request.requirement;
                         let future = self.observations.observe(request);
@@ -364,8 +432,13 @@ where
                         };
                         match result {
                             Ok(response) => {
-                                budget
-                                    .record_response(response.fact.preparation_footprint_bytes())?;
+                                let actual_bytes = response.fact.preparation_footprint_bytes();
+                                budget.record_response(actual_bytes)?;
+                                if let Some(charge) = self
+                                    .settle_provider_response(response_reservation, actual_bytes)?
+                                {
+                                    retained_response_charges.push(charge);
+                                }
                                 observations.insert(id, response.fact);
                             }
                             Err(error)
@@ -418,6 +491,7 @@ where
                             ));
                         }
                         budget.begin_negotiation(request.request.preparation_footprint_bytes())?;
+                        let response_reservation = self.reserve_provider_response(scope).await?;
                         let future = self.negotiations.negotiate(request);
                         let response = tokio::select! {
                             reason = cancellation.cancelled() => {
@@ -428,7 +502,13 @@ where
                             }
                             result = future => result.map_err(source_error)?,
                         };
-                        budget.record_response(response.fact.preparation_footprint_bytes())?;
+                        let actual_bytes = response.fact.preparation_footprint_bytes();
+                        budget.record_response(actual_bytes)?;
+                        if let Some(charge) =
+                            self.settle_provider_response(response_reservation, actual_bytes)?
+                        {
+                            retained_response_charges.push(charge);
+                        }
                         let history = histories.entry(id).or_default();
                         let changed = history
                             .last()
@@ -468,6 +548,15 @@ fn governance_error(error: novarocks_workload_control::WorkError) -> Preparation
     PreparationError::new(PreparationErrorKind::Governance, error.to_string())
 }
 
+fn resource_error(error: novarocks_workload_control::WorkError) -> PreparationError {
+    let kind = if matches!(&error, novarocks_workload_control::WorkError::Cancelled(_)) {
+        PreparationErrorKind::Cancelled
+    } else {
+        PreparationErrorKind::Governance
+    };
+    PreparationError::new(kind, error.to_string())
+}
+
 fn contract_error(message: &'static str) -> PreparationError {
     PreparationError::new(PreparationErrorKind::SourceContract, message)
 }
@@ -489,7 +578,10 @@ mod tests {
     use std::{
         collections::VecDeque,
         num::{NonZeroU32, NonZeroUsize},
-        sync::Mutex,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -497,12 +589,15 @@ mod tests {
     use novarocks_workload_control::{
         CancellationReason, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::{
         api::QueryExecutionKind,
         coordination::{ExecutionEffect, RecoveryMode},
-        preparation::{ExecutionResourceRequirements, FrozenCostEstimate},
+        preparation::{
+            ExecutionResourceRequirements, FrozenCostEstimate, FrozenEstimateUnknownReason,
+        },
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -511,6 +606,86 @@ mod tests {
     impl PreparationFootprint for Tiny {
         fn preparation_footprint_bytes(&self) -> usize {
             1
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct SizedFact(usize);
+
+    impl PreparationFootprint for SizedFact {
+        fn preparation_footprint_bytes(&self) -> usize {
+            self.0
+        }
+    }
+
+    struct BlockingObservation {
+        calls: AtomicUsize,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl BlockingObservation {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    impl ObservationSource<SizedFact, SizedFact> for BlockingObservation {
+        fn observe(&self, request: ObservationRequest<SizedFact>) -> ObservationFuture<SizedFact> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                release.notified().await;
+                Ok(ObservationResponse::new(request.request))
+            })
+        }
+    }
+
+    struct FailingObservation;
+
+    impl ObservationSource<SizedFact, SizedFact> for FailingObservation {
+        fn observe(&self, _request: ObservationRequest<SizedFact>) -> ObservationFuture<SizedFact> {
+            Box::pin(async {
+                Err(SourceError::new(
+                    SourceErrorKind::RequiredBindingInvalid,
+                    "required observation failed",
+                ))
+            })
+        }
+    }
+
+    struct PendingSizedNegotiation;
+
+    impl NegotiationSource<SizedFact, SizedFact> for PendingSizedNegotiation {
+        fn negotiate(
+            &self,
+            _request: NegotiationRequest<SizedFact>,
+        ) -> NegotiationFuture<SizedFact> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct SingleObservationCompiler;
+
+    impl PurePreparationCompiler<SizedFact, SizedFact, SizedFact, SizedFact>
+        for SingleObservationCompiler
+    {
+        fn advance(
+            &mut self,
+            input: CompilerInput<'_, SizedFact, SizedFact>,
+        ) -> Result<CompilerStep<SizedFact, SizedFact>, PreparationError> {
+            let id = ObservationId::new(NonZeroU32::new(1).unwrap());
+            if input.observation(id).is_none() {
+                return Ok(CompilerStep::NeedObservations(vec![
+                    ObservationRequest::new(id, ObservationRequirement::Required, SizedFact(64)),
+                ]));
+            }
+            Ok(CompilerStep::Complete(Box::new(empty_description_draft())))
         }
     }
 
@@ -606,13 +781,14 @@ mod tests {
                         native_preparation_plan(NativePreparationFixture::MissingResultOutput)
                             .unwrap(),
                     ),
-                    Vec::new(),
                     None,
                     ExecutionEffect::None,
                     RecoveryMode::NoRecovery,
                     Vec::new(),
-                    FrozenCostEstimate::default(),
-                    ExecutionResourceRequirements::default(),
+                    FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+                    ExecutionResourceRequirements::unknown(
+                        FrozenEstimateUnknownReason::NotProjected,
+                    ),
                 ),
             )))
         }
@@ -640,13 +816,14 @@ mod tests {
                         native_preparation_plan(NativePreparationFixture::MissingResultOutput)
                             .unwrap(),
                     ),
-                    Vec::new(),
                     None,
                     ExecutionEffect::None,
                     RecoveryMode::NoRecovery,
                     Vec::new(),
-                    FrozenCostEstimate::default(),
-                    ExecutionResourceRequirements::default(),
+                    FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+                    ExecutionResourceRequirements::unknown(
+                        FrozenEstimateUnknownReason::NotProjected,
+                    ),
                 ),
             )))
         }
@@ -685,16 +862,32 @@ mod tests {
                         native_preparation_plan(NativePreparationFixture::MissingResultOutput)
                             .unwrap(),
                     ),
-                    Vec::new(),
                     None,
                     ExecutionEffect::None,
                     RecoveryMode::NoRecovery,
                     Vec::new(),
-                    FrozenCostEstimate::default(),
-                    ExecutionResourceRequirements::default(),
+                    FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+                    ExecutionResourceRequirements::unknown(
+                        FrozenEstimateUnknownReason::NotProjected,
+                    ),
                 ),
             )))
         }
+    }
+
+    fn empty_description_draft() -> FrozenExecutionDescriptionDraft {
+        FrozenExecutionDescriptionDraft::new(
+            QueryExecutionKind::Maintenance,
+            novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(
+                native_preparation_plan(NativePreparationFixture::MissingResultOutput).unwrap(),
+            ),
+            None,
+            ExecutionEffect::None,
+            RecoveryMode::NoRecovery,
+            Vec::new(),
+            FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+        )
     }
 
     fn limits(deadline: Instant) -> PreparationLimits {
@@ -714,7 +907,11 @@ mod tests {
         )
     }
 
-    fn scope() -> (novarocks_workload_control::RootWork, WorkScope) {
+    fn scope() -> (
+        novarocks_workload_control::RootWork,
+        WorkScope,
+        LocalResourceAuthority,
+    ) {
         let control = WorkloadControl::try_new(
             WorkloadConfig::default(),
             ResourceConfig {
@@ -729,16 +926,17 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = root.owner.scope();
-        (root, scope)
+        (root, scope, control.resources())
     }
 
     #[tokio::test]
     async fn deadline_interrupts_a_provider_future_that_never_returns() {
-        let (_root, scope) = scope();
+        let (_root, scope, resources) = scope();
         let driver = PreparationDriver::new(
             Arc::new(PendingObservation),
             Arc::new(PendingNegotiation),
             limits(Instant::now() + Duration::from_millis(10)),
+            resources,
         );
         let error = driver
             .prepare(&mut ObservationCompiler, &scope)
@@ -749,11 +947,12 @@ mod tests {
 
     #[tokio::test]
     async fn scope_cancellation_interrupts_a_provider_future_that_never_returns() {
-        let (root, scope) = scope();
+        let (root, scope, resources) = scope();
         let driver = PreparationDriver::new(
             Arc::new(PendingObservation),
             Arc::new(PendingNegotiation),
             limits(Instant::now() + Duration::from_secs(1)),
+            resources,
         );
         let cancel = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -769,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn unchanged_negotiation_is_rejected_as_non_convergent() {
-        let (_root, scope) = scope();
+        let (_root, scope, resources) = scope();
         let driver = PreparationDriver::new(
             Arc::new(PendingObservation),
             Arc::new(SequenceNegotiation(Mutex::new(VecDeque::from([
@@ -777,6 +976,7 @@ mod tests {
                 Tiny(1),
             ])))),
             limits(Instant::now() + Duration::from_secs(1)),
+            resources,
         );
         let error = driver
             .prepare(&mut NegotiationCompiler, &scope)
@@ -787,11 +987,12 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_observation_id_is_rejected_before_map_overwrite() {
-        let (_root, scope) = scope();
+        let (_root, scope, resources) = scope();
         let driver = PreparationDriver::new(
             Arc::new(ImmediateObservation),
             Arc::new(PendingNegotiation),
             limits(Instant::now() + Duration::from_secs(1)),
+            resources,
         );
         let error = driver
             .prepare(&mut ObservationCompiler, &scope)
@@ -807,11 +1008,12 @@ mod tests {
             SourceErrorKind::DeadlineExceeded,
             SourceErrorKind::ContractViolation,
         ] {
-            let (_root, scope) = scope();
+            let (_root, scope, resources) = scope();
             let driver = PreparationDriver::new(
                 Arc::new(OptionalFailureObservation(kind)),
                 Arc::new(PendingNegotiation),
                 limits(Instant::now() + Duration::from_secs(1)),
+                resources,
             );
             let description = driver.prepare(&mut OptionalCompiler, &scope).await.unwrap();
             assert_eq!(description.kind(), QueryExecutionKind::Maintenance);
@@ -820,7 +1022,7 @@ mod tests {
 
     #[tokio::test]
     async fn optional_diagnostic_budget_exhaustion_does_not_fail_the_query() {
-        let (_root, scope) = scope();
+        let (_root, scope, resources) = scope();
         let limits = PreparationLimits::new(
             crate::observation::PreparationCountLimits::new(
                 NonZeroU32::new(8).unwrap(),
@@ -841,6 +1043,7 @@ mod tests {
             )),
             Arc::new(PendingNegotiation),
             limits,
+            resources,
         );
         let description = driver
             .prepare(&mut OptionalDiagnosticBudgetCompiler, &scope)
@@ -851,7 +1054,7 @@ mod tests {
 
     #[tokio::test]
     async fn optional_diagnostic_vector_never_exceeds_count_budget() {
-        let (_root, scope) = scope();
+        let (_root, scope, resources) = scope();
         let limits = PreparationLimits::new(
             crate::observation::PreparationCountLimits::new(
                 NonZeroU32::new(8).unwrap(),
@@ -872,6 +1075,7 @@ mod tests {
             )),
             Arc::new(PendingNegotiation),
             limits,
+            resources,
         );
         let description = driver
             .prepare(&mut TwoOptionalCompiler, &scope)
@@ -882,7 +1086,7 @@ mod tests {
 
     #[tokio::test]
     async fn oscillating_negotiation_is_rejected() {
-        let (_root, scope) = scope();
+        let (_root, scope, resources) = scope();
         let driver = PreparationDriver::new(
             Arc::new(PendingObservation),
             Arc::new(SequenceNegotiation(Mutex::new(VecDeque::from([
@@ -891,11 +1095,98 @@ mod tests {
                 Tiny(1),
             ])))),
             limits(Instant::now() + Duration::from_secs(1)),
+            resources,
         );
         let error = driver
             .prepare(&mut NegotiationCompiler, &scope)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), PreparationErrorKind::NonConvergent);
+    }
+
+    #[tokio::test]
+    async fn concurrent_provider_response_waits_before_the_second_call() {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 80,
+                control_bytes: 16,
+                per_scope_bytes: 64,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let first_root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let second_root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let first_scope = first_root.owner.scope();
+        let second_scope = second_root.owner.scope();
+        let resources = control.resources();
+        let source = Arc::new(BlockingObservation::new());
+
+        let first_driver = PreparationDriver::new(
+            Arc::clone(&source) as Arc<dyn ObservationSource<SizedFact, SizedFact>>,
+            Arc::new(PendingSizedNegotiation),
+            limits(Instant::now() + Duration::from_secs(1)),
+            resources.clone(),
+        );
+        let mut first_compiler = SingleObservationCompiler;
+        let first = first_driver.prepare(&mut first_compiler, &first_scope);
+        tokio::pin!(first);
+        tokio::select! {
+            _ = source.entered.notified() => {}
+            result = &mut first => panic!("first preparation returned before release: {result:?}"),
+        }
+
+        let second_source: Arc<dyn ObservationSource<SizedFact, SizedFact>> = source.clone();
+        let second_driver = PreparationDriver::new(
+            second_source,
+            Arc::new(PendingSizedNegotiation),
+            limits(Instant::now() + Duration::from_secs(1)),
+            resources.clone(),
+        );
+        let mut second_compiler = SingleObservationCompiler;
+        let second = second_driver.prepare(&mut second_compiler, &second_scope);
+        tokio::pin!(second);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            result = &mut second => panic!("second preparation bypassed response capacity: {result:?}"),
+        }
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+
+        source.release.notify_one();
+        first.await.unwrap();
+        tokio::select! {
+            _ = source.entered.notified() => {}
+            result = &mut second => panic!("second preparation returned before provider release: {result:?}"),
+        }
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+        source.release.notify_one();
+        second.await.unwrap();
+        let snapshot = resources.snapshot();
+        assert_eq!(snapshot.data_reserved_bytes, 0);
+        assert_eq!(snapshot.data_used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_provider_call_releases_its_response_reservation() {
+        let (_root, scope, resources) = scope();
+        let driver = PreparationDriver::new(
+            Arc::new(FailingObservation),
+            Arc::new(PendingSizedNegotiation),
+            limits(Instant::now() + Duration::from_secs(1)),
+            resources.clone(),
+        );
+        let error = driver
+            .prepare(&mut SingleObservationCompiler, &scope)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), PreparationErrorKind::RequiredObservation);
+        let snapshot = resources.snapshot();
+        assert_eq!(snapshot.data_reserved_bytes, 0);
+        assert_eq!(snapshot.data_used_bytes, 0);
     }
 }

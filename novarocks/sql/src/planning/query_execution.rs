@@ -184,6 +184,20 @@ impl SealedPreparationPlan {
         &self.plan
     }
 
+    /// Share the immutable selected-plan allocation with a completion-only
+    /// consumer. The seal remains the sole authority for preparation and
+    /// cannot be reconstructed from this read-only projection.
+    pub fn shared_plan(&self) -> Arc<DistributedPlan> {
+        Arc::clone(&self.plan)
+    }
+
+    /// Consume the query-local seal after all seal-bound validation is complete.
+    /// The returned plan stays immutable and shares the exact allocation that
+    /// was inspected through this seal; there is no inverse reconstruction API.
+    pub fn into_shared_plan(self) -> Arc<DistributedPlan> {
+        self.plan
+    }
+
     pub fn scan_contracts(&self) -> Result<Vec<SealedScanContract>, String> {
         sealed_scan_contracts(self)
     }
@@ -287,6 +301,8 @@ impl SealedScanContract {
                 publication_id: selection.publication_id()?,
                 definition_fingerprint: selection.definition_fingerprint()?,
                 input_mapping: selection.input_mapping().to_vec(),
+                publication_inputs: selection.publication_inputs().to_vec(),
+                publication_target: selection.publication_target()?.clone(),
             })
         })
     }
@@ -306,6 +322,8 @@ pub struct SealedMvRewriteAction {
     publication_id: [u8; 16],
     definition_fingerprint: [u8; 32],
     input_mapping: Vec<MvRewriteInputSelection>,
+    publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
+    publication_target: crate::compiler::SqlMvRewritePublicationRelation,
 }
 
 impl SealedMvRewriteAction {
@@ -327,6 +345,14 @@ impl SealedMvRewriteAction {
 
     pub fn input_mapping(&self) -> &[MvRewriteInputSelection] {
         &self.input_mapping
+    }
+
+    pub fn publication_inputs(&self) -> &[crate::compiler::SqlMvRewritePublicationRelation] {
+        &self.publication_inputs
+    }
+
+    pub const fn publication_target(&self) -> &crate::compiler::SqlMvRewritePublicationRelation {
+        &self.publication_target
     }
 }
 
@@ -364,6 +390,15 @@ pub fn sealed_scan_contracts(
     {
         return Err(format!(
             "sealed distributed plan repeats scan node {duplicate}"
+        ));
+    }
+    if let Some(incomplete) = output
+        .iter()
+        .find(|contract| contract.was_mv_rewritten() && contract.mv_rewrite_action().is_none())
+    {
+        return Err(format!(
+            "sealed distributed plan MV rewrite scan node {} has no complete publication action",
+            incomplete.node_id()
         ));
     }
     Ok(output)
@@ -1087,9 +1122,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::{
-        FrozenConnectorScanIdentity, SqlScanPreparationCategory, build_frozen_connector_scan_plan,
-        frozen_connector_resolved_analyzer_table, matches_frozen_connector_scan,
-        project_execution_preparation_facts, scan_preparation_facts,
+        FrozenConnectorScanIdentity, SealedPreparationPlan, SqlScanPreparationCategory,
+        build_frozen_connector_scan_plan, frozen_connector_resolved_analyzer_table,
+        matches_frozen_connector_scan, project_execution_preparation_facts, scan_preparation_facts,
     };
     use crate::binding::SqlTableBindingId;
     use crate::plan_read::DistributedNodeKind;
@@ -1213,5 +1248,32 @@ mod tests {
         assert_eq!(result_facts.result_fragment_id(), Some(7));
         assert!(result_facts.producer_fragment_ids().is_empty());
         assert_eq!(result_facts.boundary_contracts().len(), 1);
+    }
+
+    #[test]
+    fn sealed_plan_rejects_an_mv_rewrite_without_a_complete_publication_action() {
+        let malformed = crate::test_support::native_unverified_mv_rewritten_scan_plan()
+            .expect("malformed fixture plan");
+        let sealed = SealedPreparationPlan::seal(malformed);
+
+        let error = sealed
+            .scan_contracts()
+            .expect_err("unverified MV rewrite must not cross final plan sealing");
+
+        assert!(error.contains("no complete publication action"));
+    }
+
+    #[test]
+    fn consuming_a_preparation_seal_preserves_the_exact_plan_allocation() {
+        use crate::test_support::{NativePreparationFixture, native_preparation_plan};
+
+        let sealed = SealedPreparationPlan::seal(
+            native_preparation_plan(NativePreparationFixture::ResultOutput)
+                .expect("sealed result fixture"),
+        );
+        let original = sealed.plan() as *const crate::plan_read::DistributedPlan;
+        let shared = sealed.into_shared_plan();
+
+        assert_eq!(original, shared.as_ref() as *const _);
     }
 }

@@ -25,7 +25,7 @@ use paimon::io::{FileIO, RetainedRead};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 
 use crate::io::PaimonHostFileIo;
-use crate::metadata::{PaimonFrozenRead, freeze_table};
+use crate::metadata::{PaimonFrozenRead, PaimonFrozenReadRecipe, freeze_table, rebind_table};
 use crate::resources::PaimonRequestResources;
 use crate::sdk_control::PaimonSdkReadControl;
 
@@ -138,6 +138,15 @@ impl PaimonFileSystemCatalog {
         freeze_table(table, name.clone(), self.resources.clone())
             .await
             .map(Arc::new)
+    }
+
+    /// Rebind one already-frozen semantic recipe to this request's FileIO and
+    /// resource ledger. No catalog-current or latest-snapshot lookup occurs.
+    pub(crate) fn rebind_read(
+        &self,
+        recipe: &PaimonFrozenReadRecipe,
+    ) -> Result<Arc<PaimonFrozenRead>, ConnectorError> {
+        rebind_table(self.inner.file_io().clone(), recipe, self.resources.clone()).map(Arc::new)
     }
 
     fn retain_listing(

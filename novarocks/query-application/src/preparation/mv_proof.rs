@@ -15,39 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
-use novarocks_sql::planning::query_execution::{
-    SealedMvRewriteAction, SealedPreparationPlanId, SealedScanIdentity,
-};
+use novarocks_sql::planning::query_execution::{SealedMvRewriteAction, SealedScanIdentity};
 
 use crate::api::{
-    ExactObjectBinding, MvCandidateFact, MvPublicationId, QueryConsistency, RelationOccurrence,
+    ExactObjectBinding, MvCandidateFact, MvCandidateFactInput, MvPublicationId, QueryConsistency,
+    RelationOccurrence, SealedExactBindingReceipts,
 };
-
-/// Relation mapping asserted by the compiler. The explicit
-/// publication-input ordinal prevents a same-name self join or reordered
-/// definition input from being accepted through positional coincidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MvInputMatch {
-    occurrence: SealedScanIdentity,
-    publication_input_ordinal: usize,
-}
-
-impl MvInputMatch {
-    pub const fn new(occurrence: SealedScanIdentity, publication_input_ordinal: usize) -> Self {
-        Self {
-            occurrence,
-            publication_input_ordinal,
-        }
-    }
-    pub const fn occurrence(self) -> SealedScanIdentity {
-        self.occurrence
-    }
-    pub const fn publication_input_ordinal(self) -> usize {
-        self.publication_input_ordinal
-    }
-}
 
 /// A candidate whose published inputs match the pre-rewrite query bindings.
 /// It becomes executable only when description freezing also proves that the
@@ -55,8 +30,7 @@ impl MvInputMatch {
 #[derive(Clone, Debug)]
 pub struct StrictMvCandidateMatch {
     publication_id: MvPublicationId,
-    pre_rewrite_plan: SealedPreparationPlanId,
-    input_mapping: Arc<[MvInputMatch]>,
+    inputs: Arc<[ExactObjectBinding]>,
     output: ExactObjectBinding,
     rewrite_action: SealedMvRewriteAction,
 }
@@ -64,10 +38,6 @@ pub struct StrictMvCandidateMatch {
 impl StrictMvCandidateMatch {
     pub const fn publication_id(&self) -> MvPublicationId {
         self.publication_id
-    }
-
-    pub fn input_mapping(&self) -> &[MvInputMatch] {
-        &self.input_mapping
     }
 
     /// Published output that final description freezing must match to the
@@ -80,8 +50,8 @@ impl StrictMvCandidateMatch {
         self.rewrite_action.target()
     }
 
-    pub const fn pre_rewrite_plan(&self) -> SealedPreparationPlanId {
-        self.pre_rewrite_plan
+    pub fn input_bindings(&self) -> &[ExactObjectBinding] {
+        &self.inputs
     }
 
     pub const fn rewrite_action(&self) -> &SealedMvRewriteAction {
@@ -89,199 +59,121 @@ impl StrictMvCandidateMatch {
     }
 }
 
-pub fn prove_strict_mv_candidate_match(
-    consistency: QueryConsistency,
-    query_occurrences: &[RelationOccurrence],
-    input_mapping: &[MvInputMatch],
-    candidate: &MvCandidateFact,
+/// Query-scoped proof that the optimizer-selected publication inputs match
+/// the actual pre-rewrite SQL bindings. Construction is possible only through
+/// the sealed receipt authority that minted those binding tokens.
+pub struct SelectedMvQueryInputs {
+    inputs: Arc<[ExactObjectBinding]>,
     rewrite_action: SealedMvRewriteAction,
-) -> Result<StrictMvCandidateMatch, String> {
+}
+
+impl SelectedMvQueryInputs {
+    /// The exact final-plan scan the optimizer replaced with this publication.
+    /// The opaque identity is read-only; only the proof functions can construct
+    /// or consume the selected-input authority.
+    pub const fn target(&self) -> SealedScanIdentity {
+        self.rewrite_action.target()
+    }
+}
+
+pub fn prove_selected_mv_query_inputs(
+    consistency: QueryConsistency,
+    receipts: &SealedExactBindingReceipts,
+    rewrite_action: SealedMvRewriteAction,
+) -> Result<SelectedMvQueryInputs, String> {
     if consistency != QueryConsistency::Strict {
         return Err(
             "UEA-1 currently validates MV candidate matches only at strict consistency".to_string(),
         );
     }
-    if rewrite_action.definition_fingerprint() != candidate.definition_fingerprint() {
-        return Err(
-            "MV candidate definition does not match the compiler-proved relation".to_string(),
-        );
+    let publication_inputs = rewrite_action.publication_inputs();
+    let mapping = rewrite_action.input_mapping();
+    if mapping.len() != publication_inputs.len() {
+        return Err("MV selection does not exactly cover its publication inputs".to_string());
     }
-    if rewrite_action.publication_id() != candidate.publication_id().bytes() {
-        return Err("MV candidate publication was not selected by the optimizer".to_string());
-    }
-    if rewrite_action.input_mapping().len() != input_mapping.len() {
-        return Err("MV candidate mapping differs from the optimizer selection".to_string());
-    }
-    if input_mapping.len() != candidate.inputs().len() {
-        return Err(
-            "MV candidate input count does not match the selected query occurrences".to_string(),
-        );
-    }
-    let query_occurrence_ids = query_occurrences
-        .iter()
-        .map(RelationOccurrence::occurrence)
-        .collect::<BTreeSet<_>>();
-    if query_occurrence_ids.len() != query_occurrences.len() {
-        return Err("MV candidate match input repeats a query relation occurrence".to_string());
-    }
-    let pre_rewrite_plan = query_occurrences
-        .first()
-        .ok_or_else(|| "MV candidate match has no pre-rewrite query occurrence".to_string())?
-        .occurrence()
-        .plan();
-    if query_occurrences
-        .iter()
-        .any(|occurrence| occurrence.occurrence().plan() != pre_rewrite_plan)
-    {
-        return Err(
-            "MV candidate match mixes relation occurrences from different pre-rewrite plans"
-                .to_string(),
-        );
-    }
-    if rewrite_action.target().plan() == pre_rewrite_plan {
-        return Err(
-            "MV candidate match requires distinct pre-rewrite and final plan seals".to_string(),
-        );
-    }
-    let mut seen_occurrences = BTreeSet::new();
-    let mut seen_inputs = BTreeSet::new();
-    for mapping in input_mapping.iter() {
-        if !seen_occurrences.insert(mapping.occurrence) {
-            return Err("MV candidate match repeats a query relation occurrence".to_string());
-        }
-        if !seen_inputs.insert(mapping.publication_input_ordinal) {
-            return Err("MV candidate match repeats a publication input".to_string());
-        }
-        let query_binding = query_occurrences
+    if mapping.iter().enumerate().any(|(index, selected)| {
+        mapping[..index]
             .iter()
-            .find(|query| query.occurrence() == mapping.occurrence)
-            .map(RelationOccurrence::binding)
-            .ok_or_else(|| {
-                "MV candidate match names an unknown query relation occurrence".to_string()
-            })?;
-        let published_binding = candidate
-            .inputs()
-            .get(mapping.publication_input_ordinal)
-            .ok_or_else(|| "MV candidate match names an unknown publication input".to_string())?;
-        if query_binding != published_binding {
+            .any(|other| other.occurrence() == selected.occurrence())
+    }) {
+        return Err("MV selection repeats a pre-rewrite query occurrence".to_string());
+    }
+
+    let mut inputs = vec![None; publication_inputs.len()];
+    for selected in mapping {
+        if selected.occurrence().binding() != selected.binding() {
+            return Err("MV selection occurrence and binding token disagree".to_string());
+        }
+        let ordinal = selected.publication_input_ordinal();
+        let expected = publication_inputs
+            .get(ordinal)
+            .ok_or_else(|| "MV selection names an unknown publication input".to_string())?;
+        if inputs[ordinal].is_some() {
+            return Err("MV selection repeats a publication input".to_string());
+        }
+        let actual = receipts.resolve(selected.binding())?;
+        if !actual.matches_publication_relation(expected)? {
             return Err(
-                "MV candidate input does not exactly match the mapped query relation binding"
+                "MV publication input does not match the actual pre-rewrite query binding"
                     .to_string(),
             );
         }
-        let selected = rewrite_action.input_mapping().iter().any(|selected| {
-            let query = query_occurrences
-                .iter()
-                .find(|query| query.occurrence() == mapping.occurrence)
-                .expect("query occurrence was resolved above");
-            selected.binding() == query.sql_binding()
-                && selected.occurrence() == query.sql_occurrence()
-                && selected.publication_input_ordinal() == mapping.publication_input_ordinal
-        });
-        if !selected {
-            return Err("MV candidate mapping was not selected by the optimizer".to_string());
-        }
+        inputs[ordinal] = Some(actual);
     }
-    if seen_inputs.len() != candidate.inputs().len() {
-        return Err("MV candidate match does not cover every publication input".to_string());
-    }
-    Ok(StrictMvCandidateMatch {
-        publication_id: candidate.publication_id(),
-        pre_rewrite_plan,
-        input_mapping: input_mapping.into(),
-        output: candidate.output().clone(),
+    let inputs = inputs
+        .into_iter()
+        .map(|input| input.ok_or_else(|| "MV selection omits a publication input".to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SelectedMvQueryInputs {
+        inputs: inputs.into(),
         rewrite_action,
+    })
+}
+
+/// Complete the strict proof with the exact target receipt produced by final
+/// scan negotiation. This closes both base-version and target-version races.
+pub fn prove_selected_mv_target(
+    selected: SelectedMvQueryInputs,
+    target: &RelationOccurrence,
+) -> Result<StrictMvCandidateMatch, String> {
+    if target.occurrence() != selected.rewrite_action.target() {
+        return Err("MV target receipt belongs to another final plan scan".to_string());
+    }
+    if target.sql_occurrence().binding() != target.sql_binding() {
+        return Err("MV target SQL occurrence and binding token disagree".to_string());
+    }
+    if !target
+        .binding()
+        .matches_publication_relation(selected.rewrite_action.publication_target())?
+    {
+        return Err("MV target receipt does not match the published target revision".to_string());
+    }
+    let publication_id = MvPublicationId::try_new(selected.rewrite_action.publication_id())
+        .ok_or_else(|| "MV publication identity is invalid".to_string())?;
+    let candidate = MvCandidateFactInput::try_new(
+        publication_id,
+        selected.rewrite_action.definition_fingerprint(),
+        selected.rewrite_action.source(),
+        &selected.inputs,
+        target.binding(),
+    )
+    .map(MvCandidateFact::retain)
+    .ok_or_else(|| "MV selected candidate facts are incomplete".to_string())?;
+    Ok(StrictMvCandidateMatch {
+        publication_id,
+        inputs: candidate.inputs().into(),
+        output: candidate.output().clone(),
+        rewrite_action: selected.rewrite_action,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{
-        CatalogGeneration, DataVersion, ObjectIdentity, ObjectPath, ProviderFactFormat,
-    };
+    use crate::api::{CatalogGeneration, ExactBindingReceiptStore, ObjectPath, ProviderFactFormat};
 
     fn format(kind: &str) -> ProviderFactFormat {
         ProviderFactFormat::try_new("iceberg-rest", kind).unwrap()
-    }
-
-    fn binding(table: &str, version: u8) -> ExactObjectBinding {
-        ExactObjectBinding::new_for_test(
-            ObjectPath::try_new(["ice", "ns", table]).unwrap(),
-            CatalogGeneration::try_new(format("catalog-generation/v1"), Arc::<[u8]>::from([1]))
-                .unwrap(),
-            ObjectIdentity::try_new(format("table-uuid/v1"), Arc::<[u8]>::from([2])).unwrap(),
-            DataVersion::try_new(format("snapshot-id/v1"), Arc::<[u8]>::from([version])).unwrap(),
-        )
-    }
-
-    fn candidate(inputs: Vec<ExactObjectBinding>, output_version: u8) -> MvCandidateFact {
-        candidate_with_identity([7; 16], [9; 32], inputs, output_version)
-    }
-
-    fn candidate_with_identity(
-        publication_id: [u8; 16],
-        definition_fingerprint: [u8; 32],
-        inputs: Vec<ExactObjectBinding>,
-        output_version: u8,
-    ) -> MvCandidateFact {
-        MvCandidateFact::try_new_for_test(
-            MvPublicationId::try_new(publication_id).unwrap(),
-            definition_fingerprint,
-            "catalog.mv_orders:v1",
-            &inputs,
-            &binding("mv_orders", output_version),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn optimizer_selection_rejects_other_publication_and_definition() {
-        let source_contracts = source_occurrences(1);
-        let occurrence = source_contracts[0].identity();
-        let source = binding("orders", 101);
-        let queries = [RelationOccurrence::resolved(
-            occurrence,
-            source_contracts[0].sql_occurrence(),
-            source_contracts[0].binding(),
-            source.clone(),
-        )];
-        let mapping = [MvInputMatch::new(occurrence, 0)];
-
-        for candidate in [
-            candidate_with_identity([8; 16], [9; 32], vec![source.clone()], 7),
-            candidate_with_identity([7; 16], [8; 32], vec![source.clone()], 7),
-        ] {
-            assert!(
-                prove_strict_mv_candidate_match(
-                    QueryConsistency::Strict,
-                    &queries,
-                    &mapping,
-                    &candidate,
-                    rewrite_action(),
-                )
-                .is_err()
-            );
-        }
-    }
-
-    fn source_occurrences(
-        count: usize,
-    ) -> Vec<novarocks_sql::planning::query_execution::SealedScanContract> {
-        let plan = if count == 1 {
-            novarocks_sql::test_support::native_scan_plan(
-                novarocks_sql::test_support::NativeScanFixture::ConnectorRead,
-            )
-            .unwrap()
-        } else {
-            novarocks_sql::test_support::native_self_join_scan_plan().unwrap()
-        };
-        novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(plan)
-            .scan_contracts()
-            .unwrap()
-            .into_iter()
-            .take(count)
-            .collect()
     }
 
     fn rewrite_action() -> SealedMvRewriteAction {
@@ -294,104 +186,168 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn strict_candidate_match_binds_inputs_and_exact_published_output() {
-        let source = binding("orders", 101);
-        let candidate = candidate(vec![source.clone()], 7);
-        let source_contracts = source_occurrences(1);
-        let occurrence = source_contracts[0].identity();
-        let queries = [RelationOccurrence::resolved(
-            occurrence,
-            source_contracts[0].sql_occurrence(),
-            source_contracts[0].binding(),
-            source,
-        )];
-        let mapping = [MvInputMatch::new(occurrence, 0)];
-        let action = rewrite_action();
-        let matched = prove_strict_mv_candidate_match(
-            QueryConsistency::Strict,
-            &queries,
-            &mapping,
-            &candidate,
-            action.clone(),
+    fn publication_binding(
+        relation: &novarocks_sql::compiler::SqlMvRewritePublicationRelation,
+    ) -> ExactObjectBinding {
+        ExactObjectBinding::new_for_publication_test(
+            ObjectPath::try_new(relation.table_fqn().split('.')).unwrap(),
+            CatalogGeneration::try_new(format("catalog-generation/v1"), Arc::<[u8]>::from([1]))
+                .unwrap(),
+            relation,
+        )
+    }
+
+    fn changed_publication_binding(
+        relation: &novarocks_sql::compiler::SqlMvRewritePublicationRelation,
+        object: &[u8],
+        snapshot: i64,
+    ) -> ExactObjectBinding {
+        let object = novarocks_spi::connector::ConnectorTableObjectId::try_new(
+            bytes::Bytes::copy_from_slice(object),
         )
         .unwrap();
-        assert_eq!(matched.output_binding(), candidate.output());
-        assert_eq!(matched.target_scan(), action.target());
-    }
-
-    #[test]
-    fn strict_candidate_match_rejects_a_newer_query_binding() {
-        let candidate = candidate(vec![binding("orders", 101)], 7);
-        let source_contracts = source_occurrences(1);
-        let occurrence = source_contracts[0].identity();
-        let queries = [RelationOccurrence::resolved(
-            occurrence,
-            source_contracts[0].sql_occurrence(),
-            source_contracts[0].binding(),
-            binding("orders", 102),
-        )];
-        let mapping = [MvInputMatch::new(occurrence, 0)];
-        assert!(
-            prove_strict_mv_candidate_match(
-                QueryConsistency::Strict,
-                &queries,
-                &mapping,
-                &candidate,
-                rewrite_action(),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn explicit_mapping_prevents_positional_self_join_mismatch() {
-        let left = binding("orders", 101);
-        let right = left.clone();
-        let candidate = candidate(vec![left.clone(), right.clone()], 7);
-        let contracts = source_occurrences(2);
-        let occurrences = [contracts[0].identity(), contracts[1].identity()];
-        let queries = [
-            RelationOccurrence::resolved(
-                occurrences[0],
-                contracts[0].sql_occurrence(),
-                contracts[0].binding(),
-                left,
-            ),
-            RelationOccurrence::resolved(
-                occurrences[1],
-                contracts[1].sql_occurrence(),
-                contracts[1].binding(),
-                right,
-            ),
-        ];
-        let swapped = [
-            MvInputMatch::new(occurrences[0], 1),
-            MvInputMatch::new(occurrences[1], 0),
-        ];
-        let optimizer_mapping = vec![
-            (contracts[0].sql_occurrence(), 0),
-            (contracts[1].sql_occurrence(), 1),
-        ];
-        let action = novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(
-            novarocks_sql::test_support::native_mv_rewritten_scan_plan_with_inputs(
-                optimizer_mapping,
+        let changed = novarocks_sql::compiler::SqlMvRewritePublicationRelation::new(
+            relation.table_fqn().to_string(),
+            novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                relation.revision().object_identity().provider().clone(),
+                &object,
+                Some(snapshot),
             )
             .unwrap(),
         )
-        .scan_contracts()
-        .unwrap()[0]
-            .mv_rewrite_action()
-            .unwrap();
+        .unwrap();
+        publication_binding(&changed)
+    }
+
+    fn selected_inputs(
+        action: SealedMvRewriteAction,
+        input: ExactObjectBinding,
+    ) -> Result<SelectedMvQueryInputs, String> {
+        let binding = action.input_mapping()[0].binding();
+        let allocator = novarocks_sql::binding::SqlTableBindingAllocator::try_new_for_test(
+            binding.scope().get(),
+        )?;
+        let store = ExactBindingReceiptStore::new(&allocator);
+        store.register_for_test(binding, input);
+        prove_selected_mv_query_inputs(QueryConsistency::Strict, &store.seal(), action)
+    }
+
+    fn target_occurrence(action: &SealedMvRewriteAction) -> RelationOccurrence {
+        let plan = novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(
+            novarocks_sql::test_support::native_mv_rewritten_scan_plan().unwrap(),
+        );
+        let contract = plan.scan_contracts().unwrap().remove(0);
+        RelationOccurrence::resolved(
+            action.target(),
+            contract.sql_occurrence(),
+            contract.binding(),
+            publication_binding(action.publication_target()),
+        )
+    }
+
+    #[test]
+    fn selected_proof_joins_publication_to_actual_input_and_target_receipts() {
+        let action = rewrite_action();
+        let input = publication_binding(&action.publication_inputs()[0]);
+        let selected = selected_inputs(action.clone(), input).unwrap();
+        let target = target_occurrence(&action);
+        let strict = prove_selected_mv_target(selected, &target).unwrap();
+        assert_eq!(strict.publication_id().bytes(), [7; 16]);
+        assert_eq!(strict.target_scan(), action.target());
+    }
+
+    #[test]
+    fn selected_proof_rejects_s101_s102_and_object_replacement() {
+        let action = rewrite_action();
+        let expected = &action.publication_inputs()[0];
+        let same_object = expected.revision().object_identity().value();
+        for mismatched in [
+            changed_publication_binding(expected, same_object, 102),
+            changed_publication_binding(expected, b"replacement-object", 101),
+        ] {
+            assert!(selected_inputs(action.clone(), mismatched).is_err());
+        }
+    }
+
+    #[test]
+    fn selected_proof_rejects_m1_m2_and_unreadable_target() {
+        let action = rewrite_action();
+        let selected = selected_inputs(
+            action.clone(),
+            publication_binding(&action.publication_inputs()[0]),
+        )
+        .unwrap();
+        let plan = novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(
+            novarocks_sql::test_support::native_mv_rewritten_scan_plan().unwrap(),
+        );
+        let contract = plan.scan_contracts().unwrap().remove(0);
+        let wrong_target = RelationOccurrence::resolved(
+            action.target(),
+            contract.sql_occurrence(),
+            contract.binding(),
+            changed_publication_binding(
+                action.publication_target(),
+                action
+                    .publication_target()
+                    .revision()
+                    .object_identity()
+                    .value(),
+                202,
+            ),
+        );
+        assert!(prove_selected_mv_target(selected, &wrong_target).is_err());
+
+        let selected = selected_inputs(
+            action.clone(),
+            publication_binding(&action.publication_inputs()[0]),
+        )
+        .unwrap();
+        let unreadable = ExactObjectBinding::new_without_semantic_revision_for_test(
+            ObjectPath::try_new(action.publication_target().table_fqn().split('.')).unwrap(),
+            CatalogGeneration::try_new(format("catalog-generation/v1"), Arc::<[u8]>::from([1]))
+                .unwrap(),
+        );
+        let unreadable_target = RelationOccurrence::resolved(
+            action.target(),
+            contract.sql_occurrence(),
+            contract.binding(),
+            unreadable,
+        );
+        assert!(prove_selected_mv_target(selected, &unreadable_target).is_err());
+    }
+
+    #[test]
+    fn selected_proof_rejects_cross_query_self_join_and_reordered_mapping() {
+        let action = rewrite_action();
+        let foreign_allocator = novarocks_sql::binding::SqlTableBindingAllocator::try_new_for_test(
+            std::num::NonZeroU64::new(99).unwrap(),
+        )
+        .unwrap();
         assert!(
-            prove_strict_mv_candidate_match(
+            prove_selected_mv_query_inputs(
                 QueryConsistency::Strict,
-                &queries,
-                &swapped,
-                &candidate,
-                action,
+                &ExactBindingReceiptStore::new(&foreign_allocator).seal(),
+                action.clone(),
             )
             .is_err()
         );
+
+        let occurrence = action.input_mapping()[0].occurrence();
+        for mapping in [
+            vec![(occurrence, 0), (occurrence, 0)],
+            vec![(occurrence, 1)],
+        ] {
+            let malformed = novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(
+                novarocks_sql::test_support::native_mv_rewritten_scan_plan_with_inputs(mapping)
+                    .unwrap(),
+            )
+            .scan_contracts()
+            .unwrap()
+            .remove(0)
+            .mv_rewrite_action()
+            .unwrap();
+            let actual = publication_binding(&malformed.publication_inputs()[0]);
+            assert!(selected_inputs(malformed, actual).is_err());
+        }
     }
 }

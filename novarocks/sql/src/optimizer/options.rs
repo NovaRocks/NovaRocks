@@ -69,14 +69,14 @@ pub struct SessionOptimizerSettings {
     /// Session override for `cbo_max_reorder_node` (None = default 50).
     pub max_reorder_node: Option<usize>,
     /// Session override for the broadcast fanout backend count (`cbo_broadcast_backend_count`).
-    /// `None` means use the engine-snapshotted live BE count (CI baseline 3).
+    /// `None` means use the statement-admission estimate, then the profile default.
     pub cbo_broadcast_backend_count: Option<f64>,
     /// Session override for the per-node broadcast build memory budget in bytes
     /// (`cbo_broadcast_node_mem_budget_bytes`). `None` means the profile default (1 GiB).
     pub cbo_broadcast_node_mem_budget_bytes: Option<f64>,
-    /// Snapshot of the live BE registry count, written by the engine before
-    /// `optimize()` when the session has not explicitly SET a backend count.
-    /// `None` means no snapshot available (fall back to profile default).
+    /// Statement-admission snapshot of the first non-empty BE topology count.
+    /// It stays fixed across later execution attempts. `None` means admission
+    /// had no topology estimate, so costing falls back to the profile default.
     pub effective_backend_count: Option<f64>,
     /// Query memory budget frozen at admission. SQL applies this only to
     /// costing; it never consults the process-global runtime configuration.
@@ -458,7 +458,7 @@ mod tests {
         clippy::field_reassign_with_default,
         reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
     )]
-    fn from_session_uses_engine_snapshot_when_set_unset() {
+    fn from_session_uses_admission_snapshot_when_set_unset() {
         let mut settings = SessionOptimizerSettings::default();
         settings.cbo_broadcast_backend_count = None;
         settings.effective_backend_count = Some(11.0);
@@ -481,8 +481,8 @@ mod tests {
         clippy::field_reassign_with_default,
         reason = "The fixture assigns optimizer facts progressively so each test input remains explicit."
     )]
-    fn from_session_explicit_set_overrides_engine_snapshot() {
-        // SET takes precedence over the engine-written snapshot.
+    fn from_session_explicit_set_overrides_admission_snapshot() {
+        // SET takes precedence over the admission-frozen estimate.
         let mut settings = SessionOptimizerSettings::default();
         settings.cbo_broadcast_backend_count = Some(7.0);
         settings.effective_backend_count = Some(3.0);

@@ -68,7 +68,10 @@ impl<'a> NativeFragmentEncodingView<'a> {
     }
 
     pub fn scan_facts(&self) -> NativeScanFactsView<'a> {
-        NativeScanFactsView::new(self.prepared.scan_bindings())
+        NativeScanFactsView::new(
+            self.prepared.scan_bindings(),
+            self.prepared.native_connector_scans(),
+        )
     }
 
     #[allow(
@@ -121,7 +124,7 @@ impl<'a> NativeFragmentEncodingView<'a> {
 
 /// Complete native payload for one exact encoding view.  Only its view can
 /// construct it; Core consumes it exactly once while assembling the request.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct NativeFragmentAttachment {
     by_fragment: BTreeMap<FragmentId, NativePlanFragment>,
     provenance: Option<u64>,

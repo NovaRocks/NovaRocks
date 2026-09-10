@@ -29,4 +29,5 @@ pub use properties::NormalizedCatalogProperties;
 pub use role::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlWriteBinding,
     ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
+    ConnectorReadAttemptAccess, ConnectorReadAttemptCapabilities,
 };

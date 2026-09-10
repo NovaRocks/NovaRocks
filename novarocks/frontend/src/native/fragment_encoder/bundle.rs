@@ -128,7 +128,7 @@ mod tests {
                 &plan,
             )
             .expect("prepared fragments");
-        NativeFragmentEncodingInput::new(plan, prepared)
+        NativeFragmentEncodingInput::new_for_test(plan, prepared)
     }
 
     fn writer_nodes(attachment: &NativeFragmentAttachment) -> Vec<plan::TableWriterNode> {

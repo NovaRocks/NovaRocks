@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
-    CatalogProperties, ConnectorControlPlanningLease, ConnectorFrozenRewriteGroup,
-    ConnectorInstanceId, ConnectorPinnedFileSet,
+    ConnectorControlPlanningLease, ConnectorFrozenRewriteGroup, ConnectorInstanceId,
+    ConnectorPinnedFileSet,
 };
 
 use crate::catalog_application::query_bindings::QueryScanMaterialization;
@@ -29,7 +29,6 @@ use novarocks_sql::plan_read::ColumnId;
 use novarocks_sql::plan_read::FragmentId;
 use novarocks_sql::plan_read::OutputColumn;
 use novarocks_sql::plan_read::PlanScanNode;
-use novarocks_sql::plan_read::TypedExpr;
 use novarocks_types::schema::ColumnDef;
 
 pub(crate) trait ScanBindingResolver: Send + Sync {
@@ -74,6 +73,32 @@ pub(crate) enum ResolvedScanExecution {
     /// One provider-frozen cohort read of a distributed
     /// `ALTER TABLE ... EXECUTE` procedure's own relation.
     AdmittedTableExecute(QueryRewriteGroupRead),
+}
+
+impl ResolvedScanExecution {
+    /// Project the transient admission onto the only execution distinction the
+    /// immutable native plan needs. The admission itself owns Catalog and
+    /// provider capabilities and must not cross into `PreparedFragmentSet`.
+    pub(crate) const fn prepared_kind(&self) -> PreparedScanExecutionKind {
+        match self {
+            Self::AdmittedConnectorRead(_)
+            | Self::AdmittedSystemTable(_)
+            | Self::AdmittedPinnedFileSet(_)
+            | Self::AdmittedTableExecute(_) => PreparedScanExecutionKind::AdmittedConnectorRead,
+            Self::AdmittedChangeWindow(_) => PreparedScanExecutionKind::SealedConnectorScan,
+        }
+    }
+}
+
+/// Resource-free execution category retained by native preparation.
+///
+/// Exact table, snapshot, pinned-file, and rewrite-group semantics live in the
+/// frozen typed handle. Per-attempt access and its Catalog generation guard
+/// live in `ConnectorAttemptAccessPlan`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreparedScanExecutionKind {
+    AdmittedConnectorRead,
+    SealedConnectorScan,
 }
 
 /// The exact facts one provider-frozen cohort read is planned from.
@@ -191,36 +216,25 @@ pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScan
 
 /// One SQL scan lowered onto the typed connector read stack.
 ///
-/// It deliberately carries no split. Enumeration is lazy and owned by the
-/// execution round, which drives `PreparedTypedScan::split_manager`; anything
-/// that used to size itself from a frozen split count must ask the live
-/// backend topology instead.
+/// It deliberately carries no split or provider capability. Enumeration is
+/// lazy and owned by the execution round, which opens fresh attempt access
+/// from the logical-query sidecar; anything that used to size itself from a
+/// frozen split count must ask the live backend topology instead.
 pub(crate) struct PreparedTypedConnectorScan {
-    /// Exact immutable BE materialization input. Query assembly de-duplicates
-    /// this into the one `CatalogSet` carried in every participant Init.
-    pub(crate) catalog_properties: CatalogProperties,
-    /// The typed scan node, its lazy split manager, and the constraint the
-    /// round driver must enumerate under.
+    /// Pure typed scan description. It owns no provider capability or lease.
     pub(crate) prepared: PreparedTypedScan,
-    /// Ordered SQL conjuncts with no exact typed representation, so the engine
-    /// still evaluates them above the scan. A conjunct the connector merely
-    /// declined is not here: it travels as the carrier's unenforced predicate
-    /// and the backend reader applies it.
-    pub(crate) residual_predicates: Vec<TypedExpr>,
-    /// Keeps the exact FE control generation alive through query execution.
-    /// It is never encoded into a fragment carrier.
-    #[allow(
-        dead_code,
-        reason = "The lease is retained for its drop-time ownership release through BE admission."
-    )]
-    pub(crate) planning_lease: ConnectorControlPlanningLease,
+}
+
+impl PreparedTypedConnectorScan {
+    pub(super) fn new(prepared: PreparedTypedScan) -> Self {
+        Self { prepared }
+    }
 }
 
 impl std::fmt::Debug for PreparedTypedConnectorScan {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedTypedConnectorScan")
-            .field("catalog_handle", self.catalog_properties.handle())
             .field("prepared", &self.prepared)
             .finish_non_exhaustive()
     }
@@ -255,7 +269,7 @@ pub(crate) struct ResolvedReadColumn {
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedScanBinding {
     pub node_id: i32,
-    pub execution: ResolvedScanExecution,
+    pub execution_kind: PreparedScanExecutionKind,
     pub physical_columns: Vec<ResolvedScanColumn>,
     pub required_reads: Vec<ResolvedReadColumn>,
 }
@@ -332,28 +346,16 @@ impl ResolvedScanBinding {
 
 #[derive(Default)]
 pub(crate) struct ScanExecutionBindings {
-    sealed_plan: Option<novarocks_sql::planning::query_execution::SealedPreparationPlan>,
     by_node_id: BTreeMap<i32, ResolvedScanBinding>,
+    // Immutable, already-materialized scheduling payload only. This map never
+    // owns a split source, split manager, request context, or enumeration
+    // cursor; typed connector scans register an empty entry because each
+    // attempt enumerates through its sidecar access.
     scan_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<ScanRangeParams>>>,
     typed_scans: BTreeMap<(FragmentId, i32), PreparedTypedConnectorScan>,
 }
 
 impl ScanExecutionBindings {
-    pub(crate) fn for_sealed_plan(
-        sealed_plan: novarocks_sql::planning::query_execution::SealedPreparationPlan,
-    ) -> Self {
-        Self {
-            sealed_plan: Some(sealed_plan),
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn sealed_plan(
-        &self,
-    ) -> Option<&novarocks_sql::planning::query_execution::SealedPreparationPlan> {
-        self.sealed_plan.as_ref()
-    }
-
     pub(crate) fn insert_binding(&mut self, binding: ResolvedScanBinding) -> Result<(), String> {
         if self.by_node_id.contains_key(&binding.node_id) {
             return Err(format!(
@@ -425,12 +427,6 @@ impl ScanExecutionBindings {
                 "duplicate typed connector scan fragment_id={fragment_id} node_id={node_id}"
             ));
         }
-        let catalog = scan.prepared.table_scan.table().catalog();
-        if catalog != scan.catalog_properties.handle() {
-            return Err(format!(
-                "typed connector scan fragment_id={fragment_id} node_id={node_id} does not match its frozen catalog materialization input"
-            ));
-        }
         if scan.prepared.table_scan.plan_node_id() != node_id {
             return Err(format!(
                 "typed connector scan fragment_id={fragment_id} node_id={node_id} carries plan node {}",
@@ -469,18 +465,6 @@ impl ScanExecutionBindings {
             .iter()
             .map(|(&(fragment_id, node_id), scan)| (fragment_id, node_id, scan))
     }
-
-    /// Actual typed Connector negotiation proofs for final immutable query
-    /// description freezing. No caller reconstructs residual or projection
-    /// responsibility from the encoded scan.
-    pub(crate) fn negotiation_receipts(
-        &self,
-    ) -> impl Iterator<Item = &novarocks_query_application::preparation::NegotiatedScanReceipt>
-    {
-        self.typed_scans
-            .values()
-            .map(|scan| &scan.prepared.negotiation_receipt)
-    }
 }
 
 #[cfg(test)]
@@ -495,6 +479,35 @@ mod tests {
         fn assert_send_sync<T: Send + Sync + ?Sized>() {}
 
         assert_send_sync::<dyn ScanBindingResolver>();
+    }
+
+    #[test]
+    fn prepared_execution_kind_does_not_retain_the_admission_lease() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut materialization = fixture_query_scan_materialization("ice");
+        let released = Arc::new(AtomicBool::new(false));
+        let released_on_drop = Arc::clone(&released);
+        materialization.planning_lease = ConnectorControlPlanningLease::new(
+            Arc::new(crate::connector::scan_model::planned_files_fixture_binding(
+                "ice",
+                HashMap::new(),
+                None,
+            )),
+            move || released_on_drop.store(true, Ordering::SeqCst),
+        );
+        let admission = ResolvedScanExecution::AdmittedConnectorRead(materialization);
+
+        let kind = admission.prepared_kind();
+        drop(admission);
+
+        assert_eq!(kind, PreparedScanExecutionKind::AdmittedConnectorRead);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "projecting native facts must not retain the transient Catalog lease"
+        );
     }
 
     fn planner_column(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
@@ -522,10 +535,6 @@ mod tests {
         }
     }
 
-    fn delta_execution() -> ResolvedScanExecution {
-        ResolvedScanExecution::AdmittedChangeWindow(fixture_query_scan_materialization("ice"))
-    }
-
     fn binding(
         node_id: i32,
         physical_columns: Vec<ResolvedScanColumn>,
@@ -533,7 +542,7 @@ mod tests {
     ) -> ResolvedScanBinding {
         ResolvedScanBinding {
             node_id,
-            execution: delta_execution(),
+            execution_kind: PreparedScanExecutionKind::SealedConnectorScan,
             physical_columns,
             required_reads,
         }

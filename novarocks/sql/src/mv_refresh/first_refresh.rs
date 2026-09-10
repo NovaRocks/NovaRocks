@@ -2600,7 +2600,7 @@ fn quote_sql_identifier(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
-    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::Arc;
 
     use super::*;
@@ -2696,9 +2696,7 @@ mod tests {
             None,
             "db".to_string(),
             crate::compiler::SessionOptimizerSettings::default(),
-            crate::compiler::SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(1).expect("non-zero"),
-            },
+            crate::compiler::SqlPlanningEnvironment::Distributed,
             &catalog,
             &functions,
             crate::compiler::noop_constant_evaluator(),
@@ -2728,9 +2726,7 @@ mod tests {
             None,
             "db".to_string(),
             crate::compiler::SessionOptimizerSettings::default(),
-            crate::compiler::SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(1).expect("non-zero"),
-            },
+            crate::compiler::SqlPlanningEnvironment::Distributed,
             &catalog,
             &functions,
             crate::compiler::noop_constant_evaluator(),
@@ -2764,9 +2760,7 @@ mod tests {
             &input,
             None,
             "db".to_string(),
-            crate::compiler::SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(1).expect("non-zero"),
-            },
+            crate::compiler::SqlPlanningEnvironment::Distributed,
             &catalog,
             &functions,
             crate::compiler::noop_constant_evaluator(),

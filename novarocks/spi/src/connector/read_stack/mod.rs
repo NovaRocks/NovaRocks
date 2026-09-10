@@ -64,9 +64,11 @@ pub use projection::{
     OrderedAssignments, ProjectionApplicationResult,
 };
 pub use runtime::{
-    ConnectorReadBinding, ConnectorReadChangeWindow, ConnectorReadColumnBinding,
-    ConnectorReadColumnHandle, ConnectorReadConstraint, ConnectorReadDynamicFilter,
-    ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
+    ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
+    ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
+    ConnectorReadAttemptRuntime, ConnectorReadBinding, ConnectorReadChangeWindow,
+    ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
+    ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
     ConnectorReadFrozenRewriteGroup, ConnectorReadLimitApplication, ConnectorReadMetadata,
     ConnectorReadPageSourceProvider, ConnectorReadProviderFactory, ConnectorReadRegistrationLease,
     ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationVersion,

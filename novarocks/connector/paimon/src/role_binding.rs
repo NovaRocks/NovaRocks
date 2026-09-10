@@ -34,10 +34,13 @@ use novarocks_spi::connector::read_stack::adapter::{
     ReadRuntimeAdapter,
 };
 use novarocks_spi::connector::read_stack::{
-    Assignment, ConnectorPageSource, ConnectorPageSourceProviderOptions, ConnectorReadChangeWindow,
-    ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadRelationKind,
-    ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
-    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadTableExecuteProcedure,
+    Assignment, ConnectorPageSource, ConnectorPageSourceProviderOptions,
+    ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
+    ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
+    ConnectorReadAttemptRuntime, ConnectorReadChangeWindow, ConnectorReadColumnHandle,
+    ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationVersion,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadSplit,
+    ConnectorReadSplitFacts, ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle,
     ConnectorReadTransactionHandle, ConnectorSession, ConnectorSplitBatch, Constraint,
     DynamicFilter, DynamicFilterSnapshot, SchemaTableName, SplitSourceProfile,
 };
@@ -78,7 +81,7 @@ use crate::domain::{
     PaimonBucketMode, PaimonColumn, PaimonReadTypes, PaimonReadView, PaimonSplit, PaimonTable,
 };
 use crate::io::PaimonHostFileIo;
-use crate::metadata::{PaimonFrozenRead, columns_from_schema};
+use crate::metadata::{PaimonFrozenRead, PaimonFrozenReadRecipe, columns_from_schema};
 use crate::page_source::PaimonPageSource;
 use crate::reader::PaimonReader;
 use crate::resources::PaimonRequestResources;
@@ -193,15 +196,15 @@ impl PaimonRequestCache {
 struct PaimonBoundTable {
     table: PaimonTable,
     view: PaimonReadView,
-    frozen: Option<Arc<PaimonFrozenRead>>,
+    recipe: Option<Arc<PaimonFrozenReadRecipe>>,
 }
 
 impl PaimonBoundTable {
-    fn frozen(value: Arc<PaimonFrozenRead>) -> Self {
+    fn prepared(value: Arc<PaimonFrozenRead>) -> Self {
         Self {
             table: value.table().clone(),
             view: value.view().clone(),
-            frozen: Some(value),
+            recipe: Some(Arc::new(value.recipe().clone())),
         }
     }
 
@@ -214,7 +217,7 @@ impl PaimonBoundTable {
         Ok(Self {
             table,
             view,
-            frozen: None,
+            recipe: None,
         })
     }
 }
@@ -227,6 +230,7 @@ struct PaimonReadRuntime {
     catalog: Option<PaimonFileSystemCatalog>,
     resources: Option<PaimonRequestResources>,
     request_cache: Option<Arc<PaimonRequestCache>>,
+    sealed_recipe: Option<Arc<PaimonFrozenReadRecipe>>,
 }
 
 impl PaimonReadRuntime {
@@ -242,6 +246,7 @@ impl PaimonReadRuntime {
             catalog: None,
             resources: None,
             request_cache: None,
+            sealed_recipe: None,
         }
     }
 
@@ -258,6 +263,25 @@ impl PaimonReadRuntime {
             catalog: Some(catalog),
             resources: Some(resources),
             request_cache: Some(cache),
+            sealed_recipe: None,
+        }
+    }
+
+    fn for_attempt(
+        &self,
+        catalog: PaimonFileSystemCatalog,
+        resources: PaimonRequestResources,
+        cache: Arc<PaimonRequestCache>,
+        recipe: Arc<PaimonFrozenReadRecipe>,
+    ) -> Self {
+        Self {
+            descriptor: self.descriptor.clone(),
+            catalog_handle: self.catalog_handle.clone(),
+            async_runtime: self.async_runtime.clone(),
+            catalog: Some(catalog),
+            resources: Some(resources),
+            request_cache: Some(cache),
+            sealed_recipe: Some(recipe),
         }
     }
 
@@ -280,6 +304,20 @@ impl PaimonReadRuntime {
                 catalog.prepare_read(&request_name).await
             })?
         })
+    }
+
+    fn rebind_read(
+        &self,
+        table: &PaimonBoundTable,
+    ) -> Result<Arc<PaimonFrozenRead>, ConnectorError> {
+        let recipe = table.recipe.as_ref().ok_or_else(request_binding_required)?;
+        if let Some(sealed) = &self.sealed_recipe {
+            sealed.ensure_same_scan(recipe)?;
+        }
+        self.catalog
+            .as_ref()
+            .ok_or_else(request_binding_required)?
+            .rebind_read(recipe)
     }
 }
 
@@ -316,7 +354,7 @@ impl ProviderReadMetadata for PaimonReadRuntime {
             ));
         }
         self.prepare_read(name)
-            .map(PaimonBoundTable::frozen)
+            .map(PaimonBoundTable::prepared)
             .map(Some)
     }
 
@@ -334,8 +372,8 @@ impl ProviderReadMetadata for PaimonReadRuntime {
         _session: &ConnectorSession,
         table: &Self::Table,
     ) -> Result<Vec<ProviderReadColumnBinding<Self::Column>>, ConnectorError> {
-        let frozen = table.frozen.as_ref().ok_or_else(request_binding_required)?;
-        Ok(frozen
+        let recipe = table.recipe.as_ref().ok_or_else(request_binding_required)?;
+        Ok(recipe
             .columns()
             .iter()
             .cloned()
@@ -434,7 +472,7 @@ impl ProviderReadSplitManager for PaimonReadRuntime {
         _dynamic_filter_columns: &BTreeSet<Self::Column>,
         _constraint: &Constraint<Self::Column>,
     ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
-        let frozen = Arc::clone(table.frozen.as_ref().ok_or_else(request_binding_required)?);
+        let frozen = self.rebind_read(table)?;
         let resources = self
             .resources
             .clone()
@@ -454,6 +492,7 @@ impl ProviderReadSplitManager for PaimonReadRuntime {
     }
 }
 
+#[derive(Clone)]
 struct PaimonRequestControlFactory {
     template: PaimonReadRuntime,
     properties: CatalogProperties,
@@ -478,18 +517,96 @@ impl PaimonRequestControlFactory {
             self.template.for_request(catalog, resources, cache),
         )))
     }
+
+    fn bind_attempt_runtime(
+        &self,
+        request: &ConnectorRequestContext,
+        recipe: Arc<PaimonFrozenReadRecipe>,
+    ) -> Result<ReadRuntimeAdapter<PaimonReadRuntime>, ConnectorError> {
+        active(request)?;
+        let resources = PaimonRequestResources::from_request(request)?;
+        let host_io = self
+            .access
+            .bind_file_io(&self.properties, &self.warehouse, request)?;
+        let catalog =
+            PaimonFileSystemCatalog::try_new(&self.warehouse, host_io, resources.clone())?;
+        let cache = request.request_scope_extension_or_insert_with(PaimonRequestCache::default);
+        Ok(ReadRuntimeAdapter::new(Arc::new(
+            self.template.for_attempt(catalog, resources, cache, recipe),
+        )))
+    }
+
+    fn control_for_adapter(
+        &self,
+        adapter: Arc<ReadRuntimeAdapter<PaimonReadRuntime>>,
+        sealed_recipe: Option<Arc<PaimonFrozenReadRecipe>>,
+    ) -> ConnectorReadRequestControl {
+        ConnectorReadRequestControl::provider_reacquire_attempt_access(
+            Arc::clone(&adapter)
+                as Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadMetadata>,
+            Arc::clone(&adapter)
+                as Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadSplitManager>,
+            Arc::new(PaimonAttemptAccessSealer {
+                factory: self.clone(),
+                adapter,
+                sealed_recipe,
+            }),
+        )
+    }
 }
 
 impl ConnectorReadRequestControlFactory for PaimonRequestControlFactory {
-    fn for_request(
+    fn for_planning(
         &self,
-        request: &ConnectorRequestContext,
+        request: &novarocks_spi::connector::ConnectorPlanningContext,
     ) -> Result<ConnectorReadRequestControl, ConnectorError> {
-        let adapter = self.bind_runtime(request)?;
-        Ok(ConnectorReadRequestControl::new(
-            Arc::new(adapter.clone()),
-            Arc::new(adapter),
-        ))
+        let adapter = Arc::new(self.bind_runtime(request.request())?);
+        Ok(self.control_for_adapter(adapter, None))
+    }
+}
+
+struct PaimonAttemptAccessSealer {
+    factory: PaimonRequestControlFactory,
+    adapter: Arc<ReadRuntimeAdapter<PaimonReadRuntime>>,
+    sealed_recipe: Option<Arc<PaimonFrozenReadRecipe>>,
+}
+
+impl ConnectorReadAttemptAccessSealer for PaimonAttemptAccessSealer {
+    fn seal(
+        &self,
+        frozen: &ConnectorReadTableHandle,
+        mint: ConnectorReadAttemptAccessMint,
+    ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError> {
+        let table = self.adapter.table(frozen)?;
+        let recipe = Arc::clone(table.recipe.as_ref().ok_or_else(request_binding_required)?);
+        if let Some(sealed) = &self.sealed_recipe {
+            sealed.ensure_same_scan(&recipe)?;
+        }
+        Ok(mint.seal(Arc::new(PaimonAttemptAccessReacquirer {
+            factory: self.factory.clone(),
+            recipe,
+        })))
+    }
+}
+
+struct PaimonAttemptAccessReacquirer {
+    factory: PaimonRequestControlFactory,
+    recipe: Arc<PaimonFrozenReadRecipe>,
+}
+
+impl ConnectorReadAttemptAccessReacquirer for PaimonAttemptAccessReacquirer {
+    fn for_attempt(
+        &self,
+        request: &novarocks_spi::connector::ConnectorAttemptContext,
+    ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
+        let adapter = Arc::new(
+            self.factory
+                .bind_attempt_runtime(request.request(), Arc::clone(&self.recipe))?,
+        );
+        let control = self
+            .factory
+            .control_for_adapter(adapter, Some(Arc::clone(&self.recipe)));
+        Ok(ConnectorReadAttemptRuntime::new(control.splits()))
     }
 }
 

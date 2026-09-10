@@ -188,10 +188,6 @@ fn bind_first_refresh_write_dataflow(
                         connector_context.clone(),
                     ),
                 );
-            let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-                .ok_or_else(|| {
-                "MV first-refresh write requires a non-empty admitted backend topology".to_string()
-            })?;
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
             let analyzed = analyze_mv_first_refresh_connector_write(
                 physical_sql,
@@ -199,9 +195,7 @@ fn bind_first_refresh_write_dataflow(
                     current_catalog: current_catalog.clone(),
                     current_database: current_database.clone(),
                     optimizer_settings: execution.optimizer_settings().clone(),
-                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed {
-                        backend_count,
-                    },
+                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
@@ -291,10 +285,6 @@ fn bind_first_refresh_write_dataflow(
                 ),
                 frozen_base_overlays,
             );
-            let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-                .ok_or_else(|| {
-                "MV first-refresh write requires a non-empty admitted backend topology".to_string()
-            })?;
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
             let analyzed =
                 analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
@@ -304,9 +294,7 @@ fn bind_first_refresh_write_dataflow(
                     current_catalog: current_catalog.clone(),
                     current_database: current_database.clone(),
                     optimizer_settings: execution.optimizer_settings().clone(),
-                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed {
-                        backend_count,
-                    },
+                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),

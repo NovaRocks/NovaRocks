@@ -586,7 +586,6 @@ pub(crate) struct PlannedCtasSourceQuery {
     source: novarocks_sql::planning::dml::DmlCtasSourcePlan,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
-    connector_target_parallelism: std::num::NonZeroUsize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -630,8 +629,6 @@ fn plan_query_for_ctas_source(
     let table_bindings = analyzer_provider.query_table_bindings();
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-        .ok_or_else(|| internal_failure("CTAS requires a frozen non-empty backend topology"))?;
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
@@ -642,7 +639,7 @@ fn plan_query_for_ctas_source(
             current_database: current_database.to_string(),
             optimizer_settings: execution.optimizer_settings().clone(),
         },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed { backend_count },
+        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
         &catalog_snapshot,
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
@@ -676,7 +673,6 @@ fn plan_query_for_ctas_source(
         source,
         table_bindings,
         optimizer_settings: execution.optimizer_settings().clone(),
-        connector_target_parallelism: backend_count,
     })
 }
 
@@ -721,7 +717,6 @@ fn prepare_planned_ctas_connector_write(
             planned
                 .optimizer_settings
                 .connector_static_predicate_pushdown_enabled(),
-            planned.connector_target_parallelism,
             None,
         )
         .with_typed_connector_control(
@@ -730,7 +725,7 @@ fn prepare_planned_ctas_connector_write(
         ),
     )?;
     Ok((
-        crate::query_execution::compiler::NativeFragmentEncodingInput::new(dataflow, prepared)
+        crate::query_execution::compiler::NativeFragmentEncodingInput::new(prepared)
             .with_sealed_write_targets(sealed),
         PendingCtasDistributedWrite {
             query_options,
@@ -1137,7 +1132,7 @@ struct PendingCtasDistributedWrite {
 /// The same facts once the native bundle has been bound to them. It is the
 /// exact input of the one distributed round this CTAS runs.
 struct BoundCtasDistributedWrite {
-    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
@@ -1867,18 +1862,12 @@ impl CtasEngine for DmlExecutionKernel {
             .map_err(|error| internal_failure(format!("CTAS native encoding lock: {error}")))?
             .take()
             .ok_or_else(|| internal_failure("CTAS native encoding input was already consumed"))?;
-        if !encoding.matches_native_attachment(&native_bundle) {
-            return Err(internal_failure(
-                "native fragment bundle does not match the sealed CTAS encoding input",
-            ));
-        }
-        let (_, prepared_fragments) = encoding.into_parts();
         *prepared
             .prepared
             .lock()
             .map_err(|error| internal_failure(format!("CTAS prepared write lock: {error}")))? =
             Some(BoundCtasDistributedWrite {
-                prepared: prepared_fragments,
+                encoding,
                 native_bundle,
                 query_options: pending.query_options,
                 session: pending.session,
@@ -1904,14 +1893,14 @@ impl CtasEngine for DmlExecutionKernel {
                     .take()
                     .ok_or_else(|| "CTAS prepared write was already consumed".to_string())?;
                 let BoundCtasDistributedWrite {
-                    prepared: fragments,
+                    encoding,
                     native_bundle,
                     query_options,
                     session,
                 } = bound;
                 let request =
                     crate::query_execution::contract::build_distributed_query_request_with_execution(
-                        fragments,
+                        encoding,
                         native_bundle,
                         query_options,
                         crate::query_execution::contract::DistributedQueryIntent::Write,

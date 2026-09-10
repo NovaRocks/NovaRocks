@@ -78,15 +78,20 @@ pub struct MvRewriteSelection {
     publication_id: Option<[u8; 16]>,
     definition_fingerprint: Option<[u8; 32]>,
     input_mapping: Vec<MvRewriteInputSelection>,
+    publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
+    publication_target: Option<crate::compiler::SqlMvRewritePublicationRelation>,
 }
 
 impl MvRewriteSelection {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn unverified(name: String) -> Self {
         Self {
             name,
             publication_id: None,
             definition_fingerprint: None,
             input_mapping: Vec::new(),
+            publication_inputs: Vec::new(),
+            publication_target: None,
         }
     }
 
@@ -95,6 +100,8 @@ impl MvRewriteSelection {
         publication_id: [u8; 16],
         definition_fingerprint: [u8; 32],
         input_mapping: Vec<(SqlScanOccurrence, usize)>,
+        publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
+        publication_target: crate::compiler::SqlMvRewritePublicationRelation,
     ) -> Self {
         Self {
             name,
@@ -109,6 +116,8 @@ impl MvRewriteSelection {
                     },
                 )
                 .collect(),
+            publication_inputs,
+            publication_target: Some(publication_target),
         }
     }
 
@@ -126,6 +135,16 @@ impl MvRewriteSelection {
 
     pub(crate) fn input_mapping(&self) -> &[MvRewriteInputSelection] {
         &self.input_mapping
+    }
+
+    pub(crate) fn publication_inputs(&self) -> &[crate::compiler::SqlMvRewritePublicationRelation] {
+        &self.publication_inputs
+    }
+
+    pub(crate) fn publication_target(
+        &self,
+    ) -> Option<&crate::compiler::SqlMvRewritePublicationRelation> {
+        self.publication_target.as_ref()
     }
 }
 

@@ -36,8 +36,8 @@ use crate::connector::read_stack::{
     SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
-    CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
-    ConnectorRequestContext,
+    CatalogHandle, ConnectorAttemptContext, ConnectorError, ConnectorInstanceDescriptor,
+    ConnectorPinnedFileSet, ConnectorPlanningContext, ConnectorRequestContext,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -534,6 +534,9 @@ pub enum ConnectorReadTableExecuteProcedure {
 /// Coordinator-facing read services.  They are transport neutral and never
 /// expose the concrete payload of a returned handle.
 pub trait ConnectorReadMetadata: Send + Sync {
+    /// Exact installed read generation served by this metadata view.
+    fn binding(&self) -> &ConnectorReadBinding;
+
     /// Freeze an opaque table with the transaction of its exact installed
     /// provider binding.  Roles can retain the resulting relation but cannot
     /// inspect or manufacture its transaction payload.
@@ -614,14 +617,66 @@ pub trait ConnectorReadMetadata: Send + Sync {
 pub struct ConnectorReadRequestControl {
     metadata: Arc<dyn ConnectorReadMetadata>,
     splits: Arc<dyn ConnectorReadSplitManager>,
+    binding: ConnectorReadBinding,
+    attempt_access: ConnectorReadAttemptAccessMode,
+}
+
+#[derive(Clone)]
+enum ConnectorReadAttemptAccessMode {
+    Unsupported,
+    Static(ConnectorReadBinding),
+    Provider(Arc<dyn ConnectorReadAttemptAccessSealer>),
 }
 
 impl ConnectorReadRequestControl {
-    pub fn new(
+    /// Construct a request view that explicitly rejects attempt replacement.
+    pub fn unsupported_attempt_access(
         metadata: Arc<dyn ConnectorReadMetadata>,
         splits: Arc<dyn ConnectorReadSplitManager>,
     ) -> Self {
-        Self { metadata, splits }
+        let binding = metadata.binding().clone();
+        Self {
+            metadata,
+            splits,
+            binding,
+            attempt_access: ConnectorReadAttemptAccessMode::Unsupported,
+        }
+    }
+
+    /// Construct a request view whose installed metadata and split services are
+    /// sufficient for every attempt. This is an explicit provider contract;
+    /// absence of a request factory does not imply static access.
+    pub fn static_attempt_access(
+        metadata: Arc<dyn ConnectorReadMetadata>,
+        splits: Arc<dyn ConnectorReadSplitManager>,
+        binding: ConnectorReadBinding,
+    ) -> Self {
+        Self {
+            metadata,
+            splits,
+            binding: binding.clone(),
+            attempt_access: ConnectorReadAttemptAccessMode::Static(binding),
+        }
+    }
+
+    /// Construct a request view whose provider validates the final handle and
+    /// reacquires the next attempt's request-scoped access.
+    pub fn provider_reacquire_attempt_access(
+        metadata: Arc<dyn ConnectorReadMetadata>,
+        splits: Arc<dyn ConnectorReadSplitManager>,
+        sealer: Arc<dyn ConnectorReadAttemptAccessSealer>,
+    ) -> Self {
+        let binding = metadata.binding().clone();
+        Self {
+            metadata,
+            splits,
+            binding,
+            attempt_access: ConnectorReadAttemptAccessMode::Provider(sealer),
+        }
+    }
+
+    pub const fn binding(&self) -> &ConnectorReadBinding {
+        &self.binding
     }
 
     pub fn metadata(&self) -> Arc<dyn ConnectorReadMetadata> {
@@ -631,15 +686,210 @@ impl ConnectorReadRequestControl {
     pub fn splits(&self) -> Arc<dyn ConnectorReadSplitManager> {
         Arc::clone(&self.splits)
     }
+
+    /// Seal the final, already-negotiated handle into a provider-owned
+    /// per-attempt access source. Providers without request-vended access use
+    /// an exact static rebind to these same generation services.
+    pub fn seal_attempt_access(
+        &self,
+        frozen: &ConnectorReadTableHandle,
+    ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError> {
+        if self.metadata.binding() != &self.binding
+            || self.splits.binding() != &self.binding
+            || frozen.binding() != &self.binding
+        {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "Connector read attempt access received capabilities from different bindings",
+            ));
+        }
+        match &self.attempt_access {
+            ConnectorReadAttemptAccessMode::Provider(sealer) => {
+                let seal = Arc::new(());
+                let source = sealer.seal(
+                    frozen,
+                    ConnectorReadAttemptAccessMint {
+                        frozen: frozen.clone(),
+                        seal: Arc::clone(&seal),
+                    },
+                )?;
+                if !Arc::ptr_eq(&seal, &source.seal) {
+                    return Err(ConnectorError::new(
+                        crate::connector::ConnectorErrorKind::InvalidRequest,
+                        "Connector read attempt sealer returned a source from another seal",
+                    ));
+                }
+                Ok(source)
+            }
+            ConnectorReadAttemptAccessMode::Static(binding) => {
+                Ok(ConnectorReadAttemptAccessSource::new_private(
+                    ConnectorReadAttemptAccessMint {
+                        frozen: frozen.clone(),
+                        seal: Arc::new(()),
+                    },
+                    Arc::new(StaticConnectorReadAttemptAccess {
+                        splits: Arc::clone(&self.splits),
+                        binding: binding.clone(),
+                    }),
+                ))
+            }
+            ConnectorReadAttemptAccessMode::Unsupported => Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "Connector read generation does not support per-attempt access reacquisition",
+            )),
+        }
+    }
+}
+
+/// Provider-owned factory sealed against one exact, final read handle.
+pub trait ConnectorReadAttemptAccessSealer: Send + Sync {
+    fn seal(
+        &self,
+        frozen: &ConnectorReadTableHandle,
+        mint: ConnectorReadAttemptAccessMint,
+    ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError>;
+}
+
+/// Authority issued only after a request control verifies one exact final
+/// handle and installed generation. The provider may attach its private
+/// reacquirer but cannot replace the frozen handle.
+pub struct ConnectorReadAttemptAccessMint {
+    frozen: ConnectorReadTableHandle,
+    seal: Arc<()>,
+}
+
+impl ConnectorReadAttemptAccessMint {
+    pub fn seal(
+        self,
+        reacquirer: Arc<dyn ConnectorReadAttemptAccessReacquirer>,
+    ) -> ConnectorReadAttemptAccessSource {
+        ConnectorReadAttemptAccessSource::new_private(self, reacquirer)
+    }
+}
+
+/// Reacquires only request-scoped access for one immutable scan. It cannot
+/// renegotiate projection, predicate, limit, snapshot, or relation identity.
+pub trait ConnectorReadAttemptAccessReacquirer: Send + Sync {
+    fn for_attempt(
+        &self,
+        request: &ConnectorAttemptContext,
+    ) -> Result<ConnectorReadAttemptRuntime, ConnectorError>;
+}
+
+/// Attempt-local execution services for one already-negotiated scan.
+///
+/// Metadata is deliberately absent: reacquisition can refresh authorization
+/// and build split sources for the frozen handle, but it cannot call planning
+/// operations or return a replacement handle.
+#[derive(Clone)]
+pub struct ConnectorReadAttemptRuntime {
+    splits: Arc<dyn ConnectorReadSplitManager>,
+    binding: ConnectorReadBinding,
+}
+
+impl ConnectorReadAttemptRuntime {
+    pub fn new(splits: Arc<dyn ConnectorReadSplitManager>) -> Self {
+        let binding = splits.binding().clone();
+        Self { splits, binding }
+    }
+
+    pub const fn binding(&self) -> &ConnectorReadBinding {
+        &self.binding
+    }
+
+    pub fn splits(&self) -> Arc<dyn ConnectorReadSplitManager> {
+        Arc::clone(&self.splits)
+    }
+}
+
+/// Opaque process-local access source paired with the exact final handle it
+/// was sealed from. No credential or provider payload is exposed.
+#[derive(Clone)]
+pub struct ConnectorReadAttemptAccessSource {
+    frozen: ConnectorReadTableHandle,
+    seal: Arc<()>,
+    reacquirer: Arc<dyn ConnectorReadAttemptAccessReacquirer>,
+}
+
+impl ConnectorReadAttemptAccessSource {
+    fn new_private(
+        mint: ConnectorReadAttemptAccessMint,
+        reacquirer: Arc<dyn ConnectorReadAttemptAccessReacquirer>,
+    ) -> Self {
+        Self {
+            frozen: mint.frozen,
+            seal: mint.seal,
+            reacquirer,
+        }
+    }
+
+    pub const fn frozen(&self) -> &ConnectorReadTableHandle {
+        &self.frozen
+    }
+
+    pub(crate) fn for_attempt(
+        &self,
+        request: &ConnectorAttemptContext,
+    ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
+        check_attempt_request_active(request)?;
+        let runtime = self.reacquirer.for_attempt(request)?;
+        if runtime.binding() != self.frozen.binding()
+            || runtime.splits.binding() != self.frozen.binding()
+        {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "Connector read attempt reacquirer returned another binding",
+            ));
+        }
+        Ok(runtime)
+    }
+}
+
+struct StaticConnectorReadAttemptAccess {
+    splits: Arc<dyn ConnectorReadSplitManager>,
+    binding: ConnectorReadBinding,
+}
+
+impl ConnectorReadAttemptAccessReacquirer for StaticConnectorReadAttemptAccess {
+    fn for_attempt(
+        &self,
+        request: &ConnectorAttemptContext,
+    ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
+        check_attempt_request_active(request)?;
+        if self.splits.binding() != &self.binding {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "Static Connector attempt access changed its installed binding",
+            ));
+        }
+        Ok(ConnectorReadAttemptRuntime::new(Arc::clone(&self.splits)))
+    }
+}
+
+fn check_attempt_request_active(request: &ConnectorAttemptContext) -> Result<(), ConnectorError> {
+    let request = request.request();
+    if request.cancellation().is_cancelled() {
+        return Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Cancelled,
+            "Connector read attempt access was cancelled",
+        ));
+    }
+    if std::time::Instant::now() >= request.deadline() {
+        return Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::DeadlineExceeded,
+            "Connector read attempt access deadline elapsed",
+        ));
+    }
+    Ok(())
 }
 
 /// Connector-owned factory for a request-bound coordinator read view. The
 /// factory is retained by the exact installed control; a role can request a
 /// view but cannot inspect or construct provider payloads.
 pub trait ConnectorReadRequestControlFactory: Send + Sync {
-    fn for_request(
+    fn for_planning(
         &self,
-        request: &ConnectorRequestContext,
+        request: &ConnectorPlanningContext,
     ) -> Result<ConnectorReadRequestControl, ConnectorError>;
 }
 
@@ -668,6 +918,9 @@ pub trait ConnectorReadSplitSource: Send {
 }
 
 pub trait ConnectorReadSplitManager: Send + Sync {
+    /// Exact installed read generation served by this split manager.
+    fn binding(&self) -> &ConnectorReadBinding;
+
     fn get_splits(
         &self,
         session: &ConnectorSession,

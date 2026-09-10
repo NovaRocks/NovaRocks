@@ -128,6 +128,7 @@ pub struct PreparedFragmentSet {
     // The SQL-owned sealed facts are shared with DistributedPlan. This carrier
     // cannot mutate or reconstruct the query-global graph.
     runtime_filter_facts: SqlPreparedRuntimeFilterFacts,
+    native_connector_scans: super::native_encoding_view::FrozenNativeConnectorScans,
 }
 
 impl PreparedFragmentSet {
@@ -139,6 +140,7 @@ impl PreparedFragmentSet {
         edges: Vec<FragmentEdge>,
         runtime_filter_facts: SqlPreparedRuntimeFilterFacts,
         write_root_targets: Option<Vec<novarocks_spi::connector::write_stack::WriteTargetOrdinal>>,
+        native_connector_scans: super::native_encoding_view::FrozenNativeConnectorScans,
     ) -> Self {
         Self {
             by_fragment,
@@ -150,6 +152,7 @@ impl PreparedFragmentSet {
                 write_root_targets,
             },
             runtime_filter_facts,
+            native_connector_scans,
         }
     }
 
@@ -181,6 +184,12 @@ impl PreparedFragmentSet {
         &self,
     ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
         self.projection.write_root_targets.as_deref()
+    }
+
+    pub(crate) const fn native_connector_scans(
+        &self,
+    ) -> &super::native_encoding_view::FrozenNativeConnectorScans {
+        &self.native_connector_scans
     }
 }
 

@@ -79,7 +79,18 @@ pub struct RuntimeFilterBindingAttachment {
 /// validated schedule. Core validates only artifact/topology membership.
 pub struct RuntimeFilterDeploymentAttachment {
     artifact_id: RuntimeFilterArtifactId,
+    execution_id: QueryExecutionId,
     contributions: BTreeMap<usize, novarocks_proto_models::novarocks::RuntimeFilterContribution>,
+}
+
+impl RuntimeFilterDeploymentAttachment {
+    fn matches(
+        &self,
+        artifact_id: RuntimeFilterArtifactId,
+        execution_id: QueryExecutionId,
+    ) -> bool {
+        self.artifact_id == artifact_id && self.execution_id == execution_id
+    }
 }
 
 impl RuntimeFilterBindingAttachment {
@@ -88,27 +99,52 @@ impl RuntimeFilterBindingAttachment {
     }
 }
 
-/// The owned prepared/native pair. It has no public constructor, `Clone`, or
-/// inverse `from_parts`, so artifacts from different sealed plans cannot be
-/// recombined by a role crate.
-pub struct PreparedDistributedQuery {
+/// Immutable inputs shared by every attempt of one logical execution.
+///
+/// Instantiation clones only the native attachment that receives attempt-local
+/// runtime-filter and schedule bindings. The prepared plan and Connector
+/// access scope retain one exact owner for the whole logical execution.
+pub(crate) struct PreparedDistributedAttemptTemplate {
     handoff_id: u64,
-    prepared: PreparedFragmentSet,
-    native_bundle: NativeFragmentAttachment,
+    prepared: Arc<PreparedFragmentSet>,
+    native_template: Arc<NativeFragmentAttachment>,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
-impl PreparedDistributedQuery {
+impl PreparedDistributedAttemptTemplate {
     pub(super) fn new(
         prepared: PreparedFragmentSet,
-        native_bundle: NativeFragmentAttachment,
+        native_template: NativeFragmentAttachment,
+        attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
     ) -> Self {
         Self {
             handoff_id: NEXT_HANDOFF_ID.fetch_add(1, Ordering::Relaxed),
-            prepared,
-            native_bundle,
+            prepared: Arc::new(prepared),
+            native_template: Arc::new(native_template),
+            attempt_access: Arc::new(attempt_access),
         }
     }
 
+    pub(crate) fn instantiate(&self) -> PreparedDistributedQuery {
+        PreparedDistributedQuery {
+            handoff_id: self.handoff_id,
+            prepared: Arc::clone(&self.prepared),
+            native_bundle: self.native_template.as_ref().clone(),
+            attempt_access: Arc::clone(&self.attempt_access),
+        }
+    }
+}
+
+/// One attempt's owned prepared/native typestate. It can only be instantiated
+/// from the logical execution's immutable attempt template.
+pub struct PreparedDistributedQuery {
+    handoff_id: u64,
+    prepared: Arc<PreparedFragmentSet>,
+    native_bundle: NativeFragmentAttachment,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
+}
+
+impl PreparedDistributedQuery {
     pub fn scheduling_view(&self) -> FragmentSchedulingView<'_> {
         FragmentSchedulingView {
             handoff_id: self.handoff_id,
@@ -143,6 +179,14 @@ impl PreparedDistributedQuery {
         self.prepared.scan_bindings().typed_scans()
     }
 
+    pub(crate) fn connector_attempt_access(
+        &self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<&crate::query_execution::preparation::ConnectorAttemptAccessEntry> {
+        self.attempt_access.get(fragment_id, node_id)
+    }
+
     /// Borrow-only identity and fragment-set view used by the Frontend RF
     /// encoder. SQL-private binding facts are intentionally added by the
     /// dedicated view in the next owner-local layer.
@@ -170,6 +214,7 @@ impl PreparedDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
             native_bundle,
+            attempt_access: self.attempt_access,
         })
     }
 }
@@ -178,8 +223,9 @@ impl PreparedDistributedQuery {
 /// distributed-query typestate and the only state that may bind a schedule.
 pub struct RuntimeFilterBoundPreparedDistributedQuery {
     handoff_id: u64,
-    prepared: PreparedFragmentSet,
+    prepared: Arc<PreparedFragmentSet>,
     native_bundle: NativeFragmentAttachment,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl RuntimeFilterBoundPreparedDistributedQuery {
@@ -197,6 +243,7 @@ impl RuntimeFilterBoundPreparedDistributedQuery {
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule,
+            attempt_access: self.attempt_access,
         })
     }
 }
@@ -291,9 +338,10 @@ impl<'a> RuntimeFilterBindingEncodingView<'a> {
 /// readiness and the connector install/ACK barrier must first complete.
 pub struct ScheduleBoundDistributedQuery {
     handoff_id: u64,
-    prepared: PreparedFragmentSet,
+    prepared: Arc<PreparedFragmentSet>,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl ScheduleBoundDistributedQuery {
@@ -353,9 +401,12 @@ impl ScheduleBoundDistributedQuery {
         self,
         attachment: RuntimeFilterDeploymentAttachment,
     ) -> Result<RuntimeFilterDeploymentReadyDistributedQuery, DistributedQueryError> {
-        if attachment.artifact_id != RuntimeFilterArtifactId(self.schedule.handoff_id) {
+        if !attachment.matches(
+            RuntimeFilterArtifactId(self.schedule.handoff_id),
+            self.schedule.execution_id,
+        ) {
             return Err(contract_error(
-                "runtime filter deployment attachment belongs to a different prepared query handoff",
+                "runtime filter deployment attachment belongs to a different attempt schedule",
             ));
         }
         Ok(RuntimeFilterDeploymentReadyDistributedQuery {
@@ -364,6 +415,7 @@ impl ScheduleBoundDistributedQuery {
             native_bundle: self.native_bundle,
             schedule: self.schedule,
             runtime_filter_contributions: attachment.contributions,
+            attempt_access: self.attempt_access,
         })
     }
 }
@@ -463,6 +515,7 @@ impl<'a> RuntimeFilterScheduledView<'a> {
         }
         Ok(RuntimeFilterDeploymentAttachment {
             artifact_id: self.artifact_id,
+            execution_id: self.execution_id,
             contributions: by_backend,
         })
     }
@@ -496,11 +549,12 @@ impl RuntimeFilterBackendTopologyEntry {
 /// transition entrypoint while owner-local deployment compilation migrates.
 pub struct RuntimeFilterDeploymentReadyDistributedQuery {
     handoff_id: u64,
-    prepared: PreparedFragmentSet,
+    prepared: Arc<PreparedFragmentSet>,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
     runtime_filter_contributions:
         BTreeMap<usize, novarocks_proto_models::novarocks::RuntimeFilterContribution>,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl RuntimeFilterDeploymentReadyDistributedQuery {
@@ -523,7 +577,8 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
                 "task execution preparation execution id does not match validated schedule",
             ));
         }
-        let catalog_lease = freeze_query_catalog_lease(&self.prepared, options.catalog_set())?;
+        let catalog_lease =
+            freeze_query_catalog_lease(&self.attempt_access, options.catalog_set())?;
         let options = options.with_catalog_set(catalog_lease.catalog_set().clone());
         Ok(TaskExecutionPreparedQuery {
             handoff_id: self.handoff_id,
@@ -533,6 +588,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             options,
             catalog_lease,
             runtime_filter_contributions: self.runtime_filter_contributions,
+            attempt_access: self.attempt_access,
         })
     }
 }
@@ -546,7 +602,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
 /// barrier between the two for it to sit behind.
 pub struct TaskExecutionPreparedQuery {
     handoff_id: u64,
-    prepared: PreparedFragmentSet,
+    prepared: Arc<PreparedFragmentSet>,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
     options: QueryInitOptions,
@@ -560,6 +616,7 @@ pub struct TaskExecutionPreparedQuery {
     )]
     catalog_lease: QueryCatalogLease,
     runtime_filter_contributions: BTreeMap<usize, novarocks::RuntimeFilterContribution>,
+    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl TaskExecutionPreparedQuery {
@@ -680,25 +737,15 @@ impl TaskExecutionSubmission {
 /// contributes its own catalog through the query's Init options, so only typed
 /// reads are merged here.
 fn freeze_query_catalog_lease(
-    prepared: &PreparedFragmentSet,
+    attempt_access: &crate::query_execution::preparation::ConnectorAttemptAccessPlan,
     existing: &CatalogSet,
 ) -> Result<QueryCatalogLease, DistributedQueryError> {
-    let typed_reads = prepared
-        .scan_bindings()
-        .typed_scans()
-        .map(|(_, _, scan)| (scan.catalog_properties.clone(), scan.planning_lease.clone()))
+    let typed_reads = attempt_access
+        .iter()
+        .map(|(_, _, access)| access.catalog_properties().clone())
         .collect::<Vec<_>>();
-    let catalog_set = merge_catalog_properties(
-        existing,
-        typed_reads.iter().map(|(properties, _)| properties.clone()),
-    )?;
-    Ok(QueryCatalogLease::new(
-        catalog_set,
-        typed_reads
-            .into_iter()
-            .map(|(_, planning_lease)| planning_lease)
-            .collect(),
-    ))
+    let catalog_set = merge_catalog_properties(existing, typed_reads)?;
+    Ok(QueryCatalogLease::new(catalog_set, Vec::new()))
 }
 
 fn merge_catalog_properties(
@@ -1586,7 +1633,10 @@ mod tests {
         ConnectorProviderId, ConnectorSplit,
     };
 
-    use super::{derive_fragment_instance_id, merge_catalog_properties};
+    use super::{
+        RuntimeFilterArtifactId, RuntimeFilterDeploymentAttachment, derive_fragment_instance_id,
+        merge_catalog_properties,
+    };
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
@@ -1722,6 +1772,27 @@ mod tests {
             derive_fragment_instance_id(second_attempt, 9, 3).expect("second fragment instance id"),
             first
         );
+    }
+
+    #[test]
+    fn runtime_filter_deployment_attachment_is_bound_to_one_attempt() {
+        let query_id = QueryId::new(41, 74);
+        let first_attempt =
+            QueryExecutionId::new(query_id, AttemptId::new(1).expect("valid attempt"))
+                .expect("valid execution id");
+        let second_attempt =
+            QueryExecutionId::new(query_id, AttemptId::new(2).expect("valid attempt"))
+                .expect("valid execution id");
+        let artifact_id = RuntimeFilterArtifactId(17);
+        let attachment = RuntimeFilterDeploymentAttachment {
+            artifact_id,
+            execution_id: first_attempt,
+            contributions: BTreeMap::new(),
+        };
+
+        assert!(attachment.matches(artifact_id, first_attempt));
+        assert!(!attachment.matches(artifact_id, second_attempt));
+        assert!(!attachment.matches(RuntimeFilterArtifactId(18), first_attempt));
     }
 
     #[test]

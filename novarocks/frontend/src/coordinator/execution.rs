@@ -343,6 +343,16 @@ enum RoundCredentialLeaseSource {
 }
 
 impl RoundCredentialLeaseSource {
+    fn connector_request_context(
+        &self,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> novarocks_spi::connector::ConnectorRequestContext {
+        match self {
+            Self::Frozen(_) => context,
+            Self::Reservation { reservation, .. } => reservation.connector_request_context(context),
+        }
+    }
+
     fn into_credential_leases(self) -> Result<QueryCredentialLeases, DistributedQueryError> {
         match self {
             Self::Frozen(leases) => Ok(leases),
@@ -677,12 +687,20 @@ impl FrontendDistributedQueryCoordinator {
             RuntimeFilterFeedbackState::new(execution_id, Default::default())
                 .expect("empty runtime filter feedback declaration is valid"),
         );
+        let connector_context = crate::connector::connector_request_context_for_deadline(
+            statement_deadline,
+            parts.cancellation.clone(),
+        )
+        .map_err(failed)?;
+        let connector_context =
+            credential_lease_source.connector_request_context(connector_context);
         let split_assignment_plan = prepare_round_split_assignment(
             &parts.artifacts,
             &schedule,
             self.task_update_retry_policy,
             Arc::clone(&feedback_state),
             self.connector_split_initial_dynamic_filter_wait_cap,
+            &connector_context,
         )?;
         // A source open may load manifest metadata under the request-local
         // resolver and collect one exact vended response. Seal that collector
@@ -1947,7 +1965,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
     ) -> Result<StatementResult, DistributedQueryError> {
-        let (first_request, first_completion, mut round_factory, reservation) =
+        let (first_request, first_completion, mut attempt_factory, reservation) =
             operation.into_parts();
         let reservation = match reservation {
             Some(reservation) => reservation,
@@ -1959,7 +1977,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         let first_execution_id = reservation.execution_id();
         let first_revision = first_request.topology().revision();
         let retry_deadline = statement_deadline_for_request(&first_request)?;
-        let first_retry_boundary = round_factory
+        let first_retry_boundary = attempt_factory
             .as_deref()
             .map(|factory| factory as &dyn PreReadyRetryBoundary);
         match self.execute_round(
@@ -1981,7 +1999,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                 if first_error.pre_ready_topology_outcome().is_none() {
                     return Err(first_error);
                 }
-                let Some(factory) = round_factory.as_deref_mut() else {
+                let Some(factory) = attempt_factory.as_deref_mut() else {
                     return Err(first_error);
                 };
                 let reason = pre_ready_topology_reason(
@@ -2007,13 +2025,13 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                         )
                     })?;
                 observe_waiting_for_backend(waiting_started_at.elapsed());
-                let replan_started_at = Instant::now();
+                let instantiation_started_at = Instant::now();
                 let replacement_reservation =
                     crate::query_execution::completion::QueryAttemptReservation::retry(
                         query_id, 2,
                     )?;
-                let replacement = factory.replan(fresh_topology, replacement_reservation);
-                observe_pre_ready_replan(replan_started_at.elapsed());
+                let replacement = factory.instantiate(fresh_topology, replacement_reservation);
+                observe_pre_ready_replan(instantiation_started_at.elapsed());
                 let replacement = replacement?;
                 let (
                     replacement_request,
@@ -2516,8 +2534,8 @@ mod tests {
         FinalTaskInfoRead, FragmentDispatcher, RootResultOutcome,
     };
     use crate::query_execution::completion::{
-        PreReadyRetryBoundary, PreparedDistributedQuery, PreparedDistributedRequestFactory,
-        PreparedDistributedRoundFactory, PreparedQueryCompletion,
+        PreReadyRetryBoundary, PreparedDistributedAttemptFactory, PreparedDistributedQuery,
+        PreparedDistributedRequestFactory, PreparedQueryCompletion,
         PreparedRetriableDistributedRequest,
     };
     use crate::query_execution::contract::{
@@ -2863,8 +2881,8 @@ mod tests {
             Arc<Mutex<Vec<crate::common::backend_topology::BackendTopologySnapshot>>>,
     }
 
-    impl PreparedDistributedRoundFactory for RecordingRetryFactory {
-        fn replan(
+    impl PreparedDistributedAttemptFactory for RecordingRetryFactory {
+        fn instantiate(
             &mut self,
             topology: crate::common::backend_topology::BackendTopologySnapshot,
             reservation: crate::query_execution::completion::QueryAttemptReservation,
@@ -2954,21 +2972,23 @@ mod tests {
             ScanPreparationOptions::single_backend_fixture(),
         )
         .expect("prepared result fixture");
-        let native = crate::query_execution::native_fragment::native_fragment_attachment_for_test(
-            [novarocks_proto_models::plan::PlanFragment {
-                fragment_id: 7,
-                // The task protocol refuses a fragment plan with no sink, so a
-                // fixture without one would fail at graph assembly and never
-                // reach the behaviour these tests are about.
-                sink: Some(novarocks_proto_models::plan::DataSink {
-                    kind: Some(novarocks_proto_models::plan::data_sink::Kind::Result(true)),
-                }),
-                ..Default::default()
-            }],
-            &BTreeSet::from([7]),
-            None,
-        )
-        .expect("native fragment fixture");
+        let encoding =
+            crate::query_execution::post_compile::NativeFragmentEncodingInput::new(prepared);
+        let native = encoding
+            .native_attachment_for_test(
+                [novarocks_proto_models::plan::PlanFragment {
+                    fragment_id: 7,
+                    // The task protocol refuses a fragment plan with no sink, so a
+                    // fixture without one would fail at graph assembly and never
+                    // reach the behaviour these tests are about.
+                    sink: Some(novarocks_proto_models::plan::DataSink {
+                        kind: Some(novarocks_proto_models::plan::data_sink::Kind::Result(true)),
+                    }),
+                    ..Default::default()
+                }],
+                &BTreeSet::from([7]),
+            )
+            .expect("native fragment fixture");
         let cancellation = QueryCancellationSource::new();
         let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
             ClusterRole::Fe,
@@ -2981,7 +3001,7 @@ mod tests {
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
         );
         build_distributed_query_request_with_execution(
-            prepared,
+            encoding,
             native,
             None,
             DistributedQueryIntent::Result,
@@ -3110,7 +3130,7 @@ mod tests {
         assert!(
             cancelled.is_none(),
             "a cancelled attempt is never reclassified into topology-retry evidence, \
-             because a replan must never re-run a statement the client killed"
+             because replacement must never re-run a statement the client killed"
         );
         assert!(
             elapsed < OBSERVATION / 4,
@@ -3120,7 +3140,7 @@ mod tests {
     }
 
     #[test]
-    fn a_replaced_captured_process_replans_the_round_once_before_establish() {
+    fn a_replaced_captured_process_instantiates_one_attempt_before_establish() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3162,8 +3182,8 @@ mod tests {
                 Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
             );
         // The membership owner replaces the captured process. Published before
-        // the round starts because that is the only ordering a test can pin;
-        // what matters is that the replan rests on this fact rather than on a
+        // the attempt starts because that is the only ordering a test can pin;
+        // what matters is that replacement rests on this fact rather than on a
         // transport's own report of it.
         topology
             .record_announce(replacement.clone(), BackendReportedState::Running)
@@ -3177,7 +3197,7 @@ mod tests {
             fresh_result_request(first_snapshot.clone()).expect("first request"),
             PreparedQueryCompletion::result(),
         )
-        .with_round_factory(Box::new(RecordingRetryFactory {
+        .with_attempt_factory(Box::new(RecordingRetryFactory {
             permits: Arc::clone(&permits),
             control_ready_closures: Arc::clone(&control_ready_closures),
             stage_or_start_closures: Arc::clone(&stage_or_start_closures),
@@ -3186,10 +3206,10 @@ mod tests {
 
         let error = coordinator
             .execute_prepared(operation)
-            .expect_err("the replanned round has no backend to reach");
-        // The second round runs on the task substrate against an endpoint
+            .expect_err("the replacement attempt has no backend to reach");
+        // The replacement attempt runs on the task substrate against an endpoint
         // nothing listens on, so it ends at its own deadline. What this test
-        // is about happened before that: one permit, one replan, onto the
+        // is about happened before that: one permit, one replacement, onto the
         // process the membership owner named.
         assert!(
             error.message().contains("query timed out after"),
@@ -3198,7 +3218,7 @@ mod tests {
         );
         assert_eq!(permits.load(Ordering::SeqCst), 1);
         // Neither gate may close: no query context was ever established, so
-        // the window in which a replan is still legal never ended.
+        // the window in which a replacement is still legal never ended.
         assert_eq!(control_ready_closures.load(Ordering::SeqCst), 0);
         assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 0);
         let replanned = replanned_topologies.lock().expect("replanned topologies");
@@ -3343,7 +3363,7 @@ mod tests {
             fresh_result_request(snapshot).expect("first request"),
             PreparedQueryCompletion::result(),
         )
-        .with_round_factory(Box::new(RecordingRetryFactory {
+        .with_attempt_factory(Box::new(RecordingRetryFactory {
             permits: Arc::new(AtomicUsize::new(0)),
             control_ready_closures: Arc::clone(&control_ready_closures),
             stage_or_start_closures: Arc::clone(&stage_or_start_closures),
@@ -4237,6 +4257,7 @@ fn prepare_round_split_assignment(
     retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
     feedback: Arc<RuntimeFilterFeedbackState>,
     initial_dynamic_filter_wait_cap: Duration,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Option<RoundSplitAssignmentPlan>, DistributedQueryError> {
     let scan_nodes = artifacts
         .typed_scans()
@@ -4247,14 +4268,28 @@ fn prepare_round_split_assignment(
     }
     let session = crate::query_execution::compiler::typed_connector_session().map_err(failed)?;
     let mut sources = Vec::with_capacity(scan_nodes.len());
-    for (_, plan_node_id, scan) in artifacts.typed_scans() {
+    for (fragment_id, plan_node_id, scan) in artifacts.typed_scans() {
         let table_scan = &scan.prepared.table_scan;
-        let source = scan
-            .prepared
-            .split_manager
+        let access = artifacts
+            .connector_attempt_access(fragment_id, plan_node_id)
+            .ok_or_else(|| {
+                failed(format!(
+                    "typed connector scan fragment_id={fragment_id} node_id={plan_node_id} has no attempt access"
+                ))
+            })?;
+        let attempt_context =
+            novarocks_spi::connector::ConnectorAttemptContext::from_admitted_request(
+                connector_context.clone(),
+            );
+        let capabilities = access
+            .access()
+            .for_attempt(&attempt_context, access.planning_lease())
+            .map_err(|error| failed(error.to_string()))?;
+        let source = capabilities
+            .splits()
             .get_splits(
                 &session,
-                table_scan.table().relation().table(),
+                capabilities.frozen(),
                 table_scan.assignments(),
                 &table_scan.dynamic_filter_columns(),
                 &scan.prepared.constraint,
@@ -4267,7 +4302,7 @@ fn prepare_round_split_assignment(
         sources.push(RoundSplitSource {
             plan_node_id,
             source,
-            encoder: Arc::clone(&scan.prepared.encoder),
+            encoder: capabilities.encoder(),
             feedback: Arc::clone(&feedback),
             feedback_bindings: feedback_bindings(table_scan),
             initial_wait_deadline: None,

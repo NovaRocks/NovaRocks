@@ -127,10 +127,24 @@ impl QueryAttemptReservation {
     }
 }
 
-/// Frontend-owned factory for a replacement *whole* distributed round.  It
-/// receives a fresh topology snapshot and must return newly planned request
-/// artifacts and their matching completion formatter; no existing fragment,
-/// split, writer, RF, schedule, manifest, or profile artifact may be reused.
+/// Frontend-owned factory for a replacement *whole* distributed round. It
+/// receives a fresh topology snapshot and must return request artifacts and a
+/// matching completion formatter that belong to that attempt alone.
+///
+/// The rule this replaces said no existing fragment, split, writer, RF,
+/// schedule, manifest, or profile artifact may be reused. That was written
+/// when the only way to get a second round was to plan one from scratch, and
+/// it conflated two different things. What must not be reused is anything an
+/// attempt *owns*: no fragment instance, split source, writer, RF artifact,
+/// schedule, manifest or profile may cross from a spent attempt into a fresh
+/// one, and no credential or lease may either.
+///
+/// The sealed *description* is the opposite case. It is semantic input to
+/// every attempt of one logical execution, it names no backend and holds no
+/// capability, and re-deriving it per attempt is how two rounds of one
+/// statement came to disagree about plan shape whenever the statistics under
+/// them moved. A replacement round therefore rebinds the same sealed plan and
+/// re-derives only what the new attempt owns.
 pub(crate) trait PreReadyRetryBoundary {
     fn permit_pre_ready_retry(
         &self,
@@ -141,8 +155,8 @@ pub(crate) trait PreReadyRetryBoundary {
     fn close_after_stage_or_start(&self) {}
 }
 
-pub(crate) trait PreparedDistributedRoundFactory: Send + PreReadyRetryBoundary {
-    fn replan(
+pub(crate) trait PreparedDistributedAttemptFactory: Send + PreReadyRetryBoundary {
+    fn instantiate(
         &mut self,
         topology: crate::common::backend_topology::BackendTopologySnapshot,
         reservation: QueryAttemptReservation,
@@ -152,7 +166,7 @@ pub(crate) trait PreparedDistributedRoundFactory: Send + PreReadyRetryBoundary {
 /// Frontend-owned factory for a replacement whole distributed round whose
 /// caller retains the raw outcome (for example, a DML transaction runner
 /// still needs its exact commit/abort handles). It has the same no-reuse and
-/// one-way effect boundary as [`PreparedDistributedRoundFactory`], but it
+/// one-way effect boundary as [`PreparedDistributedAttemptFactory`], but it
 /// intentionally has no statement-result formatter.
 pub(crate) trait PreparedDistributedRequestFactory: Send + PreReadyRetryBoundary {
     fn replan(
@@ -246,7 +260,7 @@ impl PreparedImmediateQuery {
 pub struct PreparedDistributedQuery {
     request: crate::query_execution::contract::DistributedQueryRequest,
     completion: PreparedQueryCompletion,
-    round_factory: Option<Box<dyn PreparedDistributedRoundFactory>>,
+    attempt_factory: Option<Box<dyn PreparedDistributedAttemptFactory>>,
     reservation: Option<QueryAttemptReservation>,
 }
 
@@ -261,16 +275,16 @@ impl PreparedDistributedQuery {
         Self {
             request,
             completion,
-            round_factory: None,
+            attempt_factory: None,
             reservation: None,
         }
     }
 
-    pub(crate) fn with_round_factory(
+    pub(crate) fn with_attempt_factory(
         mut self,
-        round_factory: Box<dyn PreparedDistributedRoundFactory>,
+        attempt_factory: Box<dyn PreparedDistributedAttemptFactory>,
     ) -> Self {
-        self.round_factory = Some(round_factory);
+        self.attempt_factory = Some(attempt_factory);
         self
     }
 
@@ -284,13 +298,13 @@ impl PreparedDistributedQuery {
     ) -> (
         crate::query_execution::contract::DistributedQueryRequest,
         PreparedQueryCompletion,
-        Option<Box<dyn PreparedDistributedRoundFactory>>,
+        Option<Box<dyn PreparedDistributedAttemptFactory>>,
         Option<QueryAttemptReservation>,
     ) {
         (
             self.request,
             self.completion,
-            self.round_factory,
+            self.attempt_factory,
             self.reservation,
         )
     }
@@ -311,7 +325,7 @@ enum PreparedQueryFormatter {
 }
 
 struct PreparedProfileFormatter {
-    distributed_plan: novarocks_sql::plan_read::DistributedPlan,
+    distributed_plan: std::sync::Arc<novarocks_sql::plan_read::DistributedPlan>,
     planning_elapsed: std::time::Duration,
     execution_started_at: std::time::Instant,
 }
@@ -324,7 +338,7 @@ impl PreparedQueryCompletion {
     }
 
     pub(crate) fn profile(
-        distributed_plan: novarocks_sql::plan_read::DistributedPlan,
+        distributed_plan: std::sync::Arc<novarocks_sql::plan_read::DistributedPlan>,
         planning_elapsed: std::time::Duration,
         execution_started_at: std::time::Instant,
     ) -> Self {

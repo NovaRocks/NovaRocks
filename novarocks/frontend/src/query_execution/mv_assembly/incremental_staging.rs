@@ -348,10 +348,6 @@ fn bind_incremental_write_dataflow(
                 ),
                 base_overlays,
             );
-            let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-                .ok_or_else(|| {
-                "IMV incremental refresh requires a non-empty admitted backend topology".to_string()
-            })?;
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
             let write_mode = match mode {
                 MvIncrementalWriteMode::FastAppend => {
@@ -369,9 +365,7 @@ fn bind_incremental_write_dataflow(
                     routes: sealed_change_stream_routes,
                     current_catalog: None,
                     current_database: refresh_rewrite.current_database.clone(),
-                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed {
-                        backend_count,
-                    },
+                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
@@ -399,7 +393,6 @@ fn bind_incremental_write_dataflow(
             )?;
             session_native_assembly(
                 query_kernel,
-                execution,
                 sealed,
                 target_bindings.as_ref(),
                 connector_context,
@@ -445,11 +438,6 @@ fn bind_incremental_write_dataflow(
                 ),
                 base_overlays,
             );
-            let backend_count = std::num::NonZeroUsize::new(execution.topology().targets().len())
-                .ok_or_else(|| {
-                "IMV join incremental refresh requires a non-empty admitted backend topology"
-                    .to_string()
-            })?;
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_join_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshAnalyzeContext {
@@ -461,9 +449,7 @@ fn bind_incremental_write_dataflow(
                     current_catalog: None,
                     current_database: refresh_rewrite.current_database.clone(),
                     optimizer_settings: execution.optimizer_settings().clone(),
-                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed {
-                        backend_count,
-                    },
+                    environment: novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
@@ -491,7 +477,6 @@ fn bind_incremental_write_dataflow(
             )?;
             session_native_assembly(
                 query_kernel,
-                execution,
                 sealed,
                 target_bindings.as_ref(),
                 connector_context,
@@ -510,17 +495,15 @@ fn bind_incremental_write_dataflow(
 /// nothing to re-check afterwards.
 fn session_native_assembly(
     query_kernel: &QueryPreparationKernel,
-    execution: &QueryExecutionContext,
     sealed: novarocks_sql::planning::dml::DmlChangeStreamPlan,
     target_bindings: &QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &Arc<ConnectorWriteSession>,
     sealed_write_targets: SealedWriteTargets,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
-    let planned = crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
+    let planned = crate::query_execution::compiler::prepare_dml_change_stream_write(
         query_kernel.connector_control().as_ref(),
         query_kernel.typed_connector_control(),
-        execution,
         sealed,
         target_bindings,
         connector_context,

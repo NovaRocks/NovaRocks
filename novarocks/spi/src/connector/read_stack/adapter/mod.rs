@@ -496,6 +496,10 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
 }
 
 impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
+    fn binding(&self) -> &ConnectorReadBinding {
+        &self.binding
+    }
+
     fn relation(
         &self,
         kind: ConnectorReadRelationKind,
@@ -645,6 +649,10 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
 }
 
 impl<P: ProviderReadSplitManager> ConnectorReadSplitManager for ReadRuntimeAdapter<P> {
+    fn binding(&self) -> &ConnectorReadBinding {
+        &self.binding
+    }
+
     fn get_splits(
         &self,
         session: &ConnectorSession,
@@ -961,7 +969,12 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
-    use crate::connector::read_stack::{ConnectorValue, PageSourceMetrics, SourcePage};
+    use crate::connector::read_stack::{
+        ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
+        ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
+        ConnectorReadAttemptRuntime, ConnectorReadRequestControl, ConnectorValue,
+        PageSourceMetrics, SourcePage,
+    };
     use crate::connector::{ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderId};
 
     #[derive(Clone, Debug)]
@@ -1016,6 +1029,101 @@ mod tests {
         }
 
         fn transaction(&self) -> Self::Transaction {}
+    }
+
+    impl ProviderReadMetadata for Probe {
+        fn get_table_handle(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            _version: ConnectorReadRelationVersion,
+            _reference: Option<&str>,
+        ) -> Result<Option<Self::Table>, ConnectorError> {
+            Ok(Some(Table))
+        }
+
+        fn get_pinned_file_set_handle(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            _pinned: &ConnectorPinnedFileSet,
+        ) -> Result<Option<Self::Table>, ConnectorError> {
+            Ok(Some(Table))
+        }
+
+        fn get_column_bindings(
+            &self,
+            _session: &ConnectorSession,
+            _table: &Self::Table,
+        ) -> Result<Vec<ProviderReadColumnBinding<Self::Column>>, ConnectorError> {
+            Ok(Vec::new())
+        }
+
+        fn apply_filter(
+            &self,
+            _session: &ConnectorSession,
+            _table: &Self::Table,
+            _constraint: &Constraint<Self::Column>,
+        ) -> ProviderReadFilterResult<Self::Table, Self::Column> {
+            Ok(None)
+        }
+
+        fn apply_projection(
+            &self,
+            _session: &ConnectorSession,
+            _table: &Self::Table,
+            _assignments: &[Assignment<Self::Column>],
+        ) -> Result<Option<Self::Table>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn apply_limit(
+            &self,
+            _session: &ConnectorSession,
+            _table: &Self::Table,
+            _limit: u64,
+        ) -> Result<Option<ProviderReadLimitApplication<Self::Table>>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn get_system_table_plan(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+        ) -> Result<Option<ProviderReadSystemTablePlan<Self::Table>>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn get_change_window_plan(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            _window: ConnectorReadChangeWindow,
+        ) -> Result<Option<Self::Table>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn get_table_execute_plan(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            _procedure: crate::connector::read_stack::ConnectorReadTableExecuteProcedure,
+        ) -> Result<Option<Self::Table>, ConnectorError> {
+            Ok(None)
+        }
+    }
+
+    impl ProviderReadSplitManager for Probe {
+        fn get_splits(
+            &self,
+            _session: &ConnectorSession,
+            _table: &Self::Table,
+            _columns: &[Assignment<Self::Column>],
+            _dynamic_filter_columns: &BTreeSet<Self::Column>,
+            _constraint: &Constraint<Self::Column>,
+        ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
+            unimplemented!("attempt-access tests do not enumerate splits")
+        }
     }
 
     struct BadFilter {
@@ -1138,6 +1246,208 @@ mod tests {
                 .expect("transaction"),
             &()
         );
+    }
+
+    #[test]
+    fn static_attempt_access_requires_explicit_mode_and_exact_binding() {
+        struct Active;
+        impl crate::connector::ConnectorCancellation for Active {
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+        }
+
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let table = adapter.wrap_table(Table);
+        let unsupported = ConnectorReadRequestControl::unsupported_attempt_access(
+            Arc::new(adapter.clone()),
+            Arc::new(adapter.clone()),
+        );
+        let error = match unsupported.seal_attempt_access(&table) {
+            Ok(_) => panic!("absence of an explicit access mode must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+
+        let static_control = ConnectorReadRequestControl::static_attempt_access(
+            Arc::new(adapter.clone()),
+            Arc::new(adapter.clone()),
+            adapter.binding().clone(),
+        );
+        let source = static_control
+            .seal_attempt_access(&table)
+            .expect("static access is explicitly declared");
+        let attempt = crate::connector::ConnectorAttemptContext::from_admitted_request(
+            crate::connector::ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                Arc::new(Active),
+                crate::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                crate::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+            )
+            .expect("attempt request context"),
+        );
+        source
+            .for_attempt(&attempt)
+            .expect("same static binding rebinds for a new attempt");
+
+        let foreign_adapter = ReadRuntimeAdapter::new(Arc::new(Probe {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("probe").expect("provider ID"),
+                instance_id: ConnectorInstanceId::parse("other").expect("instance ID"),
+            },
+            catalog_handle: CatalogHandle::new(
+                ConnectorInstanceId::parse("other").expect("instance ID"),
+                crate::connector::CatalogVersion::from_bytes([4; 32]),
+            ),
+        }));
+        let error = match static_control.seal_attempt_access(&foreign_adapter.wrap_table(Table)) {
+            Ok(_) => panic!("a foreign generation cannot enter the static access source"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn provider_attempt_access_rejects_foreign_returned_generation() {
+        struct Active;
+        impl crate::connector::ConnectorCancellation for Active {
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+        }
+
+        struct ReturnRuntime(ConnectorReadAttemptRuntime);
+        impl ConnectorReadAttemptAccessReacquirer for ReturnRuntime {
+            fn for_attempt(
+                &self,
+                _request: &crate::connector::ConnectorAttemptContext,
+            ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        struct SealWith(Arc<dyn ConnectorReadAttemptAccessReacquirer>);
+        impl ConnectorReadAttemptAccessSealer for SealWith {
+            fn seal(
+                &self,
+                _frozen: &ConnectorReadTableHandle,
+                mint: ConnectorReadAttemptAccessMint,
+            ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError> {
+                Ok(mint.seal(Arc::clone(&self.0)))
+            }
+        }
+
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let foreign_adapter = ReadRuntimeAdapter::new(Arc::new(Probe {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("probe").expect("provider ID"),
+                instance_id: ConnectorInstanceId::parse("foreign").expect("instance ID"),
+            },
+            catalog_handle: CatalogHandle::new(
+                ConnectorInstanceId::parse("foreign").expect("instance ID"),
+                crate::connector::CatalogVersion::from_bytes([9; 32]),
+            ),
+        }));
+        let foreign = ConnectorReadAttemptRuntime::new(Arc::new(foreign_adapter.clone()));
+        let control = ConnectorReadRequestControl::provider_reacquire_attempt_access(
+            Arc::new(adapter.clone()),
+            Arc::new(adapter.clone()),
+            Arc::new(SealWith(Arc::new(ReturnRuntime(foreign)))),
+        );
+        let source = control
+            .seal_attempt_access(&adapter.wrap_table(Table))
+            .expect("same-generation handle seals");
+        let request = crate::connector::ConnectorAttemptContext::from_admitted_request(
+            crate::connector::ConnectorRequestContext::try_new(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                Arc::new(Active),
+                crate::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                crate::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+            )
+            .expect("attempt request context"),
+        );
+        let error = match source.for_attempt(&request) {
+            Ok(_) => panic!("reacquirer must not replace the sealed generation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn provider_sealer_cannot_replay_a_source_from_an_earlier_seal() {
+        struct ReturnRuntime(ConnectorReadAttemptRuntime);
+        impl ConnectorReadAttemptAccessReacquirer for ReturnRuntime {
+            fn for_attempt(
+                &self,
+                _request: &crate::connector::ConnectorAttemptContext,
+            ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        struct ReplaySource {
+            prior: Mutex<Option<ConnectorReadAttemptAccessSource>>,
+            reacquirer: Arc<dyn ConnectorReadAttemptAccessReacquirer>,
+        }
+        impl ConnectorReadAttemptAccessSealer for ReplaySource {
+            fn seal(
+                &self,
+                _frozen: &ConnectorReadTableHandle,
+                mint: ConnectorReadAttemptAccessMint,
+            ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError> {
+                let mut prior = self.prior.lock().expect("prior source lock");
+                if let Some(source) = prior.as_ref() {
+                    return Ok(source.clone());
+                }
+                let source = mint.seal(Arc::clone(&self.reacquirer));
+                *prior = Some(source.clone());
+                Ok(source)
+            }
+        }
+
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let returned = ConnectorReadAttemptRuntime::new(Arc::new(adapter.clone()));
+        let control = ConnectorReadRequestControl::provider_reacquire_attempt_access(
+            Arc::new(adapter.clone()),
+            Arc::new(adapter.clone()),
+            Arc::new(ReplaySource {
+                prior: Mutex::new(None),
+                reacquirer: Arc::new(ReturnRuntime(returned)),
+            }),
+        );
+        control
+            .seal_attempt_access(&adapter.wrap_table(Table))
+            .expect("first seal owns its mint");
+        let error = match control.seal_attempt_access(&adapter.wrap_table(Table)) {
+            Ok(_) => panic!("a prior source must not satisfy another seal"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn attempt_access_rejects_mixed_metadata_and_split_generations() {
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let foreign_adapter = ReadRuntimeAdapter::new(Arc::new(Probe {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("probe").expect("provider ID"),
+                instance_id: ConnectorInstanceId::parse("foreign").expect("instance ID"),
+            },
+            catalog_handle: CatalogHandle::new(
+                ConnectorInstanceId::parse("foreign").expect("instance ID"),
+                crate::connector::CatalogVersion::from_bytes([8; 32]),
+            ),
+        }));
+        let control = ConnectorReadRequestControl::static_attempt_access(
+            Arc::new(adapter.clone()),
+            Arc::new(foreign_adapter),
+            adapter.binding().clone(),
+        );
+        let error = match control.seal_attempt_access(&adapter.wrap_table(Table)) {
+            Ok(_) => panic!("mixed request services must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     #[test]

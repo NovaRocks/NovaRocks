@@ -275,8 +275,14 @@ impl QueryExecutionContext {
         topology: BackendTopologySnapshot,
         deadline: Option<Instant>,
         cancellation: QueryCancellationView,
-        optimizer_settings: SessionOptimizerSettings,
+        mut optimizer_settings: SessionOptimizerSettings,
     ) -> Self {
+        if optimizer_settings.cbo_broadcast_backend_count.is_none()
+            && optimizer_settings.effective_backend_count.is_none()
+            && !topology.targets().is_empty()
+        {
+            optimizer_settings.effective_backend_count = Some(topology.targets().len() as f64);
+        }
         Self {
             role,
             topology,
@@ -386,6 +392,33 @@ mod tests {
     use super::*;
     use crate::common::backend_topology::LiveBackendTarget;
     use crate::common::query_cancellation::QueryCancellationSource;
+
+    fn topology(revision: u64, backend_count: usize) -> BackendTopologySnapshot {
+        let targets = (0..backend_count)
+            .map(|backend_idx| {
+                LiveBackendTarget::new(
+                    backend_idx,
+                    BackendProcessDescriptor::new(
+                        BackendProcessId::new_v7(),
+                        QueryControlEndpoint::new(
+                            "127.0.0.1",
+                            9030_u16 + u16::try_from(backend_idx).expect("fixture backend index"),
+                        )
+                        .expect("valid loopback endpoint"),
+                        "test-deployment",
+                        "test-build",
+                        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                    )
+                    .expect("valid test descriptor"),
+                    novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
+                        [u8::try_from(backend_idx + 1).expect("fixture backend index"); 16],
+                    )
+                    .expect("nonzero epoch"),
+                )
+            })
+            .collect();
+        BackendTopologySnapshot::try_new(revision, targets).expect("valid topology")
+    }
 
     #[test]
     fn lake_publication_policy_requires_a_strict_gc_age_and_clamps_deadlines() {
@@ -498,6 +531,119 @@ mod tests {
         );
         assert_eq!(context.execution().deadline(), Some(deadline));
         assert!(context.execution().topology().targets().is_empty());
+    }
+
+    /// Load-bearing for the sealed-description rebind: a replacement round
+    /// reuses the first round's plan, so the count that shaped that plan must
+    /// not be re-derived from the new topology. `effective_backend_count` is
+    /// not a mere cost hint -- it gates BroadcastJoin feasibility, so a
+    /// re-derived value can flip a join to shuffle and invalidate the very
+    /// description the retry is rebinding.
+    #[test]
+    fn statement_admission_freezes_first_topology_count_across_later_rounds() {
+        let first = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db1".to_string(),
+            ClusterRole::Fe,
+            topology(7, 3),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings::default(),
+        ));
+        let statement = StatementAdmissionContext::new(
+            None,
+            "db1".to_string(),
+            first.execution().role(),
+            first.execution().deadline(),
+            first.execution().cancellation().clone(),
+            first.execution().optimizer_settings().clone(),
+        );
+        let replacement = statement.for_topology(topology(8, 1));
+
+        assert_eq!(
+            first
+                .execution()
+                .optimizer_settings()
+                .effective_backend_count,
+            Some(3.0)
+        );
+        assert_eq!(
+            replacement
+                .execution()
+                .optimizer_settings()
+                .effective_backend_count,
+            Some(3.0)
+        );
+        assert_eq!(
+            first.execution().optimizer_settings(),
+            replacement.execution().optimizer_settings()
+        );
+    }
+
+    #[test]
+    fn explicit_session_backend_count_wins_over_admitted_topology() {
+        let first = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db1".to_string(),
+            ClusterRole::Fe,
+            topology(7, 3),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings {
+                cbo_broadcast_backend_count: Some(11.0),
+                ..SessionOptimizerSettings::default()
+            },
+        ));
+        let statement = StatementAdmissionContext::new(
+            None,
+            "db1".to_string(),
+            first.execution().role(),
+            first.execution().deadline(),
+            first.execution().cancellation().clone(),
+            first.execution().optimizer_settings().clone(),
+        );
+        let replacement = statement.for_topology(topology(8, 1));
+
+        for context in [&first, &replacement] {
+            assert_eq!(
+                context
+                    .execution()
+                    .optimizer_settings()
+                    .cbo_broadcast_backend_count,
+                Some(11.0)
+            );
+            assert_eq!(
+                context
+                    .execution()
+                    .optimizer_settings()
+                    .effective_backend_count,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn existing_effective_backend_count_is_not_replaced_at_admission() {
+        let context = RequestContext::admit(RequestAdmission::new(
+            None,
+            "db1".to_string(),
+            ClusterRole::Fe,
+            topology(7, 3),
+            None,
+            QueryCancellationSource::new().view(),
+            SessionOptimizerSettings {
+                effective_backend_count: Some(5.0),
+                ..SessionOptimizerSettings::default()
+            },
+        ));
+
+        assert_eq!(
+            context
+                .execution()
+                .optimizer_settings()
+                .effective_backend_count,
+            Some(5.0)
+        );
     }
 
     #[test]

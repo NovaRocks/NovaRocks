@@ -22,12 +22,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorListNamespacesRequest, ConnectorNamespaceIdentity, ConnectorReadReferenceFacts,
-    ConnectorReadReferenceFactsRequest, ConnectorRequestContext, ConnectorRequestResources,
-    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
-    ConnectorResourceLedger, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution,
+    ConnectorAttemptContext, ConnectorCancellation, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorNamespaceIdentity,
+    ConnectorPlanningContext, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
+    ConnectorRequestContext, ConnectorRequestResources, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
 };
 
 /// Request-local cap for connector metadata and split preparation retained by
@@ -222,6 +222,41 @@ pub fn connector_request_context_for_query(
         query_options,
         Arc::new(QueryConnectorCancellation { cancellation }),
     )
+}
+
+/// Build the FE planning context used for metadata observation and Connector
+/// scan negotiation. This path has no execution-attempt credential collector.
+pub fn connector_planning_context_for_query(
+    query_options: Option<&QueryOptions>,
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
+) -> Result<ConnectorPlanningContext, String> {
+    ConnectorPlanningContext::try_from_request(connector_request_context_for_query(
+        query_options,
+        cancellation,
+    )?)
+    .map_err(|error| error.to_string())
+}
+
+/// Mark an already-admitted and attempt-decorated request for the SPI surface
+/// that can instantiate runtime access from frozen scan semantics.
+pub fn connector_attempt_context(request: ConnectorRequestContext) -> ConnectorAttemptContext {
+    ConnectorAttemptContext::from_admitted_request(request)
+}
+
+/// Freeze a Connector request context to the execution round's authoritative
+/// statement deadline and cancellation identity.
+pub fn connector_request_context_for_deadline(
+    deadline: std::time::Instant,
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
+) -> Result<ConnectorRequestContext, String> {
+    ConnectorRequestContext::try_new(
+        deadline,
+        Arc::new(QueryConnectorCancellation { cancellation }),
+        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map(install_frontend_connector_resources)
+    .map_err(|error| error.to_string())
 }
 
 /// Derive connector admission from the immutable query execution captured by

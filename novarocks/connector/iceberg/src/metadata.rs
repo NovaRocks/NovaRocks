@@ -30,15 +30,15 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 use novarocks_spi::connector::{
-    ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorMutationOperationId, ConnectorNamespaceIdentity,
-    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorProviderBindingKey, ConnectorReadNamedReference, ConnectorReadPurpose,
-    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
-    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorScalarType,
-    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorExactSemanticRevision,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorListNamespacesRequest,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorMutationOperationId,
+    ConnectorNamespaceIdentity, ConnectorNamespaceRequest, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorProviderBindingKey, ConnectorReadNamedReference,
+    ConnectorReadPurpose, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
+    ConnectorReadReferenceKind, ConnectorReadSelector, ConnectorReadSnapshotLogEntry,
+    ConnectorScalarType, ConnectorScalarValue, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts,
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
@@ -300,6 +300,42 @@ impl IcebergMetadata {
 impl ConnectorMetadata for IcebergMetadata {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.descriptor.instance_id
+    }
+
+    fn exact_semantic_revision(
+        &self,
+        table: &ConnectorTableHandle,
+        selector: ConnectorReadSelector,
+    ) -> Result<ConnectorExactSemanticRevision, ConnectorError> {
+        let payload = self.table_payload(table)?;
+        let table_info = payload.table_info.as_ref().ok_or_else(|| {
+            corrupt("Iceberg exact semantic revision is missing its frozen table descriptor")
+        })?;
+        let table_uuid = table_info.table_uuid.as_deref().ok_or_else(|| {
+            corrupt("Iceberg exact semantic revision is missing its physical UUID")
+        })?;
+        let object_id =
+            ConnectorTableObjectId::try_new(Bytes::copy_from_slice(table_uuid.as_bytes()))?;
+        let snapshot_id = match selector {
+            ConnectorReadSelector::Current => table_info.current_snapshot_id,
+            selector => {
+                let serialized = table_info.serialized_metadata.as_deref().ok_or_else(|| {
+                    corrupt("Iceberg exact semantic revision is missing its frozen table metadata")
+                })?;
+                let metadata: crate::iceberg::spec::TableMetadata =
+                    serde_json::from_str(serialized).map_err(|error| {
+                        corrupt(format!(
+                            "decode Iceberg exact semantic revision metadata: {error}"
+                        ))
+                    })?;
+                select_snapshot(&metadata, selector)?
+            }
+        };
+        ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            self.descriptor.provider_id.clone(),
+            &object_id,
+            snapshot_id,
+        )
     }
 
     fn list_namespaces(
@@ -2148,6 +2184,66 @@ mod plan_splits_pruning_tests {
             runtime,
         );
         (executor, warehouse, provider)
+    }
+
+    fn exact_revision_handle(
+        provider: &IcebergMetadata,
+        table_uuid: &str,
+        snapshot_id: i64,
+    ) -> ConnectorTableHandle {
+        let payload = IcebergTablePayload {
+            namespace: "db".to_string(),
+            table: "orders".to_string(),
+            table_info: Some(IcebergTableInfo {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+                table_uuid: Some(table_uuid.to_string()),
+                current_snapshot_id: Some(snapshot_id),
+                schema_id: 1,
+                location: "s3://warehouse/db/orders".to_string(),
+                schema: crate::scan_model::IcebergSchemaDef { fields: Vec::new() },
+                serialized_metadata: None,
+                serialized_metadata_rows: None,
+            }),
+            metadata_columns: Vec::new(),
+            metadata_table_type: None,
+            prepared_files: Vec::new(),
+            explicit_files: None,
+            row_mutation_frozen_source: false,
+            logical_type_columns: BTreeMap::new(),
+            hidden_columns: Vec::new(),
+        };
+        ConnectorTableHandle::try_new(
+            provider.descriptor.instance_id.clone(),
+            encode_payload(&payload, "test exact revision", 64 * 1024).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exact_semantic_revision_comes_from_the_same_frozen_handle() {
+        let (_runtime, _warehouse, provider) = provider();
+        let first = provider
+            .exact_semantic_revision(
+                &exact_revision_handle(&provider, "uuid-a", 101),
+                ConnectorReadSelector::Current,
+            )
+            .unwrap();
+        let newer = provider
+            .exact_semantic_revision(
+                &exact_revision_handle(&provider, "uuid-a", 102),
+                ConnectorReadSelector::Current,
+            )
+            .unwrap();
+        let replacement = provider
+            .exact_semantic_revision(
+                &exact_revision_handle(&provider, "uuid-b", 101),
+                ConnectorReadSelector::Current,
+            )
+            .unwrap();
+        assert_ne!(first, newer);
+        assert_ne!(first, replacement);
     }
 
     /// ORC rather than Parquet so split materialization does not try to read a

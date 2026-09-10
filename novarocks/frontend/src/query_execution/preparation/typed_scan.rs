@@ -33,14 +33,14 @@ use std::sync::Arc;
 
 use novarocks_query_application::observation::PreparationBudget;
 use novarocks_query_application::preparation::{NegotiatedScanReceipt, ScanNegotiationSession};
-use novarocks_spi::connector::ConnectorControlReadBinding;
 use novarocks_spi::connector::ConnectorPinnedFileSet;
 use novarocks_spi::connector::read_stack::{
     Assignment, ConnectorReadChangeWindow, ConnectorReadColumnBinding, ConnectorReadConstraint,
-    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadSplitManager,
-    ConnectorReadTableExecuteProcedure, ConnectorReadWorkSource, ConnectorSession,
-    ConnectorValueType, SchemaTableName, SystemTableDistribution, TupleDomain,
+    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadTableExecuteProcedure,
+    ConnectorReadWorkSource, ConnectorSession, ConnectorValueType, SchemaTableName,
+    SystemTableDistribution, TupleDomain,
 };
+use novarocks_spi::connector::{ConnectorControlReadBinding, ConnectorReadAttemptAccess};
 use novarocks_sql::plan_read::PlanScanNode;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -127,12 +127,6 @@ pub(crate) struct PreparedTypedScan {
     /// The fragment-plan scan node, carrying the frozen relation handle and
     /// the ordered assignments.
     pub(crate) table_scan: TableScanNode,
-    /// The connector's lazy split enumerator entry point. Preparation never
-    /// calls it; the execution round does.
-    pub(crate) split_manager: Arc<dyn ConnectorReadSplitManager>,
-    /// The only conversion authority for this exact binding.  It is retained
-    /// solely for fragment and TaskUpdate egress; planning never calls it.
-    pub(crate) encoder: Arc<dyn novarocks_spi::connector::ConnectorReadWireEncoder>,
     /// The constraint that was offered to the connector, kept so the round
     /// driver enumerates splits under exactly what planning pushed down.
     pub(crate) constraint: ConnectorReadConstraint,
@@ -147,9 +141,6 @@ pub(crate) struct PreparedTypedScan {
     /// connector's own answer sets this; an absent or declined limit leaves it
     /// false so the engine keeps its own limit operator.
     pub(crate) limit_guaranteed: bool,
-    /// Typed proof of the filter/projection/limit result that final query
-    /// description freezing must consume.
-    pub(crate) negotiation_receipt: NegotiatedScanReceipt,
     /// The scan output column each dynamic filter was bound to, keyed by the
     /// runtime filter's id.
     ///
@@ -178,9 +169,42 @@ impl std::fmt::Debug for PreparedTypedScan {
             .field("constraint", &self.constraint)
             .field("residual_ordinals", &self.residual_ordinals)
             .field("limit_guaranteed", &self.limit_guaranteed)
-            .field("negotiation_receipt", &self.negotiation_receipt)
             .field("dynamic_filter_outputs", &self.dynamic_filter_outputs)
             .finish_non_exhaustive()
+    }
+}
+
+/// Module-private result of Connector planning negotiation.
+///
+/// It cannot cross the preparation boundary: finalization consumes it, encodes
+/// the immutable native scan source once, and separates the pure prepared scan
+/// from the process-local attempt capability and its lineage receipt.
+pub(super) struct NegotiatedTypedScanDraft {
+    prepared: PreparedTypedScan,
+    encoder: Arc<dyn novarocks_spi::connector::ConnectorReadWireEncoder>,
+    attempt_access: ConnectorReadAttemptAccess,
+    negotiation_receipt: NegotiatedScanReceipt,
+}
+
+pub(super) struct FinalizedTypedScan {
+    pub(super) prepared: PreparedTypedScan,
+    pub(super) encoder: Arc<dyn novarocks_spi::connector::ConnectorReadWireEncoder>,
+    pub(super) attempt_access: ConnectorReadAttemptAccess,
+    pub(super) negotiation_receipt: NegotiatedScanReceipt,
+}
+
+impl NegotiatedTypedScanDraft {
+    pub(super) fn prepared(&self) -> &PreparedTypedScan {
+        &self.prepared
+    }
+
+    pub(super) fn finalize(self) -> FinalizedTypedScan {
+        FinalizedTypedScan {
+            prepared: self.prepared,
+            encoder: self.encoder,
+            attempt_access: self.attempt_access,
+            negotiation_receipt: self.negotiation_receipt,
+        }
     }
 }
 
@@ -199,7 +223,7 @@ impl std::fmt::Debug for PreparedTypedScan {
     clippy::too_many_arguments,
     reason = "Every argument is a distinct frozen fact of one scan; grouping them would hide which of them the connector sees."
 )]
-pub(crate) fn prepare_typed_scan(
+pub(super) fn prepare_typed_scan(
     session: &ConnectorSession,
     catalog: CatalogHandle,
     control: &ConnectorControlReadBinding,
@@ -214,7 +238,7 @@ pub(crate) fn prepare_typed_scan(
     dynamic_filters: &[(u32, String)],
     preparation_budget: &PreparationBudget,
     query_table_bindings: &QueryTableBindingStore,
-) -> Result<PreparedTypedScan, String> {
+) -> Result<NegotiatedTypedScanDraft, String> {
     let relation_kind = freeze.relation_kind();
     let metadata = request_control.metadata();
     let relation_name = format!("{}.{}", relation.schema_name(), relation.table_name());
@@ -483,10 +507,17 @@ pub(crate) fn prepare_typed_scan(
     // frontend code never sees or constructs the transaction payload.
     let (dynamic_filter_bindings, dynamic_filter_outputs) =
         bind_dynamic_filters(dynamic_filters, &variables_by_name, &relation_name)?;
-    let final_handle = negotiation_receipt.final_handle()?.clone();
+    let final_handle = negotiation_receipt.final_handle();
+    let attempt_access = control
+        .seal_attempt_access(request_control, final_handle)
+        .map_err(|error| {
+            format!(
+                "typed scan cannot seal per-attempt access for relation {relation_name}: {error}"
+            )
+        })?;
     let relation =
         observe_provider_negotiation(preparation_budget, &relation_name, "relation", || {
-            metadata.relation(relation_kind, final_handle)
+            metadata.relation(relation_kind, final_handle.clone())
         })
         .map_err(|error| format!("typed scan cannot freeze relation {relation_name}: {error}"))?;
     let table_scan = TableScanNode::new(
@@ -504,15 +535,17 @@ pub(crate) fn prepare_typed_scan(
     .map_err(|error| format!("typed scan node {plan_node_id}: {error}"))?;
 
     // 9. Take the enumerator entry point without enumerating anything.
-    Ok(PreparedTypedScan {
-        table_scan,
-        split_manager: request_control.splits(),
+    Ok(NegotiatedTypedScanDraft {
+        prepared: PreparedTypedScan {
+            table_scan,
+            constraint,
+            residual_ordinals: lowered.residual_ordinals,
+            limit_guaranteed,
+            dynamic_filter_outputs,
+        },
         encoder: control.encoder(),
-        constraint,
-        residual_ordinals: lowered.residual_ordinals,
-        limit_guaranteed,
+        attempt_access,
         negotiation_receipt,
-        dynamic_filter_outputs,
     })
 }
 

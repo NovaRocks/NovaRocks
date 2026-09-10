@@ -513,11 +513,41 @@ pub fn native_mv_rewritten_scan_plan() -> Result<DistributedPlan, String> {
     let occurrence =
         crate::planner::payload::SqlScanOccurrence::from_scan(source.binding, &scan.columns)
             .expect("MV rewrite fixture scan has an occurrence anchor");
+    let publication = crate::compiler::SqlMvRewriteSelectionFacts::try_new_for_target(
+        [7; 16],
+        [9; 32],
+        vec!["ice.db.orders".to_string()],
+        "test_catalog.test_db.test_table".to_string(),
+    )?;
     scan.mv_rewritten_from = Some(crate::planner::payload::MvRewriteSelection::selected(
         "mv_orders".to_string(),
         [7; 16],
         [9; 32],
         vec![(occurrence, 0)],
+        publication.publication_inputs().to_vec(),
+        publication.publication_target().clone(),
+    ));
+    seal_fixture_plan(vec![PlanFragment { root, ..fragment }])
+}
+
+/// Build a malformed final MV scan whose annotation lacks publication proof.
+/// It exists only to prove that SQL sealing rejects the pre-UEA unverified
+/// marker rather than exposing it as an executable rewrite action.
+pub fn native_unverified_mv_rewritten_scan_plan() -> Result<DistributedPlan, String> {
+    let plan = native_scan_fixture_plan(
+        SqlScanKind::ConnectorRead,
+        vec![column_def("id", DataType::Int64, false)],
+        vec![output_column(1, "id", DataType::Int64)],
+        None,
+        Vec::new(),
+    )?;
+    let fragment = plan.fragments()[0].clone();
+    let mut root = fragment.root;
+    let DistributedNodeKind::Scan(scan) = &mut root.payload else {
+        unreachable!("MV rewrite fixture is a scan")
+    };
+    scan.mv_rewritten_from = Some(crate::planner::payload::MvRewriteSelection::unverified(
+        "mv_orders".to_string(),
     ));
     seal_fixture_plan(vec![PlanFragment { root, ..fragment }])
 }
@@ -540,11 +570,19 @@ pub fn native_mv_rewritten_scan_plan_with_inputs(
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         unreachable!("MV rewrite fixture is a scan")
     };
+    let publication = crate::compiler::SqlMvRewriteSelectionFacts::try_new_for_target(
+        [7; 16],
+        [9; 32],
+        vec!["ice.db.orders".to_string()],
+        "test_catalog.test_db.test_table".to_string(),
+    )?;
     scan.mv_rewritten_from = Some(crate::planner::payload::MvRewriteSelection::selected(
         "mv_orders".to_string(),
         [7; 16],
         [9; 32],
         input_mapping,
+        publication.publication_inputs().to_vec(),
+        publication.publication_target().clone(),
     ));
     seal_fixture_plan(vec![PlanFragment { root, ..fragment }])
 }

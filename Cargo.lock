@@ -4012,12 +4012,12 @@ dependencies = [
 name = "novarocks-query-application"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "novarocks-execution-contract",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
  "novarocks-workload-control",
- "sha2",
  "tokio",
 ]
 

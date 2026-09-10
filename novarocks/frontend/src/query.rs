@@ -23,11 +23,8 @@ use std::time::{Duration, Instant};
 
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
-#[cfg(test)]
-use crate::common::admitted_query_context::RequestAdmission;
 use crate::common::admitted_query_context::{
-    LakePublicationRuntimePolicy, RequestContext, SessionOptimizerSettings,
-    StatementAdmissionContext,
+    LakePublicationRuntimePolicy, RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
 use crate::common::backend_topology::BackendTopologyService;
 use crate::common::engine_error::EngineError;
@@ -1103,15 +1100,15 @@ impl FrontendQuerySession {
             optimizer_settings.optimizer_query_mem_limit_bytes =
                 Some(self.service.optimizer_query_mem_limit_bytes as f64);
         }
-        let statement_context = StatementAdmissionContext::new(
+        let context = RequestContext::admit(RequestAdmission::new(
             state.current_catalog,
             state.current_database,
             self.service.role,
+            topology,
             deadline,
             cancellation.clone(),
             optimizer_settings,
-        );
-        let context = statement_context.for_topology(topology);
+        ));
         let compiler = self.service.query_compiler.clone();
         let command_executor = Arc::clone(&self.service.command_executor);
         let query_execution = self.service.query_execution.clone();
