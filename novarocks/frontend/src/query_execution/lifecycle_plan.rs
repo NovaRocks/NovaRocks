@@ -1007,7 +1007,7 @@ impl QueryCatalogLease {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::{AttemptCredentialLeaseCollector, QueryCatalogLease, QueryInitOptions};
     use crate::common::backend_topology::LiveBackendTarget;
@@ -1108,6 +1108,25 @@ mod tests {
         }
     }
 
+    struct DropTrackedRefresher {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropTrackedRefresher {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl ConnectorVendedS3CredentialLeaseRefresher for DropTrackedRefresher {
+        fn refresh_vended_s3_credentials(
+            &self,
+        ) -> Result<VendedS3CredentialLeaseRefresh, novarocks_spi::connector::ConnectorError>
+        {
+            panic!("the drop-tracked refresher is never invoked")
+        }
+    }
+
     #[test]
     fn attempt_collector_deduplicates_scope_and_drains_once() {
         let collector = AttemptCredentialLeaseCollector::new(execution_id());
@@ -1133,11 +1152,23 @@ mod tests {
         let collector = AttemptCredentialLeaseCollector::new(execution_id());
         let weak_collector = Arc::downgrade(&collector);
         let sink = collector.sink();
+        let refresher_dropped = Arc::new(AtomicBool::new(false));
+        let contribution = vended_contribution("accepted-before-cancel")
+            .with_refresher(Arc::new(DropTrackedRefresher {
+                dropped: Arc::clone(&refresher_dropped),
+            }))
+            .expect("drop-tracked provider refresher");
+        sink.offer_vended_s3_credential_lease(&vended_catalog_properties(), contribution)
+            .expect("credential is collected before cancellation");
         drop(collector);
 
         assert!(
             weak_collector.upgrade().is_none(),
             "a provider-held sink must not extend the attempt collector lifetime"
+        );
+        assert!(
+            refresher_dropped.load(Ordering::SeqCst),
+            "credential-owned provider state must be released with the cancelled attempt"
         );
         let error = sink
             .offer_vended_s3_credential_lease(

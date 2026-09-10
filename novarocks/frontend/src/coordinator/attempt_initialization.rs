@@ -495,10 +495,14 @@ impl AttemptReady {
 mod tests {
     use std::sync::mpsc;
 
+    use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorProviderId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+        CatalogProperties, CatalogVersion, ConnectorCancellation, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
+        VendedS3CredentialLeaseEntry,
     };
     use novarocks_types::{AttemptId, QueryId};
 
@@ -699,6 +703,67 @@ mod tests {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .expect("valid test Connector context")
+    }
+
+    fn vended_catalog_properties() -> CatalogProperties {
+        CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::try_from_canonical("catalog.vended").expect("catalog name"),
+                CatalogVersion::from_bytes([0x24; 32]),
+            ),
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
+            1,
+            vec![],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::Backend,
+                    CatalogCredentialMode::Vended,
+                )
+                .expect("vended binding"),
+            ],
+        )
+        .expect("catalog properties")
+    }
+
+    fn vended_contribution() -> VendedS3CredentialLeaseContribution {
+        VendedS3CredentialLeaseContribution::try_new(
+            vec![
+                VendedS3CredentialLeaseEntry::try_new(
+                    StorageCredentialScopePrefix::try_from_normalized("s3://warehouse/data")
+                        .expect("prefix"),
+                    u64::MAX,
+                    SecretValue::new("access"),
+                    SecretValue::new("secret"),
+                    SecretValue::new("token"),
+                )
+                .expect("entry"),
+            ],
+            None,
+        )
+        .expect("contribution")
+    }
+
+    #[test]
+    fn dropped_attempt_source_publishes_credentials_observed_before_failure() {
+        let reservation =
+            QueryAttemptReservation::retry(QueryId::new(17, 23), 2).expect("attempt reservation");
+        reservation
+            .credential_lease_sink()
+            .offer_vended_s3_credential_lease(&vended_catalog_properties(), vended_contribution())
+            .expect("credential contribution");
+        let observed = Arc::new(AtomicBool::new(false));
+        let source = RoundCredentialLeaseSource::Reservation {
+            reservation: Some(reservation),
+            observed_collected: Some(Arc::clone(&observed)),
+        };
+
+        drop(source);
+
+        assert!(
+            observed.load(Ordering::Acquire),
+            "dropping a failed attempt source must publish credentials already collected"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
