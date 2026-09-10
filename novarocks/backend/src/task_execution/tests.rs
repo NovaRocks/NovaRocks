@@ -366,6 +366,8 @@ struct FakeRunnable {
 }
 
 impl RunnableTask for FakeRunnable {
+    fn commit_creation(&self) {}
+
     fn cancel(&self, reason: CancelReason) {
         self.ledger.cancels.fetch_add(1, Ordering::SeqCst);
         if self.ignore_stand_down.load(Ordering::SeqCst) {

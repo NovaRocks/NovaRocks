@@ -26,7 +26,7 @@
 //! install_receiver          decode + prepare_fragment -> dormant handle
 //! install_inbound_capability register the descriptor for frame admission
 //! apply_task_domain         initial splits / edge opens / filters
-//! submit_runnable           start the dormant handle on its own thread
+//! submit_runnable           start and attach the dormant handle
 //! ```
 //!
 //! The dormant handle is what makes that split honest. Receiver registration
@@ -35,7 +35,7 @@
 //! [`DormantFragmentHandle`]. So `install_receiver` prepares the whole
 //! fragment and parks the handle; `remove_receiver` drops it, and the
 //! `FragmentResources` it owns roll every registration back. `submit_runnable`
-//! is the only step that can start a thread, and it runs last.
+//! is the only step that starts the prepared execution, and it runs last.
 //!
 //! This host reads nothing from the fragment-based lifecycle registry. Every
 //! query-scoped fact it needs arrives through [`TaskQueryContextFacts`], which
@@ -96,6 +96,7 @@ use crate::fragment::ingress::{ReceivedReadSplit, TypedReadAttemptContext};
 use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 
+use super::completion::{TaskCompletionSignal, TaskCompletionSupervisor};
 use super::fault;
 use super::host::{HostRejection, RunnableTask, TaskExecutionHost};
 use super::shared_facts::fragment_plan;
@@ -438,6 +439,7 @@ pub struct NativeTaskExecutionHost {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     commit_port: Arc<dyn FragmentCommitPort>,
     execution_runtime: Arc<ExecutionRuntime>,
+    completion_supervisor: Arc<TaskCompletionSupervisor>,
     /// Split delivery, keyed by execution and kernel key so a replaced attempt
     /// gets a fresh queue set and can never inherit a sequence space.
     split_queues: Arc<SplitQueueRegistry<ReceivedReadSplit>>,
@@ -599,7 +601,7 @@ impl NativeTaskExecutionHost {
         reason = "Every execution port this host drives is injected explicitly; \
                   a bundle struct would only move the same list one level away."
     )]
-    pub fn new(
+    pub(crate) fn new(
         queries: NativeFragmentQueryRuntime,
         context_facts: Arc<dyn TaskQueryContextFacts>,
         capabilities: Arc<TaskInboundCapabilities>,
@@ -608,6 +610,7 @@ impl NativeTaskExecutionHost {
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         commit_port: Arc<dyn FragmentCommitPort>,
         execution_runtime: Arc<ExecutionRuntime>,
+        completion_supervisor: Arc<TaskCompletionSupervisor>,
     ) -> Self {
         Self {
             queries,
@@ -618,6 +621,7 @@ impl NativeTaskExecutionHost {
             exchange_receiver_port,
             commit_port,
             execution_runtime,
+            completion_supervisor,
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
         }
@@ -1059,13 +1063,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         self.capabilities.remove(descriptor);
     }
 
-    /// Starts the prepared fragment on its own thread.
+    /// Starts the prepared fragment and hands its terminal work to the
+    /// process-wide completion owner.
     ///
-    /// This is the last install step and the only one that can start a
-    /// thread. Everything that could fail has already run, so a failure here
-    /// is a resource failure and leaves no worker behind: if the spawn is
-    /// refused the dormant handle and the pre-start registration lease are
-    /// dropped, which rolls both back.
+    /// This is the last install step. Everything fallible runs before the
+    /// dormant fragment starts, so a refusal leaves no running worker behind.
     fn submit_runnable(
         &self,
         descriptor: &TaskDescriptor,
@@ -1127,66 +1129,71 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
 
         let task = Arc::new(NativeRunnableTask::new(identity, kernel_key));
         let worker = Arc::clone(&task);
+        let completion_worker = Arc::clone(&task);
         let queries = self.queries.clone();
         let split_queues = Arc::clone(&self.split_queues);
         let attempt = runtime.attempt;
         let sink_kind = runtime.sink_kind;
         let operator_statistics = Arc::clone(&runtime.operator_statistics);
-        std::thread::Builder::new()
-            .name(format!(
-                "native-task-{:x}-{:x}",
-                kernel_key.high(),
-                kernel_key.low()
-            ))
-            .spawn(move || {
-                // The pre-start lease keeps the query route rollback-capable
-                // while this worker is dormant; only the thread that starts it
-                // may make it live.
-                registration.into_running();
-                // RUNNING is published before the drivers are submitted
-                // because it is the route becoming live that the status
-                // describes, and because no terminal state is reachable from
-                // PLANNED: a task that never publishes RUNNING could not
-                // publish FINISHED either.
-                reporter.running();
-                let running = if injected_execution_failure {
-                    dormant.start_failed(fault::TASK_EXECUTION_FAILURE_DETAIL)
-                } else {
-                    dormant.start()
-                };
-                // Replays a stand-down that arrived while this task was
-                // submitted but not yet started. Without it, a cancel racing
-                // the worker's first instruction would be dropped and the
-                // task would run to completion after being told to stop.
-                worker.attach(Arc::new(running.clone()));
-                let fact = running.join();
-                // `join` is the positive local evidence that pipeline work
-                // stopped. A terminal status, abort acknowledgement, or
-                // timeout cannot manufacture this fact.
-                reporter.note_actual_stopped();
-                // The sampling tick stops firing the moment the drivers
-                // finish, so the last event-driven snapshot predates the rows
-                // the operators counted on their way out. The terminal fact
-                // carries the profile as frozen at the end, and recording it
-                // here — before the terminal state is published — is what puts
-                // final numbers in a final info rather than stale ones. A task
-                // that was asked for no profile has nothing to read here.
-                if let Some(profile) = fact.profile() {
-                    operator_statistics.record_profile(profile);
-                }
-                report_terminal(&reporter, sink_kind, &fact, worker.stand_down());
-                worker.finish();
-                split_queues.close_attempt(attempt);
-                queries.unregister_fragment_execution(execution, kernel_key);
-                queries.finish_fragment(execution);
-                // Every runtime owner named above has now returned its local
-                // responsibility. Registry-owned receiver/capability state is
-                // released later, by the retirement transition itself.
-                reporter.note_resources_converged();
-            })
+        let completion_reporter = reporter.clone();
+        let completion = self
+            .completion_supervisor
+            .reserve(
+                identity,
+                kernel_key,
+                Box::new(move |fact| {
+                    // The stopped observer is the positive local evidence
+                    // that pipeline work ended. A terminal status, abort
+                    // acknowledgement, or timeout cannot manufacture it.
+                    completion_reporter.note_actual_stopped();
+                    // The sampling tick stops firing the moment the drivers
+                    // finish, so the last event-driven snapshot predates the
+                    // rows the operators counted on their way out. The
+                    // terminal fact carries the final frozen profile.
+                    if let Some(profile) = fact.profile() {
+                        operator_statistics.record_profile(profile);
+                    }
+                    report_terminal(
+                        &completion_reporter,
+                        sink_kind,
+                        &fact,
+                        completion_worker.stand_down(),
+                    );
+                    completion_worker.finish();
+                    split_queues.close_attempt(attempt);
+                    queries.unregister_fragment_execution(execution, kernel_key);
+                    queries.finish_fragment(execution);
+                    // Every runtime owner named above has now returned its
+                    // local responsibility. Registry-owned ingress state is
+                    // released later, by retirement.
+                    completion_reporter.note_resources_converged();
+                }),
+            )
             .map_err(|error| {
-                resource_exhausted(format!("spawn native task worker failed: {error}"))
+                resource_exhausted(format!("reserve native task completion failed: {error}"))
             })?;
+        task.bind_completion(completion.clone());
+
+        // The pre-start lease keeps the query route rollback-capable while
+        // this worker is dormant. Submission makes it live synchronously.
+        registration.into_running();
+        // RUNNING is published before the drivers are submitted because it is
+        // the route becoming live that the status describes, and because no
+        // terminal state is reachable from PLANNED.
+        reporter.running();
+        let running = if injected_execution_failure {
+            dormant.start_failed(fault::TASK_EXECUTION_FAILURE_DETAIL)
+        } else {
+            dormant.start()
+        };
+        // Replays a stand-down that arrived while this task was submitted but
+        // not yet attached. The latch remains the first-wins cancellation
+        // authority.
+        worker.attach(Arc::new(running.clone()));
+        // Subscription after start is deliberate: the kernel retains an
+        // already-stopped fact and invokes this immediately, so neither a
+        // synchronous completion nor a stop-before-subscribe race is lost.
+        running.subscribe_stopped(move |fact| completion.publish(fact));
         Ok(task)
     }
 
@@ -1338,6 +1345,7 @@ pub struct NativeRunnableTask {
     identity: TaskIdentity,
     fragment_instance_id: UniqueId,
     state: Mutex<RunnableState>,
+    completion: OnceLock<TaskCompletionSignal>,
 }
 
 impl fmt::Debug for NativeRunnableTask {
@@ -1362,7 +1370,15 @@ impl NativeRunnableTask {
             identity,
             fragment_instance_id,
             state: Mutex::new(RunnableState::default()),
+            completion: OnceLock::new(),
         }
+    }
+
+    fn bind_completion(&self, completion: TaskCompletionSignal) {
+        assert!(
+            self.completion.set(completion).is_ok(),
+            "a native runnable task binds one completion slot"
+        );
     }
 
     /// Publishes the started fragment and replays any latched stand-down.
@@ -1383,8 +1399,8 @@ impl NativeRunnableTask {
     }
 
     /// Releases this handle's reference to the running fragment once the
-    /// worker has its terminal fact, so the kernel handle's last drop belongs
-    /// to the worker rather than to a later canceller.
+    /// completion owner has its terminal fact, so the kernel handle's last
+    /// drop belongs to that owner rather than to a later canceller.
     fn finish(&self) {
         let mut state = self.state.lock().expect(RUNNABLE_LOCK);
         state.finished = true;
@@ -1400,8 +1416,8 @@ impl NativeRunnableTask {
             state.stand_down = Some(stand_down);
             state.handle.as_ref().map(Arc::clone)
         };
-        // An absent handle means the worker has not started the fragment yet.
-        // The latch set above is what `attach` replays.
+        // An absent handle means the fragment has not been attached yet. The
+        // latch set above is what `attach` replays.
         if let Some(handle) = handle {
             handle.cancel(stand_down.reason());
         }
@@ -1409,6 +1425,13 @@ impl NativeRunnableTask {
 }
 
 impl RunnableTask for NativeRunnableTask {
+    fn commit_creation(&self) {
+        self.completion
+            .get()
+            .expect("a submitted native task has a completion slot")
+            .commit_creation();
+    }
+
     fn cancel(&self, reason: CancelReason) {
         self.request(StandDown::Cancel(reason));
     }
@@ -1550,8 +1573,8 @@ mod tests {
     use super::{
         CompositeFragmentEventSink, ExchangeRouteClaim, ExchangeRouteQuery, FragmentStandDown,
         InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, QueryContextOptions,
-        StandDown, TaskInboundCapabilities, TaskOperatorStatisticsSink, TaskQueryContextFacts,
-        query_options_fingerprint, report_terminal,
+        StandDown, TaskCompletionSupervisor, TaskInboundCapabilities, TaskOperatorStatisticsSink,
+        TaskQueryContextFacts, query_options_fingerprint, report_terminal,
     };
 
     use std::num::{NonZeroU32, NonZeroUsize};
@@ -1979,6 +2002,7 @@ mod tests {
 
     fn host(facts: Arc<StubContextFacts>) -> NativeTaskExecutionHost {
         let data_runtime = crate::rpc::runtime::test_backend_data_runtime();
+        let completion_supervisor = TaskCompletionSupervisor::start(data_runtime.clone(), 64);
         NativeTaskExecutionHost::new(
             NativeFragmentQueryRuntime::global(),
             facts,
@@ -1988,6 +2012,7 @@ mod tests {
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(crate::runtime::sink_commit::BackendSinkCommitPort),
             test_execution_runtime(),
+            completion_supervisor,
         )
     }
 
@@ -2923,9 +2948,8 @@ mod tests {
 
     /// Waits for a task to reach a terminal status, or gives up.
     ///
-    /// The worker runs on its own thread, so a poll is the only way to observe
-    /// it. The bound is generous and only exists so a hang fails the test
-    /// instead of blocking the suite forever.
+    /// Completion is published by the process owner asynchronously. The bound
+    /// only exists so a hang fails the test instead of blocking the suite.
     fn await_terminal(owner: &TaskStatusOwner) -> TaskState {
         for _ in 0..600 {
             if owner.is_terminal() {
@@ -2934,6 +2958,18 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("task did not reach a terminal state: {:?}", owner.state());
+    }
+
+    fn submit_committed(
+        host: &NativeTaskExecutionHost,
+        descriptor: &TaskDescriptor,
+        reporter: TaskStatusReporter,
+    ) -> Arc<dyn RunnableTask> {
+        let runnable = host
+            .submit_runnable(descriptor, reporter)
+            .expect("a prepared fragment starts");
+        runnable.commit_creation();
+        runnable
     }
 
     fn await_runtime_convergence(owner: &TaskStatusOwner) {
@@ -2962,12 +2998,10 @@ mod tests {
         host.install_receiver(&descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
-        let runnable = host
-            .submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        let runnable = submit_committed(&host, &descriptor, reporter);
 
-        // A NOOP sink owes nothing further, so the worker itself is the only
-        // thing that may publish FINISHED. If the worker never reported, this
+        // A NOOP sink owes nothing further, so the completion owner is the
+        // only thing that may publish FINISHED. If it never reported, this
         // would hang at PLANNED and the poll would fail.
         assert_eq!(await_terminal(&owner), TaskState::Finished);
         assert!(
@@ -3007,8 +3041,7 @@ mod tests {
         host.install_receiver(&descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
-        host.submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        submit_committed(&host, &descriptor, reporter);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         assert_eq!(
@@ -3025,16 +3058,15 @@ mod tests {
     }
 
     #[test]
-    fn submitting_a_task_that_was_never_prepared_is_refused_before_a_thread_exists() {
+    fn submitting_a_task_that_was_never_prepared_is_refused_before_execution_starts() {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
         let task = identity(25, 1, 1);
         let descriptor = consistent_descriptor(task, UniqueId::new(201, 202));
         let (_owner, reporter) = reporter_for(task);
 
-        // `submit_runnable` is the only step that can start a thread, so it
-        // must refuse an unprepared task rather than spawn a worker with
-        // nothing to run.
+        // `submit_runnable` is the only step that can start execution, so it
+        // must refuse an unprepared task rather than run nothing.
         let rejection = host
             .submit_runnable(&descriptor, reporter)
             .expect_err("no prepared fragment exists");
@@ -3176,9 +3208,7 @@ mod tests {
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
-        let runnable = host
-            .submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        let runnable = submit_committed(&host, &descriptor, reporter);
 
         // The owner publishes ABORTING and then asks the task to stand down,
         // which may land before or after the worker started the fragment.
@@ -3200,15 +3230,13 @@ mod tests {
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
-        let _runnable = host
-            .submit_runnable(&descriptor, reporter.clone())
-            .expect("first submit starts the fragment");
+        let _runnable = submit_committed(&host, &descriptor, reporter.clone());
 
         // The dormant handle is taken exactly once. A second submit must not
-        // start a second worker over the same pipeline.
+        // start a second execution over the same pipeline.
         let rejection = host
             .submit_runnable(&descriptor, reporter)
-            .expect_err("one fragment, one worker");
+            .expect_err("one fragment, one execution");
         assert!(
             rejection.detail().as_str().contains("submitted twice"),
             "{rejection}"
@@ -3361,9 +3389,7 @@ mod tests {
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
-        let _runnable = host
-            .submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        let _runnable = submit_committed(&host, &descriptor, reporter);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         let final_info = owner.final_info().expect("a terminal task has final info");
@@ -3395,9 +3421,7 @@ mod tests {
         let (owner, reporter) = reporter_for(task);
 
         host.install_receiver(&descriptor).expect("prepares");
-        let _runnable = host
-            .submit_runnable(&descriptor, reporter)
-            .expect("a prepared fragment starts");
+        let _runnable = submit_committed(&host, &descriptor, reporter);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
         let final_info = owner.final_info().expect("a terminal task has final info");

@@ -188,6 +188,7 @@ pub struct BackendApplicationHost {
     ready_marker: String,
     grpc_server: BackendRpcServerHandle,
     execution_runtime: Arc<ExecutionRuntime>,
+    task_completion_supervisor: Arc<crate::task_execution::TaskCompletionSupervisor>,
     task_deadline_tick: TaskDeadlineTickTask,
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
@@ -346,6 +347,7 @@ struct BackendApplicationServices {
     execution_runtime: Arc<ExecutionRuntime>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     task_execution_registry: Arc<TaskExecutionRegistry>,
+    task_completion_supervisor: Arc<crate::task_execution::TaskCompletionSupervisor>,
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
     /// The task substrate's exchange-destination authority. The RPC data
     /// plane needs it directly: without it no created task can receive an
@@ -615,6 +617,12 @@ fn compose_backend_application_services(
     let result_retained_budget = crate::runtime::result_buffer::ResultRetainedBudget::new(
         result_retained_limits.per_process(),
     );
+    let task_execution_registry_config =
+        TaskExecutionRegistryConfig::for_process(backend_process_id);
+    let task_completion_supervisor = crate::task_execution::TaskCompletionSupervisor::start(
+        data_runtime.clone(),
+        task_execution_registry_config.max_active_tasks_per_backend,
+    );
     let execution_host = Arc::new(crate::task_execution::NativeTaskExecutionHost::new(
         crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global(),
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::TaskQueryContextFacts>,
@@ -628,9 +636,10 @@ fn compose_backend_application_services(
             ),
         ),
         Arc::clone(&execution_runtime),
+        Arc::clone(&task_completion_supervisor),
     ));
     let task_execution_registry = TaskExecutionRegistry::with_process_clock(
-        TaskExecutionRegistryConfig::for_process(backend_process_id),
+        task_execution_registry_config,
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::QueryContextHost>,
         execution_host,
     );
@@ -645,6 +654,7 @@ fn compose_backend_application_services(
         execution_runtime,
         exchange_receiver_port,
         task_execution_registry,
+        task_completion_supervisor,
         task_execution_ingress,
         task_inbound_capabilities: inbound_capabilities,
         query_context_host: context_host,
@@ -699,6 +709,7 @@ impl BackendApplicationHost {
             self.grpc_server.poll_failure(),
             self.metrics_http_server.poll_failure(),
             Ok(self.task_deadline_tick.poll_failure()),
+            Ok(self.task_completion_supervisor.poll_failure()),
         ] {
             match failure {
                 Ok(Some(error)) => {
@@ -722,11 +733,19 @@ impl BackendApplicationHost {
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
         self.announce_task.stop();
         self.task_deadline_tick.stop();
-        let execution_result = self.execution_runtime.shutdown_driver_execution();
+        // Close ingress before draining drivers, so no CreateTask can
+        // install a new completion slot behind the shutdown boundary.
         let listener_shutdown = self.grpc_server.stop();
+        let execution_result = self.execution_runtime.shutdown_driver_execution();
+        // Driver shutdown publishes every actual-stop fact. Only after that
+        // may the fixed completion owner drain its exact slots and return.
+        let completion_result = self.task_completion_supervisor.shutdown();
         let metrics_result = self.metrics_http_server.stop();
         combine_shutdown_results(
-            combine_shutdown_results(execution_result, listener_shutdown),
+            combine_shutdown_results(
+                combine_shutdown_results(listener_shutdown, execution_result),
+                completion_result,
+            ),
             metrics_result,
         )
         .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error))
@@ -881,6 +900,7 @@ impl BackendApplicationHost {
             ),
             grpc_server,
             execution_runtime: services.execution_runtime,
+            task_completion_supervisor: services.task_completion_supervisor,
             task_deadline_tick,
             metrics_http_server,
             process_descriptor,

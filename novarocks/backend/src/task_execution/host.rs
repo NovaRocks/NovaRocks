@@ -213,8 +213,14 @@ pub trait QueryContextHost: Send + Sync {
 /// A submitted, runnable task.
 ///
 /// The handle is deliberately narrow: the owner publishes status and decides
-/// terminal outcomes, so a running task can only be asked to stand down.
+/// terminal outcomes. The registry opens its completion gate at creation
+/// commit and may otherwise only ask the running task to stand down.
 pub trait RunnableTask: fmt::Debug + Send + Sync {
+    /// Opens completion processing after the registry has installed the task
+    /// as a live creation. A fragment may physically stop before this call;
+    /// its exact completion slot retains the fact until commit.
+    fn commit_creation(&self);
+
     fn cancel(&self, reason: CancelReason);
 
     fn abort(&self, cause: AbortCause);
@@ -224,7 +230,7 @@ pub trait RunnableTask: fmt::Debug + Send + Sync {
 ///
 /// The three install steps are called in exactly the order the creation
 /// transaction commits them, and `submit_runnable` is last: it is the only one
-/// that can start a thread, so a failure in any earlier step is reported
+/// that starts executable work, so a failure in any earlier step is reported
 /// before a worker exists to clean up.
 pub trait TaskExecutionHost: Send + Sync {
     /// Closes data-plane admission for every task of this exact query

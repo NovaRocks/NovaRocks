@@ -2754,10 +2754,10 @@ impl TaskExecutionRegistry {
 /// The creation transaction's rollback guard.
 ///
 /// A creation is atomic because every step before the last one is undoable and
-/// the last one is the only step that can start a thread: the receiver, the
+/// the last one is the only step that can start execution: the receiver, the
 /// inbound capability, and the reservation are removed in reverse on any
 /// failure, and `submit_runnable` either returns a handle — after which
-/// nothing can fail — or returns an error before any worker exists.
+/// nothing can fail — or returns an error before execution starts.
 struct CreationTransaction<'a> {
     registry: &'a TaskExecutionRegistry,
     context: QueryContextRef,
@@ -2826,6 +2826,10 @@ impl CreationTransaction<'_> {
                 status.release_to_observers();
             }
         }
+        // Completion can race ahead of the creation transaction. It may run
+        // only after the task is findable as Live, so an immediate terminal
+        // fact cannot make a creating task disappear behind the transaction.
+        runnable.commit_creation();
         if closed {
             // The context already revoked new work. Close the submitted
             // task's independently installed data-plane capability as part of

@@ -42,6 +42,7 @@
 // Design: ADR-0135 (docs/adr/ADR-0135-native-distributed-work-as-tasks.md)
 
 mod clock;
+mod completion;
 mod context_host;
 mod credential_slot;
 mod domains;
@@ -62,6 +63,7 @@ mod status;
 mod tests;
 
 pub use clock::{BackendMonotonicClock, ManualClock, ProcessMonotonicClock};
+pub(crate) use completion::TaskCompletionSupervisor;
 pub use context_host::NativeQueryContextHost;
 pub use credential_slot::QueryContextCredentialSlot;
 pub use execution_host::{

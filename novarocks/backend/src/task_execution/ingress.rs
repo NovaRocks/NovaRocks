@@ -572,6 +572,8 @@ mod tests {
     struct InertRunnable;
 
     impl RunnableTask for InertRunnable {
+        fn commit_creation(&self) {}
+
         fn cancel(&self, _reason: CancelReason) {}
 
         fn abort(&self, _cause: AbortCause) {}
