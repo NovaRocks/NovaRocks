@@ -30,7 +30,7 @@ use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::ConnectorReadWireEncoder;
 use novarocks_spi::connector::read_stack::ConnectorReadColumnHandle;
 use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
-use novarocks_spi::connector::read_stack::SplitSourceProfile;
+use novarocks_spi::connector::read_stack::{ConnectorSplitBatch, SplitSourceProfile};
 
 use super::super::connector_domain::CatalogHandle;
 use super::driver::{
@@ -62,24 +62,60 @@ pub(crate) struct RoundSplitSource {
     /// Exact carrier binding -> opaque connector column mapping frozen by the
     /// prepared scan.  A feedback channel can constrain no other column.
     pub(crate) feedback_bindings: Vec<(u32, ConnectorReadColumnHandle)>,
+    pub(crate) initial_wait_initialized: bool,
     pub(crate) initial_wait_deadline: Option<Instant>,
 }
 
 /// The per-round owner of every split source and the driver that drains them.
 pub(crate) struct RoundSplitAssignment {
     driver: SplitAssignmentDriver,
-    sources: Vec<RoundSplitSource>,
+    sources: Vec<Option<RoundSplitSource>>,
     stop: SplitAssignmentStop,
     /// Closing owns source cleanup. It is deliberately independent from
-    /// `stop`: the coordinator signals stop before it joins the worker, and
-    /// that worker must still release every source after observing the signal.
+    /// `stop`: the coordinator can signal stop before the serial pump reaches
+    /// cleanup, and that pump must still release every source afterwards.
     closed: bool,
+    /// Next source considered for one bounded enumeration operation.
+    next_source: usize,
+    started_at: Instant,
+    initial_dynamic_filter_wait_cap: Duration,
+}
+
+/// What one admitted synchronous split-source operation produced.
+pub(crate) enum RoundSplitEnumeration {
+    Ready(RoundSplitEnumerationRequest),
+    /// Every remaining source is temporarily blocked by feedback or task
+    /// backpressure. The owner parks outside Connector admission.
+    Idle(Duration),
+    Finished,
+}
+
+/// One source moved into an ordinary blocking job.
+pub(crate) struct RoundSplitEnumerationRequest {
+    slot: usize,
+    source: RoundSplitSource,
+    dynamic_filter:
+        Option<novarocks_spi::connector::read_stack::ConnectorReadDynamicFilterSnapshot>,
+    started_at: Instant,
+    initial_dynamic_filter_wait_cap: Duration,
+}
+
+/// One completed Connector call, including the source the serial owner must
+/// either adopt or close through the ordinary lane.
+pub(crate) struct RoundSplitEnumerationResult {
+    pub(crate) slot: usize,
+    pub(crate) source: RoundSplitSource,
+    pub(crate) batch: Result<
+        Option<ConnectorSplitBatch<novarocks_spi::connector::read_stack::ConnectorReadSplit>>,
+        SplitAssignmentDriverError,
+    >,
 }
 
 impl RoundSplitAssignment {
     pub(crate) fn profile_snapshot(&self) -> SplitSourceProfile {
         self.sources
             .iter()
+            .flatten()
             .fold(SplitSourceProfile::default(), |mut total, source| {
                 let next = source.source.profile_snapshot();
                 total.files_considered =
@@ -100,15 +136,6 @@ impl RoundSplitAssignment {
         initial_dynamic_filter_wait_cap: Duration,
     ) -> Self {
         let stop = SplitAssignmentStop::default();
-        let started_at = Instant::now();
-        let mut sources = sources;
-        for source in &mut sources {
-            let requested = source
-                .source
-                .initial_dynamic_filter_wait_request()
-                .min(initial_dynamic_filter_wait_cap);
-            source.initial_wait_deadline = (!requested.is_zero()).then(|| started_at + requested);
-        }
         Self {
             driver: SplitAssignmentDriver::new(
                 execution_id,
@@ -122,9 +149,12 @@ impl RoundSplitAssignment {
                 retry_policy,
                 stop.clone(),
             ),
-            sources,
+            sources: sources.into_iter().map(Some).collect(),
             stop,
             closed: false,
+            next_source: 0,
+            started_at: Instant::now(),
+            initial_dynamic_filter_wait_cap,
         }
     }
 
@@ -137,85 +167,201 @@ impl RoundSplitAssignment {
         self.stop.clone()
     }
 
-    /// Drain every source until each plan node has sent its terminal marker.
+    /// Runs at most one synchronous Connector enumeration operation.
     ///
-    /// A source that yields nothing right now is retried after the other
-    /// sources get a turn, so one slow enumeration cannot starve the rest.
-    pub(crate) fn pump_to_completion(
+    /// The process supervisor calls this under one ordinary permit. It never
+    /// sends a TaskUpdate or waits for an acknowledgement; the serial owner
+    /// adopts the returned batch first and starts transport work separately.
+    pub(crate) fn enumerate_once(
         &mut self,
-    ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
-        while !self.stop.is_stopped() {
-            let mut progressed = false;
-            let mut pending = false;
-            let mut feedback_wait_deadline = None;
-            for index in 0..self.sources.len() {
-                if self.stop.is_stopped() {
-                    break;
-                }
-                let plan_node_id = self.sources[index].plan_node_id;
-                if self.driver.is_terminal_for(plan_node_id) {
-                    continue;
-                }
-                pending = true;
-                if self.driver.is_backpressured(plan_node_id) {
-                    continue;
-                }
-                let dynamic_filter = self.sources[index]
-                    .feedback
-                    .snapshot_for_scan(plan_node_id, &self.sources[index].feedback_bindings);
-                if let Some(deadline) = self.sources[index].initial_wait_deadline {
-                    if Instant::now() < deadline
-                        && self.sources[index].feedback.is_initial_wait_blocked(
-                            plan_node_id,
-                            self.sources[index]
-                                .feedback_bindings
-                                .iter()
-                                .map(|(binding_id, _)| *binding_id),
-                        )
-                    {
-                        feedback_wait_deadline = Some(
-                            feedback_wait_deadline
-                                .map_or(deadline, |current: Instant| current.min(deadline)),
-                        );
-                        continue;
-                    }
-                    self.sources[index].initial_wait_deadline = None;
-                }
-                let source = self.sources[index].source.as_mut();
-                if self.driver.pump(
-                    plan_node_id,
-                    source,
-                    DEFAULT_PUMP_BATCH_SIZE,
-                    &dynamic_filter,
-                )? {
-                    progressed = true;
-                }
-            }
-            if !pending {
-                return Ok(self.profile_snapshot());
-            }
-            if !progressed {
-                // Either every remaining task is at its queue ceiling, or every
-                // source had nothing right now. Both resolve on their own, so
-                // wait briefly rather than spin a core. The statement deadline
-                // and the stop handle are what end a round that never
-                // progresses; this loop deliberately has no deadline of its
-                // own, because inventing one would cancel a legitimately slow
-                // enumeration.
-                if let Some(deadline) = feedback_wait_deadline {
-                    let budget = deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(IDLE_PUMP_BACKOFF);
-                    if let Some(source) = self.sources.first() {
-                        let generation = source.feedback.generation();
-                        source.feedback.wait_for_change(generation, budget);
-                    }
-                } else if self.stop.wait_backoff(IDLE_PUMP_BACKOFF) {
-                    break;
-                }
-            }
+    ) -> Result<RoundSplitEnumeration, SplitAssignmentDriverError> {
+        if self.closed || self.stop.is_stopped() {
+            return Err(SplitAssignmentDriverError::Closed);
         }
-        Ok(self.profile_snapshot())
+        let mut pending = false;
+        let mut feedback_wait_deadline = None;
+        let source_count = self.sources.len();
+        let mut selected = None;
+        for offset in 0..source_count {
+            let index = (self.next_source + offset) % source_count;
+            let Some(source) = self.sources[index].as_ref() else {
+                continue;
+            };
+            let plan_node_id = source.plan_node_id;
+            if self.driver.is_terminal_for(plan_node_id) {
+                continue;
+            }
+            pending = true;
+            if self.driver.is_backpressured(plan_node_id) {
+                continue;
+            }
+            let source = self.sources[index]
+                .as_mut()
+                .expect("the selected source remains owned by the round");
+            if !source.initial_wait_initialized {
+                selected = Some((index, None));
+                break;
+            }
+            if let Some(deadline) = source.initial_wait_deadline {
+                if Instant::now() < deadline
+                    && source.feedback.is_initial_wait_blocked(
+                        plan_node_id,
+                        source
+                            .feedback_bindings
+                            .iter()
+                            .map(|(binding_id, _)| *binding_id),
+                    )
+                {
+                    feedback_wait_deadline = Some(
+                        feedback_wait_deadline
+                            .map_or(deadline, |current: Instant| current.min(deadline)),
+                    );
+                    continue;
+                }
+                source.initial_wait_deadline = None;
+            }
+            let dynamic_filter = source
+                .feedback
+                .snapshot_for_scan(plan_node_id, &source.feedback_bindings);
+            selected = Some((index, Some(dynamic_filter)));
+            break;
+        }
+
+        let Some((index, dynamic_filter)) = selected else {
+            if !pending {
+                return Ok(RoundSplitEnumeration::Finished);
+            }
+            let wait = feedback_wait_deadline.map_or(IDLE_PUMP_BACKOFF, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(IDLE_PUMP_BACKOFF)
+            });
+            return Ok(RoundSplitEnumeration::Idle(wait));
+        };
+        self.next_source = (index + 1) % source_count.max(1);
+        let source = self.sources[index]
+            .take()
+            .expect("the selected source remains owned by the round");
+        Ok(RoundSplitEnumeration::Ready(RoundSplitEnumerationRequest {
+            slot: index,
+            source,
+            dynamic_filter,
+            started_at: self.started_at,
+            initial_dynamic_filter_wait_cap: self.initial_dynamic_filter_wait_cap,
+        }))
+    }
+
+    /// Performs the only Connector call in one ordinary blocking job.
+    pub(crate) fn enumerate_source(
+        mut request: RoundSplitEnumerationRequest,
+    ) -> RoundSplitEnumerationResult {
+        let plan_node_id = request.source.plan_node_id;
+        let batch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(dynamic_filter) = request.dynamic_filter.as_ref() else {
+                let requested = request
+                    .source
+                    .source
+                    .initial_dynamic_filter_wait_request()
+                    .min(request.initial_dynamic_filter_wait_cap);
+                request.source.initial_wait_initialized = true;
+                request.source.initial_wait_deadline =
+                    (!requested.is_zero()).then(|| request.started_at + requested);
+                return Ok(None);
+            };
+            request
+                .source
+                .source
+                .next_batch(DEFAULT_PUMP_BATCH_SIZE, dynamic_filter)
+                .map(Some)
+        }))
+        .map_err(|_| SplitAssignmentDriverError::SplitSource {
+            plan_node_id,
+            detail: "split source panicked while enumerating".to_owned(),
+        })
+        .and_then(|batch| {
+            batch.map_err(|error| SplitAssignmentDriverError::SplitSource {
+                plan_node_id,
+                detail: error.to_string(),
+            })
+        });
+        RoundSplitEnumerationResult {
+            slot: request.slot,
+            source: request.source,
+            batch,
+        }
+    }
+
+    /// Restores the source before the batch can change driver state.
+    pub(crate) fn adopt_enumeration(
+        &mut self,
+        result: RoundSplitEnumerationResult,
+    ) -> Result<
+        Option<(
+            i32,
+            ConnectorSplitBatch<novarocks_spi::connector::read_stack::ConnectorReadSplit>,
+        )>,
+        SplitAssignmentDriverError,
+    > {
+        let plan_node_id = result.source.plan_node_id;
+        let slot = self
+            .sources
+            .get_mut(result.slot)
+            .expect("an enumerated source retains its exact round slot");
+        assert!(
+            slot.is_none(),
+            "an enumerated source can be adopted only once"
+        );
+        *slot = Some(result.source);
+        result
+            .batch
+            .map(|batch| batch.map(|batch| (plan_node_id, batch)))
+    }
+
+    /// Applies one already-enumerated batch and performs its TaskUpdate waits.
+    ///
+    /// This method must run outside Connector ordinary admission.
+    pub(crate) fn deliver(
+        &mut self,
+        plan_node_id: i32,
+        batch: ConnectorSplitBatch<novarocks_spi::connector::read_stack::ConnectorReadSplit>,
+    ) -> Result<bool, SplitAssignmentDriverError> {
+        let no_more_splits = batch.no_more_splits();
+        let splits = batch
+            .into_splits()
+            .into_iter()
+            .map(super::super::connector_domain::Split::new)
+            .collect::<Vec<_>>();
+        let has_work = !splits.is_empty();
+        if !has_work && !no_more_splits {
+            return Ok(false);
+        }
+        let placement = self.driver.distribute(plan_node_id, splits)?;
+        self.driver
+            .start_delivery(plan_node_id, placement, no_more_splits)?;
+        Ok(true)
+    }
+
+    pub(crate) fn drive_delivery(&mut self) -> Result<bool, SplitAssignmentDriverError> {
+        self.driver.drive_delivery()
+    }
+
+    pub(crate) fn next_delivery_wake_at(&self) -> Option<Instant> {
+        self.driver.next_delivery_wake_at()
+    }
+
+    pub(crate) fn delivery_in_progress(&self) -> bool {
+        self.driver.delivery_in_progress()
+    }
+
+    pub(crate) fn close_source(mut source: RoundSplitSource) {
+        if let Err(error) = source.source.close() {
+            tracing::warn!(
+                plan_node_id = source.plan_node_id,
+                error = %error,
+                "closing a split source failed"
+            );
+        }
+        emit_split_source_close_marker(source.plan_node_id);
     }
 
     /// Idempotent. Closes the driver and every source exactly once.
@@ -226,10 +372,10 @@ impl RoundSplitAssignment {
         self.closed = true;
         self.stop.stop();
         self.driver.close();
-        for entry in &mut self.sources {
-            // A source close may race an outstanding batch; the connector
-            // contract makes it idempotent, and a batch that already completed
-            // normally may still be returned to whoever asked for it.
+        for entry in self.sources.iter_mut().flatten() {
+            // An in-flight source is moved out of this collection. The serial
+            // pump adopts it before normal close, while an abandoned owner
+            // sends it through the separate protected reaper.
             let _ = entry.source.close();
             // Acceptance evidence: a pre-ControlReady replan must close the
             // old round's sources rather than reuse them, and this is the only
@@ -276,22 +422,30 @@ mod tests {
     use novarocks_types::{AttemptId, QueryId};
 
     use crate::query_execution::connector_domain::TaskUpdateRequest;
-    use crate::query_execution::split_assignment::{TaskUpdateOutcome, TaskUpdateTransportError};
+    use crate::query_execution::split_assignment::{
+        TaskUpdateOutcome, TaskUpdateTicket, TaskUpdateTransportError,
+    };
 
     use super::*;
 
     struct NeverSend;
 
     impl TaskUpdateTransport for NeverSend {
-        fn send(
+        fn begin(
             &self,
             _execution_id: QueryExecutionId,
             _target: &AssignmentTarget,
             _request: &TaskUpdateRequest,
-            _timeout: std::time::Duration,
-            _stop: &SplitAssignmentStop,
-        ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+        ) -> Result<TaskUpdateTicket, TaskUpdateTransportError> {
             panic!("closing a round must not send a task update")
+        }
+
+        fn poll(
+            &self,
+            _ticket: TaskUpdateTicket,
+            _stop: &SplitAssignmentStop,
+        ) -> Option<Result<TaskUpdateOutcome, TaskUpdateTransportError>> {
+            panic!("closing a round must not poll a task update")
         }
     }
 
@@ -386,6 +540,7 @@ mod tests {
                         .expect("empty feedback declaration"),
                 ),
                 feedback_bindings: Vec::new(),
+                initial_wait_initialized: false,
                 initial_wait_deadline: None,
             }],
             TaskUpdateRetryPolicy::default(),

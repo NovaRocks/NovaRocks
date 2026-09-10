@@ -61,7 +61,8 @@ use super::query_registry::{
 };
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::split_assignment_round::{
-    RoundSplitAssignmentPlan, SplitAssignmentRoundGuard, assignment_endpoints, assignment_targets,
+    OpenRoundSplitSources, RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
+    assignment_endpoints, assignment_targets,
 };
 use super::task_round::{
     AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
@@ -701,6 +702,7 @@ impl FrontendDistributedQueryCoordinator {
             Arc::clone(&feedback_state),
             self.connector_split_initial_dynamic_filter_wait_cap,
             &connector_context,
+            self.data_runtime.connector_blocking_io().clone(),
         )?;
         // A source open may load manifest metadata under the request-local
         // resolver and collect one exact vended response. Seal that collector
@@ -1031,6 +1033,22 @@ impl FrontendDistributedQueryCoordinator {
         );
         let root_task = round.root_task();
 
+        // Split enumeration is another per-attempt owner on the same serial
+        // turn. Its synchronous Connector calls run under process admission,
+        // while TaskUpdate submission and acknowledgement observation remain
+        // outside that permit.
+        let mut split_assignment = split_assignment_plan.and_then(|plan| {
+            SplitAssignmentRoundGuard::install(
+                &mut round,
+                execution_id,
+                plan,
+                Arc::clone(&split_delivery) as Arc<dyn TaskUpdateTransport>,
+                self.data_runtime.clone(),
+                Arc::clone(&wake)
+                    as Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
+            )
+        });
+
         // The two per-attempt feedback loops. Both hang on the runner's one
         // pump seam rather than on call sites in the drive loop below: see
         // `TaskRound::turn` for why they land between the status fold and
@@ -1063,18 +1081,6 @@ impl FrontendDistributedQueryCoordinator {
         } else {
             None
         };
-
-        // Started as soon as the substrate exists rather than after a staging
-        // barrier this path does not have: a delivery for a task that is still
-        // creating is queued on that task and drains when its create is
-        // acknowledged.
-        let mut split_assignment = split_assignment_plan.and_then(|plan| {
-            SplitAssignmentRoundGuard::start(
-                execution_id,
-                plan,
-                Arc::clone(&split_delivery) as Arc<dyn TaskUpdateTransport>,
-            )
-        });
 
         let mut final_task_info = FinalTaskInfoCollector::new(
             result_transport.as_ref(),
@@ -1230,7 +1236,7 @@ impl FrontendDistributedQueryCoordinator {
             // a worker that stopped because every source went terminal is the
             // normal case and says nothing about the query.
             let delivery_failure = split_assignment
-                .as_mut()
+                .as_ref()
                 .and_then(SplitAssignmentRoundGuard::failure)
                 .map(|error| format!("split assignment stopped delivering: {error}"));
             if let Some(detail) = delivery_failure {
@@ -1649,10 +1655,11 @@ impl FrontendDistributedQueryCoordinator {
                     execution_started,
                     None,
                 );
-                if !assignment.is_finished() {
+                let abandoned = !assignment.is_finished();
+                if abandoned {
                     split_delivery.abandon("split assignment round ended with the attempt");
                 }
-                match assignment.finish() {
+                match assignment.finish_after_attempt(abandoned) {
                     Ok(profile) => {
                         emit_distributed_write_phase_marker(
                             intent,
@@ -4302,7 +4309,7 @@ fn abort_task_round(round: &mut TaskRound, reason: &str) {
 ///
 /// Enumeration itself does not happen here: `get_splits` hands back a source
 /// the round pumps. Returning `None` means this query reads nothing through a
-/// connector, so no pump thread is started at all.
+/// connector, so no split pump is installed.
 ///
 /// The session is minted per round rather than reused from preparation:
 /// preparation runs before the execution id exists, so there is no session to
@@ -4315,6 +4322,7 @@ fn prepare_round_split_assignment(
     feedback: Arc<RuntimeFilterFeedbackState>,
     initial_dynamic_filter_wait_cap: Duration,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
 ) -> Result<Option<RoundSplitAssignmentPlan>, DistributedQueryError> {
     let scan_nodes = artifacts
         .typed_scans()
@@ -4324,7 +4332,7 @@ fn prepare_round_split_assignment(
         return Ok(None);
     }
     let session = crate::query_execution::compiler::typed_connector_session().map_err(failed)?;
-    let mut sources = Vec::with_capacity(scan_nodes.len());
+    let mut sources = OpenRoundSplitSources::with_capacity(scan_nodes.len(), blocking_io.clone());
     for (fragment_id, plan_node_id, scan) in artifacts.typed_scans() {
         let table_scan = &scan.prepared.table_scan;
         let access = artifacts
@@ -4367,13 +4375,14 @@ fn prepare_round_split_assignment(
             encoder: capabilities.encoder(),
             feedback: Arc::clone(&feedback),
             feedback_bindings: feedback_bindings(table_scan),
+            initial_wait_initialized: false,
             initial_wait_deadline: None,
         });
     }
     let targets = assignment_targets(schedule, &scan_nodes);
     // Every scan node must have somewhere to send its work. An empty task set
     // would silently drop every split of that scan.
-    for plan_node_id in sources.iter().map(|source| source.plan_node_id) {
+    for plan_node_id in sources.plan_node_ids() {
         if targets
             .get(&plan_node_id)
             .is_none_or(|targets| targets.is_empty())
@@ -4383,12 +4392,14 @@ fn prepare_round_split_assignment(
             )));
         }
     }
+    let sources = sources.into_sources();
     Ok(Some(RoundSplitAssignmentPlan::new(
         targets,
         sources,
         retry_policy,
         initial_dynamic_filter_wait_cap,
         assignment_endpoints(schedule),
+        blocking_io,
     )))
 }
 

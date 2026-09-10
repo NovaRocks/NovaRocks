@@ -94,6 +94,7 @@ impl std::error::Error for ConnectorBlockingIoError {}
 /// A submitted call whose result can be polled by an existing serial owner.
 pub(crate) struct ConnectorBlockingIoJob<T> {
     outcome: Arc<Mutex<Option<Result<T, ConnectorBlockingIoError>>>>,
+    ready: Arc<tokio::sync::Notify>,
 }
 
 impl<T> ConnectorBlockingIoJob<T> {
@@ -102,6 +103,21 @@ impl<T> ConnectorBlockingIoJob<T> {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
+    }
+
+    /// Waits asynchronously for the admitted call to publish its outcome.
+    ///
+    /// The polling accessor remains useful to serial owners such as credential
+    /// rotation. Split assignment uses this form to wake its serial round only
+    /// after the blocking worker has released the Connector permit.
+    pub(crate) async fn finish(self) -> Result<T, ConnectorBlockingIoError> {
+        loop {
+            let notified = self.ready.notified();
+            if let Some(outcome) = self.try_take() {
+                return outcome;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -131,6 +147,19 @@ impl ConnectorBlockingIoSupervisor {
         self.spawn(false, call)
     }
 
+    /// Submit ordinary split-source work.
+    ///
+    /// Only the synchronous Connector call belongs inside `call`; transport
+    /// acknowledgement and retry waits must run after this job has finished so
+    /// they cannot consume the ordinary capacity reserved for enumeration.
+    pub(crate) fn spawn_ordinary<T, F>(&self, call: F) -> ConnectorBlockingIoJob<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.spawn(true, call)
+    }
+
     fn spawn<T, F>(&self, ordinary: bool, call: F) -> ConnectorBlockingIoJob<T>
     where
         T: Send + 'static,
@@ -138,6 +167,8 @@ impl ConnectorBlockingIoSupervisor {
     {
         let outcome = Arc::new(Mutex::new(None));
         let published = Arc::clone(&outcome);
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let publish_ready = Arc::clone(&ready);
         let total = Arc::clone(&self.total);
         let ordinary_permits = Arc::clone(&self.ordinary);
         self.runtime.spawn(async move {
@@ -145,7 +176,11 @@ impl ConnectorBlockingIoSupervisor {
                 match ordinary_permits.acquire_owned().await {
                     Ok(permit) => Some(permit),
                     Err(_) => {
-                        publish_error(&published, "connector blocking-I/O ordinary lane closed");
+                        publish_error(
+                            &published,
+                            &publish_ready,
+                            "connector blocking-I/O ordinary lane closed",
+                        );
                         return;
                     }
                 }
@@ -155,7 +190,11 @@ impl ConnectorBlockingIoSupervisor {
             let total_permit = match total.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    publish_error(&published, "connector blocking-I/O supervisor closed");
+                    publish_error(
+                        &published,
+                        &publish_ready,
+                        "connector blocking-I/O supervisor closed",
+                    );
                     return;
                 }
             };
@@ -172,15 +211,24 @@ impl ConnectorBlockingIoSupervisor {
                 detail: format!("connector blocking-I/O worker failed: {error}"),
             });
             *published.lock().unwrap_or_else(|error| error.into_inner()) = Some(completed);
+            // Each job has exactly one consuming waiter. A stored single
+            // permit also covers completion before `finish` registers, while
+            // `notify_waiters` would lose that notification.
+            publish_ready.notify_one();
         });
-        ConnectorBlockingIoJob { outcome }
+        ConnectorBlockingIoJob { outcome, ready }
     }
 }
 
-fn publish_error<T>(slot: &Arc<Mutex<Option<Result<T, ConnectorBlockingIoError>>>>, detail: &str) {
+fn publish_error<T>(
+    slot: &Arc<Mutex<Option<Result<T, ConnectorBlockingIoError>>>>,
+    ready: &tokio::sync::Notify,
+    detail: &str,
+) {
     *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(Err(ConnectorBlockingIoError {
         detail: detail.to_owned(),
     }));
+    ready.notify_one();
 }
 
 #[cfg(test)]
@@ -292,5 +340,32 @@ mod tests {
         observe_second_start
             .recv_timeout(Duration::from_secs(2))
             .expect("second ordinary call did not start");
+    }
+
+    #[test]
+    fn async_finish_observes_completion_published_before_it_waits() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let supervisor = ConnectorBlockingIoSupervisor::new(
+            runtime.handle().clone(),
+            ConnectorBlockingIoBudget::try_new(2, 1).expect("budget"),
+        );
+        let job = supervisor.spawn_ordinary(|| 17_u8);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while job
+            .outcome
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "job did not publish completion");
+            std::thread::yield_now();
+        }
+
+        assert_eq!(runtime.block_on(job.finish()).expect("finished job"), 17);
     }
 }

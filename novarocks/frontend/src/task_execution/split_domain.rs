@@ -82,6 +82,7 @@ pub(crate) fn delivery_action(error: &SplitAssignmentDriverError) -> FrontendAct
     match error {
         SplitAssignmentDriverError::Transport { .. } => FrontendAction::RetryExactRequest,
         SplitAssignmentDriverError::Closed => FrontendAction::StopSendingAndReconcile,
+        SplitAssignmentDriverError::DeliveryInProgress => FrontendAction::FailAttempt,
         SplitAssignmentDriverError::Rejected { .. }
         | SplitAssignmentDriverError::Assignment(_)
         | SplitAssignmentDriverError::NoAdmittedTask { .. }

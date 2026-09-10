@@ -17,14 +17,11 @@
 
 //! The split-assignment delivery bridge.
 //!
-//! `SplitAssignmentDriver` delivers splits through a synchronous port and runs
-//! the ADR-0123 retry machinery around it: it holds the immutable request
-//! until a strict Accepted acknowledgement, resends only that identical
-//! request after a genuinely unknown outcome, bounds each attempt and the
-//! total error duration by frozen config, and interrupts its backoff on round
-//! stop. The task protocol is the opposite shape: `QueryTaskExecution` is a
-//! single-owner state machine that batches operations and settles them later
-//! from acknowledgements.
+//! `SplitAssignmentDriver` opens a delivery and polls it on later round turns.
+//! It retains the immutable request until a strict acknowledgement, reattaches
+//! only that request after a genuinely unknown outcome, and owns the bounded
+//! retry timing. `QueryTaskExecution` remains the single owner that batches,
+//! releases, and settles the underlying task operation.
 //!
 //! This module bridges the two without reimplementing either. Nothing here
 //! decides whether a request may be resent, how long to wait, or when a round
@@ -32,24 +29,21 @@
 //! [`super::split_domain`] owns the address and verdict vocabulary the two
 //! sides share.
 //!
-//! It is two halves over one shared state, because `QueryTaskExecution` takes
-//! `&mut self` and belongs to the round runner while the driver runs on its
-//! own blocking worker thread:
+//! It is two halves over one shared state because `QueryTaskExecution` and the
+//! split pump advance serially during the same `TaskRound` turn:
 //!
 //! - the transport half ([`TaskUpdateTransport`]) translates one request into
-//!   task-domain updates, hands them to the shared state, and blocks its
-//!   caller until that submission settles, its timeout elapses, or the round
-//!   is abandoned;
+//!   a task-domain update and returns a ticket that later polls observe;
 //! - the owner half ([`SplitDeliveryBridge::take_pending`],
 //!   [`SplitDeliveryBridge::admit`], [`SplitDeliveryBridge::settle`]) is what
 //!   the round runner calls on its own turn.
 //!
-//! The binding from a substrate operation to a blocked sender is established
+//! The binding from a substrate operation to a delivery ticket is established
 //! by [`SplitDeliverySink`], a pass-through observer over the operation sink.
 //! A released `UpdateTask` is the only place where an operation id and the
 //! split domain it carries are both visible, and a failed-closed
 //! acknowledgement carries no receipt, so routing by the acknowledgement's own
-//! identity would strand exactly the senders that must not keep waiting.
+//! identity would strand exactly the tickets that must be resolved.
 //!
 //! The acknowledgement itself reaches the owner half through
 //! [`super::round::AcknowledgementObserver`]: the round runner is the only
@@ -58,8 +52,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use novarocks_execution::task_execution::{
     ContentFingerprint, DomainProgression, OperationKind, PlanNodeId, SplitAssignmentIntent,
@@ -81,7 +74,7 @@ use super::intent::{
 use super::remote_task::UpdateAdmission;
 use crate::query_execution::connector_domain::TaskUpdateRequest;
 use crate::query_execution::split_assignment::{
-    AcceptedPlanNode, AssignmentTarget, SplitAssignmentStop, TaskUpdateOutcome,
+    AcceptedPlanNode, AssignmentTarget, SplitAssignmentStop, TaskUpdateOutcome, TaskUpdateTicket,
     TaskUpdateTransport, TaskUpdateTransportError,
 };
 
@@ -207,15 +200,10 @@ struct DeliveryState {
 /// The shared state both halves own.
 #[derive(Debug)]
 pub(crate) struct SplitDeliveryBridge {
+    execution_id: QueryExecutionId,
     /// Frozen with the graph, before the substrate takes ownership of it.
     tasks: BTreeMap<UniqueId, TaskId>,
     state: Mutex<DeliveryState>,
-    /// Woken by [`SplitDeliveryBridge::settle`],
-    /// [`SplitDeliveryBridge::admit`] and
-    /// [`SplitDeliveryBridge::abandon`]. A sender never sleeps on a poll
-    /// interval: it waits once for the whole remaining timeout and is woken
-    /// early by whichever of those calls resolves it.
-    settled: Condvar,
 }
 
 impl SplitDeliveryBridge {
@@ -226,14 +214,17 @@ impl SplitDeliveryBridge {
     /// the driver's addresses are resolved by the one module that owns that
     /// translation.
     pub(crate) fn for_graph(graph: &TaskGraph) -> Arc<Self> {
-        Self::with_tasks(super::split_domain::task_kernel_index(graph))
+        Self::with_tasks(
+            graph.execution_id(),
+            super::split_domain::task_kernel_index(graph),
+        )
     }
 
-    fn with_tasks(tasks: BTreeMap<UniqueId, TaskId>) -> Arc<Self> {
+    fn with_tasks(execution_id: QueryExecutionId, tasks: BTreeMap<UniqueId, TaskId>) -> Arc<Self> {
         Arc::new(Self {
+            execution_id,
             tasks,
             state: Mutex::new(DeliveryState::default()),
-            settled: Condvar::new(),
         })
     }
 
@@ -368,7 +359,6 @@ impl SplitDeliveryBridge {
             state.by_operation.remove(&operation_id);
         }
         drop(state);
-        self.settled.notify_all();
         Ok(if retained {
             SettleVerdict::Retained
         } else {
@@ -396,7 +386,6 @@ impl SplitDeliveryBridge {
                 live.outcome = Some(DeliveryOutcome::Unknown(reason.clone()));
             }
         }
-        self.settled.notify_all();
     }
 
     fn note_released(&self, released: &[(TaskOperationId, TaskId)]) {
@@ -447,8 +436,34 @@ impl SplitDeliveryBridge {
             };
             live.outcome = Some(outcome);
         }
-        self.settled.notify_all();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl SplitDeliveryBridge {
+    /// Synchronous test adapter over the production begin/poll contract.
+    fn send(
+        &self,
+        execution_id: QueryExecutionId,
+        target: &AssignmentTarget,
+        request: &TaskUpdateRequest,
+        timeout: std::time::Duration,
+        stop: &SplitAssignmentStop,
+    ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+        let ticket = self.begin(execution_id, target, request)?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(outcome) = self.poll(ticket, stop) {
+                return outcome;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(TaskUpdateTransportError::retryable_network(
+                    "test delivery was not acknowledged before its deadline",
+                ));
+            }
+            std::thread::yield_now();
+        }
     }
 }
 
@@ -511,14 +526,27 @@ impl DeliveryState {
 }
 
 impl TaskUpdateTransport for SplitDeliveryBridge {
-    fn send(
+    fn begin(
         &self,
-        _execution_id: QueryExecutionId,
+        execution_id: QueryExecutionId,
         target: &AssignmentTarget,
         request: &TaskUpdateRequest,
-        timeout: Duration,
-        stop: &SplitAssignmentStop,
-    ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+    ) -> Result<TaskUpdateTicket, TaskUpdateTransportError> {
+        if execution_id != self.execution_id {
+            return Err(TaskUpdateTransportError::fatal(format!(
+                "split delivery belongs to {:?}, not {:?}",
+                self.execution_id, execution_id
+            )));
+        }
+        if request.fragment_instance_id() != target.fragment_instance_id {
+            return Err(TaskUpdateTransportError::fatal(format!(
+                "split delivery request {:x}:{:x} does not match target {:x}:{:x}",
+                request.fragment_instance_id().high(),
+                request.fragment_instance_id().low(),
+                target.fragment_instance_id.high(),
+                target.fragment_instance_id.low(),
+            )));
+        }
         let task = *self
             .tasks
             .get(&target.fragment_instance_id)
@@ -531,38 +559,32 @@ impl TaskUpdateTransport for SplitDeliveryBridge {
             })?;
         let update = task_update(request).map_err(TaskUpdateTransportError::fatal)?;
 
-        let deadline = Instant::now() + timeout;
         let mut state = self.lock();
         let delivery = state
             .attach_or_open(task, update)
             .map_err(TaskUpdateTransportError::fatal)?;
-        loop {
-            if let Some(outcome) = state.take_outcome(delivery) {
-                return delivered(outcome);
-            }
-            // The round's stop handle has its own condition variable, which
-            // this bridge cannot be woken by. `abandon` is the prompt path;
-            // this check keeps a stop that only reached the driver correct,
-            // and the driver bounds the wait by the same per-attempt timeout
-            // it bounds every delivery attempt with.
-            if stop.is_stopped() {
-                return Err(TaskUpdateTransportError::retryable_network(
-                    "split assignment round stopped while a task update was outstanding",
-                ));
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(TaskUpdateTransportError::retryable_network(format!(
-                    "task update to backend {} was not acknowledged within {} ms",
-                    target.backend_idx,
-                    timeout.as_millis(),
-                )));
-            };
-            let (guard, _) = self
-                .settled
-                .wait_timeout(state, remaining)
-                .expect("split delivery condvar");
-            state = guard;
+        Ok(TaskUpdateTicket(delivery.0))
+    }
+
+    fn poll(
+        &self,
+        ticket: TaskUpdateTicket,
+        stop: &SplitAssignmentStop,
+    ) -> Option<Result<TaskUpdateOutcome, TaskUpdateTransportError>> {
+        if stop.is_stopped() {
+            return Some(Err(TaskUpdateTransportError::closed(
+                "split assignment round stopped while a task update was outstanding",
+            )));
         }
+        let delivery = DeliveryId(ticket.0);
+        let mut state = self.lock();
+        if !state.live.contains_key(&delivery) {
+            return Some(Err(TaskUpdateTransportError::fatal(format!(
+                "split delivery {} is not live",
+                delivery.0
+            ))));
+        }
+        state.take_outcome(delivery).map(delivered)
     }
 }
 
@@ -749,6 +771,7 @@ fn fingerprint(intent: &SplitAssignmentIntent) -> ContentFingerprint {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use novarocks_execution::task_execution::{
         DomainProgression, OperationOutcome, PlanNodeSplitReceipt, SplitOffer, SplitWatermark,
@@ -760,6 +783,7 @@ mod tests {
     use novarocks_types::{AttemptId, QueryId};
 
     use crate::query_execution::connector_domain::PlanNodeAssignmentState;
+    use crate::query_execution::split_assignment::TaskUpdateTransportErrorKind;
 
     use super::*;
 
@@ -858,7 +882,7 @@ mod tests {
     }
 
     fn bridge() -> Arc<SplitDeliveryBridge> {
-        SplitDeliveryBridge::with_tasks(BTreeMap::from([(FINST, task_id())]))
+        SplitDeliveryBridge::with_tasks(execution_id(), BTreeMap::from([(FINST, task_id())]))
     }
 
     fn target() -> AssignmentTarget {
@@ -1004,6 +1028,22 @@ mod tests {
     }
 
     #[test]
+    fn local_round_stop_is_closed_without_entering_unknown_retry() {
+        let bridge = bridge();
+        let stop = SplitAssignmentStop::default();
+        let ticket = bridge
+            .begin(execution_id(), &target(), &terminal_request(true))
+            .expect("the exact attempt may open a delivery");
+        stop.stop();
+
+        let error = bridge
+            .poll(ticket, &stop)
+            .expect("a stopped round settles locally")
+            .expect_err("a stopped round cannot keep delivering");
+        assert_eq!(error.kind(), TaskUpdateTransportErrorKind::Closed);
+    }
+
+    #[test]
     fn an_abandoned_round_reports_an_unknown_outcome_rather_than_a_local_close() {
         // Only the driver may conclude that its round is closed; it re-reads
         // its own stop handle before it resends. A transport that claimed
@@ -1031,9 +1071,8 @@ mod tests {
 
     #[test]
     fn a_stopped_round_does_not_leave_a_sender_waiting_for_a_settlement() {
-        // The round stop reaches the driver, not this bridge's condition
-        // variable. A sender must still observe it rather than wait out the
-        // whole error budget.
+        // A local round stop is a closed owner, not an unknown remote
+        // outcome. The sender must observe it without entering retry backoff.
         let bridge = bridge();
         let stop = SplitAssignmentStop::default();
         stop.stop();
@@ -1048,7 +1087,7 @@ mod tests {
             .expect_err("a stopped round settles nothing");
         assert_eq!(
             error.kind(),
-            crate::query_execution::split_assignment::TaskUpdateTransportErrorKind::RetryableNetwork
+            crate::query_execution::split_assignment::TaskUpdateTransportErrorKind::Closed
         );
     }
 
@@ -1389,7 +1428,7 @@ mod tests {
     fn an_unknown_fragment_instance_is_refused_rather_than_delivered_elsewhere() {
         // The fragment instance id is the kernel key. Guessing a task for an
         // unknown one would send a scan's splits to a different scan.
-        let bridge = SplitDeliveryBridge::with_tasks(BTreeMap::new());
+        let bridge = SplitDeliveryBridge::with_tasks(execution_id(), BTreeMap::new());
         let error = bridge
             .send(
                 execution_id(),
@@ -1404,6 +1443,40 @@ mod tests {
             crate::query_execution::split_assignment::TaskUpdateTransportErrorKind::Fatal
         );
         assert!(error.detail().contains("is not a task of this attempt"));
+    }
+
+    #[test]
+    fn a_delivery_for_another_attempt_is_refused_before_task_lookup() {
+        let bridge = bridge();
+        let other_attempt = QueryExecutionId::new(
+            execution_id().query_id(),
+            AttemptId::new(2).expect("attempt"),
+        )
+        .expect("execution id");
+        let request = TaskUpdateRequest::new(FINST, Vec::new());
+
+        let error = bridge
+            .begin(other_attempt, &target(), &request)
+            .expect_err("another attempt cannot attach to this bridge");
+        assert_eq!(error.kind(), TaskUpdateTransportErrorKind::Fatal);
+        assert!(error.detail().contains("split delivery belongs"));
+    }
+
+    #[test]
+    fn a_request_for_another_fragment_is_refused_before_task_lookup() {
+        let bridge = bridge();
+        let mut wrong_target = target();
+        wrong_target.fragment_instance_id = UniqueId::new(31, 41);
+
+        let error = bridge
+            .begin(execution_id(), &wrong_target, &terminal_request(true))
+            .expect_err("request and target identities must be indivisible");
+
+        assert_eq!(
+            error.kind(),
+            crate::query_execution::split_assignment::TaskUpdateTransportErrorKind::Fatal
+        );
+        assert!(error.detail().contains("does not match target"));
     }
 
     #[test]

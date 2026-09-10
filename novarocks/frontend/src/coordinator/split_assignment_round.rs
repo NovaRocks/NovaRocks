@@ -15,28 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The coordinator's per-round split-assignment worker.
+//! The coordinator's per-round split-assignment pump.
 //!
-//! A scan blocks until splits arrive, and the statement thread blocks fetching
-//! results, so the pump cannot share either. It runs on its own thread for the
-//! life of one execution round, and the guard below closes it on every exit
-//! path — success, failure, cancellation, or timeout — because a round that
-//! left its sources open would leak a connector's enumeration state past the
-//! attempt that owned it.
+//! The pump advances as part of `TaskRound`. Each synchronous Connector call
+//! moves one source into the process ordinary blocking-I/O lane; TaskUpdate
+//! submission, acknowledgement, retry delay, and source-owner bookkeeping stay
+//! on the serial round without occupying that lane. The guard only signals
+//! stop, so cancellation and drop never join or block an OS thread.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
+use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::artifact::ValidatedFragmentSchedule;
 use crate::query_execution::split_assignment::{
-    AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitSource,
-    SplitAssignmentDriverError, TaskUpdateRetryPolicy, TaskUpdateTransport,
-    emit_split_source_close_marker,
+    AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitEnumeration,
+    RoundSplitEnumerationResult, RoundSplitSource, SplitAssignmentDriverError,
+    TaskUpdateRetryPolicy, TaskUpdateTransport,
 };
+use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
+use crate::task_execution::error::TaskExecutionError;
+use crate::task_execution::execution::QueryTaskExecution;
+use crate::task_execution::round::{TaskRound, TurnPump};
+use crate::task_execution::status_intake::StatusIntakeWake;
 use novarocks_sql::plan_read::FragmentId;
 
 /// How many splits one task may hold before the driver stops pulling for it.
@@ -102,12 +108,68 @@ pub(crate) struct RoundSplitAssignmentPlan {
     /// builds its transport, and a transport built from a later snapshot could
     /// address a process this attempt never scheduled.
     endpoints: Vec<(usize, RuntimeEndpoint)>,
+    blocking_io: ConnectorBlockingIoSupervisor,
+}
+
+/// Sources opened while one round is still being assembled.
+///
+/// Any later scan or target-validation error drops this owner before a plan
+/// exists. Its drop therefore schedules exact close work through protected
+/// lifecycle capacity instead of relying on `Box` destruction to release a
+/// Connector's enumeration state.
+pub(crate) struct OpenRoundSplitSources {
+    sources: Vec<RoundSplitSource>,
+    blocking_io: ConnectorBlockingIoSupervisor,
+}
+
+impl OpenRoundSplitSources {
+    pub(crate) fn with_capacity(
+        capacity: usize,
+        blocking_io: ConnectorBlockingIoSupervisor,
+    ) -> Self {
+        Self {
+            sources: Vec::with_capacity(capacity),
+            blocking_io,
+        }
+    }
+
+    pub(crate) fn push(&mut self, source: RoundSplitSource) {
+        self.sources.push(source);
+    }
+
+    pub(crate) fn plan_node_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.sources.iter().map(|source| source.plan_node_id)
+    }
+
+    pub(crate) fn into_sources(mut self) -> Vec<RoundSplitSource> {
+        std::mem::take(&mut self.sources)
+    }
+}
+
+impl Drop for OpenRoundSplitSources {
+    fn drop(&mut self) {
+        schedule_source_close(&self.blocking_io, std::mem::take(&mut self.sources));
+    }
+}
+
+fn schedule_source_close(
+    blocking_io: &ConnectorBlockingIoSupervisor,
+    sources: Vec<RoundSplitSource>,
+) {
+    if sources.is_empty() {
+        return;
+    }
+    let _ = blocking_io.spawn_protected(move || {
+        for source in sources {
+            RoundSplitAssignment::close_source(source);
+        }
+    });
 }
 
 impl RoundSplitAssignmentPlan {
     /// Everything but the delivery transport.
     ///
-    /// The transport arrives at [`SplitAssignmentRoundGuard::start`] because
+    /// The transport arrives at [`SplitAssignmentRoundGuard::install`] because
     /// the two are frozen at different moments: sources must be open before
     /// the attempt's credential leases are sealed, while the task substrate's
     /// delivery bridge cannot exist until the task graph does -- and the graph
@@ -118,6 +180,7 @@ impl RoundSplitAssignmentPlan {
         retry_policy: TaskUpdateRetryPolicy,
         initial_dynamic_filter_wait_cap: std::time::Duration,
         endpoints: Vec<(usize, RuntimeEndpoint)>,
+        blocking_io: ConnectorBlockingIoSupervisor,
     ) -> Self {
         Self {
             targets,
@@ -125,6 +188,7 @@ impl RoundSplitAssignmentPlan {
             retry_policy,
             initial_dynamic_filter_wait_cap,
             endpoints,
+            blocking_io,
         }
     }
 
@@ -141,45 +205,289 @@ impl RoundSplitAssignmentPlan {
 
 impl Drop for RoundSplitAssignmentPlan {
     fn drop(&mut self) {
-        for source in &mut self.sources {
-            if let Err(error) = source.source.close() {
-                tracing::warn!(
-                    plan_node_id = source.plan_node_id,
-                    error = %error,
-                    "closing an unstarted split source failed"
-                );
+        schedule_source_close(&self.blocking_io, std::mem::take(&mut self.sources));
+    }
+}
+
+struct OwnerSlot<T> {
+    owner_live: bool,
+    result: Option<T>,
+}
+
+impl<T> OwnerSlot<T> {
+    fn publish(&mut self, result: T) -> Result<(), T> {
+        if self.owner_live {
+            self.result = Some(result);
+            Ok(())
+        } else {
+            Err(result)
+        }
+    }
+
+    fn abandon(&mut self) -> Option<T> {
+        self.owner_live = false;
+        self.result.take()
+    }
+}
+
+struct SplitAssignmentPump {
+    assignment: Option<RoundSplitAssignment>,
+    stop: RoundSplitAssignmentStop,
+    data_runtime: FrontendDataRuntime,
+    wake: Arc<dyn StatusIntakeWake>,
+    enumeration: Arc<Mutex<OwnerSlot<Result<RoundSplitEnumerationResult, String>>>>,
+    enumeration_in_flight: bool,
+    retry_at: Option<Instant>,
+    timer_at: Option<Instant>,
+    failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
+    outcome: Arc<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
+    closing: bool,
+}
+
+impl SplitAssignmentPump {
+    const PUMP_NAME: &'static str = "split_assignment";
+
+    fn arm_wake(&mut self, deadline: Instant) {
+        if self.timer_at.is_some_and(|armed| armed <= deadline) {
+            return;
+        }
+        self.timer_at = Some(deadline);
+        let wake = Arc::clone(&self.wake);
+        self.data_runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            wake.wake();
+        });
+    }
+
+    fn close_source_after_owner_exit(data_runtime: &FrontendDataRuntime, source: RoundSplitSource) {
+        let supervisor = data_runtime.connector_blocking_io().clone();
+        let _ = supervisor.spawn_protected(move || RoundSplitAssignment::close_source(source));
+    }
+
+    fn start_close(&mut self, error: Option<SplitAssignmentDriverError>) {
+        let Some(mut assignment) = self.assignment.take() else {
+            return;
+        };
+        self.closing = true;
+        if let Some(error) = &error {
+            let mut failure = self.failure.lock().unwrap_or_else(|lock| lock.into_inner());
+            if failure.is_none() {
+                *failure = Some(error.clone());
             }
-            // The same evidence a started round emits: a source opened and
-            // closed without ever assigning is still a source that closed.
-            emit_split_source_close_marker(source.plan_node_id);
+        }
+        let failure = Arc::clone(&self.failure);
+        let outcome = Arc::clone(&self.outcome);
+        let wake = Arc::clone(&self.wake);
+        let job = self
+            .data_runtime
+            .connector_blocking_io()
+            .spawn_protected(move || {
+                let profile = assignment.profile_snapshot();
+                assignment.close();
+                profile
+            });
+        self.data_runtime.spawn(async move {
+            let result = match job.finish().await {
+                Ok(profile) => error.map_or(Ok(profile), Err),
+                Err(worker_error) => Err(SplitAssignmentDriverError::SplitSource {
+                    plan_node_id: -1,
+                    detail: worker_error.to_string(),
+                }),
+            };
+            if let Err(error) = &result {
+                let mut failure = failure.lock().unwrap_or_else(|lock| lock.into_inner());
+                if failure.is_none() {
+                    *failure = Some(error.clone());
+                }
+            }
+            *outcome.lock().unwrap_or_else(|lock| lock.into_inner()) = Some(result);
+            wake.wake();
+        });
+    }
+
+    fn start_enumeration(
+        &mut self,
+        request: crate::query_execution::split_assignment::RoundSplitEnumerationRequest,
+    ) {
+        self.enumeration_in_flight = true;
+        let job = self
+            .data_runtime
+            .connector_blocking_io()
+            .spawn_ordinary(move || RoundSplitAssignment::enumerate_source(request));
+        let slot = Arc::clone(&self.enumeration);
+        let runtime = self.data_runtime.clone();
+        let wake = Arc::clone(&self.wake);
+        self.data_runtime.spawn(async move {
+            let result = job.finish().await.map_err(|error| error.to_string());
+            let reap = {
+                let mut slot = slot.lock().unwrap_or_else(|lock| lock.into_inner());
+                slot.publish(result)
+                    .err()
+                    .and_then(Result::ok)
+                    .map(|result| result.source)
+            };
+            if let Some(source) = reap {
+                Self::close_source_after_owner_exit(&runtime, source);
+            }
+            wake.wake();
+        });
+    }
+}
+
+impl TurnPump for SplitAssignmentPump {
+    fn name(&self) -> &'static str {
+        Self::PUMP_NAME
+    }
+
+    fn drive(&mut self, _execution: &mut QueryTaskExecution) -> Result<usize, TaskExecutionError> {
+        if self.closing {
+            return Ok(0);
+        }
+        if self
+            .timer_at
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.timer_at = None;
+        }
+        if self.enumeration_in_flight {
+            let result = self
+                .enumeration
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner())
+                .result
+                .take();
+            let Some(result) = result else {
+                return Ok(0);
+            };
+            self.enumeration_in_flight = false;
+            let result = match result {
+                Ok(result) => result,
+                Err(detail) => {
+                    self.start_close(Some(SplitAssignmentDriverError::SplitSource {
+                        plan_node_id: -1,
+                        detail,
+                    }));
+                    return Ok(1);
+                }
+            };
+            let assignment = self
+                .assignment
+                .as_mut()
+                .expect("an enumeration result retains its assignment owner");
+            let enumerated = assignment.adopt_enumeration(result);
+            if self.stop.is_stopped() {
+                self.start_close(None);
+                return Ok(1);
+            }
+            let enumerated = match enumerated {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.start_close(Some(error));
+                    return Ok(1);
+                }
+            };
+            let Some((plan_node_id, batch)) = enumerated else {
+                return Ok(1);
+            };
+            if let Err(error) = assignment.deliver(plan_node_id, batch) {
+                self.start_close(Some(error));
+                return Ok(1);
+            }
+            return Ok(1);
+        }
+
+        if self.stop.is_stopped() {
+            self.start_close(None);
+            return Ok(1);
+        }
+
+        let assignment = self
+            .assignment
+            .as_mut()
+            .expect("a live split pump owns its assignment");
+        if assignment.delivery_in_progress() {
+            return match assignment.drive_delivery() {
+                Ok(true) => Ok(1),
+                Ok(false) => {
+                    if let Some(deadline) = assignment.next_delivery_wake_at() {
+                        self.arm_wake(deadline);
+                    }
+                    Ok(0)
+                }
+                Err(error) => {
+                    self.start_close(Some(error));
+                    Ok(1)
+                }
+            };
+        }
+        if self
+            .retry_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return Ok(0);
+        }
+        self.retry_at = None;
+        match assignment.enumerate_once() {
+            Ok(RoundSplitEnumeration::Ready(request)) => {
+                self.start_enumeration(request);
+                Ok(1)
+            }
+            Ok(RoundSplitEnumeration::Idle(wait)) => {
+                let retry_at = Instant::now() + wait;
+                self.retry_at = Some(retry_at);
+                self.arm_wake(retry_at);
+                Ok(0)
+            }
+            Ok(RoundSplitEnumeration::Finished) => {
+                self.start_close(None);
+                Ok(1)
+            }
+            Err(error) => {
+                self.start_close(Some(error));
+                Ok(1)
+            }
         }
     }
 }
 
-/// A running round's split-assignment worker.
-///
-/// Dropping it stops the pump and closes every source, so no exit path has to
-/// remember to.
+impl Drop for SplitAssignmentPump {
+    fn drop(&mut self) {
+        self.stop.stop();
+        let pending_source = {
+            let mut slot = self
+                .enumeration
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner());
+            slot.abandon()
+                .and_then(Result::ok)
+                .map(|result| result.source)
+        };
+        if let Some(source) = pending_source {
+            Self::close_source_after_owner_exit(&self.data_runtime, source);
+        }
+        if let Some(mut assignment) = self.assignment.take() {
+            let supervisor = self.data_runtime.connector_blocking_io().clone();
+            let _ = supervisor.spawn_protected(move || assignment.close());
+        }
+    }
+}
+
+/// A nonblocking observation handle for the round-owned split pump.
 pub(crate) struct SplitAssignmentRoundGuard {
     stop: RoundSplitAssignmentStop,
-    worker: Option<std::thread::JoinHandle<Result<SplitSourceProfile, SplitAssignmentDriverError>>>,
-    /// The worker's own verdict, once it has been joined.
-    ///
-    /// Reaped by [`Self::failure`] as soon as the thread stops, so the round
-    /// runner can read a delivery failure while it is still turning. Without
-    /// it the verdict is only visible to [`Self::finish`], which runs after
-    /// the loop -- and a round whose deliverer died never reaches the loop's
-    /// own exit, because the scans it stopped feeding never finish.
-    joined: Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>,
+    failure: Arc<Mutex<Option<SplitAssignmentDriverError>>>,
+    outcome: Arc<Mutex<Option<Result<SplitSourceProfile, SplitAssignmentDriverError>>>>,
 }
 
 impl SplitAssignmentRoundGuard {
-    /// Start pumping. Returns `None` when this round has no typed scan, so a
-    /// query that reads nothing through a connector starts no thread.
-    pub(crate) fn start(
+    /// Installs the pump. Returns `None` when this round has no typed scan.
+    pub(crate) fn install(
+        round: &mut TaskRound,
         execution_id: QueryExecutionId,
         mut plan: RoundSplitAssignmentPlan,
         transport: Arc<dyn TaskUpdateTransport>,
+        data_runtime: FrontendDataRuntime,
+        wake: Arc<dyn StatusIntakeWake>,
     ) -> Option<Self> {
         // Taken, not borrowed: the sources move into the round, so the plan's
         // own drop must not close what the round now owns.
@@ -188,7 +496,7 @@ impl SplitAssignmentRoundGuard {
         if sources.is_empty() {
             return None;
         }
-        let mut assignment = RoundSplitAssignment::new(
+        let assignment = RoundSplitAssignment::new(
             execution_id,
             transport,
             tasks,
@@ -198,48 +506,43 @@ impl SplitAssignmentRoundGuard {
             plan.initial_dynamic_filter_wait_cap,
         );
         let stop = assignment.stop_handle();
-        let worker = std::thread::Builder::new()
-            .name(format!(
-                "split-assign-{:x}-{:x}-{}",
-                execution_id.query_id().high(),
-                execution_id.query_id().low(),
-                execution_id.attempt_id().get()
-            ))
-            .spawn(move || {
-                let result = assignment.pump_to_completion();
-                // The round owns its sources; closing here rather than only on
-                // drop means a failed pump releases them immediately instead of
-                // at an unpredictable later moment.
-                assignment.close();
-                result
-            })
-            .ok()?;
+        let failure = Arc::new(Mutex::new(None));
+        let outcome = Arc::new(Mutex::new(None));
+        round.add_pump(Box::new(SplitAssignmentPump {
+            assignment: Some(assignment),
+            stop: stop.clone(),
+            data_runtime,
+            wake,
+            enumeration: Arc::new(Mutex::new(OwnerSlot {
+                owner_live: true,
+                result: None,
+            })),
+            enumeration_in_flight: false,
+            retry_at: None,
+            timer_at: None,
+            failure: Arc::clone(&failure),
+            outcome: Arc::clone(&outcome),
+            closing: false,
+        }));
         Some(Self {
             stop,
-            worker: Some(worker),
-            joined: None,
+            failure,
+            outcome,
         })
     }
 
-    /// Whether the worker has stopped.
-    ///
-    /// The task substrate's delivery bridge is settled by the round runner on
-    /// the statement thread, so a worker still waiting for an acknowledgement
-    /// can only be released by another turn. Joining it before it has stopped
-    /// would stop the very loop that releases it, so the caller asks first and
-    /// keeps turning until this is true.
+    /// Whether the pump has published its final source profile or failure.
     pub(crate) fn is_finished(&self) -> bool {
-        self.joined.is_some()
-            || self
-                .worker
-                .as_ref()
-                .is_none_or(std::thread::JoinHandle::is_finished)
+        self.outcome
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .is_some()
     }
 
     /// Why delivery stopped, if it stopped by failing.
     ///
-    /// Only ever joins a thread that has already stopped, so a caller may ask
-    /// on every turn. A worker that finished normally answers `None`: a round
+    /// A caller may ask on every turn. A pump that finished normally answers
+    /// `None`: a round
     /// whose sources are all terminal legitimately stops delivering long
     /// before its scans finish, and that is not a failure.
     ///
@@ -249,36 +552,31 @@ impl SplitAssignmentRoundGuard {
     /// deadline reporting the wait instead of the cause -- including the case
     /// ADR-0123 froze a bounded budget for, whose exhaustion is longer than a
     /// typical statement timeout and so could never be seen.
-    pub(crate) fn failure(&mut self) -> Option<&SplitAssignmentDriverError> {
-        if self.joined.is_none()
-            && self
-                .worker
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
-        {
-            let worker = self.worker.take().expect("the worker was just observed");
-            self.joined = Some(worker.join().unwrap_or(Ok(SplitSourceProfile::default())));
-        }
-        match self.joined.as_ref() {
-            Some(Err(error)) => Some(error),
-            _ => None,
-        }
+    pub(crate) fn failure(&self) -> Option<SplitAssignmentDriverError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .clone()
     }
 
-    /// Wait for delivery to finish, returning the worker result.
+    /// Takes the final profile without waiting for the pump.
     ///
-    /// The root fetch may complete before an unknown-outcome TaskUpdate has
-    /// received its retry acknowledgement. A normal successful finish must
-    /// therefore not stop the worker: doing so would discard an accepted but
-    /// unconfirmed immutable assignment. Cancellation and unwinding still use
-    /// `Drop`, which signals stop before joining.
-    pub(crate) fn finish(mut self) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
-        if let Some(joined) = self.joined.take() {
-            return joined;
-        }
-        match self.worker.take() {
-            Some(worker) => worker.join().unwrap_or(Ok(SplitSourceProfile::default())),
-            None => Ok(SplitSourceProfile::default()),
+    /// An absent outcome is accepted only after the attempt owner explicitly
+    /// abandoned residual delivery; an ordinary successful finish may never
+    /// turn an unfinished assignment into a successful empty profile.
+    pub(crate) fn finish_after_attempt(
+        self,
+        abandoned: bool,
+    ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
+        let outcome = self
+            .outcome
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .clone();
+        match outcome {
+            Some(outcome) => outcome,
+            None if abandoned => Ok(SplitSourceProfile::default()),
+            None => Err(SplitAssignmentDriverError::DeliveryInProgress),
         }
     }
 }
@@ -286,82 +584,182 @@ impl SplitAssignmentRoundGuard {
 impl Drop for SplitAssignmentRoundGuard {
     fn drop(&mut self) {
         self.stop.stop();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
+    use novarocks_spi::connector::ConnectorError;
+    use novarocks_spi::connector::read_stack::{
+        ConnectorReadDynamicFilterSnapshot, ConnectorReadSplit, ConnectorReadSplitSource,
+        ConnectorSplitBatch,
+    };
     use novarocks_types::{AttemptId, QueryId};
 
     use super::*;
 
-    fn execution_id() -> QueryExecutionId {
-        QueryExecutionId::new(QueryId::new(9, 9), AttemptId::new(1).expect("attempt"))
-            .expect("execution id")
+    struct CloseSignalSource {
+        closed: Option<mpsc::Sender<()>>,
     }
 
-    #[test]
-    fn a_round_with_no_typed_scan_starts_no_worker() {
-        struct NeverCalled;
-        impl TaskUpdateTransport for NeverCalled {
-            fn send(
-                &self,
-                _execution_id: QueryExecutionId,
-                _target: &AssignmentTarget,
-                _request: &crate::query_execution::connector_domain::TaskUpdateRequest,
-                _timeout: std::time::Duration,
-                _stop: &crate::query_execution::split_assignment::SplitAssignmentStop,
-            ) -> Result<
-                crate::query_execution::split_assignment::TaskUpdateOutcome,
-                crate::query_execution::split_assignment::TaskUpdateTransportError,
-            > {
-                panic!("a round with no source must never send");
-            }
+    impl ConnectorReadSplitSource for CloseSignalSource {
+        fn next_batch(
+            &mut self,
+            _max_size: usize,
+            _dynamic_filter: &ConnectorReadDynamicFilterSnapshot,
+        ) -> Result<ConnectorSplitBatch<ConnectorReadSplit>, ConnectorError> {
+            panic!("source-owner cleanup test must not enumerate")
         }
-        assert!(
-            SplitAssignmentRoundGuard::start(
-                execution_id(),
-                RoundSplitAssignmentPlan::new(
-                    BTreeMap::new(),
-                    Vec::new(),
-                    TaskUpdateRetryPolicy::default(),
-                    std::time::Duration::ZERO,
-                    Vec::new(),
-                ),
-                Arc::new(NeverCalled),
-            )
-            .is_none()
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn close(&mut self) -> Result<(), ConnectorError> {
+            if let Some(closed) = self.closed.take() {
+                closed.send(()).expect("publish source close");
+            }
+            Ok(())
+        }
+    }
+
+    struct CleanupTestEncoder;
+
+    impl novarocks_spi::connector::ConnectorReadWireEncoder for CleanupTestEncoder {
+        fn owner(&self) -> &str {
+            "split-cleanup-test"
+        }
+
+        fn encode_relation_payload(
+            &self,
+            _relation: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorReadRelationPayload,
+            novarocks_spi::connector::ConnectorCodecError,
+        > {
+            unreachable!("cleanup test must not encode a relation")
+        }
+
+        fn encode_column_payload(
+            &self,
+            _column: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorEncodedPayload,
+            novarocks_spi::connector::ConnectorCodecError,
+        > {
+            unreachable!("cleanup test must not encode a column")
+        }
+
+        fn encode_transaction_payload(
+            &self,
+            _transaction: &novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorEncodedPayload,
+            novarocks_spi::connector::ConnectorCodecError,
+        > {
+            unreachable!("cleanup test must not encode a transaction")
+        }
+
+        fn encode_split_payload(
+            &self,
+            _split: &ConnectorReadSplit,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorReadSplitPayload,
+            novarocks_spi::connector::ConnectorCodecError,
+        > {
+            unreachable!("cleanup test must not encode a split")
+        }
+    }
+
+    fn cleanup_test_source(closed: mpsc::Sender<()>) -> RoundSplitSource {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(17, 19),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("valid execution id");
+        RoundSplitSource {
+            plan_node_id: 7,
+            source: Box::new(CloseSignalSource {
+                closed: Some(closed),
+            }),
+            encoder: Arc::new(CleanupTestEncoder),
+            feedback: Arc::new(
+                crate::runtime_filter::feedback::RuntimeFilterFeedbackState::new(
+                    execution_id,
+                    Default::default(),
+                )
+                .expect("empty feedback declaration"),
+            ),
+            feedback_bindings: Vec::new(),
+            initial_wait_initialized: false,
+            initial_wait_deadline: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_round_with_no_typed_scan_starts_no_worker() {
+        let plan = RoundSplitAssignmentPlan::new(
+            BTreeMap::new(),
+            Vec::new(),
+            TaskUpdateRetryPolicy::default(),
+            std::time::Duration::ZERO,
+            Vec::new(),
+            ConnectorBlockingIoSupervisor::new(
+                tokio::runtime::Handle::current(),
+                crate::task_execution::ConnectorBlockingIoBudget::default(),
+            ),
         );
+        assert_eq!(plan.plan_node_ids().count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partially_opened_sources_close_through_protected_capacity() {
+        let supervisor = ConnectorBlockingIoSupervisor::new(
+            tokio::runtime::Handle::current(),
+            crate::task_execution::ConnectorBlockingIoBudget::try_new(2, 1)
+                .expect("one ordinary and one protected permit"),
+        );
+        let (release, released) = mpsc::channel();
+        let (started, ordinary_started) = mpsc::channel();
+        let ordinary = supervisor.spawn_ordinary(move || {
+            started.send(()).expect("publish ordinary start");
+            released.recv().expect("release ordinary call");
+        });
+        ordinary_started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ordinary call must occupy its lane");
+
+        let (closed, observe_close) = mpsc::channel();
+        let mut opened = OpenRoundSplitSources::with_capacity(1, supervisor);
+        opened.push(cleanup_test_source(closed));
+        drop(opened);
+
+        observe_close
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cleanup must use reserved protected capacity");
+        release.send(()).expect("release ordinary call");
+        ordinary.finish().await.expect("ordinary call finishes");
     }
 
     #[test]
-    fn finish_does_not_cancel_an_in_flight_delivery() {
+    fn ordinary_finish_refuses_an_unfinished_pump() {
         let stop = RoundSplitAssignmentStop::default();
-        let observed_stop = Arc::new(AtomicBool::new(true));
-        let worker_stop = stop.clone();
-        let worker_observed_stop = Arc::clone(&observed_stop);
         let guard = SplitAssignmentRoundGuard {
-            stop,
-            worker: Some(std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(10));
-                worker_observed_stop.store(worker_stop.is_stopped(), Ordering::SeqCst);
-                Ok(SplitSourceProfile::default())
-            })),
-            joined: None,
+            stop: stop.clone(),
+            failure: Arc::new(Mutex::new(None)),
+            outcome: Arc::new(Mutex::new(None)),
         };
 
-        guard.finish().expect("finish waits for delivery");
-
+        assert!(matches!(
+            guard.finish_after_attempt(false),
+            Err(SplitAssignmentDriverError::DeliveryInProgress)
+        ));
         assert!(
-            !observed_stop.load(Ordering::SeqCst),
-            "normal finish must not interrupt an in-flight task update retry"
+            stop.is_stopped(),
+            "consuming the guard signals residual stop"
         );
     }
 
@@ -375,16 +773,15 @@ mod tests {
         // A normal stop must stay silent, because a round whose sources all
         // went terminal legitimately stops delivering long before its scans
         // finish.
-        let mut failed = SplitAssignmentRoundGuard {
+        let failed = SplitAssignmentRoundGuard {
             stop: RoundSplitAssignmentStop::default(),
-            worker: Some(std::thread::spawn(|| {
-                Err(SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 4 })
-            })),
-            joined: None,
+            failure: Arc::new(Mutex::new(Some(
+                SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 4 },
+            ))),
+            outcome: Arc::new(Mutex::new(Some(Err(
+                SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 4 },
+            )))),
         };
-        while !failed.is_finished() {
-            std::thread::yield_now();
-        }
         let detail = failed
             .failure()
             .expect("a failed deliverer reports its own cause")
@@ -394,23 +791,20 @@ mod tests {
         // result afterwards.
         assert!(failed.failure().is_some());
         failed
-            .finish()
+            .finish_after_attempt(false)
             .expect_err("the joined verdict is still the round's result");
 
-        let mut healthy = SplitAssignmentRoundGuard {
+        let healthy = SplitAssignmentRoundGuard {
             stop: RoundSplitAssignmentStop::default(),
-            worker: Some(std::thread::spawn(|| Ok(SplitSourceProfile::default()))),
-            joined: None,
+            failure: Arc::new(Mutex::new(None)),
+            outcome: Arc::new(Mutex::new(Some(Ok(SplitSourceProfile::default())))),
         };
-        while !healthy.is_finished() {
-            std::thread::yield_now();
-        }
         assert!(
             healthy.failure().is_none(),
             "a deliverer that ran out of sources has not failed"
         );
         healthy
-            .finish()
+            .finish_after_attempt(false)
             .expect("a clean stop is still a clean stop");
     }
 }
