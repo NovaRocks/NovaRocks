@@ -28,6 +28,7 @@ mod lease;
 mod operation;
 mod recovery;
 mod result;
+mod stand_down;
 mod status;
 
 pub use actor::*;
@@ -43,4 +44,5 @@ pub use lease::*;
 pub use operation::*;
 pub use recovery::*;
 pub use result::*;
+pub use stand_down::*;
 pub use status::*;

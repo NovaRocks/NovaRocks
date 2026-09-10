@@ -38,7 +38,7 @@ use novarocks_execution_contract::{
 use novarocks_types::NativeCompatibilityId;
 use tokio::sync::mpsc;
 
-use super::{AttemptActivationIdentity, MonotonicInstant};
+use super::{AttemptActivationIdentity, EstablishStandDownFact, MonotonicInstant};
 
 /// Unforgeable actor receipt for the first issue of one exact admission request.
 ///
@@ -911,6 +911,46 @@ impl EstablishIssueLedger {
             .map(EstablishIssueRecord::snapshot)
     }
 
+    /// Projects only the facts needed by actor-owned context stand-down.
+    ///
+    /// A granted admission ticket remains an Abort responsibility even when
+    /// Establish was definitely unsent. Worker Abort owns both the absent-
+    /// context fence and prompt return of that ticket's reserved capacity.
+    pub(crate) fn stand_down_facts(
+        &mut self,
+    ) -> Result<Vec<(QueryContextRef, EstablishStandDownFact)>, EstablishIssueError> {
+        self.drain_events()?;
+        Ok(self
+            .required_contexts
+            .iter()
+            .map(|context| {
+                let fact = if self
+                    .records
+                    .get(context)
+                    .is_some_and(|record| record.state == EstablishIssueState::IssueAuthorized)
+                {
+                    EstablishStandDownFact::IssueUnsettled
+                } else if self.records.contains_key(context)
+                    || self
+                        .admission_issues
+                        .get(context)
+                        .is_some_and(|record| admission_may_hold_worker_capacity(record.state))
+                    || self
+                        .retired_admission_issues
+                        .iter()
+                        .any(|((retired, _), record)| {
+                            retired == context && admission_may_hold_worker_capacity(record.state)
+                        })
+                {
+                    EstablishStandDownFact::AbortRequired
+                } else {
+                    EstablishStandDownFact::NoGrant
+                };
+                (*context, fact)
+            })
+            .collect())
+    }
+
     pub(crate) fn has_worker_rejection(&self) -> bool {
         self.records.values().any(|record| {
             matches!(
@@ -991,6 +1031,16 @@ impl EstablishIssueLedger {
         }
         Ok(true)
     }
+}
+
+fn admission_may_hold_worker_capacity(state: AdmissionIssueState) -> bool {
+    matches!(
+        state,
+        AdmissionIssueState::Pending
+            | AdmissionIssueState::Granted { .. }
+            | AdmissionIssueState::ExpiredGrant(_)
+            | AdmissionIssueState::RetryableNoGrant(OperationOutcome::AdmissionTicketStillActive)
+    )
 }
 
 fn replay_retired_admission_settlement(
@@ -1420,6 +1470,24 @@ mod tests {
         permit.identity()
     }
 
+    fn actor_config(
+        execution: QueryExecutionId,
+        contexts: Vec<QueryContextRef>,
+    ) -> LogicalExecutionActorConfig {
+        LogicalExecutionActorConfig::single_attempt_completion(
+            execution,
+            ExecutionEffect::None,
+            NonZeroUsize::new(1).unwrap(),
+            contexts,
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .with_abort_query_context_effect_port(
+            crate::coordination::PermanentlyBackpressuredAbortEffectPort::shared(),
+            NonZeroUsize::new(2).unwrap(),
+        )
+    }
+
     fn context(execution: QueryExecutionId) -> QueryContextRef {
         QueryContextRef::new(
             execution,
@@ -1709,6 +1777,11 @@ mod tests {
                 )
                 .unwrap(),
             AdmissionIssueDisposition::Retryable
+        );
+        assert_eq!(
+            ledger.stand_down_facts().unwrap(),
+            vec![(context, EstablishStandDownFact::AbortRequired)],
+            "a locally expired retired grant and AdmissionTicketStillActive still own Worker capacity"
         );
         assert_eq!(
             ledger.begin_admission_issue(activation, first_request, expiry),
@@ -2116,15 +2189,7 @@ mod tests {
         let observed_at = MonotonicInstant::from_origin(Duration::from_secs(5));
         let expected_expiry = MonotonicInstant::from_origin(Duration::from_secs(13));
         let clock = Arc::new(ManualActorClock::new(sent_at));
-        let config = LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            NonZeroUsize::new(1).unwrap(),
-            vec![context],
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-        )
-        .with_clock(clock.clone());
+        let config = actor_config(execution, vec![context]).with_clock(clock.clone());
         let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
@@ -2149,14 +2214,7 @@ mod tests {
     async fn actor_refuses_success_when_a_required_context_was_never_issued() {
         let execution = execution(10);
         let context = context(execution);
-        let config = LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            NonZeroUsize::new(1).unwrap(),
-            vec![context],
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-        );
+        let config = actor_config(execution, vec![context]);
         let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
@@ -2176,14 +2234,7 @@ mod tests {
     async fn actor_owns_exact_establish_replay_until_worker_settlement() {
         let execution = execution(11);
         let context = context(execution);
-        let config = LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            NonZeroUsize::new(1).unwrap(),
-            vec![context],
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-        );
+        let config = actor_config(execution, vec![context]);
         let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
@@ -2238,14 +2289,7 @@ mod tests {
     async fn actor_cancellation_revokes_an_authorized_pre_transport_permit() {
         let execution = execution(12);
         let context = context(execution);
-        let config = LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            NonZeroUsize::new(1).unwrap(),
-            vec![context],
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-        );
+        let config = actor_config(execution, vec![context]);
         let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
@@ -2295,14 +2339,7 @@ mod tests {
         let execution = execution(13);
         let first_context = context(execution);
         let second_context = context(execution);
-        let config = LogicalExecutionActorConfig::single_attempt_completion(
-            execution,
-            ExecutionEffect::None,
-            NonZeroUsize::new(1).unwrap(),
-            vec![first_context, second_context],
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-        );
+        let config = actor_config(execution, vec![first_context, second_context]);
         let (owner, initial) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
         let actor = owner.actor();
         let running = actor.activate(initial.ready()).await.unwrap();
