@@ -28,8 +28,8 @@ use crate::common::backend_topology::{
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
 };
 use crate::native::fragment_transport::{
-    ExpectedOutputSchemaView, FinalTaskInfoRead, FragmentDispatcher, NativeTaskResultTransport,
-    RootResultOutcome, TaskReadGrace, TaskResultTransport,
+    FinalTaskInfoRead, FragmentDispatcher, NativeTaskResultTransport, RootResultOutcome,
+    TaskReadGrace, TaskResultTransport,
 };
 use crate::query_execution::artifact::{
     PreparedDistributedQuery, RuntimeFilterDeploymentReadyDistributedQuery,
@@ -1264,6 +1264,7 @@ impl FrontendDistributedQueryCoordinator {
                     statement_deadline,
                     self.result_fetch_byte_limit,
                     Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                    self.data_runtime.clone(),
                 ) {
                     Ok(polls) => {
                         emit_distributed_write_phase_marker(
@@ -1370,20 +1371,40 @@ impl FrontendDistributedQueryCoordinator {
                                 Some((root_batch_count, root_row_count)),
                             );
                         }
+                        if let Err(error) = root_result_polls
+                            .as_ref()
+                            .expect("a root result answer requires its poll owner")
+                            .acknowledge(packet_sequence)
+                        {
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error,
+                            ));
+                        }
                         last_root_poll = RootResultPoll::Packet(packet_sequence);
                         moved = true;
                     }
                     Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) => {
-                        break Err(self.fail_task_round(
-                            query_id,
-                            &mut round,
-                            &split_delivery,
-                            classification,
-                            QueryFailureCause::FrontendExecution,
-                            format!(
-                                "root result poller exposed unacknowledged end of stream packet {packet_sequence}"
-                            ),
-                        ));
+                        if let Err(error) = root_result_polls
+                            .as_ref()
+                            .expect("a root result answer requires its poll owner")
+                            .acknowledge(packet_sequence)
+                        {
+                            break Err(self.fail_task_round(
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error,
+                            ));
+                        }
+                        last_root_poll = RootResultPoll::Packet(packet_sequence);
+                        moved = true;
                     }
                     Ok(RootResultOutcome::EndOfStream { packet_sequence }) => {
                         if let Err(error) = round.consume_root_result_packet(packet_sequence, true)
@@ -3378,23 +3399,33 @@ mod tests {
             _max_wait: MaxWait,
             acknowledged: Option<ResultPacketSequence>,
             _max_result_bytes: ResultByteLimit,
-            _expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
-        ) -> Result<RootResultOutcome, String> {
-            self.releases
+            _expected_output_schema: Option<novarocks_execution::exec::chunk::ChunkSchemaRef>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<RootResultOutcome, String>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let answer = self
+                .releases
                 .lock()
                 .expect("scripted release lock")
                 .recv()
-                .map_err(|_| "the test stopped releasing polls".to_owned())?;
-            self.polls.fetch_add(1, Ordering::SeqCst);
-            self.acknowledgements
-                .lock()
-                .expect("scripted acknowledgement lock")
-                .push(acknowledged);
-            self.answers
-                .lock()
-                .expect("scripted answer lock")
-                .pop_front()
-                .ok_or_else(|| "the script ran out of answers".to_owned())
+                .map_err(|_| "the test stopped releasing polls".to_owned())
+                .and_then(|()| {
+                    self.polls.fetch_add(1, Ordering::SeqCst);
+                    self.acknowledgements
+                        .lock()
+                        .expect("scripted acknowledgement lock")
+                        .push(acknowledged);
+                    self.answers
+                        .lock()
+                        .expect("scripted answer lock")
+                        .pop_front()
+                        .ok_or_else(|| "the script ran out of answers".to_owned())
+                });
+            Box::pin(async move { answer })
         }
 
         fn final_task_info(&self, _identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
@@ -3444,20 +3475,19 @@ mod tests {
     }
 
     /// The defect this pins: one root result poll asks a backend to hold its
-    /// answer for up to `MAX_ROOT_RESULT_WAIT`, and an attempt has exactly
-    /// one thread -- the one that turns its task state machine. While that
-    /// thread waited out a poll it dispatched nothing, so every decision made
-    /// by another thread meanwhile waited for the poll instead of for its own
-    /// facts. A distributed `SELECT` opens its producers' exchange edges
+    /// answer for up to `MAX_ROOT_RESULT_WAIT`, while the attempt owner must
+    /// keep turning its task state machine. When the owner waited out a poll
+    /// it dispatched nothing, so every decision made elsewhere meanwhile
+    /// waited for the poll instead of for its own facts. A distributed
+    /// `SELECT` opens its producers' exchange edges
     /// exactly there: each edge-open decision cost one whole poll wait, and
     /// the cost was invisible as anything but latency. Measured on a 1FE+3BE
     /// cluster, every statement of the `filter` suite took ~0.85 s of which
     /// ~0.05 s was work, and the suite took 92 s against its baseline's 4 s.
     ///
-    /// So the answers must reach the loop without the loop ever waiting for
-    /// one, and the polls must stop themselves once the read is over: a poll
-    /// after the end of the stream is refused by a backend that has already
-    /// handed its result over.
+    /// Answers must therefore reach the loop without the loop waiting for
+    /// one. A following poll must also wait for the owner to accept the exact
+    /// prior sequence; enqueueing an answer is not an acknowledgement.
     #[test]
     fn root_result_polls_answer_a_loop_that_never_waits_for_one() {
         let (release, releases) = std::sync::mpsc::channel();
@@ -3476,6 +3506,10 @@ mod tests {
             acknowledgements: Mutex::new(Vec::new()),
         });
         let wake = Arc::new(crate::task_execution::status_intake::CountingWake::default());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("root result poll runtime");
         let mut polls = super::RootResultPolls::start(
             Arc::clone(&transport) as Arc<dyn super::TaskResultTransport>,
             root_task_for_test(),
@@ -3484,6 +3518,7 @@ mod tests {
             ResultByteLimit::new(TEST_RESULT_FETCH_BYTE_LIMIT)
                 .expect("the test result byte limit is nonzero"),
             Arc::clone(&wake) as Arc<dyn crate::task_execution::status_intake::StatusIntakeWake>,
+            crate::native::data_runtime::FrontendDataRuntime::new(runtime.handle().clone()),
         )
         .expect("the poller starts");
 
@@ -3510,17 +3545,34 @@ mod tests {
         assert!(wake.count() >= 1, "an answer wakes the loop");
 
         release.send(()).expect("the poller polls again by itself");
-        release
-            .send(())
-            .expect("the poller acknowledges end of stream by itself");
         let second = answer_within(&mut polls, Duration::from_secs(10))
             .expect("the second answer reaches the loop");
         assert!(
             matches!(
                 second,
-                Ok(RootResultOutcome::EndOfStream { packet_sequence: 7 })
+                Ok(RootResultOutcome::EndOfStreamPending { packet_sequence: 7 })
             ),
             "actual: {second:?}"
+        );
+        assert_eq!(
+            transport.polls.load(Ordering::SeqCst),
+            2,
+            "the next poll must wait until the owner accepts pending EOS"
+        );
+        polls
+            .acknowledge(7)
+            .expect("the attempt owner acknowledges pending EOS");
+        release
+            .send(())
+            .expect("the accepted EOS acknowledgement starts the final poll");
+        let third = answer_within(&mut polls, Duration::from_secs(10))
+            .expect("the final answer reaches the loop");
+        assert!(
+            matches!(
+                third,
+                Ok(RootResultOutcome::EndOfStream { packet_sequence: 7 })
+            ),
+            "actual: {third:?}"
         );
 
         // Nothing is polled after the end of the stream. The poller has let
@@ -3912,14 +3964,13 @@ fn max_root_result_wait(now: Instant, deadline: Instant) -> MaxWait {
     MaxWait::new(wait).unwrap_or_else(|_| MaxWait::default_for(OperationKind::GetFinalTaskInfo))
 }
 
-/// One attempt's root result polls, run beside the loop that owns the attempt.
+/// One attempt's root result polls, run as an async task beside its owner.
 ///
 /// A poll asks the root task's backend to hold the request until it has
-/// something to say, for up to [`MAX_ROOT_RESULT_WAIT`]. An attempt has
-/// exactly one thread, and it is the thread that turns the task state
-/// machine: waiting out the poll on it stops that machine for the whole wait,
-/// and turning it is what dispatches an edge open, settles an
-/// acknowledgement and folds status.
+/// something to say, for up to [`MAX_ROOT_RESULT_WAIT`]. The async transport
+/// future parks on the process runtime, so it does not occupy the thread that
+/// turns the task state machine, dispatches edge opens, settles task
+/// acknowledgements, and folds status.
 ///
 /// Every one of those decisions is made by another thread -- a create
 /// acknowledgement arriving, a status event published -- so each one that
@@ -3929,12 +3980,13 @@ fn max_root_result_wait(now: Instant, deadline: Instant) -> MaxWait {
 /// nowhere except as latency: measured on a 1FE+3BE cluster, every statement
 /// of the `filter` suite took ~0.85 s, of which ~0.05 s was work.
 ///
-/// So the polls run here instead. One is in flight at a time, in order, and
-/// each answer wakes the loop -- the read is exactly as sequential and as
-/// prompt as it was, while the loop stays free to move a decision the moment
-/// it is made.
+/// One poll is in flight at a time, in order, and each answer wakes the loop.
+/// Data and pending EOS additionally wait for the owner to accept their exact
+/// sequence before the following request may acknowledge it.
 struct RootResultPolls {
-    answers: std::sync::mpsc::Receiver<Result<RootResultOutcome, String>>,
+    answers: tokio::sync::mpsc::Receiver<Result<RootResultOutcome, String>>,
+    acknowledgements: tokio::sync::mpsc::Sender<ResultPacketSequence>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl RootResultPolls {
@@ -3950,59 +4002,75 @@ impl RootResultPolls {
         statement_deadline: Instant,
         max_result_bytes: ResultByteLimit,
         wake: Arc<dyn StatusIntakeWake>,
+        data_runtime: FrontendDataRuntime,
     ) -> Result<Self, String> {
-        // One answer of slack, so the next poll may already be in flight
-        // while the loop folds the last one. More would buy nothing: the
-        // answers are one ordered stream with one consumer.
-        let (sender, answers) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("root-result-polls".to_owned())
-            .spawn(move || {
-                let mut acknowledged = None;
-                loop {
-                    let now = Instant::now();
-                    if now >= statement_deadline {
-                        break;
-                    }
-                    let answer = transport.fetch_root_result(
+        // Both queues are one item wide because the root stream is ordered.
+        // A following fetch cannot carry an ACK until the attempt owner has
+        // taken and accepted the preceding packet.
+        let (sender, answers) = tokio::sync::mpsc::channel(1);
+        let (acknowledgements, mut acknowledged_packets) = tokio::sync::mpsc::channel(1);
+        let task = data_runtime.spawn(async move {
+            let mut acknowledged = None;
+            loop {
+                let now = Instant::now();
+                if now >= statement_deadline {
+                    break;
+                }
+                let answer = transport
+                    .fetch_root_result(
                         root_task,
                         max_root_result_wait(now, statement_deadline),
                         acknowledged,
                         max_result_bytes,
-                        Some(ExpectedOutputSchemaView::new(&expected_output_schema)),
-                    );
-                    if let Ok(RootResultOutcome::EndOfStreamPending { packet_sequence }) = &answer {
-                        acknowledged = Some(ResultPacketSequence::new(*packet_sequence));
-                        continue;
-                    }
-                    // Nothing is polled after an answer the loop cannot ask
-                    // to be repeated. The stream has ended or the read
-                    // failed, and a poll past that point is refused by a
-                    // backend that has already handed its result over -- an
-                    // error the loop would read as this query's failure.
-                    let last = !matches!(
-                        &answer,
-                        Ok(RootResultOutcome::Ready { .. } | RootResultOutcome::NotReady)
-                    );
-                    let next_acknowledged = match &answer {
-                        Ok(RootResultOutcome::Ready {
+                        Some(Arc::clone(&expected_output_schema)),
+                    )
+                    .await;
+                let expected_acknowledgement = match &answer {
+                    Ok(
+                        RootResultOutcome::Ready {
                             packet_sequence, ..
-                        }) => Some(ResultPacketSequence::new(*packet_sequence)),
-                        _ => acknowledged,
-                    };
-                    if sender.send(answer).is_err() {
-                        // The loop stopped reading, so this attempt is over.
-                        break;
-                    }
-                    wake.wake();
-                    acknowledged = next_acknowledged;
-                    if last {
-                        break;
+                        }
+                        | RootResultOutcome::EndOfStreamPending { packet_sequence },
+                    ) => Some(ResultPacketSequence::new(*packet_sequence)),
+                    _ => None,
+                };
+                let last = !matches!(
+                    &answer,
+                    Ok(
+                        RootResultOutcome::Ready { .. }
+                            | RootResultOutcome::NotReady
+                            | RootResultOutcome::EndOfStreamPending { .. }
+                    )
+                );
+                if sender.send(answer).await.is_err() {
+                    break;
+                }
+                wake.wake();
+                if let Some(expected) = expected_acknowledgement {
+                    match acknowledged_packets.recv().await {
+                        Some(actual) if actual == expected => acknowledged = Some(actual),
+                        Some(actual) => {
+                            let _ = sender
+                                .send(Err(format!(
+                                    "root result acknowledgement {actual:?} does not match pending {expected:?}"
+                                )))
+                                .await;
+                            wake.wake();
+                            break;
+                        }
+                        None => break,
                     }
                 }
-            })
-            .map(|_| Self { answers })
-            .map_err(|error| format!("root result poller thread could not start: {error}"))
+                if last {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            answers,
+            acknowledgements,
+            task,
+        })
     }
 
     /// The next answer, if one has arrived.
@@ -4012,6 +4080,18 @@ impl RootResultPolls {
     /// statement deadline the loop checks itself.
     fn take(&mut self) -> Option<Result<RootResultOutcome, String>> {
         self.answers.try_recv().ok()
+    }
+
+    fn acknowledge(&self, packet_sequence: u64) -> Result<(), String> {
+        self.acknowledgements
+            .try_send(ResultPacketSequence::new(packet_sequence))
+            .map_err(|error| format!("root result acknowledgement could not be queued: {error}"))
+    }
+}
+
+impl Drop for RootResultPolls {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 

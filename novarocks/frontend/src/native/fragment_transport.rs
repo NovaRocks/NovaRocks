@@ -27,6 +27,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
@@ -317,8 +319,8 @@ pub trait TaskResultTransport: Send + Sync + 'static {
         max_wait: MaxWait,
         acknowledged: Option<ResultPacketSequence>,
         max_result_bytes: ResultByteLimit,
-        expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
-    ) -> Result<RootResultOutcome, String>;
+        expected_output_schema: Option<ChunkSchemaRef>,
+    ) -> Pin<Box<dyn Future<Output = Result<RootResultOutcome, String>> + Send + 'static>>;
 
     /// Reads one terminal task's bounded final info.
     fn final_task_info(&self, identity: TaskIdentity) -> Result<FinalTaskInfoRead, String>;
@@ -404,46 +406,59 @@ impl TaskResultTransport for NativeTaskResultTransport {
         max_wait: MaxWait,
         acknowledged: Option<ResultPacketSequence>,
         max_result_bytes: ResultByteLimit,
-        expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
-    ) -> Result<RootResultOutcome, String> {
-        let (client, address) = self.client_of(root_task)?;
-        validate_native_result_byte_limit(max_result_bytes)?;
-        let request = encode_fetch_task_result(root_task, max_wait, acknowledged, max_result_bytes);
-        let wait = max_wait.get();
-        let deadline = self.grace.deadline_for(wait);
-        let response = self.data_runtime.block_on(async {
-            let mut grpc = tokio::time::timeout(deadline, client.grpc_with_channel_error())
-                .await
-                .map_err(|_| {
-                    format!(
-                        "{address}: root result poll for task {root_task} could not acquire a \
+        expected_output_schema: Option<ChunkSchemaRef>,
+    ) -> Pin<Box<dyn Future<Output = Result<RootResultOutcome, String>> + Send + 'static>> {
+        let route = self
+            .client_of(root_task)
+            .map(|(client, address)| (client.clone(), address));
+        let validation = validate_native_result_byte_limit(max_result_bytes);
+        let grace = self.grace;
+        let data_runtime = self.data_runtime.clone();
+        Box::pin(async move {
+            let (client, address) = route?;
+            validation?;
+            let _fetch_permit = data_runtime.acquire_result_fetch().await?;
+            let request =
+                encode_fetch_task_result(root_task, max_wait, acknowledged, max_result_bytes);
+            let wait = max_wait.get();
+            let deadline = grace.deadline_for(wait);
+            let response = {
+                let mut grpc = tokio::time::timeout(deadline, client.grpc_with_channel_error())
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "{address}: root result poll for task {root_task} could not acquire a \
                          channel within {deadline:?}"
-                    )
-                })?
-                .map_err(|error| error.to_string())?;
-            // Bounded, and the bound names the fact: a poll that outlives the
-            // wait it asked for plus the transport's own residence budget is a
-            // backend that stopped answering, and reporting that is what keeps
-            // it from stopping this attempt's only thread indefinitely.
-            tokio::time::timeout(deadline, grpc.fetch_task_result(request))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "{address}: root result poll for task {root_task} did not answer within \
+                        )
+                    })?
+                    .map_err(|error| error.to_string())?;
+                // Bounded, and the bound names the fact: a poll that outlives the
+                // wait it asked for plus the transport's own residence budget is a
+                // backend that stopped answering, and reporting that is what keeps
+                // it from stopping this attempt's only thread indefinitely.
+                tokio::time::timeout(deadline, grpc.fetch_task_result(request))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "{address}: root result poll for task {root_task} did not answer within \
                          {deadline:?}; it was asked to wait at most {wait:?}"
-                    )
-                })?
-                .map(tonic::Response::into_inner)
-                .map_err(|error| format!("fetch_task_result rpc failed: {error}"))
-        })??;
-        validate_result_payload_size(&address, response.result_arrow_ipc.len(), max_result_bytes)?;
-        let status = FetchStatus::try_from(response.status).map_err(|_| {
-            format!(
-                "{address}: root result poll returned unknown status {}",
-                response.status
-            )
-        })?;
-        match status {
+                        )
+                    })?
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| format!("fetch_task_result rpc failed: {error}"))
+            }?;
+            validate_result_payload_size(
+                &address,
+                response.result_arrow_ipc.len(),
+                max_result_bytes,
+            )?;
+            let status = FetchStatus::try_from(response.status).map_err(|_| {
+                format!(
+                    "{address}: root result poll returned unknown status {}",
+                    response.status
+                )
+            })?;
+            match status {
             FetchStatus::Ready => {
                 // The sequence orders the whole stream, so a value that is not
                 // a sequence is refused rather than mapped onto one.
@@ -459,7 +474,12 @@ impl TaskResultTransport for NativeTaskResultTransport {
                 if response.result_arrow_ipc.is_empty() {
                     return Err(format!("{address}: root result READY carries no payload"));
                 }
-                decode_fetched_query_batch(&response.result_arrow_ipc, expected_output_schema)
+                decode_fetched_query_batch(
+                    &response.result_arrow_ipc,
+                    expected_output_schema
+                        .as_ref()
+                        .map(ExpectedOutputSchemaView::new),
+                )
                     .map(|batch| RootResultOutcome::Ready {
                         packet_sequence,
                         batch,
@@ -480,7 +500,8 @@ impl TaskResultTransport for NativeTaskResultTransport {
             FetchStatus::ResultStatusUnspecified => Err(format!(
                 "{address}: root result poll returned an unspecified status"
             )),
-        }
+            }
+        })
     }
 
     fn final_task_info(&self, identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
