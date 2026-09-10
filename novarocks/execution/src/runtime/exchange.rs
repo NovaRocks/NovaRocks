@@ -62,6 +62,9 @@ use novarocks_types::format_uuid;
 use novarocks_types::{SlotId, UniqueId};
 use tracing::debug;
 
+mod result_ipc_preflight;
+pub use result_ipc_preflight::{TypedRootResultDecodeBounds, preflight_typed_root_result_decode};
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ExchangeKey {
     pub finst_id_hi: i64,
@@ -1675,6 +1678,12 @@ pub fn decode_root_result_chunks(
     bytes: &[u8],
     expected_chunk_schema: Option<&ChunkSchemaRef>,
 ) -> Result<Vec<Chunk>, String> {
+    let exact_payload_limit = novarocks_execution_contract::ResultByteLimit::new(
+        u64::try_from(bytes.len())
+            .map_err(|_| "typed root result payload length does not fit u64".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    preflight_typed_root_result_decode(bytes, exact_payload_limit)?;
     let DecodedExchangePayload {
         wire_meta,
         arrow_payload,
@@ -1869,10 +1878,15 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use super::result_ipc_preflight::{
+        ARROW_IPC_CONTINUATION_MARKER, MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES,
+        MAX_TYPED_ROOT_RESULT_SCHEMA_FIELDS,
+    };
     use super::{
         BoundedPayloadWriter, ExchangeKey, ExchangePopResult, ExchangeSenderIdentity,
-        ExecutionExchangeRegistry, cancel_exchange_key, decode_chunks, decode_chunks_for_sender,
-        decode_root_result_chunks, encode_chunks, encode_chunks_bounded, get_receiver_handle,
+        ExchangeWireMeta, ExecutionExchangeRegistry, cancel_exchange_key, decode_chunks,
+        decode_chunks_for_sender, decode_root_result_chunks, encode_chunks, encode_chunks_bounded,
+        encode_exchange_payload_envelope, get_receiver_handle, preflight_typed_root_result_decode,
         push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
     };
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -2102,6 +2116,239 @@ mod tests {
             .expect_err("Arrow payload must exceed the bounded packet cap");
 
         assert!(error.contains("exceeds packet cap"), "{error}");
+    }
+
+    fn preflight_typed_test_payload(
+        payload: &[u8],
+    ) -> Result<super::TypedRootResultDecodeBounds, String> {
+        let limit = novarocks_execution_contract::ResultByteLimit::new(
+            u64::try_from(payload.len())
+                .map_err(|_| "test payload length does not fit u64".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        preflight_typed_root_result_decode(payload, limit)
+    }
+
+    #[test]
+    fn typed_root_result_preflight_bounds_encoder_round_trip_backing_bytes() {
+        let cases = vec![
+            exchange_test_chunk("name"),
+            exchange_test_zero_column_chunk(7),
+            decimal128_chunk_with_over_precision_value(123_456_789),
+            dictionary_status_chunk(
+                SlotId::new(91),
+                vec![Some(0), Some(1), None, Some(0)],
+                vec!["READY", "RUNNING"],
+            ),
+        ];
+
+        for chunk in cases {
+            let payload = encode_chunks(&[chunk], true).expect("encode typed root result");
+            let bounds = preflight_typed_test_payload(&payload)
+                .expect("current encoder output must pass preflight");
+            let decoded = decode_root_result_chunks(&payload, None).expect("decode root result");
+            let actual_backing = decoded.iter().fold(0usize, |total, chunk| {
+                total.saturating_add(chunk.logical_bytes())
+            });
+
+            assert!(
+                u64::try_from(actual_backing).unwrap() <= bounds.retained_backing_upper_bound(),
+                "decoded backing {actual_backing} exceeds {:?}",
+                bounds
+            );
+            assert!(bounds.decode_operation_upper_bound() >= bounds.retained_backing_upper_bound());
+        }
+    }
+
+    #[test]
+    fn typed_root_result_preflight_rejects_non_current_stream_shapes() {
+        let chunk = exchange_test_chunk("name");
+
+        let mut missing_slot_flag = encode_chunks(std::slice::from_ref(&chunk), true).unwrap();
+        missing_slot_flag[5] = 0;
+        let error = preflight_typed_test_payload(&missing_slot_flag)
+            .expect_err("slot metadata is mandatory");
+        assert!(error.contains("requires exactly slot-id flag"), "{error}");
+
+        let multiple_batches = encode_chunks(&[chunk.clone(), chunk.clone()], true).unwrap();
+        let error = preflight_typed_test_payload(&multiple_batches)
+            .expect_err("one fetch packet cannot contain multiple record batches");
+        assert!(error.contains("exactly one record batch"), "{error}");
+
+        let mut trailing = encode_chunks(&[chunk], true).unwrap();
+        trailing.push(0);
+        let error = preflight_typed_test_payload(&trailing)
+            .expect_err("terminal marker must end the stream");
+        assert!(
+            error.contains("terminal marker has trailing bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn typed_root_result_preflight_enforces_caller_payload_limit() {
+        let payload = encode_chunks(&[exchange_test_chunk("name")], true).unwrap();
+        let limit = novarocks_execution_contract::ResultByteLimit::new(
+            u64::try_from(payload.len() - 1).unwrap(),
+        )
+        .unwrap();
+
+        let error = preflight_typed_root_result_decode(&payload, limit)
+            .expect_err("caller payload limit must remain authoritative");
+        assert!(error.contains("exceeding hard limit"), "{error}");
+    }
+
+    #[test]
+    fn typed_root_result_preflight_rejects_compressed_stream() {
+        let chunk = exchange_test_chunk("name");
+        let schema = chunk.batch.schema();
+        let options = arrow::ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(Some(arrow::ipc::CompressionType::ZSTD))
+            .expect("compression support");
+        let mut arrow_payload = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
+            &mut arrow_payload,
+            schema.as_ref(),
+            options,
+        )
+        .expect("compressed stream writer");
+        writer.write(&chunk.batch).expect("compressed batch");
+        writer.finish().expect("finish compressed stream");
+        let wire_meta = ExchangeWireMeta::from_chunks(std::slice::from_ref(&chunk))
+            .expect("wire metadata")
+            .expect("typed wire metadata");
+        let payload = encode_exchange_payload_envelope(&arrow_payload, Some(&wire_meta));
+
+        let error = preflight_typed_test_payload(&payload)
+            .expect_err("compressed root result must fail closed");
+        assert!(error.contains("compression is not allowed"), "{error}");
+    }
+
+    #[test]
+    fn typed_root_result_preflight_rejects_exaggerated_and_negative_lengths() {
+        let payload = encode_chunks(&[exchange_test_chunk("name")], true).unwrap();
+        let arrow_offset = typed_test_arrow_payload_offset(&payload);
+
+        let mut exaggerated_metadata = payload.clone();
+        exaggerated_metadata[arrow_offset + 4..arrow_offset + 8].copy_from_slice(
+            &u32::try_from(MAX_TYPED_ROOT_RESULT_MESSAGE_METADATA_BYTES + 64)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        let error = preflight_typed_test_payload(&exaggerated_metadata)
+            .expect_err("exaggerated metadata must fail closed");
+        assert!(error.contains("per-message hard limit"), "{error}");
+
+        let mut negative_body = payload;
+        mutate_record_batch_body_length(&mut negative_body, -1);
+        let error = preflight_typed_test_payload(&negative_body)
+            .expect_err("negative body length must fail closed");
+        assert!(error.contains("body length is negative"), "{error}");
+        let error = decode_root_result_chunks(&negative_body, None)
+            .expect_err("the production decode entry must enforce preflight");
+        assert!(error.contains("body length is negative"), "{error}");
+
+        let mut oversized_body =
+            encode_chunks(&[exchange_test_chunk("name")], true).expect("fresh payload");
+        let oversized_body_length = i64::try_from(oversized_body.len() + 64).unwrap();
+        mutate_record_batch_body_length(&mut oversized_body, oversized_body_length);
+        let error = preflight_typed_test_payload(&oversized_body)
+            .expect_err("oversized body length must fail closed");
+        assert!(error.contains("exceeding hard limit"), "{error}");
+
+        let mut negative_buffer =
+            encode_chunks(&[exchange_test_chunk("name")], true).expect("fresh payload");
+        mutate_unique_record_batch_buffer_length(&mut negative_buffer, -1);
+        let error = preflight_typed_test_payload(&negative_buffer)
+            .expect_err("negative buffer length must fail closed");
+        assert!(
+            error.contains("buffer") && error.contains("negative"),
+            "{error}"
+        );
+
+        let mut excessive_structure =
+            encode_chunks(&[exchange_test_chunk("name")], true).expect("fresh payload");
+        excessive_structure[6..10].copy_from_slice(
+            &u32::try_from(MAX_TYPED_ROOT_RESULT_SCHEMA_FIELDS + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        let error = preflight_typed_test_payload(&excessive_structure)
+            .expect_err("excessive slot structure must fail closed");
+        assert!(
+            error.contains("slot count") && error.contains("hard limit"),
+            "{error}"
+        );
+    }
+
+    fn typed_test_arrow_payload_offset(payload: &[u8]) -> usize {
+        let slot_count = u32::from_le_bytes(payload[6..10].try_into().unwrap()) as usize;
+        10 + slot_count * std::mem::size_of::<u32>()
+    }
+
+    fn mutate_record_batch_body_length(payload: &mut [u8], replacement: i64) {
+        let mut offset = typed_test_arrow_payload_offset(payload);
+        loop {
+            assert_eq!(payload[offset..offset + 4], ARROW_IPC_CONTINUATION_MARKER);
+            let metadata_len =
+                u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            assert_ne!(metadata_len, 0, "record batch must precede terminal marker");
+            let metadata_start = offset + 8;
+            let metadata_end = metadata_start + metadata_len;
+            let message = arrow::ipc::root_as_message(&payload[metadata_start..metadata_end])
+                .expect("valid metadata before mutation");
+            let body_len = usize::try_from(message.bodyLength()).unwrap();
+            if message.header_type() == arrow::ipc::MessageHeader::RecordBatch {
+                let needle = message.bodyLength().to_le_bytes();
+                let matches = payload[metadata_start..metadata_end]
+                    .windows(needle.len())
+                    .enumerate()
+                    .filter_map(|(index, bytes)| (bytes == needle).then_some(index))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "body length must have one metadata encoding"
+                );
+                let start = metadata_start + matches[0];
+                payload[start..start + 8].copy_from_slice(&replacement.to_le_bytes());
+                return;
+            }
+            offset = metadata_end + body_len;
+        }
+    }
+
+    fn mutate_unique_record_batch_buffer_length(payload: &mut [u8], replacement: i64) {
+        let mut offset = typed_test_arrow_payload_offset(payload);
+        loop {
+            assert_eq!(payload[offset..offset + 4], ARROW_IPC_CONTINUATION_MARKER);
+            let metadata_len =
+                u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            assert_ne!(metadata_len, 0, "record batch must precede terminal marker");
+            let metadata_start = offset + 8;
+            let metadata_end = metadata_start + metadata_len;
+            let message = arrow::ipc::root_as_message(&payload[metadata_start..metadata_end])
+                .expect("valid metadata before mutation");
+            let body_len = usize::try_from(message.bodyLength()).unwrap();
+            if let Some(batch) = message.header_as_record_batch() {
+                for descriptor in batch.buffers().expect("record-batch buffers").iter() {
+                    let needle = descriptor.0;
+                    let matches = payload[metadata_start..metadata_end]
+                        .windows(needle.len())
+                        .enumerate()
+                        .filter_map(|(index, bytes)| (bytes == needle).then_some(index))
+                        .collect::<Vec<_>>();
+                    if matches.len() == 1 {
+                        let length_start = metadata_start + matches[0] + 8;
+                        payload[length_start..length_start + 8]
+                            .copy_from_slice(&replacement.to_le_bytes());
+                        return;
+                    }
+                }
+                panic!("record batch must contain one uniquely encoded buffer descriptor");
+            }
+            offset = metadata_end + body_len;
+        }
     }
 
     #[test]
