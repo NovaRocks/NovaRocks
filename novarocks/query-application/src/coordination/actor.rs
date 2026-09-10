@@ -1071,6 +1071,7 @@ struct ResultRuntime {
     terminal_error: Option<QueryExecutionError>,
     transport: QueryResultTransport,
     root_success: Option<RootSuccessGate>,
+    attempt_decision_pending: Option<AttemptActivationIdentity>,
     finish_waiter: Option<PendingResultFinish>,
     pending: Option<PendingResult>,
     in_flight: Option<InFlightResult>,
@@ -1110,6 +1111,7 @@ enum ActorCommand {
     },
     Failed {
         permit: RunningAttemptPermit,
+        error: Option<QueryExecutionError>,
         reply: ActorReply<LogicalConclusion>,
     },
     DeliverResultBatch {
@@ -1254,7 +1256,28 @@ impl LogicalExecutionActor {
         &self,
         permit: RunningAttemptPermit,
     ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
-        request(&self.sender, |reply| ActorCommand::Failed { permit, reply }).await
+        request(&self.sender, |reply| ActorCommand::Failed {
+            permit,
+            error: None,
+            reply,
+        })
+        .await
+    }
+
+    /// Fixes a final logical failure while preserving its public error.
+    /// Recoverable attempt failures use `begin_replacement` and must not
+    /// publish a logical failure before that decision.
+    pub async fn fail_attempt_with_error(
+        &self,
+        permit: RunningAttemptPermit,
+        error: QueryExecutionError,
+    ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
+        request(&self.sender, |reply| ActorCommand::Failed {
+            permit,
+            error: Some(error),
+            reply,
+        })
+        .await
     }
 
     /// Consumes the current attempt authority and begins exact successor
@@ -1589,6 +1612,7 @@ pub fn spawn_logical_execution_actor(
                     terminal_error: None,
                     transport,
                     root_success: None,
+                    attempt_decision_pending: None,
                     finish_waiter: None,
                     pending: None,
                     in_flight: None,
@@ -1754,8 +1778,10 @@ async fn run_actor(
                 .flatten()
         });
         let result_capacity_transport = result_runtime.as_ref().and_then(|runtime| {
-            (runtime.pending.is_some() && runtime.in_flight.is_none())
-                .then(|| runtime.transport.clone())
+            (runtime.pending.is_some()
+                && runtime.in_flight.is_none()
+                && runtime.attempt_decision_pending.is_none())
+            .then(|| runtime.transport.clone())
         });
         let result_receipt_pending = result_runtime
             .as_ref()
@@ -3088,9 +3114,16 @@ fn handle_command(
                 }
             }
         }
-        ActorCommand::Failed { permit, reply } => {
+        ActorCommand::Failed {
+            permit,
+            error,
+            reply,
+        } => {
             if let Some(attempt) = attempts.get_mut(&permit.identity().execution()) {
                 attempt.establish.revoke_issue_authority();
+            }
+            if let (Some(runtime), Some(error)) = (result_runtime.as_deref_mut(), error) {
+                runtime.terminal_error = Some(error);
             }
             settle_terminal(state, permit.into_parts(), LogicalConclusion::Failed, reply);
         }
@@ -3107,6 +3140,12 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 return;
             };
+            if runtime.attempt_decision_pending == Some(activation) {
+                drop(batch);
+                drop(credit);
+                let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
+                return;
+            }
             if runtime
                 .root_success
                 .as_ref()
@@ -3348,6 +3387,7 @@ fn handle_command(
                 };
             if let Some(runtime) = result_runtime.as_deref_mut() {
                 runtime.root_success = None;
+                runtime.attempt_decision_pending = None;
             }
             root_terminal_receiver.take();
             let identity = ReplacementQualificationIdentity::new(
@@ -3864,11 +3904,23 @@ fn apply_root_status_observation(
         || status.state().is_abort();
     gate.status = Some(status);
     if terminal_failure {
-        // A Worker terminal state is an attempt fact. The owner holding the
-        // running permit decides whether the fixed logical execution may
-        // replace this attempt; observation itself cannot conclude the
-        // business operation.
-        let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
+        if state.output_visible() {
+            // Once data crossed the visibility boundary this attempt cannot
+            // be replaced without duplicating a prefix. Fail the logical
+            // stream and interrupt any protocol delivery immediately.
+            let _ = reply.send(Err(LogicalExecutionActorError::ResultDeliveryFailed));
+            fail_result_observation(state, runtime);
+        } else {
+            // Freeze all pending and future data in the same actor turn that
+            // accepts the terminal fact. The running-permit owner can now
+            // choose replacement or a final logical failure without a queued
+            // batch racing across the visibility boundary.
+            runtime.attempt_decision_pending = Some(activation);
+            if let Some(pending) = runtime.pending.take() {
+                reject_pending_result(pending);
+            }
+            let _ = reply.send(Err(LogicalExecutionActorError::RootAttemptTerminal));
+        }
     } else {
         let _ = reply.send(Ok(()));
     }
@@ -7370,10 +7422,35 @@ mod tests {
             snapshot.phase,
             ExecutionPhase::Running { execution, .. } if execution == first
         ));
+        let batch = result_batch();
+        let (control, credit_owner, authority, credit) = result_credit(&batch);
         assert_eq!(
-            actor.fail_attempt(running).await.unwrap(),
+            running
+                .deliver_result_batch(ResultPacketSequence::new(0), batch, credit)
+                .await
+                .unwrap_err(),
+            LogicalExecutionActorError::RootAttemptTerminal
+        );
+        assert!(!actor.snapshot().await.unwrap().output_visible);
+        assert_eq!(authority.snapshot().result_credit.held_bytes(), 0);
+        let terminal_error = QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            "root task failed after attempt classification",
+        );
+        assert_eq!(
+            actor
+                .fail_attempt_with_error(running, terminal_error.clone())
+                .await
+                .unwrap(),
             LogicalConclusion::Failed
         );
+        let error = match stream.next().await {
+            Err(error) => error,
+            Ok(_) => panic!("a final attempt failure must terminate the result stream"),
+        };
+        assert_eq!(error, terminal_error);
+        credit_owner.complete();
+        drop(control);
         drop(stream);
         drop(actor);
         drop(owner);
