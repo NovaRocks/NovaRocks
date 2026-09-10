@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod actor;
 mod actor_state;
 mod completion;
 mod conclusion;
@@ -28,6 +29,7 @@ mod recovery;
 mod result;
 mod status;
 
+pub use actor::*;
 pub use actor_state::*;
 pub use completion::*;
 pub use conclusion::*;

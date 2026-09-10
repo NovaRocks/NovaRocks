@@ -17,7 +17,7 @@
 
 #![allow(
     dead_code,
-    reason = "T08 keeps the sealed reducer private until the production actor cutover"
+    reason = "T08 keeps unconnected replacement and delivery transitions private during actor cutover"
 )]
 
 use std::collections::BTreeMap;
@@ -164,6 +164,20 @@ pub(crate) struct AttemptCapability {
     actor_instance_id: u64,
     execution: QueryExecutionId,
     generation: u64,
+}
+
+impl AttemptCapability {
+    pub(super) const fn actor_instance_id(&self) -> u64 {
+        self.actor_instance_id
+    }
+
+    pub(super) const fn execution(&self) -> QueryExecutionId {
+        self.execution
+    }
+
+    pub(super) const fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 /// Move-only authority for the supervised completion of one exact attempt.
