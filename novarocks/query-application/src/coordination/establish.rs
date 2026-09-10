@@ -28,6 +28,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::{Context, Poll};
 
 use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
@@ -892,23 +893,29 @@ impl EstablishIssueLedger {
         }
     }
 
-    /// Waits for and applies one permit or transport settlement event.
-    ///
-    /// The logical execution actor selects this future alongside its bounded
-    /// command mailbox, so issue settlement never depends on polling.
-    pub(crate) async fn apply_next_event(&mut self) -> Result<(), EstablishIssueError> {
-        let event = self
-            .event_rx
-            .recv()
-            .await
-            .ok_or(EstablishIssueError::EventChannelClosed)?;
-        self.apply_event(event).map(|_| ())
+    pub(crate) fn poll_next_event(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), EstablishIssueError>> {
+        match self.event_rx.poll_recv(context) {
+            Poll::Ready(Some(event)) => Poll::Ready(self.apply_event(event).map(|_| ())),
+            Poll::Ready(None) => Poll::Ready(Err(EstablishIssueError::EventChannelClosed)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     pub(crate) fn snapshot(&self, context: QueryContextRef) -> Option<EstablishIssueSnapshot> {
         self.records
             .get(&context)
             .map(EstablishIssueRecord::snapshot)
+    }
+
+    pub(crate) fn required_contexts(&self) -> Arc<[QueryContextRef]> {
+        self.required_contexts
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .into()
     }
 
     /// Projects only the facts needed by actor-owned context stand-down.
@@ -1343,6 +1350,10 @@ mod tests {
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
+    use novarocks_workload_control::{
+        ResourceConfig, Stage, StagePermit, WorkClass, WorkOwner, WorkRequest, WorkloadConfig,
+        WorkloadControl,
+    };
     use tokio::runtime::Handle;
 
     use super::*;
@@ -1457,7 +1468,26 @@ mod tests {
         QueryExecutionId::new(QueryId::new(43, query), AttemptId::new(1).unwrap()).unwrap()
     }
 
+    fn governed_work() -> (WorkOwner, StagePermit) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 30,
+                control_bytes: 1 << 20,
+                per_scope_bytes: 1 << 28,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let stage = root.owner.scope().try_acquire(Stage::Execution).unwrap();
+        (root.owner, stage)
+    }
+
     fn activation(execution: QueryExecutionId) -> AttemptActivationIdentity {
+        let (work_owner, stage) = governed_work();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             execution,
             ExecutionEffect::None,
@@ -1465,7 +1495,10 @@ mod tests {
             Vec::new(),
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
-        );
+            work_owner,
+            stage,
+        )
+        .unwrap();
         let (_owner, permit) = spawn_logical_execution_actor(&Handle::current(), config).unwrap();
         permit.identity()
     }
@@ -1474,6 +1507,7 @@ mod tests {
         execution: QueryExecutionId,
         contexts: Vec<QueryContextRef>,
     ) -> LogicalExecutionActorConfig {
+        let (work_owner, stage) = governed_work();
         LogicalExecutionActorConfig::single_attempt_completion(
             execution,
             ExecutionEffect::None,
@@ -1481,7 +1515,10 @@ mod tests {
             contexts,
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
         )
+        .unwrap()
         .with_abort_query_context_effect_port(
             crate::coordination::PermanentlyBackpressuredAbortEffectPort::shared(),
             NonZeroUsize::new(2).unwrap(),

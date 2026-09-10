@@ -347,6 +347,10 @@ mod tests {
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
+    use novarocks_workload_control::{
+        ResourceConfig, Stage, StagePermit, WorkClass, WorkOwner, WorkRequest, WorkloadConfig,
+        WorkloadControl,
+    };
 
     use super::*;
 
@@ -356,6 +360,28 @@ mod tests {
 
     fn context(backend: BackendProcessId) -> QueryContextRef {
         QueryContextRef::new(execution(), FrontendProcessId::new_v7(), backend)
+    }
+
+    fn governed_execution() -> (WorkOwner, StagePermit) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 30,
+                control_bytes: 1 << 20,
+                per_scope_bytes: 1 << 28,
+            },
+        )
+        .expect("valid test workload control");
+        control.mark_ready().expect("test workload is ready");
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("query root is admitted");
+        let stage = root
+            .owner
+            .scope()
+            .try_acquire(Stage::Execution)
+            .expect("execution stage is admitted");
+        (root.owner, stage)
     }
 
     async fn next_effect(intake: &mut NativeAbortEffectIntake) -> NativeAbortEffect {
@@ -369,6 +395,7 @@ mod tests {
     async fn projects_actor_identity_and_replays_the_exact_native_abort() {
         let exact_context = context(BackendProcessId::new_v7());
         let (adapter, mut intake) = NativeAbortEffectAdapter::bounded(NonZeroUsize::MIN);
+        let (work_owner, execution_stage) = governed_execution();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             execution(),
             ExecutionEffect::None,
@@ -376,7 +403,10 @@ mod tests {
             vec![exact_context],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            execution_stage,
         )
+        .expect("valid single-attempt actor configuration")
         .with_abort_query_context_effect_port(
             Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
             NonZeroUsize::new(2).unwrap(),
@@ -473,9 +503,17 @@ mod tests {
         );
         let supervisor = owner.into_residual_stand_down_supervisor();
         drop(actor);
+        assert!(
+            !supervisor.is_finished(),
+            "a terminal Abort receipt does not prove actual Worker stop or process replacement"
+        );
+        supervisor
+            .observe_worker_stopped_and_context_fenced(exact_context)
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), supervisor.join())
             .await
-            .expect("settled Abort lets the owner finish")
+            .expect("exact Worker stop and context fencing lets the owner finish")
             .unwrap();
     }
 
@@ -483,6 +521,7 @@ mod tests {
     async fn invalid_context_receipts_are_rejected_without_losing_the_effect() {
         let exact_context = context(BackendProcessId::new_v7());
         let (adapter, mut intake) = NativeAbortEffectAdapter::bounded(NonZeroUsize::MIN);
+        let (work_owner, execution_stage) = governed_execution();
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             execution(),
             ExecutionEffect::None,
@@ -490,7 +529,10 @@ mod tests {
             vec![exact_context],
             NonZeroUsize::MIN,
             NonZeroUsize::MIN,
+            work_owner,
+            execution_stage,
         )
+        .expect("valid single-attempt actor configuration")
         .with_abort_query_context_effect_port(
             Arc::clone(&adapter) as Arc<dyn AbortQueryContextEffectPort>,
             NonZeroUsize::MIN,
@@ -594,11 +636,30 @@ mod tests {
                 .unwrap(),
             NativeAbortEffectSettlement::WorkerSettled
         ));
+        loop {
+            if actor
+                .stand_down_snapshot(exact_context)
+                .await
+                .unwrap()
+                .is_some_and(|snapshot| snapshot.closure() == ContextClosureState::Aborting)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         let supervisor = owner.into_residual_stand_down_supervisor();
         drop(actor);
+        assert!(
+            !supervisor.is_finished(),
+            "a valid Abort acknowledgement does not settle residual Worker responsibility"
+        );
+        supervisor
+            .observe_worker_process_replaced(exact_context)
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), supervisor.join())
             .await
-            .expect("the retained effect can still settle")
+            .expect("the retained effect plus exact process replacement can settle")
             .unwrap();
     }
 

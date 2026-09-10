@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use novarocks_execution_contract::{
@@ -146,6 +147,15 @@ impl ContextClosureState {
                 | Self::WorkerProcessReplaced
         )
     }
+
+    pub const fn residual_resource_settled(self) -> bool {
+        matches!(
+            self,
+            Self::NoRemoteResponsibility
+                | Self::WorkerStoppedAndContextFenced
+                | Self::WorkerProcessReplaced
+        )
+    }
 }
 
 /// Exact settlement produced by the Worker-facing Abort adapter.
@@ -228,6 +238,7 @@ pub enum ContextStandDownError {
     EventChannelClosed,
     EffectCapacityClosed,
     EventBackpressureInvariant,
+    ResponsibilitySettlementFailed,
 }
 
 impl fmt::Display for ContextStandDownError {
@@ -264,6 +275,9 @@ impl fmt::Display for ContextStandDownError {
             Self::EventBackpressureInvariant => {
                 "bounded Abort event capacity was exhausted before its issue budget"
             }
+            Self::ResponsibilitySettlementFailed => {
+                "stand-down residual responsibility could not be settled"
+            }
         })
     }
 }
@@ -273,7 +287,7 @@ impl std::error::Error for ContextStandDownError {}
 #[derive(Debug)]
 struct ContextStandDownRecord {
     activation: AttemptActivationIdentity,
-    cause: ContextStandDownCause,
+    cause: Option<ContextStandDownCause>,
     closure: ContextClosureState,
     request: Option<Arc<AbortQueryContextEffectRequest>>,
     identity: Option<AbortQueryContextIssueIdentity>,
@@ -296,11 +310,17 @@ impl ContextStandDownRecord {
 
     fn require_abort(&mut self, context: QueryContextRef) {
         if self.identity.is_none() {
+            let Some(cause) = self.cause else {
+                if matches!(self.closure, ContextClosureState::AwaitingEstablishIssue) {
+                    self.closure = ContextClosureState::AbortPending;
+                }
+                return;
+            };
             let identity = AbortQueryContextIssueIdentity {
                 activation: self.activation,
                 operation_id: TaskOperationId::new_v7(),
                 context,
-                cause: self.cause,
+                cause,
             };
             self.identity = Some(identity);
             self.request = Some(Arc::new(AbortQueryContextEffectRequest { identity }));
@@ -340,6 +360,7 @@ pub(crate) struct ContextStandDownLedger {
     events: mpsc::Sender<AbortIssueEvent>,
     event_rx: mpsc::Receiver<AbortIssueEvent>,
     started: bool,
+    cause: Option<ContextStandDownCause>,
     authorization_cursor: Option<QueryContextRef>,
     retry_backoff: Duration,
 }
@@ -363,6 +384,7 @@ impl ContextStandDownLedger {
             events,
             event_rx,
             started: false,
+            cause: None,
             authorization_cursor: None,
             retry_backoff: DEFAULT_ABORT_RETRY_BACKOFF,
         })
@@ -372,6 +394,23 @@ impl ContextStandDownLedger {
         &mut self,
         activation: AttemptActivationIdentity,
         cause: ContextStandDownCause,
+        facts: impl IntoIterator<Item = (QueryContextRef, EstablishStandDownFact)>,
+    ) -> Result<(), ContextStandDownError> {
+        self.begin_with_cause(activation, Some(cause), facts)
+    }
+
+    pub(crate) fn begin_successful_cleanup(
+        &mut self,
+        activation: AttemptActivationIdentity,
+        facts: impl IntoIterator<Item = (QueryContextRef, EstablishStandDownFact)>,
+    ) -> Result<(), ContextStandDownError> {
+        self.begin_with_cause(activation, None, facts)
+    }
+
+    fn begin_with_cause(
+        &mut self,
+        activation: AttemptActivationIdentity,
+        cause: Option<ContextStandDownCause>,
         facts: impl IntoIterator<Item = (QueryContextRef, EstablishStandDownFact)>,
     ) -> Result<(), ContextStandDownError> {
         if self.started {
@@ -424,12 +463,17 @@ impl ContextStandDownLedger {
             }
             self.records.insert(*context, record);
         }
+        self.cause = cause;
         self.started = true;
         Ok(())
     }
 
     pub(crate) const fn started(&self) -> bool {
         self.started
+    }
+
+    pub(crate) fn is_successful_cleanup(&self) -> bool {
+        self.started && self.cause.is_none()
     }
 
     pub(crate) fn refresh_establish_fact(
@@ -544,6 +588,14 @@ impl ContextStandDownLedger {
                 .all(|record| record.closure.stand_down_responsibility_settled())
     }
 
+    pub(crate) fn residual_resource_settled(&self) -> bool {
+        self.started
+            && self
+                .records
+                .values()
+                .all(|record| record.closure.residual_resource_settled())
+    }
+
     pub(crate) fn has_unsettled_establish_issue(&self) -> bool {
         self.records
             .values()
@@ -618,6 +670,18 @@ impl ContextStandDownLedger {
             .await
             .ok_or(ContextStandDownError::EventChannelClosed)?;
         self.apply_event(event, now())
+    }
+
+    pub(crate) fn poll_next_event(
+        &mut self,
+        context: &mut Context<'_>,
+        now: impl FnOnce() -> MonotonicInstant,
+    ) -> Poll<Result<(), ContextStandDownError>> {
+        match self.event_rx.poll_recv(context) {
+            Poll::Ready(Some(event)) => Poll::Ready(self.apply_event(event, now())),
+            Poll::Ready(None) => Poll::Ready(Err(ContextStandDownError::EventChannelClosed)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn apply_event(
@@ -1017,6 +1081,10 @@ mod tests {
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
+    use novarocks_workload_control::{
+        ResourceConfig, Stage, StagePermit, WorkClass, WorkOwner, WorkRequest, WorkloadConfig,
+        WorkloadControl,
+    };
     use std::time::Duration;
     use tokio::runtime::Handle;
 
@@ -1024,6 +1092,24 @@ mod tests {
 
     fn execution() -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(71, 1), AttemptId::new(1).unwrap()).unwrap()
+    }
+
+    fn governed_work() -> (WorkOwner, StagePermit) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 30,
+                control_bytes: 1 << 20,
+                per_scope_bytes: 1 << 28,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let stage = root.owner.scope().try_acquire(Stage::Execution).unwrap();
+        (root.owner, stage)
     }
 
     fn activation() -> AttemptActivationIdentity {
@@ -1788,6 +1874,7 @@ mod tests {
         let execution = execution();
         let context = context(BackendProcessId::new_v7());
         let port = Arc::new(RecordingPort::default());
+        let (work_owner, stage) = governed_work();
         let config = crate::coordination::LogicalExecutionActorConfig::single_attempt_completion(
             execution,
             crate::coordination::ExecutionEffect::None,
@@ -1795,7 +1882,10 @@ mod tests {
             vec![context],
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
         )
+        .unwrap()
         .with_abort_query_context_effect_port(
             Arc::clone(&port) as Arc<dyn AbortQueryContextEffectPort>,
             NonZeroUsize::new(2).unwrap(),
@@ -1875,9 +1965,17 @@ mod tests {
         }
         let supervisor = owner.into_residual_stand_down_supervisor();
         drop(actor);
+        assert!(
+            !supervisor.is_finished(),
+            "a terminal record does not prove actual stop or process replacement"
+        );
+        supervisor
+            .observe_worker_stopped_and_context_fenced(context)
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), supervisor.join())
             .await
-            .expect("settled stand-down lets the registry-owned supervisor finish")
+            .expect("positive Registry convergence lets the residual supervisor finish")
             .unwrap();
     }
 
@@ -1885,6 +1983,7 @@ mod tests {
     async fn actor_with_remote_contexts_requires_an_abort_effect_port() {
         let execution = execution();
         let context = context(BackendProcessId::new_v7());
+        let (work_owner, stage) = governed_work();
         let config = crate::coordination::LogicalExecutionActorConfig::single_attempt_completion(
             execution,
             crate::coordination::ExecutionEffect::None,
@@ -1892,7 +1991,10 @@ mod tests {
             vec![context],
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1).unwrap(),
-        );
+            work_owner,
+            stage,
+        )
+        .unwrap();
         assert!(matches!(
             crate::coordination::spawn_logical_execution_actor(&Handle::current(), config),
             Err(crate::coordination::LogicalExecutionActorError::InvariantViolation)

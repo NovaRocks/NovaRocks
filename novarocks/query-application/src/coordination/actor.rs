@@ -17,28 +17,39 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use novarocks_execution_contract::{
-    AcquireQueryContextAdmissionTicket, EstablishQueryContext, QueryContextRef,
+    AcquireQueryContextAdmissionTicket, EstablishQueryContext, OperationOutcome, QueryContextRef,
 };
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::QueryExecutionId;
+use novarocks_workload_control::{
+    CancellationReason, CancellationView, Obligation, ObligationKey, ObligationKind, Stage,
+    StagePermit, WorkOwner, WorkScope,
+};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use super::actor_state::{ActorStateError, AttemptCapability, LogicalExecutionState};
+use super::actor_state::{
+    ActorStateError, AttemptCapability, LogicalExecutionState, ReplacementFact, ReplacementToken,
+};
 use super::{
     AbortQueryContextEffectPort, AbortQueryContextIssuePermit, AbortQueryContextIssueSubmit,
-    AdmissionIssueDisposition, AdmissionIssueReceipt, AdmissionIssueSettlement,
-    ContextStandDownCause, ContextStandDownError, ContextStandDownLedger, ContextStandDownSnapshot,
-    EstablishIssueError, EstablishIssueLedger, EstablishIssuePermit, EstablishIssueSnapshot,
-    ExecutionEffect, ExecutionPhase, LogicalConclusion, LogicalOutputMode, MonotonicInstant,
-    RecoveryMode, RegistryContextConvergence,
+    ActiveReplacementResources, AdmissionIssueDisposition, AdmissionIssueReceipt,
+    AdmissionIssueSettlement, AttemptFailureClass, ContextStandDownCause, ContextStandDownError,
+    ContextStandDownLedger, ContextStandDownSnapshot, EstablishIssueError, EstablishIssueLedger,
+    EstablishIssuePermit, EstablishIssueSnapshot, ExecutionEffect, ExecutionPhase,
+    LogicalConclusion, LogicalOutputMode, MonotonicInstant, RecoveryMode, RecoveryRefusal,
+    RegistryContextConvergence, ReplacementQualificationEffectAdmission,
+    ReplacementQualificationEffectPort, ReplacementQualificationEffectReceipt,
+    ReplacementQualificationEffectSubmission, ReplacementQualificationFailure,
+    ReplacementQualificationIdentity, ReplacementQualificationRequest,
+    ReplacementQualificationSettlement, ReplacementWorkerAdmissionEvidence, receipt_channel,
 };
 
 /// Immutable identity of one actor-owned attempt activation generation.
@@ -55,6 +66,12 @@ pub struct AttemptActivationIdentity {
 /// Opaque process-local identity of one logical execution actor instance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalExecutionActorId(u64);
+
+impl LogicalExecutionActorId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// Actor-owned monotonic time authority. Callers never provide a current time
 /// or derive an admission-ticket expiry themselves.
@@ -166,6 +183,24 @@ impl AttemptInstantiationPermit {
             lifetime: self.lifetime.take(),
             mailbox_liveness: self.mailbox_liveness.take(),
         }
+    }
+
+    /// Consumes initialization evidence for grants already recorded by the
+    /// actor. The opaque active owner keeps exclusive cleanup responsibility;
+    /// this call transfers neither the Acquire operation nor ticket ownership.
+    pub async fn take_replacement_admission_evidence(
+        &self,
+    ) -> Result<Option<Box<[ReplacementWorkerAdmissionEvidence]>>, LogicalExecutionActorError> {
+        request(
+            self.mailbox_liveness
+                .as_ref()
+                .expect("live instantiation permit retains actor liveness"),
+            |reply| ActorCommand::TakeReplacementAdmissionEvidence {
+                activation: self.identity(),
+                reply,
+            },
+        )
+        .await
     }
 
     fn into_parts(
@@ -369,6 +404,47 @@ impl Drop for RunningAttemptPermit {
     }
 }
 
+/// Move-only owner of the interval between a failed attempt and its proposed
+/// successor. Dropping it cancels the logical execution and leaves every old
+/// attempt ledger under the actor's residual supervision.
+#[derive(Debug)]
+#[must_use = "replacement qualification must activate its successor or conclude"]
+pub struct ReplacementQualification {
+    identity: ReplacementQualificationIdentity,
+    lifetime: Option<Arc<PermitLifetime>>,
+    mailbox_liveness: Option<mpsc::Sender<ActorCommand>>,
+}
+
+impl ReplacementQualification {
+    pub const fn identity(&self) -> ReplacementQualificationIdentity {
+        self.identity
+    }
+
+    fn into_parts(
+        mut self,
+    ) -> (
+        ReplacementQualificationIdentity,
+        Arc<PermitLifetime>,
+        mpsc::Sender<ActorCommand>,
+    ) {
+        let lifetime = self
+            .lifetime
+            .take()
+            .expect("live replacement qualification retains its lifetime");
+        let mailbox_liveness = self
+            .mailbox_liveness
+            .take()
+            .expect("live replacement qualification retains actor liveness");
+        (self.identity, lifetime, mailbox_liveness)
+    }
+}
+
+impl Drop for ReplacementQualification {
+    fn drop(&mut self) {
+        abandon_on_drop(&mut self.lifetime);
+    }
+}
+
 fn identity_of(capability: &AttemptCapability) -> AttemptActivationIdentity {
     AttemptActivationIdentity {
         actor_instance_id: capability.actor_instance_id(),
@@ -377,25 +453,112 @@ fn identity_of(capability: &AttemptCapability) -> AttemptActivationIdentity {
     }
 }
 
+fn retired_obligation_key(identity: ReplacementQualificationIdentity) -> ObligationKey {
+    let query = identity.failed().query_id();
+    let mut bytes = [0_u8; 32];
+    bytes[0..8].copy_from_slice(&identity.actor().get().to_le_bytes());
+    bytes[8..16].copy_from_slice(&query.high().to_le_bytes());
+    bytes[16..24].copy_from_slice(&query.low().to_le_bytes());
+    bytes[24..32].copy_from_slice(&identity.failed().attempt_id().get().to_le_bytes());
+    ObligationKey(bytes)
+}
+
 /// Honest construction inputs for the currently connected actor slice.
 ///
 /// T08 first connects a single, completion-only attempt. Recovery and result
 /// delivery remain reducer capabilities until their actor-owned effect gates
 /// are connected; callers cannot select those modes prematurely.
-#[derive(Clone, Debug)]
 pub struct LogicalExecutionActorConfig {
     initial_execution: QueryExecutionId,
+    recovery_mode: RecoveryMode,
     effect: ExecutionEffect,
+    output_mode: LogicalOutputMode,
+    max_attempts: u32,
     mailbox_capacity: NonZeroUsize,
     required_establish_contexts: Vec<QueryContextRef>,
     max_admission_issues_per_context: NonZeroUsize,
     max_establish_authorizations_per_context: NonZeroUsize,
     abort_effect_port: Option<Arc<dyn AbortQueryContextEffectPort>>,
+    replacement_effect_port: Option<Arc<dyn ReplacementQualificationEffectPort>>,
+    replacement_reservation_valid_for: Option<Duration>,
     max_abort_authorizations_per_context: NonZeroUsize,
     clock: Arc<dyn LogicalExecutionClock>,
+    work_owner: Option<WorkOwner>,
+    execution_stage: Option<StagePermit>,
+}
+
+impl fmt::Debug for LogicalExecutionActorConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LogicalExecutionActorConfig")
+            .field("initial_execution", &self.initial_execution)
+            .field("recovery_mode", &self.recovery_mode)
+            .field("effect", &self.effect)
+            .field("output_mode", &self.output_mode)
+            .field("max_attempts", &self.max_attempts)
+            .field(
+                "work",
+                &self.work_owner.as_ref().map(|owner| owner.scope().id()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LogicalExecutionActorConfig {
+    fn drop(&mut self) {
+        self.execution_stage.take();
+        if let Some(owner) = self.work_owner.take() {
+            owner.complete();
+        }
+    }
+}
+
+fn close_unstarted_governance(work_owner: WorkOwner, execution_stage: StagePermit) {
+    drop(execution_stage);
+    work_owner.complete();
 }
 
 impl LogicalExecutionActorConfig {
+    /// Constructs an execution whose business contract permits no attempt
+    /// replacement. External-effect executions can only use this constructor.
+    pub fn no_recovery_completion(
+        initial_execution: QueryExecutionId,
+        effect: ExecutionEffect,
+        mailbox_capacity: NonZeroUsize,
+        required_establish_contexts: Vec<QueryContextRef>,
+        max_admission_issues_per_context: NonZeroUsize,
+        max_establish_authorizations_per_context: NonZeroUsize,
+        work_owner: WorkOwner,
+        initial_execution_stage: StagePermit,
+    ) -> Result<Self, LogicalExecutionActorError> {
+        let work = work_owner.scope();
+        if initial_execution_stage
+            .check(&work, Stage::Execution)
+            .is_err()
+        {
+            close_unstarted_governance(work_owner, initial_execution_stage);
+            return Err(LogicalExecutionActorError::InvariantViolation);
+        }
+        Ok(Self {
+            initial_execution,
+            recovery_mode: RecoveryMode::NoRecovery,
+            effect,
+            output_mode: LogicalOutputMode::CompletionOnly,
+            max_attempts: 1,
+            mailbox_capacity,
+            required_establish_contexts,
+            max_admission_issues_per_context,
+            max_establish_authorizations_per_context,
+            abort_effect_port: None,
+            replacement_effect_port: None,
+            replacement_reservation_valid_for: None,
+            max_abort_authorizations_per_context: max_establish_authorizations_per_context,
+            clock: Arc::new(ProcessLogicalExecutionClock::new()),
+            work_owner: Some(work_owner),
+            execution_stage: Some(initial_execution_stage),
+        })
+    }
+
     pub fn single_attempt_completion(
         initial_execution: QueryExecutionId,
         effect: ExecutionEffect,
@@ -403,18 +566,71 @@ impl LogicalExecutionActorConfig {
         required_establish_contexts: Vec<QueryContextRef>,
         max_admission_issues_per_context: NonZeroUsize,
         max_establish_authorizations_per_context: NonZeroUsize,
-    ) -> Self {
-        Self {
+        work_owner: WorkOwner,
+        initial_execution_stage: StagePermit,
+    ) -> Result<Self, LogicalExecutionActorError> {
+        Self::no_recovery_completion(
             initial_execution,
             effect,
             mailbox_capacity,
             required_establish_contexts,
             max_admission_issues_per_context,
             max_establish_authorizations_per_context,
+            work_owner,
+            initial_execution_stage,
+        )
+    }
+
+    /// Constructs effect-free read execution recovery before any data packet
+    /// becomes visible. The budget must authorize at least one successor.
+    pub(crate) fn read_only_pre_visibility_recovery(
+        initial_execution: QueryExecutionId,
+        mailbox_capacity: NonZeroUsize,
+        required_establish_contexts: Vec<QueryContextRef>,
+        max_admission_issues_per_context: NonZeroUsize,
+        max_establish_authorizations_per_context: NonZeroUsize,
+        max_attempts: NonZeroU32,
+        replacement_effect_port: Arc<dyn ReplacementQualificationEffectPort>,
+        work_owner: WorkOwner,
+        initial_execution_stage: StagePermit,
+        replacement_reservation_valid_for: Duration,
+    ) -> Result<Self, LogicalExecutionActorError> {
+        if max_attempts.get() <= 1 {
+            close_unstarted_governance(work_owner, initial_execution_stage);
+            return Err(LogicalExecutionActorError::RecoveryRefused(
+                RecoveryRefusal::AttemptBudget,
+            ));
+        }
+        if replacement_reservation_valid_for.is_zero() {
+            close_unstarted_governance(work_owner, initial_execution_stage);
+            return Err(LogicalExecutionActorError::InvariantViolation);
+        }
+        let work = work_owner.scope();
+        if initial_execution_stage
+            .check(&work, Stage::Execution)
+            .is_err()
+        {
+            close_unstarted_governance(work_owner, initial_execution_stage);
+            return Err(LogicalExecutionActorError::InvariantViolation);
+        }
+        Ok(Self {
+            initial_execution,
+            recovery_mode: RecoveryMode::RestartAttemptBeforeVisibility,
+            effect: ExecutionEffect::None,
+            output_mode: LogicalOutputMode::ResultStream,
+            max_attempts: max_attempts.get(),
+            mailbox_capacity,
+            required_establish_contexts,
+            max_admission_issues_per_context,
+            max_establish_authorizations_per_context,
             abort_effect_port: None,
+            replacement_effect_port: Some(replacement_effect_port),
+            replacement_reservation_valid_for: Some(replacement_reservation_valid_for),
             max_abort_authorizations_per_context: max_establish_authorizations_per_context,
             clock: Arc::new(ProcessLogicalExecutionClock::new()),
-        }
+            work_owner: Some(work_owner),
+            execution_stage: Some(initial_execution_stage),
+        })
     }
 
     /// Connects the role-composed Abort effect port. The query application
@@ -445,6 +661,9 @@ pub enum LogicalExecutionActorError {
     WrongExecution,
     WrongPhase,
     AlreadyConcluded,
+    RecoveryRefused(RecoveryRefusal),
+    ReplacementNotReady,
+    ReplacementQualificationFailed(ReplacementQualificationFailure),
     InvariantViolation,
     Establish(EstablishIssueError),
     StandDown(ContextStandDownError),
@@ -458,15 +677,30 @@ impl fmt::Display for LogicalExecutionActorError {
         if let Self::StandDown(error) = self {
             return write!(formatter, "query-context stand-down failed: {error}");
         }
+        if let Self::RecoveryRefused(reason) = self {
+            return write!(
+                formatter,
+                "logical execution recovery was refused: {reason:?}"
+            );
+        }
+        if let Self::ReplacementQualificationFailed(reason) = self {
+            return write!(
+                formatter,
+                "attempt replacement qualification failed: {reason:?}"
+            );
+        }
         formatter.write_str(match self {
             Self::MailboxClosed => "logical execution actor mailbox is closed",
             Self::StaleAuthority => "attempt authority belongs to another actor or generation",
             Self::WrongExecution => "attempt authority does not name the current execution",
             Self::WrongPhase => "logical execution is in the wrong phase",
             Self::AlreadyConcluded => "logical execution has already concluded",
+            Self::ReplacementNotReady => "attempt replacement qualification is incomplete",
             Self::InvariantViolation => "logical execution actor invariant was violated",
-            Self::Establish(_) => unreachable!("handled above"),
-            Self::StandDown(_) => unreachable!("handled above"),
+            Self::Establish(_)
+            | Self::StandDown(_)
+            | Self::RecoveryRefused(_)
+            | Self::ReplacementQualificationFailed(_) => unreachable!("handled above"),
         })
     }
 }
@@ -487,9 +721,9 @@ impl From<ActorStateError> for LogicalExecutionActorError {
             | ActorStateError::SuccessRequiresEndOfStream
             | ActorStateError::SuccessAlreadyAuthorized => Self::WrongPhase,
             ActorStateError::AlreadyConcluded => Self::AlreadyConcluded,
-            ActorStateError::RecoveryRefused(_)
-            | ActorStateError::ReplacementNotReady(_)
-            | ActorStateError::StaleReplacement
+            ActorStateError::RecoveryRefused(reason) => Self::RecoveryRefused(reason),
+            ActorStateError::ReplacementNotReady(_) => Self::ReplacementNotReady,
+            ActorStateError::StaleReplacement
             | ActorStateError::EffectAlreadyPending
             | ActorStateError::EffectAlreadySatisfied
             | ActorStateError::EffectIdentityExhausted
@@ -518,11 +752,99 @@ pub struct LogicalExecutionActorSnapshot {
     pub conclusion: Option<LogicalConclusion>,
     pub establish_error: Option<EstablishIssueError>,
     pub stand_down_error: Option<ContextStandDownError>,
+    pub replacement_error: Option<ReplacementQualificationFailure>,
+}
+
+struct AttemptLedgers {
+    activation: AttemptActivationIdentity,
+    establish: EstablishIssueLedger,
+    establish_error: Option<EstablishIssueError>,
+    stand_down: ContextStandDownLedger,
+    stand_down_error: Option<ContextStandDownError>,
+    pending_aborts: BTreeMap<QueryContextRef, AbortQueryContextIssuePermit>,
+    abort_backpressured: bool,
+    retired_obligation: Option<Obligation>,
+    active_resources: Option<ActiveReplacementResources>,
+}
+
+impl fmt::Debug for AttemptLedgers {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttemptLedgers")
+            .field("activation", &self.activation)
+            .field("has_retired_obligation", &self.retired_obligation.is_some())
+            .field("has_active_resources", &self.active_resources.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+struct ReplacementRuntime {
+    token: ReplacementToken,
+    identity: ReplacementQualificationIdentity,
+    request: Arc<ReplacementQualificationRequest>,
+    effect_cancellation: watch::Sender<bool>,
+    effect_dispatched: bool,
+    effect_settled: bool,
+    effect_backpressured: bool,
+    activation: Option<PendingReplacementActivation>,
+    reservation: Option<super::QualifiedReplacementReservation>,
+    effect_dispatched_at: Option<MonotonicInstant>,
+    conservative_expiry: Option<MonotonicInstant>,
+    reservation_valid_for: Duration,
+    stale_usage_accounted: bool,
+}
+
+impl fmt::Debug for ReplacementRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReplacementRuntime")
+            .field("identity", &self.identity)
+            .field("effect_dispatched", &self.effect_dispatched)
+            .field("effect_settled", &self.effect_settled)
+            .field("has_reservation", &self.reservation.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct PendingReplacementActivation {
+    lifetime: Arc<PermitLifetime>,
+    mailbox_liveness: mpsc::Sender<ActorCommand>,
+    reply: ActorReply<AttemptInstantiationPermit>,
+}
+
+/// Cancels a replacement whose caller stopped awaiting the actor reply after
+/// transferring the move-only qualification into the mailbox.
+#[derive(Debug)]
+struct PendingAuthorityRequest {
+    lifetime: Option<Arc<PermitLifetime>>,
+}
+
+impl PendingAuthorityRequest {
+    fn new(lifetime: Arc<PermitLifetime>) -> Self {
+        Self {
+            lifetime: Some(lifetime),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.lifetime.take();
+    }
+}
+
+impl Drop for PendingAuthorityRequest {
+    fn drop(&mut self) {
+        abandon_on_drop(&mut self.lifetime);
+    }
 }
 
 type ActorReply<T> = oneshot::Sender<Result<T, LogicalExecutionActorError>>;
 
 enum ActorCommand {
+    TakeReplacementAdmissionEvidence {
+        activation: AttemptActivationIdentity,
+        reply: ActorReply<Option<Box<[ReplacementWorkerAdmissionEvidence]>>>,
+    },
     Activate {
         readiness: AttemptReadinessReceipt,
         reply: ActorReply<RunningAttemptPermit>,
@@ -542,6 +864,17 @@ enum ActorCommand {
     Failed {
         permit: RunningAttemptPermit,
         reply: ActorReply<LogicalConclusion>,
+    },
+    BeginReplacement {
+        permit: RunningAttemptPermit,
+        failure: AttemptFailureClass,
+        replacement: QueryExecutionId,
+        replacement_contexts: Vec<QueryContextRef>,
+        reply: ActorReply<ReplacementQualification>,
+    },
+    ActivateReplacement {
+        qualification: ReplacementQualification,
+        reply: ActorReply<AttemptInstantiationPermit>,
     },
     BeginAdmissionIssue {
         activation: AttemptActivationIdentity,
@@ -645,6 +978,55 @@ impl LogicalExecutionActor {
         permit: RunningAttemptPermit,
     ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
         request(&self.sender, |reply| ActorCommand::Failed { permit, reply }).await
+    }
+
+    /// Consumes the current attempt authority and begins exact successor
+    /// qualification. The old attempt becomes residual before any successor
+    /// capacity can be activated.
+    pub async fn begin_replacement(
+        &self,
+        permit: RunningAttemptPermit,
+        failure: AttemptFailureClass,
+        replacement: QueryExecutionId,
+        replacement_contexts: Vec<QueryContextRef>,
+    ) -> Result<ReplacementQualification, LogicalExecutionActorError> {
+        request(&self.sender, |reply| ActorCommand::BeginReplacement {
+            permit,
+            failure,
+            replacement,
+            replacement_contexts,
+            reply,
+        })
+        .await
+    }
+
+    /// Activates a fully qualified successor and returns its exact
+    /// instantiation authority. The combined qualification owner proves the
+    /// replacement gate; the old attempt's stand-down ledger remains an
+    /// independently supervised residual after activation.
+    pub async fn activate_replacement(
+        &self,
+        qualification: ReplacementQualification,
+    ) -> Result<AttemptInstantiationPermit, LogicalExecutionActorError> {
+        let lifetime = qualification
+            .lifetime
+            .as_ref()
+            .cloned()
+            .ok_or(LogicalExecutionActorError::StaleAuthority)?;
+        let mut pending_request = PendingAuthorityRequest::new(lifetime);
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(ActorCommand::ActivateReplacement {
+                qualification,
+                reply,
+            })
+            .await
+            .map_err(|_| LogicalExecutionActorError::MailboxClosed)?;
+        let result = response
+            .await
+            .map_err(|_| LogicalExecutionActorError::MailboxClosed)?;
+        pending_request.disarm();
+        result
     }
 
     pub async fn snapshot(
@@ -801,14 +1183,14 @@ impl ResidualStandDownSupervisor {
 /// runtime and mints the initial exact instantiation authority.
 pub fn spawn_logical_execution_actor(
     runtime: &Handle,
-    config: LogicalExecutionActorConfig,
+    mut config: LogicalExecutionActorConfig,
 ) -> Result<(LogicalExecutionActorOwner, AttemptInstantiationPermit), LogicalExecutionActorError> {
     let mut state = LogicalExecutionState::new(
         config.initial_execution,
-        RecoveryMode::NoRecovery,
+        config.recovery_mode,
         config.effect,
-        LogicalOutputMode::CompletionOnly,
-        1,
+        config.output_mode,
+        config.max_attempts,
     )?;
     let capability = state.attempt_capability(config.initial_execution)?;
     let capability_identity = identity_of(&capability);
@@ -846,19 +1228,64 @@ pub fn spawn_logical_execution_actor(
         .abort_effect_port
         .as_ref()
         .map(|port| port.subscribe_capacity());
+    let replacement_capacity = config
+        .replacement_effect_port
+        .as_ref()
+        .map(|port| port.subscribe_capacity());
+    let (replacement_receipts, replacement_receipt_rx) = receipt_channel();
+    let work_cancellation = config
+        .work_owner
+        .as_ref()
+        .ok_or(LogicalExecutionActorError::InvariantViolation)?
+        .scope()
+        .cancellation()
+        .map_err(|_| LogicalExecutionActorError::InvariantViolation)?;
+    let execution_stage = config
+        .execution_stage
+        .take()
+        .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+    let work_owner = config
+        .work_owner
+        .take()
+        .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+    let attempts = BTreeMap::from([(
+        config.initial_execution,
+        AttemptLedgers {
+            activation: capability_identity,
+            establish,
+            establish_error: None,
+            stand_down,
+            stand_down_error: None,
+            pending_aborts: BTreeMap::new(),
+            abort_backpressured: false,
+            retired_obligation: None,
+            active_resources: None,
+        },
+    )]);
     let clock = Arc::clone(&config.clock);
     let actor_lifetime = Arc::clone(&lifetime);
+    let abort_effect_port = config.abort_effect_port.take();
+    let replacement_effect_port = config.replacement_effect_port.take();
     let join = runtime.spawn(async move {
         run_actor(
             &mut state,
             receiver,
             abandoned_rx,
             actor_lifetime,
-            establish,
-            stand_down,
-            capability_identity,
-            config.abort_effect_port,
+            attempts,
+            abort_effect_port,
             abort_capacity,
+            replacement_effect_port,
+            work_owner,
+            execution_stage,
+            config.replacement_reservation_valid_for,
+            replacement_capacity,
+            replacement_receipts,
+            replacement_receipt_rx,
+            work_cancellation,
+            config.max_admission_issues_per_context,
+            config.max_establish_authorizations_per_context,
+            config.max_abort_authorizations_per_context,
             clock,
         )
         .await;
@@ -884,91 +1311,152 @@ async fn run_actor(
     mut receiver: mpsc::Receiver<ActorCommand>,
     mut abandoned: watch::Receiver<bool>,
     lifetime: Arc<PermitLifetime>,
-    mut establish: EstablishIssueLedger,
-    mut stand_down: ContextStandDownLedger,
-    activation: AttemptActivationIdentity,
+    mut attempts: BTreeMap<QueryExecutionId, AttemptLedgers>,
     abort_effect_port: Option<Arc<dyn AbortQueryContextEffectPort>>,
     mut abort_capacity: Option<watch::Receiver<u64>>,
+    replacement_effect_port: Option<Arc<dyn ReplacementQualificationEffectPort>>,
+    work_owner: WorkOwner,
+    execution_stage: StagePermit,
+    replacement_reservation_valid_for: Option<Duration>,
+    mut replacement_capacity: Option<watch::Receiver<u64>>,
+    replacement_receipts: mpsc::UnboundedSender<ReplacementQualificationEffectReceipt>,
+    mut replacement_receipt_rx: mpsc::UnboundedReceiver<ReplacementQualificationEffectReceipt>,
+    work_cancellation: CancellationView,
+    max_admission_issues_per_context: NonZeroUsize,
+    max_establish_authorizations_per_context: NonZeroUsize,
+    max_abort_authorizations_per_context: NonZeroUsize,
     clock: Arc<dyn LogicalExecutionClock>,
 ) {
     let mut establish_error = None;
     let mut stand_down_error = None;
-    let mut pending_aborts = BTreeMap::new();
-    let mut abort_backpressured = false;
+    let mut replacement_error = None;
+    let mut replacement = None;
+    let mut execution_stage = Some(execution_stage);
     let mut receiver_open = true;
     loop {
         let now = clock.now();
-        if *abandoned.borrow() {
-            establish.revoke_issue_authority();
-            conclude_abandoned(state);
+        if state.conclusion().is_none()
+            && let Some(reason) = work_cancellation.reason()
+        {
+            revoke_all_establish_authority(&mut attempts);
+            conclude_for_work_cancellation(state, replacement.as_ref(), &reason);
             lifetime.settle();
         }
-        if let Err(error) =
-            synchronize_stand_down(state, activation, &mut establish, &mut stand_down)
+        expire_replacement_reservation(state, replacement.as_mut(), &mut replacement_error, now);
+        if *abandoned.borrow() {
+            revoke_all_establish_authority(&mut attempts);
+            conclude_abandoned(state, replacement.as_ref());
+            lifetime.settle();
+        }
+        release_concluded_actor_resources(state, &mut execution_stage, replacement.as_mut());
+        synchronize_all_stand_down(
+            state,
+            &mut attempts,
+            &mut stand_down_error,
+            now,
+            abort_effect_port.as_deref(),
+        );
+        if state.conclusion().is_some()
+            && let Some(replacement) = replacement.as_mut()
+            && !replacement.effect_dispatched
         {
-            stand_down_error.get_or_insert(error);
+            replacement.effect_backpressured = false;
         }
-        if stand_down.responsibility_settled() {
-            if let Err(error) =
-                cancel_pending_abort_issues(&mut stand_down, &mut pending_aborts, now)
-            {
-                stand_down_error.get_or_insert(error);
-            }
-            abort_backpressured = !pending_aborts.is_empty();
-        }
-        if stand_down_error.is_none() {
-            if let Err(error) = drive_abort_effect(
-                &mut stand_down,
-                abort_effect_port.as_deref(),
-                &mut pending_aborts,
-                &mut abort_backpressured,
+        if state.conclusion().is_none() {
+            drive_replacement_effect(
+                replacement.as_mut(),
+                replacement_effect_port.as_deref(),
+                &replacement_receipts,
                 now,
-            ) {
-                stand_down_error.get_or_insert(error);
-            }
+            );
         }
-        if !receiver_open && actor_cleanup_complete(state, &stand_down) {
+        try_activate_qualified_replacement(
+            state,
+            &mut attempts,
+            &mut replacement,
+            max_admission_issues_per_context,
+            max_establish_authorizations_per_context,
+            max_abort_authorizations_per_context,
+            clock.as_ref(),
+        );
+        release_concluded_actor_resources(state, &mut execution_stage, replacement.as_mut());
+        if !receiver_open && actor_cleanup_complete(state, &attempts, replacement.as_ref()) {
+            work_owner.complete();
             return;
         }
-        let abort_retry_at = stand_down_error
-            .is_none()
-            .then(|| stand_down.next_retry_at())
-            .flatten();
+        let abort_retry_at = next_abort_retry_at(&attempts);
+        let abort_backpressured = attempts.values().any(|attempt| attempt.abort_backpressured);
+        let replacement_backpressured = replacement.as_ref().is_some_and(|replacement| {
+            state.conclusion().is_none() && replacement.effect_backpressured
+        });
+        let replacement_effect_pending = replacement.as_ref().is_some_and(|replacement| {
+            replacement.effect_dispatched && !replacement.effect_settled
+        });
+        let replacement_expires_at = replacement.as_ref().and_then(|replacement| {
+            state
+                .conclusion()
+                .is_none()
+                .then_some(replacement.conservative_expiry)
+                .flatten()
+        });
         tokio::select! {
             biased;
             changed = abandoned.changed(), if !*abandoned.borrow() => {
                 if changed.is_ok() && *abandoned.borrow() {
-                    establish.revoke_issue_authority();
-                    conclude_abandoned(state);
+                    revoke_all_establish_authority(&mut attempts);
+                    conclude_abandoned(state, replacement.as_ref());
                     lifetime.settle();
                 }
             }
-            result = establish.apply_next_event() => {
-                match result {
-                    Ok(()) if establish.has_worker_rejection() => {
-                        establish_error.get_or_insert(EstablishIssueError::EstablishRejected);
-                        establish.revoke_issue_authority();
-                        conclude_failed(state);
-                    }
-                    Ok(()) => {}
-                    Err(error) => {
-                        establish_error.get_or_insert(error);
-                        establish.revoke_issue_authority();
-                        conclude_failed(state);
-                    }
-                }
+            reason = work_cancellation.cancelled(), if state.conclusion().is_none() => {
+                revoke_all_establish_authority(&mut attempts);
+                conclude_for_work_cancellation(state, replacement.as_ref(), &reason);
+                lifetime.settle();
             }
-            result = stand_down.apply_next_event(|| clock.now()), if stand_down.started() && !stand_down.responsibility_settled() => {
-                if let Err(error) = result {
-                    stand_down_error.get_or_insert(error);
-                }
+            event = wait_for_attempt_ledger_event(&mut attempts, clock.as_ref()) => {
+                apply_attempt_ledger_event(state, &mut attempts, event, &mut establish_error, &mut stand_down_error);
             }
+            receipt = replacement_receipt_rx.recv(), if replacement_effect_pending => {
+                apply_replacement_receipt(
+                    state,
+                    replacement.as_mut(),
+                    receipt,
+                    &mut replacement_error,
+                );
+            }
+            _ = wait_for_replacement_expiry(clock.as_ref(), replacement_expires_at), if replacement_expires_at.is_some() => {}
             _ = wait_for_abort_retry(clock.as_ref(), abort_retry_at), if abort_retry_at.is_some() => {}
             result = wait_for_abort_capacity(&mut abort_capacity), if abort_backpressured => {
                 match result {
-                    Ok(()) => abort_backpressured = false,
+                    Ok(()) => {
+                        for attempt in attempts.values_mut() {
+                            attempt.abort_backpressured = false;
+                        }
+                    }
                     Err(error) => {
                         stand_down_error.get_or_insert(error);
+                        for attempt in attempts.values_mut() {
+                            if attempt.abort_backpressured {
+                                attempt.stand_down_error.get_or_insert(error);
+                                attempt.abort_backpressured = false;
+                            }
+                        }
+                    }
+                }
+            }
+            result = wait_for_replacement_capacity(&mut replacement_capacity), if replacement_backpressured => {
+                match result {
+                    Ok(()) => {
+                        if let Some(replacement) = replacement.as_mut() {
+                            replacement.effect_backpressured = false;
+                        }
+                    }
+                    Err(failure) => {
+                        if let Some(replacement) = replacement.as_mut() {
+                            replacement.effect_backpressured = false;
+                        }
+                        replacement_error.get_or_insert(failure);
+                        conclude_replacement_failed(state, replacement.as_mut());
                     }
                 }
             }
@@ -979,15 +1467,584 @@ async fn run_actor(
                 };
                 handle_command(
                     state,
-                    &mut establish,
+                    &mut attempts,
                     &mut establish_error,
-                    &mut stand_down,
                     &mut stand_down_error,
-                    activation,
+                    &mut replacement,
+                    &mut replacement_error,
                     clock.as_ref(),
+                    &work_owner.scope(),
+                    &work_cancellation,
+                    replacement_reservation_valid_for,
                     command,
                 );
             }
+        }
+    }
+}
+
+fn release_concluded_actor_resources(
+    state: &LogicalExecutionState,
+    execution_stage: &mut Option<StagePermit>,
+    replacement: Option<&mut ReplacementRuntime>,
+) {
+    if state.conclusion().is_none() {
+        return;
+    }
+    execution_stage.take();
+    let Some(replacement) = replacement else {
+        return;
+    };
+    if replacement.effect_dispatched && !replacement.effect_settled {
+        replacement.effect_cancellation.send_replace(true);
+    }
+    replacement.reservation.take();
+    if let Some(pending) = replacement.activation.take() {
+        pending.lifetime.settle();
+        let _ = pending
+            .reply
+            .send(Err(LogicalExecutionActorError::WrongPhase));
+    }
+}
+
+fn expire_replacement_reservation(
+    state: &mut LogicalExecutionState,
+    replacement: Option<&mut ReplacementRuntime>,
+    replacement_error: &mut Option<ReplacementQualificationFailure>,
+    now: MonotonicInstant,
+) {
+    let Some(replacement) = replacement else {
+        return;
+    };
+    let expired = state.conclusion().is_none()
+        && replacement
+            .conservative_expiry
+            .is_some_and(|expiry| now.has_reached(expiry));
+    if !expired {
+        return;
+    }
+    replacement.reservation.take();
+    replacement.effect_cancellation.send_replace(true);
+    replacement_error.get_or_insert(ReplacementQualificationFailure::Expired);
+    if let Some(pending) = replacement.activation.take() {
+        pending.lifetime.settle();
+        let _ = pending.reply.send(Err(
+            LogicalExecutionActorError::ReplacementQualificationFailed(
+                ReplacementQualificationFailure::Expired,
+            ),
+        ));
+    }
+    conclude_replacement_failed(state, Some(replacement));
+}
+
+enum AttemptLedgerEvent {
+    Establish(QueryExecutionId, Result<(), EstablishIssueError>),
+    StandDown(QueryExecutionId, Result<(), ContextStandDownError>),
+}
+
+async fn wait_for_attempt_ledger_event(
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
+    clock: &dyn LogicalExecutionClock,
+) -> AttemptLedgerEvent {
+    std::future::poll_fn(|context| {
+        for (execution, attempt) in attempts.iter_mut() {
+            match attempt.establish.poll_next_event(context) {
+                std::task::Poll::Ready(result) => {
+                    return std::task::Poll::Ready(AttemptLedgerEvent::Establish(
+                        *execution, result,
+                    ));
+                }
+                std::task::Poll::Pending => {}
+            }
+            if attempt.stand_down.started() && !attempt.stand_down.responsibility_settled() {
+                match attempt.stand_down.poll_next_event(context, || clock.now()) {
+                    std::task::Poll::Ready(result) => {
+                        return std::task::Poll::Ready(AttemptLedgerEvent::StandDown(
+                            *execution, result,
+                        ));
+                    }
+                    std::task::Poll::Pending => {}
+                }
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+fn apply_attempt_ledger_event(
+    state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
+    event: AttemptLedgerEvent,
+    establish_error: &mut Option<EstablishIssueError>,
+    stand_down_error: &mut Option<ContextStandDownError>,
+) {
+    match event {
+        AttemptLedgerEvent::Establish(execution, result) => {
+            let Some(attempt) = attempts.get_mut(&execution) else {
+                return;
+            };
+            let result = result.and_then(|()| {
+                if attempt.establish.has_worker_rejection() {
+                    Err(EstablishIssueError::EstablishRejected)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = result {
+                establish_error.get_or_insert(error);
+                attempt.establish_error.get_or_insert(error);
+                attempt.establish.revoke_issue_authority();
+                if matches!(state.phase(), ExecutionPhase::Running { execution: current, .. } if current == execution)
+                {
+                    conclude_failed(state);
+                }
+            }
+        }
+        AttemptLedgerEvent::StandDown(execution, Err(error)) => {
+            stand_down_error.get_or_insert(error);
+            if let Some(attempt) = attempts.get_mut(&execution) {
+                attempt.stand_down_error.get_or_insert(error);
+            }
+        }
+        AttemptLedgerEvent::StandDown(_, Ok(())) => {}
+    }
+}
+
+fn revoke_all_establish_authority(attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>) {
+    for attempt in attempts.values_mut() {
+        attempt.establish.revoke_issue_authority();
+    }
+}
+
+fn synchronize_all_stand_down(
+    state: &LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
+    stand_down_error: &mut Option<ContextStandDownError>,
+    now: MonotonicInstant,
+    abort_effect_port: Option<&dyn AbortQueryContextEffectPort>,
+) {
+    for attempt in attempts.values_mut() {
+        if !attempt.stand_down.started() && state.conclusion() == Some(LogicalConclusion::Succeeded)
+        {
+            if let Err(error) = begin_or_refresh_successful_cleanup(attempt) {
+                stand_down_error.get_or_insert(error);
+                attempt.stand_down_error.get_or_insert(error);
+            }
+        }
+        let replacement_failed = matches!(
+            state.phase(),
+            ExecutionPhase::Replacing { failed, .. } if failed == attempt.activation.execution()
+        );
+        let cause = if attempt.stand_down.started() || replacement_failed {
+            Some(ContextStandDownCause::LogicalExecutionFailed)
+        } else {
+            state.conclusion().and_then(|conclusion| match conclusion {
+                LogicalConclusion::Cancelled => {
+                    Some(ContextStandDownCause::LogicalExecutionCancelled)
+                }
+                LogicalConclusion::Failed | LogicalConclusion::BusinessDecisionRequired => {
+                    Some(ContextStandDownCause::LogicalExecutionFailed)
+                }
+                LogicalConclusion::Succeeded => None,
+            })
+        };
+        if let Some(cause) = cause {
+            if let Err(error) = begin_or_refresh_stand_down(attempt, cause) {
+                stand_down_error.get_or_insert(error);
+                attempt.stand_down_error.get_or_insert(error);
+            }
+        }
+        if attempt.stand_down.started() && attempt.stand_down.responsibility_settled() {
+            if let Err(error) = cancel_pending_abort_issues(
+                &mut attempt.stand_down,
+                &mut attempt.pending_aborts,
+                now,
+            ) {
+                stand_down_error.get_or_insert(error);
+                attempt.stand_down_error.get_or_insert(error);
+            }
+            attempt.abort_backpressured = !attempt.pending_aborts.is_empty();
+        }
+        if attempt.stand_down.residual_resource_settled() {
+            let obligation_resolved = attempt
+                .retired_obligation
+                .as_ref()
+                .is_none_or(Obligation::resolve);
+            if obligation_resolved {
+                attempt.retired_obligation.take();
+            } else {
+                stand_down_error
+                    .get_or_insert(ContextStandDownError::ResponsibilitySettlementFailed);
+                attempt
+                    .stand_down_error
+                    .get_or_insert(ContextStandDownError::ResponsibilitySettlementFailed);
+                continue;
+            }
+            if let Some(resources) = attempt.active_resources.take() {
+                resources.finish();
+            }
+        }
+        if !attempt.stand_down.is_successful_cleanup()
+            && attempt.stand_down_error.is_none()
+            && let Err(error) = drive_abort_effect(
+                &mut attempt.stand_down,
+                abort_effect_port,
+                &mut attempt.pending_aborts,
+                &mut attempt.abort_backpressured,
+                now,
+            )
+        {
+            stand_down_error.get_or_insert(error);
+            attempt.stand_down_error.get_or_insert(error);
+        }
+    }
+}
+
+fn begin_or_refresh_stand_down(
+    attempt: &mut AttemptLedgers,
+    cause: ContextStandDownCause,
+) -> Result<(), ContextStandDownError> {
+    let facts = attempt
+        .establish
+        .stand_down_facts()
+        .map_err(|_| ContextStandDownError::WrongState)?;
+    if !attempt.stand_down.started() {
+        return attempt.stand_down.begin(attempt.activation, cause, facts);
+    }
+    for (context, fact) in facts {
+        attempt.stand_down.refresh_establish_fact(context, fact)?;
+    }
+    Ok(())
+}
+
+fn begin_or_refresh_successful_cleanup(
+    attempt: &mut AttemptLedgers,
+) -> Result<(), ContextStandDownError> {
+    let facts = attempt
+        .establish
+        .stand_down_facts()
+        .map_err(|_| ContextStandDownError::WrongState)?;
+    if !attempt.stand_down.started() {
+        return attempt
+            .stand_down
+            .begin_successful_cleanup(attempt.activation, facts);
+    }
+    for (context, fact) in facts {
+        attempt.stand_down.refresh_establish_fact(context, fact)?;
+    }
+    Ok(())
+}
+
+fn next_abort_retry_at(
+    attempts: &BTreeMap<QueryExecutionId, AttemptLedgers>,
+) -> Option<MonotonicInstant> {
+    attempts
+        .values()
+        .filter(|attempt| attempt.stand_down_error.is_none())
+        .filter_map(|attempt| attempt.stand_down.next_retry_at())
+        .min()
+}
+
+fn drive_replacement_effect(
+    replacement: Option<&mut ReplacementRuntime>,
+    port: Option<&dyn ReplacementQualificationEffectPort>,
+    receipts: &mpsc::UnboundedSender<ReplacementQualificationEffectReceipt>,
+    now: MonotonicInstant,
+) {
+    let Some(replacement) = replacement else {
+        return;
+    };
+    if replacement.effect_dispatched || replacement.effect_backpressured {
+        return;
+    }
+    let Some(port) = port else {
+        return;
+    };
+    match port.try_reserve(replacement.request.as_ref()) {
+        ReplacementQualificationEffectAdmission::Admitted(reservation) => {
+            replacement.effect_dispatched = true;
+            replacement.effect_dispatched_at = Some(now);
+            reservation.submit(ReplacementQualificationEffectSubmission::new(
+                Arc::clone(&replacement.request),
+                receipts.clone(),
+                replacement.effect_cancellation.subscribe(),
+            ));
+        }
+        ReplacementQualificationEffectAdmission::Backpressured => {
+            replacement.effect_backpressured = true;
+        }
+    }
+}
+
+fn apply_replacement_receipt(
+    state: &mut LogicalExecutionState,
+    replacement: Option<&mut ReplacementRuntime>,
+    receipt: Option<ReplacementQualificationEffectReceipt>,
+    replacement_error: &mut Option<ReplacementQualificationFailure>,
+) {
+    let Some(replacement) = replacement else {
+        return;
+    };
+    let Some(receipt) = receipt else {
+        replacement.effect_settled = true;
+        replacement_error.get_or_insert(ReplacementQualificationFailure::EffectOwnerClosed);
+        if state.conclusion().is_none() {
+            conclude_replacement_failed(state, Some(replacement));
+        }
+        return;
+    };
+    replacement.effect_settled = true;
+    let (operation_id, identity, settlement) = receipt.into_parts();
+    if identity != replacement.identity || operation_id != replacement.request.operation_id() {
+        replacement_error.get_or_insert(ReplacementQualificationFailure::OutcomeUnknown);
+        if state.conclusion().is_none() {
+            conclude_replacement_failed(state, Some(replacement));
+        }
+        return;
+    }
+    match settlement {
+        ReplacementQualificationSettlement::Qualified(reservation) => {
+            let Some(dispatched_at) = replacement.effect_dispatched_at else {
+                replacement_error
+                    .get_or_insert(ReplacementQualificationFailure::InvalidReservation);
+                conclude_replacement_failed(state, Some(replacement));
+                return;
+            };
+            let ticket_expiry =
+                reservation.conservative_expiry(dispatched_at, replacement.reservation_valid_for);
+            replacement.conservative_expiry = Some(
+                replacement
+                    .conservative_expiry
+                    .map_or(ticket_expiry, |current| current.min(ticket_expiry)),
+            );
+            if state.conclusion().is_some() {
+                if let Some(pending) = replacement.activation.take() {
+                    pending.lifetime.settle();
+                    let _ = pending
+                        .reply
+                        .send(Err(LogicalExecutionActorError::WrongPhase));
+                }
+                return;
+            }
+            replacement.reservation = Some(reservation);
+        }
+        ReplacementQualificationSettlement::Failed(failure) => {
+            replacement_error.get_or_insert(failure);
+            if state.conclusion().is_none() {
+                conclude_replacement_failed(state, Some(replacement));
+            }
+        }
+    }
+}
+
+fn conclude_replacement_failed(
+    state: &mut LogicalExecutionState,
+    replacement: Option<&mut ReplacementRuntime>,
+) {
+    if let Some(replacement) = replacement {
+        let _ = state.conclude_replacement(&replacement.token, LogicalConclusion::Failed);
+    }
+}
+
+fn try_activate_qualified_replacement(
+    state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
+    replacement: &mut Option<ReplacementRuntime>,
+    max_admission_issues_per_context: NonZeroUsize,
+    max_establish_authorizations_per_context: NonZeroUsize,
+    max_abort_authorizations_per_context: NonZeroUsize,
+    clock: &dyn LogicalExecutionClock,
+) {
+    let Some(active) = replacement.as_mut() else {
+        return;
+    };
+    let Some(pending_activation) = active.activation.take() else {
+        return;
+    };
+    let Some(reservation) = active.reservation.take() else {
+        active.activation = Some(pending_activation);
+        return;
+    };
+    let Some(conservative_expiry) = active.conservative_expiry else {
+        pending_activation.lifetime.settle();
+        let _ = pending_activation.reply.send(Err(
+            LogicalExecutionActorError::ReplacementQualificationFailed(
+                ReplacementQualificationFailure::InvalidReservation,
+            ),
+        ));
+        conclude_replacement_failed(state, Some(active));
+        return;
+    };
+    if clock.now().has_reached(conservative_expiry) {
+        pending_activation.lifetime.settle();
+        let _ = pending_activation.reply.send(Err(
+            LogicalExecutionActorError::ReplacementQualificationFailed(
+                ReplacementQualificationFailure::Expired,
+            ),
+        ));
+        conclude_replacement_failed(state, Some(active));
+        return;
+    }
+    // The opaque reservation proves reachability, isolation, successor
+    // admission, and that the registry's old usage record remains under
+    // last-known/current-unknown ownership. The exact failed attempt must also
+    // have registered the actor-owned same-scope RetiredAttempt obligation,
+    // whose registration consumes old-attempt capacity even when no byte
+    // observation is available. The handle remains present until positive
+    // residual convergence; an already converged no-remote attempt may have
+    // resolved it before successor activation.
+    if !active.stale_usage_accounted
+        || !attempts
+            .get(&active.identity.failed())
+            .is_some_and(|attempt| {
+                attempt.retired_obligation.is_some()
+                    || attempt.stand_down.residual_resource_settled()
+            })
+    {
+        pending_activation.lifetime.settle();
+        let _ = pending_activation.reply.send(Err(
+            LogicalExecutionActorError::ReplacementQualificationFailed(
+                ReplacementQualificationFailure::InvalidReservation,
+            ),
+        ));
+        conclude_replacement_failed(state, Some(active));
+        return;
+    }
+    for fact in [
+        ReplacementFact::ReachableContextsClosed,
+        ReplacementFact::AttemptIsolationProven,
+        ReplacementFact::StaleUsageAccounted,
+        ReplacementFact::NewCapacityAdmitted,
+    ] {
+        let result = state
+            .issue_replacement_effect(&active.token, fact)
+            .and_then(|pending| state.complete_replacement_effect(&active.token, pending));
+        if result.is_err() {
+            pending_activation.lifetime.settle();
+            let _ = pending_activation.reply.send(Err(
+                LogicalExecutionActorError::ReplacementQualificationFailed(
+                    ReplacementQualificationFailure::OutcomeUnknown,
+                ),
+            ));
+            conclude_replacement_failed(state, Some(active));
+            return;
+        }
+    }
+    let activated = match reservation.activate() {
+        Ok(resources) => resources,
+        Err(error) => {
+            pending_activation.lifetime.settle();
+            let _ = pending_activation.reply.send(Err(
+                LogicalExecutionActorError::ReplacementQualificationFailed(error),
+            ));
+            conclude_replacement_failed(state, Some(active));
+            return;
+        }
+    };
+    let Some(first_sent_at) = active.effect_dispatched_at else {
+        pending_activation.lifetime.settle();
+        let _ = pending_activation.reply.send(Err(
+            LogicalExecutionActorError::ReplacementQualificationFailed(
+                ReplacementQualificationFailure::InvalidReservation,
+            ),
+        ));
+        conclude_replacement_failed(state, Some(active));
+        return;
+    };
+    match state.activate_replacement(&active.token) {
+        Ok(capability) => {
+            let activation = identity_of(&capability);
+            let contexts = active
+                .request
+                .replacement_contexts()
+                .iter()
+                .copied()
+                .collect();
+            let result = if attempts.contains_key(&active.identity.replacement()) {
+                Err(LogicalExecutionActorError::WrongExecution)
+            } else {
+                new_attempt_ledgers(
+                    activation,
+                    contexts,
+                    max_admission_issues_per_context,
+                    max_establish_authorizations_per_context,
+                    max_abort_authorizations_per_context,
+                    None,
+                )
+                .and_then(|mut ledgers| {
+                    for admission in activated.admissions() {
+                        let issue = ledgers.establish.begin_admission_issue(
+                            activation,
+                            admission.request(),
+                            first_sent_at,
+                        )?;
+                        let disposition = ledgers.establish.settle_admission_issue(
+                            activation,
+                            issue,
+                            AdmissionIssueSettlement::applied(
+                                issue.operation_id(),
+                                OperationOutcome::Accepted,
+                                admission.receipt(),
+                            )?,
+                            clock.now(),
+                        )?;
+                        if disposition != AdmissionIssueDisposition::Granted {
+                            return Err(
+                                LogicalExecutionActorError::ReplacementQualificationFailed(
+                                    ReplacementQualificationFailure::Expired,
+                                ),
+                            );
+                        }
+                    }
+                    ledgers.active_resources =
+                        Some(ActiveReplacementResources::replacement(activated));
+                    Ok(ledgers)
+                })
+            }
+            .map(|ledgers| {
+                attempts.insert(active.identity.replacement(), ledgers);
+                Ok(AttemptInstantiationPermit {
+                    capability: Some(capability),
+                    lifetime: Some(Arc::clone(&pending_activation.lifetime)),
+                    mailbox_liveness: Some(pending_activation.mailbox_liveness.clone()),
+                })
+            })
+            .and_then(|permit| permit);
+            match result {
+                Ok(permit) => {
+                    if let Err(response) = pending_activation.reply.send(Ok(permit)) {
+                        drop(response);
+                    }
+                    *replacement = None;
+                }
+                Err(error) => {
+                    if let Ok(capability) = state.attempt_capability(active.identity.replacement())
+                    {
+                        let _ = state.conclude(&capability, LogicalConclusion::Failed);
+                    }
+                    pending_activation.lifetime.abandon();
+                    let _ = pending_activation.reply.send(Err(error));
+                }
+            }
+        }
+        Err(ActorStateError::ReplacementNotReady(_)) => {
+            // All prerequisites were sealed by the same qualified reservation.
+            // Reaching this branch would lose active isolation ownership, so
+            // fail closed instead of attempting a second qualification.
+            drop(activated);
+            pending_activation.lifetime.settle();
+            let _ = pending_activation.reply.send(Err(
+                LogicalExecutionActorError::ReplacementQualificationFailed(
+                    ReplacementQualificationFailure::InvalidReservation,
+                ),
+            ));
+            conclude_replacement_failed(state, Some(active));
+        }
+        Err(error) => {
+            drop(activated);
+            pending_activation.lifetime.settle();
+            let _ = pending_activation.reply.send(Err(error.into()));
         }
     }
 }
@@ -1006,31 +2063,97 @@ fn conclude_failed(state: &mut LogicalExecutionState) {
     }
 }
 
-fn conclude_abandoned(state: &mut LogicalExecutionState) {
+fn conclude_abandoned(state: &mut LogicalExecutionState, replacement: Option<&ReplacementRuntime>) {
+    conclude_with(state, replacement, LogicalConclusion::Cancelled);
+}
+
+fn conclude_for_work_cancellation(
+    state: &mut LogicalExecutionState,
+    replacement: Option<&ReplacementRuntime>,
+    reason: &CancellationReason,
+) {
+    let conclusion = match reason {
+        CancellationReason::DeadlineExceeded
+        | CancellationReason::FrontendDrainDeadlineExceeded => LogicalConclusion::Failed,
+        CancellationReason::Requested
+        | CancellationReason::ExplicitKill { .. }
+        | CancellationReason::ExplicitKillConnection { .. }
+        | CancellationReason::ClientDisconnected
+        | CancellationReason::ServerShutdown
+        | CancellationReason::OwnerDropped => LogicalConclusion::Cancelled,
+    };
+    conclude_with(state, replacement, conclusion);
+}
+
+fn conclude_with(
+    state: &mut LogicalExecutionState,
+    replacement: Option<&ReplacementRuntime>,
+    conclusion: LogicalConclusion,
+) {
     if state.conclusion().is_some() {
         return;
     }
     let execution = match state.phase() {
         ExecutionPhase::Instantiating { execution, .. }
         | ExecutionPhase::Running { execution, .. } => execution,
+        ExecutionPhase::Replacing { .. } => {
+            if let Some(replacement) = replacement {
+                let _ = state.conclude_replacement(&replacement.token, conclusion);
+            }
+            return;
+        }
         _ => return,
     };
     if let Ok(capability) = state.attempt_capability(execution) {
-        let _ = state.conclude(&capability, LogicalConclusion::Cancelled);
+        let _ = state.conclude(&capability, conclusion);
     }
 }
 
 fn handle_command(
     state: &mut LogicalExecutionState,
-    establish: &mut EstablishIssueLedger,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
     establish_error: &mut Option<EstablishIssueError>,
-    stand_down: &mut ContextStandDownLedger,
     stand_down_error: &mut Option<ContextStandDownError>,
-    actor_activation: AttemptActivationIdentity,
+    replacement: &mut Option<ReplacementRuntime>,
+    replacement_error: &mut Option<ReplacementQualificationFailure>,
     clock: &dyn LogicalExecutionClock,
+    work: &WorkScope,
+    work_cancellation: &CancellationView,
+    replacement_reservation_valid_for: Option<Duration>,
     command: ActorCommand,
 ) {
     match command {
+        ActorCommand::TakeReplacementAdmissionEvidence { activation, reply } => {
+            let result = (|| {
+                if !matches!(
+                    state.phase(),
+                    ExecutionPhase::Instantiating { execution, .. }
+                        if execution == activation.execution()
+                ) {
+                    return Err(LogicalExecutionActorError::WrongPhase);
+                }
+                let current = state.attempt_capability(activation.execution())?;
+                if identity_of(&current) != activation {
+                    return Err(LogicalExecutionActorError::StaleAuthority);
+                }
+                let attempt = attempts
+                    .get_mut(&activation.execution())
+                    .ok_or(LogicalExecutionActorError::WrongExecution)?;
+                Ok(attempt
+                    .active_resources
+                    .as_mut()
+                    .and_then(ActiveReplacementResources::take_admissions))
+            })();
+            if let Err(Ok(Some(admissions))) = reply.send(result) {
+                let restored = attempts
+                    .get_mut(&activation.execution())
+                    .and_then(|attempt| attempt.active_resources.as_mut())
+                    .is_some_and(|resources| resources.restore_admissions(admissions).is_ok());
+                if !restored {
+                    conclude_failed(state);
+                }
+            }
+        }
         ActorCommand::Activate { readiness, reply } => {
             let (capability, lifetime, mailbox_liveness) = readiness.into_parts();
             match state.mark_running(&capability) {
@@ -1057,25 +2180,178 @@ fn handle_command(
                 reply,
             );
         }
-        ActorCommand::Completed { permit, reply } => match establish.ensure_success_ready() {
-            Ok(()) => {
-                establish.revoke_issue_authority();
-                settle_terminal(
-                    state,
-                    permit.into_parts(),
-                    LogicalConclusion::Succeeded,
-                    reply,
-                );
+        ActorCommand::Completed { permit, reply } => {
+            let execution = permit.identity().execution();
+            let Some(attempt) = attempts.get_mut(&execution) else {
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongExecution));
+                return;
+            };
+            match attempt.establish.ensure_success_ready() {
+                Ok(()) => {
+                    attempt.establish.revoke_issue_authority();
+                    settle_terminal(
+                        state,
+                        permit.into_parts(),
+                        LogicalConclusion::Succeeded,
+                        reply,
+                    );
+                }
+                Err(error) => {
+                    establish_error.get_or_insert(error);
+                    attempt.establish_error.get_or_insert(error);
+                    attempt.establish.revoke_issue_authority();
+                    settle_terminal_with_error(state, permit.into_parts(), error.into(), reply);
+                }
             }
-            Err(error) => {
-                establish_error.get_or_insert(error);
-                establish.revoke_issue_authority();
-                settle_terminal_with_error(state, permit.into_parts(), error.into(), reply);
-            }
-        },
+        }
         ActorCommand::Failed { permit, reply } => {
-            establish.revoke_issue_authority();
+            if let Some(attempt) = attempts.get_mut(&permit.identity().execution()) {
+                attempt.establish.revoke_issue_authority();
+            }
             settle_terminal(state, permit.into_parts(), LogicalConclusion::Failed, reply);
+        }
+        ActorCommand::BeginReplacement {
+            permit,
+            failure,
+            replacement: replacement_execution,
+            replacement_contexts,
+            reply,
+        } => {
+            let activation = permit.identity();
+            let (capability, lifetime, mailbox_liveness) = permit.into_parts();
+            if let Some(reason) = work_cancellation.reason() {
+                revoke_all_establish_authority(attempts);
+                conclude_for_work_cancellation(state, replacement.as_ref(), &reason);
+                lifetime.settle();
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            }
+            let preparation = validate_contexts(replacement_execution, &replacement_contexts)
+                .and_then(|contexts| {
+                    let failed = attempts
+                        .get_mut(&activation.execution())
+                        .ok_or(LogicalExecutionActorError::WrongExecution)?;
+                    failed.establish.revoke_issue_authority();
+                    let failed_contexts = failed.establish.required_contexts();
+                    begin_or_refresh_stand_down(
+                        failed,
+                        ContextStandDownCause::LogicalExecutionFailed,
+                    )?;
+                    Ok((contexts, failed_contexts))
+                });
+            let (contexts, failed_contexts) = match preparation {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    let _ = state.conclude(&capability, LogicalConclusion::Failed);
+                    lifetime.settle();
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            let token =
+                match state.begin_replacement(&capability, replacement_execution, failure, false) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        let _ = state.conclude(&capability, LogicalConclusion::Failed);
+                        lifetime.settle();
+                        let _ = reply.send(Err(error.into()));
+                        return;
+                    }
+                };
+            let identity = ReplacementQualificationIdentity::new(
+                activation.actor(),
+                token.failed(),
+                token.replacement(),
+                token.eligibility_generation(),
+            );
+            let Some(reservation_valid_for) = replacement_reservation_valid_for else {
+                let _ = state.conclude_replacement(&token, LogicalConclusion::Failed);
+                lifetime.settle();
+                let _ = reply.send(Err(LogicalExecutionActorError::InvariantViolation));
+                return;
+            };
+            let obligation = match work.register_obligation(
+                retired_obligation_key(identity),
+                ObligationKind::RetiredAttempt,
+            ) {
+                Ok(obligation) => obligation,
+                Err(_) => {
+                    let _ = state.conclude_replacement(&token, LogicalConclusion::Failed);
+                    lifetime.settle();
+                    let _ = reply.send(Err(LogicalExecutionActorError::InvariantViolation));
+                    return;
+                }
+            };
+            let failed = attempts
+                .get_mut(&activation.execution())
+                .expect("failed attempt was validated before replacement transition");
+            failed.retired_obligation = Some(obligation);
+            let issued_at = clock.now();
+            let conservative_expiry = issued_at.saturating_add(reservation_valid_for);
+            let (effect_cancellation, _) = watch::channel(false);
+            let request = Arc::new(ReplacementQualificationRequest::new(
+                identity,
+                failed_contexts,
+                contexts,
+                issued_at,
+                conservative_expiry,
+            ));
+            *replacement = Some(ReplacementRuntime {
+                token,
+                identity,
+                request,
+                effect_cancellation,
+                effect_dispatched: false,
+                effect_settled: false,
+                effect_backpressured: false,
+                activation: None,
+                reservation: None,
+                effect_dispatched_at: None,
+                conservative_expiry: Some(conservative_expiry),
+                reservation_valid_for,
+                stale_usage_accounted: true,
+            });
+            let qualification = ReplacementQualification {
+                identity,
+                lifetime: Some(Arc::clone(&lifetime)),
+                mailbox_liveness: Some(mailbox_liveness),
+            };
+            if let Err(response) = reply.send(Ok(qualification)) {
+                drop(response);
+            }
+        }
+        ActorCommand::ActivateReplacement {
+            qualification,
+            reply,
+        } => {
+            let (identity, lifetime, mailbox_liveness) = qualification.into_parts();
+            let Some(active) = replacement.as_mut() else {
+                lifetime.abandon();
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            if identity != active.identity {
+                lifetime.abandon();
+                let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
+                return;
+            }
+            if let Some(error) = *replacement_error {
+                lifetime.settle();
+                let _ = reply.send(Err(
+                    LogicalExecutionActorError::ReplacementQualificationFailed(error),
+                ));
+                return;
+            }
+            if active.activation.is_some() {
+                lifetime.abandon();
+                let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
+                return;
+            }
+            active.activation = Some(PendingReplacementActivation {
+                lifetime,
+                mailbox_liveness,
+                reply,
+            });
         }
         ActorCommand::BeginAdmissionIssue {
             activation,
@@ -1083,9 +2359,18 @@ fn handle_command(
             reply,
         } => {
             let result = verify_running_activation(state, activation)
-                .and_then(|()| (*establish_error).map_or(Ok(()), |error| Err(error.into())))
                 .and_then(|()| {
-                    establish
+                    attempts
+                        .get(&activation.execution())
+                        .ok_or(LogicalExecutionActorError::WrongExecution)?
+                        .establish_error
+                        .map_or(Ok(()), |error| Err(error.into()))
+                })
+                .and_then(|()| {
+                    attempts
+                        .get_mut(&activation.execution())
+                        .ok_or(LogicalExecutionActorError::WrongExecution)?
+                        .establish
                         .begin_admission_issue(activation, request, clock.now())
                         .map_err(Into::into)
                 });
@@ -1097,16 +2382,15 @@ fn handle_command(
             settlement,
             reply,
         } => {
-            let result = verify_actor_activation(actor_activation, activation)
+            let result = attempts
+                .get(&activation.execution())
+                .ok_or(LogicalExecutionActorError::WrongExecution)
+                .and_then(|attempt| verify_actor_activation(attempt.activation, activation))
                 .and_then(|()| {
-                    if state.conclusion().is_some() {
-                        Ok(())
-                    } else {
-                        (*establish_error).map_or(Ok(()), |error| Err(error.into()))
-                    }
-                })
-                .and_then(|()| {
-                    establish
+                    attempts
+                        .get_mut(&activation.execution())
+                        .ok_or(LogicalExecutionActorError::WrongExecution)?
+                        .establish
                         .settle_admission_issue(
                             activation,
                             admission_issue,
@@ -1117,8 +2401,14 @@ fn handle_command(
                 });
             if let Err(LogicalExecutionActorError::Establish(error)) = result {
                 establish_error.get_or_insert(error);
-                establish.revoke_issue_authority();
-                conclude_failed(state);
+                if let Some(attempt) = attempts.get_mut(&activation.execution()) {
+                    attempt.establish_error.get_or_insert(error);
+                    attempt.establish.revoke_issue_authority();
+                }
+                if matches!(state.phase(), ExecutionPhase::Running { execution, .. } if execution == activation.execution())
+                {
+                    conclude_failed(state);
+                }
             }
             let _ = reply.send(result);
         }
@@ -1129,9 +2419,18 @@ fn handle_command(
             reply,
         } => {
             let result = verify_running_activation(state, activation)
-                .and_then(|()| (*establish_error).map_or(Ok(()), |error| Err(error.into())))
                 .and_then(|()| {
-                    establish
+                    attempts
+                        .get(&activation.execution())
+                        .ok_or(LogicalExecutionActorError::WrongExecution)?
+                        .establish_error
+                        .map_or(Ok(()), |error| Err(error.into()))
+                })
+                .and_then(|()| {
+                    attempts
+                        .get_mut(&activation.execution())
+                        .ok_or(LogicalExecutionActorError::WrongExecution)?
+                        .establish
                         .authorize_issue(activation, request, native_compatibility_id, clock.now())
                         .map_err(Into::into)
                 });
@@ -1143,28 +2442,53 @@ fn handle_command(
             reply,
         } => {
             let result = verify_running_activation(state, activation)
-                .and_then(|()| (*establish_error).map_or(Ok(()), |error| Err(error.into())))
                 .and_then(|()| {
-                    establish
+                    attempts
+                        .get(&activation.execution())
+                        .ok_or(LogicalExecutionActorError::WrongExecution)?
+                        .establish_error
+                        .map_or(Ok(()), |error| Err(error.into()))
+                })
+                .and_then(|()| {
+                    attempts
+                        .get_mut(&activation.execution())
+                        .ok_or(LogicalExecutionActorError::WrongExecution)?
+                        .establish
                         .reauthorize_issue(activation, context, clock.now())
                         .map_err(Into::into)
                 });
             let _ = reply.send(result);
         }
         ActorCommand::EstablishSnapshot { context, reply } => {
-            let _ = reply.send(Ok(establish.snapshot(context)));
+            let snapshot = attempts
+                .get(&context.query_execution_id())
+                .and_then(|attempt| attempt.establish.snapshot(context));
+            let _ = reply.send(Ok(snapshot));
         }
         ActorCommand::StandDownSnapshot { context, reply } => {
-            let _ = reply.send(Ok(stand_down.snapshot(context)));
+            let snapshot = attempts
+                .get(&context.query_execution_id())
+                .and_then(|attempt| attempt.stand_down.snapshot(context));
+            let _ = reply.send(Ok(snapshot));
         }
         ActorCommand::RegistryContextConverged {
             context,
             convergence,
             reply,
         } => {
-            let result = stand_down
-                .observe_registry_convergence(context, convergence)
-                .map_err(Into::into);
+            let result = match attempts.get_mut(&context.query_execution_id()) {
+                Some(attempt) => {
+                    let result = attempt
+                        .stand_down
+                        .observe_registry_convergence(context, convergence)
+                        .map_err(Into::into);
+                    if let Err(LogicalExecutionActorError::StandDown(error)) = &result {
+                        attempt.stand_down_error.get_or_insert(*error);
+                    }
+                    result
+                }
+                None => Err(LogicalExecutionActorError::WrongExecution),
+            };
             if let Err(LogicalExecutionActorError::StandDown(error)) = &result {
                 stand_down_error.get_or_insert(*error);
             }
@@ -1176,6 +2500,7 @@ fn handle_command(
                 conclusion: state.conclusion(),
                 establish_error: *establish_error,
                 stand_down_error: *stand_down_error,
+                replacement_error: *replacement_error,
             }));
         }
     }
@@ -1194,32 +2519,53 @@ fn verify_actor_activation(
     Ok(())
 }
 
-fn synchronize_stand_down(
-    state: &LogicalExecutionState,
+fn validate_contexts(
+    execution: QueryExecutionId,
+    contexts: &[QueryContextRef],
+) -> Result<Arc<[QueryContextRef]>, LogicalExecutionActorError> {
+    let distinct: BTreeSet<_> = contexts.iter().copied().collect();
+    if distinct.len() != contexts.len()
+        || distinct
+            .iter()
+            .any(|context| context.query_execution_id() != execution)
+    {
+        return Err(LogicalExecutionActorError::WrongExecution);
+    }
+    Ok(distinct.into_iter().collect::<Vec<_>>().into())
+}
+
+fn new_attempt_ledgers(
     activation: AttemptActivationIdentity,
-    establish: &mut EstablishIssueLedger,
-    stand_down: &mut ContextStandDownLedger,
-) -> Result<(), ContextStandDownError> {
-    let Some(conclusion) = state.conclusion() else {
-        return Ok(());
-    };
-    let cause = match conclusion {
-        LogicalConclusion::Succeeded => return Ok(()),
-        LogicalConclusion::Cancelled => ContextStandDownCause::LogicalExecutionCancelled,
-        LogicalConclusion::Failed | LogicalConclusion::BusinessDecisionRequired => {
-            ContextStandDownCause::LogicalExecutionFailed
-        }
-    };
-    let facts = establish
-        .stand_down_facts()
-        .map_err(|_| ContextStandDownError::WrongState)?;
-    if !stand_down.started() {
-        return stand_down.begin(activation, cause, facts);
+    required_contexts: BTreeSet<QueryContextRef>,
+    max_admission_issues_per_context: NonZeroUsize,
+    max_establish_authorizations_per_context: NonZeroUsize,
+    max_abort_authorizations_per_context: NonZeroUsize,
+    active_resources: Option<ActiveReplacementResources>,
+) -> Result<AttemptLedgers, LogicalExecutionActorError> {
+    if required_contexts
+        .iter()
+        .any(|context| context.query_execution_id() != activation.execution())
+    {
+        return Err(LogicalExecutionActorError::WrongExecution);
     }
-    for (context, fact) in facts {
-        stand_down.refresh_establish_fact(context, fact)?;
-    }
-    Ok(())
+    let establish = EstablishIssueLedger::new(
+        required_contexts.clone(),
+        max_admission_issues_per_context,
+        max_establish_authorizations_per_context,
+    );
+    let stand_down =
+        ContextStandDownLedger::new(required_contexts, max_abort_authorizations_per_context)?;
+    Ok(AttemptLedgers {
+        activation,
+        establish,
+        establish_error: None,
+        stand_down,
+        stand_down_error: None,
+        pending_aborts: BTreeMap::new(),
+        abort_backpressured: false,
+        retired_obligation: None,
+        active_resources,
+    })
 }
 
 fn drive_abort_effect(
@@ -1298,13 +2644,53 @@ async fn wait_for_abort_capacity(
     }
 }
 
+async fn wait_for_replacement_capacity(
+    capacity: &mut Option<watch::Receiver<u64>>,
+) -> Result<(), ReplacementQualificationFailure> {
+    if let Some(capacity) = capacity {
+        capacity
+            .changed()
+            .await
+            .map_err(|_| ReplacementQualificationFailure::EffectOwnerClosed)
+    } else {
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+async fn wait_for_replacement_expiry(
+    clock: &dyn LogicalExecutionClock,
+    expiry: Option<MonotonicInstant>,
+) {
+    if let Some(expiry) = expiry {
+        tokio::time::sleep(expiry.saturating_duration_since(clock.now())).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 fn actor_cleanup_complete(
     state: &LogicalExecutionState,
-    stand_down: &ContextStandDownLedger,
+    attempts: &BTreeMap<QueryExecutionId, AttemptLedgers>,
+    replacement: Option<&ReplacementRuntime>,
 ) -> bool {
+    let attempt_settled = |attempt: &AttemptLedgers| {
+        attempt.stand_down.started()
+            && attempt.stand_down.residual_resource_settled()
+            && attempt.retired_obligation.is_none()
+            && attempt.active_resources.is_none()
+    };
+    let replacement_effect_settled = replacement
+        .map(|replacement| {
+            replacement.reservation.is_none()
+                && (!replacement.effect_dispatched || replacement.effect_settled)
+        })
+        .unwrap_or(true);
     match state.conclusion() {
-        Some(LogicalConclusion::Succeeded) => true,
-        Some(_) => stand_down.responsibility_settled(),
+        Some(LogicalConclusion::Succeeded) => {
+            attempts.values().all(attempt_settled) && replacement_effect_settled
+        }
+        Some(_) => attempts.values().all(attempt_settled) && replacement_effect_settled,
         None => false,
     }
 }
@@ -1373,12 +2759,31 @@ fn settle_terminal_with_error(
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::sync::Mutex;
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
     use std::task::Poll;
+    use std::time::Duration;
 
+    use super::super::{
+        ActiveAttemptIsolationOwner, AttemptIsolationActivationFailure,
+        AttemptIsolationReservation, EstablishIssueIdentity, EstablishIssueSubmit,
+        EstablishTransportAdmission, EstablishTransportReservation, EstablishTransportSink,
+        EstablishTransportSubmission, QualifiedReplacementReservation, QualifiedWorkerAdmission,
+        ReplacementQualificationEffectReservation,
+    };
     use super::*;
-    use novarocks_execution_contract::{QueryContextReceipt, QueryContextState};
+    use novarocks_execution_contract::{
+        AdmissionEpochCapability, AdmissionTicketId, CodecOwnedContent, ConfidentialContent,
+        ContentFingerprint, CredentialEpoch, CredentialLeaseId, CredentialUpdate, LeaseValidFor,
+        OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextReceipt,
+        QueryContextState, TaskOperationId,
+    };
+    use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{AttemptId, BackendProcessId, FrontendProcessId, QueryId};
+    use novarocks_workload_control::{
+        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
 
     #[derive(Debug)]
     struct SelectiveAbortPort {
@@ -1426,11 +2831,711 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ClosingMixedAbortPort {
+        accepted: QueryContextRef,
+        blocked: QueryContextRef,
+        submissions: Arc<Mutex<Vec<super::super::AbortQueryContextEffectSubmission>>>,
+        capacity: Mutex<Option<watch::Sender<u64>>>,
+        reserve_calls: AtomicUsize,
+    }
+
+    impl ClosingMixedAbortPort {
+        fn new(accepted: QueryContextRef, blocked: QueryContextRef) -> Self {
+            let (capacity, _) = watch::channel(0);
+            Self {
+                accepted,
+                blocked,
+                submissions: Arc::default(),
+                capacity: Mutex::new(Some(capacity)),
+                reserve_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn close_capacity(&self) {
+            self.capacity.lock().unwrap().take();
+        }
+    }
+
+    #[derive(Debug)]
+    struct HoldingAbortReservation {
+        submissions: Arc<Mutex<Vec<super::super::AbortQueryContextEffectSubmission>>>,
+    }
+
+    impl super::super::AbortQueryContextEffectReservation for HoldingAbortReservation {
+        fn submit(self: Box<Self>, submission: super::super::AbortQueryContextEffectSubmission) {
+            self.submissions.lock().unwrap().push(submission);
+        }
+    }
+
+    impl AbortQueryContextEffectPort for ClosingMixedAbortPort {
+        fn subscribe_capacity(&self) -> watch::Receiver<u64> {
+            self.capacity
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("test capacity is open during actor construction")
+                .subscribe()
+        }
+
+        fn try_reserve(
+            &self,
+            identity: super::super::AbortQueryContextIssueIdentity,
+        ) -> super::super::AbortQueryContextEffectAdmission {
+            self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+            if identity.context() == self.accepted {
+                super::super::AbortQueryContextEffectAdmission::Admitted(Box::new(
+                    HoldingAbortReservation {
+                        submissions: Arc::clone(&self.submissions),
+                    },
+                ))
+            } else if identity.context() == self.blocked {
+                super::super::AbortQueryContextEffectAdmission::Backpressured
+            } else {
+                super::super::AbortQueryContextEffectAdmission::Closed
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ManualActorClock {
+        now: Mutex<MonotonicInstant>,
+    }
+
+    impl ManualActorClock {
+        fn new(now: MonotonicInstant) -> Self {
+            Self {
+                now: Mutex::new(now),
+            }
+        }
+
+        fn set(&self, now: MonotonicInstant) {
+            *self.now.lock().unwrap() = now;
+        }
+    }
+
+    impl LogicalExecutionClock for ManualActorClock {
+        fn now(&self) -> MonotonicInstant {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayedQualificationPort {
+        submissions: Arc<Mutex<Vec<ReplacementQualificationEffectSubmission>>>,
+        capacity: watch::Sender<u64>,
+    }
+
+    impl Default for DelayedQualificationPort {
+        fn default() -> Self {
+            let (capacity, _) = watch::channel(0);
+            Self {
+                submissions: Arc::default(),
+                capacity,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayedQualificationReservation {
+        submissions: Arc<Mutex<Vec<ReplacementQualificationEffectSubmission>>>,
+    }
+
+    impl ReplacementQualificationEffectReservation for DelayedQualificationReservation {
+        fn submit(self: Box<Self>, submission: ReplacementQualificationEffectSubmission) {
+            self.submissions.lock().unwrap().push(submission);
+        }
+    }
+
+    impl ReplacementQualificationEffectPort for DelayedQualificationPort {
+        fn subscribe_capacity(&self) -> watch::Receiver<u64> {
+            self.capacity.subscribe()
+        }
+
+        fn try_reserve(
+            &self,
+            _request: &ReplacementQualificationRequest,
+        ) -> ReplacementQualificationEffectAdmission {
+            ReplacementQualificationEffectAdmission::Admitted(Box::new(
+                DelayedQualificationReservation {
+                    submissions: Arc::clone(&self.submissions),
+                },
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ClosingBackpressureQualificationPort {
+        capacity: Mutex<Option<watch::Sender<u64>>>,
+        reserve_calls: AtomicUsize,
+    }
+
+    impl Default for ClosingBackpressureQualificationPort {
+        fn default() -> Self {
+            let (capacity, _) = watch::channel(0);
+            Self {
+                capacity: Mutex::new(Some(capacity)),
+                reserve_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ClosingBackpressureQualificationPort {
+        fn close(&self) {
+            self.capacity.lock().unwrap().take();
+        }
+    }
+
+    impl ReplacementQualificationEffectPort for ClosingBackpressureQualificationPort {
+        fn subscribe_capacity(&self) -> watch::Receiver<u64> {
+            self.capacity
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("test capacity is open during actor construction")
+                .subscribe()
+        }
+
+        fn try_reserve(
+            &self,
+            _request: &ReplacementQualificationRequest,
+        ) -> ReplacementQualificationEffectAdmission {
+            self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+            ReplacementQualificationEffectAdmission::Backpressured
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecoverableBackpressureQualificationPort {
+        available: AtomicBool,
+        reserve_calls: AtomicUsize,
+        submissions: Arc<AtomicUsize>,
+        capacity: watch::Sender<u64>,
+    }
+
+    impl Default for RecoverableBackpressureQualificationPort {
+        fn default() -> Self {
+            let (capacity, _) = watch::channel(0);
+            Self {
+                available: AtomicBool::new(false),
+                reserve_calls: AtomicUsize::new(0),
+                submissions: Arc::new(AtomicUsize::new(0)),
+                capacity,
+            }
+        }
+    }
+
+    impl RecoverableBackpressureQualificationPort {
+        fn recover_capacity(&self) {
+            self.available.store(true, Ordering::SeqCst);
+            self.capacity.send_modify(|generation| *generation += 1);
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingQualificationReservation {
+        submissions: Arc<AtomicUsize>,
+    }
+
+    impl ReplacementQualificationEffectReservation for CountingQualificationReservation {
+        fn submit(self: Box<Self>, _submission: ReplacementQualificationEffectSubmission) {
+            self.submissions.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ReplacementQualificationEffectPort for RecoverableBackpressureQualificationPort {
+        fn subscribe_capacity(&self) -> watch::Receiver<u64> {
+            self.capacity.subscribe()
+        }
+
+        fn try_reserve(
+            &self,
+            _request: &ReplacementQualificationRequest,
+        ) -> ReplacementQualificationEffectAdmission {
+            self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+            if self.available.load(Ordering::SeqCst) {
+                ReplacementQualificationEffectAdmission::Admitted(Box::new(
+                    CountingQualificationReservation {
+                        submissions: Arc::clone(&self.submissions),
+                    },
+                ))
+            } else {
+                ReplacementQualificationEffectAdmission::Backpressured
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct HoldingEstablishTransport {
+        submission: Arc<Mutex<Option<EstablishTransportSubmission>>>,
+    }
+
+    #[derive(Debug)]
+    struct HoldingEstablishReservation {
+        submission: Arc<Mutex<Option<EstablishTransportSubmission>>>,
+    }
+
+    impl EstablishTransportReservation for HoldingEstablishReservation {
+        fn submit(self: Box<Self>, submission: EstablishTransportSubmission) {
+            let replaced = self.submission.lock().unwrap().replace(submission);
+            assert!(replaced.is_none());
+        }
+    }
+
+    impl EstablishTransportSink for HoldingEstablishTransport {
+        fn try_reserve(&self, _identity: EstablishIssueIdentity) -> EstablishTransportAdmission {
+            EstablishTransportAdmission::Admitted(Box::new(HoldingEstablishReservation {
+                submission: Arc::clone(&self.submission),
+            }))
+        }
+    }
+
+    impl HoldingEstablishTransport {
+        fn take(&self) -> EstablishTransportSubmission {
+            self.submission.lock().unwrap().take().unwrap()
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeContent(ContentFingerprint);
+
+    impl CodecOwnedContent for FakeContent {
+        fn fingerprint(&self) -> ContentFingerprint {
+            self.0
+        }
+
+        fn encoded_len(&self) -> usize {
+            1
+        }
+    }
+
+    struct FakeSecret;
+
+    impl ConfidentialContent for FakeSecret {
+        fn encoded_len(&self) -> usize {
+            1
+        }
+
+        fn matches(&self, other: &dyn ConfidentialContent) -> bool {
+            other.encoded_len() == 1
+        }
+    }
+
     fn execution(query: i64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(31, query), AttemptId::new(1).unwrap()).unwrap()
     }
 
+    fn replacement(execution: QueryExecutionId, attempt: u64) -> QueryExecutionId {
+        QueryExecutionId::new(execution.query_id(), AttemptId::new(attempt).unwrap()).unwrap()
+    }
+
+    fn test_governed_work() -> (WorkOwner, StagePermit) {
+        static CONTROL: OnceLock<WorkloadControl> = OnceLock::new();
+        let control = CONTROL.get_or_init(|| {
+            let control = WorkloadControl::try_new(
+                WorkloadConfig::default(),
+                ResourceConfig {
+                    total_bytes: 1 << 30,
+                    control_bytes: 1 << 20,
+                    per_scope_bytes: 1 << 28,
+                },
+            )
+            .unwrap();
+            control.mark_ready().unwrap();
+            control
+        });
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = root.owner.scope();
+        let stage = scope.try_acquire(Stage::Execution).unwrap();
+        (root.owner, stage)
+    }
+
+    fn test_governed_child_work(
+        parent_deadline: Option<tokio::time::Instant>,
+    ) -> (WorkOwner, WorkOwner, StagePermit) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 30,
+                control_bytes: 1 << 20,
+                per_scope_bytes: 1 << 28,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest {
+                class: WorkClass::Query,
+                deadline: parent_deadline,
+            })
+            .unwrap();
+        let child = root
+            .owner
+            .scope()
+            .child(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let stage = child.scope().try_acquire(Stage::Execution).unwrap();
+        (root.owner, child, stage)
+    }
+
+    #[derive(Debug)]
+    struct TestIsolationReservation {
+        identity: ReplacementQualificationIdentity,
+        failed_contexts: BTreeSet<QueryContextRef>,
+        contexts: BTreeSet<QueryContextRef>,
+        admissions: Box<[QualifiedWorkerAdmission]>,
+    }
+
+    #[derive(Debug)]
+    struct TestActiveIsolation(QueryExecutionId);
+
+    impl AttemptIsolationReservation for TestIsolationReservation {
+        fn identity(&self) -> ReplacementQualificationIdentity {
+            self.identity
+        }
+        fn topology_revision(&self) -> u64 {
+            1
+        }
+        fn admissions(&self) -> &[QualifiedWorkerAdmission] {
+            &self.admissions
+        }
+        fn validate_binding(
+            &self,
+            failed_contexts: &[QueryContextRef],
+        ) -> Result<(), ReplacementQualificationFailure> {
+            let failed: BTreeSet<_> = failed_contexts.iter().copied().collect();
+            let contexts: BTreeSet<_> = self
+                .admissions
+                .iter()
+                .map(QualifiedWorkerAdmission::context)
+                .collect();
+            (failed == self.failed_contexts && contexts == self.contexts)
+                .then_some(())
+                .ok_or(ReplacementQualificationFailure::InvalidReservation)
+        }
+        fn activate(
+            self: Box<Self>,
+        ) -> Result<Box<dyn ActiveAttemptIsolationOwner>, AttemptIsolationActivationFailure>
+        {
+            Ok(Box::new(TestActiveIsolation(self.identity.replacement())))
+        }
+        fn abandon(self: Box<Self>) {}
+    }
+
+    impl ActiveAttemptIsolationOwner for TestActiveIsolation {
+        fn execution(&self) -> QueryExecutionId {
+            self.0
+        }
+        fn finish(self: Box<Self>) {}
+        fn abandon(self: Box<Self>) {}
+    }
+
+    #[derive(Debug)]
+    struct CountingIsolationReservation {
+        identity: ReplacementQualificationIdentity,
+        abandoned: Arc<AtomicUsize>,
+        admissions: Box<[QualifiedWorkerAdmission]>,
+    }
+
+    impl AttemptIsolationReservation for CountingIsolationReservation {
+        fn identity(&self) -> ReplacementQualificationIdentity {
+            self.identity
+        }
+        fn topology_revision(&self) -> u64 {
+            1
+        }
+        fn admissions(&self) -> &[QualifiedWorkerAdmission] {
+            &self.admissions
+        }
+        fn validate_binding(
+            &self,
+            _failed_contexts: &[QueryContextRef],
+        ) -> Result<(), ReplacementQualificationFailure> {
+            Ok(())
+        }
+        fn activate(
+            self: Box<Self>,
+        ) -> Result<Box<dyn ActiveAttemptIsolationOwner>, AttemptIsolationActivationFailure>
+        {
+            Ok(Box::new(CountingActiveIsolation {
+                execution: self.identity.replacement(),
+                abandoned: Arc::clone(&self.abandoned),
+            }))
+        }
+        fn abandon(self: Box<Self>) {
+            self.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingActiveIsolation {
+        execution: QueryExecutionId,
+        abandoned: Arc<AtomicUsize>,
+    }
+
+    impl ActiveAttemptIsolationOwner for CountingActiveIsolation {
+        fn execution(&self) -> QueryExecutionId {
+            self.execution
+        }
+        fn finish(self: Box<Self>) {
+            self.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+        fn abandon(self: Box<Self>) {
+            self.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingIsolationReservation {
+        identity: ReplacementQualificationIdentity,
+        abandoned: Arc<AtomicUsize>,
+        admissions: Box<[QualifiedWorkerAdmission]>,
+    }
+
+    impl AttemptIsolationReservation for FailingIsolationReservation {
+        fn identity(&self) -> ReplacementQualificationIdentity {
+            self.identity
+        }
+
+        fn topology_revision(&self) -> u64 {
+            1
+        }
+
+        fn admissions(&self) -> &[QualifiedWorkerAdmission] {
+            &self.admissions
+        }
+
+        fn validate_binding(
+            &self,
+            _failed_contexts: &[QueryContextRef],
+        ) -> Result<(), ReplacementQualificationFailure> {
+            Ok(())
+        }
+
+        fn activate(
+            self: Box<Self>,
+        ) -> Result<Box<dyn ActiveAttemptIsolationOwner>, AttemptIsolationActivationFailure>
+        {
+            Err(AttemptIsolationActivationFailure::new(
+                ReplacementQualificationFailure::Rejected,
+                self,
+            ))
+        }
+
+        fn abandon(self: Box<Self>) {
+            self.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct LifecycleIsolationReservation {
+        identity: ReplacementQualificationIdentity,
+        failed_contexts: BTreeSet<QueryContextRef>,
+        contexts: BTreeSet<QueryContextRef>,
+        admissions: Box<[QualifiedWorkerAdmission]>,
+        finished: Arc<AtomicUsize>,
+        abandoned: Arc<AtomicUsize>,
+    }
+
+    impl AttemptIsolationReservation for LifecycleIsolationReservation {
+        fn identity(&self) -> ReplacementQualificationIdentity {
+            self.identity
+        }
+
+        fn topology_revision(&self) -> u64 {
+            1
+        }
+
+        fn admissions(&self) -> &[QualifiedWorkerAdmission] {
+            &self.admissions
+        }
+
+        fn validate_binding(
+            &self,
+            failed_contexts: &[QueryContextRef],
+        ) -> Result<(), ReplacementQualificationFailure> {
+            let failed: BTreeSet<_> = failed_contexts.iter().copied().collect();
+            let contexts: BTreeSet<_> = self
+                .admissions
+                .iter()
+                .map(QualifiedWorkerAdmission::context)
+                .collect();
+            (failed == self.failed_contexts && contexts == self.contexts)
+                .then_some(())
+                .ok_or(ReplacementQualificationFailure::InvalidReservation)
+        }
+
+        fn activate(
+            self: Box<Self>,
+        ) -> Result<Box<dyn ActiveAttemptIsolationOwner>, AttemptIsolationActivationFailure>
+        {
+            Ok(Box::new(LifecycleActiveIsolation {
+                execution: self.identity.replacement(),
+                finished: Arc::clone(&self.finished),
+                abandoned: Arc::clone(&self.abandoned),
+            }))
+        }
+
+        fn abandon(self: Box<Self>) {
+            self.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct LifecycleActiveIsolation {
+        execution: QueryExecutionId,
+        finished: Arc<AtomicUsize>,
+        abandoned: Arc<AtomicUsize>,
+    }
+
+    impl ActiveAttemptIsolationOwner for LifecycleActiveIsolation {
+        fn execution(&self) -> QueryExecutionId {
+            self.execution
+        }
+
+        fn finish(self: Box<Self>) {
+            self.finished.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn abandon(self: Box<Self>) {
+            self.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn qualified_reservation(
+        submission: &ReplacementQualificationEffectSubmission,
+    ) -> QualifiedReplacementReservation {
+        let request = submission.request();
+        let admissions: Box<[_]> = request
+            .replacement_contexts()
+            .iter()
+            .enumerate()
+            .map(|(index, context)| {
+                let tag = u8::try_from(index + 1).unwrap();
+                QualifiedWorkerAdmission::try_new(
+                    request.identity().replacement(),
+                    admission_request(*context, tag),
+                    admission_ticket(*context, tag),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let contexts = admissions
+            .iter()
+            .map(QualifiedWorkerAdmission::context)
+            .collect();
+        QualifiedReplacementReservation::try_new(
+            request,
+            Box::new(TestIsolationReservation {
+                identity: request.identity(),
+                failed_contexts: request.failed_contexts().iter().copied().collect(),
+                contexts,
+                admissions,
+            }),
+        )
+        .unwrap()
+    }
+
+    fn qualify(submission: ReplacementQualificationEffectSubmission) {
+        let reservation = qualified_reservation(&submission);
+        submission.qualified(reservation).unwrap();
+    }
+
+    fn admission_request(
+        context: QueryContextRef,
+        tag: u8,
+    ) -> novarocks_execution_contract::AcquireQueryContextAdmissionTicket {
+        novarocks_execution_contract::AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context,
+            LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+            NativeCompatibilityId::new([tag; 32]),
+            AdmissionEpochCapability::try_from_bytes([tag; 16]).unwrap(),
+        )
+    }
+
+    fn admission_ticket(context: QueryContextRef, tag: u8) -> QueryContextAdmissionTicketReceipt {
+        QueryContextAdmissionTicketReceipt::new(
+            AdmissionTicketId::try_from_bytes([tag; 16]).unwrap(),
+            context,
+            LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+        )
+    }
+
+    fn establish_request(
+        context: QueryContextRef,
+        ticket: QueryContextAdmissionTicketReceipt,
+        tag: u8,
+    ) -> Arc<novarocks_execution_contract::EstablishQueryContext> {
+        let content = |offset| {
+            Arc::new(FakeContent(ContentFingerprint::from_bytes(
+                [tag + offset; 16],
+            ))) as Arc<dyn CodecOwnedContent>
+        };
+        Arc::new(novarocks_execution_contract::EstablishQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            ticket.ticket_id(),
+            content(0),
+            content(1),
+            content(2),
+            CredentialUpdate::new(
+                CredentialLeaseId::new(u64::from(tag)),
+                CredentialEpoch::new(1).unwrap(),
+                Arc::new(FakeSecret),
+            ),
+            LeaseValidFor::new(Duration::from_secs(30)).unwrap(),
+        ))
+    }
+
+    fn recovery_config(
+        initial_execution: QueryExecutionId,
+        port: Arc<dyn ReplacementQualificationEffectPort>,
+        max_attempts: u32,
+    ) -> LogicalExecutionActorConfig {
+        let (work_owner, stage) = test_governed_work();
+        LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            initial_execution,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(max_attempts).unwrap(),
+            port,
+            work_owner,
+            stage,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+    }
+
+    fn recovery_config_with_contexts(
+        initial_execution: QueryExecutionId,
+        contexts: Vec<QueryContextRef>,
+        port: Arc<dyn ReplacementQualificationEffectPort>,
+        max_attempts: u32,
+    ) -> LogicalExecutionActorConfig {
+        let (work_owner, stage) = test_governed_work();
+        LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            initial_execution,
+            NonZeroUsize::new(4).unwrap(),
+            contexts,
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(max_attempts).unwrap(),
+            port,
+            work_owner,
+            stage,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+    }
+
     fn config(initial_execution: QueryExecutionId) -> LogicalExecutionActorConfig {
+        let (work_owner, stage) = test_governed_work();
         LogicalExecutionActorConfig::single_attempt_completion(
             initial_execution,
             ExecutionEffect::None,
@@ -1438,7 +3543,10 @@ mod tests {
             Vec::new(),
             NonZeroUsize::new(2).unwrap(),
             NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
         )
+        .unwrap()
     }
 
     async fn wait_for_conclusion(
@@ -1469,6 +3577,92 @@ mod tests {
             actor.complete_attempt(running).await.unwrap(),
             LogicalConclusion::Succeeded
         );
+    }
+
+    #[tokio::test]
+    async fn successful_initial_attempt_waits_for_positive_resource_convergence() {
+        let runtime = Handle::current();
+        let first = execution(877);
+        let frontend = FrontendProcessId::new_v7();
+        let context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let unrelated = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let abort_port = Arc::new(ClosingMixedAbortPort::new(context, unrelated));
+        let abort_submissions = Arc::clone(&abort_port.submissions);
+        let (work_owner, stage) = test_governed_work();
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
+            first,
+            ExecutionEffect::None,
+            NonZeroUsize::new(4).unwrap(),
+            vec![context],
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
+        )
+        .unwrap()
+        .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let ticket = admission_ticket(context, 71);
+        let admission = running
+            .begin_admission_issue(admission_request(context, 71))
+            .await
+            .unwrap();
+        running
+            .settle_admission_issue(
+                admission,
+                AdmissionIssueSettlement::applied(
+                    admission.operation_id(),
+                    OperationOutcome::Accepted,
+                    ticket,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let establish = running
+            .authorize_establish(
+                establish_request(context, ticket, 71),
+                NativeCompatibilityId::new([71; 32]),
+            )
+            .await
+            .unwrap();
+        let transport = HoldingEstablishTransport::default();
+        assert_eq!(
+            establish.try_submit(&transport).unwrap(),
+            EstablishIssueSubmit::Accepted
+        );
+        transport
+            .take()
+            .worker_settled(OperationOutcome::Accepted)
+            .unwrap();
+        assert_eq!(
+            actor.complete_attempt(running).await.unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        assert!(
+            abort_submissions.lock().unwrap().is_empty(),
+            "successful cleanup must not be sent through the Abort effect"
+        );
+
+        let supervisor = owner.into_residual_stand_down_supervisor();
+        drop(actor);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !supervisor.is_finished(),
+            "query success is not a Worker resource-convergence fact"
+        );
+        supervisor
+            .observe_worker_stopped_and_context_fenced(context)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor.join())
+            .await
+            .expect("positive Registry convergence must finish successful cleanup")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1567,6 +3761,1563 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_waits_for_the_combined_external_qualification() {
+        let runtime = Handle::current();
+        let first = execution(81);
+        let second = replacement(first, 2);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let (owner, permit) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(permit.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(qualification.identity().failed(), first);
+        assert_eq!(qualification.identity().replacement(), second);
+
+        let mut activation = Box::pin(actor.activate_replacement(qualification));
+        assert!(matches!(
+            std::future::poll_fn(|context| Poll::Ready(activation.as_mut().poll(context))).await,
+            Poll::Pending
+        ));
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        assert_eq!(submission.request().identity().replacement(), second);
+        assert!(submission.request().failed_contexts().is_empty());
+        qualify(submission);
+
+        let permit = activation.await.unwrap();
+        assert_eq!(permit.identity().execution(), second);
+        let running = actor.activate(permit.ready()).await.unwrap();
+        assert_eq!(
+            actor.fail_attempt(running).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn late_establish_settlement_refreshes_the_failed_attempt_residual() {
+        let runtime = Handle::current();
+        let first = execution(811);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let (capacity, _) = watch::channel(0);
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let abort_port = Arc::new(SelectiveAbortPort {
+            blocked: QueryContextRef::new(first, frontend, BackendProcessId::new_v7()),
+            accepted: Arc::clone(&accepted),
+            capacity,
+        });
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let config = recovery_config_with_contexts(first, vec![old_context], port, 2)
+            .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let ticket = admission_ticket(old_context, 21);
+        let admission = running
+            .begin_admission_issue(admission_request(old_context, 21))
+            .await
+            .unwrap();
+        running
+            .settle_admission_issue(
+                admission,
+                AdmissionIssueSettlement::applied(
+                    admission.operation_id(),
+                    OperationOutcome::Accepted,
+                    ticket,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let establish = running
+            .authorize_establish(
+                establish_request(old_context, ticket, 21),
+                NativeCompatibilityId::new([21; 32]),
+            )
+            .await
+            .unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            submissions.lock().unwrap()[0].request().failed_contexts(),
+            &[old_context]
+        );
+        qualify(submissions.lock().unwrap().pop().unwrap());
+        let successor = actor.activate_replacement(qualification).await.unwrap();
+        let successor = actor.activate(successor.ready()).await.unwrap();
+        assert_eq!(
+            actor
+                .stand_down_snapshot(old_context)
+                .await
+                .unwrap()
+                .unwrap()
+                .closure(),
+            super::super::ContextClosureState::AwaitingEstablishIssue
+        );
+
+        drop(establish);
+        for _ in 0..16 {
+            let closure = actor
+                .stand_down_snapshot(old_context)
+                .await
+                .unwrap()
+                .unwrap()
+                .closure();
+            if closure == super::super::ContextClosureState::Aborting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(&*accepted.lock().unwrap(), &[old_context]);
+        assert_eq!(
+            actor
+                .stand_down_snapshot(old_context)
+                .await
+                .unwrap()
+                .unwrap()
+                .closure(),
+            super::super::ContextClosureState::Aborting
+        );
+        assert_eq!(
+            actor.fail_attempt(successor).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_replacement_retains_unsettled_failed_attempt_residual() {
+        let runtime = Handle::current();
+        let first = execution(812);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let blocked_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let abort_port = Arc::new(ClosingMixedAbortPort::new(old_context, blocked_context));
+        let abort_submissions = Arc::clone(&abort_port.submissions);
+        let mut config = recovery_config_with_contexts(first, vec![old_context], port, 2);
+        config =
+            config.with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+        // Result-stream success is not exposed by this actor slice yet. The
+        // completion-only test mode reaches the same actor cleanup loop after
+        // exercising the real replacement and residual ledgers.
+        config.output_mode = LogicalOutputMode::CompletionOnly;
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let ticket = admission_ticket(old_context, 22);
+        let admission = running
+            .begin_admission_issue(admission_request(old_context, 22))
+            .await
+            .unwrap();
+        running
+            .settle_admission_issue(
+                admission,
+                AdmissionIssueSettlement::applied(
+                    admission.operation_id(),
+                    OperationOutcome::Accepted,
+                    ticket,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let establish = running
+            .authorize_establish(
+                establish_request(old_context, ticket, 22),
+                NativeCompatibilityId::new([22; 32]),
+            )
+            .await
+            .unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        qualify(submissions.lock().unwrap().pop().unwrap());
+        let successor = actor.activate_replacement(qualification).await.unwrap();
+        let successor = actor.activate(successor.ready()).await.unwrap();
+        assert_eq!(
+            actor.complete_attempt(successor).await.unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        assert_eq!(
+            actor
+                .stand_down_snapshot(old_context)
+                .await
+                .unwrap()
+                .unwrap()
+                .closure(),
+            super::super::ContextClosureState::AwaitingEstablishIssue
+        );
+
+        let supervisor = owner.into_residual_stand_down_supervisor();
+        drop(actor);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !supervisor.is_finished(),
+            "successful current attempt must not discard an old residual responsibility"
+        );
+
+        drop(establish);
+        let abort = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(submission) = abort_submissions.lock().unwrap().pop() {
+                    break submission;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late Establish settlement must start residual Abort");
+        assert!(!supervisor.is_finished());
+        abort
+            .worker_settled(QueryContextReceipt::new(
+                old_context,
+                QueryContextState::Aborting,
+            ))
+            .unwrap();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !supervisor.is_finished(),
+            "Abort acknowledgement is not an actual-stop or process-fence fact"
+        );
+        supervisor
+            .observe_worker_stopped_and_context_fenced(old_context)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor.join())
+            .await
+            .expect("registry convergence must settle the old residual")
+            .unwrap();
+    }
+
+    async fn assert_initial_attempt_residual_requires_positive_convergence(
+        query: i64,
+        worker_state: QueryContextState,
+    ) {
+        let runtime = Handle::current();
+        let first = execution(query);
+        let frontend = FrontendProcessId::new_v7();
+        let context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let unrelated = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let abort_port = Arc::new(ClosingMixedAbortPort::new(context, unrelated));
+        let abort_submissions = Arc::clone(&abort_port.submissions);
+        let (work_owner, stage) = test_governed_work();
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
+            first,
+            ExecutionEffect::None,
+            NonZeroUsize::new(4).unwrap(),
+            vec![context],
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
+        )
+        .unwrap()
+        .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let ticket = admission_ticket(context, 51);
+        let admission = running
+            .begin_admission_issue(admission_request(context, 51))
+            .await
+            .unwrap();
+        running
+            .settle_admission_issue(
+                admission,
+                AdmissionIssueSettlement::applied(
+                    admission.operation_id(),
+                    OperationOutcome::Accepted,
+                    ticket,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let establish = running
+            .authorize_establish(
+                establish_request(context, ticket, 51),
+                NativeCompatibilityId::new([51; 32]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            actor.fail_attempt(running).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+        drop(establish);
+        let abort = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(submission) = abort_submissions.lock().unwrap().pop() {
+                    break submission;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed initial attempt must reach the Abort effect owner");
+        abort
+            .worker_settled(QueryContextReceipt::new(context, worker_state))
+            .unwrap();
+
+        let supervisor = owner.into_residual_stand_down_supervisor();
+        drop(actor);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !supervisor.is_finished(),
+            "a Worker status without positive stop or process replacement must retain supervision"
+        );
+        supervisor
+            .observe_worker_stopped_and_context_fenced(context)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor.join())
+            .await
+            .expect("positive Registry convergence must settle the initial residual")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_terminal_retained_attempt_remains_residually_supervised() {
+        assert_initial_attempt_residual_requires_positive_convergence(
+            872,
+            QueryContextState::TerminalRetained,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn initial_gone_attempt_remains_residually_supervised() {
+        assert_initial_attempt_residual_requires_positive_convergence(873, QueryContextState::Gone)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn old_attempt_convergence_cannot_mutate_the_running_replacement() {
+        let runtime = Handle::current();
+        let first = execution(82);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let config = recovery_config_with_contexts(first, vec![old_context], port, 2)
+            .with_abort_query_context_effect_port(
+                super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+                NonZeroUsize::new(2).unwrap(),
+            );
+        let (owner, permit) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(permit.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        qualify(submissions.lock().unwrap().pop().unwrap());
+        let permit = actor.activate_replacement(qualification).await.unwrap();
+        let running = actor.activate(permit.ready()).await.unwrap();
+
+        let (reply, response) = oneshot::channel();
+        actor
+            .sender
+            .send(ActorCommand::RegistryContextConverged {
+                context: old_context,
+                convergence: RegistryContextConvergence::WorkerProcessReplaced,
+                reply,
+            })
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+        assert!(matches!(
+            actor.snapshot().await.unwrap().phase,
+            ExecutionPhase::Running { execution, .. } if execution == second
+        ));
+        assert_eq!(
+            actor.fail_attempt(running).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn old_attempt_establish_rejection_does_not_gate_the_successor() {
+        let runtime = Handle::current();
+        let first = execution(821);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let new_context = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let qualification_port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&qualification_port.submissions);
+        let config = recovery_config_with_contexts(first, vec![old_context], qualification_port, 2)
+            .with_abort_query_context_effect_port(
+                super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+                NonZeroUsize::new(2).unwrap(),
+            );
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let ticket = admission_ticket(old_context, 22);
+        let admission = running
+            .begin_admission_issue(admission_request(old_context, 22))
+            .await
+            .unwrap();
+        running
+            .settle_admission_issue(
+                admission,
+                AdmissionIssueSettlement::applied(
+                    admission.operation_id(),
+                    OperationOutcome::Accepted,
+                    ticket,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let establish = running
+            .authorize_establish(
+                establish_request(old_context, ticket, 22),
+                NativeCompatibilityId::new([22; 32]),
+            )
+            .await
+            .unwrap();
+        let transport = HoldingEstablishTransport::default();
+        assert_eq!(
+            establish.try_submit(&transport).unwrap(),
+            EstablishIssueSubmit::Accepted
+        );
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                vec![new_context],
+            )
+            .await
+            .unwrap();
+        qualify(submissions.lock().unwrap().pop().unwrap());
+        let successor = actor.activate_replacement(qualification).await.unwrap();
+        let admissions = successor
+            .take_replacement_admission_evidence()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(admissions[0].context(), new_context);
+        let successor = actor.activate(successor.ready()).await.unwrap();
+
+        transport
+            .take()
+            .worker_settled(OperationOutcome::ContextConflict)
+            .unwrap();
+        for _ in 0..16 {
+            if actor.snapshot().await.unwrap().establish_error
+                == Some(EstablishIssueError::EstablishRejected)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            actor.snapshot().await.unwrap().establish_error,
+            Some(EstablishIssueError::EstablishRejected)
+        );
+        let _establish = successor
+            .authorize_establish(
+                establish_request(new_context, admissions[0].receipt(), 23),
+                NativeCompatibilityId::new([23; 32]),
+            )
+            .await
+            .expect("an old attempt diagnostic must not gate successor Establish");
+        assert_eq!(
+            actor.fail_attempt(successor).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_refusals_preserve_closed_policy() {
+        let runtime = Handle::current();
+        let first = execution(83);
+        let second = replacement(first, 2);
+        let (owner, permit) = spawn_logical_execution_actor(&runtime, config(first)).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(permit.ready()).await.unwrap();
+        assert_eq!(
+            actor
+                .begin_replacement(
+                    running,
+                    AttemptFailureClass::RecoverableInfrastructure,
+                    second,
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            LogicalExecutionActorError::RecoveryRefused(RecoveryRefusal::Mode)
+        );
+        wait_for_conclusion(actor, LogicalConclusion::Failed).await;
+
+        let port = Arc::new(DelayedQualificationPort::default());
+        let (owner, permit) =
+            spawn_logical_execution_actor(&runtime, recovery_config(execution(84), port, 2))
+                .unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(permit.ready()).await.unwrap();
+        assert_eq!(
+            actor
+                .begin_replacement(
+                    running,
+                    AttemptFailureClass::RecoverableInfrastructure,
+                    execution(999),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            LogicalExecutionActorError::WrongExecution
+        );
+        wait_for_conclusion(actor, LogicalConclusion::Failed).await;
+
+        let first = execution(842);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let (owner, permit) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(permit.ready()).await.unwrap();
+        assert_eq!(
+            actor
+                .begin_replacement(
+                    running,
+                    AttemptFailureClass::ContractViolation,
+                    replacement(first, 2),
+                    Vec::new(),
+                )
+                .await
+                .unwrap_err(),
+            LogicalExecutionActorError::RecoveryRefused(RecoveryRefusal::FailureClass)
+        );
+        wait_for_conclusion(actor, LogicalConclusion::Failed).await;
+
+        let port = Arc::new(DelayedQualificationPort::default());
+        let (work_owner, stage) = test_governed_work();
+        assert_eq!(
+            LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+                execution(843),
+                NonZeroUsize::new(1).unwrap(),
+                Vec::new(),
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroU32::new(1).unwrap(),
+                port,
+                work_owner,
+                stage,
+                Duration::from_secs(30),
+            )
+            .unwrap_err(),
+            LogicalExecutionActorError::RecoveryRefused(RecoveryRefusal::AttemptBudget)
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_work_cancellation_concludes_a_running_execution() {
+        let runtime = Handle::current();
+        let first = execution(880);
+        let (parent, work_owner, stage) = test_governed_child_work(None);
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
+            first,
+            ExecutionEffect::None,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
+        )
+        .unwrap();
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+
+        parent.cancel(CancellationReason::Requested);
+        wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
+        drop(running);
+        drop(actor);
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        parent.complete();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inherited_work_deadline_cancels_backpressured_replacement() {
+        let runtime = Handle::current();
+        let first = execution(881);
+        let second = replacement(first, 2);
+        let port = Arc::new(RecoverableBackpressureQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (parent, work_owner, stage) = test_governed_child_work(Some(deadline));
+        let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            first,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            port,
+            work_owner,
+            stage,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        assert_eq!(submissions.load(Ordering::SeqCst), 0);
+        drop(qualification);
+        drop(actor);
+        owner
+            .into_residual_stand_down_supervisor()
+            .join()
+            .await
+            .unwrap();
+        parent.complete();
+    }
+
+    #[tokio::test]
+    async fn work_cancellation_abandons_qualified_successor_while_authority_is_held() {
+        let runtime = Handle::current();
+        let first = execution(882);
+        let second = replacement(first, 2);
+        let failed_context = QueryContextRef::new(
+            first,
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        );
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let (parent, work_owner, stage) = test_governed_child_work(None);
+        let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            first,
+            NonZeroUsize::new(4).unwrap(),
+            vec![failed_context],
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            port,
+            work_owner,
+            stage,
+            Duration::from_secs(60),
+        )
+        .unwrap()
+        .with_abort_query_context_effect_port(
+            super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        let request = submission.request();
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        let reservation = QualifiedReplacementReservation::try_new(
+            request,
+            Box::new(CountingIsolationReservation {
+                identity: request.identity(),
+                abandoned: Arc::clone(&abandoned),
+                admissions: Vec::new().into_boxed_slice(),
+            }),
+        )
+        .unwrap();
+        submission.qualified(reservation).unwrap();
+        actor.snapshot().await.unwrap();
+
+        parent.cancel(CancellationReason::Requested);
+        wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
+        assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+        drop(qualification);
+        drop(actor);
+        let supervisor = owner.into_residual_stand_down_supervisor();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !supervisor.is_finished(),
+            "work ownership must outlive successor cleanup until the failed Worker converges"
+        );
+        supervisor
+            .observe_worker_stopped_and_context_fenced(failed_context)
+            .await
+            .unwrap();
+        supervisor.join().await.unwrap();
+        parent.complete();
+    }
+
+    #[tokio::test]
+    async fn dropped_qualification_and_unknown_effect_cannot_lose_responsibility() {
+        let runtime = Handle::current();
+        let first = execution(85);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let (owner, permit) = spawn_logical_execution_actor(
+            &runtime,
+            recovery_config(first, Arc::clone(&port) as Arc<_>, 2),
+        )
+        .unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(permit.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                replacement(first, 2),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        drop(qualification);
+        wait_for_conclusion(actor, LogicalConclusion::Cancelled).await;
+
+        let first = execution(86);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let (owner, permit) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(permit.ready()).await.unwrap();
+        let _qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                replacement(first, 2),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        drop(submissions.lock().unwrap().pop().unwrap());
+        let snapshot = wait_for_conclusion(actor, LogicalConclusion::Failed).await;
+        assert_eq!(
+            snapshot.replacement_error,
+            Some(ReplacementQualificationFailure::OutcomeUnknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_replacement_activation_abandons_the_logical_execution() {
+        let runtime = Handle::current();
+        let first = execution(861);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let (owner, initial) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let LogicalExecutionActorOwner { actor, join } = owner;
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                replacement(first, 2),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let mut activation = Box::pin(actor.activate_replacement(qualification));
+        assert!(matches!(
+            std::future::poll_fn(|context| Poll::Ready(activation.as_mut().poll(context))).await,
+            Poll::Pending
+        ));
+        assert_eq!(submissions.lock().unwrap().len(), 1);
+
+        drop(activation);
+        wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
+        qualify(submissions.lock().unwrap().pop().unwrap());
+        drop(actor);
+        tokio::time::timeout(Duration::from_secs(1), join)
+            .await
+            .expect("submitted qualification must remain supervised after cancellation")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn conclusion_abandons_qualified_successor_before_old_residual_converges() {
+        let runtime = Handle::current();
+        let first = execution(874);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let old_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let unrelated = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let abort_port = Arc::new(ClosingMixedAbortPort::new(old_context, unrelated));
+        let abort_submissions = Arc::clone(&abort_port.submissions);
+        let config = recovery_config_with_contexts(first, vec![old_context], port, 2)
+            .with_abort_query_context_effect_port(abort_port, NonZeroUsize::new(2).unwrap());
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let ticket = admission_ticket(old_context, 61);
+        let admission = running
+            .begin_admission_issue(admission_request(old_context, 61))
+            .await
+            .unwrap();
+        running
+            .settle_admission_issue(
+                admission,
+                AdmissionIssueSettlement::applied(
+                    admission.operation_id(),
+                    OperationOutcome::Accepted,
+                    ticket,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let establish = running
+            .authorize_establish(
+                establish_request(old_context, ticket, 61),
+                NativeCompatibilityId::new([61; 32]),
+            )
+            .await
+            .unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        let request = submission.request();
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        let reservation = QualifiedReplacementReservation::try_new(
+            request,
+            Box::new(CountingIsolationReservation {
+                identity: request.identity(),
+                abandoned: Arc::clone(&abandoned),
+                admissions: Vec::new().into_boxed_slice(),
+            }),
+        )
+        .unwrap();
+        submission.qualified(reservation).unwrap();
+        // The receipt branch is biased ahead of mailbox commands, so this
+        // snapshot proves the actor has taken ownership of the reservation.
+        actor.snapshot().await.unwrap();
+        assert_eq!(abandoned.load(Ordering::SeqCst), 0);
+
+        drop(qualification);
+        wait_for_conclusion(&actor, LogicalConclusion::Cancelled).await;
+        assert_eq!(
+            abandoned.load(Ordering::SeqCst),
+            1,
+            "successor grants must be abandoned immediately at logical conclusion"
+        );
+
+        drop(establish);
+        let abort = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(submission) = abort_submissions.lock().unwrap().pop() {
+                    break submission;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old attempt must remain under Abort supervision");
+        abort
+            .worker_settled(QueryContextReceipt::new(
+                old_context,
+                QueryContextState::TerminalRetained,
+            ))
+            .unwrap();
+        let supervisor = owner.into_residual_stand_down_supervisor();
+        drop(actor);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!supervisor.is_finished());
+        supervisor
+            .observe_worker_stopped_and_context_fenced(old_context)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor.join())
+            .await
+            .expect("old residual convergence must finish actor cleanup")
+            .unwrap();
+    }
+
+    #[test]
+    fn qualified_worker_admission_rejects_a_foreign_receipt_context() {
+        let first = execution(864);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let expected = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let foreign = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        assert_eq!(
+            QualifiedWorkerAdmission::try_new(
+                second,
+                admission_request(expected, 41),
+                admission_ticket(foreign, 41),
+            )
+            .unwrap_err(),
+            ReplacementQualificationFailure::InvalidReservation
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_clock_expires_qualified_capacity_before_activation() {
+        let runtime = Handle::current();
+        let first = execution(866);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let clock = Arc::new(ManualActorClock::new(MonotonicInstant::ORIGIN));
+        let config = recovery_config(first, port, 2).with_clock(clock.clone());
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                replacement(first, 2),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        clock.set(MonotonicInstant::from_origin(Duration::from_secs(31)));
+        qualify(submission);
+        assert_eq!(
+            actor.activate_replacement(qualification).await.unwrap_err(),
+            LogicalExecutionActorError::ReplacementQualificationFailed(
+                ReplacementQualificationFailure::Expired,
+            )
+        );
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn replacement_deadline_cancels_a_hung_effect_and_releases_the_execution_stage() {
+        let runtime = Handle::current();
+        let first = execution(869);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let clock = Arc::new(ManualActorClock::new(MonotonicInstant::ORIGIN));
+        let (work_owner, stage) = test_governed_work();
+        let scope = work_owner.scope();
+        let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            first,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            port,
+            work_owner,
+            stage,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_clock(clock.clone());
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                replacement(first, 2),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            submission.request().conservative_expiry(),
+            MonotonicInstant::from_origin(Duration::from_secs(30))
+        );
+        let cancellation = submission.subscribe_cancellation();
+
+        clock.set(MonotonicInstant::from_origin(Duration::from_secs(31)));
+        wait_for_conclusion(actor, LogicalConclusion::Failed).await;
+        assert!(*cancellation.borrow());
+        let replacement_stage = scope.try_acquire(Stage::Execution).unwrap();
+        drop(replacement_stage);
+
+        drop(qualification);
+        drop(submission);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn qualified_replacement_expires_while_the_caller_holds_activation_authority() {
+        let runtime = Handle::current();
+        let first = execution(870);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let clock = Arc::new(ManualActorClock::new(MonotonicInstant::ORIGIN));
+        let (work_owner, stage) = test_governed_work();
+        let scope = work_owner.scope();
+        let config = LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
+            first,
+            NonZeroUsize::new(4).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            port,
+            work_owner,
+            stage,
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_clock(clock.clone());
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                replacement(first, 2),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        qualify(submissions.lock().unwrap().pop().unwrap());
+
+        clock.set(MonotonicInstant::from_origin(Duration::from_secs(31)));
+        wait_for_conclusion(actor, LogicalConclusion::Failed).await;
+        let replacement_stage = scope.try_acquire(Stage::Execution).unwrap();
+        drop(replacement_stage);
+
+        drop(qualification);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn replacement_reservation_rejects_incorrect_failed_context_proof() {
+        let runtime = Handle::current();
+        let first = execution(871);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let failed_context = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let foreign_failed_context =
+            QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let config = recovery_config_with_contexts(first, vec![failed_context], port, 2)
+            .with_abort_query_context_effect_port(
+                super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+                NonZeroUsize::new(2).unwrap(),
+            );
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let _qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        let request = submission.request();
+        assert_eq!(
+            QualifiedReplacementReservation::try_new(
+                request,
+                Box::new(TestIsolationReservation {
+                    identity: request.identity(),
+                    failed_contexts: BTreeSet::from([foreign_failed_context]),
+                    contexts: BTreeSet::new(),
+                    admissions: Vec::new().into_boxed_slice(),
+                }),
+            )
+            .unwrap_err(),
+            ReplacementQualificationFailure::InvalidReservation
+        );
+        drop(submission);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn duplicate_replacement_contexts_fail_and_conclude_the_consumed_attempt() {
+        let runtime = Handle::current();
+        let first = execution(876);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let duplicate = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let port = Arc::new(DelayedQualificationPort::default());
+        let (owner, initial) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        assert_eq!(
+            actor
+                .begin_replacement(
+                    running,
+                    AttemptFailureClass::RecoverableInfrastructure,
+                    second,
+                    vec![duplicate, duplicate],
+                )
+                .await
+                .unwrap_err(),
+            LogicalExecutionActorError::WrongExecution
+        );
+        wait_for_conclusion(actor, LogicalConclusion::Failed).await;
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn replacement_reservation_rejects_a_foreign_isolation_identity() {
+        let runtime = Handle::current();
+        let first = execution(867);
+        let second = replacement(first, 2);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let (owner, initial) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let _qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        let request = submission.request();
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        let foreign = ReplacementQualificationIdentity::new(
+            request.identity().actor(),
+            first,
+            replacement(first, 3),
+            request.identity().eligibility_generation(),
+        );
+        assert_eq!(
+            QualifiedReplacementReservation::try_new(
+                request,
+                Box::new(CountingIsolationReservation {
+                    identity: foreign,
+                    abandoned: Arc::clone(&abandoned),
+                    admissions: Vec::new().into_boxed_slice(),
+                }),
+            )
+            .unwrap_err(),
+            ReplacementQualificationFailure::InvalidReservation
+        );
+        assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+        drop(submission);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn replacement_resources_are_consumed_once_and_drop_closes_active_ownership() {
+        let runtime = Handle::current();
+        let first = execution(868);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let (owner, initial) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                replacement(first, 2),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        let request = submission.request();
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        let reservation = QualifiedReplacementReservation::try_new(
+            request,
+            Box::new(CountingIsolationReservation {
+                identity: request.identity(),
+                abandoned: Arc::clone(&abandoned),
+                admissions: Vec::new().into_boxed_slice(),
+            }),
+        )
+        .unwrap();
+        submission.qualified(reservation).unwrap();
+        let successor = actor.activate_replacement(qualification).await.unwrap();
+        assert!(
+            successor
+                .take_replacement_admission_evidence()
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            successor
+                .take_replacement_admission_evidence()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(successor);
+        wait_for_conclusion(actor, LogicalConclusion::Cancelled).await;
+        assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn failed_isolation_activation_returns_ownership_for_abandonment() {
+        let runtime = Handle::current();
+        let first = execution(883);
+        let second = replacement(first, 2);
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let (owner, initial) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        let request = submission.request();
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        let reservation = QualifiedReplacementReservation::try_new(
+            request,
+            Box::new(FailingIsolationReservation {
+                identity: request.identity(),
+                abandoned: Arc::clone(&abandoned),
+                admissions: Vec::new().into_boxed_slice(),
+            }),
+        )
+        .unwrap();
+        submission.qualified(reservation).unwrap();
+
+        assert_eq!(
+            actor.activate_replacement(qualification).await.unwrap_err(),
+            LogicalExecutionActorError::ReplacementQualificationFailed(
+                ReplacementQualificationFailure::Rejected,
+            )
+        );
+        assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_take_restores_the_exact_successor_bundle() {
+        let runtime = Handle::current();
+        let first = execution(875);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let new_context = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let (owner, initial) =
+            spawn_logical_execution_actor(&runtime, recovery_config(first, port, 2)).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                vec![new_context],
+            )
+            .await
+            .unwrap();
+        qualify(submissions.lock().unwrap().pop().unwrap());
+        let successor = actor.activate_replacement(qualification).await.unwrap();
+        let (reply, response) = oneshot::channel();
+        actor
+            .sender
+            .send(ActorCommand::TakeReplacementAdmissionEvidence {
+                activation: successor.identity(),
+                reply,
+            })
+            .await
+            .unwrap();
+        drop(response);
+        actor.snapshot().await.unwrap();
+
+        let admissions = successor
+            .take_replacement_admission_evidence()
+            .await
+            .unwrap()
+            .expect("a cancelled receiver must not consume the move-only admission bundle");
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(admissions[0].context(), new_context);
+        drop(successor);
+        wait_for_conclusion(actor, LogicalConclusion::Cancelled).await;
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn successful_replacement_finishes_isolation_only_after_resource_convergence() {
+        let runtime = Handle::current();
+        let first = execution(878);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let new_context = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let port = Arc::new(DelayedQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let mut config = recovery_config(first, port, 2).with_abort_query_context_effect_port(
+            super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        config.output_mode = LogicalOutputMode::CompletionOnly;
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                second,
+                vec![new_context],
+            )
+            .await
+            .unwrap();
+        let submission = submissions.lock().unwrap().pop().unwrap();
+        let request = submission.request();
+        let admission = QualifiedWorkerAdmission::try_new(
+            second,
+            admission_request(new_context, 81),
+            admission_ticket(new_context, 81),
+        )
+        .unwrap();
+        let finished = Arc::new(AtomicUsize::new(0));
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        let reservation = QualifiedReplacementReservation::try_new(
+            request,
+            Box::new(LifecycleIsolationReservation {
+                identity: request.identity(),
+                failed_contexts: BTreeSet::new(),
+                contexts: BTreeSet::from([new_context]),
+                admissions: vec![admission].into_boxed_slice(),
+                finished: Arc::clone(&finished),
+                abandoned: Arc::clone(&abandoned),
+            }),
+        )
+        .unwrap();
+        submission.qualified(reservation).unwrap();
+        let successor = actor.activate_replacement(qualification).await.unwrap();
+        let admissions = successor
+            .take_replacement_admission_evidence()
+            .await
+            .unwrap()
+            .unwrap();
+        let successor = actor.activate(successor.ready()).await.unwrap();
+        let establish = successor
+            .authorize_establish(
+                establish_request(new_context, admissions[0].receipt(), 81),
+                NativeCompatibilityId::new([81; 32]),
+            )
+            .await
+            .unwrap();
+        let transport = HoldingEstablishTransport::default();
+        assert_eq!(
+            establish.try_submit(&transport).unwrap(),
+            EstablishIssueSubmit::Accepted
+        );
+        transport
+            .take()
+            .worker_settled(OperationOutcome::Accepted)
+            .unwrap();
+        let before_completion = actor.snapshot().await.unwrap();
+        assert!(matches!(
+            before_completion.phase,
+            ExecutionPhase::Running { execution, .. } if execution == second
+        ));
+        assert_eq!(before_completion.conclusion, None);
+        assert_eq!(
+            actor.complete_attempt(successor).await.unwrap(),
+            LogicalConclusion::Succeeded
+        );
+        assert_eq!(finished.load(Ordering::SeqCst), 0);
+        assert_eq!(abandoned.load(Ordering::SeqCst), 0);
+
+        let supervisor = owner.into_residual_stand_down_supervisor();
+        drop(actor);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!supervisor.is_finished());
+        assert_eq!(finished.load(Ordering::SeqCst), 0);
+        supervisor
+            .observe_worker_stopped_and_context_fenced(new_context)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), supervisor.join())
+            .await
+            .expect("positive Registry convergence must finish successor isolation")
+            .unwrap();
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+        assert_eq!(abandoned.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_replacement_capacity_does_not_starve_the_mailbox() {
+        let runtime = Handle::current();
+        let first = execution(862);
+        let port = Arc::new(ClosingBackpressureQualificationPort::default());
+        let (owner, initial) = spawn_logical_execution_actor(
+            &runtime,
+            recovery_config(first, Arc::clone(&port) as Arc<_>, 2),
+        )
+        .unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let _qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                replacement(first, 2),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            if port.reserve_calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(port.reserve_calls.load(Ordering::SeqCst), 1);
+        port.close();
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = actor.snapshot().await.unwrap();
+                if snapshot.conclusion == Some(LogicalConclusion::Failed) {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed capacity must not create a biased-select busy loop");
+        assert_eq!(
+            snapshot.replacement_error,
+            Some(ReplacementQualificationFailure::EffectOwnerClosed)
+        );
+        assert_eq!(port.reserve_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_backpressured_replacement_never_submits_after_capacity_recovers() {
+        let runtime = Handle::current();
+        let first = execution(863);
+        let port = Arc::new(RecoverableBackpressureQualificationPort::default());
+        let submissions = Arc::clone(&port.submissions);
+        let (owner, initial) = spawn_logical_execution_actor(
+            &runtime,
+            recovery_config(first, Arc::clone(&port) as Arc<_>, 2),
+        )
+        .unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let qualification = actor
+            .begin_replacement(
+                running,
+                AttemptFailureClass::RecoverableInfrastructure,
+                replacement(first, 2),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            if port.reserve_calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(port.reserve_calls.load(Ordering::SeqCst), 1);
+
+        let mut activation = Box::pin(actor.activate_replacement(qualification));
+        assert!(matches!(
+            std::future::poll_fn(|context| Poll::Ready(activation.as_mut().poll(context))).await,
+            Poll::Pending
+        ));
+        drop(activation);
+        wait_for_conclusion(actor, LogicalConclusion::Cancelled).await;
+
+        port.recover_capacity();
+        for _ in 0..16 {
+            actor.snapshot().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(submissions.load(Ordering::SeqCst), 0);
+        assert_eq!(port.reserve_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn permit_keeps_actor_alive_after_owner_is_dropped() {
         let runtime = Handle::current();
         let (owner, permit) =
@@ -1634,6 +5385,198 @@ mod tests {
         assert_eq!(
             stand_down.snapshot(reachable).unwrap().closure(),
             super::super::ContextClosureState::Aborting
+        );
+    }
+
+    #[test]
+    fn one_attempts_stand_down_error_does_not_block_another_attempt() {
+        let first = execution(101);
+        let second = replacement(first, 2);
+        let frontend = FrontendProcessId::new_v7();
+        let blocked = QueryContextRef::new(first, frontend, BackendProcessId::new_v7());
+        let reachable = QueryContextRef::new(second, frontend, BackendProcessId::new_v7());
+        let first_activation = AttemptActivationIdentity::from_parts(17, first, 1);
+        let second_activation = AttemptActivationIdentity::from_parts(17, second, 2);
+        let make_attempt = |activation, context| {
+            let contexts = BTreeSet::from([context]);
+            let establish = EstablishIssueLedger::new(
+                contexts.clone(),
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+            );
+            let mut stand_down =
+                ContextStandDownLedger::new(contexts, NonZeroUsize::new(2).unwrap()).unwrap();
+            stand_down
+                .begin(
+                    activation,
+                    ContextStandDownCause::LogicalExecutionFailed,
+                    [(context, super::super::EstablishStandDownFact::AbortRequired)],
+                )
+                .unwrap();
+            AttemptLedgers {
+                activation,
+                establish,
+                establish_error: None,
+                stand_down,
+                stand_down_error: None,
+                pending_aborts: BTreeMap::new(),
+                abort_backpressured: false,
+                retired_obligation: None,
+                active_resources: None,
+            }
+        };
+        let mut attempts = BTreeMap::from([
+            (first, make_attempt(first_activation, blocked)),
+            (second, make_attempt(second_activation, reachable)),
+        ]);
+        attempts.get_mut(&first).unwrap().stand_down_error =
+            Some(ContextStandDownError::WrongState);
+        let (capacity, _) = watch::channel(0);
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let port = SelectiveAbortPort {
+            blocked,
+            accepted: Arc::clone(&accepted),
+            capacity,
+        };
+        let mut state = LogicalExecutionState::new(
+            first,
+            RecoveryMode::NoRecovery,
+            ExecutionEffect::None,
+            LogicalOutputMode::CompletionOnly,
+            1,
+        )
+        .unwrap();
+        let first_capability = state.attempt_capability(first).unwrap();
+        state.mark_running(&first_capability).unwrap();
+        let mut global_error = Some(ContextStandDownError::WrongState);
+
+        synchronize_all_stand_down(
+            &state,
+            &mut attempts,
+            &mut global_error,
+            MonotonicInstant::ORIGIN,
+            Some(&port),
+        );
+
+        assert_eq!(&*accepted.lock().unwrap(), &[reachable]);
+    }
+
+    #[tokio::test]
+    async fn failed_stand_down_attempt_does_not_busy_wake_on_an_old_retry_deadline() {
+        let runtime = Handle::current();
+        let execution = execution(102);
+        let frontend = FrontendProcessId::new_v7();
+        let unknown = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+        let blocked = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+        let clock = Arc::new(ManualActorClock::new(MonotonicInstant::ORIGIN));
+        let port = Arc::new(ClosingMixedAbortPort::new(unknown, blocked));
+        let (work_owner, stage) = test_governed_work();
+        let config = LogicalExecutionActorConfig::single_attempt_completion(
+            execution,
+            ExecutionEffect::None,
+            NonZeroUsize::new(4).unwrap(),
+            vec![unknown, blocked],
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
+        )
+        .unwrap()
+        .with_abort_query_context_effect_port(port.clone(), NonZeroUsize::new(2).unwrap())
+        .with_clock(clock.clone());
+        let (owner, initial) = spawn_logical_execution_actor(&runtime, config).unwrap();
+        let actor = owner.actor();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        for (context, tag) in [(unknown, 31), (blocked, 32)] {
+            let issue = running
+                .begin_admission_issue(admission_request(context, tag))
+                .await
+                .unwrap();
+            running
+                .settle_admission_issue(
+                    issue,
+                    AdmissionIssueSettlement::applied(
+                        issue.operation_id(),
+                        OperationOutcome::Accepted,
+                        admission_ticket(context, tag),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            actor.fail_attempt(running).await.unwrap(),
+            LogicalConclusion::Failed
+        );
+
+        let submission = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(submission) = port.submissions.lock().unwrap().pop() {
+                    break submission;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the accepted context must reach the Abort effect owner");
+        assert_eq!(submission.identity().context(), unknown);
+        let _late = submission.transport_unknown().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = actor.stand_down_snapshot(unknown).await.unwrap().unwrap();
+                if snapshot.issue_state()
+                    == Some(super::super::AbortQueryContextIssueState::TransportUnknown)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transport-unknown retry must be retained by the stand-down ledger");
+
+        port.close_capacity();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if actor.snapshot().await.unwrap().stand_down_error
+                    == Some(ContextStandDownError::EffectCapacityClosed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closing Abort capacity must fail the owning attempt");
+        let reserve_calls_after_failure = port.reserve_calls.load(Ordering::SeqCst);
+
+        clock.set(MonotonicInstant::from_origin(Duration::from_millis(100)));
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let snapshot = tokio::time::timeout(Duration::from_millis(250), actor.snapshot())
+            .await
+            .expect("an expired retry from a failed attempt must not starve the mailbox")
+            .unwrap();
+        assert_eq!(
+            snapshot.stand_down_error,
+            Some(ContextStandDownError::EffectCapacityClosed)
+        );
+        let residual = tokio::time::timeout(
+            Duration::from_millis(250),
+            actor.stand_down_snapshot(unknown),
+        )
+        .await
+        .expect("the failed attempt's residual ledger must remain observable")
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            residual.issue_state(),
+            Some(super::super::AbortQueryContextIssueState::TransportUnknown)
+        );
+        assert_eq!(
+            port.reserve_calls.load(Ordering::SeqCst),
+            reserve_calls_after_failure,
+            "a failed attempt must retain its ledger without issuing another Abort effect"
         );
     }
 }

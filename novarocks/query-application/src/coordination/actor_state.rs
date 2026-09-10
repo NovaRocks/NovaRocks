@@ -140,6 +140,20 @@ pub(crate) struct ReplacementToken {
     eligibility_generation: u64,
 }
 
+impl ReplacementToken {
+    pub(super) const fn failed(&self) -> QueryExecutionId {
+        self.failed
+    }
+
+    pub(super) const fn replacement(&self) -> QueryExecutionId {
+        self.replacement
+    }
+
+    pub(super) const fn eligibility_generation(&self) -> u64 {
+        self.eligibility_generation
+    }
+}
+
 /// Move-only authority for one supervised replacement effect.  The actor
 /// runtime must return this exact value after the effect completes; the
 /// reducer never accepts a caller-authored replacement fact.
